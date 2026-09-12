@@ -27,8 +27,8 @@ use aruna_core::structs::{
     RoCrateLimits, RoCrateMediaType, RoCrateUploadRecord, RoutingSnapshot, SourceConnectorKind,
     VersionKey,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, UserId};
-use aruna_core::util::unix_timestamp_millis;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::connectors::create_connector::{
     CreateSourceConnectorInput, CreateSourceConnectorOperation,
@@ -43,8 +43,8 @@ use aruna_operations::jobs::store::{
 };
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
-use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::metadata::materialization_queue::process_materialization_batch;
+use aruna_operations::metadata::projector::replay_event_log;
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
@@ -65,7 +65,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use aruna_core::identifiers::{BucketId, PlacementHandle};
+use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::{MetaResourceId, StructuredId};
 
 /// A fixed structured id (handle 1, bucket 0). The single-node import fixture
@@ -168,11 +168,8 @@ async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(result.imported, 1);
     assert_eq!(result.failed, 0);
 
-    assert_eq!(
-        replay_metadata_event_log(fixture.context.as_ref()).await?,
-        1
-    );
-    let materialized = process_metadata_materialization_batch(fixture.context.as_ref()).await?;
+    assert_eq!(replay_event_log(fixture.context.as_ref()).await?, 1);
+    let materialized = process_materialization_batch(fixture.context.as_ref()).await?;
     assert_eq!(materialized.processed, 1);
 
     let export = ExportRoCrateSpec {
@@ -242,12 +239,9 @@ async fn imports_eln_export() -> Result<(), Box<dyn std::error::Error>> {
         .len(),
         1
     );
+    assert_eq!(replay_event_log(fixture.context.as_ref()).await?, 1);
     assert_eq!(
-        replay_metadata_event_log(fixture.context.as_ref()).await?,
-        1
-    );
-    assert_eq!(
-        process_metadata_materialization_batch(fixture.context.as_ref())
+        process_materialization_batch(fixture.context.as_ref())
             .await?
             .processed,
         1
@@ -281,12 +275,9 @@ async fn imports_nested_folders() -> Result<(), Box<dyn std::error::Error>> {
             .len(),
         1
     );
+    assert_eq!(replay_event_log(fixture.context.as_ref()).await?, 1);
     assert_eq!(
-        replay_metadata_event_log(fixture.context.as_ref()).await?,
-        1
-    );
-    assert_eq!(
-        process_metadata_materialization_batch(fixture.context.as_ref())
+        process_materialization_batch(fixture.context.as_ref())
             .await?
             .processed,
         1
@@ -811,12 +802,9 @@ async fn local_denial_omits() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         return Err("RO-Crate import did not succeed".into());
     }
+    assert_eq!(replay_event_log(fixture.context.as_ref()).await?, 1);
     assert_eq!(
-        replay_metadata_event_log(fixture.context.as_ref()).await?,
-        1
-    );
-    assert_eq!(
-        process_metadata_materialization_batch(fixture.context.as_ref())
+        process_materialization_batch(fixture.context.as_ref())
             .await?
             .processed,
         1
@@ -1327,9 +1315,9 @@ async fn seed_auth(
     actor: &Actor,
     group_id: GroupId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let realm = RealmAuthorizationDocument::new_default_realm_doc(actor.realm_id);
+    let realm = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
     let group =
-        GroupAuthorizationDocument::new_default_group_doc(actor.user_id, actor.realm_id, group_id);
+        GroupAuthorizationDocument::default_group_doc(actor.user_id, actor.realm_id, group_id);
     write_value(
         storage,
         AUTH_KEYSPACE,

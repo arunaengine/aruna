@@ -187,19 +187,27 @@ pub async fn reachable_roots(
     auth_context: &AuthContext,
     root: &str,
 ) -> Result<Vec<String>, AuthorizationError> {
-    let rules = drive(
+    let rules = permission_rules(context, auth_context, root).await?;
+    Ok(readable_roots(
+        &rules.direct_patterns(),
+        auth_context.path_restrictions.as_deref(),
+        root,
+    ))
+}
+
+pub async fn permission_rules(
+    context: &DriverContext,
+    auth_context: &AuthContext,
+    root: &str,
+) -> Result<PermissionRules, AuthorizationError> {
+    drive(
         PermissionRulesOperation::new(PermissionRulesConfig {
             auth_context: auth_context.clone(),
             path: root.to_string(),
         }),
         context,
     )
-    .await?;
-    Ok(readable_roots(
-        &rules.direct_patterns(),
-        auth_context.path_restrictions.as_deref(),
-        root,
-    ))
+    .await
 }
 
 /// The caller's rules for a set of groups, collected once per request: every
@@ -925,6 +933,40 @@ mod test {
     }
 
     #[test]
+    fn patterns_exclude_public() {
+        let realm_id = RealmId([19u8; 32]);
+        let direct_path = format!("/{realm_id}/g/**");
+        let public_path = format!("/{realm_id}/public/**");
+        let rules = PermissionRules::from_roles(
+            vec![
+                CollectedRole {
+                    role: role(
+                        HashMap::from([(direct_path.clone(), Permission::READ)]),
+                        HashSet::new(),
+                    ),
+                    direct: true,
+                    public: false,
+                },
+                CollectedRole {
+                    role: role(
+                        HashMap::from([(public_path, Permission::READ)]),
+                        HashSet::from([UserId::nil(realm_id)]),
+                    ),
+                    direct: false,
+                    public: true,
+                },
+            ],
+            None,
+        )
+        .expect("patterns compile");
+
+        assert_eq!(
+            rules.direct_patterns(),
+            vec![(direct_path, Permission::READ)]
+        );
+    }
+
+    #[test]
     fn skips_foreign_nil() {
         // Only this realm's Everyone principal makes a role public.
         let realm_id = RealmId([9u8; 32]);
@@ -978,7 +1020,7 @@ mod test {
             })] if key_space == AUTH_KEYSPACE && *read_txn == txn_id
         ));
 
-        let realm = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let realm = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: Vec::new().into(),
             value: Some(postcard::to_allocvec(&realm).unwrap().into()),
@@ -992,7 +1034,7 @@ mod test {
             })] if key_space == AUTH_KEYSPACE && *read_txn == txn_id
         ));
 
-        let group = GroupAuthorizationDocument::new_default_group_doc(
+        let group = GroupAuthorizationDocument::default_group_doc(
             UserId::nil(realm_id),
             realm_id,
             group_id,
@@ -1055,7 +1097,7 @@ mod test {
         });
         operation.start();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let realm = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let realm = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: Vec::new().into(),
             value: Some(postcard::to_allocvec(&realm).unwrap().into()),

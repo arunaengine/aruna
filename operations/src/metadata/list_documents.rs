@@ -178,10 +178,10 @@ mod tests {
     use ulid::Ulid;
 
     use crate::driver::{DriverContext, drive};
-    use crate::metadata::repository::{write_graph_lifecycle_effect, write_registry_effect};
+    use crate::metadata::repository::{write_graph_lifecycle, write_registry_effect};
 
     #[tokio::test]
-    async fn lists_documents_across_multiple_pages() {
+    async fn lists_across_multiple() {
         let temp = tempdir().unwrap();
         let storage_handle = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let group_id = Ulid::generate();
@@ -239,7 +239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn omits_deleted_lifecycle_records() {
+    async fn omits_deleted_lifecycle() {
         let temp = tempdir().unwrap();
         let storage_handle = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let realm_id = RealmId([5u8; 32]);
@@ -269,7 +269,7 @@ mod tests {
             1,
         );
         let event = storage_handle
-            .send_effect(write_graph_lifecycle_effect(&lifecycle, None).unwrap())
+            .send_effect(write_graph_lifecycle(&lifecycle, None).unwrap())
             .await;
         assert!(matches!(
             event,
@@ -294,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn filters_deleted_documents_without_per_record_reads() {
+    fn filters_deleted_records() {
         let realm_id = RealmId([6u8; 32]);
         let group_id = Ulid::generate();
         let active = metadata_record(realm_id, group_id, Ulid::generate(), "docs/active");

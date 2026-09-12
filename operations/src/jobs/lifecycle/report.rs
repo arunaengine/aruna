@@ -126,7 +126,7 @@ pub async fn family_report(
             continue;
         }
         if let Ok(Some(document)) =
-            crate::node::node_info::read_node_info_document(&context.storage_handle, output.node_id)
+            crate::node::node_info::read_info_document(&context.storage_handle, output.node_id)
                 .await
             && let Some(endpoint) = document.urls.s3
         {
@@ -436,11 +436,9 @@ pub async fn audit_endpoints(
             if endpoints.contains_key(&object.node_id) {
                 continue;
             }
-            if let Ok(Some(document)) = crate::node::node_info::read_node_info_document(
-                &context.storage_handle,
-                object.node_id,
-            )
-            .await
+            if let Ok(Some(document)) =
+                crate::node::node_info::read_info_document(&context.storage_handle, object.node_id)
+                    .await
                 && let Some(endpoint) = document.urls.s3
             {
                 endpoints.insert(object.node_id, endpoint);

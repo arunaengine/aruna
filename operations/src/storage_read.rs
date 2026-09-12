@@ -1,6 +1,9 @@
+use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::types::{Key, Value};
+use aruna_storage::StorageHandle;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -61,4 +64,39 @@ pub(crate) fn parse_storage_scan(event: Event) -> Result<StorageScan, StorageRea
             "unexpected event".to_string(),
         ))),
     }
+}
+
+pub(crate) async fn scan_all(
+    storage: &StorageHandle,
+    key_space: &str,
+    prefix: Option<Key>,
+) -> Result<Vec<(Key, Value)>, String> {
+    let mut collected = Vec::new();
+    let mut start = None;
+    loop {
+        match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: key_space.to_string(),
+                prefix: prefix.clone(),
+                start: start.map(IterStart::After),
+                limit: 1_000,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => {
+                collected.extend(values);
+                match next_start_after {
+                    Some(next) => start = Some(next),
+                    None => break,
+                }
+            }
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+            other => return Err(format!("unexpected iter event: {other:?}")),
+        }
+    }
+    Ok(collected)
 }

@@ -9,7 +9,7 @@ use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
     CurrentVersionPointer, Permission, RealmId, VersionKey, W3idDataIdentifier,
-    blob_object_permission_path,
+    object_permission_path,
 };
 use aruna_core::types::{GroupId, Key, TxnId};
 use serde::{Deserialize, Serialize};
@@ -103,6 +103,13 @@ struct LiveHead {
 }
 
 #[derive(Debug)]
+struct HeadCandidate {
+    head: BlobHeadKey,
+    version_id: ulid::Ulid,
+    cursor_key: Vec<u8>,
+}
+
+#[derive(Debug)]
 struct CandidateBatch {
     candidates: Vec<ObjectSearchNodeHit>,
     next_start_after: Option<Vec<u8>>,
@@ -125,7 +132,7 @@ pub async fn search_local_objects(
             scan_candidate_batch(context, &input, start_after.clone(), HEAD_SCAN_BATCH).await?;
 
         for candidate in batch.candidates {
-            let path = blob_object_permission_path(
+            let path = object_permission_path(
                 input.realm_id,
                 candidate.hit.group_id,
                 input.node_id,
@@ -206,7 +213,7 @@ async fn scan_candidate_batch(
     };
 
     let result =
-        scan_candidate_batch_in_transaction(context, input, start_after, scan_limit, txn_id).await;
+        scan_candidates(context, input, start_after, scan_limit, txn_id).await;
     let completion = if result.is_ok() {
         StorageEffect::CommitTransaction { txn_id }
     } else {
@@ -223,13 +230,31 @@ async fn scan_candidate_batch(
     }
 }
 
-async fn scan_candidate_batch_in_transaction(
+async fn scan_candidates(
     context: &DriverContext,
     input: &SearchObjectsInput,
     start_after: Option<Vec<u8>>,
     scan_limit: usize,
     txn_id: TxnId,
 ) -> Result<CandidateBatch, SearchObjectsError> {
+    let (heads, next_start_after) =
+        scan_heads(context, input, start_after, scan_limit, txn_id).await?;
+    let live = load_live(context, input, heads, txn_id).await?;
+    let candidates = build_hits(context, input, live, txn_id).await?;
+
+    Ok(CandidateBatch {
+        candidates,
+        next_start_after,
+    })
+}
+
+async fn scan_heads(
+    context: &DriverContext,
+    input: &SearchObjectsInput,
+    start_after: Option<Vec<u8>>,
+    scan_limit: usize,
+    txn_id: TxnId,
+) -> Result<(Vec<HeadCandidate>, Option<Vec<u8>>), SearchObjectsError> {
     let prefix = input
         .bucket
         .as_deref()
@@ -259,19 +284,32 @@ async fn scan_candidate_batch_in_transaction(
             continue;
         }
         let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
-        heads.push((head, pointer.version_id, key.to_vec()));
-    }
-    if heads.is_empty() {
-        return Ok(CandidateBatch {
-            candidates: Vec::new(),
-            next_start_after: next_start_after.map(|key| key.to_vec()),
+        heads.push(HeadCandidate {
+            head,
+            version_id: pointer.version_id,
+            cursor_key: key.to_vec(),
         });
     }
+    Ok((heads, next_start_after.map(|key| key.to_vec())))
+}
 
+async fn load_live(
+    context: &DriverContext,
+    input: &SearchObjectsInput,
+    heads: Vec<HeadCandidate>,
+    txn_id: TxnId,
+) -> Result<Vec<LiveHead>, SearchObjectsError> {
+    if heads.is_empty() {
+        return Ok(Vec::new());
+    }
     let version_reads = heads
         .iter()
-        .map(|(head, version_id, _)| {
-            VersionKey::new(&head.bucket, &head.key, *version_id)
+        .map(|candidate| {
+            VersionKey::new(
+                &candidate.head.bucket,
+                &candidate.head.key,
+                candidate.version_id,
+            )
                 .to_bytes()
                 .map(|key| (BLOB_VERSIONS_KEYSPACE.to_string(), Key::from(key)))
         })
@@ -284,7 +322,7 @@ async fn scan_candidate_batch_in_transaction(
     }
 
     let mut live = Vec::new();
-    for ((head, _version_id, cursor_key), (_, value)) in heads.into_iter().zip(versions) {
+    for (candidate, (_, value)) in heads.into_iter().zip(versions) {
         let Some(value) = value else {
             continue;
         };
@@ -293,18 +331,23 @@ async fn scan_candidate_batch_in_transaction(
             continue;
         }
         live.push(LiveHead {
-            head,
-            cursor_key,
+            head: candidate.head,
+            cursor_key: candidate.cursor_key,
             version,
         });
     }
-    if live.is_empty() {
-        return Ok(CandidateBatch {
-            candidates: Vec::new(),
-            next_start_after: next_start_after.map(|key| key.to_vec()),
-        });
-    }
+    Ok(live)
+}
 
+async fn build_hits(
+    context: &DriverContext,
+    input: &SearchObjectsInput,
+    live: Vec<LiveHead>,
+    txn_id: TxnId,
+) -> Result<Vec<ObjectSearchNodeHit>, SearchObjectsError> {
+    if live.is_empty() {
+        return Ok(Vec::new());
+    }
     let bucket_reads = live
         .iter()
         .map(|candidate| {
@@ -400,10 +443,7 @@ async fn scan_candidate_batch_in_transaction(
         });
     }
 
-    Ok(CandidateBatch {
-        candidates,
-        next_start_after: next_start_after.map(|key| key.to_vec()),
-    })
+    Ok(candidates)
 }
 
 async fn batch_read(
@@ -518,7 +558,7 @@ mod tests {
             &context,
             AUTH_KEYSPACE,
             realm_id.as_bytes().to_vec(),
-            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+            RealmAuthorizationDocument::default_realm_doc(realm_id)
                 .to_bytes(&actor)
                 .unwrap(),
         )
@@ -531,7 +571,7 @@ mod tests {
             (hidden_group, "hidden", false),
         ] {
             let mut auth =
-                GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+                GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
             if readable {
                 let role_id = Ulid::generate();
                 auth.roles.insert(
@@ -696,7 +736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorization_filters_without_hidden_pagination_signals() {
+    async fn authorization_hides_pages() {
         let fixture = setup().await;
         seed_materialized(&fixture, "hidden", "needle-hidden", UNIX_EPOCH, 1).await;
         seed_materialized(&fixture, "visible", "needle-visible", UNIX_EPOCH, 2).await;
@@ -732,11 +772,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn path_restrictions_are_enforced_per_object() {
+    async fn restrictions_enforced() {
         let fixture = setup().await;
         seed_materialized(&fixture, "visible", "report-allowed", UNIX_EPOCH, 3).await;
         seed_materialized(&fixture, "visible", "report-hidden", UNIX_EPOCH, 4).await;
-        let allowed_path = blob_object_permission_path(
+        let allowed_path = object_permission_path(
             fixture.realm_id,
             fixture.visible_group,
             fixture.node_id,
@@ -775,7 +815,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_marked_current_heads_are_excluded() {
+    async fn deleted_heads_excluded() {
         let fixture = setup().await;
         seed_materialized(&fixture, "visible", "state-live", UNIX_EPOCH, 5).await;
         seed_deleted(&fixture, "visible", "state-deleted").await;
@@ -802,7 +842,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keyset_and_as_of_cursor_stay_stable_across_mutations() {
+    async fn cursor_stays_stable() {
         let fixture = setup().await;
         for (key, hash_byte) in [("page-alpha", 6), ("page-charlie", 7), ("page-echo", 8)] {
             seed_materialized(&fixture, "visible", key, UNIX_EPOCH, hash_byte).await;

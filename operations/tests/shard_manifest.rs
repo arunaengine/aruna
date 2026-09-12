@@ -39,12 +39,10 @@ struct TestNode {
     context: Arc<DriverContext>,
 }
 
-// A metadata document created on node A must leave a manifest row on the origin
-// AND on the receiver that syncs it, and both holders' assembled shard manifests
-// must agree on the entry set and the topic digest.
+// A metadata document created on node A must leave a manifest row on the origin AND on the
+// receiver that syncs it.
 #[tokio::test]
-async fn document_manifest_row_lands_on_origin_and_receiver_with_matching_digest()
--> Result<(), Box<dyn std::error::Error>> {
+async fn manifest_rows_match() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([120u8; 32]);
     let (nodes, config) = build_realm_nodes(&realm_id, 2).await?;
     let group_id = Ulid::generate();
@@ -167,7 +165,7 @@ async fn build_realm_nodes(
         )
         .await?;
     }
-    wait_for_realm_node_convergence(&nodes, realm_id).await?;
+    wait_node_convergence(&nodes, realm_id).await?;
     let config = install_realm_config(&nodes, realm_id).await?;
     Ok((nodes, config))
 }
@@ -248,7 +246,7 @@ async fn install_realm_config(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
     for node in nodes {
         aruna_operations::placement::process_placements::process_shard_placements(
@@ -261,7 +259,7 @@ async fn install_realm_config(
     Ok(config)
 }
 
-async fn wait_for_realm_node_convergence(
+async fn wait_node_convergence(
     nodes: &[TestNode],
     realm_id: &RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {

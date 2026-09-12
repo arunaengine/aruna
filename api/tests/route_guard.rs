@@ -2,19 +2,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[path = "support/syntax.rs"]
+mod syntax;
+use syntax::{ident_byte as is_ident_byte, occurrences};
+
 const ROUTES_DIR: &str = "src/routes";
 const METHODS: &[&str] = &[
     "any", "delete", "get", "head", "options", "patch", "post", "put", "trace",
 ];
-/// REST authorization boundaries: `ensure_permission` and its
-/// `ensure_permission_with` / metadata wrapper, `require_owner` for the
-/// user-node device plane, and the operations `authorize` entry point.
-const BOUNDARY: &[&str] = &[
-    "create_metadata_authorized",
-    "ensure_permission",
-    "permission_granted",
-    "require_owner",
-    "request_authorization::authorize",
+const EXTERNAL_BOUNDARIES: &[&str] = &[
+    "crate::auth::ensure_permission",
+    "crate::auth::ensure_permission_with",
+    "crate::auth::permission_granted",
+];
+const LOCAL_BOUNDARIES: &[(&str, &str)] = &[
+    ("device/mod.rs", "require_owner"),
+    ("metadata.rs", "ensure_permission"),
 ];
 
 /// Routed handlers that reach no REST boundary call, with the reason each one
@@ -264,12 +267,12 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "metadata.rs",
-        "get_profile_validation_status",
+        "get_validation_status",
         "per-document visibility checked inside the routed status operation (GetVisibleMetadataDocumentRequest), forwarded under the caller's token",
     ),
     (
         "metadata.rs",
-        "list_all_metadata_documents",
+        "list_all_documents",
         "records filtered by GroupPermissionRules and policies",
     ),
     (
@@ -538,13 +541,20 @@ struct Handler {
 }
 
 struct Module {
-    bodies: BTreeMap<String, String>,
-    imports: BTreeMap<String, String>,
+    bodies: BTreeMap<String, Vec<String>>,
+    boundaries: BTreeSet<String>,
+    imports: BTreeMap<String, Import>,
     handlers: Vec<String>,
+}
+
+struct Import {
+    module: String,
+    name: String,
 }
 
 #[test]
 fn unguarded_routes_allowlisted() {
+    // Reachability supplements request permission tests; it cannot prove branch dominance.
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let modules = load_modules(manifest_dir);
     let actual = scan_routes(&modules);
@@ -613,6 +623,11 @@ fn has_body(
     if !seen.insert((module.to_owned(), name.to_owned())) {
         return false;
     }
+    if LOCAL_BOUNDARIES.contains(&(module, name)) {
+        return modules
+            .get(module)
+            .is_some_and(|current| current.bodies.contains_key(name));
+    }
     let Some(current) = modules.get(module) else {
         return false;
     };
@@ -620,7 +635,7 @@ fn has_body(
         || current
             .imports
             .get(name)
-            .is_some_and(|origin| has_body(modules, origin, name, seen))
+            .is_some_and(|import| has_body(modules, &import.module, &import.name, seen))
 }
 
 /// A handler is guarded when its own body or any function it can reach inside
@@ -641,42 +656,75 @@ fn is_guarded(
         return current
             .imports
             .get(name)
-            .is_some_and(|origin| is_guarded(modules, origin, name, seen));
+            .is_some_and(|import| is_guarded(modules, &import.module, &import.name, seen));
     };
-    if BOUNDARY.iter().any(|pattern| body.contains(pattern)) {
+    if boundary_called(body, &current.boundaries) {
         return true;
     }
-    called_names(body)
+    call_names(body)
         .iter()
         .any(|called| is_guarded(modules, module, called, seen))
 }
 
 fn load_modules(manifest_dir: &Path) -> BTreeMap<String, Module> {
+    load_sources(&read_sources(manifest_dir))
+}
+
+fn read_sources(manifest_dir: &Path) -> BTreeMap<String, String> {
     let routes_dir = manifest_dir.join(ROUTES_DIR);
     let mut files = Vec::new();
     collect_sources(&routes_dir, &mut files);
     files.sort();
 
-    let keys = files
-        .iter()
-        .filter_map(|path| module_key(&routes_dir, path))
-        .collect::<BTreeSet<_>>();
-
-    files
+    let mut sources = files
         .iter()
         .filter_map(|path| {
             let key = module_key(&routes_dir, path)?;
             let source = fs::read_to_string(path)
                 .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
-            let source = strip_tests(&mask_source(&source));
-            Some((
+            Some((key, source))
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_metadata_facade(&sources["metadata.rs"]);
+    let metadata = manifest_dir.join("src/metadata/mod.rs");
+    let source = fs::read_to_string(&metadata)
+        .unwrap_or_else(|err| panic!("failed to read {metadata:?}: {err}"));
+    // The route facade re-exports this registered router from its domain owner.
+    sources.insert("metadata.rs".to_owned(), source);
+    sources
+}
+
+fn assert_metadata_facade(source: &str) {
+    assert_eq!(
+        syntax::production(source).trim(),
+        "pub(crate) use crate::metadata::router;",
+        "routes/metadata.rs must remain the exact registered-router facade"
+    );
+}
+
+fn load_sources(sources: &BTreeMap<String, String>) -> BTreeMap<String, Module> {
+    let keys = sources.keys().cloned().collect::<BTreeSet<_>>();
+
+    sources
+        .iter()
+        .map(|(key, source)| {
+            let bodies = syntax::function_calls(source);
+            let boundaries = syntax::use_paths(source)
+                .into_iter()
+                .filter_map(|(local, path)| {
+                    EXTERNAL_BOUNDARIES.contains(&path.as_str()).then_some(local)
+                })
+                .collect();
+            let source = syntax::production(source);
+            (
                 key.clone(),
                 Module {
-                    bodies: fn_bodies(&source),
-                    imports: route_imports(&source, &key, &keys),
+                    bodies,
+                    boundaries,
+                    imports: route_imports(&source, key, &keys),
                     handlers: router_handlers(&source),
                 },
-            ))
+            )
         })
         .collect()
 }
@@ -787,38 +835,10 @@ fn wrapped_ident(source: &str) -> Option<String> {
     Some(ident.to_owned())
 }
 
-fn fn_bodies(source: &str) -> BTreeMap<String, String> {
-    let mut bodies = BTreeMap::new();
-
-    for start in occurrences(source, "fn ") {
-        if start > 0 && is_ident_byte(source.as_bytes()[start - 1]) {
-            continue;
-        }
-        let rest = &source[start + 3..].trim_start();
-        let offset = source.len() - rest.len();
-        let Some(end) = rest.find(|byte: char| !is_ident_byte(byte as u8)) else {
-            continue;
-        };
-        // A signature without a body ends at `;` before its brace.
-        let terminator = rest[end..].find(';').map(|at| at + end);
-        let brace = rest[end..].find('{').map(|at| at + end);
-        if terminator.is_some_and(|at| brace.is_none_or(|brace| at < brace)) {
-            continue;
-        }
-        if let Some(body) = block_at(source, offset) {
-            bodies
-                .entry(rest[..end].to_owned())
-                .or_insert_with(|| body.to_owned());
-        }
-    }
-
-    bodies
-}
-
 /// Maps idents imported from another route module back to that module so
 /// shared helpers and re-exports through `mod.rs` resolve across files.
 /// Absolute, `super::`, `self::` and sibling paths use the real key set.
-fn route_imports(source: &str, module: &str, keys: &BTreeSet<String>) -> BTreeMap<String, String> {
+fn route_imports(source: &str, module: &str, keys: &BTreeSet<String>) -> BTreeMap<String, Import> {
     let mut imports = BTreeMap::new();
 
     for start in occurrences(source, "use ") {
@@ -849,12 +869,18 @@ fn route_imports(source: &str, module: &str, keys: &BTreeSet<String>) -> BTreeMa
             continue;
         };
         for item in group.split(',') {
-            let Some((parent, ident)) = import_item(item) else {
+            let Some((parent, name, local)) = import_item(item) else {
                 continue;
             };
             let path = join_path(&base, &[parent.as_str()]);
             if let Some(origin) = resolve_module(keys, &path) {
-                imports.insert(ident, origin);
+                imports.insert(
+                    local,
+                    Import {
+                        module: origin,
+                        name,
+                    },
+                );
             }
         }
     }
@@ -894,8 +920,9 @@ fn import_base(path: &str, module: &str) -> Option<String> {
     }
 }
 
-/// Splits an imported item into its parent path and local binding name.
-fn import_item(item: &str) -> Option<(String, String)> {
+/// Splits an imported item into its parent path, original name and local
+/// binding name (the alias when one is given).
+fn import_item(item: &str) -> Option<(String, String, String)> {
     let item = item.trim();
     if item.is_empty() || item.contains('{') {
         return None;
@@ -908,11 +935,11 @@ fn import_item(item: &str) -> Option<(String, String)> {
         Some((parent, name)) => (parent.trim(), name.trim()),
         None => ("", path),
     };
-    let ident = alias.unwrap_or(name);
-    if ident.is_empty() || !ident.bytes().all(is_ident_byte) {
+    let local = alias.unwrap_or(name);
+    if local.is_empty() || !local.bytes().all(is_ident_byte) {
         return None;
     }
-    Some((parent.to_owned(), ident.to_owned()))
+    Some((parent.to_owned(), name.to_owned(), local.to_owned()))
 }
 
 fn resolve_module(keys: &BTreeSet<String>, path: &str) -> Option<String> {
@@ -963,25 +990,17 @@ fn join_path(base: &str, segments: &[&str]) -> String {
     }
 }
 
-fn called_names(body: &str) -> BTreeSet<String> {
-    let bytes = body.as_bytes();
-    let mut names = BTreeSet::new();
-    let mut start = None;
+fn call_names(body: &[String]) -> BTreeSet<String> {
+    body.iter()
+        .map(|path| path.rsplit("::").next().unwrap_or_default().to_owned())
+        .collect()
+}
 
-    for (index, byte) in bytes.iter().enumerate() {
-        if is_ident_byte(*byte) {
-            start.get_or_insert(index);
-            continue;
-        }
-        if let Some(from) = start.take()
-            && *byte == b'('
-            && (from == 0 || bytes[from - 1] != b'.')
-        {
-            names.insert(body[from..index].to_owned());
-        }
-    }
-
-    names
+fn boundary_called(body: &[String], boundaries: &BTreeSet<String>) -> bool {
+    body.iter().any(|path| {
+        EXTERNAL_BOUNDARIES.contains(&path.as_str())
+            || !path.contains("::") && boundaries.contains(path)
+    })
 }
 
 /// Returns the balanced brace block that follows `from`.
@@ -1006,165 +1025,6 @@ fn block_at(source: &str, from: usize) -> Option<&str> {
     None
 }
 
-/// Blanks `#[cfg(test)]` items so fixtures never satisfy the guard.
-fn strip_tests(source: &str) -> String {
-    let mut source = source.to_owned();
-
-    while let Some(start) = source.find("#[cfg(test)]") {
-        let tail = &source[start..];
-        let brace = tail.find('{');
-        let terminator = tail.find(';');
-        let end = match (brace, terminator) {
-            (Some(brace), terminator) if terminator.is_none_or(|at| brace < at) => {
-                start + brace + block_at(tail, brace).map_or(1, str::len)
-            }
-            (_, Some(at)) => start + at + 1,
-            _ => source.len(),
-        };
-        source.replace_range(start..end, &" ".repeat(end - start));
-    }
-
-    source
-}
-
-/// Blanks comments and literals so braces and boundary names inside them never
-/// reach the scanner. Byte positions stay stable.
-fn mask_source(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut masked = bytes.to_vec();
-    let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'/' if bytes.get(index + 1) == Some(&b'/') => {
-                while index < bytes.len() && bytes[index] != b'\n' {
-                    masked[index] = b' ';
-                    index += 1;
-                }
-            }
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index = mask_comment(bytes, &mut masked, index);
-            }
-            b'r' if matches!(bytes.get(index + 1), Some(b'#' | b'"')) => {
-                index = mask_raw(bytes, &mut masked, index);
-            }
-            b'"' => index = mask_string(bytes, &mut masked, index),
-            b'\'' => index = mask_char(bytes, &mut masked, index),
-            _ => index += 1,
-        }
-    }
-
-    String::from_utf8(masked).expect("masking only replaces whole bytes with spaces")
-}
-
-fn mask_comment(bytes: &[u8], masked: &mut [u8], from: usize) -> usize {
-    let mut index = from;
-    let mut depth = 0usize;
-
-    while index < bytes.len() {
-        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
-            depth += 1;
-        } else if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
-            depth -= 1;
-            masked[index] = b' ';
-            masked[index + 1] = b' ';
-            index += 2;
-            if depth == 0 {
-                return index;
-            }
-            continue;
-        }
-        if bytes[index] != b'\n' {
-            masked[index] = b' ';
-        }
-        index += 1;
-    }
-
-    index
-}
-
-fn mask_raw(bytes: &[u8], masked: &mut [u8], from: usize) -> usize {
-    let mut index = from + 1;
-    while bytes.get(index) == Some(&b'#') {
-        index += 1;
-    }
-    if bytes.get(index) != Some(&b'"') {
-        return from + 1;
-    }
-    let hashes = index - from - 1;
-    masked[from..=index].fill(b' ');
-    index += 1;
-
-    while index < bytes.len() {
-        if bytes[index] == b'"' && bytes[index + 1..].iter().take(hashes).all(|at| *at == b'#') {
-            masked[index..=index + hashes].fill(b' ');
-            return index + hashes + 1;
-        }
-        if bytes[index] != b'\n' {
-            masked[index] = b' ';
-        }
-        index += 1;
-    }
-
-    index
-}
-
-fn mask_string(bytes: &[u8], masked: &mut [u8], from: usize) -> usize {
-    masked[from] = b' ';
-    let mut index = from + 1;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\\' => {
-                masked[index] = b' ';
-                if bytes.get(index + 1).is_some_and(|byte| *byte != b'\n') {
-                    masked[index + 1] = b' ';
-                }
-                index += 2;
-            }
-            b'"' => {
-                masked[index] = b' ';
-                return index + 1;
-            }
-            b'\n' => index += 1,
-            _ => {
-                masked[index] = b' ';
-                index += 1;
-            }
-        }
-    }
-
-    index
-}
-
-/// Masks a character literal and leaves lifetimes alone.
-fn mask_char(bytes: &[u8], masked: &mut [u8], from: usize) -> usize {
-    let end = if bytes.get(from + 1) == Some(&b'\\') {
-        bytes[from + 2..]
-            .iter()
-            .position(|byte| *byte == b'\'')
-            .map(|at| from + 2 + at)
-    } else {
-        (bytes.get(from + 2) == Some(&b'\'')).then_some(from + 2)
-    };
-
-    match end {
-        Some(end) => {
-            masked[from..=end].fill(b' ');
-            end + 1
-        }
-        None => from + 1,
-    }
-}
-
-fn occurrences(source: &str, needle: &str) -> Vec<usize> {
-    source.match_indices(needle).map(|(at, _)| at).collect()
-}
-
-fn is_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
 fn format_handlers(handlers: &[&Handler]) -> String {
     if handlers.is_empty() {
         return "    none\n".to_owned();
@@ -1174,4 +1034,190 @@ fn format_handlers(handlers: &[&Handler]) -> String {
         .iter()
         .map(|handler| format!("    ({:?}, {:?}, \"\"),\n", handler.module, handler.name))
         .collect()
+}
+
+#[cfg(test)]
+mod fixtures {
+    use super::*;
+
+    fn sources(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(path, source)| ((*path).to_owned(), (*source).to_owned()))
+            .collect()
+    }
+
+    fn unguarded(entries: &[(&str, &str)]) -> BTreeSet<Handler> {
+        scan_routes(&load_sources(&sources(entries)))
+    }
+
+    fn handler(module: &str, name: &str) -> Handler {
+        Handler {
+            module: module.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn unguarded_handler_flagged() {
+        let entries = &[(
+            "tes.rs",
+            "fn router() { get(handler) }\nasync fn handler() {}\n",
+        )];
+
+        assert_eq!(
+            unguarded(entries),
+            BTreeSet::from([handler("tes.rs", "handler")])
+        );
+    }
+
+    #[test]
+    fn direct_boundary_guarded() {
+        let entries = &[(
+            "tes.rs",
+            "use crate::auth::ensure_permission;\nfn router() { get(handler) }\nasync fn handler() { ensure_permission(); }\n",
+        )];
+
+        assert!(unguarded(entries).is_empty());
+    }
+
+    #[test]
+    fn path_boundaries_guarded() {
+        let permission = &[(
+            "tes.rs",
+            "fn router() { get(handler) }\nasync fn handler() { crate::auth::permission_granted(); }\n",
+        )];
+        let permission_with = &[(
+            "tes.rs",
+            "fn router() { get(handler) }\nasync fn handler() { crate::auth::ensure_permission_with(); }\n",
+        )];
+
+        assert!(unguarded(permission).is_empty());
+        assert!(unguarded(permission_with).is_empty());
+    }
+
+    #[test]
+    fn shadowed_name_rejected() {
+        let entries = &[
+            (
+                "tes.rs",
+                "fn router() { get(handler) }\nasync fn handler() {}\n",
+            ),
+            (
+                "other.rs",
+                "use crate::auth::ensure_permission;\nasync fn handler() { ensure_permission(); }\n",
+            ),
+        ];
+
+        assert_eq!(
+            unguarded(entries),
+            BTreeSet::from([handler("tes.rs", "handler")])
+        );
+    }
+
+    #[test]
+    fn alias_boundary_resolved() {
+        let entries = &[
+            (
+                "helpers.rs",
+                "use crate::auth::ensure_permission as authorize;\npub async fn check() { authorize(); }\n",
+            ),
+            (
+                "tes.rs",
+                "use helpers::check as verify;\nfn router() { get(handler) }\nasync fn handler() { verify(); }\n",
+            ),
+        ];
+
+        assert!(unguarded(entries).is_empty());
+    }
+
+    #[test]
+    fn unrelated_path_rejected() {
+        let entries = &[(
+            "tes.rs",
+            "fn router() { get(handler) }\nasync fn handler() { fake::ensure_permission(); }\n",
+        )];
+
+        assert_eq!(
+            unguarded(entries),
+            BTreeSet::from([handler("tes.rs", "handler")])
+        );
+    }
+
+    #[test]
+    fn local_shadow_rejected() {
+        let entries = &[(
+            "tes.rs",
+            "fn router() { get(handler) }\nfn ensure_permission() {}\nasync fn handler() { ensure_permission(); }\n",
+        )];
+
+        assert_eq!(
+            unguarded(entries),
+            BTreeSet::from([handler("tes.rs", "handler")])
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "exact registered-router facade")]
+    fn facade_drift_rejected() {
+        assert_metadata_facade("pub fn router() {}\n");
+    }
+
+    #[test]
+    fn literal_not_boundary() {
+        let entries = &[(
+            "tes.rs",
+            "fn router() { get(handler) }\nasync fn handler() { let _ = \"ensure_permission\"; }\n",
+        )];
+
+        assert_eq!(
+            unguarded(entries),
+            BTreeSet::from([handler("tes.rs", "handler")])
+        );
+    }
+
+    #[test]
+    fn comment_not_boundary() {
+        let entries = &[(
+            "tes.rs",
+            "fn router() { get(handler) }\n// ensure_permission()\nasync fn handler() {}\n",
+        )];
+
+        assert_eq!(
+            unguarded(entries),
+            BTreeSet::from([handler("tes.rs", "handler")])
+        );
+    }
+
+    #[test]
+    fn extracted_handler_scanned() {
+        let entries = &[
+            (
+                "tes.rs",
+                "use child::handler;\nfn router() { get(handler) }\n",
+            ),
+            (
+                "child.rs",
+                "pub async fn handler() { ensure_permission(); }\n",
+            ),
+        ];
+
+        assert!(unguarded(entries).is_empty());
+    }
+
+    #[test]
+    fn extracted_handler_flagged() {
+        let entries = &[
+            (
+                "tes.rs",
+                "use child::handler;\nfn router() { get(handler) }\n",
+            ),
+            ("child.rs", "pub async fn handler() {}\n"),
+        ];
+
+        assert_eq!(
+            unguarded(entries),
+            BTreeSet::from([handler("tes.rs", "handler")])
+        );
+    }
 }

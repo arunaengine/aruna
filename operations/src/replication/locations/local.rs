@@ -1,10 +1,10 @@
 use super::LocationSummaryError;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::blob::blob_storage::blob_location_read;
 use crate::blob::managed_copy::{
     CopyRequest, read_effect, registration_for, serve_reads, split_reads,
 };
+use crate::blob::records::blob_location_read;
 use crate::realm::peer_trust::ensure_realm_peer;
 use crate::replication::protocol::{
     CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
@@ -23,7 +23,7 @@ use aruna_core::structs::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CurrentVersionPointer, GroupAuthorizationDocument, GroupStorageBackend, ManagedCopyKey,
     NodeSubjectRecord, Permission, PlacementPolicyRef, RealmConfigDocument, VersionKey,
-    blob_bucket_permission_path, blob_object_permission_path,
+    bucket_permission_path, object_permission_path,
 };
 use aruna_core::types::{Effects, UserId};
 use smallvec::smallvec;
@@ -355,14 +355,14 @@ impl LocationSummaryOperation {
         self.authorized = Some(bucket.identity());
         self.bucket = Some(bucket);
         let path = if self.request.key.is_empty() {
-            blob_bucket_permission_path(
+            bucket_permission_path(
                 self.request.realm_id,
                 group_id,
                 local_node,
                 &self.request.bucket,
             )
         } else {
-            blob_object_permission_path(
+            object_permission_path(
                 self.request.realm_id,
                 group_id,
                 local_node,
@@ -839,7 +839,7 @@ mod tests {
 
     fn policy_batch() -> Event {
         let realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
-        let group = GroupAuthorizationDocument::new_default_group_doc(
+        let group = GroupAuthorizationDocument::default_group_doc(
             UserId::nil(realm_id()),
             realm_id(),
             bucket_info().group_id,

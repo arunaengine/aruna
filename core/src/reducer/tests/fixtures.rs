@@ -4,12 +4,12 @@ pub(super) fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-pub(super) fn realm_id_with_seed(seed: u8) -> RealmId {
+pub(super) fn realm_id_seed(seed: u8) -> RealmId {
     RealmId::from_bytes([seed; 32])
 }
 
 pub(super) fn realm_id() -> RealmId {
-    realm_id_with_seed(9)
+    realm_id_seed(9)
 }
 
 pub(super) fn group_id() -> GroupId {
@@ -42,12 +42,12 @@ pub(super) fn oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig
     }
 }
 
-pub(super) fn user_id_with_seed(seed: u8) -> UserId {
+pub(super) fn user_id_seed(seed: u8) -> UserId {
     UserId::local(Ulid::from_bytes([seed; 16]), realm_id())
 }
 
 pub(super) fn user_id() -> UserId {
-    user_id_with_seed(8)
+    user_id_seed(8)
 }
 
 pub(super) fn actor(origin_node_id: NodeId) -> Actor {
@@ -230,7 +230,7 @@ pub(super) fn create_group(
         AdminDocumentOperation::GroupCreated {
             realm_id,
             display_name: display_name.to_string(),
-            owner: user_id_with_seed(5),
+            owner: user_id_seed(5),
         },
     )
 }
@@ -300,7 +300,7 @@ pub(super) fn remove_group_role(
     )
 }
 
-pub(super) fn assign_group_role_user(
+pub(super) fn assign_group_user(
     event_seed: u8,
     origin_seed: u8,
     role_id: RoleId,
@@ -315,7 +315,7 @@ pub(super) fn assign_group_role_user(
     )
 }
 
-pub(super) fn remove_group_role_user_assignment(
+pub(super) fn remove_group_assignment(
     event_seed: u8,
     origin_seed: u8,
     role_id: RoleId,
@@ -358,7 +358,7 @@ pub(super) fn create_realm_role(
     )
 }
 
-pub(super) fn assign_realm_role_user(
+pub(super) fn assign_realm_user(
     event_seed: u8,
     origin_seed: u8,
     role_id: RoleId,
@@ -373,7 +373,7 @@ pub(super) fn assign_realm_role_user(
     )
 }
 
-pub(super) fn remove_realm_role_user_assignment(
+pub(super) fn remove_realm_assignment(
     event_seed: u8,
     origin_seed: u8,
     role_id: RoleId,
@@ -388,7 +388,7 @@ pub(super) fn remove_realm_role_user_assignment(
     )
 }
 
-pub(super) fn ensure_realm_config_node(
+pub(super) fn ensure_realm_node(
     event_seed: u8,
     origin_seed: u8,
     node_id: NodeId,
@@ -417,7 +417,7 @@ pub(super) fn upsert_oidc_provider(
     )
 }
 
-pub(super) fn set_realm_config_settings(
+pub(super) fn set_realm_settings(
     event_seed: u8,
     origin_seed: u8,
     metadata_replication: MetadataReplicationConfig,
@@ -435,7 +435,7 @@ pub(super) fn set_realm_config_settings(
     )
 }
 
-pub(super) fn set_realm_config_description(
+pub(super) fn set_realm_description(
     event_seed: u8,
     origin_seed: u8,
     description: &str,

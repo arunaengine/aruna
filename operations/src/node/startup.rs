@@ -13,17 +13,17 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::metadata::MetadataCreateEventRecord;
 use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::driver::DriverContext;
 use crate::metadata::projector::{
-    project_metadata_create_events, project_metadata_create_events_from_log,
+    project_create_events, project_logged_events,
 };
-use crate::metadata::prune_queue::process_metadata_graph_tombstones;
-use crate::node::usage_stats::refresh_realm_usage_summary_for_targets;
-use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
+use crate::metadata::prune_queue::process_graph_tombstones;
+use crate::node::usage_stats::refresh_usage_targets;
+use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::{draining_former_holders, resolve_shard_holders};
 
 /// Shared realm-scoped topics every node subscribes to (placement is inert on
@@ -679,9 +679,7 @@ async fn reconcile_phase(
     if !*pending {
         return PhaseOutcome::default();
     }
-    // Transition steps run on the SyncPlacements timer instead of inline:
-    // recovery must not gate presence and readiness on a cluster-wide
-    // transition draining.
+    // Placement transitions run on their timer so cluster-wide draining cannot block readiness.
     let placements = crate::placement::process_placements::reconcile_shard_topics(
         context,
         config.realm_id,
@@ -775,7 +773,7 @@ async fn usage_phase(
     if !*pending {
         return PhaseOutcome::default();
     }
-    let result = crate::node::usage_stats::publish_and_refresh_usage_snapshots(
+    let result = crate::node::usage_stats::publish_refresh_snapshots(
         context.as_ref(),
         config.node_id,
         config.realm_id,
@@ -933,7 +931,7 @@ pub async fn restore_shard_pass(
 
     // Former-holder history cutoffs are frozen only for shards a prior run
     // durably verified; join verification below happens after this restore.
-    let verified = crate::shard::verify::load_verified_shard_topics(context, realm_id).await;
+    let verified = crate::shard::verify::load_verified_topics(context, realm_id).await;
 
     let range = restore_range(*cursor, units_total);
     let start = range.start;
@@ -955,14 +953,13 @@ pub async fn restore_shard_pass(
         .sum();
     let unresolved_topics = batch.unresolved_topics;
 
-    // A withheld genesis (co-holder down or refusing) has no placement record to
-    // drive a re-run, so arm the retry timer here: the reconciler re-probes when
-    // the co-holder returns instead of deferring writes at 1s until restart.
+    // A withheld genesis has no placement record to trigger another pass.
+    // Arm the retry so a returning co-holder unblocks writes without restart.
     if !unresolved_topics.is_empty()
         && let Some(task_handle) = context.task_handle.as_ref()
     {
         let effect =
-            crate::sync::shard_placement::schedule_placement_retry_effect(realm_id, node_id);
+            crate::sync::shard_placement::schedule_retry_effect(realm_id, node_id);
         let _ = task_handle.send_effect(effect).await;
     }
 
@@ -1081,9 +1078,8 @@ fn plan_shard_groups(
 
     let mut shared_peers = shared_topic_peers(config, node_id);
     shared_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    // One designated minter for realm-wide topics: the lowest sync-eligible node
-    // id, as rank-0 metadata graph topics use. Eligibility must bound the choice
-    // everywhere, or concurrent minters fork the realm document.
+    // The lowest sync-eligible node mints realm-wide topics.
+    // Applying this bound everywhere prevents concurrent minters from forking documents.
     let realm_minter = sync_eligible_node(config, node_id)
         && shared_peers
             .iter()
@@ -1091,9 +1087,7 @@ fn plan_shard_groups(
     let device_local = !sync_eligible_node(config, node_id);
     for target in shared_targets(realm_id, node_id) {
         let wide = realm_wide_target(&target);
-        // A device takes no part in the realm's own topics: it fetches the
-        // realm-wide documents as a routed read and mints the topics that are
-        // its own here, exchanged with nobody.
+        // Devices route realm-wide reads and mint only their private local topics.
         if device_local && wide {
             continue;
         }
@@ -1118,9 +1112,8 @@ fn plan_shard_groups(
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);
-            // Restart is transition-aware: a target or retained departing
-            // holder stays in its bucket's membership, publishers stay the
-            // authority set.
+            // During transitions, target and retained departing holders stay members.
+            // Publishers remain the authority set.
             let membership = crate::placement::bucket_membership(config, &placement, now_ms);
             if !membership.members.contains(&node_id) {
                 continue;
@@ -1172,7 +1165,7 @@ pub async fn prepare_shard_policy(
         return RestoreShardSummary::default();
     };
     let plan = plan_shard_groups(&config, node_id, realm_id, unix_timestamp_millis());
-    let verified = crate::shard::verify::load_verified_shard_topics(context, realm_id).await;
+    let verified = crate::shard::verify::load_verified_topics(context, realm_id).await;
 
     let mut prepared = 0usize;
     for ((co_members, publishers, retained), topics) in
@@ -1183,7 +1176,7 @@ pub async fn prepare_shard_policy(
             .copied()
             .filter(|topic| {
                 net_handle
-                    .document_sync_topic_exists(*topic)
+                    .sync_topic_exists(*topic)
                     .unwrap_or(false)
             })
             .collect();
@@ -1383,9 +1376,8 @@ async fn restore_shared(
     may_mint: bool,
 ) -> RestoreUnitOutcome {
     let mut outcome = RestoreUnitOutcome::default();
-    // A peer that is unreachable, or that refuses a topic it already holds,
-    // might hold this genesis; minting a second one forks the realm document
-    // permanently. Withheld topics stay unresolved so recovery retries them.
+    // An unreachable or refusing peer may hold the genesis, so minting would fork it.
+    // Keep withheld topics unresolved for recovery to retry.
     let (to_ensure, withheld) = crate::placement::process_placements::resolve_creatable_topics(
         context,
         net_handle,
@@ -1416,7 +1408,7 @@ async fn restore_shared(
         }
         return outcome;
     }
-    if let Err(error) = net_handle.ensure_document_sync_topics(&to_ensure, unit.peers.clone()) {
+    if let Err(error) = net_handle.ensure_sync_topics(&to_ensure, unit.peers.clone()) {
         warn!(error = %error, "Failed to ensure shared realm topics on restart");
         outcome.fail_topics(to_ensure.iter().copied());
     }
@@ -1456,7 +1448,7 @@ async fn restore_rank0(
         .copied()
         .filter(|topic| {
             net_handle
-                .document_sync_topic_exists(*topic)
+                .sync_topic_exists(*topic)
                 .unwrap_or(false)
         })
         .collect();
@@ -1516,7 +1508,7 @@ async fn restore_join(
         .copied()
         .filter(|topic| {
             net_handle
-                .document_sync_topic_exists(*topic)
+                .sync_topic_exists(*topic)
                 .unwrap_or(false)
         })
         .collect();
@@ -1575,20 +1567,20 @@ pub(crate) async fn apply_restored_reconcile(
     };
 
     let tombstones = result.metadata_graph_tombstones.clone();
-    refresh_realm_usage_summary_for_targets(context, node_id, &result.targets).await;
-    refresh_watch_interest_for_targets(context, &result.targets).await;
-    project_restored_metadata_create_events(
+    refresh_usage_targets(context, node_id, &result.targets).await;
+    refresh_target_interest(context, &result.targets).await;
+    project_restored_events(
         context,
         node_id,
         result.targets,
         result.metadata_create_events,
     )
     .await;
-    process_metadata_graph_tombstones(context, tombstones).await;
+    process_graph_tombstones(context, tombstones).await;
     true
 }
 
-async fn project_restored_metadata_create_events(
+async fn project_restored_events(
     context: &Arc<DriverContext>,
     node_id: NodeId,
     targets: Vec<DocumentSyncTarget>,
@@ -1596,7 +1588,7 @@ async fn project_restored_metadata_create_events(
 ) {
     if !metadata_create_events.is_empty() {
         if let Err(error) =
-            project_metadata_create_events(context, metadata_create_events, Some(node_id)).await
+            project_create_events(context, metadata_create_events, Some(node_id)).await
         {
             warn!(error = ?error, "Failed to project restored metadata create events");
         }
@@ -1616,7 +1608,7 @@ async fn project_restored_metadata_create_events(
     if pairs.is_empty() {
         return;
     }
-    if let Err(error) = project_metadata_create_events_from_log(context, pairs).await {
+    if let Err(error) = project_logged_events(context, pairs).await {
         warn!(error = ?error, "Failed to project restored metadata create events from log");
     }
 }
@@ -1693,9 +1685,8 @@ mod tests {
         config
     }
 
-    // Every node must resolve the same realm-wide minter. Peers resolve it over
-    // sync-eligible nodes only, so a User node that happens to hold the lowest
-    // id must not read itself as the minter and mint a rival genesis.
+    // Every node chooses the lowest sync-eligible realm minter.
+    // A lower device id must never mint a competing genesis.
     #[test]
     fn realm_minter_agrees() {
         let realm_id = RealmId([7; 32]);
@@ -1732,9 +1723,8 @@ mod tests {
         );
     }
 
-    // A device may be offline for days, so it must never sit in a peer set the
-    // restore probes and syncs: those failures block the realm's own recovery.
-    // It is a separate best-effort push target instead.
+    // Devices may remain offline, so restore excludes them from blocking peer sets.
+    // They receive separate best-effort pushes.
     #[test]
     fn units_skip_devices() {
         let realm_id = RealmId([7; 32]);
@@ -2070,7 +2060,7 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
         node.net
-            .refresh_realm_peers_from_document(config)
+            .refresh_document_peers(config)
             .await
             .expect("realm peers refresh");
     }
@@ -2082,7 +2072,7 @@ mod tests {
 
     fn seed_topic(node: &RecoveryNode, topic: ::irokle::TopicId, peers: &[NodeId]) {
         node.net
-            .ensure_document_sync_topics(&[topic], peers.to_vec())
+            .ensure_sync_topics(&[topic], peers.to_vec())
             .expect("blocked peer topic creates");
     }
 
@@ -2299,7 +2289,7 @@ mod tests {
         assert!(
             local
                 .net
-                .document_sync_topic_exists(healthy_topic)
+                .sync_topic_exists(healthy_topic)
                 .expect("healthy topic lookup")
         );
         assert!(pass.topics_completed > 0);
@@ -2328,14 +2318,12 @@ mod tests {
         assert!(
             !local
                 .net
-                .document_sync_topic_exists(topic)
+                .sync_topic_exists(topic)
                 .expect("local topic lookup")
         );
 
         mesh_nodes(&local, &blocked).await;
-        // The peer runs its own restore too, as every configured node does: only
-        // the designated minter creates the realm-wide shared topics, so a peer
-        // that never restores would strand them whichever node that is.
+        // Every configured peer restores because only the designated minter creates shared topics.
         restore_shard_subscriptions(&blocked.context, blocked.net.node_id(), realm_id).await;
         crate::placement::process_placements::process_shard_placements(
             &blocked.context,
@@ -2351,7 +2339,7 @@ mod tests {
         assert!(
             local
                 .net
-                .document_sync_topic_exists(topic)
+                .sync_topic_exists(topic)
                 .expect("healed topic lookup")
         );
 

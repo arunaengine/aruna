@@ -5,14 +5,14 @@ use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateOnboardingSecretRequest,
     CreateOnboardingSecretResponse, OnboardingMode, OnboardingPurpose, OnboardingSecret,
-    OnboardingSecretRecord, OnboardingSecretState, RequestedOnboardingMode,
-    bootstrap_issuer_proof_message, bootstrap_node_proof_message,
+    OnboardingSecretRecord, OnboardingSecretState, RequestedOnboardingMode, issuer_proof_message,
+    node_proof_message,
 };
 use aruna_core::structs::{
     AuthContext, NodeCapabilities, Permission, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
     StaticRealmEndpoint,
 };
-use aruna_core::util::unix_timestamp_secs as now_timestamp;
+use aruna_core::time::unix_timestamp_secs as now_timestamp;
 use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
 };
@@ -195,10 +195,8 @@ pub(crate) async fn authorize_onboarding_admin(
     Ok(auth)
 }
 
-/// Device enrollment is self-service: any authenticated member of this realm
-/// may mint a User-mode secret, and it is always bound to the caller. A
-/// path-restricted token may not: enrolling a device grants its holder the
-/// caller's whole identity, which no restriction could then narrow.
+/// Lets an authenticated realm member mint a User-mode secret bound to their identity.
+/// Path-restricted tokens cannot grant the unrestricted identity a device receives.
 fn authorize_device_enrollment(
     state: &Arc<ServerState>,
     auth: Option<AuthContext>,
@@ -235,7 +233,7 @@ async fn enforce_enrollment_policies(
         .map_err(|_| ServerError::Forbidden)
 }
 
-async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResult<()> {
+async fn prune_stale_secrets(state: &Arc<ServerState>) -> ServerResult<()> {
     let now = now_timestamp();
     let secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
         .await
@@ -351,7 +349,7 @@ pub async fn create_onboarding_secret(
             owner: auth.user_id,
         },
     };
-    prune_stale_onboarding_secrets(&state).await?;
+    prune_stale_secrets(&state).await?;
 
     let ttl = request
         .expires_in_seconds
@@ -492,7 +490,7 @@ pub async fn list_onboarding_secrets(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<ListOnboardingSecretsResponse>)> {
     let _auth = authorize_onboarding_admin(&state, auth).await?;
-    prune_stale_onboarding_secrets(&state).await?;
+    prune_stale_secrets(&state).await?;
     let mut secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
         .await
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
@@ -771,7 +769,7 @@ pub async fn bootstrap_onboarding(
         .bootstrap_endpoint()
         .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string()))?;
     let wrapped_management_key = if matches!(record.mode, OnboardingMode::Management) {
-        Some(wrap_realm_private_key(
+        Some(wrap_realm_key(
             &state,
             request
                 .transport_public_key
@@ -863,10 +861,8 @@ pub async fn bootstrap_onboarding(
     Ok((StatusCode::OK, Json(response)))
 }
 
-/// Realm endpoints a joiner may dial straight away: the discovery
-/// configuration's declared ones, kept only for nodes that are configured,
-/// sync-eligible members and not the joiner itself. The node serving this call
-/// is handed over separately as the temporary bootstrap endpoint.
+/// Returns declared endpoints for configured, sync-eligible members other than the joiner.
+/// The serving node is returned separately as the temporary bootstrap endpoint.
 async fn realm_endpoints(
     state: &Arc<ServerState>,
     joiner: NodeId,
@@ -987,7 +983,7 @@ fn verify_node_proof(request: &BootstrapOnboardingRequest, node_id: NodeId) -> S
         VerifyingKey::from_bytes(node_id.as_bytes()).map_err(|_| ServerError::BadRequest)?;
     verifying_key
         .verify(
-            &bootstrap_node_proof_message(
+            &node_proof_message(
                 &request.onboarding_secret,
                 &request.node_id,
                 request.transport_public_key.as_deref(),
@@ -1018,7 +1014,7 @@ fn verify_issuer_proof(
     .map_err(|_| ServerError::BadRequest)?;
     verifying_key
         .verify(
-            &bootstrap_issuer_proof_message(
+            &issuer_proof_message(
                 &request.onboarding_secret,
                 &request.node_id,
                 request
@@ -1031,13 +1027,11 @@ fn verify_issuer_proof(
         .map_err(|_| ServerError::Unauthorized)
 }
 
-fn wrap_realm_private_key(
+fn wrap_realm_key(
     state: &Arc<ServerState>,
     transport_public_key: &str,
 ) -> ServerResult<(String, String, String)> {
-    let realm_private_key_pem = state
-        .realm_private_key_pem()
-        .ok_or(ServerError::Forbidden)?;
+    let realm_key_pem = state.realm_key_pem().ok_or(ServerError::Forbidden)?;
     let transport_public_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(transport_public_key)
         .map_err(|_| ServerError::BadRequest)?;
@@ -1051,7 +1045,7 @@ fn wrap_realm_private_key(
     let cipher = SalsaBox::new(&transport_public_key, &wrapping_secret_key);
     let nonce = SalsaBox::generate_nonce(&mut CryptoOsRng);
     let ciphertext = cipher
-        .encrypt(&nonce, realm_private_key_pem.as_bytes())
+        .encrypt(&nonce, realm_key_pem.as_bytes())
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
 
     Ok((
@@ -1078,11 +1072,11 @@ mod tests {
     use aruna_core::onboarding::{
         BootstrapOnboardingRequest, CreateOnboardingSecretRequest, OnboardingMode,
         OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord, OnboardingSecretState,
-        RequestedOnboardingMode, bootstrap_issuer_proof_message, bootstrap_node_proof_message,
+        RequestedOnboardingMode, issuer_proof_message, node_proof_message,
     };
     use aruna_core::reducer::AdminDocumentReducerState;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-    use aruna_core::storage_entries::admin_document_reducer_state_key;
+    use aruna_core::storage_entries::reducer_state_key;
     use aruna_core::structs::{
         Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
         RealmNodeKind, StaticRealmEndpoint,
@@ -1225,12 +1219,12 @@ mod tests {
         assert_eq!(declared, vec![endpoint(server)]);
         assert!(super::declared_endpoints(&config, &server.to_string()).is_empty());
 
-        config.discovery = aruna_core::structs::default_realm_discovery_config();
+        config.discovery = aruna_core::structs::default_discovery_config();
         assert!(super::declared_endpoints(&config, &stranger.to_string()).is_empty());
     }
 
     #[test]
-    fn placement_validation_errors_map_to_bad_request() {
+    fn placement_errors_badrequest() {
         assert!(matches!(
             map_finalize_error(BootstrapOnboardingFinalizeError::ReservedNodeLabel(
                 String::new()
@@ -1244,7 +1238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_and_consume_server_onboarding_secret() {
+    async fn server_secret_consumed() {
         let (state, realm_id, seed_node_id, user_id, net_handle, _tempdir) =
             setup_management_state().await;
         let auth = AuthContext {
@@ -1274,14 +1268,10 @@ mod tests {
         let bootstrap_node_id = iroh::SecretKey::from_bytes(&node_proof.to_bytes()).public();
         let node_id = bootstrap_node_id.to_string();
         let node_signature = node_proof
-            .sign(&bootstrap_node_proof_message(
-                &onboarding_secret,
-                &node_id,
-                None,
-            ))
+            .sign(&node_proof_message(&onboarding_secret, &node_id, None))
             .to_string();
         let issuer_signature = issuer_key
-            .sign(&bootstrap_issuer_proof_message(
+            .sign(&issuer_proof_message(
                 &onboarding_secret,
                 &node_id,
                 &issuer_public_key,
@@ -1334,9 +1324,7 @@ mod tests {
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::Read {
                 key_space: ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                key: admin_document_reducer_state_key(&AdminDocumentTarget::RealmConfig {
-                    realm_id,
-                }),
+                key: reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id }),
                 txn_id: None,
             }))
             .await
@@ -1347,7 +1335,7 @@ mod tests {
             other => panic!("unexpected realm config reducer state read result: {other:?}"),
         };
         assert_eq!(
-            reducer_state.materialized_realm_config_nodes()[&bootstrap_node_id],
+            reducer_state.materialized_config_nodes()[&bootstrap_node_id],
             RealmNodeKind::Server
         );
 
@@ -1488,7 +1476,7 @@ mod tests {
         let (state, realm_id, _node_id, user_id, net_handle, _tempdir) =
             setup_management_state().await;
         state
-            .register_rest_interface_with_public_url(
+            .register_rest_interface(
                 "0.0.0.0:3000".parse().unwrap(),
                 Some("https://node.example.test"),
             )
@@ -1668,7 +1656,7 @@ mod tests {
         let device_node_id = iroh::SecretKey::from_bytes(&device_key.to_bytes()).public();
         let node_id = device_node_id.to_string();
         let node_proof = device_key
-            .sign(&bootstrap_node_proof_message(
+            .sign(&node_proof_message(
                 &created.onboarding_secret,
                 &node_id,
                 None,
@@ -1816,7 +1804,7 @@ mod tests {
         let bootstrap_node_id = iroh::SecretKey::from_bytes(&node_proof.to_bytes()).public();
         let node_id = bootstrap_node_id.to_string();
         let node_signature = node_proof
-            .sign(&bootstrap_node_proof_message(&encoded, &node_id, None))
+            .sign(&node_proof_message(&encoded, &node_id, None))
             .to_string();
 
         let result = bootstrap_onboarding(
@@ -1849,7 +1837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_and_revoke_onboarding_secrets() {
+    async fn secrets_list_revoke() {
         let (state, realm_id, _node_id, user_id, net_handle, _tempdir) =
             setup_management_state().await;
         let auth = AuthContext {
@@ -1904,7 +1892,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_prunes_expired_available_but_keeps_expired_finalizing_secret() {
+    async fn secret_pruning_correct() {
         let (state, realm_id, _node_id, user_id, net_handle, _tempdir) =
             setup_management_state().await;
         let auth = AuthContext {
@@ -1979,7 +1967,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_issuer_proof_does_not_consume_secret() {
+    async fn invalid_proof_preserves() {
         let (state, realm_id, _seed_node_id, user_id, net_handle, _tempdir) =
             setup_management_state().await;
         let auth = AuthContext {
@@ -2005,7 +1993,7 @@ mod tests {
         let joiner_node_id = iroh::SecretKey::from_bytes(&node_proof.to_bytes()).public();
         let joiner_node_id_string = joiner_node_id.to_string();
         let node_signature = node_proof
-            .sign(&bootstrap_node_proof_message(
+            .sign(&node_proof_message(
                 &created.onboarding_secret,
                 &joiner_node_id_string,
                 None,
@@ -2041,7 +2029,7 @@ mod tests {
         assert_eq!(listed.secrets.len(), 1);
 
         let issuer_signature = issuer_key
-            .sign(&bootstrap_issuer_proof_message(
+            .sign(&issuer_proof_message(
                 &onboarding_secret,
                 &joiner_node_id_string,
                 &issuer_public_key,
@@ -2068,7 +2056,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn management_bootstrap_wraps_realm_key() {
+    async fn bootstrap_wraps_key() {
         let (state, realm_id, _seed_node_id, user_id, net_handle, _tempdir) =
             setup_management_state().await;
         let auth = AuthContext {
@@ -2097,7 +2085,7 @@ mod tests {
         let transport_public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(transport_secret_key.public_key().as_bytes());
         let node_signature = joiner_node_key
-            .sign(&bootstrap_node_proof_message(
+            .sign(&node_proof_message(
                 &created.onboarding_secret,
                 &joiner_node_id_string,
                 Some(&transport_public_key),

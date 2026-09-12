@@ -51,15 +51,17 @@ jobs:
       - name: Install grcov
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: grcov
+          tool: grcov@0.10.8
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
           tool: cargo-nextest@0.9.140
 
+      # The measured target set matches the main tests job, so a coverage move
+      # cannot come from a different target selection.
       - name: Run instrumented tests
-        run: cargo nextest run --workspace --all-features --locked --profile ci
+        run: cargo nextest run --workspace --all-targets --all-features --locked --profile ci
 
       # nextest never runs doctests; they stay in the measured set.
       - name: Run instrumented doctests
@@ -76,7 +78,18 @@ jobs:
             --ignore-not-existing \
             --ignore "/*" \
             --ignore "target/*" \
+            --ignore "*/src/**/tests/*" \
+            --ignore "*/src/**/tests.rs" \
             --keep-only "*/src/*"
+          # Extracted test files are excluded; inline test code remains in its source file.
+          source_files="$(grep '^SF:' coverage.lcov | sed 's/^SF://' | sort -u)"
+          printf 'coverage source files: %s\n' "$(printf '%s\n' "$source_files" | wc -l)"
+          printf '%s\n' "$source_files" > coverage-sources.txt
+          if printf '%s\n' "$source_files" | grep -Eq '/src/(.*/)?tests?(/|\.rs$)'; then
+            echo "coverage.lcov contains test sources:" >&2
+            printf '%s\n' "$source_files" | grep -E '/src/(.*/)?tests?(/|\.rs$)' >&2
+            exit 1
+          fi
           records=$(grep -c '^DA:' coverage.lcov || true)
           if [ "$records" -lt 1000 ]; then
             echo "coverage.lcov has only $records DA records" >&2
@@ -87,7 +100,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage
-          path: coverage.lcov
+          path: |
+            coverage.lcov
+            coverage-sources.txt
           if-no-files-found: error
           retention-days: 1
 
@@ -126,6 +141,8 @@ jobs:
             echo "coverage.lcov has only $records DA records" >&2
             exit 1
           fi
+          grep '^SF:' coverage-parts/coverage.lcov | sed 's/^SF://' | sort -u \
+            | diff -u coverage-parts/coverage-sources.txt -
 
       - name: Upload coverage report
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0

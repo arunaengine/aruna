@@ -86,7 +86,7 @@ impl RevokeUserAccessOperation {
         })]
     }
 
-    fn handle_user_access_read(&mut self, event: Event) -> Effects {
+    fn access_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(RevokeUserAccessError::InvalidOperationState);
         };
@@ -158,7 +158,7 @@ impl RevokeUserAccessOperation {
         })]
     }
 
-    fn handle_user_access_written(&mut self, event: Event) -> Effects {
+    fn access_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.emit_error(RevokeUserAccessError::InvalidOperationState);
         };
@@ -216,9 +216,9 @@ impl Operation for RevokeUserAccessOperation {
         match self.state {
             RevokeUserAccessState::Init => self.handle_init(),
             RevokeUserAccessState::StartTransaction => self.handle_transaction_started(event),
-            RevokeUserAccessState::ReadUserAccess => self.handle_user_access_read(event),
+            RevokeUserAccessState::ReadUserAccess => self.access_read(event),
             RevokeUserAccessState::ReadOwnerIndex => self.handle_index_read(event),
-            RevokeUserAccessState::WriteUserAccess => self.handle_user_access_written(event),
+            RevokeUserAccessState::WriteUserAccess => self.access_written(event),
             RevokeUserAccessState::DeleteUserAccess => self.handle_access_deleted(event),
             RevokeUserAccessState::CommitTransaction => self.handle_transaction_committed(event),
             RevokeUserAccessState::Finish => smallvec![],
@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_revoke_user_access() {
+    async fn revokes_user_access() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();

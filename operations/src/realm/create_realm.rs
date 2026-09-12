@@ -5,20 +5,20 @@ use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::identifiers::{FieldError, PlacementHandle};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
-use aruna_core::storage_entries::admin_document_reducer_state_write_entry;
+use aruna_core::storage_entries::reducer_state_entry;
 use aruna_core::structs::{
     Actor, BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE,
     HandleRange, NodePlacementEntry, OidcProviderConfig, PlacementBinding, PlacementScope,
     RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, band_start,
-    normalize_node_placement_input,
+    normalize_placement_input,
 };
+use aruna_core::structured_id::{FieldError, PlacementHandle};
 use aruna_core::task::TaskEvent;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, Value};
-use aruna_core::util::unix_timestamp_millis;
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -77,14 +77,13 @@ impl CreateRealmOperation {
         }
     }
 
-    fn emit_create_auth_doc(&mut self) -> Result<Effects, CreateRealmError> {
+    fn emit_auth_create(&mut self) -> Result<Effects, CreateRealmError> {
         self.txn_id
             .ok_or_else(|| CreateRealmError::NoTransactionFound)?;
 
         let realm_id = self.config.actor.realm_id;
 
-        let auth_doc =
-            RealmAuthorizationDocument::new_default_realm_doc(self.config.actor.realm_id);
+        let auth_doc = RealmAuthorizationDocument::default_realm_doc(self.config.actor.realm_id);
 
         self.auth_doc = Some(auth_doc.clone());
 
@@ -98,7 +97,7 @@ impl CreateRealmOperation {
         })])
     }
 
-    fn emit_create_config_doc(&mut self) -> Result<Effects, CreateRealmError> {
+    fn emit_config_create(&mut self) -> Result<Effects, CreateRealmError> {
         self.txn_id
             .ok_or_else(|| CreateRealmError::NoTransactionFound)?;
 
@@ -107,9 +106,7 @@ impl CreateRealmOperation {
             RealmConfigDocument::default_for_realm(realm_id, self.config.oidc_providers.clone());
         config_doc.description = self.config.realm_description.clone();
         config_doc.ensure_node(self.config.actor.node_id, RealmNodeKind::Management);
-        // The creating coordinator owns the whole assignable band space as a
-        // self-issued root pool and consumes its own first band before any
-        // other node can onboard.
+        // The creator owns the root pool and consumes its first band before onboarding peers.
         config_doc.band_pools.push(BandPool {
             pool_id: Ulid::generate(),
             parent: None,
@@ -142,17 +139,15 @@ impl CreateRealmOperation {
         });
         config_doc
             .placement_map
-            .push(self.creating_node_placement_entry()?);
-        // The creator's own view is epoch one; `admin_reducer_seed_writes` hands
-        // the activations it seeds to the reducer, without which they could
-        // never advance.
+            .push(self.creating_node_placement()?);
+        // Epoch one and its reducer events make the creator's seeded activations advanceable.
         config_doc.snapshot_candidate_map();
         self.config_doc = Some(config_doc.clone());
 
         let key = (*realm_id.as_bytes()).into();
         let value = config_doc.to_bytes(&self.config.actor)?.into();
         let mut writes = vec![(REALM_CONFIG_KEYSPACE.to_string(), key, value)];
-        writes.extend(self.admin_reducer_seed_writes()?);
+        writes.extend(self.reducer_seed_writes()?);
 
         Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
@@ -160,8 +155,8 @@ impl CreateRealmOperation {
         })])
     }
 
-    fn creating_node_placement_entry(&self) -> Result<NodePlacementEntry, CreateRealmError> {
-        let (location, weight) = normalize_node_placement_input(
+    fn creating_node_placement(&self) -> Result<NodePlacementEntry, CreateRealmError> {
+        let (location, weight) = normalize_placement_input(
             self.config.node_location.as_deref(),
             self.config.node_weight,
         )
@@ -176,7 +171,7 @@ impl CreateRealmOperation {
         })
     }
 
-    fn admin_reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateRealmError> {
+    fn reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateRealmError> {
         let realm_id = self.config.actor.realm_id;
         let config_doc = self
             .config_doc
@@ -252,7 +247,7 @@ impl CreateRealmOperation {
         config_events.push(config_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::RealmConfigNodePlacementSet {
-                entry: self.creating_node_placement_entry()?,
+                entry: self.creating_node_placement()?,
             },
         )?);
         for map in &config_doc.candidate_maps {
@@ -287,8 +282,8 @@ impl CreateRealmOperation {
             true,
         );
         let mut writes = vec![
-            admin_document_reducer_state_write_entry(&realm_state)?,
-            admin_document_reducer_state_write_entry(&config_state)?,
+            reducer_state_entry(&realm_state)?,
+            reducer_state_entry(&config_state)?,
             outbox_write_entry(&realm_auth_record).map_err(ConversionError::from)?,
         ];
         for event in config_events {
@@ -307,7 +302,7 @@ impl CreateRealmOperation {
         Ok(writes)
     }
 
-    fn finish_after_outbox_schedule(&mut self) -> Effects {
+    fn finish_after_schedule(&mut self) -> Effects {
         if let Some(config) = &self.config_doc
             && let Some(auth) = &self.auth_doc
         {
@@ -348,7 +343,7 @@ impl CreateRealmOperation {
         )
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn fail_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -368,13 +363,13 @@ impl CreateRealmOperation {
 
         self.state = CreateRealmState::CreateAuthDoc;
         self.txn_id = Some(txn_id);
-        match self.emit_create_auth_doc() {
+        match self.emit_auth_create() {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn handle_create_auth_doc(&mut self, event: Event) -> Effects {
+    fn handle_auth_create(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
@@ -385,13 +380,13 @@ impl CreateRealmOperation {
         };
 
         self.state = CreateRealmState::CreateConfigDoc;
-        match self.emit_create_config_doc() {
+        match self.emit_config_create() {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn handle_create_config_doc(&mut self, event: Event) -> Effects {
+    fn handle_config_create(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event(
@@ -427,10 +422,10 @@ impl CreateRealmOperation {
         }
     }
 
-    fn handle_schedule_document_sync_outbox_drain(&mut self, event: Event) -> Effects {
+    fn handle_outbox_schedule(&mut self, event: Event) -> Effects {
         match event {
-            Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_after_outbox_schedule(),
-            Event::Task(TaskEvent::Error { .. }) => self.finish_after_outbox_schedule(),
+            Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_after_schedule(),
+            Event::Task(TaskEvent::Error { .. }) => self.finish_after_schedule(),
             other => self.unexpected_event(
                 CreateRealmState::ScheduleDocumentSyncOutboxDrain,
                 "Event::Task(TaskEvent::TimerScheduled)",
@@ -498,19 +493,17 @@ impl Operation for CreateRealmOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.fail_storage_error(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
 
         match self.state {
             CreateRealmState::StartTransaction => self.handle_start_transaction(event),
-            CreateRealmState::CreateAuthDoc => self.handle_create_auth_doc(event),
-            CreateRealmState::CreateConfigDoc => self.handle_create_config_doc(event),
+            CreateRealmState::CreateAuthDoc => self.handle_auth_create(event),
+            CreateRealmState::CreateConfigDoc => self.handle_config_create(event),
             CreateRealmState::CommitTransaction => self.handle_commit_transaction(event),
-            CreateRealmState::ScheduleDocumentSyncOutboxDrain => {
-                self.handle_schedule_document_sync_outbox_drain(event)
-            }
+            CreateRealmState::ScheduleDocumentSyncOutboxDrain => self.handle_outbox_schedule(event),
             CreateRealmState::Init | CreateRealmState::Finish | CreateRealmState::Error => {
                 smallvec![]
             }
@@ -644,7 +637,7 @@ mod test {
     }
 
     #[test]
-    fn creating_node_placement_entry_clamps_and_rejects() {
+    fn placement_clamps_values() {
         let realm_id = RealmId::from_bytes([31; 32]);
         let actor = actor(realm_id, 1, 2);
 
@@ -652,7 +645,7 @@ mod test {
         clamped.node_weight = Some(50_000);
         clamped.node_location = Some("  eu-west  ".to_string());
         let entry = CreateRealmOperation::new(clamped)
-            .creating_node_placement_entry()
+            .creating_node_placement()
             .unwrap();
         assert_eq!(entry.weight, aruna_core::structs::MAX_NODE_WEIGHT);
         assert_eq!(entry.location, "eu-west");
@@ -660,7 +653,7 @@ mod test {
         let mut too_long = config(actor);
         too_long.node_location = Some("x".repeat(65));
         assert_eq!(
-            CreateRealmOperation::new(too_long).creating_node_placement_entry(),
+            CreateRealmOperation::new(too_long).creating_node_placement(),
             Err(super::CreateRealmError::NodeLocationTooLong)
         );
     }
@@ -695,13 +688,13 @@ mod test {
             .collect()
     }
 
-    fn operation_ready_to_schedule(actor: Actor, txn_id: TxnId) -> CreateRealmOperation {
+    fn ready_to_schedule(actor: Actor, txn_id: TxnId) -> CreateRealmOperation {
         let mut config_doc = RealmConfigDocument::default_for_realm(actor.realm_id, Vec::new());
         config_doc.description = "A realm description".to_string();
         config_doc.ensure_node(actor.node_id, RealmNodeKind::Management);
         let mut operation = CreateRealmOperation::new(config(actor.clone()));
         operation.txn_id = Some(txn_id);
-        operation.auth_doc = Some(RealmAuthorizationDocument::new_default_realm_doc(
+        operation.auth_doc = Some(RealmAuthorizationDocument::default_realm_doc(
             actor.realm_id,
         ));
         operation.config_doc = Some(config_doc);
@@ -710,11 +703,11 @@ mod test {
     }
 
     #[test]
-    fn seeds_reducer_state_and_admin_outbox() {
+    fn seeds_admin_state() {
         let realm_id = RealmId::from_bytes([2; 32]);
         let actor = actor(realm_id, 3, 4);
         let txn_id = TxnId::generate();
-        let auth_doc = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let auth_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let realm_admin_role = auth_doc
             .roles
             .values()
@@ -729,7 +722,7 @@ mod test {
         operation.txn_id = Some(txn_id);
         operation.auth_doc = Some(auth_doc);
 
-        let effects = operation.emit_create_config_doc().unwrap();
+        let effects = operation.emit_config_create().unwrap();
         let writes = batch_writes(&effects, txn_id);
 
         let config_doc = RealmConfigDocument::from_bytes(
@@ -761,31 +754,25 @@ mod test {
                 .materialized_realm_roles()
                 .contains(&realm_admin_role.role_id)
         );
-        assert!(
-            realm_state
-                .materialized_realm_role_user_assignments()
-                .is_empty()
-        );
+        assert!(realm_state.materialized_realm_assignments().is_empty());
         assert_eq!(
-            config_state.materialized_realm_config_nodes()[&actor.node_id],
+            config_state.materialized_config_nodes()[&actor.node_id],
             RealmNodeKind::Management
         );
-        let materialized_providers = config_state.materialized_realm_config_oidc_providers();
+        let materialized_providers = config_state.materialized_oidc_providers();
         assert_eq!(materialized_providers.len(), 2);
         assert_eq!(materialized_providers.get("alpha"), Some(&alpha_provider));
         assert_eq!(materialized_providers.get("beta"), Some(&beta_provider));
         assert_eq!(
-            config_state.materialized_realm_config_metadata_replication(),
+            config_state.materialized_metadata_replication(),
             Some(config_doc.metadata_replication.clone())
         );
         assert_eq!(
-            config_state.materialized_realm_config_discovery(),
+            config_state.materialized_realm_discovery(),
             Some(config_doc.discovery.clone())
         );
         assert_eq!(
-            config_state
-                .materialized_realm_config_description()
-                .as_deref(),
+            config_state.materialized_realm_description().as_deref(),
             Some(config_doc.description.as_str())
         );
 
@@ -808,25 +795,15 @@ mod test {
         assert_eq!(seeded_bindings.len(), 5);
         assert_eq!(seeded_placements.len(), 2);
         assert_eq!(
-            config_state.materialized_realm_config_default_strategy(),
+            config_state.materialized_default_strategy(),
             Some(seeded_default_strategy_id)
         );
-        assert_eq!(
-            config_state
-                .materialized_realm_config_placement_strategies()
-                .len(),
-            3
-        );
+        assert_eq!(config_state.materialized_strategies().len(), 3);
         assert_eq!(
             config_state.materialized_family_strategy(),
             Some(seeded_family_strategy_id)
         );
-        assert_eq!(
-            config_state
-                .materialized_realm_config_strategy_bindings()
-                .len(),
-            5
-        );
+        assert_eq!(config_state.materialized_strategy_bindings().len(), 5);
         assert_eq!(config_state.materialized_placement_bindings().len(), 2);
 
         let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
@@ -1037,9 +1014,9 @@ mod test {
         let txn_id = TxnId::generate();
         let mut operation = CreateRealmOperation::new(config(actor.clone()));
         operation.txn_id = Some(txn_id);
-        operation.auth_doc = Some(RealmAuthorizationDocument::new_default_realm_doc(realm_id));
+        operation.auth_doc = Some(RealmAuthorizationDocument::default_realm_doc(realm_id));
 
-        let effects = operation.emit_create_config_doc().unwrap();
+        let effects = operation.emit_config_create().unwrap();
         let writes = batch_writes(&effects, txn_id);
         let config_doc = RealmConfigDocument::from_bytes(
             write_values(writes, REALM_CONFIG_KEYSPACE)
@@ -1073,15 +1050,15 @@ mod test {
     }
 
     #[test]
-    fn seeds_default_and_everywhere_strategies_with_class_bindings() {
+    fn seeds_default_strategies() {
         let realm_id = RealmId::from_bytes([21; 32]);
         let actor = actor(realm_id, 3, 4);
         let txn_id = TxnId::generate();
         let mut operation = CreateRealmOperation::new(config(actor.clone()));
         operation.txn_id = Some(txn_id);
-        operation.auth_doc = Some(RealmAuthorizationDocument::new_default_realm_doc(realm_id));
+        operation.auth_doc = Some(RealmAuthorizationDocument::default_realm_doc(realm_id));
 
-        let effects = operation.emit_create_config_doc().unwrap();
+        let effects = operation.emit_config_create().unwrap();
         let writes = batch_writes(&effects, txn_id);
         let config_doc = RealmConfigDocument::from_bytes(
             write_values(writes, REALM_CONFIG_KEYSPACE)
@@ -1131,11 +1108,11 @@ mod test {
     }
 
     #[test]
-    fn schedules_outbox_drain_and_finishes_without_direct_replication() {
+    fn schedules_outbox_drain() {
         let realm_id = RealmId::from_bytes([5; 32]);
         let actor = actor(realm_id, 6, 7);
         let txn_id = TxnId::generate();
-        let mut operation = operation_ready_to_schedule(actor, txn_id);
+        let mut operation = ready_to_schedule(actor, txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id,

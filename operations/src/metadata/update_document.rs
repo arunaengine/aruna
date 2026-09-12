@@ -12,16 +12,15 @@ use aruna_core::metadata::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
-    document_sync_revision_write_entry, metadata_create_acceptance_key,
-    metadata_document_lifecycle_write_entry, metadata_event_log_key, metadata_event_log_prefix,
-    metadata_profile_validation_status_write_entry, raw_budget_entry, raw_budget_key,
+    create_acceptance_key, document_lifecycle_entry, event_log_key, event_log_prefix,
+    profile_validation_entry, raw_budget_entry, raw_budget_key, sync_revision_entry,
 };
 use aruna_core::structs::{
     MetadataAuditRecord, MetadataRegistryRecord, PlacementRef, RealmConfigDocument,
 };
 use aruna_core::task::TaskEvent;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, TxnId};
-use aruna_core::util::unix_timestamp_millis;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
@@ -31,16 +30,14 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::metadata::materialization_queue::{
-    new_materialization_job, new_pending_materialization_status,
-    schedule_metadata_materialization_drain_effect,
+    new_materialization_job, new_pending_status, schedule_materialization,
 };
 use crate::metadata::profile_validation::{
-    not_profiled_status, stale_status, submission_has_profile_tag, validate_submission,
+    not_profiled_status, stale_status, submission_profile_tag, validate_submission,
 };
-use crate::metadata::projector::{create_event_outbox_record, registry_outbox_record};
+use crate::metadata::projector::{create_outbox_record, registry_outbox_record};
 use crate::metadata::repository::{
-    StorageReadError, metadata_event_projection_write_entries, parse_registry_read,
-    read_registry_effect,
+    StorageReadError, event_projection_entries, parse_registry_read, read_registry_effect,
 };
 use crate::sync::document_outbox::{outbox_write_entry, schedule_outbox_drain_effect};
 use crate::sync::shard_placement::sort_node_ids;
@@ -95,7 +92,7 @@ pub struct UpdateMetadataDocumentOperation {
     /// Buckets this update publishes onto and the activation generation each
     /// resolved at, read as a fence inside the write transaction.
     fenced: Vec<(PlacementRef, u64)>,
-    profile_validation_status: Option<MetadataProfileValidationStatus>,
+    route_profile_status: Option<MetadataProfileValidationStatus>,
     state: UpdateMetadataDocumentState,
     output: Option<Result<MetadataRegistryRecord, UpdateMetadataDocumentError>>,
 }
@@ -148,9 +145,9 @@ pub enum UpdateMetadataDocumentError {
 
 impl UpdateMetadataDocumentOperation {
     pub fn new(config: UpdateMetadataDocumentConfig) -> Self {
-        let profile_validation_status = match &config.mutation {
+        let route_profile_status = match &config.mutation {
             UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld }
-                if !submission_has_profile_tag(jsonld) =>
+                if !submission_profile_tag(jsonld) =>
             {
                 Some(not_profiled_status(config.document_id))
             }
@@ -177,7 +174,7 @@ impl UpdateMetadataDocumentOperation {
             accepted_create: None,
             realm_config: None,
             fenced: Vec::new(),
-            profile_validation_status,
+            route_profile_status,
             state: UpdateMetadataDocumentState::Init,
             output: None,
         }
@@ -311,10 +308,7 @@ impl UpdateMetadataDocumentOperation {
             .map_or(0, |(_, generation)| *generation)
     }
 
-    fn write_update_batch_effect(
-        &self,
-        txn_id: TxnId,
-    ) -> Result<Effect, UpdateMetadataDocumentError> {
+    fn write_update_batch(&self, txn_id: TxnId) -> Result<Effect, UpdateMetadataDocumentError> {
         let Some(event) = self.update_event.as_ref() else {
             return Err(UpdateMetadataDocumentError::MissingTransaction);
         };
@@ -322,13 +316,12 @@ impl UpdateMetadataDocumentOperation {
         let audit = self.audit_record(event);
         // Updating an existing document is a mutation, not an origin write, so it
         // never mints the lifecycle sync topic genesis.
-        let lifecycle_outbox = create_event_outbox_record(event, self.realm_config.as_ref(), false)
+        let lifecycle_outbox = create_outbox_record(event, self.realm_config.as_ref(), false)
             .fenced_at(self.generation_of(&event.record.placement));
         let outbox = (!event.record.holder_node_ids.is_empty()).then_some(&lifecycle_outbox);
-        let status = new_pending_materialization_status(event, now);
+        let status = new_pending_status(event, now);
         let job = new_materialization_job(event, now);
-        let mut writes =
-            metadata_event_projection_write_entries(event, &audit, outbox, &status, &job)?;
+        let mut writes = event_projection_entries(event, &audit, outbox, &status, &job)?;
         // Refresh the everywhere-bound registry row so non-holders see the new
         // revision, not just the bucket's holders.
         if let Some(registry_outbox) =
@@ -345,23 +338,20 @@ impl UpdateMetadataDocumentOperation {
         let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
             event: Box::new(event.clone()),
         };
-        writes.push(metadata_document_lifecycle_write_entry(&lifecycle)?);
+        writes.push(document_lifecycle_entry(&lifecycle)?);
         if outbox.is_none() {
             let aruna_core::document::DocumentSyncOutboxEvent::Upsert { change, .. } =
                 lifecycle_outbox.event
             else {
                 unreachable!("metadata lifecycle update outbox must be an upsert");
             };
-            writes.push(document_sync_revision_write_entry(
-                &lifecycle_outbox.target,
-                &change,
-            )?);
+            writes.push(sync_revision_entry(&lifecycle_outbox.target, &change)?);
         }
         let Some(raw_budget) = self.next_raw_budget.as_ref() else {
             return Err(UpdateMetadataDocumentError::RawLimit);
         };
         writes.push(raw_budget_entry(raw_budget)?);
-        let Some(mut profile_status) = self.profile_validation_status.clone() else {
+        let Some(mut profile_status) = self.route_profile_status.clone() else {
             return Err(MetadataError::Backend(
                 "profile validation status is missing before update commit".to_string(),
             )
@@ -372,9 +362,7 @@ impl UpdateMetadataDocumentOperation {
         // The merged render is only known once the batch materializes, so the
         // accepted status carries no digest to be fresh against yet.
         profile_status.dataset_digest = None;
-        writes.push(metadata_profile_validation_status_write_entry(
-            &profile_status,
-        )?);
+        writes.push(profile_validation_entry(&profile_status)?);
         Ok(Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: Some(txn_id),
@@ -474,7 +462,7 @@ impl UpdateMetadataDocumentOperation {
         for (key, value) in values {
             let event: MetadataCreateEventRecord =
                 postcard::from_bytes(value).map_err(|_| UpdateMetadataDocumentError::RawLimit)?;
-            if key != &metadata_event_log_key(self.config.document_id, event.event_id)
+            if key != &event_log_key(self.config.document_id, event.event_id)
                 || event.record.document_id != self.config.document_id
             {
                 return Err(UpdateMetadataDocumentError::RawLimit);
@@ -572,7 +560,7 @@ pub async fn update_metadata_document(
     mut operation: UpdateMetadataDocumentOperation,
     context: &DriverContext,
 ) -> Result<MetadataRegistryRecord, UpdateMetadataDocumentError> {
-    operation.profile_validation_status = Some(match &operation.config.mutation {
+    operation.route_profile_status = Some(match &operation.config.mutation {
         UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld } => {
             validate_submission(
                 context,
@@ -750,7 +738,7 @@ impl Operation for UpdateMetadataDocumentOperation {
                         ),
                         (
                             METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
-                            metadata_create_acceptance_key(self.config.document_id),
+                            create_acceptance_key(self.config.document_id),
                         ),
                     ];
                     // The fence joins this transaction's read set, so a
@@ -827,7 +815,7 @@ impl Operation for UpdateMetadataDocumentOperation {
                     self.state = UpdateMetadataDocumentState::ReadRawEvents;
                     smallvec![Effect::Storage(StorageEffect::Iter {
                         key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
-                        prefix: Some(metadata_event_log_prefix(self.config.document_id)),
+                        prefix: Some(event_log_prefix(self.config.document_id)),
                         start: None,
                         limit: RAW_EVENT_LIMIT,
                         txn_id: Some(txn_id),
@@ -863,7 +851,7 @@ impl Operation for UpdateMetadataDocumentOperation {
                         return self.fail(UpdateMetadataDocumentError::MissingTransaction);
                     };
                     self.state = UpdateMetadataDocumentState::WriteUpdateBatch;
-                    match self.write_update_batch_effect(txn_id) {
+                    match self.write_update_batch(txn_id) {
                         Ok(effect) => smallvec![effect],
                         Err(error) => self.fail(error),
                     }
@@ -886,7 +874,7 @@ impl Operation for UpdateMetadataDocumentOperation {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.state = UpdateMetadataDocumentState::ScheduleMaterializationDrain;
-                    smallvec![schedule_metadata_materialization_drain_effect()]
+                    smallvec![schedule_materialization()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
@@ -973,8 +961,8 @@ mod tests {
         METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_RAW_BUDGET_KEYSPACE,
     };
     use aruna_core::storage_entries::{
-        document_sync_revision_key, metadata_create_acceptance_key, metadata_event_log_key,
-        metadata_registry_key, raw_budget_key,
+        create_acceptance_key, event_log_key, metadata_registry_key, raw_budget_key,
+        sync_revision_key,
     };
     use aruna_core::structs::{Actor, PlacementRef, RealmId};
 
@@ -1117,7 +1105,7 @@ mod tests {
                     budget.map(|budget| postcard::to_allocvec(&budget).unwrap().into()),
                 ),
                 (
-                    metadata_create_acceptance_key(record.document_id),
+                    create_acceptance_key(record.document_id),
                     Some(postcard::to_allocvec(&create).unwrap().into()),
                 ),
             ],
@@ -1144,14 +1132,14 @@ mod tests {
         let create = create_event(record);
         Event::Storage(StorageEvent::IterResult {
             values: vec![(
-                metadata_event_log_key(record.document_id, create.event_id),
+                event_log_key(record.document_id, create.event_id),
                 postcard::to_allocvec(&create).unwrap().into(),
             )],
             next_start_after: None,
         })
     }
 
-    fn assert_no_graph_mutation_or_sync(effects: &[Effect]) {
+    fn assert_no_mutation(effects: &[Effect]) {
         for effect in effects {
             match effect {
                 Effect::Metadata(MetadataEffect::ApplyRoCrate { .. })
@@ -1279,7 +1267,7 @@ mod tests {
                 )
             })
             .expect("revision sidecar write exists");
-        assert_eq!(revision_key, &document_sync_revision_key(&outbox.target));
+        assert_eq!(revision_key, &sync_revision_key(&outbox.target));
         assert_eq!(revision.current.event_id, event.event_id);
         assert_eq!(revision.current.actor, event.node_id);
         assert_eq!(revision.current.generation, event.record.updated_at_ms);
@@ -1478,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn update_takes_bucket_fence() {
+    fn update_takes_bucket() {
         // An admitted update stamps the generation it resolved at onto every
         // outbox row it commits, so the drain can bound the predecessor set.
         let actor = actor();
@@ -1506,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_fence_rejects_update() {
+    fn closed_fence_rejects() {
         // The departing holder closed generation one: the write must not commit
         // an old-placement row after that.
         let actor = actor();
@@ -1651,7 +1639,7 @@ mod tests {
         let create_len = create_value.len() as u64;
         let effects = operation.step(Event::Storage(StorageEvent::IterResult {
             values: vec![(
-                metadata_event_log_key(record.document_id, create.event_id),
+                event_log_key(record.document_id, create.event_id),
                 create_value.clone().into(),
             )],
             next_start_after: None,
@@ -1782,7 +1770,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_rocrate_validates_and_commits_update_intent_before_craqle_mutation() {
+    fn replace_validates_commits() {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::generate();
@@ -1794,9 +1782,9 @@ mod tests {
             },
         ));
 
-        assert_no_graph_mutation_or_sync(operation.start().as_slice());
+        assert_no_mutation(operation.start().as_slice());
         let effects = operation.step(registry_read(&record));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         let effects = operation.step(realm_config_read(&record));
         let [Effect::Metadata(MetadataEffect::PlanBatch { graph_iri, .. })] = effects.as_slice()
         else {
@@ -1808,22 +1796,22 @@ mod tests {
         assert_start_transaction(effects.as_slice());
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         let effects = operation.step(registry_read(&record));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         let effects = operation.step(raw_budget_read(
             &record,
             1,
             postcard::experimental::serialized_size(&create_event(&record)).unwrap() as u64,
         ));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         let effects = operation.step(raw_events(&record));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         assert_update_batch(effects.as_slice(), txn_id, is_replace);
     }
 
     #[test]
-    fn entity_upsert_appends_durable_update_event_before_materialization() {
+    fn entity_upsert_appends() {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::generate();
@@ -1837,9 +1825,9 @@ mod tests {
 
         operation.start();
         let effects = operation.step(registry_read(&record));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         let effects = operation.step(realm_config_read(&record));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         assert_plan_batch(effects.as_slice());
         assert_start_transaction(operation.step(batch_planned(&record)).as_slice());
 
@@ -1889,7 +1877,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_failure_does_not_mutate_or_sync_graph() {
+    fn commit_preserves_graph() {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::generate();
@@ -1901,35 +1889,35 @@ mod tests {
             },
         ));
 
-        assert_no_graph_mutation_or_sync(operation.start().as_slice());
+        assert_no_mutation(operation.start().as_slice());
         let effects = operation.step(registry_read(&record));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         let effects = operation.step(realm_config_read(&record));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         let effects = operation.step(batch_planned(&record));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         let effects = operation.step(registry_read(&record));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         let effects = operation.step(raw_budget_read(
             &record,
             1,
             postcard::experimental::serialized_size(&create_event(&record)).unwrap() as u64,
         ));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         let effects = operation.step(raw_events(&record));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: Vec::new(),
         }));
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {
             error: aruna_core::errors::StorageError::WriteError("boom".to_string()),
         }));
 
-        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_no_mutation(effects.as_slice());
         assert!(operation.is_complete());
         assert_eq!(
             operation.finalize(),

@@ -256,8 +256,7 @@ impl MetadataQueryCache {
         now: Instant,
     ) -> bool {
         // A mutation that landed while the query ran already invalidated this
-        // result; storing it would only evict a fresher entry. The generation
-        // is checked too, because entries are shared across callers.
+        // result, and shared entries make the generation check mandatory.
         if stamp != self.stamp(generation) {
             return false;
         }

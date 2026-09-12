@@ -66,7 +66,7 @@ impl GetGroupOperation {
         Ok(())
     }
 
-    fn emit_get_auth_doc(&mut self) -> Effects {
+    fn emit_auth_read(&mut self) -> Effects {
         let key = self.config.group_id.to_bytes().into();
 
         smallvec![Effect::Storage(StorageEffect::Read {
@@ -75,7 +75,7 @@ impl GetGroupOperation {
             txn_id: self.txn_id,
         })]
     }
-    fn emit_parse_auth_doc(
+    fn parse_auth_result(
         &mut self,
         value: Option<byteview::ByteView>,
     ) -> Result<Effects, GetGroupError> {
@@ -129,7 +129,7 @@ impl GetGroupOperation {
         )
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn catch_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -165,13 +165,13 @@ impl GetGroupOperation {
         match self.emit_parse_group(value) {
             Ok(_) => {
                 self.state = GetGroupState::GetAuthDoc;
-                self.emit_get_auth_doc()
+                self.emit_auth_read()
             }
             Err(err) => self.fail(err),
         }
     }
 
-    fn handle_get_auth_doc(&mut self, event: Event) -> Effects {
+    fn handle_auth_read(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
@@ -181,7 +181,7 @@ impl GetGroupOperation {
             );
         };
 
-        match self.emit_parse_auth_doc(value) {
+        match self.parse_auth_result(value) {
             Ok(effects) => {
                 if !self.external_txn {
                     self.state = GetGroupState::CommitTransaction;
@@ -265,7 +265,7 @@ impl Operation for GetGroupOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.catch_storage_error(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
@@ -273,7 +273,7 @@ impl Operation for GetGroupOperation {
         match self.state {
             GetGroupState::StartTransaction => self.handle_start_transaction(event),
             GetGroupState::GetGroup => self.handle_get_group(event),
-            GetGroupState::GetAuthDoc => self.handle_get_auth_doc(event),
+            GetGroupState::GetAuthDoc => self.handle_auth_read(event),
             GetGroupState::CommitTransaction => self.handle_commit_transaction(event),
             // A terminal state owns no transaction to clean up, so this fails
             // without the abort effects `unexpected_event` would emit.

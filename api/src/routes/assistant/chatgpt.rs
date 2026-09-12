@@ -1,5 +1,5 @@
 use super::{ProviderModel, ensure_enabled, load_provider, save_provider, validate_base_url};
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::compute::Secret;
@@ -8,7 +8,7 @@ use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
     AssistantProviderStatus, AuthContext,
 };
-use aruna_core::util::unix_timestamp_secs;
+use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::assistant::provider::CreateProviderOperation;
 use aruna_operations::driver::drive;
 use axum::extract::{Path, State};
@@ -227,7 +227,7 @@ pub async fn start_login(
     body: Option<Json<StartLoginRequest>>,
 ) -> ServerResult<(StatusCode, Json<ChatgptLoginResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let label = body
         .and_then(|Json(request)| request.label)
         .map(|label| label.trim().to_string())
@@ -341,7 +341,7 @@ pub async fn poll_login(
     Path(provider_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<LoginPollResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let mut provider = load_provider(&state, auth.user_id, provider_id).await?;
     let expected = provider.clone();
     if provider.kind != AssistantProviderKind::Chatgpt {
@@ -635,7 +635,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_login_registers_pending() {
+    async fn start_registers_pending() {
         let router = Router::new().route(
             "/api/accounts/deviceauth/usercode",
             post(|| async {
@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_login_upstream_fails() {
+    async fn start_upstream_fails() {
         let router = Router::new().route(
             "/api/accounts/deviceauth/usercode",
             post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
@@ -836,7 +836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_login_already_ready() {
+    async fn poll_already_ready() {
         let (_dir, state, auth) = setup_state().await;
         let state = Arc::new(state);
         let provider = seed_ready(&state, &auth, "http://127.0.0.1:1".to_string(), 1).await;
@@ -851,7 +851,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_login_exchange_fails() {
+    async fn poll_exchange_fails() {
         let router = Router::new()
             .route(
                 "/api/accounts/deviceauth/token",
@@ -912,7 +912,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_provider_rejects_pending() {
+    async fn provider_rejects_pending() {
         let (_dir, state, auth) = setup_state().await;
         let provider = AssistantProvider {
             provider_id: Ulid::generate().to_string(),

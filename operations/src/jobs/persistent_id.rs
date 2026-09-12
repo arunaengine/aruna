@@ -1,7 +1,7 @@
 use aruna_core::structs::{
     AuthContext, JobError, JobResultPayload, MintPersistentIdSpec, PersistentIdFailure,
 };
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::api::MetadataApiError;

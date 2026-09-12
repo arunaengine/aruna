@@ -1,12 +1,13 @@
-use super::auth::{auth_storage, node_id_from_seed, realm_fixture};
+use super::super::transport::with_sync_timeout;
+use super::auth::{auth_storage, node_id_seed, realm_fixture};
 use super::*;
 #[test]
 fn workspace_delete_allowed() {
     let (_, realm_id, user_id) = realm_fixture();
     let relationship = SyncRelationship {
         id: Ulid::generate(),
-        source: ArunaArn::s3_bucket(realm_id, node_id_from_seed(1), "ws-temporary").unwrap(),
-        target: ArunaArn::s3_bucket(realm_id, node_id_from_seed(2), "target").unwrap(),
+        source: ArunaArn::s3_bucket(realm_id, node_id_seed(1), "ws-temporary").unwrap(),
+        target: ArunaArn::s3_bucket(realm_id, node_id_seed(2), "target").unwrap(),
         mode: SyncMode::Continuous,
         reference_handling: Default::default(),
         reference_serving: false,
@@ -58,8 +59,8 @@ async fn sync_creates_bucket() {
     let group_id = Ulid::generate();
     let relationship = SyncRelationship {
         id: Ulid::generate(),
-        source: ArunaArn::s3_bucket(realm_id, node_id_from_seed(1), "source").unwrap(),
-        target: ArunaArn::s3_bucket(realm_id, node_id_from_seed(2), "foobar").unwrap(),
+        source: ArunaArn::s3_bucket(realm_id, node_id_seed(1), "source").unwrap(),
+        target: ArunaArn::s3_bucket(realm_id, node_id_seed(2), "foobar").unwrap(),
         mode: SyncMode::Once,
         reference_handling: Default::default(),
         reference_serving: false,
@@ -125,7 +126,7 @@ async fn body_timeout() {
     assert_timeout(&[0, 0, 0, 0, 8], true).await;
 }
 #[test]
-fn metadata_handle_options_default_to_buffered_document_sync_persist() {
+fn sync_defaults_buffered() {
     let options = MetadataHandleOptions::default();
 
     assert_eq!(
@@ -134,10 +135,10 @@ fn metadata_handle_options_default_to_buffered_document_sync_persist() {
     );
 }
 #[test]
-fn metadata_handle_options_can_set_document_sync_persist_policy() {
+fn set_sync_policy() {
     let options = MetadataHandleOptions::default()
         .with_search_storage(MetadataSearchStorage::Memory)
-        .with_document_sync_persist_policy(FjallPersistPolicy::SyncAll);
+        .with_sync_policy(FjallPersistPolicy::SyncAll);
 
     assert_eq!(options.search_storage, MetadataSearchStorage::Memory);
     assert_eq!(
@@ -146,12 +147,12 @@ fn metadata_handle_options_can_set_document_sync_persist_policy() {
     );
 }
 #[tokio::test]
-async fn flush_persistence_succeeds_without_document_sync_database() {
+async fn flush_without_sync() {
     let (_storage_dir, storage) = auth_storage();
     let metadata_dir = tempdir().expect("metadata dir");
     let metadata_handle = MetadataHandle::new_with_options(
         metadata_dir.path(),
-        node_id_from_seed(1),
+        node_id_seed(1),
         storage,
         None,
         None,

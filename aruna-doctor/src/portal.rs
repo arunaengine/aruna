@@ -20,7 +20,7 @@ pub async fn update_portal(
         .ok_or(CliError::MissingPortalConfig("PORTAL_DIR"))?;
     let artifact_url = match artifact_url.or_else(|| nonempty_env("PORTAL_ARTIFACT_URL")) {
         Some(artifact_url) => artifact_url,
-        None if latest_website_prerelease => latest_website_prerelease_artifact_url().await?,
+        None if latest_website_prerelease => latest_artifact_url().await?,
         None => return Err(CliError::MissingPortalConfig("PORTAL_ARTIFACT_URL")),
     };
     let artifact_sha256 = artifact_sha256.or_else(|| nonempty_env("PORTAL_ARTIFACT_SHA256"));
@@ -44,7 +44,7 @@ pub async fn update_portal(
     Ok(())
 }
 
-async fn latest_website_prerelease_artifact_url() -> Result<String, CliError> {
+async fn latest_artifact_url() -> Result<String, CliError> {
     fetch_prerelease_url(WEBSITE_RELEASES_URL).await
 }
 
@@ -61,13 +61,13 @@ async fn fetch_prerelease_url(releases_url: &str) -> Result<String, CliError> {
     }
 
     let releases: Vec<GithubRelease> = request.send().await?.error_for_status()?.json().await?;
-    select_website_prerelease_artifact(&releases).ok_or(CliError::MissingPortalWebsiteArtifact {
+    select_artifact(&releases).ok_or(CliError::MissingPortalWebsiteArtifact {
         repo: WEBSITE_REPO,
         asset: PORTAL_ARTIFACT_NAME,
     })
 }
 
-fn select_website_prerelease_artifact(releases: &[GithubRelease]) -> Option<String> {
+fn select_artifact(releases: &[GithubRelease]) -> Option<String> {
     releases
         .iter()
         .filter(|release| release.prerelease && !release.draft)
@@ -103,7 +103,7 @@ struct GithubReleaseAsset {
 mod tests {
     use super::{
         GithubRelease, GithubReleaseAsset, PORTAL_ARTIFACT_NAME, fetch_prerelease_url,
-        select_website_prerelease_artifact, update_portal,
+        select_artifact, update_portal,
     };
     use axum::{Router, body::Bytes, routing::get};
     use flate2::{Compression, write::GzEncoder};
@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_first_prerelease_with_portal_artifact() {
+    fn selects_first_artifact() {
         let releases = vec![
             release(false, false, &[asset("aruna-portal-dist.tar.gz", "stable")]),
             release(true, true, &[asset("aruna-portal-dist.tar.gz", "draft")]),
@@ -256,7 +256,7 @@ mod tests {
         ];
 
         assert_eq!(
-            select_website_prerelease_artifact(&releases).as_deref(),
+            select_artifact(&releases).as_deref(),
             Some("latest-prerelease")
         );
     }

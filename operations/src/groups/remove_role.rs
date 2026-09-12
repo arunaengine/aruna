@@ -11,8 +11,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, PlacementRef, RealmConfigDocument,
@@ -217,13 +216,13 @@ impl RemoveGroupRoleOperation {
             );
         };
 
-        match self.emit_get_auth_doc_and_admin_state(value, txn_id) {
+        match self.emit_auth_read(value, txn_id) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn emit_get_auth_doc_and_admin_state(
+    fn emit_auth_read(
         &mut self,
         group: Option<ByteView>,
         txn_id: TxnId,
@@ -241,7 +240,7 @@ impl RemoveGroupRoleOperation {
                 (AUTH_KEYSPACE.to_string(), key),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                 ),
                 (
                     REALM_CONFIG_KEYSPACE.to_string(),
@@ -252,12 +251,7 @@ impl RemoveGroupRoleOperation {
         })])
     }
 
-    fn handle_get_auth_doc_and_admin_state(
-        &mut self,
-        event: Event,
-        txn_id: TxnId,
-        group: Group,
-    ) -> Effects {
+    fn handle_auth_read(&mut self, event: Event, txn_id: TxnId, group: Group) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event(
@@ -279,7 +273,7 @@ impl RemoveGroupRoleOperation {
             );
         };
 
-        match self.emit_write_group_auth_doc_and_admin_state(
+        match self.emit_document_write(
             txn_id,
             group,
             auth_doc_value.clone(),
@@ -291,7 +285,7 @@ impl RemoveGroupRoleOperation {
         }
     }
 
-    fn emit_write_group_auth_doc_and_admin_state(
+    fn emit_document_write(
         &mut self,
         txn_id: TxnId,
         mut group: Group,
@@ -299,9 +293,8 @@ impl RemoveGroupRoleOperation {
         reducer_state_value: Option<ByteView>,
         realm_config_value: Option<ByteView>,
     ) -> Result<Effects, RemoveGroupRoleError> {
-        let mut auth_doc = GroupAuthorizationDocument::from_bytes(
-            &auth_doc.ok_or_else(|| RemoveGroupRoleError::AuthDocNotFound)?,
-        )?;
+        let mut auth_doc =
+            super::parse_auth_record(auth_doc)?.ok_or(RemoveGroupRoleError::AuthDocNotFound)?;
         let role = auth_doc
             .roles
             .get(&self.input.role_id)
@@ -316,7 +309,7 @@ impl RemoveGroupRoleOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                aruna_core::reducer::decode_reducer_state(value.as_ref())
                     .map_err(ConversionError::from)
             })
             .transpose()?;
@@ -330,21 +323,19 @@ impl RemoveGroupRoleOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
-        let admin_events = apply_admin_reducer_updates(&mut reducer_state, &self.input)?;
-        materialize_removed_group_role(
+        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
+        materialize_role_removal(
             &mut group,
             &mut auth_doc,
             self.input.role_id,
             &reducer_state,
         );
 
-        let stale_conflict_delete_keys: Vec<_> = stale_admin_document_conflict_delete_entries(
-            previous_reducer_state.as_ref(),
-            Some(&reducer_state),
-        )
-        .into_iter()
-        .map(|(key_space, key)| (key_space, key.as_ref().to_vec()))
-        .collect();
+        let stale_conflict_delete_keys: Vec<_> =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state))
+                .into_iter()
+                .map(|(key_space, key)| (key_space, key.as_ref().to_vec()))
+                .collect();
         let mut writes = vec![
             (
                 AUTH_KEYSPACE.to_string(),
@@ -356,7 +347,7 @@ impl RemoveGroupRoleOperation {
                 group.group_id.to_bytes().into(),
                 group.to_bytes(&self.input.actor)?.into(),
             ),
-            admin_document_reducer_state_write_entry(&reducer_state)?,
+            reducer_state_entry(&reducer_state)?,
         ];
         let document_target = DocumentSyncTarget::GroupAuthorization {
             group_id: self.input.group_id,
@@ -387,7 +378,7 @@ impl RemoveGroupRoleOperation {
             .fenced_at(generation);
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
-        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+        writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.state = RemoveGroupRoleState::WriteGroupAuthDocAndAdminState {
             txn_id,
@@ -403,7 +394,7 @@ impl RemoveGroupRoleOperation {
         })])
     }
 
-    fn handle_write_group_auth_doc_and_admin_state(
+    fn handle_document_write(
         &mut self,
         event: Event,
         txn_id: TxnId,
@@ -440,7 +431,7 @@ impl RemoveGroupRoleOperation {
         self.emit_commit_transaction(txn_id, group, auth_doc, admin_outbox_written)
     }
 
-    fn handle_delete_stale_admin_conflicts(
+    fn handle_conflict_deletes(
         &mut self,
         event: Event,
         txn_id: TxnId,
@@ -547,7 +538,7 @@ impl RemoveGroupRoleOperation {
         smallvec![]
     }
 
-    fn handle_schedule_admin_document_outbox_drain(
+    fn handle_drain_schedule(
         &mut self,
         event: Event,
         group: Group,
@@ -600,7 +591,7 @@ impl RemoveGroupRoleOperation {
         )
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn catch_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -631,7 +622,7 @@ impl Operation for RemoveGroupRoleOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.catch_storage_error(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
@@ -641,7 +632,7 @@ impl Operation for RemoveGroupRoleOperation {
             RemoveGroupRoleState::StartTransaction => self.handle_start_transaction(event),
             RemoveGroupRoleState::GetGroup { txn_id } => self.handle_get_group(event, txn_id),
             RemoveGroupRoleState::GetAuthDocAndAdminState { txn_id, group } => {
-                self.handle_get_auth_doc_and_admin_state(event, txn_id, group)
+                self.handle_auth_read(event, txn_id, group)
             }
             RemoveGroupRoleState::WriteGroupAuthDocAndAdminState {
                 txn_id,
@@ -649,7 +640,7 @@ impl Operation for RemoveGroupRoleOperation {
                 auth_doc,
                 admin_outbox_written,
                 stale_conflict_delete_keys,
-            } => self.handle_write_group_auth_doc_and_admin_state(
+            } => self.handle_document_write(
                 event,
                 txn_id,
                 group,
@@ -662,13 +653,7 @@ impl Operation for RemoveGroupRoleOperation {
                 group,
                 auth_doc,
                 admin_outbox_written,
-            } => self.handle_delete_stale_admin_conflicts(
-                event,
-                txn_id,
-                group,
-                auth_doc,
-                admin_outbox_written,
-            ),
+            } => self.handle_conflict_deletes(event, txn_id, group, auth_doc, admin_outbox_written),
             RemoveGroupRoleState::ReadBucketFence {
                 txn_id,
                 group,
@@ -682,7 +667,7 @@ impl Operation for RemoveGroupRoleOperation {
                 ..
             } => self.handle_commit_transaction(event, group, auth_doc, admin_outbox_written),
             RemoveGroupRoleState::ScheduleAdminDocumentOutboxDrain { group, auth_doc } => {
-                self.handle_schedule_admin_document_outbox_drain(event, group, auth_doc)
+                self.handle_drain_schedule(event, group, auth_doc)
             }
             RemoveGroupRoleState::Init
             | RemoveGroupRoleState::Finish
@@ -720,7 +705,7 @@ impl Operation for RemoveGroupRoleOperation {
     }
 }
 
-fn apply_admin_reducer_updates(
+fn apply_reducer_updates(
     state: &mut AdminDocumentReducerState,
     input: &RemoveGroupRoleConfig,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
@@ -733,7 +718,7 @@ fn apply_admin_reducer_updates(
     Ok(vec![event])
 }
 
-fn materialize_removed_group_role(
+fn materialize_role_removal(
     group: &mut Group,
     auth_doc: &mut GroupAuthorizationDocument,
     role_id: RoleId,
@@ -844,7 +829,7 @@ pub mod test {
     }
 
     #[test]
-    fn queues_admin_operation_outbox_event_for_role_removal() {
+    fn queues_removal_outbox() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let group_id = Ulid::from_bytes([4u8; 16]);
@@ -881,7 +866,7 @@ pub mod test {
         });
 
         let effects = operation
-            .emit_write_group_auth_doc_and_admin_state(
+            .emit_document_write(
                 TxnId::generate(),
                 group,
                 Some(auth_doc.to_bytes(&actor).unwrap().into()),
@@ -977,7 +962,7 @@ pub mod test {
     }
 
     #[tokio::test]
-    pub async fn test_admin_role_undeletable() {
+    pub async fn protects_admin_role() {
         let (context, net_handle, _tmp) = test_context().await;
         let (actor, group, auth_doc) = setup_group(&context).await;
         let admin_role_id = *auth_doc

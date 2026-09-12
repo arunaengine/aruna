@@ -11,8 +11,8 @@ use aruna_core::structs::{
     PhysicalExecutionResult, PhysicalExecutionState, ResultMessage,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::NodeId;
-use aruna_core::util::unix_timestamp_millis;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -492,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn infra_failure_is_error() {
+    fn retryable_maps_error() {
         // Only an authenticated permanent, job-specific failure may replicate as
         // `failed`; a retryable one stays an infrastructure `error`.
         assert_eq!(

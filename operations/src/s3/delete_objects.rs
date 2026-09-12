@@ -152,7 +152,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn delete_objects_processes_mixed_batch() {
+    async fn mixed_batch_processed() {
         let (_temp, context) = test_context().await;
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let user_id = UserId::local(Ulid::generate(), realm_id);
@@ -214,7 +214,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn delete_objects_isolates_failures() {
+    async fn failures_isolated() {
         let (_temp, context) = test_context().await;
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let user_id = UserId::local(Ulid::generate(), realm_id);

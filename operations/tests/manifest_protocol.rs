@@ -43,7 +43,7 @@ struct TestNode {
 }
 
 #[tokio::test]
-async fn manifest_request_rejected_from_non_realm_peer() -> Result<(), Box<dyn std::error::Error>> {
+async fn rejects_nonrealm_peer() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([121u8; 32]);
     let (nodes, config) = build_realm_nodes(&realm_id, 2).await?;
     // An outsider node that is not in the realm config at all.
@@ -74,7 +74,7 @@ async fn manifest_request_rejected_from_non_realm_peer() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
-async fn manifest_request_rejected_for_non_held_shard() -> Result<(), Box<dyn std::error::Error>> {
+async fn rejects_unheld_shard() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([123u8; 32]);
     let (nodes, _config) = build_realm_nodes(&realm_id, 2).await?;
 
@@ -97,12 +97,11 @@ async fn manifest_request_rejected_for_non_held_shard() -> Result<(), Box<dyn st
 }
 
 #[tokio::test]
-async fn manifest_request_rejected_from_sync_eligible_non_holder()
--> Result<(), Box<dyn std::error::Error>> {
+async fn rejects_nonholder_peer() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([127u8; 32]);
     let (nodes, config) = build_realm_nodes(&realm_id, 4).await?;
     let responder = nodes[0].net.node_id();
-    let (placement, non_holder, holder) = placement_with_non_holder_requester(&config, &nodes);
+    let (placement, non_holder, holder) = nonholder_placement(&config, &nodes);
 
     let non_holder_node = nodes
         .iter()
@@ -129,7 +128,7 @@ async fn manifest_request_rejected_from_sync_eligible_non_holder()
 }
 
 #[tokio::test]
-async fn new_holder_verifies_shard_against_co_holder() -> Result<(), Box<dyn std::error::Error>> {
+async fn new_holder_verifies() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([124u8; 32]);
     let (nodes, config) = build_realm_nodes(&realm_id, 2).await?;
     let group_id = Ulid::generate();
@@ -164,7 +163,7 @@ async fn new_holder_verifies_shard_against_co_holder() -> Result<(), Box<dyn std
     let placement = created.record.placement;
 
     // Wait until node B (the co-holder) has synced the document into its shard.
-    wait_for_manifest_entry(&nodes[1], realm_id, placement, &target).await?;
+    wait_manifest_entry(&nodes[1], realm_id, placement, &target).await?;
 
     // Before verification, node B has no marker for that shard.
     assert!(!is_shard_verified(nodes[1].context.as_ref(), realm_id, &placement).await);
@@ -193,16 +192,13 @@ async fn new_holder_verifies_shard_against_co_holder() -> Result<(), Box<dyn std
     Ok(())
 }
 
-// Two genesis-less holders compute the SAME (non-zero) empty fingerprint, so
-// their digests match: exactly the condition that would falsely certify
-// convergence. Verification must still refuse to mark the shard verified,
-// because neither has a local genesis.
+// Two genesis-less holders compute the SAME (non-zero) empty fingerprint, so their digests
+// match: exactly the condition that would falsely certify convergence.
 #[tokio::test]
-async fn co_holders_with_no_genesis_do_not_verify_on_matching_empty_digest()
--> Result<(), Box<dyn std::error::Error>> {
+async fn genesisless_never_verify() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([126u8; 32]);
     let nodes = build_meshed_nodes(realm_id, 2).await?;
-    let config = install_config_without_placements(&nodes, realm_id, 2).await?;
+    let config = install_unplaced_config(&nodes, realm_id, 2).await?;
 
     let placement = any_held_placement(&config, nodes[1].net.node_id());
     let left = assemble_shard_manifest(nodes[0].context.as_ref(), realm_id, placement).await?;
@@ -214,7 +210,7 @@ async fn co_holders_with_no_genesis_do_not_verify_on_matching_empty_digest()
     assert!(
         !nodes[1]
             .net
-            .document_sync_topic_exists(aruna_core::document::shard_topic_id(realm_id, &placement))
+            .sync_topic_exists(aruna_core::document::shard_topic_id(realm_id, &placement))
             .unwrap_or(false),
         "no local genesis exists for the shard"
     );
@@ -258,7 +254,7 @@ async fn build_meshed_nodes(
 
 // Installs a small-shard realm config (every node holds every shard) but does
 // not run the placement reconciler, so no shard topic genesis exists.
-async fn install_config_without_placements(
+async fn install_unplaced_config(
     nodes: &[TestNode],
     realm_id: RealmId,
     shard_count: u32,
@@ -299,7 +295,7 @@ async fn install_config_without_placements(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
     Ok(config)
 }
@@ -319,7 +315,7 @@ fn any_held_placement(config: &RealmConfigDocument, node_id: NodeId) -> Placemen
     panic!("node holds no shard");
 }
 
-fn placement_with_non_holder_requester(
+fn nonholder_placement(
     config: &RealmConfigDocument,
     nodes: &[TestNode],
 ) -> (PlacementRef, NodeId, NodeId) {
@@ -351,7 +347,7 @@ fn placement_with_non_holder_requester(
     panic!("no shard found with a holder responder and sync-eligible non-holder requester");
 }
 
-async fn wait_for_manifest_entry(
+async fn wait_manifest_entry(
     node: &TestNode,
     realm_id: RealmId,
     placement: PlacementRef,
@@ -398,7 +394,7 @@ async fn build_realm_nodes(
         )
         .await?;
     }
-    wait_for_realm_node_convergence(&nodes, realm_id).await?;
+    wait_node_convergence(&nodes, realm_id).await?;
     let config = install_realm_config(&nodes, realm_id).await?;
     Ok((nodes, config))
 }
@@ -479,7 +475,7 @@ async fn install_realm_config(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
     for node in nodes {
         aruna_operations::placement::process_placements::process_shard_placements(
@@ -492,7 +488,7 @@ async fn install_realm_config(
     Ok(config)
 }
 
-async fn wait_for_realm_node_convergence(
+async fn wait_node_convergence(
     nodes: &[TestNode],
     realm_id: &RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {

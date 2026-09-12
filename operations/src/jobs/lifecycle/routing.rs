@@ -9,8 +9,8 @@ use aruna_core::structs::{
     JobProgress, JobProjection, JobRecord, JobResultPayload, JobState, LogicalJobSpec,
     LogicalJobState, PhysicalExecutionState, ResultMessage, WorkspaceMode,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{NodeId, UserId};
-use aruna_core::util::unix_timestamp_millis;
 
 use std::time::Duration;
 

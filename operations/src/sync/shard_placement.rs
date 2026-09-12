@@ -8,7 +8,7 @@ use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::structs::{PLACEMENT_EPOCH_PAD, PlacementRef, RealmId};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
-use aruna_core::util::unix_timestamp_secs;
+use aruna_core::time::unix_timestamp_secs;
 use byteview::ByteView;
 
 pub const DOCUMENT_SYNC_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -90,12 +90,12 @@ pub fn delete_placement_effect(realm_id: RealmId, placement: &PlacementRef) -> E
     })
 }
 
-pub fn schedule_placement_retry_effect(realm_id: RealmId, local_node_id: NodeId) -> Effect {
-    schedule_placement_retry_after(realm_id, local_node_id, SYNC_PLACEMENT_RETRY_AFTER)
+pub fn schedule_retry_effect(realm_id: RealmId, local_node_id: NodeId) -> Effect {
+    schedule_retry_after(realm_id, local_node_id, SYNC_PLACEMENT_RETRY_AFTER)
 }
 
-pub fn schedule_placement_revalidation_effect(realm_id: RealmId, local_node_id: NodeId) -> Effect {
-    schedule_placement_retry_after(realm_id, local_node_id, Duration::ZERO)
+pub fn schedule_revalidation(realm_id: RealmId, local_node_id: NodeId) -> Effect {
+    schedule_retry_after(realm_id, local_node_id, Duration::ZERO)
 }
 
 /// Arms the placement timer for a computed deadline without postponing any
@@ -114,7 +114,7 @@ pub fn schedule_placement_deadline(
     })
 }
 
-pub fn schedule_placement_retry_after(
+pub fn schedule_retry_after(
     realm_id: RealmId,
     local_node_id: NodeId,
     after: Duration,
@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_key_is_realm_and_shard_scoped() {
+    fn key_scopes_shard() {
         let first_realm = RealmId::from_bytes([1u8; 32]);
         let second_realm = RealmId::from_bytes([2u8; 32]);
 
@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_deduplicates_peers_and_computes_missing_count() {
+    fn deduplicates_and_counts() {
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let authoritative = node(1);
         let peer = node(5);
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_counts_authoritative_node_toward_desired_peer_count() {
+    fn authority_counts_target() {
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let record = new_placement(realm_id, placement(2), node(1), vec![node(5), node(6)]);
 
@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_records_authoritative_holder_explicitly() {
+    fn records_authoritative_holder() {
         let realm_id = RealmId::from_bytes([5u8; 32]);
         let authoritative = node(7);
 
@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_deduplicates_selected_peers_and_excludes_authoritative() {
+    fn selection_excludes_authority() {
         let realm_id = RealmId::from_bytes([6u8; 32]);
         let authoritative = node(7);
 

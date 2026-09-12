@@ -1,31 +1,24 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 //! Holder and non-holder coverage on a realm sized above the replication factor.
-//!
-//! Every other multi-node fixture in this workspace runs at `node_count <= RF`,
-//! where every node holds every bucket and non-holder behaviour is unobservable.
-//! These tests run five Management nodes at RF three plus a User-kind node, and
-//! prove holdership against the bucket a create actually stamps before exercising
-//! the path, so a regression to universal holdership fails the fixture instead of
-//! quietly voiding the test.
 
 mod topology;
 
 use aruna_core::StructuredId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::identifiers::{BucketId, PlacementHandle};
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQueryResults;
-use aruna_core::storage_entries::metadata_registry_delete_entries;
+use aruna_core::storage_entries::registry_delete_entries;
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
     ImportRoCrateSpec, ImportRoCrateTarget, JobState, RoCrateLimits, WorkspaceMode, band_start,
     user_dedup_key,
 };
+use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JobRouteError;
-use aruna_operations::jobs::drain::{JobClassBudget, process_job_queue_batch};
+use aruna_operations::jobs::drain::{JobClassBudget, drain_job_batch};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, read_record_routed,
@@ -44,13 +37,13 @@ use aruna_operations::metadata::create_document::{
     mint_forward_document, mint_local_document,
 };
 use aruna_operations::metadata::forward::{
-    MetadataWriteError, create_metadata_document_routed, delete_metadata_document_routed,
-    export_rocrate_routed, origin_holds_document, update_metadata_document_routed,
+    MetadataWriteError, export_rocrate_routed, origin_holds_document, route_metadata_create,
+    route_metadata_delete, route_metadata_update,
 };
 use aruna_operations::metadata::get_document::{
-    GetMetadataDocumentError, GetMetadataDocumentOperation, load_metadata_record_by_document,
+    GetMetadataDocumentError, GetMetadataDocumentOperation, load_document_record,
 };
-use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::metadata::projector::replay_event_log;
 use aruna_operations::metadata::update_document::UpdateMetadataDocumentMutation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use std::cell::RefCell;
@@ -359,7 +352,7 @@ async fn owner_claims() -> TestResult<()> {
     .await?;
     let passive = realm.node(1);
 
-    let passive_result = process_job_queue_batch(
+    let passive_result = drain_job_batch(
         &passive.context.storage_handle,
         passive.node_id(),
         JOB_BUDGET,
@@ -374,7 +367,7 @@ async fn owner_claims() -> TestResult<()> {
         "a non-owner has nothing to claim"
     );
 
-    let owner_result = process_job_queue_batch(
+    let owner_result = drain_job_batch(
         &ingress.context.storage_handle,
         ingress.node_id(),
         JOB_BUDGET,
@@ -398,9 +391,7 @@ async fn owner_claims() -> TestResult<()> {
 
 #[tokio::test]
 async fn swap_keeps_owner() -> TestResult<()> {
-    // An arbitrary placement rebalance never re-homes a job: the owner is
-    // derived from the JobId, so it keeps executing and control ops still
-    // route to it even after it stops being selectable for any placement.
+    // An arbitrary placement rebalance never re-homes a job.
     let mut realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let owner_id = realm.node(0).node_id();
     let submitted = submit_execution_job(
@@ -446,7 +437,7 @@ async fn swap_keeps_owner() -> TestResult<()> {
         .iter()
         .filter(|node| node.is_sync_eligible() && node.node_id() != owner_id)
     {
-        let result = process_job_queue_batch(
+        let result = drain_job_batch(
             &node.context.storage_handle,
             node.node_id(),
             JOB_BUDGET,
@@ -463,8 +454,7 @@ async fn swap_keeps_owner() -> TestResult<()> {
     }
 
     let owner = realm.find(owner_id);
-    let result =
-        process_job_queue_batch(&owner.context.storage_handle, owner_id, JOB_BUDGET, None).await?;
+    let result = drain_job_batch(&owner.context.storage_handle, owner_id, JOB_BUDGET, None).await?;
     assert_eq!(
         result.claimed.len(),
         1,
@@ -546,7 +536,7 @@ async fn owner_down_unavailable() -> TestResult<()> {
         .iter()
         .filter(|node| node.is_sync_eligible() && node.node_id() != owner_id)
     {
-        let result = process_job_queue_batch(
+        let result = drain_job_batch(
             &node.context.storage_handle,
             node.node_id(),
             JOB_BUDGET,
@@ -635,15 +625,14 @@ async fn fixture_proves_nonholders() -> TestResult<()> {
         realm.assert_not_holder(*node_id, &placement);
     }
 
-    // Holders are a pure function of the replicated config and the stamped bucket,
-    // so the proof is exact rather than probabilistic: every node derives the same
-    // set, in the same rank order.
+    // Holders are a pure function of the replicated config and the stamped bucket, so the proof
+    // is exact rather than probabilistic.
     for view in realm.holder_views(&placement).await? {
         assert_eq!(view, holders, "holder set diverged across nodes");
     }
 
-    // A User-kind node is never sync-eligible, so it holds no bucket to stamp: the
-    // one origin from which a create must be forwarded (D10).
+    // A User-kind node is never sync-eligible, so it holds no bucket to stamp: the one origin
+    // from which a create must be forwarded (D10).
     assert_eq!(
         realm.origin_placement(realm.user_node(), group_id, document_id, path),
         None
@@ -653,10 +642,8 @@ async fn fixture_proves_nonholders() -> TestResult<()> {
     Ok(())
 }
 
-// D3: a create stamps the best-ranked bucket its origin already holds, so the
-// origin is always a holder of what it creates and can always publish it. A
-// blind document hash would place it anywhere, including on buckets the origin
-// does not hold - the state that makes an offline node's writes undeliverable.
+// D3: a create stamps the best-ranked bucket its origin already holds, so the origin is always
+// a holder of what it creates and can always publish it.
 #[tokio::test]
 async fn create_stamps_origin() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
@@ -704,10 +691,8 @@ async fn create_stamps_origin() -> TestResult<()> {
     Ok(())
 }
 
-// A non-holder carries the document's registry row - the row rides the
-// everywhere-bound registry class, which is what lets it route reads and writes -
-// but it holds no bucket of the document, so it has no graph. The miss is
-// therefore the graph's, not the record's.
+// A non-holder carries the document's registry row - the row rides the everywhere-bound
+// registry class.
 #[tokio::test]
 async fn read_misses_nonholder() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
@@ -764,10 +749,8 @@ async fn read_misses_nonholder() -> TestResult<()> {
     Ok(())
 }
 
-// D10/D11: a write arriving at a node that holds no bucket of the document is
-// forwarded to a holder. The bystander never joins the bucket's topic to publish
-// it itself, so the mutation can only reach the holders through the forward -
-// and the bystander still has no graph afterwards.
+// D10/D11: a write arriving at a node that holds no bucket of the document is forwarded to a
+// holder.
 #[tokio::test]
 async fn bystander_writes_forward() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
@@ -794,7 +777,7 @@ async fn bystander_writes_forward() -> TestResult<()> {
         || registry_row_present(bystander, document_id),
     )
     .await?;
-    let record = load_metadata_record_by_document(bystander.context.as_ref(), document_id)
+    let record = load_document_record(bystander.context.as_ref(), document_id)
         .await
         .map_err(|error| format!("registry read failed: {error:?}"))?
         .ok_or("the non-holder must carry the registry row")?;
@@ -841,7 +824,7 @@ async fn bystander_writes_forward() -> TestResult<()> {
     );
 
     let stale = realm.find(holders[0]);
-    let stale_record = load_metadata_record_by_document(stale.context.as_ref(), document_id)
+    let stale_record = load_document_record(stale.context.as_ref(), document_id)
         .await
         .map_err(|error| format!("registry read failed: {error:?}"))?
         .ok_or("the holder must carry the registry row")?;
@@ -849,7 +832,7 @@ async fn bystander_writes_forward() -> TestResult<()> {
         .context
         .storage_handle
         .send_storage_effect(StorageEffect::BatchDelete {
-            deletes: metadata_registry_delete_entries(&stale_record),
+            deletes: registry_delete_entries(&stale_record),
             txn_id: None,
         })
         .await;
@@ -1013,10 +996,8 @@ async fn document_export_routes() -> TestResult<()> {
     Ok(())
 }
 
-// The create a bucket-holding node can never reach: a User-kind node holds no
-// bucket, so it can stamp none and must forward the create to a holder (D10).
-// The holder stamps the document's blind-hashed bucket, and the forwarder is
-// never added to it (D11).
+// The create a bucket-holding node can never reach: a User-kind node holds no bucket, so it can
+// stamp none and must forward the create to a holder (D10).
 #[tokio::test]
 async fn user_create_forwards() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
@@ -1031,7 +1012,7 @@ async fn user_create_forwards() -> TestResult<()> {
         None
     );
 
-    let created = create_metadata_document_routed(
+    let created = route_metadata_create(
         CreateMetadataDocumentOperation::new(document_config(
             &realm,
             user,
@@ -1108,10 +1089,9 @@ async fn export_routed(
         .ok_or("the routed export produced no result")?)
 }
 
-/// A routed update, re-run while every holder reports its placement view
-/// unavailable: forwarded writes fail closed while config replication or a
-/// pending registry projection lags, which a starved machine stretches past
-/// one attempt.
+/// A routed update, re-run while every holder reports its placement view unavailable: forwarded
+/// writes fail closed while config replication or a pending registry projection lags, which a
+/// starved machine stretches past one attempt.
 async fn update_routed(
     node: &TestNode,
     realm: &Topology,
@@ -1121,7 +1101,7 @@ async fn update_routed(
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "no routed update reached a holder",
         || async {
-            match update_metadata_document_routed(
+            match route_metadata_update(
                 &node.context,
                 realm.actor(node),
                 None,
@@ -1155,7 +1135,7 @@ async fn delete_routed(node: &TestNode, realm: &Topology, document_id: Ulid) -> 
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "no routed delete reached a holder",
         || async {
-            match delete_metadata_document_routed(
+            match route_metadata_delete(
                 &node.context,
                 realm.actor(node),
                 None,
@@ -1220,7 +1200,7 @@ async fn create_document(
         node.context.as_ref(),
     )
     .await?;
-    replay_metadata_event_log(node.context.as_ref()).await?;
+    replay_event_log(node.context.as_ref()).await?;
     Ok(created.record.placement)
 }
 
@@ -1234,7 +1214,7 @@ async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) ->
 }
 
 async fn registry_row_present(node: &TestNode, document_id: Ulid) -> bool {
-    load_metadata_record_by_document(node.context.as_ref(), document_id)
+    load_document_record(node.context.as_ref(), document_id)
         .await
         .is_ok_and(|record| record.is_some())
 }

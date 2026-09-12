@@ -11,7 +11,7 @@ use aruna_core::structs::{
     SyncBase, SyncPageLimit, SyncRefusal, SyncedFolder,
 };
 use aruna_core::types::{GroupId, Key, NodeId, UserId};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -109,7 +109,7 @@ pub async fn bind_folder(
         .await
         .map_err(|_| FolderError::Unavailable)?;
     let eligible = config
-        .sync_eligible_node_ids()
+        .sync_eligible_nodes()
         .map_err(|_| FolderError::Unavailable)?;
     if !eligible.contains(&input.remote.node_id) {
         return Err(FolderError::NotRealmNode(input.remote.node_id));
@@ -590,9 +590,8 @@ mod tests {
         }
     }
 
-    // An unbind interrupted after its state was persisted must finish on the
-    // next call: the binding is the durable handle on the cleanup, so it may
-    // never be missing while rows it owns are still there.
+    // An unbind interrupted after its state was persisted must finish on the next
+    // call: the binding is the durable handle on the cleanup while its rows remain.
     #[tokio::test]
     async fn resumes_interrupted_unbind() {
         let (_dir, context) = context().await;

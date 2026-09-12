@@ -15,16 +15,14 @@ use aruna_core::metadata::{
     resolve_raw_revision,
 };
 use aruna_core::storage_entries::{
-    metadata_create_event_write_entry, metadata_materialization_document_job_write_entry,
-    metadata_materialization_job_write_entry, metadata_materialization_status_key,
-    metadata_materialization_status_write_entry,
+    create_event_entry, document_job_entry, materialization_job_entry,
+    materialization_status_entry, materialization_status_key,
 };
 use aruna_core::structs::{Actor, MetadataRegistryRecord, PlacementRef, RealmId};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::{
-    new_materialization_job, new_pending_materialization_status,
-    process_metadata_materialization_batch,
+    new_materialization_job, new_pending_status, process_materialization_batch,
 };
 use aruna_storage::{FjallStorage, StorageHandle};
 use craqle::{
@@ -71,7 +69,7 @@ async fn raw_projection_diverges() -> Result<(), Box<dyn std::error::Error>> {
         ]
     })
     .to_string();
-    let base = create_event_with_payload(
+    let base = create_payload_event(
         &test,
         document_id,
         Ulid::from_parts(40, 1),
@@ -187,7 +185,7 @@ async fn raw_projection_diverges() -> Result<(), Box<dyn std::error::Error>> {
     projected_names.sort();
     assert_eq!(projected_names, ["Peer A", "Peer B"]);
 
-    let update_a = create_event_with_payload(
+    let update_a = create_payload_event(
         &test,
         document_id,
         Ulid::from_parts(41, 1),
@@ -201,7 +199,7 @@ async fn raw_projection_diverges() -> Result<(), Box<dyn std::error::Error>> {
             .to_string(),
         },
     );
-    let update_b = create_event_with_payload(
+    let update_b = create_payload_event(
         &test,
         document_id,
         Ulid::from_parts(41, 2),
@@ -248,21 +246,20 @@ fn sync_craqle(
 }
 
 #[tokio::test]
-async fn crash_after_craqle_apply_before_finish_retries_idempotently()
--> Result<(), Box<dyn std::error::Error>> {
+async fn retries_interrupted_apply() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context(true).await?;
     let document_id = Ulid::from_bytes([1u8; 16]);
     let event_id = Ulid::from_parts(10, 1);
     let event = create_event(&test, document_id, event_id, "crash-window");
-    let status = new_pending_materialization_status(&event, 1);
+    let status = new_pending_status(&event, 1);
     let job = new_materialization_job(&event, 1);
     write_entries(
         &test.context.storage_handle,
         vec![
-            metadata_create_event_write_entry(&event)?,
-            metadata_materialization_status_write_entry(&status)?,
-            metadata_materialization_job_write_entry(&job)?,
-            metadata_materialization_document_job_write_entry(&job)?,
+            create_event_entry(&event)?,
+            materialization_status_entry(&status)?,
+            materialization_job_entry(&job)?,
+            document_job_entry(&job)?,
         ],
     )
     .await?;
@@ -280,7 +277,7 @@ async fn crash_after_craqle_apply_before_finish_retries_idempotently()
         other => return Err(format!("unexpected metadata event: {other:?}").into()),
     }
 
-    let drained = process_metadata_materialization_batch(test.context.as_ref()).await?;
+    let drained = process_materialization_batch(test.context.as_ref()).await?;
 
     assert_eq!(drained.processed, 1);
     assert_eq!(job_count(&test.context.storage_handle).await?, 0);
@@ -294,8 +291,7 @@ async fn crash_after_craqle_apply_before_finish_retries_idempotently()
 }
 
 #[tokio::test]
-async fn final_status_with_leftover_job_is_cleaned_without_reapply()
--> Result<(), Box<dyn std::error::Error>> {
+async fn cleans_leftover_job() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context(false).await?;
     let document_id = Ulid::from_bytes([2u8; 16]);
     let event_id = Ulid::from_parts(20, 1);
@@ -316,14 +312,14 @@ async fn final_status_with_leftover_job_is_cleaned_without_reapply()
     write_entries(
         &test.context.storage_handle,
         vec![
-            metadata_materialization_status_write_entry(&final_status)?,
-            metadata_materialization_job_write_entry(&job)?,
-            metadata_materialization_document_job_write_entry(&job)?,
+            materialization_status_entry(&final_status)?,
+            materialization_job_entry(&job)?,
+            document_job_entry(&job)?,
         ],
     )
     .await?;
 
-    let drained = process_metadata_materialization_batch(test.context.as_ref()).await?;
+    let drained = process_materialization_batch(test.context.as_ref()).await?;
 
     // The final status obsoletes the leftover job, so the scan prunes it as
     // not-live rather than reapplying: nothing is processed, both rows go.
@@ -337,8 +333,7 @@ async fn final_status_with_leftover_job_is_cleaned_without_reapply()
 }
 
 #[tokio::test]
-async fn entity_upsert_materialization_replay_is_idempotent()
--> Result<(), Box<dyn std::error::Error>> {
+async fn upsert_replay_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context(true).await?;
     let document_id = Ulid::from_bytes([3u8; 16]);
     let create_event = create_event(&test, document_id, Ulid::from_parts(30, 1), "entity-replay");
@@ -356,7 +351,7 @@ async fn entity_upsert_materialization_replay_is_idempotent()
     }
 
     let upsert_event_id = Ulid::from_parts(30, 2);
-    let upsert_event = create_event_with_payload(
+    let upsert_event = create_payload_event(
         &test,
         document_id,
         upsert_event_id,
@@ -366,9 +361,9 @@ async fn entity_upsert_materialization_replay_is_idempotent()
         },
     );
 
-    assert_replayed_upsert_is_idempotent(metadata_handle, &upsert_event).await?;
+    assert_upsert_replayed(metadata_handle, &upsert_event).await?;
 
-    let patch_event = create_event_with_payload(
+    let patch_event = create_payload_event(
         &test,
         document_id,
         Ulid::from_parts(30, 3),
@@ -391,7 +386,7 @@ async fn entity_upsert_materialization_replay_is_idempotent()
     assert_eq!(entity["description"], "preserved");
 
     let contextual_event_id = Ulid::from_parts(30, 4);
-    let contextual_event = create_event_with_payload(
+    let contextual_event = create_payload_event(
         &test,
         document_id,
         contextual_event_id,
@@ -400,11 +395,11 @@ async fn entity_upsert_materialization_replay_is_idempotent()
             jsonld: r##"{"@id":"#lab","@type":"Organization","name":"lab"}"##.to_string(),
         },
     );
-    assert_replayed_upsert_is_idempotent(metadata_handle, &contextual_event).await?;
+    assert_upsert_replayed(metadata_handle, &contextual_event).await?;
     Ok(())
 }
 
-async fn assert_replayed_upsert_is_idempotent(
+async fn assert_upsert_replayed(
     metadata_handle: &MetadataHandle,
     event: &MetadataCreateEventRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -444,7 +439,7 @@ fn create_event(
     event_id: Ulid,
     name: &str,
 ) -> MetadataCreateEventRecord {
-    create_event_with_payload(
+    create_payload_event(
         test,
         document_id,
         event_id,
@@ -458,7 +453,7 @@ fn create_event(
     )
 }
 
-fn create_event_with_payload(
+fn create_payload_event(
     test: &TestContext,
     document_id: Ulid,
     event_id: Ulid,
@@ -587,7 +582,7 @@ async fn read_status(
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: aruna_core::keyspaces::METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
-            key: metadata_materialization_status_key(document_id),
+            key: materialization_status_key(document_id),
             txn_id: None,
         })
         .await

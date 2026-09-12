@@ -13,7 +13,7 @@ use aruna_core::structs::{
     AuthContext, BlobVersion, BlobVersionState, CapturedInput, InputSource, LogicalJobSpec,
     NodeInfoDocument, Permission, PlacementPolicyRef, PlacementSubject, PolicyResolution,
     RealmConfigDocument, RealmNodeKind, VersionKey, VersionedObjectArn, WorkspaceMode,
-    blob_group_permission_path, storage_subject,
+    group_permission_path, storage_subject,
 };
 use aruna_core::types::NodeId;
 use thiserror::Error;
@@ -23,9 +23,9 @@ use ulid::Ulid;
 use super::ids;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::blob::blob_holders::GetBlobHoldersOperation;
+use crate::blob::holders::GetBlobHoldersOperation;
 use crate::driver::{DriverContext, drive};
-use crate::node::node_info::read_node_info_document;
+use crate::node::node_info::read_info_document;
 use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 
 /// Tag that pins the container network mode, shared with the executor path.
@@ -118,12 +118,12 @@ async fn advertisements(
     config: &RealmConfigDocument,
 ) -> (BTreeMap<NodeId, NodeInfoDocument>, bool) {
     let mut documents = BTreeMap::new();
-    let Ok(members) = config.sync_eligible_node_ids() else {
+    let Ok(members) = config.sync_eligible_nodes() else {
         return (documents, true);
     };
     let mut unread = false;
     for node_id in members {
-        match read_node_info_document(&context.storage_handle, node_id).await {
+        match read_info_document(&context.storage_handle, node_id).await {
             Ok(Some(document)) => {
                 documents.insert(node_id, document);
             }
@@ -225,7 +225,7 @@ async fn target_allowed(context: &DriverContext, spec: &LogicalJobSpec, target: 
         context,
         spec.realm_id,
         &auth,
-        &blob_group_permission_path(spec.realm_id, spec.group_id, target),
+        &group_permission_path(spec.realm_id, spec.group_id, target),
         &Permission::WRITE,
         PolicyRequestExtras::rest(),
     )
@@ -472,8 +472,7 @@ mod tests {
     use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
     use aruna_core::scheduling::plan_execution;
     use aruna_core::structs::{
-        AdvertisementEpoch, InputMode, InputSelection, NodeUrls, NodeUtilization,
-        node_info_storage_key,
+        AdvertisementEpoch, InputMode, InputSelection, NodeUrls, NodeUtilization, node_info_key,
     };
 
     /// A realm of `members` servers, each advertising eight backends, which is
@@ -537,7 +536,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: NODE_INFO_KEYSPACE.to_string(),
-                key: node_info_storage_key(document.node_id).into(),
+                key: node_info_key(document.node_id).into(),
                 value: document.to_bytes().expect("advertisement is valid").into(),
                 txn_id: None,
             })

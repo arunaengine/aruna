@@ -1,17 +1,11 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 //! Membership bounds around a transition (#399).
-//!
-//! Two properties, neither of which any other scenario pins: an abort leaves
-//! the realm with holder-only membership and no half-moved bucket, and a
-//! transition limited to one bucket in flight really does hand them over one at
-//! a time - observable in the order the cut-overs are stamped, which is carried
-//! data rather than a sampled race.
 
 mod topology;
 
 use aruna_core::structs::{PlacementRef, TransitionLimits};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::placement::transition::{preview_transition, transition_health};
 use aruna_operations::realm::mutate_placement::RealmPlacementMutation;
 

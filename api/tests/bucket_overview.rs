@@ -93,8 +93,7 @@ async fn setup() -> Fixture {
         user_id: owner,
         realm_id,
     };
-    let mut group_auth =
-        GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+    let mut group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
     let viewer_role = group_auth
         .roles
         .values()
@@ -124,7 +123,7 @@ async fn setup() -> Fixture {
         (
             AUTH_KEYSPACE,
             realm_id.as_bytes().to_vec(),
-            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+            RealmAuthorizationDocument::default_realm_doc(realm_id)
                 .to_bytes(&actor)
                 .unwrap(),
         ),

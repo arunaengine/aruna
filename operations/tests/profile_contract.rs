@@ -12,7 +12,7 @@ use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, MetadataProfileValidationSeverity,
     MetadataProfileValidationState, PROCESS_RUN_CRATE_PROFILE_IRI,
 };
-use aruna_core::storage_entries::metadata_event_log_prefix;
+use aruna_core::storage_entries::event_log_prefix;
 use aruna_core::structs::{
     Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
     RealmId, RealmNodeKind,
@@ -25,7 +25,7 @@ use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentPayload, mint_local_document,
 };
 use aruna_operations::metadata::forward::{
-    MetadataWriteError, admits_profile_peer, create_metadata_document_routed, export_profile_local,
+    MetadataWriteError, admits_profile_peer, export_profile_local, route_metadata_create,
 };
 use aruna_operations::metadata::profile_validation::{
     current_validation_status, load_validation_status, preview_submission, profile_public_iri,
@@ -36,9 +36,8 @@ use aruna_operations::metadata::update_document::{
     UpdateMetadataDocumentOperation, update_metadata_document,
 };
 use aruna_operations::metadata::{
-    MetadataHandle, MetadataHandleOptions,
-    materialization_queue::process_metadata_materialization_batch,
-    projector::drain_pending_metadata_projection_queue,
+    MetadataHandle, MetadataHandleOptions, materialization_queue::process_materialization_batch,
+    projector::drain_projection_queue,
 };
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -60,8 +59,7 @@ struct TestContext {
 }
 
 #[tokio::test]
-async fn tagged_create_rejects_atomically_and_can_be_retried()
--> Result<(), Box<dyn std::error::Error>> {
+async fn tagged_create_retryable() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context(false).await?;
     let group_id = Ulid::generate();
     let (profile_id, profile_revision) = register_profile(&test, group_id, minimum_shape()).await?;
@@ -127,8 +125,7 @@ async fn tagged_create_rejects_atomically_and_can_be_retried()
 }
 
 #[tokio::test]
-async fn external_tag_and_unavailable_validator_fail_closed()
--> Result<(), Box<dyn std::error::Error>> {
+async fn validator_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
     let unavailable = build_context(true).await?;
     let group_id = Ulid::generate();
     let (profile_id, _) = register_profile(&unavailable, group_id, minimum_shape()).await?;
@@ -175,8 +172,7 @@ async fn external_tag_and_unavailable_validator_fail_closed()
 }
 
 #[tokio::test]
-async fn unsupported_registered_constraint_rejects_without_mutation()
--> Result<(), Box<dyn std::error::Error>> {
+async fn constraint_rejects_atomically() -> Result<(), Box<dyn std::error::Error>> {
     // SHACL-SPARQL is outside craqle's Core subset and must fail closed.
     let test = build_context(false).await?;
     let group_id = Ulid::generate();
@@ -627,8 +623,7 @@ async fn rejects_crate_local() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn invalid_replace_preserves_the_last_revision_and_is_retryable()
--> Result<(), Box<dyn std::error::Error>> {
+async fn invalid_replace_retryable() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context(false).await?;
     let group_id = Ulid::generate();
     let (profile_id, _) = register_profile(&test, group_id, minimum_shape()).await?;
@@ -641,9 +636,9 @@ async fn invalid_replace_preserves_the_last_revision_and_is_retryable()
         crate_json(document_id, None, true, true),
     )
     .await?;
-    drain_pending_metadata_projection_queue(test.context.as_ref()).await?;
+    drain_projection_queue(test.context.as_ref()).await?;
     // A replace plans its batch against the local graph, so it must be applied.
-    process_metadata_materialization_batch(test.context.as_ref()).await?;
+    process_materialization_batch(test.context.as_ref()).await?;
     let tag = profile_public_iri(profile_id);
 
     let error = update_metadata_document(
@@ -888,8 +883,8 @@ async fn render_resolves_group() -> Result<(), Box<dyn std::error::Error>> {
         ),
     )
     .await?;
-    drain_pending_metadata_projection_queue(test.context.as_ref()).await?;
-    process_metadata_materialization_batch(test.context.as_ref()).await?;
+    drain_projection_queue(test.context.as_ref()).await?;
+    process_materialization_batch(test.context.as_ref()).await?;
 
     let status = load_validation_status(test.context.as_ref(), document_id, None)
         .await?
@@ -1024,8 +1019,7 @@ async fn make_private(
 }
 
 #[tokio::test]
-async fn profile_revision_change_invalidates_and_revalidation_repins()
--> Result<(), Box<dyn std::error::Error>> {
+async fn revision_change_repins() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context(false).await?;
     let group_id = Ulid::generate();
     let (profile_id, original_revision) =
@@ -1044,7 +1038,7 @@ async fn profile_revision_change_invalidates_and_revalidation_repins()
         ),
     )
     .await?;
-    drain_pending_metadata_projection_queue(test.context.as_ref()).await?;
+    drain_projection_queue(test.context.as_ref()).await?;
 
     let updated_profile = update_metadata_document(
         UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
@@ -1198,14 +1192,14 @@ async fn register_profile(
         profile_json(profile_id, shapes),
     )
     .await?;
-    drain_pending_metadata_projection_queue(test.context.as_ref()).await?;
-    process_metadata_materialization_batch(test.context.as_ref()).await?;
+    drain_projection_queue(test.context.as_ref()).await?;
+    process_materialization_batch(test.context.as_ref()).await?;
     Ok((profile_id, created.event_id))
 }
 
 async fn seed_group(test: &TestContext, group_id: Ulid) -> Result<(), Box<dyn std::error::Error>> {
-    let realm = RealmAuthorizationDocument::new_default_realm_doc(test.actor.realm_id);
-    let auth = GroupAuthorizationDocument::new_default_group_doc(
+    let realm = RealmAuthorizationDocument::default_realm_doc(test.actor.realm_id);
+    let auth = GroupAuthorizationDocument::default_group_doc(
         test.actor.user_id,
         test.actor.realm_id,
         group_id,
@@ -1386,17 +1380,15 @@ async fn create_crate(
     aruna_operations::metadata::create_document::CreateMetadataDocumentResult,
     CreateMetadataDocumentError,
 > {
-    match create_metadata_document_routed(
-        CreateMetadataDocumentOperation::new_for_generated_document_id(
-            CreateMetadataDocumentConfig {
-                actor: test.actor.clone(),
-                group_id,
-                document_id,
-                document_path: path.to_string(),
-                public: true,
-                payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
-            },
-        ),
+    match route_metadata_create(
+        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+            actor: test.actor.clone(),
+            group_id,
+            document_id,
+            document_path: path.to_string(),
+            public: true,
+            payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
+        }),
         test.context.clone(),
         None,
     )
@@ -1427,7 +1419,7 @@ async fn event_count(
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
             key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
-            prefix: Some(metadata_event_log_prefix(document_id)),
+            prefix: Some(event_log_prefix(document_id)),
             start: None,
             limit: 10,
             txn_id: None,
@@ -1456,7 +1448,7 @@ async fn build_context(
         None,
         None,
         None,
-        MetadataHandleOptions::default().with_profile_validation_disabled(validator_disabled),
+        MetadataHandleOptions::default().with_validation_disabled(validator_disabled),
     )?;
     let actor = Actor {
         node_id,

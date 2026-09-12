@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::structs::RealmId;
-use aruna_core::util::unix_timestamp_secs;
+use aruna_core::time::unix_timestamp_secs;
 use aruna_core::{IdEnvironment, SystemEnvironment};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -33,9 +33,8 @@ struct ClockAnchor {
 
 struct AnchorState {
     anchor: ClockAnchor,
-    // Candidate anchor captured from the previous diverged sample. A re-anchor only
-    // commits once a second sample agrees with it, so a lone spurious wall reading
-    // fails one op but is discarded rather than adopted as the new anchor.
+    // Candidate anchor from the previous diverged sample: re-anchor commits only
+    // once a second sample agrees, so a lone bad reading is discarded.
     pending: Option<ClockAnchor>,
 }
 

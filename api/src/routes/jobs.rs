@@ -14,7 +14,7 @@ use aruna_core::structs::{
     ExportReportRow, ImportReportRow, InputMode, InputSelection, InputSource,
     JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, NodeCapabilities,
     OutputDestination, OutputSelection, Permission, WorkspaceMode, WorkspaceOutput,
-    blob_bucket_permission_path, blob_group_permission_path,
+    bucket_permission_path, group_permission_path,
 };
 use aruna_core::types::NodeId;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
@@ -48,7 +48,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_realm_auth};
+use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_auth};
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::rate_limit::LocalKey;
@@ -259,10 +259,8 @@ pub struct SubmitExecutionRequest {
     #[serde(default)]
     pub outputs: Vec<ExecutionOutputRequest>,
     #[serde(default)]
-    /// Workspace prefixes to inventory at completion. Only objects this
-    /// execution itself wrote under a prefix are reported: a version another
-    /// writer produced is never attributed to this job. A non-empty list needs
-    /// `workspace.mode` `existing` and at least one bucket-qualified output.
+    /// Workspace prefixes whose versions this execution wrote and inventories at completion.
+    /// Requires `workspace.mode` `existing` and at least one bucket-qualified output.
     pub output_prefixes: Vec<String>,
     /// How a destination key already claimed by another declared input or by an
     /// object in the workspace bucket is resolved. Defaults to `reject`.
@@ -295,10 +293,8 @@ pub struct SubmitJobResponse {
     /// The alias the responder currently reduces as canonical. It may change
     /// once a partitioned lower claim is learned; `job_id` never does.
     pub canonical_job_id: String,
-    /// The family's state at this accept: `queued` for a fresh admission, and
-    /// what the responder currently reduces for an idempotent replay, so a
-    /// replay of a running or finished request reports that instead. It is a
-    /// point-in-time value; poll `status_url` for the live state.
+    /// Family state at acceptance or the current reduced state for an idempotent replay.
+    /// This is a snapshot; poll `status_url` for the live state.
     pub state: String,
     /// Preferred route, not an owner: any node that reduced the family answers.
     pub origin_node_url: String,
@@ -323,10 +319,8 @@ pub struct JobOutputResponse {
     pub content_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
-    /// Node-local S3 endpoint owning this exact version. Use it with the
-    /// bucket, key, and version_id above; the responder is not necessarily the
-    /// execution node. Null when this responder does not yet know the owning
-    /// node's endpoint, which never withholds the rest of the output.
+    /// Node-local S3 endpoint owning this version, which may differ from the execution node.
+    /// Null when the responder does not know the endpoint; other output remains available.
     pub endpoint_url: Option<String>,
 }
 
@@ -359,10 +353,8 @@ pub struct JobPlacementCandidateResponse {
     pub reason: Option<String>,
 }
 
-/// Where the request was planned to run. It is the plan this responder stored
-/// when it planned the request itself, else the newest launch record any
-/// witness published. `alternatives`, `rejected` and `omitted` are counted only
-/// in the first case, because only a local planning round keeps them.
+/// Uses this responder's stored plan, or otherwise the newest witnessed launch record.
+/// Only a local planning round supplies `alternatives`, `rejected`, and `omitted` counts.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct JobPlacementResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -784,7 +776,7 @@ pub(crate) fn forwarded_job_auth(
             .as_ref()
             .map(ValidatedArunaBearerTokenCarrier::as_str),
     )
-    .map_err(super::metadata::map_metadata_api_error)
+    .map_err(crate::metadata::map_api_error)
 }
 
 pub(crate) fn map_job_route(error: JobRouteError) -> ServerError {
@@ -964,7 +956,7 @@ async fn validate_owned_bucket(
     crate::auth::ensure_permission_with(
         state,
         auth,
-        blob_bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
+        bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
         Permission::WRITE,
         extras,
     )
@@ -1209,7 +1201,7 @@ pub async fn list_jobs(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(query): Query<ListJobsQuery>,
 ) -> ServerResult<(StatusCode, Json<JobListResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let cursor = decode_cursor(query.cursor.as_deref())?;
     let limit = query
         .limit
@@ -1447,7 +1439,7 @@ pub(crate) async fn submit_execution(
     )?;
     let target = request.target.unwrap_or_default();
     let auth = match target {
-        ExecutionTarget::Realm => require_unrestricted_realm_auth(state, auth)?,
+        ExecutionTarget::Realm => require_unrestricted_auth(state, auth)?,
         ExecutionTarget::Local => local_auth(state, auth).await?,
     };
     let group_id = Ulid::from_string(&request.group_id).map_err(|_| ServerError::BadRequest)?;
@@ -1467,7 +1459,7 @@ pub(crate) async fn submit_execution(
     crate::auth::ensure_permission_with(
         state,
         &auth,
-        blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
+        group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
         Permission::WRITE,
         extras.clone(),
     )
@@ -1815,7 +1807,7 @@ pub async fn get_job(
     Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
     // A distributed external job is answered from the replicated family; every
     // other job keeps the owner-routed view.
@@ -1991,7 +1983,7 @@ pub async fn get_job_report(
     Path(job_id): Path<String>,
     Query(query): Query<ReportQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
     let cursor = decode_report_cursor(query.cursor.as_deref())?;
     if cursor
@@ -2145,10 +2137,10 @@ async fn artifact_response(
     headers: HeaderMap,
     download: bool,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
     let auth_token = forwarded_job_auth(bearer)?;
-    let now_ms = aruna_core::util::unix_timestamp_millis();
+    let now_ms = aruna_core::time::unix_timestamp_millis();
     let owned = match read_artifact_routed(
         &state.get_ctx(),
         auth.user_id,
@@ -2474,7 +2466,7 @@ pub async fn cancel_job(
     Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
 
     let outcome = cancel_job_routed(
@@ -2501,7 +2493,6 @@ pub async fn cancel_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::identifiers::{BucketId, PlacementHandle};
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::{
         ArtifactRef, BackendLocation, BackendRef, ExportOmissionCounts, ExportRoCrateResult,
@@ -2510,6 +2501,7 @@ mod tests {
         JobPayload, JobProgress, JobResultPayload, NodeCapabilities, PathRestriction, Permission,
         RealmId, ReasonCode, RoCrateLimits,
     };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
@@ -2641,7 +2633,7 @@ mod tests {
     }
 
     #[test]
-    fn partitioned_view_is_marked() {
+    fn partitioned_view_marked() {
         // A partitioned read must name its responder and say that it is local
         // and exhausted here, without ever reading as a converged failure.
         let response = family_response(&family_report_fixture());
@@ -2662,7 +2654,7 @@ mod tests {
     }
 
     #[test]
-    fn outputs_keep_exact_versions() {
+    fn outputs_preserve_versions() {
         // The exact VersionId and its producing execution are the identity of a
         // job output; the object's current version is a different question.
         let response = family_response(&family_report_fixture());
@@ -2963,7 +2955,7 @@ mod tests {
                 total: Some(2),
                 unit: "entries".to_string(),
             },
-            aruna_core::util::unix_timestamp_millis(),
+            aruna_core::time::unix_timestamp_millis(),
         )
         .await
         .unwrap()
@@ -3164,7 +3156,7 @@ mod tests {
             &export_job(
                 job_id,
                 owner,
-                aruna_core::util::unix_timestamp_millis() + 60_000,
+                aruna_core::time::unix_timestamp_millis() + 60_000,
             ),
         )
         .await
@@ -3259,7 +3251,7 @@ mod tests {
     async fn urls_are_absolute() {
         let (_dir, state) = build_state().await;
         state
-            .register_rest_interface_with_public_url(
+            .register_rest_interface(
                 "127.0.0.1:3000".parse().unwrap(),
                 Some("https://owner.example/"),
             )
@@ -3307,9 +3299,7 @@ mod tests {
         let (_dir, state) = build_state().await;
         let owner = user(2);
         let job_id = JobId::from_bytes([9u8; 16]);
-        // has_run keeps this job off the never-run direct-cancel fast path (see
-        // set_cancel_requested), so it stays live and cancel_requested-flagged across
-        // repeated cancel calls, which is what this test exercises.
+        // A prior run keeps repeated cancellation on the live, cancel-requested path.
         let mut record = job_for(job_id, owner, 1000);
         record.has_run = true;
         insert_job(&state.get_ctx().storage_handle, &record)
@@ -3745,7 +3735,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_output_without_bucket() {
+    fn output_requires_bucket() {
         let error = native_outputs(
             vec![output_request("/out/report.txt", "reports/r.txt", None)],
             WorkspaceMode::None,

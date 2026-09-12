@@ -13,12 +13,10 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
-use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_write_entry,
-};
+use aruna_core::storage_entries::{conflict_write_entries, reducer_state_entry};
 use aruna_core::structs::{
     Actor, Group, GroupAuthorizationDocument, PlacementRef, RealmConfigDocument, Role,
-    group_owner_index_key, group_owner_index_prefix,
+    owner_index_key, owner_index_prefix,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
@@ -88,11 +86,11 @@ impl CreateGroupOperation {
         }
     }
     #[tracing::instrument(name = "group.create.emit_count_owned", level = "debug", skip(self), fields(state = ?self.state))]
-    fn emit_count_owned_groups(&mut self, cap: u32) -> Effects {
+    fn emit_owned_count(&mut self, cap: u32) -> Effects {
         self.state = CreateGroupState::CountOwnedGroups;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: GROUP_OWNER_INDEX_KEYSPACE.to_string(),
-            prefix: Some(group_owner_index_prefix(self.config.actor.user_id).into()),
+            prefix: Some(owner_index_prefix(self.config.actor.user_id).into()),
             start: None,
             limit: cap as usize,
             txn_id: self.txn_id,
@@ -100,7 +98,7 @@ impl CreateGroupOperation {
     }
 
     #[tracing::instrument(name = "group.create.handle_count_owned", level = "debug", skip(self, event), fields(state = ?self.state))]
-    fn handle_count_owned_groups(&mut self, event: Event) -> Effects {
+    fn handle_owned_count(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             return self.unexpected_event(
@@ -127,7 +125,7 @@ impl CreateGroupOperation {
     #[tracing::instrument(name = "group.create.emit_group", level = "debug", skip(self), fields(state = ?self.state, group_name = %self.config.display_name))]
     fn emit_create_group(&mut self) -> Result<Effects, CreateGroupError> {
         let group_id = Ulid::generate();
-        let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
+        let auth_doc = GroupAuthorizationDocument::default_group_doc(
             self.config.actor.user_id,
             self.config.actor.realm_id,
             group_id,
@@ -164,7 +162,7 @@ impl CreateGroupOperation {
     }
 
     #[tracing::instrument(name = "group.create.emit_auth_doc", level = "debug", skip(self), fields(state = ?self.state))]
-    fn emit_create_auth_doc(&mut self) -> Result<Effects, CreateGroupError> {
+    fn emit_auth_create(&mut self) -> Result<Effects, CreateGroupError> {
         let txn_id = self.txn_id.ok_or(CreateGroupError::NoTransactionFound)?;
 
         let group_id = self
@@ -180,7 +178,7 @@ impl CreateGroupOperation {
         let key = group_id.to_bytes().into();
         let value = auth_doc.to_bytes(&self.config.actor)?.into();
         let mut writes = vec![(AUTH_KEYSPACE.to_string(), key, value)];
-        writes.extend(self.admin_reducer_seed_writes()?);
+        writes.extend(self.reducer_seed_writes()?);
 
         Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
@@ -188,7 +186,7 @@ impl CreateGroupOperation {
         })])
     }
 
-    fn admin_reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateGroupError> {
+    fn reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateGroupError> {
         let group_id = self
             .group
             .as_ref()
@@ -242,7 +240,7 @@ impl CreateGroupOperation {
             .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
         let realm_id = self.config.actor.realm_id;
-        let mut writes = vec![admin_document_reducer_state_write_entry(&reducer_state)?];
+        let mut writes = vec![reducer_state_entry(&reducer_state)?];
         for event in admin_events {
             let record = new_outbox_record_with_id(
                 event.event_id,
@@ -256,12 +254,12 @@ impl CreateGroupOperation {
             .fenced_at(self.fence.generation(&realm_id, &placement));
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
-        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+        writes.extend(conflict_write_entries(&reducer_state)?);
 
         Ok(writes)
     }
 
-    fn finish_after_outbox_schedule(&mut self) -> Effects {
+    fn finish_after_schedule(&mut self) -> Effects {
         if let Some(group) = &self.group
             && let Some(auth) = &self.auth_doc
         {
@@ -311,8 +309,8 @@ impl CreateGroupOperation {
         )
     }
 
-    #[tracing::instrument(name = "group.create.fail_on_storage_error", level = "trace", skip(self, event), fields(state = ?self.state, event = ?event))]
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    #[tracing::instrument(name = "group.create.catch_storage_error", level = "trace", skip(self, event), fields(state = ?self.state, event = ?event))]
+    fn catch_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             if matches!(error, StorageError::TransactionConflict)
                 && self.conflicts < CONFLICT_RETRIES
@@ -358,7 +356,7 @@ impl CreateGroupOperation {
         })]
     }
 
-    fn handle_read_realm_config(&mut self, event: Event) -> Effects {
+    fn handle_realm_config(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
@@ -387,7 +385,7 @@ impl CreateGroupOperation {
                     cleanup_effects,
                 )
             }
-            Some(cap) => self.emit_count_owned_groups(cap),
+            Some(cap) => self.emit_owned_count(cap),
             None => {
                 self.state = CreateGroupState::CreateGroup;
                 match self.emit_create_group() {
@@ -410,14 +408,14 @@ impl CreateGroupOperation {
         };
 
         self.state = CreateGroupState::WriteOwnerIndex;
-        match self.emit_write_owner_index() {
+        match self.emit_owner_index() {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
     #[tracing::instrument(name = "group.create.emit_owner_index", level = "debug", skip(self), fields(state = ?self.state))]
-    fn emit_write_owner_index(&mut self) -> Result<Effects, CreateGroupError> {
+    fn emit_owner_index(&mut self) -> Result<Effects, CreateGroupError> {
         let group_id = self
             .group
             .as_ref()
@@ -425,14 +423,14 @@ impl CreateGroupOperation {
             .group_id;
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
             key_space: GROUP_OWNER_INDEX_KEYSPACE.to_string(),
-            key: group_owner_index_key(self.config.actor.user_id, group_id).into(),
+            key: owner_index_key(self.config.actor.user_id, group_id).into(),
             value: ByteView::from(Vec::new()),
             txn_id: self.txn_id,
         })])
     }
 
     #[tracing::instrument(name = "group.create.handle_owner_index_write", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
-    fn handle_write_owner_index(&mut self, event: Event) -> Effects {
+    fn handle_owner_index(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
@@ -444,7 +442,7 @@ impl CreateGroupOperation {
 
         self.state = CreateGroupState::CreateRoles;
         self.resolve_fence();
-        match self.emit_create_auth_doc() {
+        match self.emit_auth_create() {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
@@ -531,14 +529,14 @@ impl CreateGroupOperation {
         }
     }
 
-    fn handle_schedule_document_sync_outbox_drain(&mut self, event: Event) -> Effects {
+    fn handle_drain_schedule(&mut self, event: Event) -> Effects {
         match event {
-            Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_after_outbox_schedule(),
+            Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_after_schedule(),
             // The group is committed either way; the outbox drains on its next
             // wake, so a scheduling failure only delays replication.
             Event::Task(TaskEvent::Error { message, .. }) => {
                 warn!(%message, "Group document outbox drain was not scheduled");
-                self.finish_after_outbox_schedule()
+                self.finish_after_schedule()
             }
             other => self.unexpected_event(
                 CreateGroupState::ScheduleDocumentSyncOutboxDrain,
@@ -627,23 +625,21 @@ impl Operation for CreateGroupOperation {
 
     #[tracing::instrument(name = "group.create.step", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.catch_storage_error(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
 
         match self.state {
             CreateGroupState::StartTransaction => self.handle_start_transaction(event),
-            CreateGroupState::ReadRealmConfig => self.handle_read_realm_config(event),
-            CreateGroupState::CountOwnedGroups => self.handle_count_owned_groups(event),
+            CreateGroupState::ReadRealmConfig => self.handle_realm_config(event),
+            CreateGroupState::CountOwnedGroups => self.handle_owned_count(event),
             CreateGroupState::CreateGroup => self.handle_create_group(event),
-            CreateGroupState::WriteOwnerIndex => self.handle_write_owner_index(event),
+            CreateGroupState::WriteOwnerIndex => self.handle_owner_index(event),
             CreateGroupState::CreateRoles => self.handle_create_roles(event),
             CreateGroupState::ReadBucketFence => self.handle_bucket_fence(event),
             CreateGroupState::CommitTransaction => self.handle_commit_transaction(event),
-            CreateGroupState::ScheduleDocumentSyncOutboxDrain => {
-                self.handle_schedule_document_sync_outbox_drain(event)
-            }
+            CreateGroupState::ScheduleDocumentSyncOutboxDrain => self.handle_drain_schedule(event),
             CreateGroupState::Init | CreateGroupState::Finish | CreateGroupState::Error => {
                 smallvec![]
             }
@@ -744,7 +740,7 @@ mod test {
         let realm_id = RealmId([3; 32]);
         let actor = actor(realm_id, 1, 2);
         let txn_id = Ulid::from_bytes([4; 16]);
-        let mut operation = operation_ready_to_schedule(actor, txn_id);
+        let mut operation = ready_to_schedule(actor, txn_id);
         let conflict = || {
             Event::Storage(StorageEvent::Error {
                 error: aruna_core::errors::StorageError::TransactionConflict,
@@ -772,8 +768,8 @@ mod test {
         ));
     }
 
-    fn operation_ready_to_schedule(actor: Actor, txn_id: TxnId) -> CreateGroupOperation {
-        let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
+    fn ready_to_schedule(actor: Actor, txn_id: TxnId) -> CreateGroupOperation {
+        let auth_doc = GroupAuthorizationDocument::default_group_doc(
             actor.user_id,
             actor.realm_id,
             Ulid::from_bytes([9; 16]),
@@ -873,7 +869,7 @@ mod test {
             effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { .. })]
         ));
-        let writes = operation.admin_reducer_seed_writes().unwrap();
+        let writes = operation.reducer_seed_writes().unwrap();
         let records = write_values(&writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
@@ -908,7 +904,7 @@ mod test {
     }
 
     #[test]
-    fn seeds_group_reducer_state_and_admin_outbox_in_order() {
+    fn seeds_reducer_outbox() {
         let realm_id = RealmId::from_bytes([2; 32]);
         let actor = actor(realm_id, 3, 4);
         let txn_id = TxnId::generate();
@@ -937,7 +933,7 @@ mod test {
             other => panic!("unexpected group write effect: {other:?}"),
         }
 
-        let effects = operation.emit_create_auth_doc().unwrap();
+        let effects = operation.emit_auth_create().unwrap();
         let writes = batch_writes(&effects, txn_id);
         let target = AdminDocumentTarget::Group {
             group_id: group.group_id,
@@ -961,11 +957,11 @@ mod test {
             auth_doc.roles.keys().copied().collect::<BTreeSet<_>>()
         );
         assert_eq!(
-            reducer_state.materialized_group_display_name().as_deref(),
+            reducer_state.materialized_group_name().as_deref(),
             Some(group.display_name.as_str())
         );
         assert_eq!(
-            reducer_state.materialized_group_realm_id(),
+            reducer_state.materialized_group_realm(),
             Some(group.realm_id)
         );
         assert!(reducer_state.conflicts.is_empty());
@@ -976,7 +972,7 @@ mod test {
             .find(|role| role.name == "admin")
             .unwrap();
         assert!(
-            reducer_state.materialized_group_role_user_assignments()[&admin_role.role_id]
+            reducer_state.materialized_group_assignments()[&admin_role.role_id]
                 .contains(&actor.user_id)
         );
 
@@ -1039,11 +1035,11 @@ mod test {
     }
 
     #[test]
-    fn schedules_outbox_drain_and_finishes_without_direct_replication() {
+    fn schedule_finishes() {
         let realm_id = RealmId::from_bytes([5; 32]);
         let actor = actor(realm_id, 6, 7);
         let txn_id = TxnId::generate();
-        let mut operation = operation_ready_to_schedule(actor, txn_id);
+        let mut operation = ready_to_schedule(actor, txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id,
@@ -1150,7 +1146,7 @@ mod test {
     }
 
     #[tokio::test]
-    pub async fn owner_cap_blocks_creation_at_limit() {
+    pub async fn owner_cap_blocks() {
         let random_path = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();

@@ -1,10 +1,6 @@
 //! Guarded writes into a folder the owner syncs on their own machine.
-//!
-//! Every operation here is non-destructive by construction: a write lands only
-//! through a guard the adapter re-verifies at rename time, a conflicted copy
-//! never replaces anything, and a removal moves the file aside instead of
-//! unlinking it. The guard repeats the operation's decision on purpose, because
-//! the file may change between the decision and the write.
+//! Writes land only through a guard re-verified at rename time, conflicted
+//! copies never replace anything, and removals move files aside.
 
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{LocalFileEvent, LocalFileRefusal};
@@ -280,9 +276,8 @@ async fn jailed_target(root: &str, relative: &str) -> Result<(PathBuf, PathBuf),
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new(""),
     };
-    // Directories are created only once the deepest part that already exists is
-    // proved to be inside the root, so a link on the way out is never followed
-    // and never extended.
+    // Directories are created only after the deepest existing ancestor is
+    // jailed inside the root, so a link on the way out is never followed.
     let anchor = jailed_ancestor(&root, parent).await?;
     if !anchor.starts_with(&root) {
         return Err(escaped);
@@ -423,11 +418,9 @@ async fn write_temp(
     })
 }
 
-/// The second half of the replace rule, without a window between the check and
-/// the write: the spool and the target swap places atomically, and the bytes
-/// that were displaced are identified afterwards. Only bytes that match the
-/// guard are discarded; anything else is put back, and if even that fails the
-/// owner's bytes are moved aside rather than lost.
+/// The second half of the replace rule: the spool and target swap places
+/// atomically, then only displaced bytes matching the guard are discarded;
+/// anything else is restored, or moved aside if restoring fails.
 #[cfg(not(windows))]
 async fn exchange_guarded(
     spool: &Path,
@@ -441,9 +434,8 @@ async fn exchange_guarded(
         return Err(PlaceError::Refused(LocalFileRefusal::NotRegular));
     }
     exchange(spool, target)?;
-    // The displaced file now sits at the spool path. Only its strong hash can
-    // answer for it here: the exchange moved its name, and with it the change
-    // time its weak fingerprint carries.
+    // The displaced file now sits at the spool path, where only its strong
+    // hash can answer for it: the exchange renamed away its fingerprint.
     let displaced = match hash_stable(spool).await {
         Ok((_, hash, _)) => &hash == blake3,
         Err(_) => false,
@@ -780,9 +772,8 @@ mod tests {
         assert_eq!(tokio::fs::read(&file).await.unwrap(), b"newer");
     }
 
-    // The fingerprint a write reports must be the one the next observation
-    // reads, or every synced file would look changed the moment it landed and
-    // be uploaded and conflicted again on the next pass.
+    // The fingerprint a write reports must match the next observation, or
+    // every synced file would look changed and upload again.
     #[tokio::test]
     async fn write_matches_listing() {
         let root = tempfile::tempdir().unwrap();
@@ -1027,9 +1018,8 @@ mod tests {
         assert!(!outside.path().join("note.txt").exists());
     }
 
-    // The trash and the write spool are this node's bookkeeping and live in the
-    // reserved directory. Everything else in the folder is the owner's, whatever
-    // it is named, and a sweep must never remove it.
+    // Trash and write spool are this node's bookkeeping in the reserved
+    // directory; a sweep must never remove the owner's other files.
     #[tokio::test]
     async fn hides_reserved_entries() {
         let root = tempfile::tempdir().unwrap();

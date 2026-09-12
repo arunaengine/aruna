@@ -1,4 +1,4 @@
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::require_unrestricted_auth;
 use crate::cors::CorsConfig;
 use crate::server_state::ServerState;
 use axum::Router;
@@ -300,7 +300,7 @@ async fn mcp_auth(State(state): State<Arc<ServerState>>, request: Request, next:
         .get::<Option<aruna_core::structs::AuthContext>>()
         .cloned()
         .flatten();
-    match require_unrestricted_realm_auth(&state, auth) {
+    match require_unrestricted_auth(&state, auth) {
         Ok(_) => next.run(request).await,
         Err(crate::error::ServerError::Unauthorized) => auth_error(StatusCode::UNAUTHORIZED),
         Err(_) => auth_error(StatusCode::FORBIDDEN),

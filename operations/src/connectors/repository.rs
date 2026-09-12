@@ -26,7 +26,7 @@ pub fn source_connector_prefix(group_id: GroupId) -> Key {
     ByteView::from(group_id.to_bytes().to_vec())
 }
 
-pub fn source_connector_secret_key(connector_id: Ulid) -> Key {
+pub fn connector_secret_key(connector_id: Ulid) -> Key {
     ByteView::from(connector_id.to_bytes().to_vec())
 }
 
@@ -42,10 +42,10 @@ pub fn read_connector_effect(
     })
 }
 
-pub fn read_connector_secret_effect(connector_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub fn read_secret_effect(connector_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
-        key: source_connector_secret_key(connector_id),
+        key: connector_secret_key(connector_id),
         txn_id,
     })
 }
@@ -62,10 +62,10 @@ pub fn delete_connector_effect(
     })
 }
 
-pub fn delete_connector_secret_effect(connector_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub fn delete_secret_effect(connector_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Delete {
         key_space: SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
-        key: source_connector_secret_key(connector_id),
+        key: connector_secret_key(connector_id),
         txn_id,
     })
 }
@@ -84,10 +84,7 @@ pub fn iter_connectors_effect(
     })
 }
 
-pub fn iter_connector_reference_versions_effect(
-    start_after: Option<Key>,
-    txn_id: Option<TxnId>,
-) -> Effect {
+pub fn reference_scan_effect(start_after: Option<Key>, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Iter {
         key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
         prefix: None,
@@ -101,9 +98,7 @@ pub fn parse_connector_read(event: Event) -> Result<Option<SourceConnector>, Sto
     parse_storage_read(event, SourceConnector::from_bytes)
 }
 
-pub fn parse_connector_secret_read(
-    event: Event,
-) -> Result<Option<SourceConnectorSecret>, StorageReadError> {
+pub fn parse_secret_read(event: Event) -> Result<Option<SourceConnectorSecret>, StorageReadError> {
     parse_storage_read(event, SourceConnectorSecret::from_bytes)
 }
 
@@ -113,13 +108,13 @@ pub fn parse_connector_iter(
     parse_storage_iter(event, SourceConnector::from_bytes)
 }
 
-pub fn parse_blob_version_iter(
+pub fn parse_version_iter(
     event: Event,
 ) -> Result<(Vec<BlobVersion>, Option<Key>), StorageReadError> {
     parse_storage_iter(event, BlobVersion::from_bytes)
 }
 
-pub fn blob_version_references_connector(version: &BlobVersion, connector_id: Ulid) -> bool {
+pub fn references_connector(version: &BlobVersion, connector_id: Ulid) -> bool {
     matches!(
         &version.state,
         BlobVersionState::Reference { source, .. } if source.connector_id == Some(connector_id)
@@ -152,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn connector_prefix_matches_group_scoped_key() {
+    fn prefix_matches_group() {
         let record = sample_record();
         let prefix = source_connector_prefix(record.group_id);
         let key = source_connector_key(record.group_id, record.connector_id);
@@ -162,15 +157,15 @@ mod tests {
     }
 
     #[test]
-    fn connector_secret_key_is_connector_id() {
+    fn secret_key_encoding() {
         let record = sample_record();
-        let key = source_connector_secret_key(record.connector_id);
+        let key = connector_secret_key(record.connector_id);
 
         assert_eq!(key.as_ref(), record.connector_id.to_bytes().as_slice());
     }
 
     #[test]
-    fn parse_connector_iter_decodes_records() {
+    fn decodes_connector_page() {
         let record = sample_record();
         let next_key = source_connector_key(record.group_id, Ulid::from_bytes([6u8; 16]));
         let event = Event::Storage(StorageEvent::IterResult {

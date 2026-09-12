@@ -619,7 +619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn roundtrips_bucket_cors_configuration() {
+    async fn configuration_roundtrips() {
         let context = make_context();
         let bucket = "my-bucket";
         let original = bucket_info(None);
@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_missing_bucket_and_missing_config() {
+    async fn missing_config_rejected() {
         let bucket = "missing-bucket".to_string();
 
         let context = make_context();

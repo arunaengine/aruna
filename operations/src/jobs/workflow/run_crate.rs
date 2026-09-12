@@ -16,7 +16,7 @@ pub(crate) const PROCESS_PROFILE: &str = "https://w3id.org/ro/wfrun/process/0.5"
 const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket";
 
 use super::super::executor::{JobContext, JobRunOutcome};
-use super::super::store::{put_run_crate_status, read_job_record, read_run_crate_status};
+use super::super::store::{put_crate_status, read_crate_status, read_job_record};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
 use crate::metadata::MetadataAuthToken;
@@ -30,12 +30,12 @@ use crate::notifications::watch::emit::emit_metadata_created;
 /// Run the follow-on run-crate obligation for a finished execution job. A failure
 /// records a durable status and never fails the parent; this internal job succeeds
 /// once the outcome is recorded so it is not retried forever on a permanent error.
-pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome {
+pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome {
     let context = ctx.driver.as_ref();
     let storage = &context.storage_handle;
 
     // A re-driven crate job returns a previously recorded outcome without recreating it.
-    let saved_id = match read_run_crate_status(storage, for_job).await {
+    let saved_id = match read_crate_status(storage, for_job).await {
         Ok(Some(RunCrateStatus::Written { resource })) => {
             return JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource });
         }
@@ -98,7 +98,7 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
     };
     if saved_id.is_none()
         && let Err(error) =
-            put_run_crate_status(storage, for_job, &RunCrateStatus::Minted { document_id }).await
+            put_crate_status(storage, for_job, &RunCrateStatus::Minted { document_id }).await
     {
         return JobRunOutcome::Failed(JobError::retryable(format!(
             "run crate status write failed: {error}"
@@ -141,7 +141,7 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
         let status = RunCrateStatus::Denied {
             message: "metadata write access denied".to_string(),
         };
-        if let Err(error) = put_run_crate_status(storage, for_job, &status).await {
+        if let Err(error) = put_crate_status(storage, for_job, &status).await {
             return JobRunOutcome::Failed(JobError::retryable(format!(
                 "run crate status write failed: {error}"
             )));
@@ -151,7 +151,7 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
         });
     }
 
-    let jsonld = build_run_crate_jsonld(&parent, spec, document_id);
+    let jsonld = build_crate_jsonld(&parent, spec, document_id);
 
     let (status, resource) = match create_metadata_document_routed(
         CreateMetadataDocumentOperation::new_for_generated_document_id(
@@ -208,7 +208,7 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
             (status, resource)
         }
     };
-    if let Err(error) = put_run_crate_status(storage, for_job, &status).await {
+    if let Err(error) = put_crate_status(storage, for_job, &status).await {
         return JobRunOutcome::Failed(JobError::retryable(format!(
             "run crate status write failed: {error}"
         )));
@@ -222,7 +222,7 @@ fn is_transient(error: &MetadataWriteError) -> bool {
 
 /// RO-Crate 1.2 JSON-LD conforming to the Process Run Crate 0.5 profile. No
 /// secrets are included (spec 16.10).
-fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id: Ulid) -> String {
+fn build_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id: Ulid) -> String {
     let root = format!("https://w3id.org/aruna/{document_id}");
     let action_id = format!("#run-{}", record.job_id);
     let agent_id = format!("#agent-{}", record.created_by);
@@ -626,7 +626,7 @@ mod tests {
 
     fn parse(record: &JobRecord, spec: &ExecutionSpec) -> serde_json::Value {
         let doc = Ulid::from_bytes(record.job_id.to_bytes());
-        serde_json::from_str(&build_run_crate_jsonld(record, spec, doc)).unwrap()
+        serde_json::from_str(&build_crate_jsonld(record, spec, doc)).unwrap()
     }
 
     fn entity_id(value: &Value) -> Option<&str> {
@@ -731,7 +731,7 @@ mod tests {
         let (record, spec) = execution_record();
         let document_id = Ulid::from_bytes(record.job_id.to_bytes());
         let root_id = format!("https://w3id.org/aruna/{document_id}");
-        let jsonld = build_run_crate_jsonld(&record, &spec, document_id);
+        let jsonld = build_crate_jsonld(&record, &spec, document_id);
         let directory = tempfile::tempdir().unwrap();
         let node = craqle::CraqleNode::open(directory.path()).unwrap();
         let graph_id = craqle::GraphId::new(&root_id);
@@ -788,14 +788,13 @@ mod tests {
     }
 
     #[test]
-    fn crate_meets_builtin_profile() {
+    fn meets_builtin_profile() {
         // The built-in shapes must accept what this generator writes.
         use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
         use crate::metadata::profile_shacl::{ProfileShaclEngine, ProfileShapes};
 
         let (record, spec) = execution_record();
-        let jsonld =
-            build_run_crate_jsonld(&record, &spec, Ulid::from_bytes(record.job_id.to_bytes()));
+        let jsonld = build_crate_jsonld(&record, &spec, Ulid::from_bytes(record.job_id.to_bytes()));
         let directory = tempfile::tempdir().unwrap();
         let engine = ProfileShaclEngine::open(directory.path()).unwrap();
         let report = engine

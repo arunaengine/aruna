@@ -1,6 +1,6 @@
 // net/src/dht/kbucket.rs
+use aruna_core::id::xor_distance_32;
 use aruna_core::id::{NodeId, NodeIdExt};
-use aruna_core::util::xor_distance_32;
 use std::collections::VecDeque;
 
 /// Maximum entries per bucket (standard Kademlia k value)
@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn test_routing_table_closest() {
+    fn routing_table_closest() {
         let local = make_node(0);
         let mut table = RoutingTable::new(local);
 

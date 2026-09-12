@@ -134,9 +134,8 @@ async fn separates_peer_authority() {
 
 #[tokio::test]
 async fn refuses_unknown_offer() {
-    // A launch offer from a node outside the realm is declined before any
-    // admission work, and an offer naming another target is not this node's
-    // launch to accept.
+    // An offer from outside the realm is declined before admission, and one naming
+    // another target is not this node's launch to accept.
     let (_dir, context, net, family) = fixture().await;
     let spec = family.spec();
     let launch = family.launch(&spec, family.holder.public(), 0);

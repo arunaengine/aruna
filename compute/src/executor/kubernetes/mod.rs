@@ -12,7 +12,7 @@ use aruna_core::compute::{
     NOBODY, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec,
     TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
 };
-use aruna_core::util::tail_str;
+use aruna_core::structs::tail_str;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -1754,10 +1754,9 @@ fn pull_refused(reason: &str, message: Option<&str>) -> bool {
     .any(|needle| message.contains(needle))
 }
 
-/// Kubernetes retries a failing image pull forever, so the Job counts such a
-/// Pod as active and never reports a terminal condition. A malformed or refused
-/// reference fails at once; a repeated failure fails once it outlives
-/// `deadline`, which is anchored at the Pod start and so also covers scheduling.
+/// Kubernetes retries a failing image pull forever, so the Job counts such a Pod
+/// as active and never reports a terminal condition. A malformed or refused
+/// reference fails at once; a repeated one fails once it outlives `deadline`.
 fn pod_stuck_reason(pod: &Pod, deadline: Duration, now: Timestamp) -> Option<String> {
     let status = pod.status.as_ref()?;
     let waited = status
@@ -2633,6 +2632,7 @@ mod tests {
                 (404, status_json(404))
             }),
             config: test_config(),
+            policies: Vec::new(),
         };
         let context = context();
         let spec = TaskSpec::new(context.attempt.clone(), "registry.example/task:latest");
@@ -2724,6 +2724,7 @@ mod tests {
         let backend = KubernetesBackend {
             client,
             config: test_config(),
+            policies: Vec::new(),
         };
         let context = context();
         let spec = TaskSpec::new(context.attempt.clone(), "registry.example/task:latest");
@@ -2783,7 +2784,11 @@ mod tests {
         });
         let mut config = test_config();
         config.s3_cidrs.push("10.0.0.0/24".to_string());
-        let backend = KubernetesBackend { client, config };
+        let backend = KubernetesBackend {
+            client,
+            config,
+            policies: Vec::new(),
+        };
         let context = context();
         let mut spec = TaskSpec::new(context.attempt.clone(), "registry.example/task:latest");
         spec.staging_mode = StagingMode::DirectS3;
@@ -3273,7 +3278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_uses_pod_start() {
+    async fn prefers_pod_start() {
         // The Job publishes startTime only once its controller processed it, so
         // the running container is the earlier evidence.
         let client = fake_client(|method, path| match (method, path) {

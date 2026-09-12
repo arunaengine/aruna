@@ -12,7 +12,7 @@ use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
 };
 use aruna_core::operation::Operation;
-use aruna_core::storage_entries::metadata_document_lifecycle_revision_change;
+use aruna_core::storage_entries::lifecycle_revision_change;
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::PlacementRef;
@@ -27,7 +27,7 @@ use ulid::Ulid;
 
 use crate::document_repository;
 use crate::sync::document_outbox::{
-    new_outbox_record, schedule_outbox_drain_effect, write_outbox_effect,
+    new_outbox_record, schedule_drain_effect, write_outbox_effect,
 };
 
 const USER_SYNC_PAGE_SIZE: usize = 256;
@@ -99,17 +99,17 @@ impl AnnounceTopicOperation {
         document: Option<DocumentSyncTarget>,
         allow_genesis: bool,
     ) -> Self {
-        Self::new_for_document_with_peers(topic, local_node_id, document, Vec::new(), allow_genesis)
+        Self::new_with_peers(topic, local_node_id, document, Vec::new(), allow_genesis)
     }
 
-    pub fn new_for_document_with_peers(
+    pub fn new_with_peers(
         topic: TopicId,
         local_node_id: NodeId,
         document: Option<DocumentSyncTarget>,
         peers: Vec<NodeId>,
         allow_genesis: bool,
     ) -> Self {
-        Self::new_for_document_with_peers_and_placement(
+        Self::new_with_placement(
             topic,
             local_node_id,
             document,
@@ -119,7 +119,7 @@ impl AnnounceTopicOperation {
         )
     }
 
-    pub fn new_for_document_with_peers_and_placement(
+    pub fn new_with_placement(
         topic: TopicId,
         local_node_id: NodeId,
         document: Option<DocumentSyncTarget>,
@@ -142,7 +142,7 @@ impl AnnounceTopicOperation {
         }
     }
 
-    pub fn new_for_document_with_peers_and_bytes(
+    pub fn new_with_bytes(
         topic: TopicId,
         local_node_id: NodeId,
         document: DocumentSyncTarget,
@@ -201,7 +201,7 @@ impl AnnounceTopicOperation {
         }
     }
 
-    fn write_document_outbox_effect(
+    fn write_outbox(
         &mut self,
         document: DocumentSyncTarget,
         bytes: Vec<u8>,
@@ -210,13 +210,13 @@ impl AnnounceTopicOperation {
             Ok(change) => change,
             Err(error) => return self.fail(error),
         };
-        self.write_document_outbox_event_effect(
+        self.write_outbox_event(
             document,
             DocumentSyncOutboxEvent::Upsert { bytes, change },
         )
     }
 
-    fn write_document_outbox_event_effect(
+    fn write_outbox_event(
         &mut self,
         document: DocumentSyncTarget,
         event: DocumentSyncOutboxEvent,
@@ -314,7 +314,7 @@ impl AnnounceTopicOperation {
                         record.document_id()
                     )));
                 }
-                Ok(metadata_document_lifecycle_revision_change(
+                Ok(lifecycle_revision_change(
                     &record,
                     self.local_node_id,
                     self.placement,
@@ -363,13 +363,11 @@ impl AnnounceTopicOperation {
                 }
                 Ok(placement_policy_change(&document, self.placement))
             }
-            // These are single-writer per key and applied as plain upserts (last event
-            // wins), so the change only needs a monotonic wall-clock generation from
-            // this node.
+            // Single-writer upserts need only this node's monotonic wall-clock generation.
             DocumentSyncTarget::NodeUsage { .. }
             | DocumentSyncTarget::WatchInterest { .. }
             | DocumentSyncTarget::NodeInfo { .. } => {
-                let now = aruna_core::util::unix_timestamp_millis();
+                let now = aruna_core::time::unix_timestamp_millis();
                 Ok(DocumentSyncChange {
                     base: None,
                     current: DocumentSyncRevision {
@@ -389,7 +387,7 @@ impl AnnounceTopicOperation {
         match self.pending.pop_front() {
             Some(PendingDocumentSync::Document { document, bytes }) => {
                 if let Some(bytes) = bytes {
-                    self.write_document_outbox_effect(document, bytes)
+                    self.write_outbox(document, bytes)
                 } else {
                     self.current = Some(document.clone());
                     self.state = AnnounceTopicState::ReadDocument;
@@ -436,7 +434,7 @@ impl Operation for AnnounceTopicOperation {
                     let Some(bytes) = value else {
                         return self.next_effect();
                     };
-                    self.write_document_outbox_effect(document, bytes.to_vec())
+                    self.write_outbox(document, bytes.to_vec())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
@@ -484,7 +482,7 @@ impl Operation for AnnounceTopicOperation {
                         );
                     }
                     self.state = AnnounceTopicState::ScheduleSync;
-                    smallvec![schedule_outbox_drain_effect()]
+                    smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => {
@@ -566,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn provided_document_bytes_skip_readback_before_outbox_write() {
+    fn provided_skips_read() {
         for allow_genesis in [false, true] {
             let local_node_id = local_node_id();
             let lifecycle = MetadataGraphLifecycleRecord::deleted(
@@ -580,7 +578,7 @@ mod tests {
                 graph_iri: lifecycle.graph_iri.clone(),
             };
             let bytes = postcard::to_allocvec(&lifecycle).expect("lifecycle serializes");
-            let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_bytes(
+            let mut operation = AnnounceTopicOperation::new_with_bytes(
                 document.topic_id(),
                 local_node_id,
                 document.clone(),
@@ -607,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_aware_announce_stamps_resolved_reference() {
+    fn announce_stamps_placement() {
         let local_node_id = local_node_id();
         let lifecycle = MetadataGraphLifecycleRecord::deleted(
             "urn:graph:placed-announce".to_string(),
@@ -624,7 +622,7 @@ mod tests {
             strategy_id: Ulid::from_bytes([8; 16]),
             shard: 5,
         };
-        let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_placement(
+        let mut operation = AnnounceTopicOperation::new_with_placement(
             document.topic_id(),
             local_node_id,
             Some(document),
@@ -649,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn every_admin_document_target_refuses_whole_document_announce() {
+    fn admin_refuses_announce() {
         let local_node_id = local_node_id();
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let group_id = GroupId::generate();
@@ -664,7 +662,7 @@ mod tests {
 
         for target in admin_targets {
             assert!(target.is_admin_document(), "misclassified {target:?}");
-            let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_bytes(
+            let mut operation = AnnounceTopicOperation::new_with_bytes(
                 target.topic_id(),
                 local_node_id,
                 target.clone(),
@@ -688,10 +686,10 @@ mod tests {
     }
 
     #[test]
-    fn user_document_announcement_fails_without_revision() {
+    fn user_requires_revision() {
         let local_node_id = local_node_id();
         let (_, document) = user_document();
-        let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_bytes(
+        let mut operation = AnnounceTopicOperation::new_with_bytes(
             document.topic_id(),
             local_node_id,
             document,
@@ -711,11 +709,11 @@ mod tests {
     }
 
     #[test]
-    fn admin_document_announcement_fails_without_revision() {
+    fn admin_requires_revision() {
         let local_node_id = local_node_id();
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let document = DocumentSyncTarget::RealmConfig { realm_id };
-        let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_bytes(
+        let mut operation = AnnounceTopicOperation::new_with_bytes(
             document.topic_id(),
             local_node_id,
             document,

@@ -281,7 +281,7 @@ fn envelope_rejects_target() {
 }
 
 #[test]
-fn stale_hints_only_rank() {
+fn stale_hints_rank() {
     // Exhausted and stale telemetry lower the rank of the only target but
     // never deny it, because exact admission belongs to the target.
     let target = node(2);
@@ -568,7 +568,7 @@ fn reports_policy_gaps() {
 }
 
 #[test]
-fn ties_break_by_node() {
+fn ties_break_node() {
     // Equal scores fall back to node id bytes, then executor kind.
     let (low, high) = (node(2), node(3));
     let (low, high) = match low.as_bytes() < high.as_bytes() {

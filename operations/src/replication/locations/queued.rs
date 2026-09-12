@@ -192,9 +192,8 @@ mod tests {
 
     #[test]
     fn skips_declined_markers() {
-        // A scoped job that does not replicate delete markers will skip this
-        // version, so reporting its target as pending would promise a copy
-        // that is never coming.
+        // A scoped job that skips delete markers will skip this version, so
+        // reporting its target pending would promise a copy never coming.
         let mut operation = QueuedReplicaNodesOperation::new(
             "raw".to_string(),
             "run1.tar".to_string(),

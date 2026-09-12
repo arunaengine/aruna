@@ -16,7 +16,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{
     JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, LogicalJobSpec,
     RealmConfigDocument, RealmId, RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode,
-    job_owner_index_key, job_record_key,
+    job_record_key, owner_index_key,
 };
 use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
 use smallvec::smallvec;
@@ -305,7 +305,7 @@ impl AdmitSubmissionOperation {
         ));
         writes.push((
             JOB_OWNER_INDEX_KEYSPACE.to_string(),
-            job_owner_index_key(record.created_by, record.created_at_ms, record.job_id),
+            owner_index_key(record.created_by, record.created_at_ms, record.job_id),
             Value::from(Vec::<u8>::new().as_slice()),
         ));
         writes.push((

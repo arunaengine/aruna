@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
     REFERENCE_METADATA_REFRESH_JOB_KEYSPACE,
 };
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use tracing::{info, warn};
@@ -200,7 +200,7 @@ pub async fn probe_outbox_lag(
         for key in &keys {
             // Outbox keys end in the record's ULID, whose timestamp is the
             // enqueue time.
-            if let Some(record_ms) = ulid_suffix_timestamp_ms(key) {
+            if let Some(record_ms) = ulid_timestamp_ms(key) {
                 oldest_record_ms =
                     Some(oldest_record_ms.map_or(record_ms, |oldest| oldest.min(record_ms)));
             }
@@ -243,7 +243,7 @@ pub async fn probe_materialization_lag(
         depth += keys.len();
         for key in &keys {
             // Job keys are prefixed with the big-endian due timestamp.
-            let Some(due_at_ms) = due_at_prefix_ms(key) else {
+            let Some(due_at_ms) = due_prefix_ms(key) else {
                 continue;
             };
             if due_at_ms <= now_ms {
@@ -348,7 +348,7 @@ async fn iter_page(
     }
 }
 
-fn ulid_suffix_timestamp_ms(key: &[u8]) -> Option<u64> {
+fn ulid_timestamp_ms(key: &[u8]) -> Option<u64> {
     if key.len() < 16 {
         return None;
     }
@@ -356,7 +356,7 @@ fn ulid_suffix_timestamp_ms(key: &[u8]) -> Option<u64> {
     Some(Ulid::from_bytes(bytes).timestamp_ms())
 }
 
-fn due_at_prefix_ms(key: &[u8]) -> Option<u64> {
+fn due_prefix_ms(key: &[u8]) -> Option<u64> {
     let bytes: [u8; 8] = key.get(..8)?.try_into().ok()?;
     Some(u64::from_be_bytes(bytes))
 }
@@ -367,20 +367,20 @@ mod tests {
     use aruna_storage::FjallStorage;
 
     #[test]
-    fn ulid_suffix_timestamp_round_trips() {
+    fn ulid_suffix_trips() {
         let ulid = Ulid::from_parts(1_750_000_000_000, 42);
         let mut key = b"document-sync-outbox-v1/upsert/".to_vec();
         key.extend_from_slice(&ulid.to_bytes());
-        assert_eq!(ulid_suffix_timestamp_ms(&key), Some(1_750_000_000_000));
-        assert_eq!(ulid_suffix_timestamp_ms(b"short"), None);
+        assert_eq!(ulid_timestamp_ms(&key), Some(1_750_000_000_000));
+        assert_eq!(ulid_timestamp_ms(b"short"), None);
     }
 
     #[test]
-    fn due_at_prefix_parses_big_endian_timestamp() {
+    fn due_at_timestamp() {
         let mut key = 1_234_567u64.to_be_bytes().to_vec();
         key.extend_from_slice(&[0u8; 32]);
-        assert_eq!(due_at_prefix_ms(&key), Some(1_234_567));
-        assert_eq!(due_at_prefix_ms(&[1, 2, 3]), None);
+        assert_eq!(due_prefix_ms(&key), Some(1_234_567));
+        assert_eq!(due_prefix_ms(&[1, 2, 3]), None);
     }
 
     async fn write_key(storage: &StorageHandle, key_space: &str, key: Vec<u8>) {
@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_outbox_reports_depth_and_age() {
+    async fn probe_outbox_age() {
         let temp = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
 
@@ -421,7 +421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_queue_depth_counts_records() {
+    async fn probe_queue_records() {
         let temp = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         for index in 0u32..3 {

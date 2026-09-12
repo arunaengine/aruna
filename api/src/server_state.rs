@@ -432,11 +432,10 @@ impl ServerState {
     }
 
     pub async fn register_rest_interface(&self, bind_address: SocketAddr) {
-        self.register_rest_interface_with_public_url(bind_address, None)
-            .await;
+        self.register_rest_interface(bind_address, None).await;
     }
 
-    pub async fn register_rest_interface_with_public_url(
+    pub async fn register_rest_interface(
         &self,
         bind_address: SocketAddr,
         public_url: Option<&str>,
@@ -452,7 +451,7 @@ impl ServerState {
         let mut interface_state = self.interface_state.write().await;
         interface_state.s3 = Some(S3InterfaceRuntime {
             bind_address,
-            base_url: client_base_url_from_advertised_host(advertised_host, bind_address),
+            base_url: client_host_url(advertised_host, bind_address),
         });
     }
 
@@ -493,8 +492,8 @@ impl ServerState {
         portal.status = status;
     }
 
-    pub async fn load_metadata_realm_nodes(&self) -> Vec<NodeId> {
-        aruna_operations::metadata::api::load_metadata_realm_nodes(
+    pub async fn load_realm_nodes(&self) -> Vec<NodeId> {
+        aruna_operations::metadata::api::load_realm_nodes(
             self.driver_ctx.as_ref(),
             self.realm_id,
             self.node_id,
@@ -502,7 +501,7 @@ impl ServerState {
         .await
     }
 
-    pub async fn get_oidc_provider_by_token(
+    pub async fn get_oidc_provider(
         &self,
         selector: &OidcTokenSelector,
     ) -> Result<OidcProviderConfig, OidcError> {
@@ -549,7 +548,7 @@ impl ServerState {
             .map(|net_handle| net_handle.endpoint_addr())
     }
 
-    pub fn realm_private_key_pem(&self) -> Option<String> {
+    pub fn realm_key_pem(&self) -> Option<String> {
         match &self.node_capabilities {
             NodeCapabilities::Management {
                 realm_signing_key, ..
@@ -574,7 +573,7 @@ impl ServerState {
         }
     }
 
-    pub async fn issue_onboarding_sync_ticket(
+    pub async fn issue_sync_ticket(
         &self,
         node_id: NodeId,
     ) -> Result<OnboardingSyncTicket, OnboardingSecretError> {
@@ -598,7 +597,7 @@ impl ServerState {
         }
     }
 
-    pub async fn issuer_key_cache_len(&self) -> usize {
+    pub async fn issuer_cache_len(&self) -> usize {
         self.issuer_keys.len().await
     }
 
@@ -615,7 +614,7 @@ impl ServerState {
             .is_some()
     }
 
-    pub async fn claim_initial_realm_admin(
+    pub async fn claim_initial_admin(
         &self,
         auth: &AuthContext,
     ) -> Result<(), ClaimInitialRealmAdminError> {
@@ -648,7 +647,7 @@ impl ServerState {
                 Ok(ClaimInitialRealmAdminResult::Claimed(_))
                 | Ok(ClaimInitialRealmAdminResult::AlreadyClaimed) => {
                     initial_admin_claim.store(true, Ordering::Release);
-                    self.persist_initial_admin_claimed().await;
+                    self.persist_admin_claim().await;
                     return Ok(());
                 }
                 Err(ClaimInitialRealmAdminError::StorageError(
@@ -678,7 +677,7 @@ impl ServerState {
         .await;
     }
 
-    async fn persist_initial_admin_claimed(&self) {
+    async fn persist_admin_claim(&self) {
         let Some(initial_admin_claim) = &self.initial_admin_claim else {
             return;
         };
@@ -769,19 +768,15 @@ where
     }
 }
 
-/// Create the SwaggerUI router for API documentation.
-///
-/// Provides two separate OpenAPI specs:
-/// - `/api-docs/openapi.json` - REST & Admin API
-/// - `/api-docs/s3-openapi.json` - S3-compatible API
+/// Creates Swagger UI for the REST/Admin and S3 OpenAPI specifications.
+/// Serves them at `/api-docs/openapi.json` and `/api-docs/s3-openapi.json`.
 pub fn swagger_ui() -> SwaggerUi {
     SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi())
 }
 
 impl RestInterfaceRuntime {
     pub fn from_bind_address(bind_address: SocketAddr, public_url: Option<&str>) -> Self {
-        let base_url =
-            client_base_url_from_advertised_host(public_url.unwrap_or_default(), bind_address);
+        let base_url = client_host_url(public_url.unwrap_or_default(), bind_address);
         Self {
             bind_address,
             api_base_url: format!("{base_url}/api/v1"),
@@ -792,31 +787,28 @@ impl RestInterfaceRuntime {
     }
 }
 
-pub fn client_base_url_from_bind_address(bind_address: SocketAddr) -> String {
+pub fn client_bind_url(bind_address: SocketAddr) -> String {
     format!(
         "http://{}:{}",
-        client_host_from_ip(bind_address.ip()),
+        host_for_ip(bind_address.ip()),
         bind_address.port()
     )
 }
 
-pub fn client_base_url_from_advertised_host(
-    advertised_host: &str,
-    bind_address: SocketAddr,
-) -> String {
+pub fn client_host_url(advertised_host: &str, bind_address: SocketAddr) -> String {
     let host = match advertised_host.trim() {
-        "" => return client_base_url_from_bind_address(bind_address),
+        "" => return client_bind_url(bind_address),
         host => {
             if host.contains("://") {
                 return host.trim_end_matches('/').to_string();
             }
 
             if let Ok(addr) = host.parse::<SocketAddr>() {
-                return format!("http://{}:{}", client_host_from_ip(addr.ip()), addr.port());
+                return format!("http://{}:{}", host_for_ip(addr.ip()), addr.port());
             }
 
             if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                return format!("http://{}:{}", client_host_from_ip(ip), bind_address.port());
+                return format!("http://{}:{}", host_for_ip(ip), bind_address.port());
             }
 
             host
@@ -826,7 +818,7 @@ pub fn client_base_url_from_advertised_host(
     format!("http://{host}")
 }
 
-fn client_host_from_ip(ip: std::net::IpAddr) -> String {
+fn host_for_ip(ip: std::net::IpAddr) -> String {
     match ip {
         std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
             std::net::Ipv4Addr::LOCALHOST.to_string()
@@ -842,13 +834,12 @@ fn client_host_from_ip(ip: std::net::IpAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PublicDns, RestInterfaceRuntime, client_base_url_from_advertised_host,
-        client_base_url_from_bind_address, public_address,
+        PublicDns, RestInterfaceRuntime, client_bind_url, client_host_url, public_address,
     };
     use reqwest::dns::Resolve;
 
     #[test]
-    fn rest_runtime_uses_public_url() {
+    fn uses_public_url() {
         let runtime = RestInterfaceRuntime::from_bind_address(
             "0.0.0.0:3000".parse().unwrap(),
             Some("https://api.node-1.v3.aruna-engine.org/"),
@@ -887,33 +878,33 @@ mod tests {
     }
 
     #[test]
-    fn client_base_url_rewrites_unspecified_ipv6() {
+    fn rewrites_ipv6_url() {
         assert_eq!(
-            client_base_url_from_bind_address("[::]:3000".parse().unwrap()),
+            client_bind_url("[::]:3000".parse().unwrap()),
             "http://[::1]:3000"
         );
     }
 
     #[test]
-    fn s3_base_url_normalizes_advertised_wildcards() {
+    fn normalizes_s3_wildcards() {
         assert_eq!(
-            client_base_url_from_advertised_host("0.0.0.0", "0.0.0.0:1337".parse().unwrap()),
+            client_host_url("0.0.0.0", "0.0.0.0:1337".parse().unwrap()),
             "http://127.0.0.1:1337"
         );
         assert_eq!(
-            client_base_url_from_advertised_host("::", "[::]:1337".parse().unwrap()),
+            client_host_url("::", "[::]:1337".parse().unwrap()),
             "http://[::1]:1337"
         );
     }
 
     #[test]
-    fn s3_base_url_preserves_explicit_authority() {
+    fn preserves_s3_authority() {
         assert_eq!(
-            client_base_url_from_advertised_host("127.0.0.1:1337", "0.0.0.0:9999".parse().unwrap()),
+            client_host_url("127.0.0.1:1337", "0.0.0.0:9999".parse().unwrap()),
             "http://127.0.0.1:1337"
         );
         assert_eq!(
-            client_base_url_from_advertised_host(
+            client_host_url(
                 "s3.node-1.v3.aruna-engine.org",
                 "0.0.0.0:1337".parse().unwrap()
             ),
@@ -922,16 +913,16 @@ mod tests {
     }
 
     #[test]
-    fn s3_base_url_preserves_explicit_scheme() {
+    fn preserves_s3_scheme() {
         assert_eq!(
-            client_base_url_from_advertised_host(
+            client_host_url(
                 "https://s3.node-1.v3.aruna-engine.org",
                 "0.0.0.0:1337".parse().unwrap()
             ),
             "https://s3.node-1.v3.aruna-engine.org"
         );
         assert_eq!(
-            client_base_url_from_advertised_host(
+            client_host_url(
                 "https://s3.node-1.v3.aruna-engine.org/",
                 "0.0.0.0:1337".parse().unwrap()
             ),

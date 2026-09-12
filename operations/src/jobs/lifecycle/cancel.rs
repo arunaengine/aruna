@@ -6,10 +6,10 @@ use aruna_core::effects::JobRecordFrame;
 use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::structs::{
     AuthContext, CancelAuthority, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobId,
-    JobRecordEnvelope, JobRecordKind, LogicalJobSpec, Permission, blob_group_permission_path,
+    JobRecordEnvelope, JobRecordKind, LogicalJobSpec, Permission, group_permission_path,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::NodeId;
-use aruna_core::util::unix_timestamp_millis;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -94,7 +94,7 @@ async fn cancel_authority(
         context,
         spec.realm_id,
         auth,
-        &blob_group_permission_path(spec.realm_id, spec.group_id, local),
+        &group_permission_path(spec.realm_id, spec.group_id, local),
         &Permission::WRITE,
         PolicyRequestExtras::rest(),
     )

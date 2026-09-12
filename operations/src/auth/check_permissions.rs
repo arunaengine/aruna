@@ -103,7 +103,7 @@ mod test {
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 
     #[tokio::test]
-    pub async fn public_roles_apply_to_everyone_and_are_read_only() {
+    pub async fn public_roles_readonly() {
         let random_path = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
@@ -344,9 +344,7 @@ mod test {
         let (group, group_auth_doc) = drive(group_operation, &context).await.unwrap();
         let group_id = group.group_id;
 
-        //
-        // User is in group and has permissions
-        //
+        // A group member has the required permission.
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id,
@@ -366,9 +364,7 @@ mod test {
         let check_result = drive(perm_operation, &context).await.unwrap();
         assert!(check_result);
 
-        //
-        // User is not in group and has no permissions
-        //
+        // A nonmember has no group permissions.
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id: UserId::local(Ulid::generate(), realm_id),
@@ -388,9 +384,7 @@ mod test {
         let check_result = drive(perm_operation, &context).await.unwrap();
         assert!(!check_result);
 
-        //
-        // Group does not exist
-        //
+        // A missing group is an error.
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id,
@@ -409,9 +403,7 @@ mod test {
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(drive(perm_operation, &context).await.is_err());
 
-        //
-        // User is in group and has not sufficient permissions
-        //
+        // A viewer cannot write group metadata.
         let reader = UserId::local(Ulid::generate(), realm_id);
         let add_user_input = AddUserToGroupInput {
             actor: Actor {
@@ -449,16 +441,12 @@ mod test {
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(!drive(perm_operation, &context).await.unwrap());
 
-        //
-        // User is in group and has viewer role
-        //
+        // A viewer can read group metadata.
         perm_config.required_permission = Permission::READ;
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(drive(perm_operation, &context).await.unwrap());
 
-        //
-        // Test DENY roles
-        //
+        // A deny role overrides read permission.
         let denied_user = UserId::local(Ulid::generate(), realm_id);
         let add_role_input = AddGroupRoleConfig {
             auth_context: aruna_core::structs::AuthContext {
@@ -506,9 +494,7 @@ mod test {
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(!drive(perm_operation, &context).await.unwrap());
 
-        //
-        // User tries realm operation without realm role
-        //
+        // A user without a realm role cannot read realm roles.
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id: denied_user,
@@ -522,9 +508,7 @@ mod test {
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(!drive(perm_operation, &context).await.unwrap());
 
-        //
-        // Admin tries realm operations
-        //
+        // A realm administrator can write realm roles.
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id: admin_id,
@@ -538,9 +522,7 @@ mod test {
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(drive(perm_operation, &context).await.unwrap());
 
-        //
-        // User tries realm operation and has role
-        //
+        // An assigned realm administrator can write realm roles.
         let admin_role = realm_auth_doc
             .roles
             .iter()

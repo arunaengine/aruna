@@ -11,10 +11,8 @@ pub const MAX_ASSISTANT_TURN_BYTES: usize = 256 * 1024;
 /// Bytes all live turns of one user may hold together.
 pub const MAX_ASSISTANT_CHAT_BYTES: u64 = 8 * 1024 * 1024;
 
-/// One assistant chat of a user without its turns.
-///
-/// The head is held on the node that received it and is not replicated. A
-/// deleted chat keeps its head as a tombstone, so the id is never reused.
+/// One assistant chat of a user without its turns. The head is held on the node that received it and is
+/// not replicated. A deleted chat keeps its head as a tombstone, so the id is never reused.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantChatHead {
     pub user_id: UserId,

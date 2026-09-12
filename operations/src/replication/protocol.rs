@@ -447,6 +447,8 @@ pub enum VersionReplicationMessage {
     BaoReadAccepted {
         size: u64,
         blake3: [u8; 32],
+        etag: Option<String>,
+        hashes: BTreeMap<String, Vec<u8>>,
     },
     BaoReadRefused(BaoReadRefusal),
     LocationSummaryRequest(LocationSummaryRequest),
@@ -569,6 +571,21 @@ impl VersionReplicationMessage {
                 request.validate()?;
                 None
             }
+            Self::BaoReadAccepted { etag, hashes, .. } => {
+                if hashes.len() > MAX_REPLICATION_HASHES {
+                    return Err(ConversionError::FromStrError(
+                        "bao read hash count exceeded".to_string(),
+                    ));
+                }
+                let mut budget = ManifestBudget::default();
+                for (name, digest) in hashes {
+                    check_hash(&mut budget, name, digest)?;
+                }
+                if let Some(etag) = etag {
+                    check_text(&mut budget, etag, MAX_REPLICATION_VALUE_BYTES)?;
+                }
+                None
+            }
             Self::PlacementPolicyRequired { refs } => {
                 if PlacementPolicyRef::canonical_set(refs)? != *refs {
                     return Err(ConversionError::NonCanonicalPolicyRefs);
@@ -616,9 +633,9 @@ pub struct VersionReplicationRequest {
 mod tests {
     use super::{
         BaoReadRefusal, BaoReadRequest, BaoReadTarget, MAX_REPLICATION_HASH_BYTES,
-        MAX_REPLICATION_PARTS, MAX_REPLICATION_SOURCES, MAX_REPLICATION_VALUE_BYTES,
-        MaterializedBlobInfo, MultipartObjectReplicationMetadata, ReferenceAdvance, SyncOrigin,
-        VersionReplicationManifest, VersionReplicationMessage,
+        MAX_REPLICATION_HASHES, MAX_REPLICATION_PARTS, MAX_REPLICATION_SOURCES,
+        MAX_REPLICATION_VALUE_BYTES, MaterializedBlobInfo, MultipartObjectReplicationMetadata,
+        ReferenceAdvance, SyncOrigin, VersionReplicationManifest, VersionReplicationMessage,
     };
     use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
@@ -630,7 +647,7 @@ mod tests {
         RealmId, ReplicationItemKind, SourceConnectorKind, SourceMetadata, StagingStrategy,
         VersionSourceBinding,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -755,6 +772,8 @@ mod tests {
         let accepted = VersionReplicationMessage::BaoReadAccepted {
             size: 42,
             blake3: [8u8; 32],
+            etag: Some("etag-1".to_string()),
+            hashes: BTreeMap::from([(HASH_SHA256.to_string(), vec![9u8; 32])]),
         };
         let refused = VersionReplicationMessage::BaoReadRefused(BaoReadRefusal::ReadDenied);
 
@@ -767,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn version_replication_messages_roundtrip_with_magic_prefix() {
+    fn message_roundtrips() {
         let mut manifest = make_manifest();
         manifest.origin = Some(SyncOrigin {
             relationship_id: Ulid::from(7u128),
@@ -801,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn version_replication_messages_reject_invalid_prefix() {
+    fn invalid_prefix_rejected() {
         let message = VersionReplicationMessage::VersionManifest(make_manifest());
         let mut bytes = message.to_bytes().unwrap();
         bytes[0] = b'x';
@@ -837,6 +856,36 @@ mod tests {
         let mut bytes = VersionReplicationMessage::VersionManifest(make_manifest())
             .to_bytes()
             .unwrap();
+        bytes.pop();
+
+        assert!(VersionReplicationMessage::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn accepted_hashes_bounded() {
+        let hashes = (0..=MAX_REPLICATION_HASHES)
+            .map(|index| (format!("hash-{index}"), vec![index as u8; 32]))
+            .collect();
+        let message = VersionReplicationMessage::BaoReadAccepted {
+            size: 42,
+            blake3: [8u8; 32],
+            etag: None,
+            hashes,
+        };
+
+        assert!(VersionReplicationMessage::from_bytes(&message.to_bytes().unwrap()).is_err());
+    }
+
+    #[test]
+    fn accepted_truncation_rejected() {
+        let mut bytes = VersionReplicationMessage::BaoReadAccepted {
+            size: 42,
+            blake3: [8u8; 32],
+            etag: None,
+            hashes: BTreeMap::from([(HASH_SHA256.to_string(), vec![9u8; 32])]),
+        }
+        .to_bytes()
+        .unwrap();
         bytes.pop();
 
         assert!(VersionReplicationMessage::from_bytes(&bytes).is_err());

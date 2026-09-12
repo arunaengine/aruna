@@ -20,7 +20,7 @@ use aruna_core::keyspaces::{
 use aruna_core::structs::{
     AuthContext, BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, PathRestriction,
     Permission, SourceConnectorKind, StagingStrategy, SyncRelationship, SyncState, UsageCounters,
-    VersionKey, blob_group_permission_path, sync_relationship_key,
+    VersionKey, group_permission_path, sync_relationship_key,
 };
 use aruna_operations::driver::DriverContext;
 use aruna_operations::replication::queue::{
@@ -35,10 +35,10 @@ use aws_sdk_s3::types::{
 };
 use reqwest::StatusCode;
 use shared::{
-    JoinerNode, SeedNode, TestResult, bucket_arn, create_bearer_token, create_group_via_http,
-    create_onboarding_secret_via_http, create_s3_credentials_via_http,
-    create_s3_credentials_with_restrictions_via_http, s3_client, shutdown_pair,
-    spawn_full_joiner_node, spawn_full_seed_node, wait_for_group_via_http, wait_for_realm_nodes,
+    JoinerNode, SeedNode, TestResult, bucket_arn, create_bearer_token, create_group_http,
+    create_onboarding_secret, create_s3_credentials,
+    create_restricted_credentials, s3_client, shutdown_pair,
+    spawn_complete_joiner, spawn_complete_seed, wait_group_http, wait_realm_nodes,
     wait_until,
 };
 use std::time::Duration;
@@ -110,13 +110,13 @@ struct ReplicationHarness {
 
 impl ReplicationHarness {
     async fn new(group_name: &str) -> TestResult<Self> {
-        let seed = spawn_full_seed_node().await?;
-        let onboarding_secret = create_onboarding_secret_via_http(
+        let seed = spawn_complete_seed().await?;
+        let onboarding_secret = create_onboarding_secret(
             &seed,
             aruna_core::onboarding::OnboardingMode::Server,
         )
         .await?;
-        let joiner = spawn_full_joiner_node(&seed, onboarding_secret).await?;
+        let joiner = spawn_complete_joiner(&seed, onboarding_secret).await?;
 
         let seed_s3 = seed
             .s3
@@ -127,7 +127,7 @@ impl ReplicationHarness {
             .as_ref()
             .ok_or_else(|| std::io::Error::other("joiner node did not start S3 server"))?;
 
-        wait_for_realm_nodes(
+        wait_realm_nodes(
             &[seed.context.as_ref(), joiner.context.as_ref()],
             &seed.realm_id,
             2,
@@ -142,13 +142,13 @@ impl ReplicationHarness {
         )
         .await?;
 
-        let group = create_group_via_http(&seed.base_url, &seed_token, group_name).await?;
-        wait_for_group_via_http(&joiner.base_url, &seed_token, &group.group_id).await?;
+        let group = create_group_http(&seed.base_url, &seed_token, group_name).await?;
+        wait_group_http(&joiner.base_url, &seed_token, &group.group_id).await?;
 
         let seed_credentials =
-            create_s3_credentials_via_http(&seed.base_url, &seed_token, &group.group_id).await?;
+            create_s3_credentials(&seed.base_url, &seed_token, &group.group_id).await?;
         let joiner_credentials =
-            create_s3_credentials_via_http(&joiner.base_url, &seed_token, &group.group_id).await?;
+            create_s3_credentials(&joiner.base_url, &seed_token, &group.group_id).await?;
 
         let seed_client = s3_client(seed_s3, &seed_credentials);
         let joiner_client = s3_client(joiner_s3, &joiner_credentials);
@@ -167,7 +167,7 @@ impl ReplicationHarness {
         bucket_arn(&self.seed.realm_id, self.joiner.config.node_id, bucket)
     }
 
-    async fn create_seed_scoped_client(
+    async fn create_seed_client(
         &self,
         path_restrictions: Vec<CreateS3PathRestriction>,
     ) -> TestResult<S3Client> {
@@ -176,7 +176,7 @@ impl ReplicationHarness {
             .s3
             .as_ref()
             .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
-        let credentials = create_s3_credentials_with_restrictions_via_http(
+        let credentials = create_restricted_credentials(
             &self.seed.base_url,
             &self.seed_token,
             &self.group_id,
@@ -427,7 +427,7 @@ impl ReplicationHarness {
         .await
     }
 
-    async fn assert_object_never_appears(
+    async fn assert_object_absent(
         &self,
         bucket: &str,
         key: &str,
@@ -580,10 +580,10 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
             .assert_object_matches(target_bucket, target_key, &body)
             .await?;
         harness
-            .assert_object_never_appears(target_bucket, source_key, 10, Duration::from_millis(200))
+            .assert_object_absent(target_bucket, source_key, 10, Duration::from_millis(200))
             .await?;
         harness
-            .assert_object_never_appears(
+            .assert_object_absent(
                 target_bucket,
                 excluded_key,
                 10,
@@ -591,7 +591,7 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
             )
             .await?;
         harness
-            .assert_object_never_appears(
+            .assert_object_absent(
                 target_bucket,
                 excluded_target,
                 10,
@@ -719,10 +719,10 @@ async fn once_syncs_prefix() -> TestResult<()> {
             .assert_object_matches(target_bucket, target_key, &body)
             .await?;
         harness
-            .assert_object_never_appears(target_bucket, source_key, 10, Duration::from_millis(200))
+            .assert_object_absent(target_bucket, source_key, 10, Duration::from_millis(200))
             .await?;
         harness
-            .assert_object_never_appears(
+            .assert_object_absent(
                 target_bucket,
                 excluded_key,
                 10,
@@ -730,7 +730,7 @@ async fn once_syncs_prefix() -> TestResult<()> {
             )
             .await?;
         harness
-            .assert_object_never_appears(
+            .assert_object_absent(
                 target_bucket,
                 excluded_target,
                 10,
@@ -1427,7 +1427,7 @@ async fn chain_blocks_cycle() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn replication_live_put_reaches_joined_node() -> TestResult<()> {
+async fn live_put_replicates() -> TestResult<()> {
     let harness = ReplicationHarness::new("replication-live-put-e2e-group").await?;
 
     let result = async {
@@ -1467,7 +1467,7 @@ async fn replication_live_put_reaches_joined_node() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn replication_delete_marker_reaches_joined_node() -> TestResult<()> {
+async fn delete_marker_replicates() -> TestResult<()> {
     let harness = ReplicationHarness::new("replication-delete-marker-e2e-group").await?;
 
     let result = async {
@@ -1637,7 +1637,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
             .await?;
 
         let scoped_client = harness
-            .create_seed_scoped_client(vec![CreateS3PathRestriction {
+            .create_seed_client(vec![CreateS3PathRestriction {
                 pattern: format!("{bucket}/scoped/**"),
                 permission: "WRITE".to_string(),
             }])
@@ -1654,7 +1654,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
             .ok_or_else(|| std::io::Error::other("scoped put did not return version id"))?
             .parse()?;
 
-        let group_root = blob_group_permission_path(
+        let group_root = group_permission_path(
             harness.seed.realm_id,
             harness.group_id.parse()?,
             harness.seed.net.node_id(),
@@ -1708,7 +1708,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
         .await?;
 
         harness
-            .assert_object_never_appears(bucket, scoped_key, 5, Duration::from_millis(200))
+            .assert_object_absent(bucket, scoped_key, 5, Duration::from_millis(200))
             .await?;
         Ok(())
     }
@@ -1719,7 +1719,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn replication_honors_scoped_credential_path_restrictions() -> TestResult<()> {
+async fn scoped_replication_paths() -> TestResult<()> {
     let harness = ReplicationHarness::new("replication-scoped-credential-group").await?;
 
     let result = async {
@@ -1735,7 +1735,7 @@ async fn replication_honors_scoped_credential_path_restrictions() -> TestResult<
             .await?;
 
         let scoped_client = harness
-            .create_seed_scoped_client(vec![CreateS3PathRestriction {
+            .create_seed_client(vec![CreateS3PathRestriction {
                 pattern: format!("{bucket}/scoped/**"),
                 permission: "WRITE".to_string(),
             }])
@@ -1767,7 +1767,7 @@ async fn replication_honors_scoped_credential_path_restrictions() -> TestResult<
             .await?;
 
         harness
-            .assert_object_never_appears(bucket, scoped_key, 10, Duration::from_millis(200))
+            .assert_object_absent(bucket, scoped_key, 10, Duration::from_millis(200))
             .await?;
 
         let scoped_destination_get = harness

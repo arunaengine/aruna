@@ -3,7 +3,7 @@ use std::time::Duration;
 pub(crate) const QUEUE_RETRY_BASE_MS: u64 = 250;
 pub(crate) const QUEUE_RETRY_MAX_MS: u64 = 30_000;
 
-pub(crate) fn queue_retry_after_ms(attempts: u32) -> u64 {
+pub(crate) fn retry_delay_ms(attempts: u32) -> u64 {
     retry_after_ms(attempts, QUEUE_RETRY_BASE_MS, QUEUE_RETRY_MAX_MS)
 }
 
@@ -47,7 +47,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_backoff_preserves_queue_policy_values() {
+    fn retry_backoff_values() {
         let expected = [
             (0, 250),
             (1, 500),
@@ -62,7 +62,7 @@ mod tests {
         ];
 
         for (attempts, expected_ms) in expected {
-            assert_eq!(queue_retry_after_ms(attempts), expected_ms);
+            assert_eq!(retry_delay_ms(attempts), expected_ms);
         }
     }
 }

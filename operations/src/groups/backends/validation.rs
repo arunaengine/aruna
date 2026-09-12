@@ -1,5 +1,5 @@
 use crate::endpoint_screening;
-use aruna_core::structs::{GroupBackendKind, GroupStorageBackend, ensure_confined_relative_path};
+use aruna_core::structs::{GroupBackendKind, GroupStorageBackend, ensure_confined_path};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
@@ -111,9 +111,7 @@ pub const fn rules_for_kind(kind: GroupBackendKind) -> GroupBackendRules {
             required_secret: &["credential"],
             one_of_secret: &[],
         },
-        // Azure exposes no switch to disable ambient discovery, so a static
-        // credential is the only thing keeping that chain unreachable. Opendal
-        // pushes the shared-key provider only when `account_name` is set too.
+        // Static credentials prevent ambient discovery; Opendal enables shared keys with an account.
         GroupBackendKind::Azblob => GroupBackendRules {
             required_public: &["endpoint", "container", "account_name"],
             allowed_public: &["endpoint", "container", "root", "account_name"],
@@ -200,7 +198,7 @@ pub fn validate_backend_input(
         return Err(GroupBackendError::UnsafeBucket(bucket.clone()));
     }
     if let Some(root) = public.get("root")
-        && ensure_confined_relative_path(Path::new(root.trim_start_matches('/'))).is_err()
+        && ensure_confined_path(Path::new(root.trim_start_matches('/'))).is_err()
     {
         return Err(GroupBackendError::UnsafeRoot(root.clone()));
     }

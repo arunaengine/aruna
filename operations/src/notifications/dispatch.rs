@@ -4,8 +4,8 @@ use aruna_core::structs::{
     NotificationClass, NotificationKind, NotificationRecord, WatchAuthorizationBinding,
     WatchEventMask, WatchInterestEntry, WatchSubscription,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::UserId;
-use aruna_core::util::unix_timestamp_millis;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use ulid::Ulid;
@@ -22,14 +22,13 @@ use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::unread::{UNREAD_COUNT_CAP, UNREAD_SCAN_MAX_ROWS};
 use crate::notifications::watch::authorization::{
-    WatchAuthorization, evaluate_watch_notification_authorization,
-    list_authorized_watch_subscriptions,
+    WatchAuthorization, authorize_notification, list_authorized_subscriptions,
 };
-use crate::notifications::watch::interest::schedule_watch_interest_publish;
+use crate::notifications::watch::interest::schedule_interest_publish;
 use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_CAP_REACHED, WATCH_SUBSCRIPTION_UNAUTHORIZED,
-    WATCH_SUBSCRIPTION_UNAVAILABLE, WatchSubscriptionError, create_replicated_watch_subscription,
-    delete_replicated_watch_subscription,
+    WATCH_SUBSCRIPTION_UNAVAILABLE, WatchSubscriptionError, create_holder_watch,
+    delete_holder_watch,
 };
 use crate::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
 
@@ -76,7 +75,7 @@ impl From<NotificationDispatchError> for WatchDispatchError {
 /// Resolves the node currently holding `recipient`'s inbox with the same
 /// placement as read/write dispatch, so the live-stream endpoint can pick the
 /// wake-driven local or holder-polling remote arm.
-pub async fn resolve_inbox_holder_for_user(
+pub async fn resolve_user_holder(
     context: &DriverContext,
     recipient: UserId,
 ) -> Result<NodeId, NotificationDispatchError> {
@@ -87,10 +86,7 @@ pub async fn resolve_inbox_holder_for_user(
 /// names the net handle's channel type directly.
 pub type InboxWakeReceiver = broadcast::Receiver<UserId>;
 
-pub fn record_watch_creation_denial_metric(
-    context: &DriverContext,
-    reason: WatchAuthorizationMetricReason,
-) {
+pub fn record_watch_denial(context: &DriverContext, reason: WatchAuthorizationMetricReason) {
     if let Some(net_handle) = context.net_handle.as_ref() {
         net_handle
             .notification_watch_metrics()
@@ -127,7 +123,7 @@ async fn resolve_holder(
     }
 }
 
-pub async fn list_notifications_for_user(
+pub async fn list_for_user(
     context: &DriverContext,
     local_node_id: NodeId,
     recipient: UserId,
@@ -136,7 +132,7 @@ pub async fn list_notifications_for_user(
 ) -> Result<(Vec<NotificationRecord>, Option<Vec<u8>>), NotificationDispatchError> {
     let holder = resolve_holder(context, recipient).await?;
     if holder == local_node_id {
-        list_notifications_on_holder(context, recipient, cursor, limit)
+        list_on_holder(context, recipient, cursor, limit)
             .await
             .map_err(NotificationDispatchError::Internal)
     } else {
@@ -170,9 +166,7 @@ async fn notification_is_visible(
     if record.class != NotificationClass::Transient || record.recipient != recipient {
         return Ok(false);
     }
-    match evaluate_watch_notification_authorization(context, recipient, &record.kind, authorization)
-        .await?
-    {
+    match authorize_notification(context, recipient, &record.kind, authorization).await? {
         WatchAuthorization::Authorized => Ok(true),
         WatchAuthorization::Denied(_) => Ok(false),
         WatchAuthorization::Unavailable(error) => Err(error),
@@ -182,7 +176,7 @@ async fn notification_is_visible(
 /// Reauthorizes persisted resource-watch records at the inbox-holder boundary.
 /// Suppressed rows do not consume the caller's page, so revocation cannot hide
 /// older ordinary notifications behind a page of stale watch records.
-pub(crate) async fn list_notifications_on_holder(
+pub(crate) async fn list_on_holder(
     context: &DriverContext,
     recipient: UserId,
     mut cursor: Option<Vec<u8>>,
@@ -216,7 +210,7 @@ pub(crate) async fn list_notifications_on_holder(
     }
 }
 
-pub(crate) async fn unread_count_on_holder(
+pub(crate) async fn unread_on_holder(
     context: &DriverContext,
     recipient: UserId,
 ) -> Result<(u32, bool), String> {
@@ -258,14 +252,14 @@ pub(crate) async fn unread_count_on_holder(
     }
 }
 
-pub async fn unread_count_for_user(
+pub async fn unread_for_user(
     context: &DriverContext,
     local_node_id: NodeId,
     recipient: UserId,
 ) -> Result<(u32, bool), NotificationDispatchError> {
     let holder = resolve_holder(context, recipient).await?;
     if holder == local_node_id {
-        unread_count_on_holder(context, recipient)
+        unread_on_holder(context, recipient)
             .await
             .map_err(NotificationDispatchError::Internal)
     } else {
@@ -279,7 +273,7 @@ pub async fn unread_count_for_user(
     }
 }
 
-pub async fn mark_read_for_user(
+pub async fn mark_for_user(
     context: &DriverContext,
     local_node_id: NodeId,
     recipient: UserId,
@@ -288,7 +282,7 @@ pub async fn mark_read_for_user(
 ) -> Result<u32, NotificationDispatchError> {
     let holder = resolve_holder(context, recipient).await?;
     if holder == local_node_id {
-        let marked = mark_read_on_holder(context, recipient, ids, up_to_ms)
+        let marked = mark_on_holder(context, recipient, ids, up_to_ms)
             .await
             .map_err(NotificationDispatchError::Internal)?;
         if marked > 0
@@ -308,7 +302,7 @@ pub async fn mark_read_for_user(
     }
 }
 
-pub(crate) async fn mark_read_on_holder(
+pub(crate) async fn mark_on_holder(
     context: &DriverContext,
     recipient: UserId,
     mut ids: Vec<Ulid>,
@@ -327,8 +321,7 @@ pub(crate) async fn mark_read_on_holder(
     let now_ms = unix_timestamp_millis();
     loop {
         let (records, next_cursor) =
-            list_notifications_on_holder(context, recipient, cursor, LIST_NOTIFICATIONS_MAX_LIMIT)
-                .await?;
+            list_on_holder(context, recipient, cursor, LIST_NOTIFICATIONS_MAX_LIMIT).await?;
         let visible_ids: Vec<_> = records
             .into_iter()
             .filter(|record| {
@@ -359,7 +352,7 @@ pub(crate) async fn mark_read_on_holder(
     }
 }
 
-pub async fn create_watch_for_user(
+pub async fn create_for_user(
     context: &DriverContext,
     local_node_id: NodeId,
     owner: UserId,
@@ -369,7 +362,7 @@ pub async fn create_watch_for_user(
 ) -> Result<WatchSubscription, WatchDispatchError> {
     let holder = resolve_holder(context, owner).await?;
     let subscription = if holder == local_node_id {
-        let subscription = create_replicated_watch_subscription(
+        let subscription = create_holder_watch(
             context,
             local_node_id,
             owner,
@@ -387,7 +380,7 @@ pub async fn create_watch_for_user(
             WatchSubscriptionError::AuthorizationUnavailable(_) => WatchDispatchError::Unavailable,
             other => WatchDispatchError::Internal(other.to_string()),
         })?;
-        schedule_watch_interest_publish(context).await;
+        schedule_interest_publish(context).await;
         subscription
     } else {
         let net_handle = context
@@ -419,9 +412,8 @@ pub async fn create_watch_for_user(
             }
         })?
     };
-    // Bridge the interest-digest propagation window: the node that handled the
-    // create knows the holder now, so an event it emits before the holder's
-    // digest replicates back still routes to the holder.
+    // The creator knows the holder before its interest digest propagates.
+    // Register locally so events in that window still reach the holder.
     if let Some(net_handle) = context.net_handle.as_ref() {
         net_handle.register_local_watch_interest(
             subscription.watch_id,
@@ -436,7 +428,7 @@ pub async fn create_watch_for_user(
     Ok(subscription)
 }
 
-pub async fn delete_watch_for_user(
+pub async fn delete_for_user(
     context: &DriverContext,
     local_node_id: NodeId,
     owner: UserId,
@@ -444,7 +436,7 @@ pub async fn delete_watch_for_user(
 ) -> Result<(), WatchDispatchError> {
     let holder = resolve_holder(context, owner).await?;
     if holder == local_node_id {
-        delete_replicated_watch_subscription(
+        delete_holder_watch(
             context,
             local_node_id,
             owner,
@@ -453,7 +445,7 @@ pub async fn delete_watch_for_user(
         )
         .await
         .map_err(|error| WatchDispatchError::Internal(error.to_string()))?;
-        schedule_watch_interest_publish(context).await;
+        schedule_interest_publish(context).await;
     } else {
         let net_handle = context
             .net_handle
@@ -469,14 +461,14 @@ pub async fn delete_watch_for_user(
     Ok(())
 }
 
-pub async fn list_watches_for_user(
+pub async fn list_watches(
     context: &DriverContext,
     local_node_id: NodeId,
     owner: UserId,
 ) -> Result<Vec<WatchSubscription>, WatchDispatchError> {
     let holder = resolve_holder(context, owner).await?;
     if holder == local_node_id {
-        list_authorized_watch_subscriptions(context, owner)
+        list_authorized_subscriptions(context, owner)
             .await
             .map_err(WatchDispatchError::Internal)
     } else {

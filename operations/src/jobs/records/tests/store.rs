@@ -56,7 +56,7 @@ async fn project(context: &DriverContext, family: &Family, rebuild: bool) -> Log
 }
 
 #[tokio::test]
-async fn admits_out_of_order() {
+async fn admits_early() {
     // Records arriving before their evidence are retained and then admitted by
     // the append that supplies it, and the alias resolves to the family.
     let family = Family::new([1u8; 32]);

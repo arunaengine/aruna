@@ -11,18 +11,16 @@ use aruna_core::keyspaces::{
 use aruna_core::structs::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, TxnId, Value};
-use aruna_core::util::unix_timestamp_secs;
+use aruna_core::time::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-// Sized so one single-flight drain fills several full document sync topic-batch
-// streams per peer instead of half-filling one. Records group by peer set and each
-// peer receives every topic, so the cap scales with stream capacity, not peer count.
+// Size one drain for several full topic batches; every grouped peer receives every topic.
 pub const OUTBOX_DRAIN_BATCH_SIZE: usize =
-    4 * aruna_net::irokle::DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT;
+    4 * aruna_net::document_sync::DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT;
 const ADMIN_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/admin-operation/";
 const DELETE_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/delete/";
 const UPSERT_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/upsert/";
@@ -35,9 +33,7 @@ pub(crate) fn outbox_stream_prefixes() -> [&'static [u8]; 3] {
     ]
 }
 
-// Keys order by kind then outbox id (a ULID), with admin operations additionally
-// ordered by origin sequence, so drains are FIFO instead of following the random
-// blake3 topic id order; the topic stays in the value.
+// Sort by kind and ULID; admin records also sort by origin sequence to preserve FIFO order.
 pub fn outbox_prefix(event: &DocumentSyncOutboxEvent) -> Key {
     let mut bytes = b"document-sync-outbox-v1/".to_vec();
     bytes.extend_from_slice(event.kind());
@@ -58,9 +54,7 @@ pub fn outbox_key(record: &DocumentSyncOutboxRecord) -> Key {
         bytes.extend_from_slice(&event.origin_seq.to_be_bytes());
     }
     bytes.extend_from_slice(&record.outbox_id.to_bytes());
-    // One event can enqueue several publishes under its own id (a metadata create
-    // emits lifecycle and registry rows on different topics); without the target in
-    // the key the second overwrites the first. The id still compares first.
+    // Include the target so one event can enqueue distinct lifecycle and registry publishes.
     bytes.extend_from_slice(record.target.storage_key().as_ref());
     ByteView::from(bytes)
 }
@@ -92,7 +86,7 @@ pub fn new_outbox_record(
     admin_placement: PlacementRef,
     allow_genesis: bool,
 ) -> DocumentSyncOutboxRecord {
-    new_outbox_record_with_id(
+    new_identified_record(
         Ulid::generate(),
         node_id,
         target,
@@ -106,7 +100,7 @@ pub fn new_outbox_record(
 /// `admin_placement` is only consulted for `AdminOperation` records (which carry
 /// no envelope change); `Upsert`/`Delete` always take their ref from the event's
 /// change so the record and its envelope can never diverge.
-pub fn new_outbox_record_with_id(
+pub fn new_identified_record(
     outbox_id: Ulid,
     node_id: NodeId,
     target: DocumentSyncTarget,
@@ -136,7 +130,7 @@ pub fn new_outbox_record_with_id(
 }
 
 pub fn write_outbox_effect(record: &DocumentSyncOutboxRecord) -> Result<Effect, postcard::Error> {
-    write_outbox_effect_with_txn(record, None)
+    write_transaction_effect(record, None)
 }
 
 #[cfg(debug_assertions)]
@@ -177,7 +171,7 @@ pub fn outbox_write_entry(
     Ok((DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), key, value))
 }
 
-pub fn write_outbox_effect_with_txn(
+pub fn write_transaction_effect(
     record: &DocumentSyncOutboxRecord,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, postcard::Error> {
@@ -190,7 +184,7 @@ pub fn write_outbox_effect_with_txn(
     }))
 }
 
-pub fn schedule_outbox_drain_effect() -> Effect {
+pub fn schedule_drain_effect() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainDocumentSyncOutbox,
         after: Duration::ZERO,
@@ -381,7 +375,7 @@ async fn read_index_value(storage: &StorageHandle, key: &[u8]) -> Result<Option<
     }
 }
 
-pub async fn restore_document_sync_outbox_timers(
+pub async fn restore_outbox_timers(
     storage: &StorageHandle,
     task_handle: &TaskHandle,
 ) {
@@ -409,7 +403,7 @@ pub async fn restore_document_sync_outbox_timers(
 
     if has_records {
         let event = task_handle
-            .schedule_timer_if_idle(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
+            .schedule_idle_timer(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
             .await;
         if let TaskEvent::Error { message, .. } = event {
             warn!(message = %message, "Failed to restore document sync outbox timer");
@@ -510,7 +504,7 @@ mod tests {
         }
     }
 
-    async fn write_raw_outbox_record(storage: &StorageHandle, key: Vec<u8>, value: Vec<u8>) {
+    async fn write_raw_record(storage: &StorageHandle, key: Vec<u8>, value: Vec<u8>) {
         match storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
@@ -541,12 +535,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_outbox_record_is_deleted() {
+    async fn malformed_record_deleted() {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let corrupt_key = b"000-corrupt-outbox".to_vec();
-        write_raw_outbox_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
+        write_raw_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
 
         let batch = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_BATCH_SIZE)
             .await
@@ -564,7 +558,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_outbox_record_before_valid_is_deleted() {
+    async fn malformed_before_valid() {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
@@ -580,7 +574,7 @@ mod tests {
             aruna_core::structs::PlacementRef::NIL,
             false,
         );
-        write_raw_outbox_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
+        write_raw_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
         match storage
             .send_effect(write_outbox_effect(&valid).expect("valid outbox effect"))
             .await
@@ -610,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn outbox_prefix_is_deterministic_and_kind_scoped() {
+    fn prefix_kind_scoped() {
         let upsert = DocumentSyncOutboxEvent::Upsert {
             bytes: vec![1, 2],
             change: change(),
@@ -624,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn outbox_record_round_trips_and_deduplicates_peers() {
+    fn record_roundtrip_deduplicates() {
         let peer = node(3);
         let record = new_outbox_record(
             node(1),
@@ -646,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn outbox_record_upsert_round_trips_with_revision() {
+    fn upsert_roundtrip_revision() {
         let record = new_outbox_record(
             node(1),
             target(),
@@ -670,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn outbox_record_delete_round_trips_with_revision() {
+    fn delete_roundtrip_revision() {
         let record = new_outbox_record(
             node(1),
             target(),
@@ -690,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn outbox_key_is_unique_under_kind_prefix() {
+    fn kind_keys_unique() {
         let event = DocumentSyncOutboxEvent::Upsert {
             bytes: vec![1],
             change: change(),
@@ -719,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn outbox_keys_order_by_outbox_id_across_targets() {
+    fn keys_follow_id() {
         let event = DocumentSyncOutboxEvent::Upsert {
             bytes: vec![1],
             change: change(),
@@ -749,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_outbox_keys_order_by_origin_sequence() {
+    fn admin_keys_ordered() {
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
         let target = DocumentSyncTarget::User { user_id };
         let mut earlier = new_outbox_record(
@@ -827,7 +821,7 @@ mod tests {
         );
         let record_key = outbox_key(&record).to_vec();
         let (_, index_key, _) = revocation_index_entry(&record);
-        write_raw_outbox_record(
+        write_raw_record(
             &storage,
             record_key.clone(),
             postcard::to_allocvec(&record).expect("record serializes"),
@@ -884,13 +878,13 @@ mod tests {
         );
         let metadata_key = outbox_key(&metadata).to_vec();
         let admin_key = outbox_key(&admin).to_vec();
-        write_raw_outbox_record(
+        write_raw_record(
             &storage,
             metadata_key.clone(),
             postcard::to_allocvec(&metadata).expect("metadata serializes"),
         )
         .await;
-        write_raw_outbox_record(
+        write_raw_record(
             &storage,
             admin_key.clone(),
             postcard::to_allocvec(&admin).expect("admin serializes"),
@@ -933,7 +927,7 @@ mod tests {
             false,
         );
         let record_key = outbox_key(&record).to_vec();
-        write_raw_outbox_record(&storage, record_key.clone(), vec![1, 2, 3]).await;
+        write_raw_record(&storage, record_key.clone(), vec![1, 2, 3]).await;
         write_index(&storage, record_key.clone()).await;
 
         delete_outbox_records(&storage, vec![record_key.clone()])
@@ -953,12 +947,12 @@ mod tests {
     }
 
     #[test]
-    fn outbox_key_is_byte_identical_regardless_of_placement() {
+    fn key_ignores_placement() {
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
         let event = user_admin_event(user_id, 1);
         let outbox_id = Ulid::from_parts(5, 5);
         let target = DocumentSyncTarget::User { user_id };
-        let nil = new_outbox_record_with_id(
+        let nil = new_identified_record(
             outbox_id,
             node(1),
             target.clone(),
@@ -967,7 +961,7 @@ mod tests {
             aruna_core::structs::PlacementRef::NIL,
             false,
         );
-        let sharded = new_outbox_record_with_id(
+        let sharded = new_identified_record(
             outbox_id,
             node(1),
             target,

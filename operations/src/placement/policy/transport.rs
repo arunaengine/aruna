@@ -130,7 +130,7 @@ async fn local_policy_result(
 
 fn sync_eligible_peer(config: &RealmConfigDocument, peer: NodeId) -> bool {
     config
-        .sync_eligible_node_ids()
+        .sync_eligible_nodes()
         .is_ok_and(|eligible| eligible.contains(&peer))
 }
 

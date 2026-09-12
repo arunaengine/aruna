@@ -11,6 +11,5 @@ pub mod validation;
 
 pub use resolver::{
     ResolveSourceConnectorInput, ResolveSourceConnectorOperation, ResolveVersionSourceBindingInput,
-    ResolveVersionSourceBindingOperation, resolve_source_connector_suboperation,
-    resolve_version_source_binding_suboperation,
+    ResolveVersionSourceBindingOperation, resolve_binding_effect, resolve_connector_effect,
 };

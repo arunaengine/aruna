@@ -72,7 +72,7 @@ impl GetUserOperation {
         cleanup
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn fail_storage(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -99,13 +99,13 @@ impl GetUserOperation {
             );
         };
 
-        match self.emit_read_existing_user(allowed) {
+        match self.read_existing(allowed) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn emit_read_existing_user(
+    fn read_existing(
         &mut self,
         allowed: Result<bool, AuthorizationError>,
     ) -> Result<Effects, GetUserError> {
@@ -123,7 +123,7 @@ impl GetUserOperation {
         }
     }
 
-    fn handle_read_existing_user(&mut self, event: Event) -> Effects {
+    fn accept_existing(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
@@ -169,13 +169,13 @@ impl Operation for GetUserOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.fail_storage(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
         match self.state.clone() {
             GetUserState::Auth => self.handle_auth_result(event),
-            GetUserState::ReadExistingUser => self.handle_read_existing_user(event),
+            GetUserState::ReadExistingUser => self.accept_existing(event),
             GetUserState::Init | GetUserState::Finish | GetUserState::Error => {
                 smallvec![]
             }

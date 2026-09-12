@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn preflight_fanout_reports_partial_and_strict_fails() {
+async fn preflight_fanout_reports() {
     let directory = tempdir().unwrap();
     let context = DriverContext {
         storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
@@ -50,7 +50,7 @@ async fn preflight_fanout_reports_partial_and_strict_fails() {
         MetadataFanoutOperation::ReferencePreflight,
         local_call.clone(),
         remote_call.clone(),
-        record_preflight_node_result,
+        record_preflight_node,
         map_read_error,
     )
     .await
@@ -73,7 +73,7 @@ async fn preflight_fanout_reports_partial_and_strict_fails() {
         MetadataFanoutOperation::ReferencePreflight,
         local_call,
         remote_call,
-        record_preflight_node_result,
+        record_preflight_node,
         map_read_error,
     )
     .await;
@@ -82,7 +82,7 @@ async fn preflight_fanout_reports_partial_and_strict_fails() {
 }
 
 #[test]
-fn preflight_cursor_pagination_is_stable() {
+fn preflight_cursor_pagination() {
     let secret = iroh::SecretKey::from_bytes(&[64u8; 32]);
     let node_id = secret.public();
     let hash = [65u8; 32];

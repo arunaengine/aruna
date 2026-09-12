@@ -1,11 +1,5 @@
-//! The quarantine store's hard capacity against the replication path that fills
-//! it (#338, fixed choice D-4).
-//!
-//! Evidence is written by the sync apply path and reclaimed by the admin
-//! surface, so the fail-closed rule only holds if both halves agree: while
-//! unacknowledged evidence fills the store, a rejected event must neither be
-//! dropped nor advance its topic cursor, and reclaiming capacity must let the
-//! redelivered event persist.
+//! The quarantine store's hard capacity against the replication path that fills it (#338, fixed
+//! choice D-4).
 
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
@@ -21,7 +15,7 @@ use aruna_core::structs::{
     SyncQuarantineRecord, SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
 };
 use aruna_core::types::Value;
-use aruna_net::irokle::DocumentSyncService;
+use aruna_net::document_sync::DocumentSyncService;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::sync::sync_quarantine::{
     QuarantinePageRequest, acknowledge_quarantine_row, list_quarantine_records,
@@ -169,7 +163,7 @@ async fn capacity_blocks_releases() {
         .bind()
         .await
         .expect("endpoint binds");
-    let service = DocumentSyncService::open_with_persist_policy(
+    let service = DocumentSyncService::open_with_policy(
         endpoint,
         storage.clone(),
         doc_dir.path().join("document-sync"),

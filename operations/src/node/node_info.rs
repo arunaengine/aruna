@@ -18,16 +18,16 @@ use aruna_core::keyspaces::{
     JOB_FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE, METADATA_INDEX_KEYSPACE,
     NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
 };
-use aruna_core::storage_entries::document_sync_revision_key;
+use aruna_core::storage_entries::sync_revision_key;
 use aruna_core::structs::{
     AdvertisementEpoch, BackendCatalog, JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
     JobRecordKind, LogicalJobState, NODE_SUBJECT_KEY, NodeInfoDocument, NodeSubjectRecord,
     NodeUrls, NodeUtilization, PlacementRef, RealmConfigDocument, RealmId,
-    STORAGE_CLASS_LABEL_PREFIX, SubmissionId, node_info_storage_key,
+    STORAGE_CLASS_LABEL_PREFIX, SubmissionId, node_info_key,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, TxnId, Value};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
@@ -51,7 +51,7 @@ const SNAPSHOT_PAGE_SIZE: usize = 128;
 pub const NODE_INFO_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Arms (or shortens toward) the periodic node-info heartbeat publish task.
-pub fn schedule_node_info_publish_effect(after: Duration) -> Effect {
+pub fn schedule_info_publish(after: Duration) -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::PublishNodeInfo,
         after,
@@ -61,7 +61,7 @@ pub fn schedule_node_info_publish_effect(after: Duration) -> Effect {
 /// Assembles this node's info document from its executors, current
 /// placement-view labels, given urls, and local usage, then persists it under the
 /// single-writer node-info key without queuing replication.
-pub async fn seed_node_info_document(
+pub async fn seed_info_document(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
@@ -69,7 +69,7 @@ pub async fn seed_node_info_document(
 ) -> Result<(), String> {
     let now = unix_timestamp_millis();
     let config = load_realm_config(ctx, realm_id).await?;
-    let stored = read_node_info_document(&ctx.storage_handle, node_id).await?;
+    let stored = read_info_document(&ctx.storage_handle, node_id).await?;
     let epoch = next_epoch(ctx, realm_id, stored.as_ref(), now).await?;
     let reservation = reservation_snapshot(ctx, epoch).await?;
     // The published drain is the operator's durable flag or a departure, never
@@ -94,11 +94,11 @@ pub async fn seed_node_info_document(
         demand: demand_snapshot(ctx, epoch).await?,
         reservation,
     };
-    write_node_info_document(&ctx.storage_handle, &document).await
+    write_info_document(&ctx.storage_handle, &document).await
 }
 
 /// Seeds this node's current info document and replicates it over the shared
-/// realm topic. Bootstrap callers must seed via [`seed_node_info_document`]
+/// realm topic. Bootstrap callers must seed via [`seed_info_document`]
 /// before announcing the core documents so the authorized announcement queues first.
 pub async fn publish_node_info(
     ctx: &DriverContext,
@@ -106,7 +106,7 @@ pub async fn publish_node_info(
     realm_id: RealmId,
     urls: NodeUrls,
 ) -> Result<(), String> {
-    seed_node_info_document(ctx, node_id, realm_id, urls).await?;
+    seed_info_document(ctx, node_id, realm_id, urls).await?;
     replicate_node_info(ctx, node_id, realm_id).await
 }
 
@@ -398,7 +398,7 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
-            key: document_sync_revision_key(&target),
+            key: sync_revision_key(&target),
             txn_id: None,
         })
         .await
@@ -415,12 +415,12 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
 /// Heartbeat: refreshes the persisted node-info document's placement-view labels,
 /// utilization and timestamps, then republishes it; URLs stay startup-seeded. Scans
 /// run outside the revision, so [`revise_node_info`] never carries stale drain backwards.
-pub async fn refresh_node_info_heartbeat(
+pub async fn refresh_info_heartbeat(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
 ) -> Result<(), String> {
-    let Some(document) = read_node_info_document(&ctx.storage_handle, node_id).await? else {
+    let Some(document) = read_info_document(&ctx.storage_handle, node_id).await? else {
         return Ok(());
     };
     let now = unix_timestamp_millis();
@@ -550,9 +550,8 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
     }
 }
 
-/// Locally observed nonterminal admitted demand of one group: own families merged
-/// with advertisements from current realm members; the bool flags an understated
-/// publisher. Exact locally, approximate across partitions; feeds [`aruna_core::compute_quota::admits`].
+/// Local nonterminal demand merged with current member advertisements.
+/// The bool flags an understated publisher; remote demand is partition-tolerant.
 pub async fn group_demand(
     ctx: &DriverContext,
     realm_id: RealmId,
@@ -611,7 +610,7 @@ pub async fn set_departure_state(
     realm_id: RealmId,
     departing: bool,
 ) -> Result<bool, String> {
-    let Some(document) = read_node_info_document(&ctx.storage_handle, node_id).await? else {
+    let Some(document) = read_info_document(&ctx.storage_handle, node_id).await? else {
         return Ok(false);
     };
     // An operator drain outlives a placement observation: returning to the
@@ -660,7 +659,7 @@ pub async fn set_operator_drain(
         return Ok(false);
     }
     write_operator_drain(ctx, draining).await?;
-    let Some(document) = read_node_info_document(&ctx.storage_handle, node_id).await? else {
+    let Some(document) = read_info_document(&ctx.storage_handle, node_id).await? else {
         warn!(
             operator_draining = draining,
             "Operator compute drain recorded before this node advertises"
@@ -979,7 +978,7 @@ async fn replicate_node_info(
     .map_err(|error| format!("node info replication failed: {error}"))
 }
 
-pub(crate) async fn write_node_info_document(
+pub(crate) async fn write_info_document(
     storage: &StorageHandle,
     document: &NodeInfoDocument,
 ) -> Result<(), String> {
@@ -997,7 +996,7 @@ async fn write_info_row(
     match storage
         .send_storage_effect(StorageEffect::Write {
             key_space: NODE_INFO_KEYSPACE.to_string(),
-            key: Key::from(node_info_storage_key(document.node_id)),
+            key: Key::from(node_info_key(document.node_id)),
             value,
             txn_id,
         })
@@ -1010,7 +1009,7 @@ async fn write_info_row(
 }
 
 /// Reads a single node's persisted info document, if present.
-pub async fn read_node_info_document(
+pub async fn read_info_document(
     storage: &StorageHandle,
     node_id: NodeId,
 ) -> Result<Option<NodeInfoDocument>, String> {
@@ -1025,7 +1024,7 @@ async fn node_info_row(
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: NODE_INFO_KEYSPACE.to_string(),
-            key: Key::from(node_info_storage_key(node_id)),
+            key: Key::from(node_info_key(node_id)),
             txn_id,
         })
         .await
@@ -1044,13 +1043,13 @@ async fn node_info_row(
 /// Reads the persisted info documents for the given nodes, skipping missing ones,
 /// keyed by node id. Takes the driver context so API routes stay in the operations
 /// layer rather than touching the storage handle directly.
-pub async fn read_node_info_documents(
+pub async fn read_info_documents(
     ctx: &DriverContext,
     node_ids: &[NodeId],
 ) -> Result<BTreeMap<NodeId, NodeInfoDocument>, String> {
     let mut documents = BTreeMap::new();
     for node_id in node_ids {
-        if let Some(document) = read_node_info_document(&ctx.storage_handle, *node_id).await? {
+        if let Some(document) = read_info_document(&ctx.storage_handle, *node_id).await? {
             documents.insert(*node_id, document);
         }
     }
@@ -1060,7 +1059,7 @@ pub async fn read_node_info_documents(
 /// Arms the periodic node-info heartbeat at startup. `ShortenTimer` (never
 /// `ResetTimer`) so the durable-queue re-arm loop cannot push the deadline
 /// forward past the handler's own post-run re-arm.
-pub async fn restore_node_info_publish_timer(_storage: &StorageHandle, task_handle: &TaskHandle) {
+pub async fn restore_info_timer(_storage: &StorageHandle, task_handle: &TaskHandle) {
     if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = task_handle
         .send_effect(Effect::Task(TaskEffect::ShortenTimer {
             key: TaskKey::PublishNodeInfo,
@@ -1211,7 +1210,7 @@ mod tests {
         );
         write_realm_config(&ctx, &config).await;
 
-        seed_node_info_document(
+        seed_info_document(
             &ctx,
             local,
             realm_id,
@@ -1223,7 +1222,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = read_node_info_document(&ctx.storage_handle, local)
+        let stored = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("seeded node info document");
@@ -1259,12 +1258,12 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_node_info_heartbeat(&ctx, local, realm_id)
+        refresh_info_heartbeat(&ctx, local, realm_id)
             .await
             .unwrap();
 
         assert!(
-            read_node_info_document(&ctx.storage_handle, local)
+            read_info_document(&ctx.storage_handle, local)
                 .await
                 .unwrap()
                 .is_some()
@@ -1273,7 +1272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_writes_document_without_queuing_outbox() {
+    async fn seed_writes_document() {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -1289,7 +1288,7 @@ mod tests {
         });
         write_realm_config(&ctx, &config).await;
 
-        seed_node_info_document(
+        seed_info_document(
             &ctx,
             local,
             realm_id,
@@ -1301,7 +1300,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = read_node_info_document(&ctx.storage_handle, local)
+        let stored = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("seeded node info document");
@@ -1313,7 +1312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_uses_selector_labels_and_queues_outbox() {
+    async fn publish_queues_labels() {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([2u8; 32]);
@@ -1347,7 +1346,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = read_node_info_document(&ctx.storage_handle, local)
+        let stored = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("node info document persisted");
@@ -1374,7 +1373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_reflects_placement_changes_and_drops_stale_labels() {
+    async fn heartbeat_refreshes_labels() {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([3u8; 32]);
@@ -1404,7 +1403,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let first = read_node_info_document(&ctx.storage_handle, local)
+        let first = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -1416,10 +1415,10 @@ mod tests {
         let expected_labels = build_view(&config).nodes[0].labels.clone();
         write_realm_config(&ctx, &config).await;
 
-        refresh_node_info_heartbeat(&ctx, local, realm_id)
+        refresh_info_heartbeat(&ctx, local, realm_id)
             .await
             .unwrap();
-        let second = read_node_info_document(&ctx.storage_handle, local)
+        let second = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -1451,18 +1450,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_without_seed_is_noop() {
+    async fn unseeded_heartbeat_noop() {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let local = node(1);
         write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
 
-        refresh_node_info_heartbeat(&ctx, local, realm_id)
+        refresh_info_heartbeat(&ctx, local, realm_id)
             .await
             .unwrap();
         assert!(
-            read_node_info_document(&ctx.storage_handle, local)
+            read_info_document(&ctx.storage_handle, local)
                 .await
                 .unwrap()
                 .is_none()
@@ -1772,7 +1771,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = read_node_info_document(&ctx.storage_handle, local)
+        let stored = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("document");
@@ -1789,9 +1788,8 @@ mod tests {
 
     #[tokio::test]
     async fn merges_group_demand() {
-        // A family two publishers observe counts once, a removed publisher's
-        // demand stops counting, and the local view is current, not the last
-        // heartbeat's.
+        // Shared families count once, removed publishers stop counting,
+        // and the local view supersedes the last heartbeat.
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([12u8; 32]);
@@ -1846,7 +1844,7 @@ mod tests {
                 families,
                 truncated: false,
             }];
-            write_node_info_document(&ctx.storage_handle, &document)
+            write_info_document(&ctx.storage_handle, &document)
                 .await
                 .unwrap();
         }
@@ -1891,7 +1889,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let before = read_node_info_document(&ctx.storage_handle, local)
+        let before = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -1902,7 +1900,7 @@ mod tests {
                 .unwrap()
         );
 
-        let after = read_node_info_document(&ctx.storage_handle, local)
+        let after = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -1974,7 +1972,7 @@ mod tests {
             .await
             .expect("observation completes");
 
-        let stored = read_node_info_document(&ctx.storage_handle, local)
+        let stored = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("document");
@@ -2006,7 +2004,7 @@ mod tests {
         set_departure_state(&ctx, local, realm_id, true)
             .await
             .unwrap();
-        let departed = read_node_info_document(&ctx.storage_handle, local)
+        let departed = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2017,7 +2015,7 @@ mod tests {
                 .unwrap()
         );
 
-        let rejoined = read_node_info_document(&ctx.storage_handle, local)
+        let rejoined = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2052,7 +2050,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let drained = read_node_info_document(&ctx.storage_handle, local)
+        let drained = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2065,7 +2063,7 @@ mod tests {
         set_departure_state(&ctx, local, realm_id, false)
             .await
             .unwrap();
-        let observed = read_node_info_document(&ctx.storage_handle, local)
+        let observed = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2077,7 +2075,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let released = read_node_info_document(&ctx.storage_handle, local)
+        let released = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2143,7 +2141,7 @@ mod tests {
         write_row(
             &ctx,
             NODE_INFO_KEYSPACE,
-            Key::from(node_info_storage_key(peer)),
+            Key::from(node_info_key(peer)),
             vec![0xFFu8; 4],
         )
         .await;
@@ -2178,20 +2176,20 @@ mod tests {
         .unwrap();
 
         write_operator_drain(&ctx, true).await.unwrap();
-        refresh_node_info_heartbeat(&ctx, local, realm_id)
+        refresh_info_heartbeat(&ctx, local, realm_id)
             .await
             .unwrap();
-        let drained = read_node_info_document(&ctx.storage_handle, local)
+        let drained = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
         assert!(drained.compute_draining && !drained.leaving);
 
         write_operator_drain(&ctx, false).await.unwrap();
-        refresh_node_info_heartbeat(&ctx, local, realm_id)
+        refresh_info_heartbeat(&ctx, local, realm_id)
             .await
             .unwrap();
-        let released = read_node_info_document(&ctx.storage_handle, local)
+        let released = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2221,11 +2219,11 @@ mod tests {
             .await
             .unwrap();
 
-        refresh_node_info_heartbeat(&ctx, local, realm_id)
+        refresh_info_heartbeat(&ctx, local, realm_id)
             .await
             .unwrap();
 
-        let stored = read_node_info_document(&ctx.storage_handle, local)
+        let stored = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2252,11 +2250,11 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_node_info_heartbeat(&ctx, local, realm_id)
+        refresh_info_heartbeat(&ctx, local, realm_id)
             .await
             .unwrap();
 
-        let stored = read_node_info_document(&ctx.storage_handle, local)
+        let stored = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();

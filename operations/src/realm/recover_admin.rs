@@ -10,9 +10,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::onboarding::create_secret::secret_record_key;
-use crate::onboarding::secret_state::{
-    resolve_secret_state, secret_state_key, secret_state_write_entry,
-};
+use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry, secret_state_key};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoverInitialAdminInput {
@@ -77,7 +75,7 @@ impl RecoverInitialAdminOperation {
 
     fn replacement_writes(&self) -> Result<Vec<(KeySpace, Key, Value)>, RecoverInitialAdminError> {
         let value = postcard::to_allocvec(&self.input.record).map_err(ConversionError::from)?;
-        let state = secret_state_write_entry(
+        let state = secret_state_entry(
             self.input.record.enrollment_id,
             OnboardingSecretState::Available,
         )?;

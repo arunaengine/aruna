@@ -157,7 +157,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn list_source_connectors_returns_created_connectors() {
+    async fn lists_created_connectors() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {

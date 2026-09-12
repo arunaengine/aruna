@@ -1,6 +1,6 @@
 //! Integration tests against a real Docker daemon. Ignored by default; run
-//! with `--ignored` on a host with a daemon. Without one they skip with a
-//! clear message instead of failing.
+//! with `--ignored` on a host with a daemon. Without one they skip, unless
+//! `ARUNA_COMPUTE_REQUIRE_DOCKER=1` makes an unavailable daemon fail the run.
 #![cfg(feature = "docker")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -167,6 +167,20 @@ async fn read_output(backend: &DockerBackend, attempt: &AttemptRef, path: &str) 
 
 const IMAGE: &str = "alpine:3.24";
 
+/// Required-mode flag for daemon-backed jobs: `1` makes setup failures fatal.
+fn docker_required() -> bool {
+    std::env::var("ARUNA_COMPUTE_REQUIRE_DOCKER").as_deref() == Ok("1")
+}
+
+/// Report a missing daemon: panic in required mode, otherwise skip.
+fn daemon_missing(reason: String) -> Option<DockerBackend> {
+    if docker_required() {
+        panic!("docker backend required but unavailable: {reason}");
+    }
+    eprintln!("skipping docker test: {reason}");
+    None
+}
+
 /// Connect + health-check, or `None` when no daemon is available. Uses network
 /// mode `none`: these containers need no egress and it keeps the tests hermetic.
 async fn daemon() -> Option<DockerBackend> {
@@ -176,13 +190,13 @@ async fn daemon() -> Option<DockerBackend> {
             .join(unique("state")),
         ..DockerConfig::default()
     };
-    let backend = DockerBackend::with_config(config).ok()?;
+    let backend = match DockerBackend::with_config(config) {
+        Ok(backend) => backend,
+        Err(error) => return daemon_missing(format!("daemon setup failed: {error}")),
+    };
     match aruna_compute::ExecutorBackend::health(&backend).await {
         Ok(()) => Some(backend),
-        Err(e) => {
-            eprintln!("skipping docker test: daemon unhealthy: {e}");
-            None
-        }
+        Err(error) => daemon_missing(format!("daemon unhealthy: {error}")),
     }
 }
 

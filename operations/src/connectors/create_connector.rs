@@ -10,7 +10,7 @@ use aruna_core::types::{Effects, GroupId, UserId};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::connectors::repository::{source_connector_key, source_connector_secret_key};
+use crate::connectors::repository::{connector_secret_key, source_connector_key};
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,7 +122,7 @@ impl CreateSourceConnectorOperation {
             };
             writes.push((
                 aruna_core::keyspaces::SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
-                source_connector_secret_key(secret.connector_id),
+                connector_secret_key(secret.connector_id),
                 secret_bytes.into(),
             ));
         }
@@ -209,7 +209,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn create_source_connector_persists_connector_and_secret() {
+    async fn persists_connector_secret() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {

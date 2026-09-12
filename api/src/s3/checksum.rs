@@ -127,16 +127,14 @@ pub enum ChecksumSelection {
     AllStored,
 }
 
-pub fn parse_upload_checksum_request(
+pub fn parse_upload_checksum(
     headers: &HeaderMap,
     trailer: Option<ChecksumAlgorithm>,
 ) -> S3Result<UploadChecksumRequest> {
     parse_checksum_request(headers, true, trailer)
 }
 
-pub fn parse_complete_multipart_checksum_request(
-    headers: &HeaderMap,
-) -> S3Result<UploadChecksumRequest> {
+pub fn parse_completion_checksum(headers: &HeaderMap) -> S3Result<UploadChecksumRequest> {
     parse_checksum_request(headers, false, None)
 }
 
@@ -258,7 +256,7 @@ where
     }))
 }
 
-pub fn validate_composite_part_count(
+pub fn validate_part_count(
     request: &UploadChecksumRequest,
     actual_part_count: usize,
 ) -> S3Result<()> {
@@ -269,7 +267,7 @@ pub fn validate_composite_part_count(
 }
 
 pub fn validate_delete_checksum(headers: &HeaderMap, body: &[u8]) -> S3Result<()> {
-    let request = parse_upload_checksum_request(headers, None)?;
+    let request = parse_upload_checksum(headers, None)?;
     if request.expected.is_empty() {
         return Err(s3_error!(
             MissingSecurityHeader,
@@ -375,7 +373,7 @@ fn parse_expected_checksums(
         }
         if let Some(value) = header_str(headers, name)? {
             let (value, parsed_count) = if composite && algorithm != ChecksumAlgorithm::Md5 {
-                split_composite_part_count(algorithm, value)?
+                split_part_count(algorithm, value)?
             } else {
                 (value, None)
             };
@@ -397,10 +395,7 @@ fn parse_expected_checksums(
 
 // AWS clients send composite checksums as "<base64>-<partCount>"; '-' is not in
 // the base64 alphabet, so it can only introduce the part-count suffix.
-fn split_composite_part_count(
-    algorithm: ChecksumAlgorithm,
-    value: &str,
-) -> S3Result<(&str, Option<usize>)> {
+fn split_part_count(algorithm: ChecksumAlgorithm, value: &str) -> S3Result<(&str, Option<usize>)> {
     let Some((digest, count)) = value.rsplit_once('-') else {
         return Ok((value, None));
     };
@@ -520,9 +515,8 @@ mod tests {
     use super::{
         ApplyChecksums, CONTENT_MD5, ChecksumSelection, X_AMZ_CHECKSUM_CRC32, X_AMZ_CHECKSUM_MODE,
         X_AMZ_CHECKSUM_TYPE, X_AMZ_SDK_CHECKSUM_ALGORITHM, checksum_mode_enabled, encode_checksums,
-        parse_complete_multipart_checksum_request, parse_upload_checksum_request,
-        validate_composite_part_count, validate_delete_checksum, validate_trailer_headers,
-        verify_trailer_stream,
+        parse_completion_checksum, parse_upload_checksum, validate_delete_checksum,
+        validate_part_count, validate_trailer_headers, verify_trailer_stream,
     };
     use aruna_blob::hash::Hasher;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_CRC32};
@@ -535,13 +529,13 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn parses_upload_checksums_from_headers() {
+    fn parses_upload_checksums() {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_MD5, "XrY7u+Ae7tCTyyK7j1rNww==".parse().unwrap());
         headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==".parse().unwrap());
         headers.insert(X_AMZ_SDK_CHECKSUM_ALGORITHM, "CRC32".parse().unwrap());
 
-        let request = parse_upload_checksum_request(&headers, None).unwrap();
+        let request = parse_upload_checksum(&headers, None).unwrap();
 
         assert_eq!(request.expected.len(), 2);
         assert_eq!(request.response_algorithm, Some(ChecksumAlgorithm::Crc32));
@@ -581,30 +575,30 @@ mod tests {
     }
 
     #[test]
-    fn defaults_checksum_type_to_full_object() {
-        let request = parse_upload_checksum_request(&HeaderMap::new(), None).unwrap();
+    fn checksum_type_defaults() {
+        let request = parse_upload_checksum(&HeaderMap::new(), None).unwrap();
 
         assert_eq!(request.checksum_type.as_str(), ChecksumType::FULL_OBJECT);
         assert!(!request.checksum_type_declared);
     }
 
     #[test]
-    fn parses_explicit_checksum_type() {
+    fn parses_checksum_type() {
         let mut headers = HeaderMap::new();
         headers.insert(X_AMZ_CHECKSUM_TYPE, "COMPOSITE".parse().unwrap());
 
-        let request = parse_upload_checksum_request(&headers, None).unwrap();
+        let request = parse_upload_checksum(&headers, None).unwrap();
 
         assert_eq!(request.checksum_type.as_str(), ChecksumType::COMPOSITE);
         assert!(request.checksum_type_declared);
     }
 
     #[test]
-    fn complete_multipart_does_not_treat_content_md5_as_object_checksum() {
+    fn content_md5_excluded() {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_MD5, "XrY7u+Ae7tCTyyK7j1rNww==".parse().unwrap());
 
-        let request = parse_complete_multipart_checksum_request(&headers).unwrap();
+        let request = parse_completion_checksum(&headers).unwrap();
 
         assert!(request.expected.is_empty());
         assert_eq!(request.response_algorithm, None);
@@ -612,11 +606,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_declared_algorithm_without_inline_checksum() {
+    fn missing_inline_rejected() {
         let mut headers = HeaderMap::new();
         headers.insert(X_AMZ_SDK_CHECKSUM_ALGORITHM, "CRC32".parse().unwrap());
 
-        let err = parse_upload_checksum_request(&headers, None).unwrap_err();
+        let err = parse_upload_checksum(&headers, None).unwrap_err();
 
         assert_eq!(err.code().as_str(), "InvalidRequest");
     }
@@ -625,8 +619,7 @@ mod tests {
     fn validates_checksum_trailer() {
         let mut headers = HeaderMap::new();
         headers.insert(X_AMZ_SDK_CHECKSUM_ALGORITHM, "CRC32".parse().unwrap());
-        let request =
-            parse_upload_checksum_request(&headers, Some(ChecksumAlgorithm::Crc32)).unwrap();
+        let request = parse_upload_checksum(&headers, Some(ChecksumAlgorithm::Crc32)).unwrap();
         assert!(request.expected.is_empty());
         assert_eq!(request.response_algorithm, Some(ChecksumAlgorithm::Crc32));
 
@@ -669,13 +662,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_MD5, "nope".parse().unwrap());
 
-        let err = parse_upload_checksum_request(&headers, None).unwrap_err();
+        let err = parse_upload_checksum(&headers, None).unwrap_err();
 
         assert_eq!(err.code().as_str(), "InvalidDigest");
     }
 
     #[test]
-    fn enables_checksum_mode_from_headers() {
+    fn headers_enable_checksum() {
         let mut headers = HeaderMap::new();
         headers.insert(X_AMZ_CHECKSUM_MODE, "ENABLED".parse().unwrap());
 
@@ -683,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn applies_encoded_checksums_via_trait() {
+    fn trait_applies_checksums() {
         let mut hashes = HashMap::new();
         hashes.insert(HASH_CRC32.to_string(), vec![0xcb, 0xf4, 0x39, 0x26]);
 
@@ -705,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn suffixes_composite_checksums_with_part_count() {
+    fn composite_suffix_applied() {
         let mut hashes = HashMap::new();
         hashes.insert(HASH_CRC32.to_string(), vec![0xcb, 0xf4, 0x39, 0x26]);
 
@@ -735,19 +728,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_suffixed_composite_checksum_header() {
+    fn parses_suffixed_checksum() {
         let mut headers = HeaderMap::new();
         headers.insert(X_AMZ_CHECKSUM_TYPE, "COMPOSITE".parse().unwrap());
         headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==-2".parse().unwrap());
 
-        let request = parse_upload_checksum_request(&headers, None).unwrap();
+        let request = parse_upload_checksum(&headers, None).unwrap();
 
         assert_eq!(request.expected.len(), 1);
         assert_eq!(request.expected[0].digest, vec![0xcb, 0xf4, 0x39, 0x26]);
         assert_eq!(request.composite_part_count, Some(2));
-        assert!(validate_composite_part_count(&request, 2).is_ok());
+        assert!(validate_part_count(&request, 2).is_ok());
         assert_eq!(
-            validate_composite_part_count(&request, 3)
+            validate_part_count(&request, 3)
                 .unwrap_err()
                 .code()
                 .as_str(),
@@ -756,35 +749,35 @@ mod tests {
     }
 
     #[test]
-    fn accepts_unsuffixed_composite_checksum_header() {
+    fn accepts_unsuffixed_checksum() {
         let mut headers = HeaderMap::new();
         headers.insert(X_AMZ_CHECKSUM_TYPE, "COMPOSITE".parse().unwrap());
         headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==".parse().unwrap());
 
-        let request = parse_upload_checksum_request(&headers, None).unwrap();
+        let request = parse_upload_checksum(&headers, None).unwrap();
 
         assert_eq!(request.expected[0].digest, vec![0xcb, 0xf4, 0x39, 0x26]);
         assert_eq!(request.composite_part_count, None);
-        assert!(validate_composite_part_count(&request, 7).is_ok());
+        assert!(validate_part_count(&request, 7).is_ok());
     }
 
     #[test]
-    fn rejects_malformed_composite_part_count() {
+    fn malformed_count_rejected() {
         let mut headers = HeaderMap::new();
         headers.insert(X_AMZ_CHECKSUM_TYPE, "COMPOSITE".parse().unwrap());
         headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==-x".parse().unwrap());
 
-        let err = parse_upload_checksum_request(&headers, None).unwrap_err();
+        let err = parse_upload_checksum(&headers, None).unwrap_err();
 
         assert_eq!(err.code().as_str(), "InvalidDigest");
     }
 
     #[test]
-    fn rejects_suffixed_checksum_without_composite_type() {
+    fn invalid_suffix_rejected() {
         let mut headers = HeaderMap::new();
         headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==-2".parse().unwrap());
 
-        let err = parse_upload_checksum_request(&headers, None).unwrap_err();
+        let err = parse_upload_checksum(&headers, None).unwrap_err();
 
         assert_eq!(err.code().as_str(), "InvalidRequest");
     }

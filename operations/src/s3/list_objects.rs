@@ -1,5 +1,5 @@
 use crate::s3::list_versions::served_copy;
-use crate::s3::listing::PrefixPage;
+use crate::s3::listing::PrefixTracker;
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -15,7 +15,7 @@ use aruna_core::structs::{
     SourceConnectorKind, SourceMetadata, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, Value};
-use aruna_core::util::prefix_upper_bound;
+use aruna_core::keyspaces::prefix_upper_bound;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -120,7 +120,7 @@ pub struct ListObjectsV2Operation {
     resolved: Vec<ResolvedEntry>,
     location_reads: Vec<(String, Key)>,
     objects: Vec<ListObjectsV2Object>,
-    prefixes: PrefixPage,
+    prefixes: PrefixTracker,
     continuation_token: Option<ListObjectsV2ContinuationToken>,
     scan_prefix: Vec<u8>,
     scan_limit: usize,
@@ -145,7 +145,7 @@ impl ListObjectsV2Operation {
             resolved: Vec::new(),
             location_reads: Vec::new(),
             objects: Vec::new(),
-            prefixes: PrefixPage::default(),
+            prefixes: PrefixTracker::default(),
             continuation_token: None,
             scan_prefix: Vec::new(),
             scan_limit: 0,
@@ -400,9 +400,8 @@ impl ListObjectsV2Operation {
         let round_len = values.len();
         self.round_exhausted = round_len < self.scan_limit;
 
-        // Collect this round's candidate heads: their current version decides
-        // delete-marker status, hence Contents membership and prefix roll-up. Keys
-        // in an already-emitted group are skipped; only the cursor advances past them.
+        // Each candidate head's current version decides delete-marker status,
+        // Contents membership and prefix roll-up; keys in emitted groups skip.
         let mut candidates: Vec<(BlobHeadKey, Ulid, Vec<u8>)> = Vec::new();
         for (key, value) in values.into_iter() {
             if let Some(group_prefix) = self.cursor_group_prefix.as_deref()
@@ -454,7 +453,7 @@ impl ListObjectsV2Operation {
         })]
     }
 
-    fn handle_round_versions_read(&mut self, event: Event) -> Effects {
+    fn round_versions_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.emit_error(ListObjectsV2Error::InvalidStateEvent {
                 state: self.state.clone(),
@@ -503,9 +502,8 @@ impl ListObjectsV2Operation {
                             return self.emit_error(err);
                         }
                     } else {
-                        // Delete-markered key in a group with no live key yet:
-                        // do not emit and do not seek past, so a later live
-                        // sibling can still surface the prefix.
+                        // No live sibling yet: emit nothing and do not seek
+                        // past, so a later live key can surface the prefix.
                         self.cursor_group = None;
                         self.cursor_group_prefix = None;
                         self.last_consumed_key = Some(key_bytes);
@@ -513,17 +511,15 @@ impl ListObjectsV2Operation {
                 }
                 None => {
                     if !live {
-                        // Delete-markered key hidden from Contents; advance past
-                        // it. Any preceding group is fully emitted, so the
-                        // cursor no longer sits inside one.
+                        // Hidden from Contents; advance past it since the
+                        // preceding group is fully emitted.
                         self.cursor_group = None;
                         self.cursor_group_prefix = None;
                         self.last_consumed_key = Some(key_bytes);
                         continue;
                     }
                     // Truncate before clearing the cursor so the token still
-                    // records the group just finished, letting the next page
-                    // seek past it instead of re-emitting the prefix.
+                    // records the finished group for the next page.
                     if self.emitted() >= max_keys {
                         return self.truncate_scan();
                     }
@@ -707,7 +703,7 @@ impl Operation for ListObjectsV2Operation {
             ListObjectsV2State::Init => self.handle_init(),
             ListObjectsV2State::StartTransaction => self.handle_transaction_started(event),
             ListObjectsV2State::ReadHeads => self.handle_heads_read(event),
-            ListObjectsV2State::ReadVersions => self.handle_round_versions_read(event),
+            ListObjectsV2State::ReadVersions => self.round_versions_read(event),
             ListObjectsV2State::ReadBlobLocations => self.handle_locations_read(event),
             ListObjectsV2State::CommitTransaction => self.handle_transaction_committed(event),
             ListObjectsV2State::Finish | ListObjectsV2State::Error => smallvec![],
@@ -759,7 +755,7 @@ mod test {
     use std::time::{Duration, UNIX_EPOCH};
 
     #[tokio::test]
-    async fn test_list_objects_v2_skips_deleted_versions() {
+    async fn deleted_versions_skipped() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
 
@@ -868,7 +864,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_with_prefix() {
+    async fn prefix_filtered() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
 
@@ -923,7 +919,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_prefix_scan_does_not_stop_on_prefix_miss() {
+    async fn prefix_miss_continues() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
 
@@ -972,7 +968,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_honors_explicit_zero_max_keys() {
+    async fn zero_limit_honored() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
 
@@ -1040,7 +1036,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_pagination_without_prefix() {
+    async fn pagination_resumes() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
 
@@ -1096,7 +1092,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_empty_bucket() {
+    async fn empty_bucket_lists() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
 
@@ -1124,7 +1120,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_reference_object() {
+    async fn reference_object_lists() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
 
@@ -1359,7 +1355,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_prefix_includes_key_equal_to_prefix() {
+    async fn equal_prefix_included() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -1380,7 +1376,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_prefix_scan_with_interleaved_shorter_key() {
+    async fn short_key_interleaves() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -1392,7 +1388,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_returns_keys_in_lexicographic_order() {
+    async fn keys_sorted() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -1404,7 +1400,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_start_after_skips_preceding_keys() {
+    async fn start_after_skips() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -1422,7 +1418,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_start_after_beyond_prefix_range_returns_empty() {
+    async fn beyond_prefix_empty() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -1462,7 +1458,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_delimiter_groups_keys() {
+    async fn delimiter_groups() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -1488,7 +1484,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_delimiter_pagination_never_repeats_prefixes() {
+    async fn delimiter_paginates() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -1531,7 +1527,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_batched_hydration_preserves_key_order() {
+    async fn hydration_preserves_order() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
 
@@ -1650,7 +1646,7 @@ mod test {
     }
 
     #[test]
-    fn scan_round_ending_inside_group_seeks_past_group() {
+    fn group_round_advances() {
         let mut operation = ListObjectsV2Operation::new(delimiter_input(1, None, Some("/")));
 
         let effects = step_transaction_started(&mut operation);
@@ -1712,7 +1708,7 @@ mod test {
     }
 
     #[test]
-    fn resume_inside_group_seeks_past_group() {
+    fn group_resume_advances() {
         let token = ListObjectsV2ContinuationToken {
             last_key: BlobHeadKey::new("bucket", "dir/5").to_bytes().unwrap(),
             last_common_prefix: Some("dir/".to_string()),
@@ -1741,7 +1737,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_paginates_past_large_group() {
+    async fn large_group_paginates() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -1784,7 +1780,7 @@ mod test {
     // (a) A key whose latest version is a delete marker is absent from Contents,
     // including the zero-byte folder marker key equal to the listing prefix.
     #[tokio::test]
-    async fn test_list_objects_v2_delete_marker_absent_from_contents() {
+    async fn delete_marker_omitted() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -1807,7 +1803,7 @@ mod test {
     // (b) A prefix whose every key is delete-markered produces NO common prefix
     // and lists nothing, even though the head keys still physically exist.
     #[tokio::test]
-    async fn test_list_objects_v2_delimiter_hides_fully_deleted_prefix() {
+    async fn deleted_prefix_hidden() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -1834,10 +1830,9 @@ mod test {
     }
 
     // (c) A prefix mixing live and delete-markered keys still produces the
-    // common prefix; the leading key of the group is a delete marker to prove
-    // the scan keeps looking for a live sibling before dropping the prefix.
+    // common prefix; the scan finds the live sibling behind the marker.
     #[tokio::test]
-    async fn test_list_objects_v2_delimiter_keeps_mixed_prefix() {
+    async fn mixed_prefix_kept() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
@@ -1867,10 +1862,9 @@ mod test {
     }
 
     // (d) Pagination across delete-markered keys keeps KeyCount and IsTruncated
-    // correct: each page carries max_keys live results and the marker keys never
-    // inflate a page or short-count it.
+    // correct: markers never inflate or short-count a page.
     #[tokio::test]
-    async fn test_list_objects_v2_pagination_skips_delete_markers() {
+    async fn markers_skipped() {
         let (_temp_handle, storage_handle) = test_storage();
         let driver_ctx = test_context(storage_handle.clone());
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));

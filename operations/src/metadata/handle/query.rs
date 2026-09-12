@@ -1,6 +1,27 @@
-use super::lifecycle::list_registry_records_for_local_read;
-use super::search::{LocalReadScope, resolve_graph_visibility_scope};
-use super::*;
+use super::effects::warn_slow_call;
+use super::lifecycle::list_read_records;
+use super::search::{LocalReadScope, resolve_visibility_scope};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
+use std::time::Instant;
+
+use aruna_core::metadata::{MetadataError, MetadataQueryResults};
+use aruna_core::structs::AuthContext;
+use aruna_core::telemetry::{record_duration_ms, record_elapsed_ms};
+use craqle::{CraqleNode, GraphId};
+use oxrdf::{BlankNode, Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use spareval::{CancellationToken, QueryEvaluator};
+use spargebra::{Query, SparqlParser};
+use tokio::time::timeout_at;
+use tracing::{Span, debug_span, field};
+
+use super::effects::{graph_ids, record_error, record_query_counts};
+use super::search::select_authorized_graphs;
+use super::{
+    METADATA_QUERY_COMMON_PREFIXES, METADATA_QUERY_DEADLINE, METADATA_QUERY_MAX_BYTES,
+    METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS, MetadataHandle, MetadataInner,
+};
+use crate::metadata::query_cache::{CachedQuery, LocalScopeKind, graphs_digest, local_key};
 #[tracing::instrument(
     name = "metadata.query.local",
     level = "debug",
@@ -43,7 +64,7 @@ pub(super) async fn query_local_graphs(
         .query_cache
         .stamp(inner.visibility_cache.current_generation());
 
-    let records = list_registry_records_for_local_read(inner.clone(), &span).await?;
+    let records = list_read_records(inner.clone(), &span).await?;
 
     let authorization_started = Instant::now();
     // Document-scoped queries keep the eager per-record selection; the
@@ -59,9 +80,9 @@ pub(super) async fn query_local_graphs(
             }
             LocalReadScope::Eager(allowed)
         }
-        None => LocalReadScope::Lazy(
-            resolve_graph_visibility_scope(&inner, auth_context, records).await?,
-        ),
+        None => {
+            LocalReadScope::Lazy(resolve_visibility_scope(&inner, auth_context, records).await?)
+        }
     };
     record_elapsed_ms(&span, "authorization_ms", authorization_started);
     let lazy = match &scope {
@@ -91,7 +112,7 @@ pub(super) async fn query_local_graphs(
     {
         span.record("cache", "hit");
         span.record("result", cached.results.kind());
-        record_metadata_query_result_counts(&span, &cached.results);
+        record_query_counts(&span, &cached.results);
         record_elapsed_ms(&span, "elapsed_ms", total_started);
         return Ok((*cached.results).clone());
     }
@@ -133,9 +154,8 @@ pub(super) async fn query_local_graphs(
     let blocking_cancellation = cancellation.clone();
     let mut blocking = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        blocking_span.in_scope(|| {
-            evaluate_metadata_query_snapshot(&inner, scope, &query, &blocking_cancellation)
-        })
+        blocking_span
+            .in_scope(|| evaluate_query_snapshot(&inner, scope, &query, &blocking_cancellation))
     });
     let result = match tokio::time::timeout_at(query_deadline, &mut blocking).await {
         Ok(Ok(result)) => result,
@@ -155,8 +175,8 @@ pub(super) async fn query_local_graphs(
         Ok(results) => {
             query_span.record("result", results.kind());
             span.record("result", results.kind());
-            record_metadata_query_result_counts(&query_span, results);
-            record_metadata_query_result_counts(&span, results);
+            record_query_counts(&query_span, results);
+            record_query_counts(&span, results);
             let stored = cache_inner.query_cache.insert(
                 cache_key,
                 CachedQuery {
@@ -176,7 +196,7 @@ pub(super) async fn query_local_graphs(
             record_error(&span, &error.to_string());
         }
     }
-    warn_if_slow_metadata_backend("query_graphs", None, query_elapsed);
+    warn_slow_call("query_graphs", None, query_elapsed);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
     result
 }
@@ -206,7 +226,7 @@ pub(super) fn parse_metadata_query(sparql: &str) -> Result<Query, MetadataError>
             ));
         }
     };
-    if super::super::api::graph_pattern_contains_service(pattern) {
+    if super::super::api::pattern_contains_service(pattern) {
         return Err(MetadataError::InvalidInput(
             "SERVICE is not supported in metadata queries".to_string(),
         ));
@@ -214,7 +234,7 @@ pub(super) fn parse_metadata_query(sparql: &str) -> Result<Query, MetadataError>
     Ok(query)
 }
 
-fn evaluate_metadata_query_snapshot(
+fn evaluate_query_snapshot(
     inner: &MetadataInner,
     scope: LocalReadScope<Vec<String>>,
     query: &Query,
@@ -232,7 +252,7 @@ fn evaluate_metadata_query_snapshot(
     };
     let mut dataset = Dataset::new();
     for graph in graphs {
-        ensure_metadata_query_not_cancelled(cancellation)?;
+        ensure_not_cancelled(cancellation)?;
         if !inner
             .node
             .contains_graph(&graph)
@@ -253,7 +273,7 @@ fn evaluate_metadata_query_snapshot(
             .map(|entity| craqle::EncodedTerm::from_named_node(&NamedNode::new_unchecked(entity)))
             .collect::<HashSet<_>>();
         for quad in snapshot.quads {
-            ensure_metadata_query_not_cancelled(cancellation)?;
+            ensure_not_cancelled(cancellation)?;
             if orphaned.contains(&quad.subject) || orphaned.contains(&quad.object) {
                 continue;
             }
@@ -285,7 +305,7 @@ fn evaluate_metadata_query_snapshot(
         }
     }
 
-    ensure_metadata_query_not_cancelled(cancellation)?;
+    ensure_not_cancelled(cancellation)?;
     let evaluator = QueryEvaluator::new().with_cancellation_token(cancellation.clone());
     let mut prepared = evaluator.prepare(query);
     prepared
@@ -294,8 +314,8 @@ fn evaluate_metadata_query_snapshot(
     let evaluated = prepared
         .execute(&dataset)
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    let results = collect_metadata_query_results(evaluated)?;
-    ensure_metadata_query_not_cancelled(cancellation)?;
+    let results = collect_query_results(evaluated)?;
+    ensure_not_cancelled(cancellation)?;
     let serialized =
         serde_json::to_vec(&results).map_err(|error| MetadataError::Backend(error.to_string()))?;
     if serialized.len() > METADATA_QUERY_MAX_RESULT_BYTES {
@@ -306,7 +326,7 @@ fn evaluate_metadata_query_snapshot(
     Ok(results)
 }
 
-fn collect_metadata_query_results(
+fn collect_query_results(
     results: spareval::QueryResults<'_>,
 ) -> Result<MetadataQueryResults, MetadataError> {
     match results {
@@ -351,9 +371,7 @@ fn collect_metadata_query_results(
     }
 }
 
-fn ensure_metadata_query_not_cancelled(
-    cancellation: &CancellationToken,
-) -> Result<(), MetadataError> {
+fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), MetadataError> {
     if cancellation.is_cancelled() {
         Err(MetadataError::InvalidInput(
             "metadata query was cancelled".to_string(),
@@ -404,4 +422,24 @@ pub(super) fn snapshot_iri_references(
         ));
     }
     Ok(references)
+}
+
+impl MetadataHandle {
+    #[tracing::instrument(
+        name = "metadata.query.local_authorized",
+        level = "debug",
+        skip(self, auth_context, sparql),
+        fields(
+            query_len = sparql.len() as u64,
+            graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
+        )
+    )]
+    pub async fn query_authorized_local(
+        &self,
+        auth_context: Option<AuthContext>,
+        graph_iris: Option<Vec<String>>,
+        sparql: String,
+    ) -> Result<MetadataQueryResults, MetadataError> {
+        query_local_graphs(self.inner.clone(), auth_context, graph_iris, sparql).await
+    }
 }

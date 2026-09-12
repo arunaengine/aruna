@@ -1,6 +1,6 @@
-use crate::blob::blob_storage::{
-    HeadAliasContext, add_hash_path_index_effect, blob_location_read, write_blob_head_effect,
-    write_blob_location_effect, write_blob_version_effect,
+use crate::blob::records::{
+    HeadAliasContext, add_index_effect, blob_location_read, write_head_effect,
+    write_location_effect, write_version_effect,
 };
 use crate::blob::managed_copy::{
     CopyRegistration, CopyRequest, ManagedCopyError, register_effect, serve_reads,
@@ -9,7 +9,7 @@ use crate::blob::managed_copy::{
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
-    schedule_usage_snapshot_publish_effect,
+    schedule_snapshot_publish,
 };
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
@@ -18,7 +18,7 @@ use crate::placement::policy::{
 use crate::replication::dht_registration::dht_registration_effect;
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::s3::write_cleanup::{CleanupEvent, WriteCleanup};
+use crate::s3::write_cleanup::{CleanupStep, WriteCleanup};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
@@ -461,7 +461,7 @@ impl PutObjectOperation {
             .as_ref()
             .map_or(self.config.group_id, |bucket| bucket.group_id);
         match write_gate(self.gate_context.as_ref(), &refs, Some(group_id)) {
-            Ok(None) => self.check_purge_fence_before_write(),
+            Ok(None) => self.check_write_fence(),
             Ok(Some(mut gate)) => {
                 let effects = gate.start();
                 let complete = gate.is_complete();
@@ -496,17 +496,17 @@ impl PutObjectOperation {
             Err(error) => return self.emit_error(PolicyGateError::from(error).into()),
         };
         match gate_decision(outcome) {
-            Ok(()) => self.check_purge_fence_before_write(),
+            Ok(()) => self.check_write_fence(),
             Err(error) => self.emit_error(error.into()),
         }
     }
 
-    fn check_purge_fence_before_write(&mut self) -> Effects {
+    fn check_write_fence(&mut self) -> Effects {
         self.state = PutObjectState::CheckPurgeFenceBeforeWrite;
         smallvec![write_fence_read(&self.config.request.bucket, None)]
     }
 
-    fn handle_purge_fence_before_write(&mut self, event: Event) -> Effects {
+    fn write_fence_checked(&mut self, event: Event) -> Effects {
         match check_write_fence(event, &self.config.request.bucket, &self.config.request.key) {
             Ok(()) => self.write_blob(),
             Err(error) => self.emit_error(error.into()),
@@ -597,7 +597,7 @@ impl PutObjectOperation {
         }
     }
 
-    fn handle_purge_fence_checked(&mut self, event: Event) -> Effects {
+    fn fence_checked(&mut self, event: Event) -> Effects {
         if let Err(error) =
             check_write_fence(event, &self.config.request.bucket, &self.config.request.key)
         {
@@ -679,7 +679,7 @@ impl PutObjectOperation {
         smallvec![blob_location_read(&key, self.txn_id)]
     }
 
-    fn handle_hash_lookup_checked(&mut self, event: Event) -> Effects {
+    fn hash_checked(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
@@ -718,7 +718,7 @@ impl PutObjectOperation {
             return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
         };
 
-        let effect = match write_blob_location_effect(
+        let effect = match write_location_effect(
             match blake3_hash.try_into() {
                 Ok(hash) => hash,
                 Err(err) => return self.emit_error(PutObjectError::ConversionError(err.into())),
@@ -765,7 +765,7 @@ impl PutObjectOperation {
         })]
     }
 
-    fn handle_object_lookup_read(&mut self, event: Event) -> Effects {
+    fn object_lookup_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
@@ -801,7 +801,7 @@ impl PutObjectOperation {
         self.write_current_lookup(existing_pointer.as_ref())
     }
 
-    fn handle_liveness_version_read(&mut self, event: Event) -> Effects {
+    fn liveness_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
@@ -820,7 +820,7 @@ impl PutObjectOperation {
             Ok(pointer) => pointer,
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
-        let effect = match write_blob_head_effect(&self.alias_context(), pointer, self.txn_id) {
+        let effect = match write_head_effect(&self.alias_context(), pointer, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
@@ -829,7 +829,7 @@ impl PutObjectOperation {
         smallvec![effect]
     }
 
-    fn handle_blob_location_created(&mut self, event: Event) -> Effects {
+    fn location_created(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
             self.create_object_lookup()
         } else {
@@ -837,22 +837,22 @@ impl PutObjectOperation {
         }
     }
 
-    fn handle_blob_head_written(&mut self, event: Event) -> Effects {
+    fn head_written(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            self.write_hash_path_index()
+            self.write_path_index()
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
         }
     }
 
-    fn write_hash_path_index(&mut self) -> Effects {
+    fn write_path_index(&mut self) -> Effects {
         let Some(location) = self.get_output().cloned() else {
             return self.emit_error(PutObjectError::MissingOutput);
         };
         let Some(blake3_hash) = location.get_blake3() else {
             return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
         };
-        let effect = match add_hash_path_index_effect(
+        let effect = match add_index_effect(
             &self.alias_context(),
             match blake3_hash.try_into() {
                 Ok(hash) => hash,
@@ -871,7 +871,7 @@ impl PutObjectOperation {
         smallvec![effect]
     }
 
-    fn handle_hash_path_index_created(&mut self, event: Event) -> Effects {
+    fn path_index_created(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
             let Some(version_id) = self.version_id else {
                 return self.emit_error(PutObjectError::PutObjectFailed);
@@ -906,7 +906,7 @@ impl PutObjectOperation {
                 version_id,
             );
             self.stored_policies = version.placement_policies.clone();
-            let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
+            let effect = match write_version_effect(&version_key, &version, self.txn_id) {
                 Ok(effect) => effect,
                 Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
             };
@@ -917,7 +917,7 @@ impl PutObjectOperation {
         }
     }
 
-    fn handle_blob_version_record_created(&mut self, event: Event) -> Effects {
+    fn version_created(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
             self.register_managed_copy()
         } else {
@@ -959,13 +959,13 @@ impl PutObjectOperation {
 
     fn handle_copy_registered(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            self.write_live_replication_obligation()
+            self.write_obligation()
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
         }
     }
 
-    fn write_live_replication_obligation(&mut self) -> Effects {
+    fn write_obligation(&mut self) -> Effects {
         let Some(version_id) = self.version_id else {
             return self.emit_error(PutObjectError::PutObjectFailed);
         };
@@ -990,7 +990,7 @@ impl PutObjectOperation {
         smallvec![effect]
     }
 
-    fn handle_live_replication_obligation_written(&mut self, event: Event) -> Effects {
+    fn obligation_written(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
             if let Some(txn_id) = self.txn_id {
                 let Some(location) = self.get_output().cloned() else {
@@ -1011,9 +1011,8 @@ impl PutObjectOperation {
                     stored,
                 ));
 
-                // Enforce the hard group quota before the counters commit. Only a
-                // positive logical-bytes delta can push a group over its ceiling;
-                // deletes and zero-length writes are never gated.
+                // Enforce the hard quota before counters commit; only a
+                // positive logical delta can breach it, so deletes pass.
                 if let Some(ceiling) = self.config.quota_ceiling
                     && location.blob_size > 0
                 {
@@ -1084,7 +1083,7 @@ impl PutObjectOperation {
         }
     }
 
-    fn handle_quota_reject_abort(&mut self, event: Event) -> Effects {
+    fn abort_quota_reject(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::TransactionAborted { .. })
             | Event::Storage(StorageEvent::Error { .. }) => self.cleanup_orphan_blob(),
@@ -1175,7 +1174,7 @@ impl PutObjectOperation {
                     self.state = PutObjectState::ReleaseReservation;
                     smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
                 } else {
-                    self.register_blob_in_dht_or_continue()
+                    self.register_blob()
                 }
             }
             Event::Storage(StorageEvent::Error { error }) => {
@@ -1254,36 +1253,36 @@ impl PutObjectOperation {
         })
     }
 
-    fn register_blob_in_dht_or_continue(&mut self) -> Effects {
+    fn register_blob(&mut self) -> Effects {
         let Some(location) = self.get_output().cloned() else {
-            return self.continue_after_dht_registration();
+            return self.continue_after_registration();
         };
         let Some(blake3_hash) = location.get_blake3() else {
-            return self.continue_after_dht_registration();
+            return self.continue_after_registration();
         };
         self.state = PutObjectState::RegisterBlobInDht;
         match dht_registration_effect(blake3_hash, self.config.realm_id, &self.rocrate_limits) {
             Ok(effect) => smallvec![effect],
-            Err(_) => self.continue_after_dht_registration(),
+            Err(_) => self.continue_after_registration(),
         }
     }
 
-    fn handle_blob_registered_in_dht(&mut self, event: Event) -> Effects {
+    fn blob_registered(&mut self, event: Event) -> Effects {
         match event {
             Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))
             | Event::Net(NetEvent::Dht(DhtEvent::Error { .. }))
-            | Event::Net(NetEvent::Error(_)) => self.continue_after_dht_registration(),
+            | Event::Net(NetEvent::Error(_)) => self.continue_after_registration(),
             _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
     }
 
-    fn continue_after_dht_registration(&mut self) -> Effects {
+    fn continue_after_registration(&mut self) -> Effects {
         if let Some(location) = self.cleanup_location.take() {
             self.state = PutObjectState::CleanupDuplicate;
             smallvec![Effect::Blob(BlobEffect::Delete { location })]
         } else {
             self.state = PutObjectState::Finish;
-            smallvec![schedule_usage_snapshot_publish_effect()]
+            smallvec![schedule_snapshot_publish()]
         }
     }
 
@@ -1291,7 +1290,7 @@ impl PutObjectOperation {
         match event {
             Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
                 self.state = PutObjectState::Finish;
-                smallvec![schedule_usage_snapshot_publish_effect()]
+                smallvec![schedule_snapshot_publish()]
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
@@ -1307,7 +1306,7 @@ impl PutObjectOperation {
         self.rollback_written_blob()
     }
 
-    fn handle_failed_write_cleanup(&mut self, event: Event) -> Effects {
+    fn write_cleanup_failed(&mut self, event: Event) -> Effects {
         match event {
             Event::Blob(BlobEvent::DeleteFinished) => {
                 self.rollback_location = None;
@@ -1340,10 +1339,10 @@ impl PutObjectOperation {
 
     fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
         match self.cleanup.handle_queued(event) {
-            CleanupEvent::Effect(effect) => smallvec![effect],
-            CleanupEvent::Accepted => self.release_or_error(),
-            CleanupEvent::Exhausted | CleanupEvent::Closed => self.finish_or_error(),
-            CleanupEvent::Invalid => self.emit_error(PutObjectError::InvalidOperationState),
+            CleanupStep::Retry(effect) => smallvec![effect],
+            CleanupStep::Accepted => self.release_or_error(),
+            CleanupStep::Exhausted | CleanupStep::Closed => self.finish_or_error(),
+            CleanupStep::Invalid => self.emit_error(PutObjectError::InvalidOperationState),
         }
     }
 
@@ -1361,7 +1360,7 @@ impl PutObjectOperation {
         if self.cleanup.error_pending() {
             return self.emit_pending_error();
         }
-        self.continue_after_dht_registration()
+        self.continue_after_registration()
     }
 
     /// The commit is durable, so a refused release must not fail the request.
@@ -1382,7 +1381,7 @@ impl PutObjectOperation {
             .cloned()
             .and_then(|location| self.reconcile_work(location).ok())
         else {
-            return self.continue_after_dht_registration();
+            return self.continue_after_registration();
         };
         self.queue_cleanup_work(work)
     }
@@ -1401,7 +1400,7 @@ impl PutObjectOperation {
         if self.cleanup.error_pending() {
             self.emit_pending_error()
         } else {
-            self.register_blob_in_dht_or_continue()
+            self.register_blob()
         }
     }
 
@@ -1451,35 +1450,35 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadGateBucket => self.handle_gate_bucket(event),
             PutObjectState::PolicyGate => self.handle_policy_gate(event),
             PutObjectState::CheckPurgeFenceBeforeWrite => {
-                self.handle_purge_fence_before_write(event)
+                self.write_fence_checked(event)
             }
             PutObjectState::WriteBlob => self.handle_write_finished(event),
-            PutObjectState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
+            PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
             PutObjectState::WriteCleanupRow => self.handle_cleanup_row(event),
             PutObjectState::StartTransaction => self.handle_transaction_started(event),
-            PutObjectState::CheckPurgeFence => self.handle_purge_fence_checked(event),
+            PutObjectState::CheckPurgeFence => self.fence_checked(event),
             PutObjectState::CheckBucket => self.handle_bucket_checked(event),
             PutObjectState::FenceBackend => self.handle_backend_fenced(event),
-            PutObjectState::CheckHashLookup => self.handle_hash_lookup_checked(event),
-            PutObjectState::CreateBlobLocation => self.handle_blob_location_created(event),
-            PutObjectState::ReadObjectLookup => self.handle_object_lookup_read(event),
-            PutObjectState::ReadLivenessVersion => self.handle_liveness_version_read(event),
-            PutObjectState::WriteBlobHead => self.handle_blob_head_written(event),
-            PutObjectState::WriteHashPathIndex => self.handle_hash_path_index_created(event),
+            PutObjectState::CheckHashLookup => self.hash_checked(event),
+            PutObjectState::CreateBlobLocation => self.location_created(event),
+            PutObjectState::ReadObjectLookup => self.object_lookup_read(event),
+            PutObjectState::ReadLivenessVersion => self.liveness_read(event),
+            PutObjectState::WriteBlobHead => self.head_written(event),
+            PutObjectState::WriteHashPathIndex => self.path_index_created(event),
             PutObjectState::CreateBlobVersionRecord => {
-                self.handle_blob_version_record_created(event)
+                self.version_created(event)
             }
             PutObjectState::RegisterManagedCopy => self.handle_copy_registered(event),
             PutObjectState::WriteLiveReplicationObligation => {
-                self.handle_live_replication_obligation_written(event)
+                self.obligation_written(event)
             }
             PutObjectState::EnforceQuota => self.handle_enforce_quota(event),
-            PutObjectState::QuotaRejectAbort => self.handle_quota_reject_abort(event),
+            PutObjectState::QuotaRejectAbort => self.abort_quota_reject(event),
             PutObjectState::UpdateUsage => self.handle_usage_update(event),
             PutObjectState::CommitTransaction => self.handle_transaction_committed(event),
             PutObjectState::ReleaseReservation => self.handle_release(event),
-            PutObjectState::RegisterBlobInDht => self.handle_blob_registered_in_dht(event),
+            PutObjectState::RegisterBlobInDht => self.blob_registered(event),
             PutObjectState::CleanupDuplicate => self.handle_duplicate_cleanup(event),
             PutObjectState::Finish => self.emit_finish(),
             PutObjectState::Error => self.abort(),
@@ -1620,7 +1619,7 @@ mod routing_test {
             .with_restrictions(Some(restrictions.clone()));
         operation.version_id = Some(Ulid::generate());
 
-        let effects = operation.write_live_replication_obligation();
+        let effects = operation.write_obligation();
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected one obligation write, got {effects:?}")
@@ -1985,7 +1984,7 @@ mod test {
     }
 
     #[test]
-    fn bucket_guard_rejects_recreate() {
+    fn recreate_rejected() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = Ulid::generate();
         let node_id = iroh::SecretKey::generate().public();
@@ -2127,7 +2126,7 @@ mod test {
     }
 
     #[test]
-    fn quota_gate_error_aborts_transaction_and_deletes_written_blob() {
+    fn quota_error_cleans() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = Ulid::generate();
         let node_id = iroh::SecretKey::generate().public();
@@ -2169,7 +2168,7 @@ mod test {
     }
 
     #[test]
-    fn usage_update_error_aborts_transaction_and_deletes_written_blob() {
+    fn usage_error_cleans() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = Ulid::generate();
         let node_id = iroh::SecretKey::generate().public();
@@ -2460,7 +2459,8 @@ mod test {
             vec![7u8; 32],
         );
         let id = location.ulid;
-        op.cleanup.pending_error = Some(PutObjectError::StorageError(StorageError::CommitFailed));
+        op.cleanup
+            .set_error(PutObjectError::StorageError(StorageError::CommitFailed));
         op.cleanup.set_release(id);
         op.state = PutObjectState::QueueCleanupRow;
         assert!(
@@ -2513,7 +2513,8 @@ mod test {
         ));
         let location = test_location(op.config.user_id);
         let id = location.ulid;
-        op.cleanup.pending_error = Some(PutObjectError::StorageError(StorageError::ChannelClosed));
+        op.cleanup
+            .set_error(PutObjectError::StorageError(StorageError::ChannelClosed));
         op.cleanup.set_release(id);
         op.state = PutObjectState::QueueCleanupRow;
         assert!(
@@ -2547,7 +2548,8 @@ mod test {
         ));
         let location = test_location(op.config.user_id);
         let id = location.ulid;
-        op.cleanup.pending_error = Some(PutObjectError::StorageError(StorageError::Timeout));
+        op.cleanup
+            .set_error(PutObjectError::StorageError(StorageError::Timeout));
         op.cleanup.set_release(id);
         op.state = PutObjectState::QueueCleanupRow;
         assert!(
@@ -2581,9 +2583,8 @@ mod test {
 
     #[test]
     fn unknown_keeps_blob() {
-        // Only a proven refusal rolls the blob back; every other commit failure
-        // may already have committed the version that names these bytes, so the
-        // copy is handed to reconciliation instead of deleted or forgotten.
+        // Only a proven refusal rolls the blob back; any other commit failure
+        // may already own the version, so the copy goes to reconciliation.
         for error in [
             StorageError::CommitFailed,
             StorageError::PersistError("journal".to_string()),
@@ -2901,7 +2902,7 @@ mod test {
     }
 
     #[tokio::test]
-    pub async fn test_put_object_dedup() {
+    pub async fn deduplicates_blob() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let blob_root = format!("{temp_root}/blobstore");
@@ -3287,7 +3288,7 @@ mod test {
     }
 
     #[test]
-    fn put_object_current_pointer_generation_increments_from_existing_pointer() {
+    fn generation_increments() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let mut op = PutObjectOperation::new(PutObjectConfig {
             user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
@@ -3329,7 +3330,7 @@ mod test {
         op.txn_id = Some(Ulid::generate());
         let existing = CurrentVersionPointer::new_with_generation(Ulid::generate(), 4);
 
-        let effects = op.handle_object_lookup_read(Event::Storage(StorageEvent::ReadResult {
+        let effects = op.object_lookup_read(Event::Storage(StorageEvent::ReadResult {
             key: vec![0].into(),
             value: Some(existing.to_bytes().unwrap().into()),
         }));
@@ -3338,7 +3339,7 @@ mod test {
         };
         assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
 
-        let effects = op.handle_liveness_version_read(Event::Storage(StorageEvent::ReadResult {
+        let effects = op.liveness_read(Event::Storage(StorageEvent::ReadResult {
             key: vec![0].into(),
             value: None,
         }));
@@ -3352,7 +3353,7 @@ mod test {
     }
 
     #[tokio::test]
-    pub async fn test_put_object_overwrite_retains_historical_hash_path_index() {
+    pub async fn overwrite_retains_index() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let blob_root = format!("{temp_root}/blobstore");
@@ -3540,7 +3541,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_put_object_checksum_mismatch_cleans_up_blob() {
+    async fn mismatch_cleans_blob() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let blob_root = format!("{temp_root}/blobstore");

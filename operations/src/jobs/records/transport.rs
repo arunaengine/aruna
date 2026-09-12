@@ -328,7 +328,7 @@ async fn holder_view(
         .await
         .ok_or(ServeError::Unavailable)?;
     let eligible = config
-        .sync_eligible_node_ids()
+        .sync_eligible_nodes()
         .is_ok_and(|nodes| nodes.contains(&peer));
     if !eligible {
         return Err(ServeError::Refused(JobRecordRejection::Unauthorized));
@@ -361,7 +361,7 @@ async fn accept_record(
         return Err(ServeError::Refused(JobRecordRejection::Invalid));
     }
     let rearms = rearms_witness(record.envelope());
-    let now_ms = aruna_core::util::unix_timestamp_millis();
+    let now_ms = aruna_core::time::unix_timestamp_millis();
     let outcome = drive(
         AppendRecordOperation::new(AppendRecordConfig {
             realm_id: authority.realm_id,
@@ -486,7 +486,7 @@ pub async fn serve_launch_offer(
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     if !config
-        .sync_eligible_node_ids()
+        .sync_eligible_nodes()
         .is_ok_and(|nodes| nodes.contains(&peer))
     {
         return MetadataTransportMessage::ForwardedLaunchOffer {

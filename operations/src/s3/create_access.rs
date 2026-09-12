@@ -464,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_user_access_happy_path() {
+    fn creates_user_access() {
         let user_identity = make_user_identity();
         let group_id = Ulid::generate();
         let mut op =

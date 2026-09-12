@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BucketInfo, Group, Permission, RealmId, blob_bucket_permission_path,
+    ArunaArn, AuthContext, BucketInfo, Group, Permission, RealmId, bucket_permission_path,
 };
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
@@ -219,7 +219,7 @@ impl SearchBucketsOperation {
             return self.fail(SearchBucketsError::NotFinished);
         };
         self.state = SearchBucketsState::CheckPermission;
-        let path = blob_bucket_permission_path(
+        let path = bucket_permission_path(
             self.input.realm_id,
             candidate.info.group_id,
             self.input.node_id,
@@ -379,7 +379,7 @@ fn policy_allows(
     input: &SearchBucketsInput,
     hit: &BucketSearchHit,
 ) -> bool {
-    let path = blob_bucket_permission_path(input.realm_id, hit.group_id, hit.node_id, &hit.bucket);
+    let path = bucket_permission_path(input.realm_id, hit.group_id, hit.node_id, &hit.bucket);
     let request = policy_request_with(
         &path,
         &Permission::READ,
@@ -594,7 +594,7 @@ mod tests {
             &context,
             AUTH_KEYSPACE,
             realm_id.as_bytes().to_vec(),
-            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+            RealmAuthorizationDocument::default_realm_doc(realm_id)
                 .to_bytes(&actor)
                 .unwrap(),
         )
@@ -607,7 +607,7 @@ mod tests {
             (private_group, "Private Group", Some("data-private")),
         ] {
             let mut auth =
-                GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+                GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
             if let Some(bucket) = public_bucket.filter(|_| group_id == public_group) {
                 let role_id = Ulid::generate();
                 auth.roles.insert(
@@ -616,7 +616,7 @@ mod tests {
                         role_id,
                         name: "public-reader".to_string(),
                         permissions: HashMap::from([(
-                            blob_bucket_permission_path(realm_id, group_id, node_id, bucket),
+                            bucket_permission_path(realm_id, group_id, node_id, bucket),
                             Permission::READ,
                         )]),
                         assigned_users: HashSet::from([UserId::nil(realm_id)]),

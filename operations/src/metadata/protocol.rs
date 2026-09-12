@@ -797,20 +797,20 @@ mod tests {
     use tokio::sync::Semaphore;
 
     #[test]
-    fn transport_messages_use_auth_token_fields() {
-        assert_has_auth_token_field(MetadataTransportMessage::QueryGraphs {
+    fn transport_auth_fields() {
+        assert_auth_token(MetadataTransportMessage::QueryGraphs {
             auth_token: Some(MetadataAuthToken::bearer("query-token").unwrap()),
             graph_iris: None,
             sparql: "ASK {}".to_string(),
         });
-        assert_has_auth_token_field(MetadataTransportMessage::SearchGraphs {
+        assert_auth_token(MetadataTransportMessage::SearchGraphs {
             auth_token: Some(MetadataAuthToken::bearer("search-token").unwrap()),
             graph_iris: None,
             query: "dataset".to_string(),
             limit: 10,
             group_id: None,
         });
-        assert_has_auth_token_field(MetadataTransportMessage::FilteredSearchGraphs {
+        assert_auth_token(MetadataTransportMessage::FilteredSearchGraphs {
             auth_token: Some(MetadataAuthToken::bearer("filtered-search-token").unwrap()),
             graph_iris: None,
             query: String::new(),
@@ -819,12 +819,12 @@ mod tests {
             object_iri: "https://example.com/profile".to_string(),
             group_id: None,
         });
-        assert_has_auth_token_field(MetadataTransportMessage::SearchBuckets {
+        assert_auth_token(MetadataTransportMessage::SearchBuckets {
             auth_token: Some(MetadataAuthToken::bearer("bucket-token").unwrap()),
             query: "dataset".to_string(),
             limit: 10,
         });
-        assert_has_auth_token_field(MetadataTransportMessage::SearchObjects {
+        assert_auth_token(MetadataTransportMessage::SearchObjects {
             auth_token: Some(MetadataAuthToken::bearer("object-token").unwrap()),
             query: "reads".to_string(),
             key_match: ObjectKeyMatch::Substring,
@@ -836,11 +836,9 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_writes_carry_authority() {
-        // The holder applies a forwarded write under the caller's own token, so
-        // every forward variant must carry one: a tokenless forward would be an
-        // unauthenticated internal write path.
-        assert_has_auth_token_field(MetadataTransportMessage::ForwardCreateDocument {
+    fn writes_carry_authority() {
+        // Every forwarded write carries the caller token to prevent an internal auth bypass.
+        assert_auth_token(MetadataTransportMessage::ForwardCreateDocument {
             auth_token: Some(MetadataAuthToken::bearer("create-token").unwrap()),
             config_digest: [0; 32],
             group_id: Ulid::nil(),
@@ -851,7 +849,7 @@ mod tests {
                 jsonld: "{}".to_string(),
             },
         });
-        assert_has_auth_token_field(MetadataTransportMessage::ForwardUpdateDocument {
+        assert_auth_token(MetadataTransportMessage::ForwardUpdateDocument {
             auth_token: Some(MetadataAuthToken::bearer("update-token").unwrap()),
             config_digest: [0; 32],
             document_id: Ulid::nil(),
@@ -860,12 +858,12 @@ mod tests {
                 jsonld: "{}".to_string(),
             },
         });
-        assert_has_auth_token_field(MetadataTransportMessage::ForwardDeleteDocument {
+        assert_auth_token(MetadataTransportMessage::ForwardDeleteDocument {
             auth_token: Some(MetadataAuthToken::bearer("delete-token").unwrap()),
             config_digest: [0; 32],
             document_id: Ulid::nil(),
         });
-        assert_has_auth_token_field(MetadataTransportMessage::ForwardExportDocument {
+        assert_auth_token(MetadataTransportMessage::ForwardExportDocument {
             auth_token: Some(MetadataAuthToken::bearer("export-token").unwrap()),
             config_digest: [0; 32],
             document_id: Ulid::nil(),
@@ -875,7 +873,7 @@ mod tests {
             offset: None,
             after: None,
         });
-        assert_has_auth_token_field(MetadataTransportMessage::ForwardTokenRevocation {
+        assert_auth_token(MetadataTransportMessage::ForwardTokenRevocation {
             auth_token: MetadataAuthToken::bearer("revoke-token").unwrap(),
             token: "target-token".to_string(),
         });
@@ -902,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_create_round_trips() {
+    fn create_round_trips() {
         let message = MetadataTransportMessage::ForwardCreateDocument {
             auth_token: Some(MetadataAuthToken::bearer("create-token").unwrap()),
             config_digest: [0; 32],
@@ -1031,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_bearer_tokens_are_rejected() {
+    fn oversized_tokens_rejected() {
         let oversized = "x".repeat(MAX_METADATA_BEARER_TOKEN_LEN + 1);
 
         assert!(MetadataAuthToken::bearer(oversized).is_err());
@@ -1312,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn bearer_auth_token_round_trips_through_postcard() {
+    fn bearer_round_trips() {
         let token = MetadataAuthToken::bearer("bearer-token").unwrap();
         let bytes = postcard::to_allocvec(&token).unwrap();
 
@@ -1347,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_bearer_tokens_are_rejected_on_decode() {
+    fn oversized_decode_rejected() {
         #[derive(Serialize)]
         enum RawAuthToken {
             Bearer(String),
@@ -1399,7 +1397,7 @@ mod tests {
         assert!(encode_message(&message).is_err());
     }
 
-    fn assert_has_auth_token_field(message: MetadataTransportMessage) {
+    fn assert_auth_token(message: MetadataTransportMessage) {
         let value = serde_json::to_value(message).unwrap();
         let fields = value
             .as_object()

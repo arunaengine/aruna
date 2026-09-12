@@ -1,26 +1,21 @@
-//! Reservation release, durable cleanup queue and pending error shared by the
-//! S3 write operations, plus the multipart upload target check they all use.
+//! Reservation release, durable cleanup queue and pending error shared by S3 writes.
 
 use crate::blob::cleanup::PendingCleanup;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE};
-use aruna_core::structs::{
-    BlobCleanupWork, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    MultipartUploadStatus,
-};
+use aruna_core::structs::{BlobCleanupWork, MultipartUploadPart, MultipartUploadPartKey};
 use aruna_core::types::TxnId;
-use thiserror::Error;
 use ulid::Ulid;
 
 /// Storage's answer for a queued cleanup row, reduced to the choice each
 /// operation makes next.
 #[derive(Debug, PartialEq)]
-pub(crate) enum CleanupEvent {
+pub(crate) enum CleanupStep {
     /// Re-emit the retried row and stay queued.
-    Effect(Effect),
-    /// The row was accepted, so the queue is empty.
+    Retry(Effect),
+    /// The pending row was accepted.
     Accepted,
     /// Retries were exhausted while the channel stayed open.
     Exhausted,
@@ -31,12 +26,12 @@ pub(crate) enum CleanupEvent {
 }
 
 /// Deferred reservation release, durable cleanup queue and pending error of one
-/// write. Each operation maps a [`CleanupEvent`] to its own continuation.
+/// write. Each operation maps a [`CleanupStep`] to its own continuation.
 #[derive(Debug, PartialEq)]
 pub(crate) struct WriteCleanup<E> {
-    pub(crate) pending_cleanup: PendingCleanup,
-    pub(crate) release_id: Option<Ulid>,
-    pub(crate) pending_error: Option<E>,
+    pending_cleanup: PendingCleanup,
+    release_id: Option<Ulid>,
+    pending_error: Option<E>,
 }
 
 impl<E> Default for WriteCleanup<E> {
@@ -92,21 +87,21 @@ impl<E> WriteCleanup<E> {
         self.pending_cleanup.retry(error)
     }
 
-    pub(crate) fn handle_queued(&mut self, event: Event) -> CleanupEvent {
+    pub(crate) fn handle_queued(&mut self, event: Event) -> CleanupStep {
         match event {
             Event::Storage(StorageEvent::WriteResult { .. }) => {
                 self.pending_cleanup.accepted();
-                CleanupEvent::Accepted
+                CleanupStep::Accepted
             }
             Event::Storage(StorageEvent::Error { error }) => {
                 let closed = matches!(error, StorageError::ChannelClosed);
                 match self.pending_cleanup.retry(&error) {
-                    Some(effect) => CleanupEvent::Effect(effect),
-                    None if closed => CleanupEvent::Closed,
-                    None => CleanupEvent::Exhausted,
+                    Some(effect) => CleanupStep::Retry(effect),
+                    None if closed => CleanupStep::Closed,
+                    None => CleanupStep::Exhausted,
                 }
             }
-            _ => CleanupEvent::Invalid,
+            _ => CleanupStep::Invalid,
         }
     }
 }
@@ -130,41 +125,4 @@ pub(crate) fn delete_records_effect(
         deletes,
         txn_id,
     }))
-}
-
-#[derive(Debug, Error, PartialEq)]
-pub(crate) enum UploadTargetError {
-    #[error("The specified multipart upload does not match the target object.")]
-    TargetMismatch,
-    #[error("The multipart upload is no longer open.")]
-    NotOpen,
-    #[error("The upload is being completed, retry shortly.")]
-    CompletionInProgress,
-}
-
-/// Rejects a record whose bucket, key or status does not admit the caller.
-/// `stale_ms` marks the lapsed completion leases a caller may take over; `None`
-/// keeps the check strict for callers that only accept `Open` uploads.
-pub(crate) fn validate_upload_target(
-    record: &MultipartUpload,
-    bucket: &str,
-    key: &str,
-    allow_in_progress: bool,
-    stale_ms: Option<u64>,
-) -> Result<(), UploadTargetError> {
-    if record.bucket != bucket || record.key != key {
-        return Err(UploadTargetError::TargetMismatch);
-    }
-    if allow_in_progress {
-        return Ok(());
-    }
-    match record.status {
-        MultipartUploadStatus::Open => Ok(()),
-        MultipartUploadStatus::Completing => match stale_ms {
-            Some(now_ms) if record.completion_stale(now_ms) => Ok(()),
-            Some(_) => Err(UploadTargetError::CompletionInProgress),
-            None => Err(UploadTargetError::NotOpen),
-        },
-        MultipartUploadStatus::Aborting => Err(UploadTargetError::NotOpen),
-    }
 }

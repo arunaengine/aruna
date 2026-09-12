@@ -174,10 +174,9 @@ pub enum StagingSourceEffect {
     },
 }
 
-/// Writes into a folder the owner bound on their own machine. Every variant is
-/// non-destructive by construction: a write only lands through a guard the
-/// adapter re-verifies at rename time, a conflicted copy never replaces
-/// anything, and a removal moves the file aside instead of unlinking it.
+/// Writes into a folder the owner bound on their own machine. Every variant is non-destructive by
+/// construction: a write only lands through a guard the adapter re-verifies at rename time, a
+/// conflicted copy never replaces anything, and a removal moves the file aside instead of unlinking it.
 #[derive(Debug)]
 pub enum LocalFileEffect {
     Write {
@@ -304,12 +303,8 @@ pub enum StorageEffect {
     },
     /// Persist all pending storage data with `SyncAll` durability.
     SyncAll,
-    /// Iterate over keys in a keyspace with optional prefix and pagination.
-    ///
-    /// Iteration order is lexicographic by key bytes.
-    /// - `prefix`: restricts results to keys with this prefix
-    /// - `start`: lower bound for the first returned key
-    /// - `limit`: maximum number of entries to return
+    /// Iterates keys lexicographically with optional prefix and lower-bound start.
+    /// `limit` caps the returned entries.
     Iter {
         key_space: KeySpace,
         prefix: Option<Key>,

@@ -23,23 +23,23 @@ pub(crate) enum LookupError {
     Missing,
 }
 
-pub(crate) struct ManagedCopyCheck {
+pub(crate) struct CopyLookup {
     pub copy_key: ManagedCopyKey,
     pub location_key: BlobLocationKey,
     pub effect: Effect,
 }
 
-pub(crate) fn managed_copy_check(
+pub(crate) fn begin_copy_check(
     bucket: &str,
     key: &str,
     version_id: Ulid,
     blob_hash: [u8; 32],
     backend: BackendRef,
     txn_id: Option<Ulid>,
-) -> Result<ManagedCopyCheck, ManagedCopyError> {
+) -> Result<CopyLookup, ManagedCopyError> {
     let copy_key = ManagedCopyKey::new(VersionKey::new(bucket, key, version_id), backend.clone());
     let effect = serve_reads(&copy_key, txn_id)?;
-    Ok(ManagedCopyCheck {
+    Ok(CopyLookup {
         copy_key,
         location_key: BlobLocationKey::new(blob_hash, backend),
         effect,
@@ -48,17 +48,17 @@ pub(crate) fn managed_copy_check(
 
 /// Which node a registration must name: the reader's local node, or the node of
 /// the subject row read alongside the registration.
-pub(crate) enum CopyNodeId {
-    Given(NodeId),
+pub(crate) enum ExpectedNode {
+    Exact(NodeId),
     Subject,
 }
 
-pub(crate) fn managed_copy_read(
+pub(crate) fn finish_copy_check(
     event: Event,
     pending_copy: &mut Option<ManagedCopyKey>,
     pending_location: &mut Option<BlobLocationKey>,
     refs: &[PlacementPolicyRef],
-    node_id: CopyNodeId,
+    node_id: ExpectedNode,
 ) -> Result<BlobLocationKey, LookupError> {
     let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
         return Err(LookupError::InvalidEvent(event));
@@ -69,8 +69,8 @@ pub(crate) fn managed_copy_read(
         return Err(LookupError::Missing);
     };
     let node_id = match node_id {
-        CopyNodeId::Given(node_id) => Some(node_id),
-        CopyNodeId::Subject => Some(subject.subject.node_id),
+        ExpectedNode::Exact(node_id) => Some(node_id),
+        ExpectedNode::Subject => Some(subject.subject.node_id),
     };
     validate_registration(
         copy.as_deref(),
@@ -116,7 +116,11 @@ pub(crate) fn summary_from_read(
     let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
         return Err(LookupError::InvalidEvent(event));
     };
-    Ok(value.and_then(|value| MultipartObjectSummary::from_bytes(value.as_ref()).ok()))
+    value
+        .map(|value| {
+            MultipartObjectSummary::from_bytes(value.as_ref()).map_err(LookupError::Conversion)
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -125,7 +129,7 @@ mod tests {
     use aruna_core::structs::MultipartChecksumType;
 
     #[test]
-    fn corrupt_summary_ignored() {
+    fn summary_decode_fails() {
         let summary = MultipartObjectSummary {
             checksum_type: MultipartChecksumType::Composite,
             part_count: 3,
@@ -141,6 +145,9 @@ mod tests {
             key: Vec::new().into(),
             value: Some(vec![0xff].into()),
         });
-        assert_eq!(summary_from_read(corrupt), Ok(None));
+        assert!(matches!(
+            summary_from_read(corrupt),
+            Err(LookupError::Conversion(_))
+        ));
     }
 }

@@ -220,9 +220,8 @@ async fn admits_late_output() {
 
 #[tokio::test]
 async fn pages_receipt_kind() {
-    // A launch whose scheduler this view no longer ranks as a holder is
-    // authentic only through the receipt that stored it, and that receipt lies
-    // on a later page of its own kind.
+    // A launch whose scheduler this view no longer ranks is authentic only through
+    // its receipt, which lies on a later page of its own kind.
     let mut family = Family::new([25u8; 32]);
     family.config.ensure_node(node(7), RealmNodeKind::Server);
     let (_dir, context) = fixture(&family.config, family.holder.public()).await;

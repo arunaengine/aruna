@@ -14,8 +14,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::{MetadataRegistryRecord, Permission};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
-use aruna_core::util::unix_timestamp_millis;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -405,11 +405,8 @@ pub async fn visible_page(
             if effective_ms >= from_ms
                 && effective_ms <= until_ms
                 && let Some(record) =
-                    crate::metadata::get_document::load_metadata_record_by_document(
-                        context,
-                        document_id,
-                    )
-                    .await?
+                    crate::metadata::get_document::load_document_record(context, document_id)
+                        .await?
                 && record.updated_at_ms == updated_at_ms
             {
                 let mut record = record;
@@ -788,7 +785,7 @@ pub fn spawn_visibility_index(context: Arc<DriverContext>, shutdown: &Shutdown) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::repository::create_records_and_outbox_write_entries;
+    use crate::metadata::repository::create_outbox_entries;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
@@ -939,9 +936,7 @@ mod tests {
     }
 
     async fn seed_record(context: &DriverContext, record: &MetadataRegistryRecord) {
-        let writes =
-            create_records_and_outbox_write_entries(record, &audit(record), Ulid::generate(), None)
-                .unwrap();
+        let writes = create_outbox_entries(record, &audit(record), Ulid::generate(), None).unwrap();
         write(context, writes).await;
     }
 
@@ -1360,7 +1355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn newly_allowed_record_gets_new_oai_datestamp() {
+    async fn newly_allowed_record() {
         let (context, _dir) = context();
         let group_id = Ulid::from_bytes([99; 16]);
         seed_realm(&context, Vec::new()).await;

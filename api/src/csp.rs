@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn img_src_allows_s3() {
+    fn allows_s3_images() {
         let policy = content_security_policy(&origins(&["https://s3.test"], &["https://s3.test"]));
 
         assert!(policy.contains("img-src 'self' data: blob: https://s3.test"));

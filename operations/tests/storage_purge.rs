@@ -18,10 +18,10 @@ use aruna_core::structs::{
     MultipartChecksumType, MultipartUpload, MultipartUploadStatus, PathRestriction, Permission,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, RoutingSnapshot,
     StoragePurgeCheckpoint, StoragePurgeScope, StoragePurgeSpec, VersionKey,
-    blob_bucket_permission_path,
+    bucket_permission_path,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, NodeId, UserId};
-use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::{
@@ -88,8 +88,8 @@ async fn setup_context() -> TestContext {
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(node_id, RealmNodeKind::Server);
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(user_id, realm_id, group_id);
     let group = Group {
         display_name: "purge".to_string(),
         group_id,
@@ -193,7 +193,7 @@ fn put_operation(context: &TestContext, key: &str, bytes: &[u8]) -> PutObjectOpe
 }
 
 #[tokio::test]
-async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
+async fn scoped_fence_isolates() {
     let context = setup_context().await;
     let upload = seed_upload(
         &context.driver.storage_handle,
@@ -424,7 +424,7 @@ async fn purge_checks_objects() {
     .await;
     let mut auth_context = auth(&context);
     auth_context.path_restrictions = Some(vec![PathRestriction {
-        pattern: blob_bucket_permission_path(
+        pattern: bucket_permission_path(
             context.realm_id,
             context.group_id,
             context.node_id,
@@ -468,7 +468,7 @@ async fn purge_checks_objects() {
 }
 
 #[tokio::test]
-async fn purge_resumes_aborts_uploads_preserves_prefix_neighbors_and_deletes_bucket() {
+async fn purge_resumes_cleanly() {
     let context = setup_context().await;
     let target_old = Ulid::generate();
     let target_current = Ulid::generate();

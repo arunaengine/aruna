@@ -1340,10 +1340,8 @@ impl ExecutorBackend for DockerBackend {
             .attempt
             .validate()
             .map_err(BackendError::InvalidSpec)?;
-        // The daemon's wait endpoint (condition "not-running") answers instantly
-        // for a created-but-never-started container, which would surface a
-        // non-terminal status and break the wait contract. Poll inspect to
-        // terminal evidence or the cancel token, like the trait default.
+        // The daemon's wait endpoint answers instantly for a created-but-never-started
+        // container; poll inspect to terminal evidence or the cancel token instead.
         loop {
             let control = self.daemon_lock.read(context)?;
             validate_control(control.clone(), context)?;
@@ -2528,7 +2526,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_stream_error_classification() {
+    fn pull_stream_classification() {
         let error = bollard::errors::Error::DockerStreamError {
             error: "manifest unknown".to_string(),
         };

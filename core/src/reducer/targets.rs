@@ -11,7 +11,7 @@ impl AdminDocumentReducerState {
             .and_then(|version| version.value.clone())
     }
 
-    pub fn materialized_user_subject_ids(&self) -> BTreeSet<String> {
+    pub fn materialized_subject_ids(&self) -> BTreeSet<String> {
         if !matches!(&self.target, AdminDocumentTarget::User { .. }) {
             return BTreeSet::new();
         }
@@ -40,7 +40,7 @@ impl AdminDocumentReducerState {
 }
 
 impl AdminDocumentReducerState {
-    pub fn materialized_group_display_name(&self) -> Option<String> {
+    pub fn materialized_group_name(&self) -> Option<String> {
         if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
             return None;
         }
@@ -50,7 +50,7 @@ impl AdminDocumentReducerState {
             .and_then(|version| version.value.clone())
     }
 
-    pub fn materialized_group_realm_id(&self) -> Option<RealmId> {
+    pub fn materialized_group_realm(&self) -> Option<RealmId> {
         if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
             return None;
         }
@@ -91,11 +91,11 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .iter()
             .filter_map(|(path, version)| version.value.as_ref().map(|_| path))
-            .filter_map(|path| group_role_id_from_path(path))
+            .filter_map(|path| parse_group_role(path))
             .collect()
     }
 
-    pub fn materialized_group_role_user_assignments(&self) -> BTreeMap<RoleId, BTreeSet<UserId>> {
+    pub fn materialized_group_assignments(&self) -> BTreeMap<RoleId, BTreeSet<UserId>> {
         if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
             return BTreeMap::new();
         }
@@ -105,7 +105,7 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .iter()
             .filter_map(|(path, version)| {
-                let role_id = group_role_user_assignment_role_id_from_path(path)?;
+                let role_id = group_assignment_role(path)?;
                 let user_id = version
                     .value
                     .as_ref()
@@ -134,11 +134,11 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .iter()
             .filter_map(|(path, version)| version.value.as_ref().map(|_| path))
-            .filter_map(|path| realm_role_id_from_path(path))
+            .filter_map(|path| parse_realm_role(path))
             .collect()
     }
 
-    pub fn materialized_realm_role_user_assignments(&self) -> BTreeMap<RoleId, BTreeSet<UserId>> {
+    pub fn materialized_realm_assignments(&self) -> BTreeMap<RoleId, BTreeSet<UserId>> {
         if !matches!(&self.target, AdminDocumentTarget::Realm { .. }) {
             return BTreeMap::new();
         }
@@ -148,7 +148,7 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .iter()
             .filter_map(|(path, version)| {
-                let role_id = realm_role_user_assignment_role_id_from_path(path)?;
+                let role_id = realm_assignment_role(path)?;
                 let user_id = version
                     .value
                     .as_ref()
@@ -167,7 +167,7 @@ impl AdminDocumentReducerState {
             })
     }
 
-    pub fn materialized_realm_config_oidc_providers(&self) -> BTreeMap<String, OidcProviderConfig> {
+    pub fn materialized_oidc_providers(&self) -> BTreeMap<String, OidcProviderConfig> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return BTreeMap::new();
         }
@@ -175,20 +175,15 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .iter()
             .filter_map(|(path, version)| {
-                let provider_id = realm_config_oidc_provider_id_from_path(path)?;
-                let provider = version
-                    .value
-                    .as_deref()
-                    .and_then(oidc_provider_from_value)?;
+                let provider_id = parse_config_oidc(path)?;
+                let provider = version.value.as_deref().and_then(decode_oidc_provider)?;
 
                 (provider.id == provider_id).then(|| (provider_id.to_string(), provider))
             })
             .collect()
     }
 
-    pub fn materialized_realm_config_metadata_replication(
-        &self,
-    ) -> Option<MetadataReplicationConfig> {
+    pub fn materialized_metadata_replication(&self) -> Option<MetadataReplicationConfig> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return None;
         }
@@ -196,10 +191,10 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .get(REALM_CONFIG_METADATA_REPLICATION_PATH)
             .and_then(|version| version.value.as_deref())
-            .and_then(metadata_replication_from_value)
+            .and_then(decode_metadata_replication)
     }
 
-    pub fn materialized_realm_config_discovery(&self) -> Option<RealmDiscoveryConfig> {
+    pub fn materialized_realm_discovery(&self) -> Option<RealmDiscoveryConfig> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return None;
         }
@@ -207,10 +202,10 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .get(REALM_CONFIG_DISCOVERY_PATH)
             .and_then(|version| version.value.as_deref())
-            .and_then(realm_discovery_from_value)
+            .and_then(decode_realm_discovery)
     }
 
-    pub fn materialized_realm_config_description(&self) -> Option<String> {
+    pub fn materialized_realm_description(&self) -> Option<String> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return None;
         }
@@ -243,7 +238,7 @@ impl AdminDocumentReducerState {
             .and_then(compute_from_value)
     }
 
-    pub fn materialized_realm_config_quota(&self) -> Option<QuotaConfig> {
+    pub fn materialized_realm_quota(&self) -> Option<QuotaConfig> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return None;
         }
@@ -265,13 +260,13 @@ impl AdminDocumentReducerState {
         );
     }
 
-    pub(super) fn apply_user_subject_id(
+    pub(super) fn apply_user_subject(
         &mut self,
         event: &AdminDocumentEvent,
         subject_id: &str,
         value: Option<String>,
     ) {
-        let path = user_subject_id_path(subject_id);
+        let path = user_subject_path(subject_id);
         let current = self.user_subject_ids.get(subject_id).cloned();
 
         match self.reduce_value(event, &path, current, value) {
@@ -359,11 +354,7 @@ impl AdminDocumentReducerState {
         }
     }
 
-    pub(super) fn apply_group_role_removed(
-        &mut self,
-        event: &AdminDocumentEvent,
-        role_id: &RoleId,
-    ) {
+    pub(super) fn remove_group_role(&mut self, event: &AdminDocumentEvent, role_id: &RoleId) {
         let path = group_role_path(role_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
@@ -377,14 +368,14 @@ impl AdminDocumentReducerState {
         }
     }
 
-    pub(super) fn apply_group_role_user_assignment(
+    pub(super) fn apply_group_assignment(
         &mut self,
         event: &AdminDocumentEvent,
         role_id: &RoleId,
         user_id: &UserId,
         value: Option<String>,
     ) {
-        let path = group_role_user_assignment_path(role_id, user_id);
+        let path = group_user_path(role_id, user_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
         match self.reduce_value(event, &path, current, value) {
@@ -418,14 +409,14 @@ impl AdminDocumentReducerState {
         }
     }
 
-    pub(super) fn apply_realm_role_user_assignment(
+    pub(super) fn apply_realm_assignment(
         &mut self,
         event: &AdminDocumentEvent,
         role_id: &RoleId,
         user_id: &UserId,
         value: Option<String>,
     ) {
-        let path = realm_role_user_assignment_path(role_id, user_id);
+        let path = realm_user_path(role_id, user_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
         match self.reduce_value(event, &path, current, value) {
@@ -438,13 +429,13 @@ impl AdminDocumentReducerState {
         }
     }
 
-    pub(super) fn apply_realm_config_node(
+    pub(super) fn apply_config_node(
         &mut self,
         event: &AdminDocumentEvent,
         node_id: &NodeId,
         value: Option<String>,
     ) {
-        let path = realm_config_node_path(node_id);
+        let path = config_node_path(node_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
         match self.reduce_value(event, &path, current, value) {
@@ -457,13 +448,13 @@ impl AdminDocumentReducerState {
         }
     }
 
-    pub(super) fn apply_realm_config_oidc_provider(
+    pub(super) fn apply_oidc_provider(
         &mut self,
         event: &AdminDocumentEvent,
         provider_id: &str,
         value: Option<String>,
     ) {
-        let path = realm_config_oidc_provider_path(provider_id);
+        let path = config_oidc_path(provider_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
         match self.reduce_value(event, &path, current, value) {
@@ -476,25 +467,25 @@ impl AdminDocumentReducerState {
         }
     }
 
-    pub(super) fn apply_realm_config_settings(
+    pub(super) fn apply_config_settings(
         &mut self,
         event: &AdminDocumentEvent,
         metadata_replication: &MetadataReplicationConfig,
         discovery: &RealmDiscoveryConfig,
     ) {
-        self.apply_realm_config_setting(
+        self.apply_config_setting(
             event,
             REALM_CONFIG_METADATA_REPLICATION_PATH,
             metadata_replication_value(metadata_replication),
         );
-        self.apply_realm_config_setting(
+        self.apply_config_setting(
             event,
             REALM_CONFIG_DISCOVERY_PATH,
             realm_discovery_value(discovery),
         );
     }
 
-    pub(super) fn apply_realm_config_setting(
+    pub(super) fn apply_config_setting(
         &mut self,
         event: &AdminDocumentEvent,
         path: &str,

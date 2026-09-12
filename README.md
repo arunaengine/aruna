@@ -8,8 +8,8 @@ ___
 
 <p align="center">
     <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./img/aruna_white_font.png">
-    <img alt="Aruna logo" src="./img/aruna_dark_font.png" width="70%">
+    <source media="(prefers-color-scheme: dark)" srcset="./img/logo_white.png">
+    <img alt="Aruna logo" src="./img/logo_dark.png" width="70%">
     </picture>
 </p>
 
@@ -202,6 +202,21 @@ and Cilium treats that traffic as its reserved `ingress` entity, which no `ipBlo
 CiliumNetworkPolicy with `toEntities: [ingress]` on the S3 port, selecting pods labelled
 `aruna-engine.org/network: s3`, opens it. DNS egress is allowed by port with no peer, because a
 node-local resolver runs on a host address that is neither a pod nor a CIDR peer.
+
+Kubernetes workspaces and sessions need a pod-reachable endpoint in `ARUNA_COMPUTE_S3_URL`
+or `S3_PUBLIC_URL`. `ARUNA_COMPUTE_K8S_S3_PORT` defaults to that URL's explicit or known
+scheme port, falling back to 443. `ARUNA_COMPUTE_LOCAL_ONLY` disables workspaces and
+sessions for that executor.
+
+For policies beyond standard Kubernetes NetworkPolicy, set `ARUNA_COMPUTE_K8S_POLICY_MANIFESTS`
+to an ordered, comma-separated list of YAML files or directories. Directories contribute
+their `.yaml` and `.yml` files in filename order; files may contain several documents.
+Each resource needs `apiVersion`, `kind` and `metadata.name`, and must omit its namespace
+or use the compute namespace. The node applies these policies before advertising executor
+capabilities and before jobs. Unreadable paths, invalid documents and unavailable resource
+kinds fail startup. Its controller service account needs `create`, `get` and `patch` on
+those kinds. For example, Cilium ingress traffic may need an operator-supplied
+CiliumNetworkPolicy; the node does not assume that a vendor-specific policy is appropriate.
 
 The session images are built from `scripts/session-python` and `scripts/session-deno`, which share
 the helper in `scripts/session-helper`. Build them with their `build.sh`; the runtime catalog names

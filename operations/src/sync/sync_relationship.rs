@@ -163,9 +163,7 @@ async fn create_relationship_once(
                 if parse_values(SyncRelationshipDirection::Outgoing, values)?
                     .iter()
                     .any(|existing| {
-                        // Detached stubs only keep retained reference data
-                        // readable; they must not block re-creating the same
-                        // relationship.
+                        // Detached stubs keep retained references readable without blocking recreation.
                         existing.state != SyncState::Detached
                             && same_create_identity(existing, relationship)
                     })

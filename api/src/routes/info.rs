@@ -12,12 +12,12 @@ use aruna_core::structs::{
 use aruna_core::structs::{BackendRef, USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
-use aruna_operations::node::observability::load_node_observability_status;
+use aruna_operations::node::status::load_status;
 use aruna_operations::node::usage_stats::{LoadUsageCountersOperation, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, provision_metadata_binding,
@@ -29,7 +29,7 @@ use aruna_operations::realm::get_nodes::{
 };
 use aruna_operations::realm::mutate_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
-    drive_realm_placement_mutation,
+    drive_placement_mutation,
 };
 use aruna_operations::realm::set_quota::{
     SetRealmQuotaConfig, SetRealmQuotaError, SetRealmQuotaOperation,
@@ -66,12 +66,9 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_usage))
 }
 
-/// Node information. `node.status`, `node.realm_id` and `api_version` are public:
-/// what a client needs to health check the node and learn which realm to
-/// authenticate against. Node identity, addresses and peer topology need a token
-/// of this realm; backend detail, request metrics and warnings need a realm
-/// config admin. Gated values are absent, never restructured, so a client keeps
-/// parsing the shape it always parsed.
+/// Node information. `node.status`, `node.realm_id` and `api_version` are public;
+/// node identity, addresses, peer topology, backend detail and warnings need a realm
+/// token or config admin, and gated values are absent, never restructured.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct InfoResponse {
     pub node: NodeStatus,
@@ -274,13 +271,9 @@ pub struct InterfaceStatus {
     pub url: Option<String>,
 }
 
-/// Realm information. `realm_id`, `description`, `oidc_providers`, the public
-/// interface urls, metadata replication policy and aggregate public overview
-/// are public. The overview exposes only live document, group and configured
-/// membership counts; each nullable value is unknown rather than zero when this
-/// node cannot answer it. Realm topology (`nodes`, `discovery`), quota policy
-/// and interface listen addresses need a token of this realm and are otherwise
-/// absent or empty.
+/// Realm information. Identity, description, oidc providers, public urls and the
+/// count-only overview are public; topology, quota and listen addresses need a realm
+/// token, and gated values are absent or empty rather than restructured.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct RealmInfoResponse {
     pub realm_id: String,
@@ -1131,7 +1124,7 @@ pub(crate) async fn run_realm_info(
     }
 
     let metadata_replication = RealmMetadataReplicationResponse {
-        default_replication_factor: config.effective_default_metadata_replication_factor(),
+        default_replication_factor: config.effective_replication_factor(),
     };
     let live_datasets = match count_realm_documents(&state.get_ctx(), config.realm_id).await {
         Ok(count) => count,
@@ -1153,7 +1146,7 @@ pub(crate) async fn run_realm_info(
         nodes_configured: u64::try_from(config.nodes.len()).ok(),
     });
 
-    let node_info_docs = load_node_info_documents_best_effort(state, &config).await;
+    let node_info_docs = load_node_documents(state, &config).await;
     let mut management_urls = management_urls(
         state,
         &config,
@@ -1167,7 +1160,7 @@ pub(crate) async fn run_realm_info(
     }
 
     let (discovery, nodes, quota) = if realm_authenticated {
-        let present_nodes = load_realm_presence_best_effort(state).await;
+        let present_nodes = load_realm_presence(state).await;
         let discovery = serde_json::to_value(&config.discovery)
             .map_err(|error| ServerError::InternalError(error.to_string()))?;
         let contacts = state.peer_contacts();
@@ -1260,7 +1253,7 @@ fn management_urls(
     urls
 }
 
-pub(crate) async fn load_node_info_documents_best_effort(
+pub(crate) async fn load_node_documents(
     state: &ServerState,
     config: &RealmConfigDocument,
 ) -> BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument> {
@@ -1269,8 +1262,7 @@ pub(crate) async fn load_node_info_documents_best_effort(
         .iter()
         .filter_map(|node| node.node_id.parse().ok())
         .collect();
-    match aruna_operations::node::node_info::read_node_info_documents(&state.get_ctx(), &node_ids)
-        .await
+    match aruna_operations::node::node_info::read_info_documents(&state.get_ctx(), &node_ids).await
     {
         Ok(documents) => documents,
         Err(error) => {
@@ -1280,7 +1272,7 @@ pub(crate) async fn load_node_info_documents_best_effort(
     }
 }
 
-fn map_node_info_document(
+fn map_node_document(
     document: &aruna_core::structs::NodeInfoDocument,
 ) -> RealmNodeInfoDocumentResponse {
     RealmNodeInfoDocumentResponse {
@@ -1308,7 +1300,7 @@ fn map_node_info_document(
     }
 }
 
-async fn is_realm_config_admin(state: &ServerState, auth: &AuthContext) -> ServerResult<bool> {
+async fn is_realm_admin(state: &ServerState, auth: &AuthContext) -> ServerResult<bool> {
     let realm_id = state.get_realm_id();
     permission_granted(
         state,
@@ -1319,7 +1311,7 @@ async fn is_realm_config_admin(state: &ServerState, auth: &AuthContext) -> Serve
     .await
 }
 
-async fn authorize_realm_config_admin(
+async fn require_realm_admin(
     state: &Arc<ServerState>,
     auth: Option<AuthContext>,
 ) -> ServerResult<AuthContext> {
@@ -1327,7 +1319,7 @@ async fn authorize_realm_config_admin(
     if auth.realm_id != state.get_realm_id() || !state.is_management_node() {
         return Err(ServerError::Forbidden);
     }
-    if !is_realm_config_admin(state, &auth).await? {
+    if !is_realm_admin(state, &auth).await? {
         return Err(ServerError::Forbidden);
     }
 
@@ -1350,7 +1342,7 @@ async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAcc
     if auth.realm_id != state.get_realm_id() {
         return InfoAccess::Public;
     }
-    match is_realm_config_admin(state, auth).await {
+    match is_realm_admin(state, auth).await {
         Ok(true) => InfoAccess::Admin,
         Ok(false) => InfoAccess::Realm,
         Err(error) => {
@@ -1432,7 +1424,7 @@ pub async fn get_realm_placement(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<RealmPlacementConfigResponse>)> {
-    authorize_realm_config_admin(&state, auth).await?;
+    require_realm_admin(&state, auth).await?;
     let document = drive(
         GetRealmConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
@@ -1597,20 +1589,20 @@ pub async fn mutate_realm_placement(
                 Permission::WRITE,
             )
             .await?;
-            drive_realm_placement_mutation(
+            drive_placement_mutation(
                 MutateRealmPlacementConfig { actor, mutation },
                 Some(auth),
                 &context,
             )
             .await
-            .map_err(map_mutate_realm_placement_error)?
+            .map_err(map_placement_error)?
         }
         RealmPlacementAction::Provision {
             strategy_id,
             group_id,
         } => {
             // Handle allocation carries no authorization of its own.
-            authorize_realm_config_admin(&state, Some(auth)).await?;
+            require_realm_admin(&state, Some(auth)).await?;
             let scope = group_id
                 .map(PlacementScope::Group)
                 .unwrap_or(PlacementScope::Realm(actor.realm_id));
@@ -1641,7 +1633,7 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
         HandleAllocationError::PlacementHandleExhausted { .. } => {
             ServerError::Conflict("placement handle space is exhausted".to_string())
         }
-        HandleAllocationError::Append(error) => map_mutate_realm_placement_error(error),
+        HandleAllocationError::Append(error) => map_placement_error(error),
         HandleAllocationError::ReadConfig(
             aruna_operations::realm::get_config::GetRealmConfigError::DocumentNotFound,
         ) => ServerError::NotFound,
@@ -1657,7 +1649,7 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
     }
 }
 
-fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerError {
+fn map_placement_error(error: MutateRealmPlacementError) -> ServerError {
     match error {
         MutateRealmPlacementError::RealmConfigNotFound => ServerError::NotFound,
         MutateRealmPlacementError::InvalidInput(reason) => ServerError::BadRequestReason(reason),
@@ -1803,11 +1795,11 @@ pub async fn set_realm_quota(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_set_realm_quota_error)?;
+    .map_err(map_quota_error)?;
     Ok((StatusCode::OK, Json(RealmQuotaConfig::from(stored.quota))))
 }
 
-fn map_set_realm_quota_error(error: SetRealmQuotaError) -> ServerError {
+fn map_quota_error(error: SetRealmQuotaError) -> ServerError {
     match error {
         SetRealmQuotaError::RealmConfigNotFound => ServerError::NotFound,
         SetRealmQuotaError::Unauthorized | SetRealmQuotaError::NotManagementNode => {
@@ -1843,11 +1835,9 @@ pub struct UsageResponse {
     pub logical_bytes: u64,
     pub referenced_bytes: u64,
     pub realm: UsageTotals,
-    /// Realm-wide total of live metadata documents, excluding lifecycle-deleted
-    /// ones. This is the realm's document volume, not a count of what the
-    /// calling principal may read, so it is not filtered per caller. Absent on
-    /// the group usage endpoint and on nodes without a metadata subsystem, so
-    /// an absent count never reads as zero documents.
+    /// Realm-wide live metadata document count, excluding lifecycle-deleted ones.
+    /// Not filtered per caller and absent (never zero) on the group usage endpoint
+    /// and on nodes without a metadata subsystem.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_documents: Option<u64>,
     /// Exact lifecycle-live metadata documents whose root is neither a Profile
@@ -1891,7 +1881,7 @@ impl GroupQuotaStatus {
         group_id: &aruna_core::types::GroupId,
         realm_group_logical_bytes: u64,
     ) -> Self {
-        let quota_bytes = quota.effective_group_quota_bytes(group_id);
+        let quota_bytes = quota.group_quota_bytes(group_id);
         let warning = match quota_bytes {
             Some(limit) => {
                 u128::from(realm_group_logical_bytes) * 100
@@ -2095,7 +2085,7 @@ fn map_realm_nodes(
                 });
             let info = parsed
                 .and_then(|node_id| node_info_docs.get(&node_id))
-                .map(map_node_info_document);
+                .map(map_node_document);
             // A device answering for itself is in contact by definition.
             let last_seen_ms = match (is_device, is_current) {
                 (true, true) => Some(now_ms),
@@ -2139,7 +2129,7 @@ fn presence_nodes(
     nodes
 }
 
-async fn load_realm_presence_best_effort(state: &ServerState) -> HashSet<aruna_core::NodeId> {
+async fn load_realm_presence(state: &ServerState) -> HashSet<aruna_core::NodeId> {
     // A realm with offline nodes must degrade to local-only presence rather
     // than stall the dashboard.
     let discovery = tokio::time::timeout(
@@ -2369,15 +2359,15 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
     }
 
     let ctx = state.get_ctx();
-    let observability = load_node_observability_status(ctx.as_ref()).await;
+    let snapshot = load_status(ctx.as_ref()).await;
 
-    let (network, warnings) = match observability.network {
+    let (network, warnings) = match snapshot.network {
         Some(info) => {
             response.my_addresses = info
                 .endpoint_addr
                 .addrs
                 .iter()
-                .map(transport_addr_to_string)
+                .map(format_transport_addr)
                 .collect();
             response.connections = info
                 .connections
@@ -2411,7 +2401,7 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
     response.services.network = Some(network);
 
     if admin {
-        let blob = match observability.blob {
+        let blob = match snapshot.blob {
             Some(info) => BlobServiceStatus {
                 status: ServiceStatus::from(info.status),
                 backend: Some(info.backend_type.to_string()),
@@ -2435,8 +2425,8 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
         };
         response.services.blob = Some(blob);
         response.services.database = Some(DatabaseServiceStatus {
-            status: ServiceStatus::from(observability.database.status),
-            requests: RequestSummary::from_state(&observability.database.requests),
+            status: ServiceStatus::from(snapshot.database.status),
+            requests: RequestSummary::from_state(&snapshot.database.requests),
         });
         response.portal = Some(state.portal_status().await);
         response.warnings = warnings;
@@ -2539,7 +2529,7 @@ fn side_name(side: iroh::endpoint::Side) -> String {
     }
 }
 
-fn transport_addr_to_string(addr: &iroh::TransportAddr) -> String {
+fn format_transport_addr(addr: &iroh::TransportAddr) -> String {
     match addr {
         iroh::TransportAddr::Ip(addr) => addr.to_string(),
         iroh::TransportAddr::Relay(url) => url.to_string(),
@@ -2555,8 +2545,8 @@ mod tests {
         RealmPlacementBindingScope, RealmPlacementMutationRequest, RealmPlacementOverride,
         RealmPlacementStrategy, RealmQuotaConfig, RealmUserGroupCapOverride, ServiceStatus,
         UsageResponse, get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
-        map_mutate_realm_placement_error, map_realm_nodes, map_set_realm_quota_error,
-        mutate_realm_placement, presence_nodes, set_realm_quota,
+        map_placement_error, map_quota_error, map_realm_nodes, mutate_realm_placement,
+        presence_nodes, set_realm_quota,
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
@@ -2636,11 +2626,10 @@ mod tests {
     }
 
     /// Anonymous and foreign-realm callers keep the flat shape, but every gated
-    /// value is absent or empty: the node reports only health and realm, the
-    /// interfaces only their public urls, and node identity, topology, backend
-    /// detail and warnings are gone.
+    /// value is absent or empty: only health, realm and public interface urls
+    /// remain, never identity, topology, backend detail or warnings.
     #[tokio::test]
-    async fn anonymous_info_hides_detail() {
+    async fn anonymous_info_hides() {
         let (state, _tempdir) = setup_state().await;
         state
             .register_rest_interface("0.0.0.0:3000".parse().unwrap())
@@ -2695,7 +2684,7 @@ mod tests {
     /// A realm token unlocks node identity, addresses and peers; backend detail
     /// and request metrics stay admin-only.
     #[tokio::test]
-    async fn realm_token_sees_topology() {
+    async fn realm_sees_topology() {
         let (state, _tempdir) = setup_state().await;
         state
             .register_rest_interface("0.0.0.0:3000".parse().unwrap())
@@ -2788,7 +2777,7 @@ mod tests {
     /// `last_error` on a peer connection leaks internal diagnostics, so a realm
     /// member sees it redacted while a realm config admin sees it in full.
     #[test]
-    fn peer_error_admin_only() {
+    fn peer_error_visibility() {
         let peer = aruna_core::structs::PeerConnectionState {
             node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
             status: aruna_core::structs::PeerConnectionStatus::Unreachable,
@@ -2813,7 +2802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_info_reports_storage_errors() {
+    async fn admin_reports_storage() {
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
 
         let _ = state
@@ -2840,7 +2829,7 @@ mod tests {
     }
 
     #[test]
-    fn openapi_includes_info_path() {
+    fn openapi_includes_info() {
         let openapi = ApiDoc::openapi();
 
         assert!(openapi.paths.paths.contains_key("/system/info"));
@@ -2848,16 +2837,14 @@ mod tests {
 
     async fn seed_usage_state(state: &Arc<ServerState>) {
         use aruna_core::keyspaces::{USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
-        use aruna_core::structs::{
-            NodeUsageSnapshot, node_usage_global_key, usage_global_shard_key,
-        };
+        use aruna_core::structs::{NodeUsageSnapshot, global_shard_key, usage_global_key};
 
         let ctx = state.get_ctx();
         // This node's live local total.
         ctx.storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: USAGE_STATS_KEYSPACE.to_string(),
-                key: usage_global_shard_key(0).into(),
+                key: global_shard_key(0).into(),
                 value: aruna_core::structs::UsageCounters {
                     buckets: 2,
                     ..Default::default()
@@ -2873,7 +2860,7 @@ mod tests {
         ctx.storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
-                key: node_usage_global_key(remote).into(),
+                key: usage_global_key(remote).into(),
                 value: NodeUsageSnapshot {
                     node_id: remote,
                     counters: aruna_core::structs::UsageCounters {
@@ -2900,7 +2887,7 @@ mod tests {
 
     /// The usage directory is closed to anonymous and foreign-realm callers.
     #[tokio::test]
-    async fn usage_requires_realm_auth() {
+    async fn usage_requires_auth() {
         let (state, _tempdir) = setup_state().await;
         seed_usage_state(&state).await;
 
@@ -2932,7 +2919,7 @@ mod tests {
     /// the private ones the caller holds no role for.
     #[tokio::test]
     async fn usage_counts_documents() {
-        use aruna_core::storage_entries::metadata_registry_write_entries;
+        use aruna_core::storage_entries::registry_write_entries;
         use aruna_core::structs::{MetadataRegistryRecord, PlacementRef};
 
         let storage_dir = tempdir().unwrap();
@@ -2997,7 +2984,7 @@ mod tests {
                 establishing_event_id: Ulid::nil(),
                 last_event_id: Ulid::nil(),
             };
-            writes.extend(metadata_registry_write_entries(&record).unwrap());
+            writes.extend(registry_write_entries(&record).unwrap());
         }
         assert!(matches!(
             state
@@ -3022,7 +3009,7 @@ mod tests {
     }
 
     #[test]
-    fn group_quota_status_reports_warning_and_unlimited() {
+    fn quota_warning_unlimited() {
         let group = Ulid::generate();
         let unlimited_group = Ulid::generate();
         let quota = QuotaConfig {
@@ -3056,7 +3043,7 @@ mod tests {
     }
 
     #[test]
-    fn group_quota_status_uses_fractional_warn_threshold_without_flooring() {
+    fn fractional_warn_threshold() {
         let group = Ulid::generate();
         let quota = QuotaConfig {
             default_group_quota_bytes: Some(3),
@@ -3079,15 +3066,15 @@ mod tests {
     }
 
     #[test]
-    fn openapi_includes_realm_quota_path() {
+    fn openapi_includes_quota() {
         let openapi = ApiDoc::openapi();
 
         assert!(openapi.paths.paths.contains_key("/system/realm/quota"));
     }
 
     #[test]
-    fn set_realm_quota_transaction_conflict_maps_to_http_conflict() {
-        let error = map_set_realm_quota_error(SetRealmQuotaError::StorageError(
+    fn quota_conflict_maps() {
+        let error = map_quota_error(SetRealmQuotaError::StorageError(
             StorageError::TransactionConflict,
         ));
 
@@ -3100,7 +3087,7 @@ mod tests {
     #[test]
     fn quota_capacity_unavailable() {
         // Cleanup capacity is transient, so it must not read as an internal error.
-        let error = map_set_realm_quota_error(SetRealmQuotaError::StorageError(
+        let error = map_quota_error(SetRealmQuotaError::StorageError(
             StorageError::CleanupCapacity,
         ));
 
@@ -3257,7 +3244,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_placement_admin_endpoints_require_auth_and_management_node() {
+    async fn placement_admin_gated() {
         let (state, realm_id, _admin, _tempdir) = setup_management_state().await;
         assert!(matches!(
             get_realm_placement(State(state.clone()), Extension(None)).await,
@@ -3297,7 +3284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_placement_strategy_default_binding_and_override_lifecycle() {
+    async fn placement_binding_lifecycle() {
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let auth = admin_auth(realm_id, admin);
         let job_family_strategy_id = drive(
@@ -3452,7 +3439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_info_reports_finite_and_unbounded_default_strategy_replication() {
+    async fn replication_factor_defaults() {
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let auth = admin_auth(realm_id, admin);
         let strategy_id = Ulid::from_bytes([24; 16]);
@@ -3517,7 +3504,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_metadata_replication_schema_allows_unbounded_default() {
+    fn replication_schema_unbounded() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let factor = &openapi["components"]["schemas"]["RealmMetadataReplicationResponse"]["properties"]
             ["default_replication_factor"];
@@ -3529,7 +3516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_placement_rejects_zero_replicas_dangling_refs_and_invalid_strings() {
+    async fn placement_rejects_invalid() {
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let auth = admin_auth(realm_id, admin);
         let missing = Ulid::from_bytes([22; 16]);
@@ -3614,7 +3601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_placement_route_is_registered() {
+    async fn placement_route_registered() {
         let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
         let response = crate::routes::rest_router(state)
             .oneshot(
@@ -3629,7 +3616,7 @@ mod tests {
     }
 
     #[test]
-    fn openapi_registers_realm_placement_get_patch_and_schemas() {
+    fn openapi_registers_placement() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let path = &openapi["paths"]["/system/realm/placement"];
         assert!(path.get("get").is_some());
@@ -3647,8 +3634,8 @@ mod tests {
     }
 
     #[test]
-    fn realm_placement_transaction_conflict_maps_to_http_conflict() {
-        let error = map_mutate_realm_placement_error(MutateRealmPlacementError::StorageError(
+    fn placement_conflict_maps() {
+        let error = map_placement_error(MutateRealmPlacementError::StorageError(
             StorageError::TransactionConflict,
         ));
         assert!(matches!(
@@ -3658,9 +3645,9 @@ mod tests {
     }
 
     #[test]
-    fn realm_placement_missing_config_maps_to_not_found() {
+    fn placement_missing_config() {
         assert!(matches!(
-            map_mutate_realm_placement_error(MutateRealmPlacementError::RealmConfigNotFound),
+            map_placement_error(MutateRealmPlacementError::RealmConfigNotFound),
             ServerError::NotFound
         ));
     }
@@ -3669,7 +3656,7 @@ mod tests {
     fn placement_capacity_unavailable() {
         // Cleanup capacity is transient on both placement paths.
         assert!(matches!(
-            map_mutate_realm_placement_error(MutateRealmPlacementError::StorageError(
+            map_placement_error(MutateRealmPlacementError::StorageError(
                 StorageError::CleanupCapacity
             )),
             ServerError::ServiceUnavailableReason(_)
@@ -3683,7 +3670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_realm_quota_requires_authentication() {
+    async fn quota_requires_auth() {
         let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
         let body = RealmQuotaConfig::from(QuotaConfig::default());
 
@@ -3695,7 +3682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_realm_quota_rejects_non_admin() {
+    async fn quota_requires_admin() {
         let (state, realm_id, _admin, _tempdir) = setup_management_state().await;
         let stranger = AuthContext {
             user_id: UserId::local(Ulid::generate(), realm_id),
@@ -3713,7 +3700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_sets_and_reads_realm_quota() {
+    async fn admin_sets_quota() {
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let auth = AuthContext {
             user_id: admin,
@@ -3752,7 +3739,7 @@ mod tests {
     /// Anonymous callers keep what they need to authenticate; realm topology,
     /// discovery and quota policy need a token of this realm.
     #[tokio::test]
-    async fn realm_info_gates_detail() {
+    async fn realm_gates_detail() {
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         state
             .register_rest_interface("0.0.0.0:3000".parse().unwrap())
@@ -3820,7 +3807,7 @@ mod tests {
     /// Signed-out callers receive only aggregate overview values. An
     /// unavailable metadata count is serialized as null, never as a false zero.
     #[tokio::test]
-    async fn anonymous_realm_info_exposes_count_only_public_overview() {
+    async fn anonymous_realm_overview() {
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let group = Group {
             display_name: "Protected group title".to_string(),
@@ -3873,14 +3860,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn management_urls_follow_documents() {
-        // The published document names the url a device follows; without one
-        // a management node falls back to its own interface, and a server
-        // node lists the others but never itself.
+    async fn management_urls_follow() {
+        // The published document names the url a device follows; without one a management
+        // node falls back to its own interface, and a server node lists others but not itself.
         use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
-        use aruna_core::structs::{
-            NodeInfoDocument, NodeUrls, NodeUtilization, node_info_storage_key,
-        };
+        use aruna_core::structs::{NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key};
 
         let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
         state
@@ -3917,7 +3901,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: NODE_INFO_KEYSPACE.to_string(),
-                key: node_info_storage_key(node_id).into(),
+                key: node_info_key(node_id).into(),
                 value: document.to_bytes().unwrap().into(),
                 txn_id: None,
             })
@@ -3932,11 +3916,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_realm_info_includes_placement_and_node_info() {
+    async fn realm_node_details() {
         use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
-        use aruna_core::structs::{
-            NodeInfoDocument, NodeUrls, NodeUtilization, node_info_storage_key,
-        };
+        use aruna_core::structs::{NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key};
 
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let node_id = state.get_node_id();
@@ -3987,7 +3969,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: NODE_INFO_KEYSPACE.to_string(),
-                key: node_info_storage_key(node_id).into(),
+                key: node_info_key(node_id).into(),
                 value: document.to_bytes().unwrap().into(),
                 txn_id: None,
             })
@@ -4023,7 +4005,7 @@ mod tests {
     }
 
     #[test]
-    fn node_info_openapi_marks_optional_fields_as_not_required() {
+    fn node_openapi_optional() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
         for (schema, optional_fields) in [
             ("RealmNodeUrlsResponse", &["api", "s3"][..]),
@@ -4045,7 +4027,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_realm_quota_surfaces_invalid_reason_in_bad_request_body() {
+    async fn quota_invalid_reason() {
         use axum::response::IntoResponse;
 
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;

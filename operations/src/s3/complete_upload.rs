@@ -1,13 +1,13 @@
-use crate::blob::blob_storage::{
-    HeadAliasContext, add_hash_path_index_effect, blob_location_read, write_blob_head_effect,
-    write_blob_location_effect, write_blob_version_effect,
+use crate::blob::records::{
+    HeadAliasContext, add_index_effect, blob_location_read, write_head_effect,
+    write_location_effect, write_version_effect,
 };
-use crate::blob::cleanup::schedule_blob_cleanup_effect;
+use crate::blob::cleanup::schedule_cleanup_effect;
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
-    schedule_usage_snapshot_publish_effect,
+    schedule_snapshot_publish,
 };
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
@@ -15,9 +15,8 @@ use crate::placement::policy::{
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::s3::write_cleanup::{
-    CleanupEvent, UploadTargetError, WriteCleanup, delete_records_effect, validate_upload_target,
-};
+use crate::s3::upload_target::{StatusCheck, UploadTargetError, validate_upload};
+use crate::s3::write_cleanup::{CleanupStep, WriteCleanup, delete_records_effect};
 use aruna_blob::hash::Hasher;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -314,9 +313,8 @@ impl CompleteMultipartUploadOperation {
 
     fn schedule_error(&mut self, error: CompleteMultipartUploadError) -> Effects {
         self.cleanup.set_error(error);
-        // Abort any open finalize transaction before starting the reset one, or
-        // the orphaned txn pins an LSM snapshot forever. The original error stays
-        // in `pending_error` and surfaces once cleanup completes.
+        // Abort the open finalize transaction before the reset one or the
+        // orphaned txn pins an LSM snapshot; the error stays pending.
         if let Some(txn_id) = self.txn_id.take() {
             self.state = CompleteMultipartUploadState::AbortFinalizeTransaction;
             return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
@@ -404,13 +402,13 @@ impl CompleteMultipartUploadOperation {
 
     fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
         match self.cleanup.handle_queued(event) {
-            CleanupEvent::Effect(effect) => smallvec![effect],
-            CleanupEvent::Accepted | CleanupEvent::Exhausted => self.release_or_error(),
-            CleanupEvent::Closed => {
+            CleanupStep::Retry(effect) => smallvec![effect],
+            CleanupStep::Accepted | CleanupStep::Exhausted => self.release_or_error(),
+            CleanupStep::Closed => {
                 self.cleanup_closed = true;
                 self.fail_node()
             }
-            CleanupEvent::Invalid => {
+            CleanupStep::Invalid => {
                 self.emit_error(CompleteMultipartUploadError::InvalidOperationState)
             }
         }
@@ -456,12 +454,12 @@ impl CompleteMultipartUploadOperation {
     fn finish_commit(&mut self) -> Effects {
         self.state = CompleteMultipartUploadState::Finish;
         smallvec![
-            schedule_usage_snapshot_publish_effect(),
-            schedule_blob_cleanup_effect()
+            schedule_snapshot_publish(),
+            schedule_cleanup_effect()
         ]
     }
 
-    fn handle_abort_finalize_transaction(&mut self, event: Event) -> Effects {
+    fn abort_finalize(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::TransactionAborted { .. }) => {
                 self.continue_error_cleanup()
@@ -564,7 +562,7 @@ impl CompleteMultipartUploadOperation {
         })]
     }
 
-    fn handle_mark_transaction_started(&mut self, event: Event) -> Effects {
+    fn mark_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.emit_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -573,7 +571,7 @@ impl CompleteMultipartUploadOperation {
         smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
     }
 
-    fn handle_mark_purge_fence_checked(&mut self, event: Event) -> Effects {
+    fn mark_fence_checked(&mut self, event: Event) -> Effects {
         if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
             return self.emit_error(error.into());
         }
@@ -585,7 +583,7 @@ impl CompleteMultipartUploadOperation {
         })]
     }
 
-    fn handle_upload_read_for_mark(&mut self, event: Event) -> Effects {
+    fn mark_upload_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -596,12 +594,13 @@ impl CompleteMultipartUploadOperation {
             Ok(record) => record,
             Err(err) => return self.emit_error(err.into()),
         };
-        if let Err(err) = validate_upload_target(
+        if let Err(err) = validate_upload(
             &record,
             &self.input.bucket,
             &self.input.key,
-            false,
-            Some(self.input.now_ms),
+            StatusCheck::Takeover {
+                now_ms: self.input.now_ms,
+            },
         ) {
             return self.schedule_error(err.into());
         }
@@ -736,7 +735,7 @@ impl CompleteMultipartUploadOperation {
         Ok((resolved, upload_parts))
     }
 
-    fn handle_upload_parts_read(&mut self, event: Event) -> Effects {
+    fn upload_parts_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -890,7 +889,7 @@ impl CompleteMultipartUploadOperation {
         })]
     }
 
-    fn handle_finalize_transaction_started(&mut self, event: Event) -> Effects {
+    fn finalize_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -899,7 +898,7 @@ impl CompleteMultipartUploadOperation {
         smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
     }
 
-    fn handle_finalize_purge_fence_checked(&mut self, event: Event) -> Effects {
+    fn finalize_fence_checked(&mut self, event: Event) -> Effects {
         if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
             return self.schedule_error(error.into());
         }
@@ -971,7 +970,7 @@ impl CompleteMultipartUploadOperation {
         smallvec![blob_location_read(&key, self.txn_id)]
     }
 
-    fn handle_hash_lookup_checked(&mut self, event: Event) -> Effects {
+    fn hash_checked(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -1007,7 +1006,7 @@ impl CompleteMultipartUploadOperation {
                 "blake3",
             ));
         };
-        let effect = match write_blob_location_effect(
+        let effect = match write_location_effect(
             match blake3_hash.try_into() {
                 Ok(hash) => hash,
                 Err(err) => {
@@ -1026,7 +1025,7 @@ impl CompleteMultipartUploadOperation {
         smallvec![effect]
     }
 
-    fn handle_blob_location_written(&mut self, event: Event) -> Effects {
+    fn location_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -1044,7 +1043,7 @@ impl CompleteMultipartUploadOperation {
         })]
     }
 
-    fn handle_object_lookup_read(&mut self, event: Event) -> Effects {
+    fn object_lookup_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -1075,7 +1074,7 @@ impl CompleteMultipartUploadOperation {
         self.write_current_lookup(existing_pointer.as_ref())
     }
 
-    fn handle_liveness_version_read(&mut self, event: Event) -> Effects {
+    fn liveness_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -1098,7 +1097,7 @@ impl CompleteMultipartUploadOperation {
             Ok(context) => context,
             Err(err) => return self.schedule_error(err),
         };
-        let effect = match write_blob_head_effect(&alias_context, pointer, self.txn_id) {
+        let effect = match write_head_effect(&alias_context, pointer, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
         };
@@ -1107,15 +1106,15 @@ impl CompleteMultipartUploadOperation {
         smallvec![effect]
     }
 
-    fn handle_blob_head_written(&mut self, event: Event) -> Effects {
+    fn head_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
 
-        self.write_hash_path_index()
+        self.write_path_index()
     }
 
-    fn write_hash_path_index(&mut self) -> Effects {
+    fn write_path_index(&mut self) -> Effects {
         let Some(location) = self.final_location.clone() else {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
@@ -1129,7 +1128,7 @@ impl CompleteMultipartUploadOperation {
             Ok(context) => context,
             Err(err) => return self.schedule_error(err),
         };
-        let effect = match add_hash_path_index_effect(
+        let effect = match add_index_effect(
             &alias_context,
             match blake3_hash.try_into() {
                 Ok(hash) => hash,
@@ -1156,7 +1155,7 @@ impl CompleteMultipartUploadOperation {
         smallvec![effect]
     }
 
-    fn handle_hash_path_index_written(&mut self, event: Event) -> Effects {
+    fn path_index_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -1206,7 +1205,7 @@ impl CompleteMultipartUploadOperation {
         };
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
         self.stored_policies = version.placement_policies.clone();
-        let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
+        let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
         };
@@ -1215,7 +1214,7 @@ impl CompleteMultipartUploadOperation {
         smallvec![effect]
     }
 
-    fn handle_blob_version_record_written(&mut self, event: Event) -> Effects {
+    fn version_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -1309,7 +1308,7 @@ impl CompleteMultipartUploadOperation {
         })]
     }
 
-    fn handle_object_metadata_written(&mut self, event: Event) -> Effects {
+    fn metadata_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -1326,7 +1325,7 @@ impl CompleteMultipartUploadOperation {
         smallvec![effect]
     }
 
-    fn handle_upload_records_deleted(&mut self, event: Event) -> Effects {
+    fn records_deleted(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -1409,10 +1408,10 @@ impl CompleteMultipartUploadOperation {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
-        self.write_live_replication_obligation()
+        self.write_obligation()
     }
 
-    fn write_live_replication_obligation(&mut self) -> Effects {
+    fn write_obligation(&mut self) -> Effects {
         let Some(version_id) = self.version_id else {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
@@ -1438,7 +1437,7 @@ impl CompleteMultipartUploadOperation {
         smallvec![effect]
     }
 
-    fn handle_live_replication_obligation_written(&mut self, event: Event) -> Effects {
+    fn obligation_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
@@ -1619,7 +1618,7 @@ impl CompleteMultipartUploadOperation {
         }
     }
 
-    fn handle_reset_transaction_started(&mut self, event: Event) -> Effects {
+    fn reset_started(&mut self, event: Event) -> Effects {
         let txn_id = match event {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
             Event::Storage(StorageEvent::Error { .. }) => return self.reset_failed(None),
@@ -1637,7 +1636,7 @@ impl CompleteMultipartUploadOperation {
         })]
     }
 
-    fn handle_upload_read_for_reset(&mut self, event: Event) -> Effects {
+    fn reset_upload_read(&mut self, event: Event) -> Effects {
         let value = match event {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
             Event::Storage(StorageEvent::Error { .. }) => return self.reset_failed(None),
@@ -1675,7 +1674,7 @@ impl CompleteMultipartUploadOperation {
         self.reset_failed(None)
     }
 
-    fn handle_upload_reset_written(&mut self, event: Event) -> Effects {
+    fn upload_reset(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             Event::Storage(StorageEvent::Error { .. }) => return self.reset_failed(None),
@@ -1726,7 +1725,7 @@ impl CompleteMultipartUploadOperation {
         self.rollback_composed_blob()
     }
 
-    fn handle_failed_compose_cleanup(&mut self, event: Event) -> Effects {
+    fn compose_cleanup(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::TransactionAborted { .. }) => {
                 self.continue_error_cleanup()
@@ -1767,55 +1766,55 @@ impl Operation for CompleteMultipartUploadOperation {
         match self.state {
             CompleteMultipartUploadState::Init => self.handle_init(),
             CompleteMultipartUploadState::StartMarkTransaction => {
-                self.handle_mark_transaction_started(event)
+                self.mark_started(event)
             }
             CompleteMultipartUploadState::CheckPurgeFenceForMark => {
-                self.handle_mark_purge_fence_checked(event)
+                self.mark_fence_checked(event)
             }
             CompleteMultipartUploadState::ReadUploadForMark => {
-                self.handle_upload_read_for_mark(event)
+                self.mark_upload_read(event)
             }
             CompleteMultipartUploadState::WriteUploadCompleting => self.handle_upload_marked(event),
             CompleteMultipartUploadState::CommitMarkTransaction => {
                 self.handle_mark_committed(event)
             }
-            CompleteMultipartUploadState::ReadUploadParts => self.handle_upload_parts_read(event),
+            CompleteMultipartUploadState::ReadUploadParts => self.upload_parts_read(event),
             CompleteMultipartUploadState::ReadGateBucket => self.handle_gate_bucket(event),
             CompleteMultipartUploadState::PolicyGate => self.handle_policy_gate(event),
             CompleteMultipartUploadState::ComposeBlob => self.handle_blob_composed(event),
             CompleteMultipartUploadState::StartFinalizeTransaction => {
-                self.handle_finalize_transaction_started(event)
+                self.finalize_started(event)
             }
             CompleteMultipartUploadState::CheckPurgeFenceForFinalize => {
-                self.handle_finalize_purge_fence_checked(event)
+                self.finalize_fence_checked(event)
             }
             CompleteMultipartUploadState::ReadBucketDefault => self.handle_default_read(event),
             CompleteMultipartUploadState::FenceBackend => self.handle_backend_fenced(event),
-            CompleteMultipartUploadState::CheckHashLookup => self.handle_hash_lookup_checked(event),
+            CompleteMultipartUploadState::CheckHashLookup => self.hash_checked(event),
             CompleteMultipartUploadState::WriteBlobLocation => {
-                self.handle_blob_location_written(event)
+                self.location_written(event)
             }
-            CompleteMultipartUploadState::ReadObjectLookup => self.handle_object_lookup_read(event),
+            CompleteMultipartUploadState::ReadObjectLookup => self.object_lookup_read(event),
             CompleteMultipartUploadState::ReadLivenessVersion => {
-                self.handle_liveness_version_read(event)
+                self.liveness_read(event)
             }
-            CompleteMultipartUploadState::WriteBlobHead => self.handle_blob_head_written(event),
+            CompleteMultipartUploadState::WriteBlobHead => self.head_written(event),
             CompleteMultipartUploadState::WriteHashPathIndex => {
-                self.handle_hash_path_index_written(event)
+                self.path_index_written(event)
             }
             CompleteMultipartUploadState::WriteBlobVersionRecord => {
-                self.handle_blob_version_record_written(event)
+                self.version_written(event)
             }
             CompleteMultipartUploadState::RegisterManagedCopy => self.handle_copy_registered(event),
             CompleteMultipartUploadState::WriteObjectMetadata => {
-                self.handle_object_metadata_written(event)
+                self.metadata_written(event)
             }
             CompleteMultipartUploadState::DeleteUploadRecords => {
-                self.handle_upload_records_deleted(event)
+                self.records_deleted(event)
             }
             CompleteMultipartUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             CompleteMultipartUploadState::WriteLiveReplicationObligation => {
-                self.handle_live_replication_obligation_written(event)
+                self.obligation_written(event)
             }
             CompleteMultipartUploadState::EnforceQuota => self.handle_enforce_quota(event),
             CompleteMultipartUploadState::UpdateUsage => self.handle_usage_update(event),
@@ -1823,22 +1822,22 @@ impl Operation for CompleteMultipartUploadOperation {
                 self.handle_finalize_committed(event)
             }
             CompleteMultipartUploadState::AbortFinalizeTransaction => {
-                self.handle_abort_finalize_transaction(event)
+                self.abort_finalize(event)
             }
             CompleteMultipartUploadState::ResetUploadTransaction => {
-                self.handle_reset_transaction_started(event)
+                self.reset_started(event)
             }
             CompleteMultipartUploadState::ReadUploadForReset => {
-                self.handle_upload_read_for_reset(event)
+                self.reset_upload_read(event)
             }
             CompleteMultipartUploadState::WriteUploadReset => {
-                self.handle_upload_reset_written(event)
+                self.upload_reset(event)
             }
             CompleteMultipartUploadState::CommitResetTransaction => {
                 self.handle_reset_committed(event)
             }
             CompleteMultipartUploadState::CleanupFailedCompose => {
-                self.handle_failed_compose_cleanup(event)
+                self.compose_cleanup(event)
             }
             CompleteMultipartUploadState::QueueCleanupRow => self.handle_cleanup_queued(event),
             CompleteMultipartUploadState::ReleaseReservation => self.handle_release(event),
@@ -1985,13 +1984,13 @@ fn compute_composite_hashes(
             combined.extend_from_slice(digest);
         }
 
-        let digest = composite_digest_for_algorithm(algorithm, &combined);
+        let digest = composite_digest(algorithm, &combined);
         hashes.insert(algorithm.hash_key().to_string(), digest);
     }
     Ok(hashes)
 }
 
-fn composite_digest_for_algorithm(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> Vec<u8> {
+fn composite_digest(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> Vec<u8> {
     let hashes = Hasher::new_with_bytes(bytes).finalize();
     match algorithm {
         ChecksumAlgorithm::Md5 => hashes.md5.to_vec(),
@@ -2051,7 +2050,7 @@ mod tests {
             .with_restrictions(Some(restrictions.clone()));
         operation.version_id = Some(Ulid::generate());
 
-        let effects = operation.write_live_replication_obligation();
+        let effects = operation.write_obligation();
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected one obligation write, got {effects:?}")
@@ -2200,7 +2199,7 @@ mod tests {
             "expected the finalize transaction to abort, got {effects:?}"
         );
         assert_eq!(
-            op.cleanup.pending_error,
+            op.cleanup.take_error(),
             Some(BackendFenceError::Unavailable.into())
         );
     }
@@ -2216,7 +2215,7 @@ mod tests {
         }));
 
         assert!(matches!(
-            op.cleanup.pending_error,
+            op.cleanup.take_error(),
             Some(CompleteMultipartUploadError::BackendFenceError(
                 BackendFenceError::Read(_)
             ))
@@ -2260,9 +2259,8 @@ mod tests {
 
     #[test]
     fn commit_keeps_composed() {
-        // A finalize commit that may have landed already owns the composed
-        // object, so nothing here may delete it; it goes to reconciliation with
-        // the blob location row that decides whether the commit landed.
+        // A possibly-landed finalize commit owns the composed object, so it
+        // goes to reconciliation instead of being deleted here.
         let mut op = CompleteMultipartUploadOperation::new(finalize_input());
         let mut location = composed_location(Ulid::from_bytes([5u8; 16]));
         location.hashes.insert(
@@ -2321,9 +2319,10 @@ mod tests {
             vec![7u8; 32],
         );
         let id = location.ulid;
-        op.cleanup.pending_error = Some(CompleteMultipartUploadError::StorageError(
-            StorageError::CommitFailed,
-        ));
+        op.cleanup
+            .set_error(CompleteMultipartUploadError::StorageError(
+                StorageError::CommitFailed,
+            ));
         op.cleanup.set_release(id);
         op.state = CompleteMultipartUploadState::QueueCleanupRow;
         assert!(
@@ -2376,9 +2375,10 @@ mod tests {
             vec![7u8; 32],
         );
         let id = location.ulid;
-        op.cleanup.pending_error = Some(CompleteMultipartUploadError::StorageError(
-            StorageError::Timeout,
-        ));
+        op.cleanup
+            .set_error(CompleteMultipartUploadError::StorageError(
+                StorageError::Timeout,
+            ));
         op.cleanup.set_release(id);
         op.state = CompleteMultipartUploadState::QueueCleanupRow;
         assert!(
@@ -2592,8 +2592,8 @@ mod tests {
         let location = composed_location(Ulid::from_bytes([5u8; 16]));
         op.composed_location = Some(location.clone());
         op.txn_id = Some(TxnId::from_bytes([3u8; 16]));
-        op.cleanup.pending_error =
-            Some(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        op.cleanup
+            .set_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         op.state = CompleteMultipartUploadState::CommitResetTransaction;
 
         let effects = op.step(Event::Storage(StorageEvent::Error {
@@ -2623,8 +2623,8 @@ mod tests {
         let mut op = CompleteMultipartUploadOperation::new(finalize_input());
         let location = composed_location(Ulid::from_bytes([5u8; 16]));
         op.composed_location = Some(location.clone());
-        op.cleanup.pending_error =
-            Some(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        op.cleanup
+            .set_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         op.state = CompleteMultipartUploadState::AbortFinalizeTransaction;
 
         let effects = op.step(Event::Storage(StorageEvent::Error {
@@ -2652,8 +2652,8 @@ mod tests {
     fn cleanup_close_stops() {
         let mut op = CompleteMultipartUploadOperation::new(finalize_input());
         let location = composed_location(Ulid::from_bytes([5u8; 16]));
-        op.cleanup.pending_error =
-            Some(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        op.cleanup
+            .set_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         op.state = CompleteMultipartUploadState::QueueCleanupRow;
         assert!(
             op.cleanup
@@ -2726,7 +2726,7 @@ mod tests {
         op.txn_id = Some(TxnId::generate());
         op.state = CompleteMultipartUploadState::ReadUploadForMark;
 
-        let effects = op.handle_upload_read_for_mark(Event::Storage(StorageEvent::ReadResult {
+        let effects = op.mark_upload_read(Event::Storage(StorageEvent::ReadResult {
             key: Vec::new().into(),
             value: Some(record.to_bytes().unwrap().into()),
         }));
@@ -2754,7 +2754,7 @@ mod tests {
         op.txn_id = Some(TxnId::generate());
         op.state = CompleteMultipartUploadState::ReadUploadForMark;
 
-        let effects = op.handle_upload_read_for_mark(Event::Storage(StorageEvent::ReadResult {
+        let effects = op.mark_upload_read(Event::Storage(StorageEvent::ReadResult {
             key: Vec::new().into(),
             value: Some(record.to_bytes().unwrap().into()),
         }));
@@ -2777,7 +2777,7 @@ mod tests {
         op.txn_id = Some(txn_id);
         op.state = CompleteMultipartUploadState::ReadUploadForMark;
 
-        let effects = op.handle_upload_read_for_mark(Event::Storage(StorageEvent::ReadResult {
+        let effects = op.mark_upload_read(Event::Storage(StorageEvent::ReadResult {
             key: Vec::new().into(),
             value: Some(record.to_bytes().unwrap().into()),
         }));
@@ -2788,7 +2788,7 @@ mod tests {
                 if *aborted == txn_id
         ));
         assert_eq!(
-            op.cleanup.pending_error,
+            op.cleanup.take_error(),
             Some(CompleteMultipartUploadError::CompletionInProgress)
         );
     }
@@ -2827,7 +2827,7 @@ mod tests {
         op.txn_id = Some(TxnId::generate());
         op.state = CompleteMultipartUploadState::ReadUploadForReset;
 
-        let effects = op.handle_upload_read_for_reset(Event::Storage(StorageEvent::ReadResult {
+        let effects = op.reset_upload_read(Event::Storage(StorageEvent::ReadResult {
             key: Vec::new().into(),
             value: Some(record.to_bytes().unwrap().into()),
         }));
@@ -2840,7 +2840,7 @@ mod tests {
     }
 
     #[test]
-    fn checksum_contract_failure_aborts_mark_transaction() {
+    fn contract_failure_aborts() {
         let mut input = finalize_input();
         input.checksum_type = MultipartChecksumType::FullObject;
         input.checksum_type_explicit = true;
@@ -2855,7 +2855,7 @@ mod tests {
         op.txn_id = Some(txn_id);
         op.state = CompleteMultipartUploadState::ReadUploadForMark;
 
-        let effects = op.handle_upload_read_for_mark(Event::Storage(StorageEvent::ReadResult {
+        let effects = op.mark_upload_read(Event::Storage(StorageEvent::ReadResult {
             key: Vec::new().into(),
             value: Some(record.to_bytes().unwrap().into()),
         }));
@@ -2869,7 +2869,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_checksum_contract_allows_only_per_part_checksums() {
+    fn composite_parts_only() {
         let digest = vec![7; ChecksumAlgorithm::Sha256.digest_len()];
         let mut input = finalize_input();
         input.completed_parts = vec![CompleteMultipartPart {
@@ -2924,7 +2924,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_undersized_non_final_part() {
+    fn undersized_middle_rejected() {
         let mut input = finalize_input();
         input.completed_parts = vec![
             CompleteMultipartPart {
@@ -2952,7 +2952,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_undersized_final_part() {
+    fn undersized_final_allowed() {
         let mut input = finalize_input();
         input.completed_parts = vec![
             CompleteMultipartPart {
@@ -2977,7 +2977,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_upload_records_includes_omitted_parts() {
+    fn omitted_parts_deleted() {
         let input = finalize_input();
         let mut op = CompleteMultipartUploadOperation::new(input);
         op.upload_parts = vec![part_record(1, 10), part_record(2, 20)];
@@ -3138,11 +3138,10 @@ mod tests {
         assert_eq!(result.location, location);
     }
 
-    // A quota rejection at EnforceQuota leaves the finalize transaction open. It
-    // must be aborted before the reset transaction starts, otherwise the storage
-    // actor orphans the txn and pins an LSM snapshot forever.
+    // A quota rejection leaves the finalize transaction open; it must be
+    // aborted before reset or the actor pins an LSM snapshot.
     #[test]
-    fn quota_rejection_aborts_finalize_txn_before_reset() {
+    fn quota_aborts_finalize() {
         let input = finalize_input();
         let record = open_upload_record(&input);
         let mut op = CompleteMultipartUploadOperation::new(input);
@@ -3182,7 +3181,7 @@ mod tests {
             CompleteMultipartUploadState::ResetUploadTransaction
         );
         assert_eq!(
-            op.cleanup.pending_error,
+            op.cleanup.take_error(),
             Some(CompleteMultipartUploadError::QuotaExceeded {
                 limit: 30,
                 usage: 35
@@ -3193,7 +3192,7 @@ mod tests {
     // If the finalize-txn abort itself errors, the original quota error must still
     // be surfaced rather than masked by the abort failure.
     #[test]
-    fn quota_rejection_abort_failure_preserves_original_error() {
+    fn abort_preserves_error() {
         let input = finalize_input();
         let mut op = CompleteMultipartUploadOperation::new(input);
         let finalize_txn = TxnId::generate();
@@ -3249,7 +3248,7 @@ mod tests {
         );
         assert_eq!(operation.txn_id, None);
         assert_eq!(
-            operation.cleanup.pending_error,
+            operation.cleanup.take_error(),
             Some(CompleteMultipartUploadError::StorageError(
                 StorageError::CommitFailed
             ))
@@ -3448,7 +3447,7 @@ mod gate_tests {
 
         assert!(!composes(&effects));
         assert_eq!(
-            operation.cleanup.pending_error,
+            operation.cleanup.take_error(),
             Some(CompleteMultipartUploadError::PolicyGate(
                 PolicyGateError::Denied {
                     policy_ids: vec![rule.policy().policy_id]
@@ -3458,7 +3457,7 @@ mod gate_tests {
     }
 
     #[test]
-    fn no_policy_blocks_compose() {
+    fn missing_policy_blocks() {
         // A rule that cannot be obtained blocks; it is never read as a grant.
         let rule = policy("eu-west");
         let mut operation = at_gate(Some("eu-west"));
@@ -3470,7 +3469,7 @@ mod gate_tests {
 
         assert!(!composes(&effects));
         assert!(matches!(
-            operation.cleanup.pending_error,
+            operation.cleanup.take_error(),
             Some(CompleteMultipartUploadError::PolicyGate(
                 PolicyGateError::Unavailable { .. }
             ))
@@ -3478,7 +3477,7 @@ mod gate_tests {
     }
 
     #[test]
-    fn missing_subject_blocks_compose() {
+    fn missing_subject_blocks() {
         let mut operation = at_gate(None);
         let effects = operation.step(read(Some(bucket(
             vec![PlacementPolicyRef {
@@ -3490,7 +3489,7 @@ mod gate_tests {
 
         assert!(!composes(&effects));
         assert_eq!(
-            operation.cleanup.pending_error,
+            operation.cleanup.take_error(),
             Some(CompleteMultipartUploadError::PolicyGate(
                 PolicyGateError::NoSubject
             ))
@@ -3526,7 +3525,7 @@ mod gate_tests {
         }));
 
         assert_eq!(
-            operation.cleanup.pending_error,
+            operation.cleanup.take_error(),
             Some(CompleteMultipartUploadError::PolicyGate(
                 PolicyGateError::Drift
             ))

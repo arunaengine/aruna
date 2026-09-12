@@ -37,7 +37,7 @@ impl FamilyView {
         let placement = config.family_placement(family.submission_id).ok()?;
         let strategy = config.strategy(&placement.strategy_id)?;
         let holders = activation_holders(config, strategy, &placement)?;
-        let members = config.sync_eligible_node_ids().ok()?;
+        let members = config.sync_eligible_nodes().ok()?;
         if holders.is_empty() || members.is_empty() {
             return None;
         }

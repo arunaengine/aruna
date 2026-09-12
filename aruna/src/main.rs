@@ -3,12 +3,12 @@
 #![recursion_limit = "256"]
 
 use aruna::bootstrap::{
-    ensure_initial_local_onboarding_secret, fetch_core_onboarding_documents,
+    ensure_onboarding_secret, fetch_core_documents,
     prepare_core_documents, publish_core_documents, realm_bootstrap_exists,
-    wait_for_onboarding_placement,
+    wait_for_placement,
 };
 use aruna::config::{
-    Config, PortalConfig, StartupMode, load, mark_node_state_complete, mark_onboarding_phase,
+    Config, PortalConfig, StartupMode, load, mark_onboarding_phase, mark_state_complete,
 };
 use aruna::portal;
 use aruna::shutdown::{NodeShutdown, arm_signal_exit, shutdown_grace_env, wait_for_signal};
@@ -16,8 +16,8 @@ use aruna::telemetry::{init_tracing, shutdown_tracing};
 use aruna_api::auth::OidcValidator;
 use aruna_api::cors::CorsConfig;
 use aruna_api::csp::PortalCspConfig;
-use aruna_api::ops::{OpsState, Readiness, serve_ops};
-use aruna_api::s3::s3_server::S3Server;
+use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
+use aruna_api::s3::server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::{BackendRegistry, BlobHandler};
@@ -34,10 +34,10 @@ use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::device::wipe as device_wipe;
 use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::drain::restore_job_queue_timer;
+use aruna_operations::jobs::drain::restore_drain_timer;
 use aruna_operations::jobs::lifecycle::restore_lifecycle_timers;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::metadata::projector::replay_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
 #[cfg(debug_assertions)]
 use aruna_operations::node::startup::RecoveryState;
@@ -268,7 +268,7 @@ async fn setup_runtime() -> Result<Runtime, Box<dyn std::error::Error>> {
         Some(net_handle.document_sync_database()),
         MetadataHandleOptions::default()
             .with_search_storage(config.metadata_search_storage)
-            .with_document_sync_persist_policy(config.fjall_persist_policy),
+            .with_sync_policy(config.fjall_persist_policy),
     )?;
     let blob_handle = BlobHandler::with_registry(
         BackendRegistry::from_config(&config.blob_backends).map_err(std::io::Error::other)?,
@@ -299,7 +299,7 @@ async fn setup_runtime() -> Result<Runtime, Box<dyn std::error::Error>> {
     let metrics = Arc::new(NodeMetrics::new());
     let readiness = Readiness::new();
     let recovery = RecoveryStatus::new();
-    let ops_state = OpsState::with_recovery(
+    let ops_state = MonitoringState::with_recovery(
         driver_ctx.clone(),
         metrics.clone(),
         readiness.clone(),
@@ -363,7 +363,7 @@ async fn prepare_startup(
     driver_ctx: &Arc<DriverContext>,
     net_handle: &NetHandle,
 ) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
-    let replayed_metadata_events = replay_metadata_event_log(driver_ctx.as_ref()).await?;
+    let replayed_metadata_events = replay_event_log(driver_ctx.as_ref()).await?;
     if replayed_metadata_events > 0 {
         info!(
             replayed_metadata_events,
@@ -375,10 +375,8 @@ async fn prepare_startup(
 
     // Prepare local topics before binding; remote convergence stays behind the gate.
     prepare_shard_policy(driver_ctx, config.node_id, config.realm_id).await;
-    // A device runs no document sync, so it fetches the realm documents it is
-    // judged by before it serves anything. The attempt is short on purpose: an
-    // unreachable realm must not keep the owner's own machine down, and the
-    // stored copy answers until the beat retries.
+    // Devices fetch governing realm documents before serving because they run no sync.
+    // A short attempt lets stored copies serve while heartbeat retries an unreachable realm.
     if matches!(config.node_capabilities, NodeCapabilities::User { .. })
         && !fetch_realm_documents(driver_ctx, STARTUP_DOCUMENT_FETCH).await
     {
@@ -427,7 +425,7 @@ async fn init_realm(
     // The subject comes first: the advertisement built from it carries no
     // execution target while this node has no placement subject yet.
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
-    seed_local_node_info(driver_ctx.as_ref(), config).await?;
+    seed_node_info(driver_ctx.as_ref(), config).await?;
     let documents = prepare_core_documents(
         driver_ctx.as_ref(),
         config.node_id,
@@ -438,7 +436,7 @@ async fn init_realm(
     .await?;
 
     if config.is_initial_node() {
-        match ensure_initial_local_onboarding_secret(
+        match ensure_onboarding_secret(
             driver_ctx.as_ref(),
             format!("http://{}", config.http_socket_addr),
             &config.node_state.net_secret_key,
@@ -455,7 +453,7 @@ async fn init_realm(
         }
     }
 
-    mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
+    mark_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
     Ok(CoreAnnouncement {
         documents,
         allow_genesis: true,
@@ -474,7 +472,7 @@ async fn join_realm(
         .map(|endpoint| endpoint.id)
         .or_else(|| config.peer_nodes.first().copied());
     if matches!(phase, OnboardingPhase::Bootstrapped) {
-        fetch_core_onboarding_documents(
+        fetch_core_documents(
             driver_ctx,
             &config.node_state,
             &config.realm_id,
@@ -483,7 +481,7 @@ async fn join_realm(
         )
         .await?;
     }
-    wait_for_onboarding_placement(
+    wait_for_placement(
         driver_ctx,
         config.realm_id,
         config.node_id,
@@ -504,7 +502,7 @@ async fn join_realm(
         }
     }
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
-    seed_local_node_info(driver_ctx.as_ref(), config).await?;
+    seed_node_info(driver_ctx.as_ref(), config).await?;
     let documents = match is_device(config) {
         true => Vec::new(),
         false => {
@@ -518,7 +516,7 @@ async fn join_realm(
             .await?
         }
     };
-    mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
+    mark_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
     Ok(CoreAnnouncement {
         documents,
         allow_genesis: false,
@@ -559,7 +557,7 @@ async fn provision_realm(
     }
 
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
-    seed_local_node_info(driver_ctx.as_ref(), config).await?;
+    seed_node_info(driver_ctx.as_ref(), config).await?;
     let allow_genesis = config.is_initial_node();
     let documents = match is_device(config) {
         true => Vec::new(),
@@ -690,7 +688,7 @@ async fn bind_session_s3(
     driver_ctx: Arc<DriverContext>,
     cors: CorsConfig,
     metrics: Arc<NodeMetrics>,
-    s3_timeouts: aruna_api::s3::s3_server::S3ServerTimeouts,
+    s3_timeouts: aruna_api::s3::server::S3ServerTimeouts,
     shutdown: &Shutdown,
 ) {
     let Some(session) = session else {
@@ -761,9 +759,7 @@ async fn bind_servers(
     let device_wipe = match matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
         true => {
             let (roots, unsupported) = wipe_plan(&config);
-            // A wipe erases what these roots hold, so an unsafe one fails the
-            // start rather than the erasure, and what it erases is the
-            // normalized path, never the one that hid it.
+            // Reject unsafe wipe roots before startup and erase only their normalized paths.
             let roots = aruna::config::validate_wipe_roots(&roots, dirs::home_dir().as_deref())?;
             Some(Arc::new(DeviceWipe::new(roots, unsupported)))
         }
@@ -1012,7 +1008,7 @@ async fn start_background(background: Background) {
     }
     jobs_runtime.start();
     task_queues.start(&shutdown).await;
-    restore_job_queue_timer(&driver_ctx.storage_handle, &task_handle).await;
+    restore_drain_timer(&driver_ctx.storage_handle, &task_handle).await;
     restore_lifecycle_timers(&driver_ctx.storage_handle, &task_handle).await;
     spawn_metadata_warmup(driver_ctx.clone(), &shutdown);
     spawn_session_sweep(driver_ctx.clone(), &shutdown);
@@ -1032,9 +1028,7 @@ async fn start_background(background: Background) {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Before any startup work: readiness opens and background children start
-    // long before this point, and an uninstalled handler would let the signal
-    // kill the node instead of draining it.
+    // Install signal handling before readiness or background work can start.
     let mut signal = tokio::spawn(wait_for_signal());
 
     let Runtime {
@@ -1151,9 +1145,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // the owner's wipe erases the roots here and exits with its own status.
     if let Some(wipe) = device_wipe.filter(|wipe| wipe.is_armed()) {
         let failed = device_wipe::purge(wipe.roots());
-        // Only a complete erasure may claim the wiped status; paths left behind
-        // and storage this process cannot erase at all both exit with their own
-        // code so a supervisor does not read the device as erased.
+        // Only complete erasure reports wiped status. Remaining paths or unsupported stores
+        // use a different exit code so supervisors do not treat the device as erased.
         let code = if failed.is_empty() && wipe.unsupported().is_empty() {
             info!("Wiped this device on its owner's request");
             device_wipe::WIPED_EXIT_CODE
@@ -1397,6 +1390,18 @@ fn session_s3_port(setting: Option<&str>, endpoint: Option<&str>) -> Result<u16,
         .unwrap_or(443))
 }
 
+#[cfg(any(feature = "kubernetes", test))]
+fn kubernetes_s3_access(
+    workspace: Option<&str>,
+    cidrs: Vec<String>,
+    mount_driver: Option<String>,
+) -> (Vec<String>, Option<String>) {
+    match workspace {
+        Some(_) => (cidrs, mount_driver),
+        None => (Vec::new(), None),
+    }
+}
+
 #[cfg(feature = "kubernetes")]
 async fn build_kubernetes(
     config: &Config,
@@ -1418,7 +1423,11 @@ async fn build_kubernetes(
         dotenvy::var("ARUNA_COMPUTE_K8S_S3_PORT").ok().as_deref(),
         workspace.as_deref(),
     )?;
-    let s3_mount_driver = read_mount_driver();
+    let (s3_cidrs, s3_mount_driver) = kubernetes_s3_access(
+        workspace.as_deref(),
+        s3_cidrs,
+        read_mount_driver(),
+    );
     let policy_manifests = dotenvy::var("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS")
         .ok()
         .map(|value| policy_paths(&value))
@@ -1437,7 +1446,7 @@ async fn build_kubernetes(
                 Vec::new()
             },
             s3_port,
-            s3_mount_driver: s3_mount_driver.filter(|_| workspace.is_some()),
+            s3_mount_driver,
             policy_manifests,
             service_account: dotenvy::var("ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT")
                 .unwrap_or_else(|_| aruna_compute::DEFAULT_WORKLOAD_SA.to_string()),
@@ -1460,10 +1469,7 @@ async fn build_kubernetes(
         .apply_network()
         .await
         .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
-    info!(
-        local_only = workspace.is_none(),
-        "Kubernetes executor backend enabled"
-    );
+    info!(local_only = workspace.is_none(), "Kubernetes executor backend enabled");
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
         .with_workspace_endpoint(workspace, "eu-central-1".to_string()))
@@ -1655,8 +1661,8 @@ async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<
     .map_err(|error| error.to_string())
 }
 
-async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {
-    aruna_operations::node::node_info::seed_node_info_document(
+async fn seed_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {
+    aruna_operations::node::node_info::seed_info_document(
         ctx,
         config.node_id,
         config.realm_id,
@@ -1712,10 +1718,10 @@ async fn ensure_usage_counters(
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
-    use aruna_core::structs::usage_global_shard_keys;
+    use aruna_core::structs::global_shard_keys;
     use aruna_operations::node::usage_stats::RebuildUsageStatsOperation;
 
-    let shard_keys = usage_global_shard_keys();
+    let shard_keys = global_shard_keys();
     let event = driver_ctx
         .storage_handle
         .send_storage_effect(StorageEffect::BatchRead {
@@ -1759,7 +1765,7 @@ mod tests {
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
-    use aruna_core::structs::{UsageCounters, usage_global_shard_keys};
+    use aruna_core::structs::{UsageCounters, global_shard_keys};
     use aruna_storage::StorageHandle;
     use std::thread;
     use tempfile::tempdir;
@@ -1897,6 +1903,25 @@ mod tests {
         assert!(kubernetes_workspace(false, Some("http://127.0.0.1:9000")).is_err());
         assert!(kubernetes_workspace(false, Some("http://0.0.0.0:9000")).is_err());
         assert!(kubernetes_workspace(false, Some("http://localhost:9000")).is_err());
+        assert_eq!(
+            kubernetes_s3_access(
+                None,
+                vec!["10.0.0.0/8".to_string()],
+                Some("mount.example".to_string()),
+            ),
+            (Vec::new(), None)
+        );
+        assert_eq!(
+            kubernetes_s3_access(
+                Some("https://s3.example.test"),
+                vec!["10.0.0.0/8".to_string()],
+                Some("mount.example".to_string()),
+            ),
+            (
+                vec!["10.0.0.0/8".to_string()],
+                Some("mount.example".to_string())
+            )
+        );
     }
 
     #[test]
@@ -1959,7 +1984,7 @@ mod tests {
 
     #[cfg(feature = "kubernetes")]
     #[test]
-    fn validates_k8s_cidrs() {
+    fn validates_cluster_cidrs() {
         assert_eq!(
             parse_s3_cidrs(" 10.0.0.0/8, 2001:db8::/32 ").unwrap(),
             ["10.0.0.0/8", "2001:db8::/32"]
@@ -1989,7 +2014,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_usage_counters_rebuilds_missing_shards() {
+    async fn counters_rebuild_shards() {
         let temp = tempdir().expect("temp dir");
         let storage_handle = aruna_storage::FjallStorage::open(
             temp.path().to_str().expect("temp path should be utf8"),
@@ -2006,7 +2031,7 @@ mod tests {
             "intact shards must report no rebuild"
         );
 
-        for key in usage_global_shard_keys() {
+        for key in global_shard_keys() {
             let event = storage_handle
                 .send_storage_effect(StorageEffect::Read {
                     key_space: USAGE_STATS_KEYSPACE.to_string(),
@@ -2028,7 +2053,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_usage_counters_returns_probe_errors() {
+    async fn counters_return_errors() {
         let (storage_handle, receivers) = StorageHandle::new();
         let receiver = receivers.foreground;
         let worker = thread::spawn(move || {
@@ -2053,7 +2078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_usage_counters_rejects_unexpected_probe_events() {
+    async fn counters_reject_events() {
         let (storage_handle, receivers) = StorageHandle::new();
         let receiver = receivers.foreground;
         let worker = thread::spawn(move || {

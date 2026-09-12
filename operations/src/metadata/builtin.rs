@@ -8,7 +8,7 @@ use aruna_core::metadata::PROCESS_RUN_CRATE_PROFILE_IRI;
 /// the node binary does, so there is nothing per-realm to pin.
 pub(crate) const BUILTIN_REVISION: &str = "builtin";
 
-const PROCESS_RUN_CRATE_SHAPES: &str = include_str!("builtin/process_run_crate.ttl");
+const PROCESS_RUN_CRATE_SHAPES: &str = include_str!("builtin/process_run.ttl");
 
 /// The embedded SHACL Turtle for `iri`, when the node ships shapes for it.
 pub(crate) fn builtin_shapes(iri: &str) -> Option<&'static str> {

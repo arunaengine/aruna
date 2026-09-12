@@ -116,14 +116,14 @@ mod tests {
     use super::{LogFormat, parse_log_format};
 
     #[test]
-    fn log_format_defaults_to_text() {
+    fn log_defaults_text() {
         assert_eq!(parse_log_format(None), LogFormat::Text);
         assert_eq!(parse_log_format(Some("text")), LogFormat::Text);
         assert_eq!(parse_log_format(Some("garbage")), LogFormat::Text);
     }
 
     #[test]
-    fn log_format_parses_json_case_insensitively() {
+    fn log_parses_json() {
         assert_eq!(parse_log_format(Some("json")), LogFormat::Json);
         assert_eq!(parse_log_format(Some("  JSON  ")), LogFormat::Json);
     }

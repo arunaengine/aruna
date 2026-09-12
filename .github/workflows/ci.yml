@@ -96,7 +96,79 @@ jobs:
           ARUNA_TEST_S3_ACCESS_KEY: aruna-test
           ARUNA_TEST_S3_SECRET_KEY: aruna-test-secret
           ARUNA_TEST_S3_REGION: us-east-1
-        run: cargo test -p aruna-blob --lib --locked s3_
+        # A zero-match filter exits 0, so the checker proves the exact expected set.
+        run: |
+          set -euo pipefail
+          cargo test -p aruna-blob --lib --locked s3_ -- \
+            --ignored --format pretty --color never 2>&1 | tee s3-backend.log
+          python3 scripts/backend_log.py s3-backend.log \
+            blob::tests::s3_roundtrip_range \
+            blob::tests::s3_multipart_compose \
+            blob::tests::s3_group_backend \
+            blob::tests::s3_backend_routes
+
+  docker-backend:
+    runs-on: ubuntu-latest
+    # Hang cap for the daemon-backed compute suite, not a performance budget.
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install Rust
+        run: rustup show active-toolchain
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # A required daemon job must fail when Docker is unavailable instead of
+      # letting the ignored cases skip past a broken environment.
+      - name: Require the Docker daemon
+        run: docker info >/dev/null
+
+      - name: Run Docker backend tests
+        env:
+          ARUNA_COMPUTE_REQUIRE_DOCKER: "1"
+        run: |
+          set -euo pipefail
+          cargo test -p aruna-compute --no-default-features --features docker \
+            --test docker_backend --locked -- \
+            --ignored --format pretty --color never 2>&1 | tee docker-backend.log
+          python3 scripts/backend_log.py docker-backend.log \
+            idempotent_submit resubmit_after_removal exit_code_capture file_transfer \
+            wildcard_outputs chunked_transfer cancelled_submit cancel_stops \
+            created_cancel_removes reconcile_adopts log_bounds resource_limits \
+            foreign_not_adopted wait_is_observational
+
+  feature-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install Rust
+        run: rustup show active-toolchain
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # The compute manifest defines the supported backend selections; an
+      # all-feature build alone can hide a conditional-import mistake.
+      - name: Check the default workspace build
+        run: |
+          cargo check --workspace --locked
+          cargo check --workspace --all-targets --all-features --locked
+
+      - name: Check the compute feature selections
+        run: |
+          set -euo pipefail
+          cargo check -p aruna-compute --no-default-features --locked
+          for features in docker apptainer kubernetes; do
+            cargo check -p aruna-compute --no-default-features --features "$features" --locked
+          done
 
   fmt:
     runs-on: ubuntu-latest
@@ -108,11 +180,11 @@ jobs:
       - name: Install nightly rustfmt
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-23
           components: rustfmt
 
       - name: Check formatting
-        run: cargo +nightly fmt --all -- --check
+        run: cargo +nightly-2026-08-23 fmt --all -- --check
 
   clippy:
     runs-on: ubuntu-latest
@@ -124,14 +196,14 @@ jobs:
       - name: Install nightly clippy
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-23
           components: clippy
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Run clippy
-        run: cargo +nightly clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo +nightly-2026-08-23 clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   deny:
     runs-on: ubuntu-latest
@@ -157,11 +229,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      # Explicit manifest: nested image/helper build scripts and the
+      # extensionless POSIX launcher each need their own dialect.
       - name: Run ShellCheck
-        run: shellcheck scripts/*.sh scripts/tests/*.sh
+        run: |
+          shellcheck scripts/*.sh scripts/tests/*.sh
+          shellcheck --shell=sh scripts/compute-helper/build.sh scripts/session-deno/build.sh \
+            scripts/session-python/build.sh scripts/session-helper/session-start
 
-      - name: Run session-helper tests
-        run: python3 -m unittest discover -s scripts/session-helper
+      - name: Run Python helper tests
+        run: |
+          python3 -m unittest discover -s scripts/session-helper
+          python3 -m unittest scripts/tests/test_backend.py
 
   compose-config:
     runs-on: ubuntu-latest
@@ -190,7 +269,7 @@ jobs:
           PROMETHEUS_IMAGE: prom/prometheus:v3.5.3@sha256:ddc2493835a1509976d5e4e0c94199c4f843ce1f42dd6bcfc8231ba734a93ff7
         run: |
           set -euo pipefail
-          for file in aruna-alerts.yml aruna-alerts.test.yml; do
+          for file in alerts.yml alerts.test.yml; do
             test -f "scripts/observability/$file" \
               || { echo "missing scripts/observability/$file" >&2; exit 1; }
           done
@@ -200,8 +279,8 @@ jobs:
               --entrypoint /bin/promtool \
               "$PROMETHEUS_IMAGE" "$@"
           }
-          promtool check rules /rules/aruna-alerts.yml
-          promtool test rules /rules/aruna-alerts.test.yml
+          promtool check rules /rules/alerts.yml
+          promtool test rules /rules/alerts.test.yml
 
   just-contracts:
     runs-on: ubuntu-latest
@@ -214,7 +293,7 @@ jobs:
       - name: Install just
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: just
+          tool: just@1.58.0
 
       - name: Run recipe contract tests
         run: bash scripts/tests/just_recipes.sh
@@ -237,7 +316,7 @@ jobs:
       - name: Install just
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: just
+          tool: just@1.58.0
 
       - name: Build the deployment binaries once
         run: cargo build --release --locked -p aruna -p aruna-doctor
@@ -475,7 +554,7 @@ jobs:
       - name: Install just
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: just
+          tool: just@1.58.0
 
       - name: Build the compose image once
         run: docker compose --file scripts/compose.yaml build aruna
@@ -545,7 +624,7 @@ jobs:
             echo "  scrape_interval: 15s"
             echo "  scrape_timeout: 5s"
             echo "rule_files:"
-            echo "  - aruna-alerts.yml"
+            echo "  - alerts.yml"
             echo "scrape_configs:"
             echo "  - job_name: aruna"
             echo "    metrics_path: /metrics"

@@ -92,7 +92,7 @@ impl InboundEventHandler for TestInboundHandler {
 }
 
 #[tokio::test]
-async fn test_storage_iter_pagination() -> Result<(), Box<dyn std::error::Error>> {
+async fn storage_iter_pagination() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempdir()?;
     let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
 
@@ -161,7 +161,7 @@ async fn test_storage_iter_pagination() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[tokio::test]
-async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>> {
+async fn dht_put_get() -> Result<(), Box<dyn std::error::Error>> {
     let temp_a = tempdir()?;
     let temp_b = tempdir()?;
     let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
@@ -279,15 +279,9 @@ async fn dht_fallback_inner() -> Result<(), Box<dyn std::error::Error>> {
     realm_config.ensure_node(node_a, RealmNodeKind::Management);
     realm_config.ensure_node(node_b, RealmNodeKind::Management);
     realm_config.ensure_node(node_c, RealmNodeKind::Management);
-    handle_a
-        .refresh_realm_peers_from_document(&realm_config)
-        .await?;
-    handle_b
-        .refresh_realm_peers_from_document(&realm_config)
-        .await?;
-    handle_c
-        .refresh_realm_peers_from_document(&realm_config)
-        .await?;
+    handle_a.refresh_document_peers(&realm_config).await?;
+    handle_b.refresh_document_peers(&realm_config).await?;
+    handle_c.refresh_document_peers(&realm_config).await?;
 
     let (stream_tx, stream_rx) = mpsc::unbounded_channel();
     handle_b.set_inbound_handler(Arc::new(TestInboundHandler {
@@ -333,7 +327,7 @@ async fn dht_fallback_inner() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Error>> {
+async fn stream_send_receive() -> Result<(), Box<dyn std::error::Error>> {
     let temp_a = tempdir()?;
     let temp_b = tempdir()?;
     let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
@@ -389,7 +383,7 @@ async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Er
 }
 
 #[tokio::test]
-async fn test_open_stream_rejects_internal_alpn() -> Result<(), Box<dyn std::error::Error>> {
+async fn rejects_internal_alpn() -> Result<(), Box<dyn std::error::Error>> {
     let temp_a = tempdir()?;
     let temp_b = tempdir()?;
     let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
@@ -652,7 +646,7 @@ async fn realm_fanout_inner() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_dht_key_id_hashing() {
+fn dht_key_hashing() {
     let key1 = DhtKeyId::from_data(b"test-key");
     let key2 = DhtKeyId::from_data(b"test-key");
     let key3 = DhtKeyId::from_data(b"different-key");
@@ -668,7 +662,7 @@ fn test_dht_key_id_hashing() {
 }
 
 #[test]
-fn test_topic_id_creation() {
+fn topic_id_creation() {
     let realm_id = RealmId::from_bytes([3u8; 32]);
     let topic1 = TopicId::realm(realm_id);
 

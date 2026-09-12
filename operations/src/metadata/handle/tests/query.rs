@@ -1,7 +1,7 @@
 use super::super::query::parse_metadata_query;
 use super::super::*;
 #[test]
-fn metadata_query_validation_allows_common_prefixes_and_rejects_unsafe_forms() {
+fn query_validation_allows() {
     parse_metadata_query("SELECT ?s WHERE { ?s a schema:Dataset }")
         .expect("common metadata prefixes are available");
     parse_metadata_query("ASK WHERE { ?s ?p ?o }").expect("ASK is supported");
@@ -23,7 +23,7 @@ fn metadata_query_validation_allows_common_prefixes_and_rejects_unsafe_forms() {
 }
 
 #[test]
-fn metadata_query_validation_rejects_oversize_input() {
+fn query_validation_rejects() {
     assert!(matches!(
         parse_metadata_query(&" ".repeat(METADATA_QUERY_MAX_BYTES + 1)),
         Err(MetadataError::InvalidInput(_))

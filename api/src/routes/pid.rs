@@ -1,7 +1,5 @@
-//! Automatic typed w3id lifecycle and landing resolution. Ordinary documents
-//! use `https://w3id.org/aruna/{document_id}`; Profiles use only
-//! `https://w3id.org/aruna/profile/{document_id}`. Every lifecycle read and
-//! transition routes to the document's single PID authority.
+//! Typed w3id lifecycle and landing resolution routed to each document's PID authority.
+//! Documents use `/aruna/{document_id}` and profiles use `/aruna/profile/{document_id}`.
 
 use std::sync::Arc;
 
@@ -20,19 +18,17 @@ use aruna_core::structs::{
     AuthContext, MetadataRegistryRecord, Permission, PersistentIdFailure, PersistentIdKind,
     PersistentIdMapping, PersistentIdProvider, PersistentIdStatus,
 };
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::forward::{
     read_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };
-use aruna_operations::metadata::get_document::load_metadata_record_by_document;
+use aruna_operations::metadata::get_document::load_document_record;
 
-use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_realm_auth,
-};
+use crate::auth::{ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::metadata::{forwarded_auth_token, map_metadata_api_error};
+use crate::metadata::{forwarded_auth_token, map_api_error};
 use crate::server_state::ServerState;
 
 #[derive(OpenApi)]
@@ -281,13 +277,9 @@ async fn require_status_visibility(
     ensure_permission(state, auth, path, Permission::READ).await
 }
 
-/// Authenticated typed status is sourced only from the durable PID mapping.
-/// `requested`, `processing`, `active`, `failed`, `admin-withdrawn` and
-/// `tombstoned` are its stored lifecycle states; failure and job fields come
-/// from that same row, never from a possibly unreadable job endpoint.
-/// `unknown` means the caller may read the document but the authority cannot
-/// currently give a definitive record. Anonymous access to a private
-/// mapping or registry row remains 404 and is not an existence oracle.
+/// Returns authenticated status and failure facts solely from the durable PID mapping.
+/// `unknown` means the authority lacks a definitive row for a readable document.
+/// Anonymous access to private mappings remains 404 and reveals no existence.
 #[utoipa::path(
     get,
     path = "/metadata/{document_id}/pids",
@@ -337,7 +329,7 @@ async fn list_persistent_ids(
 ) -> ServerResult<Json<Vec<PersistentIdView>>> {
     let document_id = Ulid::from_string(&document_id).map_err(|_| ServerError::BadRequest)?;
     let ctx = state.get_ctx();
-    let record = load_metadata_record_by_document(&ctx, document_id)
+    let record = load_document_record(&ctx, document_id)
         .await
         .map_err(|error| ServerError::InternalError(format!("{error:?}")))?;
     let routed = read_pid_routed(&ctx, state.get_realm_id(), document_id).await;
@@ -436,7 +428,7 @@ async fn withdraw_pid(
     Path(document_id): Path<String>,
     Json(request): Json<WithdrawPersistentIdRequest>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let document_id = Ulid::from_string(&document_id).map_err(|_| ServerError::BadRequest)?;
     let reason = validated_withdrawal_reason(&request)?;
     let ctx = state.get_ctx();
@@ -449,7 +441,7 @@ async fn withdraw_pid(
     .await?;
     let existing = read_pid_routed(&ctx, state.get_realm_id(), document_id)
         .await
-        .map_err(map_metadata_api_error)?
+        .map_err(map_api_error)?
         .ok_or(ServerError::NotFound)?;
     if request.confirm_pid != existing.pid {
         return Err(ServerError::BadRequest);
@@ -464,7 +456,7 @@ async fn withdraw_pid(
         forwarded_auth_token(bearer_token)?,
     )
     .await
-    .map_err(map_metadata_api_error)?;
+    .map_err(map_api_error)?;
     if mapping.status != PersistentIdStatus::AdminWithdrawn {
         return Err(ServerError::ServiceUnavailable);
     }
@@ -516,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_intent_does_not_depend_on_job_readability() {
+    fn intent_ignores_readability() {
         let id = Ulid::from_bytes([3; 16]);
         let mapping = PersistentIdMapping::requested(
             id,
@@ -542,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_withdrawal_requires_provider_confirmation_fields() {
+    fn withdrawal_requires_confirmation() {
         let valid = WithdrawPersistentIdRequest {
             provider: "w3id".to_string(),
             confirm_pid: "https://w3id.org/aruna/example".to_string(),

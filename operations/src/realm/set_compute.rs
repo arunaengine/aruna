@@ -13,8 +13,7 @@ use aruna_core::reducer::{
     AdminDocumentReducerError, AdminDocumentReducerState, REALM_CONFIG_COMPUTE_PATH,
 };
 use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::{
     Actor, AuthContext, Permission, RealmComputeConfig, RealmConfigDocument, policy_admin_path,
@@ -136,14 +135,14 @@ impl SetRealmComputeOperation {
                 ),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                 ),
             ],
             txn_id: Some(txn_id),
         })]
     }
 
-    fn emit_write_document_and_admin_state(
+    fn emit_document_write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
@@ -170,7 +169,7 @@ impl SetRealmComputeOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                aruna_core::reducer::decode_reducer_state(value.as_ref())
                     .map_err(ConversionError::from)
             })
             .transpose()?;
@@ -190,15 +189,11 @@ impl SetRealmComputeOperation {
                 compute: self.config.compute.clone(),
             },
         )?;
-        // Derive the stored configuration from the reducer's materialized state
-        // so the local write agrees with the replicated overlay: a conflicted
-        // compute path leaves the previously agreed configuration in place.
+        // Materialized reducer state keeps local and replicated compute conflict outcomes equal.
         apply_reducer_compute(&mut document, &reducer_state);
 
-        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
-            previous_reducer_state.as_ref(),
-            Some(&reducer_state),
-        );
+        let stale_conflict_deletes =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let document_target = self.document_ref();
         let placement = placement_ref_for_target(&document, &document_target, Default::default());
         let mut writes = vec![
@@ -207,7 +202,7 @@ impl SetRealmComputeOperation {
                 document_target.storage_key(),
                 document.to_bytes(&self.config.actor)?.into(),
             ),
-            admin_document_reducer_state_write_entry(&reducer_state)?,
+            reducer_state_entry(&reducer_state)?,
         ];
         let record = new_outbox_record_with_id(
             admin_event.event_id,
@@ -219,7 +214,7 @@ impl SetRealmComputeOperation {
             false,
         );
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
-        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+        writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
         self.state = SetRealmComputeState::WriteDocumentAndAdminState {
@@ -317,10 +312,9 @@ impl Operation for SetRealmComputeOperation {
                             format!("{values:?}"),
                         );
                     };
-                    match self.emit_write_document_and_admin_state(
-                        document_value.clone(),
-                        reducer_state_value.clone(),
-                    ) {
+                    match self
+                        .emit_document_write(document_value.clone(), reducer_state_value.clone())
+                    {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }
@@ -480,7 +474,7 @@ mod tests {
     /// The realm admin role only grants what the operation checks, so the
     /// permission sub-operation decides on stored rules like production does.
     async fn seed_realm_admin(ctx: &DriverContext, actor: &Actor) {
-        let mut document = RealmAuthorizationDocument::new_default_realm_doc(actor.realm_id);
+        let mut document = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
         for role in document.roles.values_mut() {
             role.assigned_users.insert(actor.user_id);
         }
@@ -610,7 +604,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let actor = actor(realm_id);
         seed(&ctx, &actor, &management_config(realm_id, &actor)).await;
-        let mut document = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let mut document = RealmAuthorizationDocument::default_realm_doc(realm_id);
         document.roles.clear();
         match ctx
             .storage_handle

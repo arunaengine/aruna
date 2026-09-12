@@ -1188,7 +1188,7 @@ impl BlobHandler {
         let prefix = stats_prefix(backend, config.bucket_prefix.as_deref());
         let start = start_after.map(|bucket| IterStart::After(stats_key(backend, bucket).into()));
         let event = tokio::time::timeout(
-            self.control_plane_io_timeout(),
+            self.io_timeout(),
             self.storage
                 .send_effect(Effect::Storage(StorageEffect::Iter {
                     key_space: BUCKET_STATS_DB.to_string(),
@@ -1287,7 +1287,7 @@ pub(super) fn build_hidden_path(
         .map_err(|_| ConversionError::OsStringError)
 }
 
-pub(super) fn build_multipart_part_path(upload_id: Ulid, part_number: u16, ulid: Ulid) -> String {
+pub(super) fn build_part_path(upload_id: Ulid, part_number: u16, ulid: Ulid) -> String {
     PathBuf::from(MULTIPART_PART_PREFIX)
         .join(upload_id.to_string())
         .join(format!("{:05}_{}", part_number, ulid))

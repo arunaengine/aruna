@@ -15,7 +15,7 @@ use utoipa_axum::routes;
 
 use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::metadata::{
+use crate::metadata::{
     ProfileValidationPreviewRequest, ProfileValidationPreviewResponse, ensure_metadata_scope,
 };
 use crate::server_state::ServerState;
@@ -25,8 +25,8 @@ use aruna_operations::device::enqueue_draft::{
     EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation,
 };
 use aruna_operations::device::inspect_draft::{InspectDraftError, InspectDraftOperation};
-use aruna_operations::device::intake::{IntakeEntry, IntakeState};
 use aruna_operations::device::list_drafts::ListDraftsOperation;
+use aruna_operations::device::publish_queue::{PublishEntry, PublishState};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::profile_validation::preview_submission;
 use aruna_operations::metadata::public_preview::restricted_files;
@@ -83,8 +83,8 @@ pub struct QueueDraftRequest {
     pub rocrate: Value,
 }
 
-impl From<IntakeEntry> for DeviceDraft {
-    fn from(entry: IntakeEntry) -> Self {
+impl From<PublishEntry> for DeviceDraft {
+    fn from(entry: PublishEntry) -> Self {
         let mut draft = Self {
             draft_id: entry.draft_id.to_string(),
             group_id: entry.group_id.to_string(),
@@ -98,7 +98,7 @@ impl From<IntakeEntry> for DeviceDraft {
             retryable: None,
         };
         match entry.state {
-            IntakeState::Pending {
+            PublishState::Pending {
                 attempts,
                 last_error,
                 ..
@@ -107,7 +107,7 @@ impl From<IntakeEntry> for DeviceDraft {
                 draft.attempts = Some(attempts);
                 draft.last_error = last_error;
             }
-            IntakeState::Publishing {
+            PublishState::Publishing {
                 document_id,
                 attempts,
                 ..
@@ -116,11 +116,11 @@ impl From<IntakeEntry> for DeviceDraft {
                 draft.document_id = Some(document_id.to_string());
                 draft.attempts = Some(attempts);
             }
-            IntakeState::Published { document_id } => {
+            PublishState::Published { document_id } => {
                 draft.status = "published".to_string();
                 draft.document_id = Some(document_id.to_string());
             }
-            IntakeState::Failed {
+            PublishState::Failed {
                 reason,
                 retryable,
                 document_id,
@@ -208,7 +208,7 @@ async fn queue_draft(
     let auth = require_owner(&state, auth).await?;
     let group_id = parse_group_id(&request.group_id)?;
     let jsonld = rocrate_jsonld(&request.rocrate)?;
-    let entry = IntakeEntry::new(
+    let entry = PublishEntry::new(
         Ulid::generate(),
         auth.user_id,
         group_id,
@@ -455,7 +455,7 @@ async fn preview_draft(
 mod tests {
     use super::{DeviceDraft, preview_draft};
     use crate::error::ServerError;
-    use crate::routes::metadata::ProfileValidationPreviewRequest;
+    use crate::metadata::ProfileValidationPreviewRequest;
     use crate::server_state::ServerState;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -464,7 +464,7 @@ mod tests {
         Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::types::UserId;
-    use aruna_operations::device::intake::{IntakeEntry, IntakeState};
+    use aruna_operations::device::publish_queue::{PublishEntry, PublishState};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
     use aruna_operations::metadata::MetadataHandle;
@@ -589,8 +589,8 @@ mod tests {
         );
     }
 
-    fn entry() -> IntakeEntry {
-        IntakeEntry::new(
+    fn entry() -> PublishEntry {
+        PublishEntry::new(
             Ulid::generate(),
             UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
             Ulid::generate(),
@@ -609,7 +609,7 @@ mod tests {
         assert_eq!(pending.status, "pending");
         assert!(pending.document_id.is_none());
 
-        source.state = IntakeState::Publishing {
+        source.state = PublishState::Publishing {
             document_id,
             due_at_ms: 0,
             attempts: 2,
@@ -621,7 +621,7 @@ mod tests {
             Some(document_id.to_string().as_str())
         );
 
-        source.state = IntakeState::Failed {
+        source.state = PublishState::Failed {
             reason: "denied".to_string(),
             retryable: false,
             document_id: None,

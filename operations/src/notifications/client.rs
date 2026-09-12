@@ -166,7 +166,7 @@ pub async fn delete_watch_remote(
     }
 }
 
-pub async fn deliver_watch_events_remote(
+pub async fn deliver_events_remote(
     net_handle: &NetHandle,
     holder: NodeId,
     events: Vec<WatchEvent>,

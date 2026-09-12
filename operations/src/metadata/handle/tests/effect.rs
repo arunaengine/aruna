@@ -1,10 +1,10 @@
-use super::auth::{auth_storage, node_id_from_seed};
+use super::auth::{auth_storage, node_id_seed};
 use super::*;
 pub(super) fn memory_handle(storage: StorageHandle) -> (TempDir, MetadataHandle) {
     let metadata_dir = tempdir().expect("metadata dir");
     let metadata_handle = MetadataHandle::new_with_options(
         metadata_dir.path(),
-        node_id_from_seed(9),
+        node_id_seed(9),
         storage,
         None,
         None,
@@ -95,14 +95,14 @@ async fn plan_needs_graph() {
 
 #[test]
 fn maps_violations() {
-    let error = metadata_error_from_craqle(CraqleError::Update(
-        craqle::UpdateError::ValidationFailed(vec![craqle::CrateViolation {
+    let error = error_from_craqle(CraqleError::Update(craqle::UpdateError::ValidationFailed(
+        vec![craqle::CrateViolation {
             code: "missing_root_data_entity",
             message: "missing root".to_string(),
             pointer: "/@graph".to_string(),
             entity_id: Some("./".to_string()),
-        }]),
-    ));
+        }],
+    )));
 
     let MetadataError::Validation(violations) = error else {
         panic!("expected structured metadata validation error");
@@ -116,7 +116,7 @@ fn maps_violations() {
 fn maps_io_failures() {
     // Infrastructure must stay distinguishable from a rejected payload: the
     // materialization queue retries the former forever and parks the latter.
-    let error = metadata_error_from_craqle(CraqleError::Io(std::io::Error::other("disk")));
+    let error = error_from_craqle(CraqleError::Io(std::io::Error::other("disk")));
 
     assert!(matches!(error, MetadataError::Persist(_)));
 }

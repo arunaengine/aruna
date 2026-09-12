@@ -10,8 +10,7 @@ use aruna_core::reducer::{
 };
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
 use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::{Actor, AuthContext, Permission, RealmConfigDocument, policy_admin_path};
 use aruna_core::task::TaskEvent;
@@ -138,7 +137,7 @@ impl SetRealmPoliciesOperation {
                 ),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                 ),
             ],
             txn_id: Some(txn_id),
@@ -174,7 +173,7 @@ impl SetRealmPoliciesOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                aruna_core::reducer::decode_reducer_state(value.as_ref())
                     .map_err(ConversionError::from)
             })
             .transpose()?;
@@ -198,10 +197,8 @@ impl SetRealmPoliciesOperation {
         // last agreed set in place instead of clobbering it with the input.
         apply_reducer_policies(&mut document, &reducer_state);
 
-        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
-            previous_reducer_state.as_ref(),
-            Some(&reducer_state),
-        );
+        let stale_conflict_deletes =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let document_target = self.document_ref();
         let placement = placement_ref_for_target(&document, &document_target, Default::default());
         let mut writes = vec![
@@ -210,7 +207,7 @@ impl SetRealmPoliciesOperation {
                 document_target.storage_key(),
                 document.to_bytes(&self.config.actor)?.into(),
             ),
-            admin_document_reducer_state_write_entry(&reducer_state)?,
+            reducer_state_entry(&reducer_state)?,
         ];
         let record = new_outbox_record_with_id(
             admin_event.event_id,
@@ -222,7 +219,7 @@ impl SetRealmPoliciesOperation {
             false,
         );
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
-        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+        writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
         self.state = SetRealmPoliciesState::WriteDocumentAndAdminState {
@@ -483,7 +480,7 @@ mod tests {
     /// Realm creation leaves the admin role unassigned, so the fixture claims it
     /// for the actor the permission sub-operation then decides on.
     async fn seed_realm_admin(context: &DriverContext, actor: &Actor) {
-        let mut document = RealmAuthorizationDocument::new_default_realm_doc(actor.realm_id);
+        let mut document = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
         for role in document.roles.values_mut() {
             role.assigned_users.insert(actor.user_id);
         }

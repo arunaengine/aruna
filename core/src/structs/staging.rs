@@ -35,7 +35,7 @@ mod tests {
     use ulid::Ulid;
 
     #[test]
-    fn portable_source_descriptor_roundtrip_preserves_payload() {
+    fn portable_source_payload() {
         let descriptor = PortableSourceDescriptor {
             kind: SourceConnectorKind::S3,
             public_config: HashMap::from([
@@ -55,7 +55,7 @@ mod tests {
     }
 
     #[test]
-    fn version_source_binding_roundtrip_preserves_strategy_and_connector_id() {
+    fn version_source_id() {
         let binding = VersionSourceBinding {
             strategy: StagingStrategy::Snapshot,
             descriptor: PortableSourceDescriptor {

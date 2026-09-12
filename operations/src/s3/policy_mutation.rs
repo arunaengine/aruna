@@ -19,7 +19,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::blob::blob_storage::HeadAliasContext;
+use crate::blob::records::HeadAliasContext;
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
 use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
@@ -326,7 +326,7 @@ mod tests {
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
 
-    use crate::blob::blob_storage::HeadAliasContext;
+    use crate::blob::records::HeadAliasContext;
     use crate::placement::policy::cache::PolicyCacheEntry;
     use crate::placement::policy::tests::fixtures::signed_document;
     use crate::s3::policy_successor::SuccessorError;

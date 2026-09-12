@@ -6,7 +6,6 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::identifiers::{BucketId, PlacementHandle, StructuredIdGenerator};
 use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
 use aruna_core::metadata::{
     METADATA_RAW_BYTES_LIMIT, MetadataCreateCrateRequest, MetadataCreateEventPayload,
@@ -15,8 +14,7 @@ use aruna_core::metadata::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
-    metadata_create_acceptance_key, metadata_create_acceptance_write_entry,
-    metadata_profile_validation_status_write_entry, raw_budget_entry,
+    create_acceptance_entry, create_acceptance_key, profile_validation_entry, raw_budget_entry,
 };
 use aruna_core::structs::{
     Actor, BindingError, DEFAULT_JOB_RETENTION_MS, DocumentClass, JobPayload, JobRecord,
@@ -24,8 +22,9 @@ use aruna_core::structs::{
     PlacementScope, PlacementStrategy, RealmConfigDocument, RealmId, WorkspaceMode, pid_dedup_key,
     shard_for_subject,
 };
+use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredIdGenerator};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, TxnId, Value};
-use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{MetaResourceId, StructuredId};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
@@ -35,12 +34,10 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::persistent_id::{mapping_revision, mapping_route_for, transition_entries};
 use crate::metadata::profile_validation::{
-    not_profiled_status, submission_has_profile_tag, validate_submission,
+    not_profiled_status, submission_profile_tag, validate_submission,
 };
-use crate::metadata::projector::schedule_pending_metadata_projection_drain;
-use crate::metadata::repository::{
-    metadata_create_event_and_pending_projection_write_entries, read_registry_by_document_effect,
-};
+use crate::metadata::projector::schedule_projection_drain;
+use crate::metadata::repository::{create_projection_entries, read_document_registry};
 use crate::placement::{
     PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
     resolve_shard_holders, strategy_for_target,
@@ -97,7 +94,7 @@ pub struct CreateMetadataDocumentOperation {
     state: CreateMetadataDocumentState,
     record: Option<MetadataRegistryRecord>,
     create_event: Option<MetadataCreateEventRecord>,
-    profile_validation_status: Option<MetadataProfileValidationStatus>,
+    route_profile_status: Option<MetadataProfileValidationStatus>,
     pending_realm_config: Option<RealmConfigDocument>,
     pending_placement: Option<PlacementRef>,
     pending_holders: Vec<NodeId>,
@@ -140,7 +137,7 @@ pub enum CreateMetadataDocumentError {
     PlacementBinding(#[from] BindingError),
     /// The structured-id generator refused to mint under a clock-health fault.
     #[error(transparent)]
-    ClockHealth(#[from] aruna_core::identifiers::ClockHealthError),
+    ClockHealth(#[from] aruna_core::structured_id::ClockHealthError),
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("operation did not finish")]
@@ -161,12 +158,12 @@ pub enum CreateMetadataDocumentError {
 
 impl CreateMetadataDocumentOperation {
     pub fn new(config: CreateMetadataDocumentConfig) -> Self {
-        let profile_validation_status = match &config.payload {
+        let route_profile_status = match &config.payload {
             CreateMetadataDocumentPayload::Scaffold { .. } => {
                 Some(not_profiled_status(config.document_id))
             }
             CreateMetadataDocumentPayload::RoCrate { jsonld }
-                if !submission_has_profile_tag(jsonld) =>
+                if !submission_profile_tag(jsonld) =>
             {
                 Some(not_profiled_status(config.document_id))
             }
@@ -181,7 +178,7 @@ impl CreateMetadataDocumentOperation {
             state: CreateMetadataDocumentState::Init,
             record: None,
             create_event: None,
-            profile_validation_status,
+            route_profile_status,
             pending_realm_config: None,
             pending_placement: None,
             pending_holders: Vec::new(),
@@ -189,7 +186,7 @@ impl CreateMetadataDocumentOperation {
         }
     }
 
-    pub fn new_for_generated_document_id(config: CreateMetadataDocumentConfig) -> Self {
+    pub fn new_generated_id(config: CreateMetadataDocumentConfig) -> Self {
         let mut operation = Self::new(config);
         operation.skip_existing_check = true;
         operation
@@ -219,7 +216,7 @@ impl CreateMetadataDocumentOperation {
             state: CreateMetadataDocumentState::Init,
             record: None,
             create_event: None,
-            profile_validation_status: self.profile_validation_status.clone(),
+            route_profile_status: self.route_profile_status.clone(),
             pending_realm_config: None,
             pending_placement: None,
             pending_holders: Vec::new(),
@@ -401,7 +398,7 @@ impl CreateMetadataDocumentOperation {
     /// The realm config joins the fence read set read-only: it is never written
     /// back, so concurrent creates stay conflict-free, while a real config change
     /// conflicts the commit and makes the retry re-choose its placement.
-    fn read_create_fence_effect(&mut self, txn_id: TxnId) -> Effects {
+    fn read_create_fence(&mut self, txn_id: TxnId) -> Effects {
         self.txn_id = Some(txn_id);
         self.state = CreateMetadataDocumentState::ReadCreateFence;
         let realm_target = DocumentSyncTarget::RealmConfig {
@@ -411,7 +408,7 @@ impl CreateMetadataDocumentOperation {
             reads: vec![
                 (
                     METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
-                    metadata_create_acceptance_key(self.config.document_id),
+                    create_acceptance_key(self.config.document_id),
                 ),
                 (
                     realm_target.storage_keyspace().to_string(),
@@ -469,14 +466,14 @@ impl CreateMetadataDocumentOperation {
         };
         match self.placement_from_id(Some(&config)) {
             Ok(placement) => match self.holder_node_ids(Some(&config), &placement) {
-                Ok(holders) => self.read_pid_fence_or_append(config, placement, holders),
+                Ok(holders) => self.ensure_pid_fence(config, placement, holders),
                 Err(error) => self.fail(error),
             },
             Err(error) => self.fail(error),
         }
     }
 
-    fn read_pid_fence_or_append(
+    fn ensure_pid_fence(
         &mut self,
         realm_config: RealmConfigDocument,
         placement: PlacementRef,
@@ -553,7 +550,7 @@ impl CreateMetadataDocumentOperation {
         }) else {
             return self.fail(CreateMetadataDocumentError::RawLimit);
         };
-        let Some(mut status) = self.profile_validation_status.clone() else {
+        let Some(mut status) = self.route_profile_status.clone() else {
             return self.fail(
                 MetadataError::Backend(
                     "profile validation status is missing before create commit".to_string(),
@@ -563,13 +560,12 @@ impl CreateMetadataDocumentOperation {
         };
         status.document_id = create_event.record.document_id;
         status.dataset_revision = create_event.event_id;
-        let writes = metadata_create_event_and_pending_projection_write_entries(&create_event)
-            .and_then(|mut writes| {
-                writes.push(raw_budget_entry(&raw_budget)?);
-                writes.push(metadata_create_acceptance_write_entry(&create_event)?);
-                writes.push(metadata_profile_validation_status_write_entry(&status)?);
-                Ok(writes)
-            });
+        let writes = create_projection_entries(&create_event).and_then(|mut writes| {
+            writes.push(raw_budget_entry(&raw_budget)?);
+            writes.push(create_acceptance_entry(&create_event)?);
+            writes.push(profile_validation_entry(&status)?);
+            Ok(writes)
+        });
         match writes.and_then(|mut writes| {
             let profile = match &self.config.payload {
                 CreateMetadataDocumentPayload::Scaffold { .. } => false,
@@ -582,7 +578,7 @@ impl CreateMetadataDocumentOperation {
                 }
             };
             let dedup_key = pid_dedup_key(create_event.record.document_id);
-            let job_id = crate::jobs::service::mint_local_job_from_config(
+            let job_id = crate::jobs::service::mint_configured_job(
                 realm_config,
                 create_event.node_id,
                 &dedup_key,
@@ -739,7 +735,7 @@ pub async fn create_metadata_document(
         let document_id = mint_local_id(context.as_ref(), &template.config).await?;
         template.config.document_id = document_id.as_ulid();
     }
-    template.profile_validation_status = Some(match &template.config.payload {
+    template.route_profile_status = Some(match &template.config.payload {
         CreateMetadataDocumentPayload::RoCrate { jsonld } => {
             validate_submission(
                 context.as_ref(),
@@ -770,12 +766,12 @@ pub async fn create_metadata_document(
             Err(error) => return Err(error),
         }
     };
-    schedule_pending_metadata_projection_drain(context.as_ref(), std::time::Duration::ZERO)
+    schedule_projection_drain(context.as_ref(), std::time::Duration::ZERO)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     if let Some(task_handle) = context.task_handle.as_ref() {
         task_handle
-            .send_effect(crate::jobs::submit::schedule_job_drain_effect())
+            .send_effect(crate::jobs::submit::schedule_materialization())
             .await;
     }
     Ok(created)
@@ -984,10 +980,7 @@ impl Operation for CreateMetadataDocumentOperation {
                         return self.start_transaction_effect();
                     }
                     self.state = CreateMetadataDocumentState::CheckExisting;
-                    smallvec![read_registry_by_document_effect(
-                        self.config.document_id,
-                        None
-                    )]
+                    smallvec![read_document_registry(self.config.document_id, None)]
                 }
                 Event::Metadata(MetadataEvent::Error { error, .. }) => {
                     self.fail_without_cleanup(error.into())
@@ -1009,7 +1002,7 @@ impl Operation for CreateMetadataDocumentOperation {
             }
             CreateMetadataDocumentState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.read_create_fence_effect(txn_id)
+                    self.read_create_fence(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail_without_cleanup(error.into())
@@ -1155,7 +1148,7 @@ mod tests {
     };
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::{
-        metadata_create_acceptance_key, metadata_event_log_prefix, metadata_pending_projection_key,
+        create_acceptance_key, event_log_prefix, pending_projection_key,
     };
     use aruna_core::structs::{
         Actor, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, JobPayload,
@@ -1238,7 +1231,7 @@ mod tests {
     ) -> Event {
         Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
-                (metadata_create_acceptance_key(document_id), None),
+                (create_acceptance_key(document_id), None),
                 (
                     actor.realm_id.as_bytes().to_vec().into(),
                     config.map(|config| {
@@ -1253,7 +1246,7 @@ mod tests {
         })
     }
 
-    fn apply_create_and_pid_fences(
+    fn apply_create_pid(
         operation: &mut CreateMetadataDocumentOperation,
         actor: &Actor,
         document_id: Ulid,
@@ -1304,7 +1297,7 @@ mod tests {
         let group_id = GroupId::generate();
         let realm_config = realm_config(&actor);
         let document_id = held_doc_id(&realm_config, &actor, group_id, "datasets/fast-create");
-        let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+        let mut operation = CreateMetadataDocumentOperation::new_generated_id(config(
             actor.clone(),
             group_id,
             document_id,
@@ -1331,8 +1324,7 @@ mod tests {
         };
         assert_eq!(*read_txn, txn_id);
 
-        let effects =
-            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
+        let effects = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
         let [
             Effect::Storage(StorageEffect::BatchWrite {
                 writes,
@@ -1413,7 +1405,7 @@ mod tests {
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (
-                    metadata_create_acceptance_key(document_id),
+                    create_acceptance_key(document_id),
                     Some(postcard::to_allocvec(&winner).unwrap().into()),
                 ),
                 (actor.realm_id.as_bytes().to_vec().into(), None),
@@ -1440,7 +1432,7 @@ mod tests {
         let actor = actor(realm_id, 11);
         let group_id = GroupId::generate();
         let document_id = Ulid::from_bytes([41; 16]);
-        let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+        let mut operation = CreateMetadataDocumentOperation::new_generated_id(config(
             actor.clone(),
             group_id,
             document_id,
@@ -1451,13 +1443,10 @@ mod tests {
         begin_transaction(&mut operation, effects.as_slice());
         operation.conflict_recheck = true;
 
-        let mut expected = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
-            actor,
-            group_id,
-            document_id,
-        ));
+        let mut expected =
+            CreateMetadataDocumentOperation::new_generated_id(config(actor, group_id, document_id));
         // The status carries its construction time; the copy keeps the original's.
-        expected.profile_validation_status = operation.profile_validation_status.clone();
+        expected.route_profile_status = operation.route_profile_status.clone();
         assert_eq!(operation.fresh_copy(), expected);
     }
 
@@ -1510,7 +1499,7 @@ mod tests {
         assert_eq!(txn_id, &None);
     }
 
-    fn assert_create_event_append(effects: &[Effect], document_id: Ulid, actor: &Actor) -> Key {
+    fn assert_create_event(effects: &[Effect], document_id: Ulid, actor: &Actor) -> Key {
         let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects else {
             panic!("expected metadata create event append");
         };
@@ -1532,7 +1521,7 @@ mod tests {
             .expect("event log write exists");
         assert!(
             key.as_ref()
-                .starts_with(metadata_event_log_prefix(document_id).as_ref())
+                .starts_with(event_log_prefix(document_id).as_ref())
         );
 
         let event: MetadataCreateEventRecord =
@@ -1574,10 +1563,10 @@ mod tests {
             .iter()
             .find(|(key_space, key, _)| {
                 key_space == METADATA_CREATE_ACCEPTANCE_KEYSPACE
-                    && key == &metadata_create_acceptance_key(document_id)
+                    && key == &create_acceptance_key(document_id)
             })
             .expect("create acceptance write exists");
-        assert_eq!(acceptance_key, &metadata_create_acceptance_key(document_id));
+        assert_eq!(acceptance_key, &create_acceptance_key(document_id));
         let accepted: MetadataCreateEventRecord =
             postcard::from_bytes(acceptance_value.as_ref()).expect("create acceptance decodes");
         assert_eq!(accepted, event);
@@ -1588,7 +1577,7 @@ mod tests {
             .expect("pending projection marker write exists");
         assert_eq!(
             marker_key,
-            &metadata_pending_projection_key(document_id, event.event_id)
+            &pending_projection_key(document_id, event.event_id)
         );
         assert!(marker_value.as_ref().is_empty());
 
@@ -1623,13 +1612,13 @@ mod tests {
     }
 
     #[test]
-    fn generated_document_id_validates_then_appends_without_existing_read() {
+    fn generated_id_validates() {
         let realm_id = RealmId([11u8; 32]);
         let actor = actor(realm_id, 6);
         let group_id = GroupId::generate();
         let realm_config = realm_config(&actor);
         let document_id = held_doc_id(&realm_config, &actor, group_id, "datasets/fast-create");
-        let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+        let mut operation = CreateMetadataDocumentOperation::new_generated_id(config(
             actor.clone(),
             group_id,
             document_id,
@@ -1640,13 +1629,12 @@ mod tests {
         let effects = operation.step(validation_result(document_id));
         let effects = begin_transaction(&mut operation, effects.as_slice());
         assert_fence_read(effects.as_slice());
-        let effects =
-            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
-        assert_create_event_append(effects.as_slice(), document_id, &actor);
+        let effects = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
+        assert_create_event(effects.as_slice(), document_id, &actor);
     }
 
     #[test]
-    fn profile_create_records_only_profile_pid() {
+    fn profile_create_records() {
         let realm_id = RealmId([12u8; 32]);
         let actor = actor(realm_id, 7);
         let group_id = GroupId::generate();
@@ -1672,13 +1660,12 @@ mod tests {
             })
             .to_string(),
         };
-        let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config);
+        let mut operation = CreateMetadataDocumentOperation::new_generated_id(config);
 
         operation.start();
         let effects = operation.step(validation_result(document_id));
         let _ = begin_transaction(&mut operation, effects.as_slice());
-        let effects =
-            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
+        let effects = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected atomic create writes");
         };
@@ -1701,18 +1688,13 @@ mod tests {
 
     #[test]
     fn config_joins_fence() {
-        // The stamped bucket decides the document's sync topic, so the config it
-        // came from must be in the commit's read set: no read precedes the
-        // transaction, and the fence read carries the realm config.
+        // The fence reads the realm config so its stamped bucket joins the commit read set.
         let realm_id = RealmId([22u8; 32]);
         let actor = actor(realm_id, 5);
         let group_id = GroupId::generate();
         let document_id = Ulid::generate();
-        let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
-            actor,
-            group_id,
-            document_id,
-        ));
+        let mut operation =
+            CreateMetadataDocumentOperation::new_generated_id(config(actor, group_id, document_id));
 
         operation.start();
         let effects = operation.step(validation_result(document_id));
@@ -1721,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn stamped_bucket_is_held() {
+    fn stamped_bucket_held() {
         // Topic membership is the holder set, so the origin can only publish a
         // create onto a bucket it holds: the stamp must land in its held set.
         let realm_id = RealmId([21u8; 32]);
@@ -1729,7 +1711,7 @@ mod tests {
         let realm_config = realm_config(&actor);
         let group_id = GroupId::generate();
         let document_id = held_doc_id(&realm_config, &actor, group_id, "datasets/fast-create");
-        let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+        let mut operation = CreateMetadataDocumentOperation::new_generated_id(config(
             actor.clone(),
             group_id,
             document_id,
@@ -1738,8 +1720,7 @@ mod tests {
         operation.start();
         let effects = operation.step(validation_result(document_id));
         begin_transaction(&mut operation, effects.as_slice());
-        let effects =
-            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
+        let effects = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected transactional create append");
         };
@@ -1773,11 +1754,8 @@ mod tests {
         // random == 1 packs handle 0 (bits 60..79): a plain, unstructured ULID.
         let document_id = Ulid::from_parts(1_700_000_000_000, 1);
         assert!(MetaResourceId::from_bytes(document_id.to_bytes()).is_err());
-        let operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
-            actor,
-            group_id,
-            document_id,
-        ));
+        let operation =
+            CreateMetadataDocumentOperation::new_generated_id(config(actor, group_id, document_id));
         assert!(matches!(
             operation.placement_from_id(Some(&realm_config)),
             Err(CreateMetadataDocumentError::PlacementBindingUnavailable(_))
@@ -1785,7 +1763,7 @@ mod tests {
     }
 
     #[test]
-    fn create_checks_existing_after_validation_and_uses_local_holder() {
+    fn create_checks_existing() {
         let realm_id = RealmId([8u8; 32]);
         let actor = actor(realm_id, 1);
         let group_id = GroupId::generate();
@@ -1804,9 +1782,8 @@ mod tests {
         }));
         let effects = begin_transaction(&mut operation, effects.as_slice());
         assert_fence_read(effects.as_slice());
-        let effects =
-            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
-        let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
+        let effects = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
+        let create_event_key = assert_create_event(effects.as_slice(), document_id, &actor);
         assert!(operation.record.as_ref().is_some_and(|record| {
             record.holder_node_ids.contains(&actor.node_id)
                 && record
@@ -1831,13 +1808,13 @@ mod tests {
     }
 
     #[test]
-    fn create_returns_after_event_append_without_persistent_effects() {
+    fn create_returns_event() {
         let realm_id = RealmId([12u8; 32]);
         let actor = actor(realm_id, 7);
         let group_id = GroupId::generate();
         let realm_config = realm_config(&actor);
         let document_id = held_doc_id(&realm_config, &actor, group_id, "datasets/fast-create");
-        let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+        let mut operation = CreateMetadataDocumentOperation::new_generated_id(config(
             actor.clone(),
             group_id,
             document_id,
@@ -1847,9 +1824,8 @@ mod tests {
         let effects = operation.step(validation_result(document_id));
         let effects = begin_transaction(&mut operation, effects.as_slice());
         assert_fence_read(effects.as_slice());
-        let effects =
-            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
-        let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
+        let effects = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
+        let create_event_key = assert_create_event(effects.as_slice(), document_id, &actor);
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: vec![(METADATA_EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
         }));
@@ -1867,7 +1843,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_failure_does_not_append_event() {
+    fn validation_rejects_append() {
         let realm_id = RealmId([13u8; 32]);
         let actor = actor(realm_id, 8);
         let group_id = GroupId::generate();
@@ -1893,7 +1869,7 @@ mod tests {
     }
 
     #[test]
-    fn create_event_append_failure_fails_without_projection_cleanup() {
+    fn append_failure_stops() {
         let realm_id = RealmId([10u8; 32]);
         let actor = actor(realm_id, 5);
         let group_id = GroupId::generate();
@@ -1910,9 +1886,8 @@ mod tests {
         }));
         let fence_read = begin_transaction(&mut operation, existing_read.as_slice());
         assert_fence_read(fence_read.as_slice());
-        let append =
-            apply_create_and_pid_fences(&mut operation, &actor, document_id, &realm_config);
-        assert_create_event_append(append.as_slice(), document_id, &actor);
+        let append = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
+        assert_create_event(append.as_slice(), document_id, &actor);
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {
             error: aruna_core::errors::StorageError::WriteError("boom".to_string()),
@@ -1930,9 +1905,8 @@ mod tests {
         );
     }
 
-    // Answers each storage effect of the create flow; the first `conflict_commits`
-    // commits fail with a conflict and the rest succeed. Returns StartTransaction
-    // count so tests can prove a retry occurred.
+    // Answers each storage effect of the create flow; the first `conflict_commits` commits
+    // fail with a conflict and the rest succeed.
     fn scripted_conflict_actor(
         receiver: EffectReceiver,
         conflict_commits: u32,
@@ -2025,11 +1999,8 @@ mod tests {
         let actor_thread = scripted_conflict_actor(receivers.foreground, 1, config_bytes);
         let context = conflict_test_context(storage, temp.path());
 
-        let operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
-            actor,
-            group_id,
-            document_id,
-        ));
+        let operation =
+            CreateMetadataDocumentOperation::new_generated_id(config(actor, group_id, document_id));
         let result = create_metadata_document(operation, context.clone()).await;
         assert!(result.is_ok(), "retry recovers conflict: {result:?}");
 
@@ -2054,11 +2025,8 @@ mod tests {
         let actor_thread = scripted_conflict_actor(receivers.foreground, u32::MAX, config_bytes);
         let context = conflict_test_context(storage, temp.path());
 
-        let operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
-            actor,
-            group_id,
-            document_id,
-        ));
+        let operation =
+            CreateMetadataDocumentOperation::new_generated_id(config(actor, group_id, document_id));
         let result = create_metadata_document(operation, context.clone()).await;
         assert!(matches!(
             result,

@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_conflicts_paused_write() {
+    async fn close_conflicts_write() {
         // A write that read the open fence and then paused must not commit
         // after the departing holder closed that generation.
         let directory = tempdir().unwrap();

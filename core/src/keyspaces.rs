@@ -398,6 +398,21 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     CRAQLE_LOG_KEYSPACE,
 ];
 
+/// Smallest key strictly greater than every key starting with `prefix`,
+/// or `None` if no such key exists (prefix is all `0xFF`).
+pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    for idx in (0..upper.len()).rev() {
+        if upper[idx] != u8::MAX {
+            upper[idx] = upper[idx].saturating_add(1);
+            upper.truncate(idx + 1);
+            return Some(upper);
+        }
+    }
+
+    None
+}
+
 /// Cleanup keyspaces record the work a finished transaction still owes, so
 /// storage must admit their writes ahead of the ordinary write queue.
 pub fn is_cleanup_keyspace(key_space: &str) -> bool {
@@ -406,11 +421,20 @@ pub fn is_cleanup_keyspace(key_space: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, is_cleanup_keyspace};
+    use super::{
+        BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, is_cleanup_keyspace, prefix_upper_bound,
+    };
 
     #[test]
     fn classifies_cleanup_keyspace() {
         assert!(is_cleanup_keyspace(BLOB_CLEANUP_KEYSPACE));
         assert!(!is_cleanup_keyspace(BLOB_LOCATIONS_KEYSPACE));
+    }
+
+    #[test]
+    fn computes_prefix_bound() {
+        assert_eq!(prefix_upper_bound(b"abc"), Some(b"abd".to_vec()));
+        assert_eq!(prefix_upper_bound(b"ab\xff"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_upper_bound(b"\xff\xff"), None);
     }
 }

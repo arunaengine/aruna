@@ -80,7 +80,7 @@ impl ListUsersOperation {
         smallvec![]
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn fail_storage(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -209,7 +209,7 @@ impl Operation for ListUsersOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.fail_storage(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn authorized_user_list_emits_iter() {
+    fn authorized_emits_iter() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let mut operation = ListUsersOperation::new(input(realm_id, 10, None));
 
@@ -319,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn filters_users_by_realm_and_returns_cursor() {
+    fn filters_realm_cursor() {
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let foreign_realm_id = RealmId::from_bytes([4u8; 32]);
         let alice = user(realm_id, 2, "alice");
@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn uses_start_after_cursor() {
+    fn uses_cursor_start() {
         let realm_id = RealmId::from_bytes([5u8; 32]);
         let start_after = user(realm_id, 6, "cursor").user_id;
         let mut operation =
@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_user_list_fails() {
+    fn unauthorized_fails() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let mut operation = ListUsersOperation::new(input(realm_id, 10, None));
         operation.start();

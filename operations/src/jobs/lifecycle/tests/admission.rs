@@ -354,9 +354,8 @@ fn absent_input() -> InputSelection {
 
 #[tokio::test]
 async fn device_skips_materialization() {
-    // A device references its inputs instead of resolving them: an object absent
-    // here still reaches forwarding, and nothing is admitted locally. The same
-    // request on a realm node is refused because that node must hold the input.
+    // A device references inputs instead of resolving them: an absent object still
+    // reaches forwarding. A realm node refuses because it must hold the input.
     let mut spec = payload();
     spec.inputs.push(absent_input());
 
@@ -401,9 +400,8 @@ async fn device_skips_materialization() {
     .await
     .expect_err("the input is not materialized here");
 
-    // The realm node resolves the input against its own objects, so it stops at
-    // the absent one instead of reaching forwarding. A definitive miss is the
-    // submitter's error, not a retryable placement failure.
+    // The realm node resolves against its own objects and stops at the absent one;
+    // a definitive miss is the submitter's error, not a retryable placement one.
     let SubmitJobError::InvalidWorkspace(reason) = refused else {
         panic!("a realm node must refuse an input it does not hold");
     };

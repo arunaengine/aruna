@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicySignEvent, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::storage_entries::{document_sync_revision_write_entry, shard_manifest_write_entry};
+use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::{
     Actor, AuthContext, Permission, PlacementPolicy, PlacementPolicyDocument, PlacementPolicyError,
     PlacementRef, PolicyAuthorityError, PolicyPublication, PolicyPublicationClaim,
@@ -23,7 +23,7 @@ use ulid::Ulid;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
 use crate::sync::document_outbox::{
-    new_outbox_record, outbox_write_entry, schedule_outbox_drain_effect,
+    new_outbox_record, outbox_write_entry, schedule_drain_effect,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -259,8 +259,8 @@ impl CreatePolicyOperation {
             target.storage_key(),
             bytes.clone().into(),
         )];
-        writes.push(document_sync_revision_write_entry(&target, &change)?);
-        if let Some(entry) = shard_manifest_write_entry(&target, &change)? {
+        writes.push(sync_revision_entry(&target, &change)?);
+        if let Some(entry) = shard_manifest_entry(&target, &change)? {
             writes.push(entry);
         }
         let record = new_outbox_record(
@@ -410,7 +410,7 @@ impl Operation for CreatePolicyOperation {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.state = CreatePolicyState::ScheduleDrain;
-                    smallvec![schedule_outbox_drain_effect()]
+                    smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;

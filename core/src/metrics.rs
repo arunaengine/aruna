@@ -1,7 +1,5 @@
-//! Per-node Prometheus metrics registry.
-//!
-//! Each node owns one [`NodeMetrics`]. The registry is instance-scoped rather
-//! than process-global so the integration harness can run several full nodes in
+//! Per-node Prometheus metrics registry. Each node owns one [`NodeMetrics`]. The registry is
+//! instance-scoped rather than process-global so the integration harness can run several full nodes in
 //! one process without their counters merging.
 
 use prometheus_client::collector::Collector;
@@ -261,7 +259,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn render_includes_builtin_metrics() {
+    async fn render_includes_metrics() {
         let metrics = NodeMetrics::new();
         metrics
             .http_requests
@@ -296,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn method_label_collapses_nonstandard_tokens() {
+    fn method_label_tokens() {
         assert_eq!(method_label("GET"), "GET");
         assert_eq!(method_label("PATCH"), "PATCH");
         assert_eq!(method_label("BREW"), "other");
@@ -304,7 +302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_started_gauge_tracks_flag() {
+    async fn node_started_flag() {
         let metrics = NodeMetrics::new();
         assert!(metrics.render().await.contains("aruna_node_started 0"));
         metrics.set_node_started(true);
@@ -312,7 +310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_registration_is_rendered() {
+    async fn late_registration_rendered() {
         let metrics = NodeMetrics::new();
         let gauge: Gauge = Gauge::default();
         gauge.set(7);
@@ -323,7 +321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notification_watch_metrics_use_bounded_reason_labels() {
+    async fn notification_watch_labels() {
         assert_eq!(
             WatchAuthorizationMetricReason::parse("token_revoked"),
             Some(WatchAuthorizationMetricReason::TokenRevoked)

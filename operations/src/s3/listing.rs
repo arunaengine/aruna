@@ -50,13 +50,13 @@ pub(crate) fn retain_after_marker<T>(
 /// Common prefixes emitted by one page, the group a resume marker already
 /// represents, and the most recently emitted group.
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct PrefixPage {
+pub(crate) struct PrefixTracker {
     prefixes: Vec<String>,
     resume: Option<String>,
     last: Option<String>,
 }
 
-impl PrefixPage {
+impl PrefixTracker {
     pub(crate) fn count(&self) -> usize {
         self.prefixes.len()
     }
@@ -106,26 +106,26 @@ pub(crate) fn split_after_marker<T>(
     }
 }
 
-/// One packed listing page: retained entries, emitted prefixes, the last
+/// One listing page: retained entries, emitted prefixes, the last
 /// emitted index and whether input entries remained.
 #[derive(Debug)]
-pub(crate) struct PackedPage<T> {
+pub(crate) struct ListingPage<T> {
     pub(crate) entries: Vec<T>,
     pub(crate) prefixes: Vec<String>,
     pub(crate) truncated: bool,
     pub(crate) last_index: Option<usize>,
 }
 
-/// Packs sorted entries into one page: consecutive entries sharing a common
-/// prefix collapse into one prefix, other entries are cloned, and `limit` caps
-/// the number of emitted entries.
-pub(crate) fn pack_page<T: Clone>(
+/// Builds one listing page from sorted entries: consecutive entries sharing a
+/// common prefix collapse into one prefix, other entries are cloned, and `limit`
+/// caps the number of emitted entries.
+pub(crate) fn build_page<T: Clone>(
     entries: &[T],
     limit: usize,
     prefix: Option<&str>,
     delimiter: Option<&str>,
     key_of: impl Fn(&T) -> &str,
-) -> PackedPage<T> {
+) -> ListingPage<T> {
     let mut kept = Vec::new();
     let mut prefixes = Vec::new();
     let mut last_index = None;
@@ -133,7 +133,7 @@ pub(crate) fn pack_page<T: Clone>(
 
     while index < entries.len() {
         if kept.len() + prefixes.len() >= limit {
-            return PackedPage {
+            return ListingPage {
                 entries: kept,
                 prefixes,
                 truncated: true,
@@ -161,7 +161,7 @@ pub(crate) fn pack_page<T: Clone>(
         }
     }
 
-    PackedPage {
+    ListingPage {
         entries: kept,
         prefixes,
         truncated: false,

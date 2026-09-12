@@ -20,7 +20,7 @@ use aruna_operations::metadata::create_document::{
     mint_local_document,
 };
 use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
-use aruna_operations::metadata::projector::project_metadata_create_events_from_log;
+use aruna_operations::metadata::projector::project_logged_events;
 use aruna_operations::node::startup::{SHARED_RESTORE_TOPIC_COUNT, restore_shard_subscriptions};
 use aruna_operations::realm::announce_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
@@ -72,11 +72,10 @@ struct OutageFixture {
     seeded: Vec<Vec<u8>>,
 }
 
-// A restart re-announces one topic per held shard plus the fixed shared topics
-// (never one per stored document), and a fresh write still converges to the
-// restarted node afterwards.
+// A restart re-announces one topic per held shard plus the fixed shared topics (never one per
+// stored document), and a fresh write still converges to the restarted node afterwards.
 #[test]
-fn restart_reannounces_held_shard_topics_not_documents() -> Result<(), BoxError> {
+fn restart_reannounces_shards() -> Result<(), BoxError> {
     let runtime = make_runtime()?;
     let result = runtime.block_on(restart_traffic_body());
     runtime.shutdown_timeout(Duration::from_secs(10));
@@ -105,7 +104,7 @@ async fn prepare_restart_state(
 ) -> Result<(Vec<TestNode>, GroupId, Vec<(GroupId, Ulid)>), BoxError> {
     let nodes = spawn_restart_nodes(realm_id, node2_dir, secret, aux).await?;
     announce_restart_nodes(&nodes, realm_id, aux).await?;
-    wait_for_realm_node_convergence(&nodes, &realm_id).await?;
+    wait_node_convergence(&nodes, &realm_id).await?;
     install_realm_config(&nodes, &realm_id).await?;
     let (group_id, created) = seed_restart_documents(realm_id, &nodes).await?;
     Ok((nodes, group_id, created))
@@ -270,10 +269,7 @@ fn make_runtime() -> Result<tokio::runtime::Runtime, BoxError> {
 }
 
 // Owns the auxiliary node-2 runtime and always tears it down off the async
-// context. Shutting a runtime down by dropping it inside an async task panics;
-// routing every drop through `spawn_blocking` means an early `?` return yields
-// the real error instead of that masking panic.
-struct AuxRuntime(Option<tokio::runtime::Runtime>);
+// context.
 
 impl AuxRuntime {
     fn new() -> Result<Self, BoxError> {
@@ -346,21 +342,19 @@ async fn run_writer(
             .map_err(|error| format!("mint failed index={index}: {error:?}"))?
             .as_ulid();
         let result = drive(
-            CreateMetadataDocumentOperation::new_for_generated_document_id(
-                CreateMetadataDocumentConfig {
-                    actor,
-                    group_id,
-                    document_id,
-                    document_path,
-                    public: true,
-                    payload: CreateMetadataDocumentPayload::Scaffold {
-                        name: format!("Restart Dataset {index}"),
-                        description: "Restart traffic document".to_string(),
-                        date_published: "2026-07-07".to_string(),
-                        license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                    },
+            CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+                actor,
+                group_id,
+                document_id,
+                document_path,
+                public: true,
+                payload: CreateMetadataDocumentPayload::Scaffold {
+                    name: format!("Restart Dataset {index}"),
+                    description: "Restart traffic document".to_string(),
+                    date_published: "2026-07-07".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 },
-            ),
+            }),
             context.as_ref(),
         )
         .await
@@ -387,7 +381,7 @@ async fn flush_projection_batches(
             continue;
         }
         let drained: Vec<(Ulid, Ulid)> = std::mem::take(batch);
-        project_metadata_create_events_from_log(targets[slot].1.as_ref(), drained)
+        project_logged_events(targets[slot].1.as_ref(), drained)
             .await
             .map_err(|error| format!("projection failed: {error:?}"))?;
     }
@@ -612,15 +606,12 @@ async fn write_config(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(config).await?;
+        node.net.refresh_document_peers(config).await?;
     }
     Ok(())
 }
 
-async fn wait_for_realm_node_convergence(
-    nodes: &[TestNode],
-    realm_id: &RealmId,
-) -> Result<(), BoxError> {
+async fn wait_node_convergence(nodes: &[TestNode], realm_id: &RealmId) -> Result<(), BoxError> {
     let expected: std::collections::HashSet<_> =
         nodes.iter().map(|node| node.net.node_id()).collect();
     wait_for_convergence("realm nodes did not converge", || async {
@@ -846,15 +837,10 @@ async fn finish_outage(
     .await?;
     let topic = outage.target.sync_topic_id(realm_id, &outage.placement);
     assert!(
-        nodes[1]
-            .net
-            .document_sync_topic_exists(topic)
-            .unwrap_or(false),
+        nodes[1].net.sync_topic_exists(topic).unwrap_or(false),
         "restored peer must retain the genesis"
     );
-    // Each restored peer runs its own restore, as every configured node does:
-    // only the designated minter creates the realm-wide topics, and the live
-    // node here is never it, so a peer that never restores strands them.
+    // Each restored peer runs its own restore, as every configured node does.
     for peer in &nodes[1..] {
         aruna_operations::node::startup::restore_shard_subscriptions(
             &peer.context,
@@ -957,8 +943,8 @@ fn incident_config(
     nodes: &[TestNode],
     strategy: &aruna_core::structs::PlacementStrategy,
 ) -> RealmConfigDocument {
-    use aruna_core::identifiers::PlacementHandle;
     use aruna_core::structs::{DocumentClass, METADATA_HANDLE, PlacementBinding, PlacementScope};
+    use aruna_core::structured_id::PlacementHandle;
 
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.default_strategy_id = Some(strategy.strategy_id);
@@ -989,7 +975,7 @@ fn incident_target(
 > {
     use aruna_core::MetaResourceId;
     use aruna_core::document::DocumentSyncTarget;
-    use aruna_core::identifiers::{BucketId, PlacementHandle};
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
 
     let placement = aruna_core::structs::PlacementRef {
         strategy_id: strategy.strategy_id,
@@ -1033,20 +1019,14 @@ fn ensure_incident_topics(
         .collect();
     nodes[1]
         .net
-        .ensure_document_sync_topics(&topics, vec![local, peer_two])?;
+        .ensure_sync_topics(&topics, vec![local, peer_two])?;
     let topic = target.sync_topic_id(realm_id, &placement);
     assert!(
-        nodes[1]
-            .net
-            .document_sync_topic_exists(topic)
-            .unwrap_or(false),
+        nodes[1].net.sync_topic_exists(topic).unwrap_or(false),
         "one peer must hold the recovery fixture genesis"
     );
     assert!(
-        !nodes[0]
-            .net
-            .document_sync_topic_exists(topic)
-            .unwrap_or(true),
+        !nodes[0].net.sync_topic_exists(topic).unwrap_or(true),
         "the live node must start without the shard genesis"
     );
     Ok(())

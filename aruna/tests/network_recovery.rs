@@ -16,8 +16,8 @@ use aruna_tasks::TaskHandle;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use shared::{
-    TestResult, create_bearer_token, create_group_via_http, create_onboarding_secret_via_http,
-    shutdown_pair, spawn_full_joiner_node, spawn_full_seed_node, wait_for_realm_nodes, wait_until,
+    TestResult, create_bearer_token, create_group_http, create_onboarding_secret,
+    shutdown_pair, spawn_complete_joiner, spawn_complete_seed, wait_realm_nodes, wait_until,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -231,11 +231,11 @@ async fn check_recovery(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn realm_outage_recovers() -> TestResult<()> {
-    let seed = spawn_full_seed_node().await?;
+    let seed = spawn_complete_seed().await?;
     let onboarding =
-        create_onboarding_secret_via_http(&seed, aruna_core::onboarding::OnboardingMode::Server)
+        create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server)
             .await?;
-    let joiner = spawn_full_joiner_node(&seed, onboarding).await?;
+    let joiner = spawn_complete_joiner(&seed, onboarding).await?;
     let result = async {
         let token = create_bearer_token(
             seed.context.as_ref(),
@@ -244,13 +244,13 @@ async fn realm_outage_recovers() -> TestResult<()> {
             seed.capabilities.clone(),
         )
         .await?;
-        wait_for_realm_nodes(
+        wait_realm_nodes(
             &[seed.context.as_ref(), joiner.context.as_ref()],
             &seed.realm_id,
             2,
         )
         .await?;
-        let group = create_group_via_http(&seed.base_url, &token, "network-recovery").await?;
+        let group = create_group_http(&seed.base_url, &token, "network-recovery").await?;
         check_healthy(&seed, &token).await?;
 
         let created = reqwest::Client::new()

@@ -55,7 +55,7 @@ mod tests {
     };
 
     #[test]
-    fn bearer_token_hash_matches_existing_blake3_hex() {
+    fn bearer_token_hex() {
         let token = "bearer-token";
         let expected = blake3::hash(b"bearer-token").to_string();
 
@@ -63,14 +63,14 @@ mod tests {
     }
 
     #[test]
-    fn credential_hash_matches_existing_blake3_hex() {
+    fn credential_hash_hex() {
         let secret = b"credential-secret";
 
         assert_eq!(credential_hash(secret), blake3::hash(secret).to_string());
     }
 
     #[test]
-    fn auth_state_keys_preserve_persisted_names() {
+    fn auth_state_names() {
         assert_eq!(TRUSTED_REALMS_LIST_KEY, b"trusted_realms_list");
     }
 

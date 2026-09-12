@@ -4,7 +4,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::{AuthContext, RealmConfigDocument, RealmId, TokenClaims};
-use aruna_core::util::unix_timestamp_secs;
+use aruna_core::time::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use base64::Engine;
@@ -43,7 +43,7 @@ pub trait ArunaBearerTokenValidationState: Sync {
         &self,
         issuer_pubkey: &str,
     ) -> Result<DecodingKey, ArunaBearerTokenError> {
-        decoding_key_from_base64_public_key(issuer_pubkey)
+        bearer_decoding_key(issuer_pubkey)
     }
 }
 
@@ -111,18 +111,18 @@ pub async fn realm_token_revoked(
     }
 }
 
-pub async fn validate_aruna_bearer_token<S>(
+pub async fn validate_bearer_token<S>(
     state: &S,
     token: &str,
 ) -> Result<AuthContext, ArunaBearerTokenError>
 where
     S: ArunaBearerTokenValidationState + ?Sized,
 {
-    let claims = decode_aruna_bearer_token(state, token).await?;
+    let claims = decode_bearer_token(state, token).await?;
     Ok(claims.try_into()?)
 }
 
-pub async fn decode_aruna_bearer_token<S>(
+pub async fn decode_bearer_token<S>(
     state: &S,
     token: &str,
 ) -> Result<TokenClaims, ArunaBearerTokenError>
@@ -146,11 +146,11 @@ where
     {
         state.issuer_decoding_key(issuer).await?
     } else {
-        decoding_key_from_base64_public_key(issuer)?
+        bearer_decoding_key(issuer)?
     };
     let claims = decode::<TokenClaims>(token, &decoding_key, &Validation::new(Algorithm::EdDSA))?;
 
-    validate_aruna_bearer_token_claims(state, &claims.claims).await?;
+    validate_bearer_claims(state, &claims.claims).await?;
 
     // The issuing realm from the verified claims, so a foreign token is judged
     // by its origin realm's revocation set and not by the serving node's.
@@ -185,7 +185,7 @@ where
     }
 }
 
-pub async fn validate_aruna_bearer_token_claims<S>(
+pub async fn validate_bearer_claims<S>(
     state: &S,
     claims: &TokenClaims,
 ) -> Result<(), ArunaBearerTokenError>
@@ -196,9 +196,7 @@ where
     if now > claims.exp {
         return Err(ArunaBearerTokenError::Expired);
     }
-    // The signed lifetime, not the remaining one: a token minted past the bound
-    // that the replicated revocation set can hold (`valid_revocation_expiry`)
-    // must never become acceptable merely by ageing. A future `iat` evades it.
+    // Judge the signed lifetime so ageing and a future `iat` cannot evade the revocation bound.
     if !valid_token_lifetime(claims.iat, claims.exp)
         || claims.iat.saturating_sub(now) > REVOCATION_GRACE_SECS
     {
@@ -220,7 +218,7 @@ fn verify_realm_delegation(
     Ok(())
 }
 
-pub fn decoding_key_from_base64_public_key(
+pub fn bearer_decoding_key(
     issuer_pubkey: &str,
 ) -> Result<DecodingKey, ArunaBearerTokenError> {
     let issuer_pubkey: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -263,10 +261,10 @@ impl Default for IssuerKeyCache {
 
 impl IssuerKeyCache {
     pub fn new() -> Self {
-        Self::with_capacity_and_ttl(ISSUER_KEY_CACHE_CAPACITY, ISSUER_KEY_CACHE_TTL)
+        Self::with_limits(ISSUER_KEY_CACHE_CAPACITY, ISSUER_KEY_CACHE_TTL)
     }
 
-    pub fn with_capacity_and_ttl(capacity: usize, ttl: Duration) -> Self {
+    pub fn with_limits(capacity: usize, ttl: Duration) -> Self {
         let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
         Self {
             entries: Mutex::new(LruCache::new(capacity)),
@@ -285,7 +283,7 @@ impl IssuerKeyCache {
             }
             entries.pop(issuer_pubkey);
         }
-        let key = decoding_key_from_base64_public_key(issuer_pubkey)?;
+        let key = bearer_decoding_key(issuer_pubkey)?;
         entries.put(
             issuer_pubkey.to_string(),
             CachedIssuerKey {
@@ -319,8 +317,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issuer_key_cache_evicts_beyond_capacity() {
-        let cache = IssuerKeyCache::with_capacity_and_ttl(2, ISSUER_KEY_CACHE_TTL);
+    async fn evicts_beyond_capacity() {
+        let cache = IssuerKeyCache::with_limits(2, ISSUER_KEY_CACHE_TTL);
         for _ in 0..5 {
             let key = generate_signing_key();
             cache.get_or_insert(&pubkey_b64(&key)).await.unwrap();
@@ -345,9 +343,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issuer_key_cache_refreshes_expired_entries() {
+    async fn refreshes_expired_entries() {
         let ttl = Duration::from_secs(3600);
-        let cache = IssuerKeyCache::with_capacity_and_ttl(4, ttl);
+        let cache = IssuerKeyCache::with_limits(4, ttl);
         let key = generate_signing_key();
         let pubkey = pubkey_b64(&key);
         cache.get_or_insert(&pubkey).await.unwrap();
@@ -365,7 +363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issuer_key_cache_rejects_invalid_pubkey() {
+    async fn rejects_invalid_pubkey() {
         let cache = IssuerKeyCache::new();
         assert!(cache.get_or_insert("not-base64!!").await.is_err());
         assert!(cache.is_empty().await);
@@ -464,11 +462,11 @@ mod tests {
         let claims = lifetime_claims(FIXED_NOW - max, FIXED_NOW + 600);
 
         assert!(matches!(
-            validate_aruna_bearer_token_claims(&state, &claims).await,
+            validate_bearer_claims(&state, &claims).await,
             Err(ArunaBearerTokenError::LifetimeTooLong)
         ));
         // A token signed within the bound still validates.
-        validate_aruna_bearer_token_claims(&state, &lifetime_claims(FIXED_NOW, FIXED_NOW + 600))
+        validate_bearer_claims(&state, &lifetime_claims(FIXED_NOW, FIXED_NOW + 600))
             .await
             .unwrap();
     }
@@ -479,7 +477,7 @@ mod tests {
         let skewed = FIXED_NOW + aruna_core::auth::REVOCATION_GRACE_SECS + 60;
 
         assert!(matches!(
-            validate_aruna_bearer_token_claims(&state, &lifetime_claims(skewed, skewed + 600))
+            validate_bearer_claims(&state, &lifetime_claims(skewed, skewed + 600))
                 .await,
             Err(ArunaBearerTokenError::LifetimeTooLong)
         ));
@@ -492,7 +490,7 @@ mod tests {
         let claims = lifetime_claims(FIXED_NOW - 1200, FIXED_NOW - 600);
 
         assert!(matches!(
-            validate_aruna_bearer_token_claims(&state, &claims).await,
+            validate_bearer_claims(&state, &claims).await,
             Err(ArunaBearerTokenError::Expired)
         ));
     }

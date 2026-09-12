@@ -11,7 +11,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::onboarding::secret_state::secret_state_write_entry;
+use crate::onboarding::secret_state::secret_state_entry;
 
 pub(crate) const SECRET_RECORD_PREFIX: &str = "secret:";
 /// Secrets one page of the outstanding-secret scan reads. The scan follows its
@@ -92,7 +92,7 @@ impl CreateOnboardingSecretOperation {
                 );
             }
         };
-        let state_entry = match secret_state_write_entry(
+        let state_entry = match secret_state_entry(
             self.input.record.enrollment_id,
             OnboardingSecretState::Available,
         ) {
@@ -533,9 +533,8 @@ mod tests {
         }
     }
 
-    // An owner's slot must be found wherever it sits in the range: the first
-    // page is full of other owners' records, so a single-page scan would miss
-    // it and hand out a device over the cap.
+    // The owner's record lies beyond a page of other owners.
+    // A single-page scan would admit a device over the cap.
     #[tokio::test]
     async fn cap_scans_pages() {
         let owner = UserId::local(Ulid::generate(), realm());

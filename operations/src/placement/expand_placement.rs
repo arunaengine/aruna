@@ -4,15 +4,15 @@
 
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{Actor, CandidatePlacementMap, RealmConfigDocument, TransitionLimits};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
 use crate::realm::get_config::GetRealmConfigOperation;
 use crate::realm::mutate_placement::{
-    MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
-    RealmPlacementMutation,
+    CONFLICT_ATTEMPTS, MutateRealmPlacementConfig, MutateRealmPlacementError,
+    MutateRealmPlacementOperation, RealmPlacementMutation,
 };
 use crate::tasks::queue_backoff::conflict_backoff;
 
@@ -68,9 +68,7 @@ pub async fn expand_realm_placement(
 ) -> Result<Vec<Ulid>, MutateRealmPlacementError> {
     let config = ensure_activated_map(context, actor).await?;
     let (next_epoch, map) = next_map(&config);
-    // The newest epoch is the durable pending expansion target when it already
-    // freezes the current view; equality never short-circuits the transition
-    // work below, or a join during an active expansion would be dropped.
+    // Reuse the durable pending view without skipping its unfinished transition work.
     let reuse = config
         .newest_map_epoch()
         .and_then(|epoch| config.candidate_map(epoch))
@@ -174,8 +172,6 @@ async fn read_config(
         .map_err(|_| MutateRealmPlacementError::RealmConfigNotFound)
 }
 
-const MUTATION_CONFLICT_RETRIES: usize = 10;
-
 /// Drives one placement mutation, re-driving on SSI conflict: the node's own
 /// reconciler submits transition steps against the same realm config document
 /// concurrently, so bounded interference is expected, not an error.
@@ -196,7 +192,7 @@ pub(crate) async fn mutate(
         .await;
         match result {
             Err(MutateRealmPlacementError::StorageError(StorageError::TransactionConflict))
-                if attempts < MUTATION_CONFLICT_RETRIES =>
+                if attempts < CONFLICT_ATTEMPTS =>
             {
                 // Retrying with no wait spends every attempt in one contention window.
                 tokio::time::sleep(conflict_backoff(attempts, actor.node_id.as_bytes())).await;

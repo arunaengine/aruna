@@ -9,7 +9,7 @@ use aruna_core::structs::{
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use crate::blob::blob_holders::GetBlobHoldersOperation;
+use crate::blob::holders::GetBlobHoldersOperation;
 use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
@@ -52,9 +52,8 @@ pub async fn stage_remote_input(
             "no known holder for input {bucket}/{key}"
         )));
     }
-    // Only the ingress endpoint owns the bucket/key/version identity. Any other
-    // holder keeps a registered copy of the same bytes, so it is asked by
-    // content hash once the exact version turns out not to be its own.
+    // Only ingress owns the bucket/key/version identity; any other holder has a
+    // registered copy, asked by content hash when the version is not its own.
     let ingress = record
         .captured_inputs
         .iter()

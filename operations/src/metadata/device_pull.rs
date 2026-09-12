@@ -12,7 +12,7 @@ use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
 use aruna_core::structs::{
     AuthContext, BlobVersion, BlobVersionState, BucketInfo, Permission, RemoteHead,
     SYNC_SOURCE_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPullAck, SyncRefusal,
-    SyncVersionPage, VersionKey, VersionedObjectArn, blob_object_permission_path,
+    SyncVersionPage, VersionKey, VersionedObjectArn, object_permission_path,
 };
 use aruna_core::types::{GroupId, NodeId};
 use tracing::{debug, warn};
@@ -193,7 +193,7 @@ async fn ensure_write(
     authorize_pull(
         context,
         auth,
-        blob_object_permission_path(
+        object_permission_path(
             auth.realm_id,
             bucket.group_id,
             node_id,
@@ -568,7 +568,7 @@ async fn ensure_read(
     authorize_pull(
         context,
         auth,
-        aruna_core::structs::blob_bucket_permission_path(auth.realm_id, group_id, node_id, bucket),
+        aruna_core::structs::bucket_permission_path(auth.realm_id, group_id, node_id, bucket),
         Permission::READ,
         "s3.ListObjectVersions",
     )
@@ -624,8 +624,7 @@ mod tests {
             user_id,
             realm_id,
         };
-        let auth_doc =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+        let auth_doc = GroupAuthorizationDocument::default_group_doc(user_id, realm_id, group_id);
         let group = Group {
             display_name: "sync".to_string(),
             group_id,
@@ -651,7 +650,7 @@ mod tests {
                     (
                         AUTH_KEYSPACE.to_string(),
                         realm_id.as_bytes().to_vec().into(),
-                        RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                        RealmAuthorizationDocument::default_realm_doc(realm_id)
                             .to_bytes(&actor)
                             .unwrap()
                             .into(),
@@ -756,9 +755,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_follows_upload() {
-        // The same device version is uploaded and then deleted: the delete must
-        // not read the upload's own version as its replay, or the realm object
-        // would stay live after the owner removed the file.
+        // A delete must not treat the preceding upload version as its own replay.
         let fixture = policy_fixture(None).await;
         let request = pull_request(true);
         let mut version = BlobVersion::materialized(
@@ -915,9 +912,7 @@ mod tests {
 
     #[test]
     fn parks_hash_mismatch() {
-        // The device's file no longer answers for the bytes the upload named, so
-        // re-reading it can only fail again: the row parks for the owner rather
-        // than retrying forever, while transport faults stay retryable.
+        // A missing source file parks the row, while transport failures remain retryable.
         assert_eq!(
             read_refusal(&BaoReadError::Refused(BaoReadRefusal::HashMismatch)),
             SyncRefusal::Invalid(

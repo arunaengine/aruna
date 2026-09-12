@@ -14,12 +14,12 @@ use crate::driver::{
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
-    METADATA_PROJECTION_RETRY_AFTER, project_metadata_create_events,
-    project_metadata_create_events_from_log, schedule_pending_metadata_projection_drain,
+    METADATA_PROJECTION_RETRY_AFTER, project_create_events, project_logged_events,
+    schedule_projection_drain,
 };
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
-use crate::node::usage_stats::refresh_realm_usage_summary_for_targets;
+use crate::node::usage_stats::refresh_usage_targets;
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
 use crate::placement::process_placements::reconcile_shard_topics;
@@ -33,9 +33,9 @@ use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::sync::document_outbox::{
-    new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
+    new_identified_record, schedule_drain_effect, write_outbox_effect,
 };
-use crate::tasks::queue_backoff::queue_retry_after_ms;
+use crate::tasks::queue_backoff::retry_after_ms;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
     DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
@@ -47,8 +47,8 @@ use aruna_core::id::NodeId;
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::{
     AuthContext, HashPathIndexKey, Permission, RealmId, ReplicationItemKind, RoCrateLimits,
-    WatchEvent, WatchEventDetail, WatchEventKind, blob_bucket_permission_path,
-    blob_object_permission_path, data_watch_resource_path,
+    WatchEvent, WatchEventDetail, WatchEventKind, bucket_permission_path, object_permission_path,
+    watch_resource_path,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
@@ -110,7 +110,7 @@ impl OperationsInboundHandler {
                 return None;
             }
         };
-        let eligible = match config.sync_eligible_node_ids() {
+        let eligible = match config.sync_eligible_nodes() {
             Ok(ids) => ids,
             Err(error) => {
                 warn!(peer = %peer, error = %error, "Failed to resolve replication peers");
@@ -160,7 +160,7 @@ async fn emit_replication_watch(
             event_id: Ulid::generate(),
             realm_id: manifest.auth_context.realm_id,
             kind: WatchEventKind::DataUploaded,
-            path: data_watch_resource_path(group_id, node_id, &manifest.bucket, &manifest.key),
+            path: watch_resource_path(group_id, node_id, &manifest.bucket, &manifest.key),
             actor: manifest.auth_context.user_id,
             occurred_at_ms,
             detail: WatchEventDetail::DataUploaded {
@@ -221,9 +221,9 @@ async fn manifest_policy(
         Err(error) => return Err(error.to_string()),
     };
     let path = if manifest.key.is_empty() {
-        blob_bucket_permission_path(local_realm, group_id, local_node, &manifest.bucket)
+        bucket_permission_path(local_realm, group_id, local_node, &manifest.bucket)
     } else {
-        blob_object_permission_path(
+        object_permission_path(
             local_realm,
             group_id,
             local_node,
@@ -295,7 +295,7 @@ async fn bao_policy(
                     Ok(Some(Err(error))) => return Err(error.to_string()),
                     Err(error) => return Err(error.to_string()),
                 };
-            let path = blob_object_permission_path(
+            let path = object_permission_path(
                 request.realm_id,
                 group_id,
                 local_node,
@@ -433,11 +433,11 @@ impl DocumentSyncReconcileCoalescer {
                     state.queued_since = None;
                     std::mem::take(&mut state.queued).into_iter().collect()
                 };
-                if reconcile_inbound_document_sync_topics(&context, batch.clone()).await {
+                if reconcile_inbound_topics(&context, batch.clone()).await {
                     failures = 0;
                 } else {
                     coalescer.trigger(context.clone(), batch);
-                    let retry_after = Duration::from_millis(queue_retry_after_ms(failures));
+                    let retry_after = Duration::from_millis(retry_after_ms(failures));
                     failures = failures.saturating_add(1);
                     sleep(retry_after).await;
                 }
@@ -502,7 +502,7 @@ fn spawn_queue_gauge(coalescer: Weak<DocumentSyncReconcileCoalescer>, shutdown: 
     });
 }
 
-async fn reconcile_inbound_document_sync_topics(
+async fn reconcile_inbound_topics(
     context: &Arc<DriverContext>,
     topics: Vec<irokle::TopicId>,
 ) -> bool {
@@ -511,7 +511,7 @@ async fn reconcile_inbound_document_sync_topics(
     };
     let run_started = Instant::now();
     let topic_count = topics.len();
-    let targets = match net_handle.reconcile_document_sync_topics(topics).await {
+    let targets = match net_handle.reconcile_sync_topics(topics).await {
         Ok(targets) => targets,
         Err(err) => {
             error!(error = ?err, "Failed to reconcile inbound document sync topics");
@@ -535,10 +535,10 @@ async fn reconcile_inbound_document_sync_topics(
         // application; the reconcile arms the SyncPlacements timer instead.
         reconcile_shard_topics(context, *net_handle.realm_id(), net_handle.node_id()).await;
     }
-    refresh_realm_usage_summary_for_targets(context, net_handle.node_id(), &targets.targets).await;
+    refresh_usage_targets(context, net_handle.node_id(), &targets.targets).await;
     refresh_watch_interest_for_targets(context, &targets.targets).await;
     let project_started = Instant::now();
-    project_inbound_metadata_create_events(context, targets).await;
+    project_inbound_events(context, targets).await;
     let project_elapsed = project_started.elapsed();
     let prune_started = Instant::now();
     process_metadata_graph_tombstones(context, metadata_graph_tombstones).await;
@@ -587,7 +587,7 @@ pub fn initialize_net_holder(
 
     net_handle.set_inbound_handler(inbound_handler.clone());
     if let Some(metadata_handle) = metadata_handle {
-        schedule_periodic_metadata_document_sync_maintenance(
+        schedule_sync_maintenance(
             context,
             Arc::downgrade(&inbound_handler.document_sync_reconcile),
             metadata_handle,
@@ -680,9 +680,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             manifest,
                                             ..
                                         }) => {
-                                            // A manifest carries its own asserted
-                                            // identity, so only infrastructure may
-                                            // ever publish one.
+                                            // Only infrastructure may publish a self-identifying manifest.
                                             if admission != BaoAdmission::Infra {
                                                 warn!(peer = %node_id, stream_id = %stream_id, "Refusing a replication manifest from a device");
                                                 close_failed_bao(&blob_handle, stream_id).await;
@@ -878,7 +876,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                             warn!(peer = %node_id, "Dropping inbound document sync stream without net handle");
                             return;
                         };
-                        match net_handle.handle_document_sync_stream(stream, node_id).await {
+                        match net_handle.handle_sync_stream(stream, node_id).await {
                             Ok(touched_topics) => {
                                 self.document_sync_reconcile
                                     .trigger(self.context.clone(), touched_topics);
@@ -1005,7 +1003,7 @@ async fn reemit_evicted_documents(
     let mut written = 0usize;
     let mut complete = true;
     for document in documents {
-        let record = new_outbox_record_with_id(
+        let record = new_identified_record(
             document.event_id,
             node_id,
             document.target,
@@ -1041,9 +1039,8 @@ async fn reemit_evicted_documents(
         warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, "Cannot schedule outbox drain for re-emitted evictions without task handle");
         return complete;
     };
-    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle
-        .send_effect(schedule_outbox_drain_effect())
-        .await
+    if let Event::Task(TaskEvent::Error { message, .. }) =
+        task_handle.send_effect(schedule_drain_effect()).await
     {
         warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, message = %message, "Failed to schedule outbox drain after re-emitting evictions");
     }
@@ -1054,18 +1051,11 @@ async fn reemit_evicted_documents(
     complete
 }
 
-async fn project_inbound_metadata_create_events(
-    context: &DriverContext,
-    reconciled: DocumentSyncReconcileResult,
-) {
+async fn project_inbound_events(context: &DriverContext, reconciled: DocumentSyncReconcileResult) {
     if !reconciled.metadata_create_events.is_empty() {
         let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
-        if let Err(error) = project_metadata_create_events(
-            context,
-            reconciled.metadata_create_events,
-            local_node_id,
-        )
-        .await
+        if let Err(error) =
+            project_create_events(context, reconciled.metadata_create_events, local_node_id).await
         {
             error!(
                 error = ?error,
@@ -1088,7 +1078,7 @@ async fn project_inbound_metadata_create_events(
         };
         targets.push((document_id, event_id));
     }
-    if let Err(error) = project_metadata_create_events_from_log(context, targets).await {
+    if let Err(error) = project_logged_events(context, targets).await {
         error!(
             error = ?error,
             "Failed to project metadata create event batch from log after inbound document sync reconciliation"
@@ -1098,14 +1088,12 @@ async fn project_inbound_metadata_create_events(
 }
 
 async fn schedule_projection_retry(context: &DriverContext) {
-    if let Err(error) =
-        schedule_pending_metadata_projection_drain(context, METADATA_PROJECTION_RETRY_AFTER).await
-    {
+    if let Err(error) = schedule_projection_drain(context, METADATA_PROJECTION_RETRY_AFTER).await {
         warn!(task_id = ?TaskKey::DrainMetadataProjectionQueue, error = ?error, "Failed to schedule metadata projection retry");
     }
 }
 
-fn schedule_periodic_metadata_document_sync_maintenance(
+fn schedule_sync_maintenance(
     context: Arc<DriverContext>,
     coalescer: Weak<DocumentSyncReconcileCoalescer>,
     metadata_handle: MetadataHandle,
@@ -1132,12 +1120,12 @@ fn schedule_periodic_metadata_document_sync_maintenance(
             };
             coalescer.trigger_all(context.clone());
             cycle = cycle.saturating_add(1);
-            run_metadata_document_sync_maintenance(&metadata_handle, "periodic", cycle).await;
+            run_sync_maintenance(&metadata_handle, "periodic", cycle).await;
         }
     });
 }
 
-async fn run_metadata_document_sync_maintenance(
+async fn run_sync_maintenance(
     metadata_handle: &MetadataHandle,
     source: &'static str,
     attempt: usize,
@@ -1244,9 +1232,7 @@ mod tests {
 
         let unknown = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let foreign = aruna_core::structs::RealmId::from_bytes([4u8; 32]);
-        // A realm node reaches the whole plane; a device reaches reads only, and
-        // only through a realm node, so it is never a replication source and
-        // never answered by another device.
+        // Devices read only through realm nodes and cannot source replication.
         assert_eq!(
             handler.bao_peer_admitted(realm_id, server, server).await,
             Some(BaoAdmission::Infra)
@@ -1283,7 +1269,7 @@ mod tests {
         let node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let group_id = Ulid::generate();
-        let path = blob_object_permission_path(realm_id, group_id, node_id, "bucket", "key");
+        let path = object_permission_path(realm_id, group_id, node_id, "bucket", "key");
         let auth_context = AuthContext {
             user_id,
             realm_id,
@@ -1462,7 +1448,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbound_projection_failure_schedules_durable_projection_retry() {
+    async fn projection_failure_retries() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
@@ -1477,7 +1463,7 @@ mod tests {
         let document_id = ulid::Ulid::generate();
         let event_id = ulid::Ulid::generate();
 
-        project_inbound_metadata_create_events(
+        project_inbound_events(
             &context,
             DocumentSyncReconcileResult {
                 targets: vec![DocumentSyncTarget::MetadataCreateEvent {
@@ -1490,13 +1476,13 @@ mod tests {
         )
         .await;
 
-        let timer = read_persisted_task_timer(&storage, &TaskKey::DrainMetadataProjectionQueue)
+        let timer = read_task_timer(&storage, &TaskKey::DrainMetadataProjectionQueue)
             .await
             .expect("projection retry timer persisted");
         assert_eq!(timer.key, TaskKey::DrainMetadataProjectionQueue);
     }
 
-    async fn read_persisted_task_timer(
+    async fn read_task_timer(
         storage: &aruna_storage::StorageHandle,
         key: &TaskKey,
     ) -> Option<PersistedTaskTimer> {

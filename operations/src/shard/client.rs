@@ -136,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_response_rejects_wrong_placement() {
+    fn response_rejects_placement() {
         let holder = node_id(1);
         let requested = placement(7);
         let received = manifest(holder, placement(8));
@@ -151,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_response_rejects_wrong_holder() {
+    fn response_rejects_holder() {
         let requested_holder = node_id(1);
         let placement = placement(7);
         let received = manifest(node_id(2), placement);

@@ -2,7 +2,7 @@ use super::harness::*;
 use super::*;
 
 #[tokio::test]
-async fn restore_document_sync_outbox_timers_schedules_drain_when_outbox_has_records() {
+async fn restore_document_records() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
@@ -19,13 +19,13 @@ async fn restore_document_sync_outbox_timers_schedules_drain_when_outbox_has_rec
     );
     write_outbox_record(&storage, &record).await;
 
-    let restored_key = restore_document_sync_outbox_timer_and_receive_key(&storage).await;
+    let restored_key = restore_document_key(&storage).await;
 
     assert_eq!(restored_key, TaskKey::DrainDocumentSyncOutbox);
 }
 
 #[tokio::test(start_paused = true)]
-async fn restore_document_sync_outbox_timers_keeps_existing_backoff_timer() {
+async fn restore_document_timer() {
     let _clock = freeze_clock();
     let temp_dir = tempdir().expect("temp dir");
     let storage =
@@ -55,10 +55,10 @@ async fn restore_document_sync_outbox_timers_keeps_existing_backoff_timer() {
         other => panic!("unexpected timer schedule event: {other:?}"),
     }
 
-    restore_document_sync_outbox_timers(&storage, &task_handle).await;
+    restore_outbox_timers(&storage, &task_handle).await;
 
     let TaskEvent::TimerScheduled { after, .. } = task_handle
-        .schedule_timer_if_idle(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
+        .schedule_idle_timer(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
         .await
     else {
         panic!("expected timer schedule event");
@@ -83,7 +83,7 @@ async fn installed_fence() {
         ..
     } = installed_setup().await;
 
-    drive_document_sync_outbox_drain(context.clone()).await;
+    drive_sync_drain(context.clone()).await;
     assert!(recv_progress(&mut completed).await);
     {
         let rotation = handler.rotation.lock().expect("rotation lock");
@@ -97,14 +97,14 @@ async fn installed_fence() {
     );
     assert!(completed.try_recv().is_err());
 
-    drive_document_sync_outbox_drain(context.clone()).await;
+    drive_sync_drain(context.clone()).await;
     assert_eq!(
         scheduled_after(&task_handle).await,
         OUTBOX_CONTINUATION_AFTER
     );
     assert!(completed.try_recv().is_err());
 
-    drive_document_sync_outbox_drain(context).await;
+    drive_sync_drain(context).await;
     assert_eq!(
         scheduled_after(&task_handle).await,
         OUTBOX_CONTINUATION_AFTER
@@ -126,7 +126,7 @@ async fn installed_continues() {
         ..
     } = installed_setup().await;
 
-    drive_document_sync_outbox_drain(context).await;
+    drive_sync_drain(context).await;
     assert!(recv_progress(&mut completed).await);
     // Tokio rounds a timer deadline up to the next millisecond, so the clock
     // has to pass the interval rather than land exactly on it.
@@ -178,7 +178,7 @@ async fn drain_keeps_timer() {
         other => panic!("unexpected timer schedule event: {other:?}"),
     }
 
-    drive_document_sync_outbox_drain(Arc::new(DriverContext {
+    drive_sync_drain(Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
@@ -195,7 +195,7 @@ async fn drain_keeps_timer() {
         "the direct fence must not replace the active timer"
     );
     let TaskEvent::TimerScheduled { after, .. } = task_handle
-        .schedule_timer_if_idle(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
+        .schedule_idle_timer(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
         .await
     else {
         panic!("expected timer schedule event");
@@ -204,7 +204,7 @@ async fn drain_keeps_timer() {
 }
 
 #[tokio::test]
-async fn outbox_sync_error_retains_record_for_retry() {
+async fn outbox_sync_retry() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
@@ -233,7 +233,7 @@ async fn outbox_sync_error_retains_record_for_retry() {
     write_outbox_record(&storage, &record).await;
 
     let outcome = handler
-        .finish_sync_drain_subbatch(
+        .finish_sync_batch(
             &TaskKey::DrainDocumentSyncOutbox,
             vec![key.clone()],
             Vec::new(),
@@ -253,7 +253,7 @@ async fn outbox_sync_error_retains_record_for_retry() {
 }
 
 #[tokio::test]
-async fn retained_outbox_record_after_sync_failure_restores_drain_timer() {
+async fn retained_outbox_timer() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
@@ -281,7 +281,7 @@ async fn retained_outbox_record_after_sync_failure_restores_drain_timer() {
     write_outbox_record(&storage, &record).await;
 
     let outcome = handler
-        .finish_sync_drain_subbatch(
+        .finish_sync_batch(
             &TaskKey::DrainDocumentSyncOutbox,
             vec![key.clone()],
             Vec::new(),
@@ -300,12 +300,12 @@ async fn retained_outbox_record_after_sync_failure_restores_drain_timer() {
         Some(record)
     );
 
-    let restored_key = restore_document_sync_outbox_timer_and_receive_key(&storage).await;
+    let restored_key = restore_document_key(&storage).await;
     assert_eq!(restored_key, TaskKey::DrainDocumentSyncOutbox);
 }
 
 #[tokio::test]
-async fn tombstones_are_processed_before_projection_retry_return() {
+async fn tombstones_are_return() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
@@ -328,7 +328,7 @@ async fn tombstones_are_processed_before_projection_retry_return() {
     );
 
     let outcome = handler
-        .finish_sync_drain_subbatch(
+        .finish_sync_batch(
             &TaskKey::DrainDocumentSyncOutbox,
             Vec::new(),
             Vec::new(),
@@ -348,7 +348,7 @@ async fn tombstones_are_processed_before_projection_retry_return() {
         .await;
 
     assert!(outcome.retry_needed);
-    let jobs = read_graph_prune_jobs(&storage).await;
+    let jobs = read_graph_jobs(&storage).await;
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].graph_iri, tombstone.graph_iri);
 }
@@ -383,7 +383,7 @@ async fn drain_reconcile_wakes() {
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
     let outcome = handler
-        .finish_sync_drain_subbatch(
+        .finish_sync_batch(
             &TaskKey::DrainDocumentSyncOutbox,
             Vec::new(),
             vec![DocumentSyncTarget::RealmConfig { realm_id }],
@@ -409,11 +409,11 @@ async fn drain_reconcile_wakes() {
 }
 
 #[tokio::test]
-async fn drain_reconcile_refreshes_realm_usage_summary() {
+async fn drain_reconcile_summary() {
     use aruna_core::keyspaces::{USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
     use aruna_core::structs::{
-        NODE_USAGE_SUMMARY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, node_usage_global_key,
-        usage_global_shard_key,
+        NODE_USAGE_SUMMARY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, global_shard_key,
+        usage_global_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 
@@ -460,7 +460,7 @@ async fn drain_reconcile_refreshes_realm_usage_summary() {
     write_stat(
         &storage,
         USAGE_STATS_KEYSPACE,
-        usage_global_shard_key(0),
+        global_shard_key(0),
         UsageCounters {
             logical_bytes: 10,
             ..Default::default()
@@ -472,7 +472,7 @@ async fn drain_reconcile_refreshes_realm_usage_summary() {
     write_stat(
         &storage,
         USAGE_NODE_STATS_KEYSPACE,
-        node_usage_global_key(remote),
+        usage_global_key(remote),
         NodeUsageSnapshot {
             node_id: remote,
             counters: UsageCounters {
@@ -496,7 +496,7 @@ async fn drain_reconcile_refreshes_realm_usage_summary() {
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
     let outcome = handler
-        .finish_sync_drain_subbatch(
+        .finish_sync_batch(
             &TaskKey::DrainDocumentSyncOutbox,
             Vec::new(),
             Vec::new(),
@@ -540,7 +540,7 @@ async fn drain_reconcile_refreshes_realm_usage_summary() {
 }
 
 #[tokio::test]
-async fn drain_reconcile_clears_realm_usage_summary_for_requested_realm_config() {
+async fn drain_reconcile_config() {
     use aruna_core::keyspaces::USAGE_NODE_STATS_KEYSPACE;
     use aruna_core::structs::{NODE_USAGE_SUMMARY_GLOBAL_KEY, UsageCounters};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -591,7 +591,7 @@ async fn drain_reconcile_clears_realm_usage_summary_for_requested_realm_config()
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
     let outcome = handler
-        .finish_sync_drain_subbatch(
+        .finish_sync_batch(
             &TaskKey::DrainDocumentSyncOutbox,
             Vec::new(),
             vec![DocumentSyncTarget::RealmConfig { realm_id }],
@@ -623,16 +623,14 @@ async fn drain_reconcile_clears_realm_usage_summary_for_requested_realm_config()
     net.shutdown().await;
 }
 
-async fn restore_document_sync_outbox_timer_and_receive_key(
-    storage: &aruna_storage::StorageHandle,
-) -> TaskKey {
+async fn restore_document_key(storage: &aruna_storage::StorageHandle) -> TaskKey {
     let task_handle = TaskHandle::new();
     let (seen_tx, mut seen_rx) = mpsc::channel(1);
     task_handle
         .set_inbound_handler(Arc::new(RecordingTaskHandler { seen: seen_tx }))
         .await;
 
-    restore_document_sync_outbox_timers(storage, &task_handle).await;
+    restore_outbox_timers(storage, &task_handle).await;
 
     tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
         .await

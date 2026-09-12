@@ -11,7 +11,6 @@ use aruna_core::compute::{
     LogTails, NOBODY, ReconcileEvidence, TaskInput, TaskOutput, TaskSpec, UserSpec,
 };
 use aruna_core::effects::StorageEffect;
-use aruna_core::identifiers::{BucketId, PlacementHandle};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
@@ -21,8 +20,9 @@ use aruna_core::structs::{
     OutputDestination, OutputSelection, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     RoutingSnapshot, WorkspaceMode, checksum::HASH_BLAKE3,
 };
+use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, NodeId};
-use aruna_core::util::unix_timestamp_millis;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::store::{insert_job, record_attempt_intent, reserve_output_commits};
@@ -318,8 +318,8 @@ async fn seed_auth(harness: &Harness) {
         user_id: harness.created_by,
         realm_id: harness.realm_id,
     };
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(harness.realm_id);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(harness.realm_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(
         harness.created_by,
         harness.realm_id,
         harness.group_id,

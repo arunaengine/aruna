@@ -1,4 +1,4 @@
-use super::auth::{auth_storage, node_id_from_seed};
+use super::auth::{auth_storage, node_id_seed};
 use super::effect::memory_handle;
 use super::visibility::{group_record, registry_record};
 use super::*;
@@ -15,8 +15,7 @@ async fn store_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, B
     }
 }
 fn registry_entries(record: &MetadataRegistryRecord) -> Vec<(String, ByteView, ByteView)> {
-    aruna_core::storage_entries::metadata_registry_write_entries(record)
-        .expect("registry entries encode")
+    aruna_core::storage_entries::registry_write_entries(record).expect("registry entries encode")
 }
 #[tokio::test]
 async fn group_records_live() {
@@ -34,8 +33,7 @@ async fn group_records_live() {
     let mut writes = registry_entries(&live);
     writes.extend(registry_entries(&gone));
     writes.push(
-        aruna_core::storage_entries::metadata_graph_lifecycle_write_entry(&tombstone)
-            .expect("tombstone encodes"),
+        aruna_core::storage_entries::graph_lifecycle_entry(&tombstone).expect("tombstone encodes"),
     );
     store_entries(&storage, writes).await;
     let (_metadata_dir, handle) = memory_handle(storage);
@@ -82,7 +80,7 @@ async fn tombstone_blocks_apply() {
     let metadata_dir = tempdir().expect("metadata dir");
     let metadata_handle = MetadataHandle::new_with_options(
         metadata_dir.path(),
-        node_id_from_seed(3),
+        node_id_seed(3),
         storage.clone(),
         None,
         None,
@@ -129,7 +127,7 @@ async fn tombstone_blocks_apply() {
     match storage
         .send_storage_effect(StorageEffect::Write {
             key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_graph_lifecycle_key(&record.graph_iri),
+            key: graph_lifecycle_key(&record.graph_iri),
             value: ByteView::from(bytes),
             txn_id: None,
         })
@@ -157,7 +155,7 @@ async fn tombstone_blocks_apply() {
     );
 }
 #[tokio::test]
-async fn flush_persistence_succeeds_with_configured_document_sync_database() {
+async fn flush_with_sync() {
     let (_storage_dir, storage) = auth_storage();
     let metadata_dir = tempdir().expect("metadata dir");
     let document_sync_dir = tempdir().expect("document sync dir");
@@ -172,14 +170,14 @@ async fn flush_persistence_succeeds_with_configured_document_sync_database() {
     .expect("document sync db opens");
     let metadata_handle = MetadataHandle::new_with_options(
         metadata_dir.path(),
-        node_id_from_seed(2),
+        node_id_seed(2),
         storage,
         None,
         None,
         Some(document_sync_db),
         MetadataHandleOptions::default()
             .with_search_storage(MetadataSearchStorage::Memory)
-            .with_document_sync_persist_policy(FjallPersistPolicy::SyncAll),
+            .with_sync_policy(FjallPersistPolicy::SyncAll),
     )
     .expect("metadata handle opens");
 

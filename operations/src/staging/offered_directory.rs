@@ -2,8 +2,8 @@
 //! Objects are reference versions bound to the device-local registration, not a
 //! path; writes are refused and files change only on the owner's filesystem.
 
-use crate::blob::blob_storage::{
-    HeadAliasContext, build_head_transition_effects, write_blob_version_effect,
+use crate::blob::records::{
+    HeadAliasContext, build_transition_effects, write_version_effect,
 };
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
@@ -143,9 +143,7 @@ pub async fn offer_directory(
     input: OfferDirectoryInput,
 ) -> Result<OfferDirectoryResult, OfferedDirectoryError> {
     check_root(context, &input.root).await?;
-    // The whole walk happens before anything is written, so an offer over the
-    // file cap is refused whole instead of leaving a bucket and half an
-    // inventory behind.
+    // Finish the walk before writes so exceeding the cap cannot leave a partial inventory.
     let entries = walk_root(context, &input.root).await?;
     register_bucket(context, &input).await?;
 
@@ -369,7 +367,7 @@ async fn send_source_effect(
         .blob_handle
         .as_ref()
         .ok_or(OfferedDirectoryError::HandleMissing)?;
-    match blob_handle.send_staging_source_effect(effect).await {
+    match blob_handle.send_staging_effect(effect).await {
         Event::StagingSource(event) => Ok(event),
         _ => Err(StagingSourceError::InvalidEffect.into()),
     }
@@ -482,7 +480,7 @@ async fn observe(
     let version_id = Ulid::generate();
     let now = SystemTime::now();
     let next = CurrentVersionPointer::next_for(pointer.as_ref(), version_id)?;
-    for effect in build_head_transition_effects(
+    for effect in build_transition_effects(
         &HeadAliasContext::new(
             input.realm_id,
             input.group_id,
@@ -498,7 +496,7 @@ async fn observe(
     }
     apply(
         context,
-        write_blob_version_effect(
+        write_version_effect(
             &VersionKey::new(&input.bucket, &entry.path, version_id),
             &BlobVersion::reference(binding.clone(), metadata.clone(), now, input.user_id, now),
             Some(txn_id),
@@ -506,9 +504,7 @@ async fn observe(
     )
     .await?;
 
-    // An offered bucket charges what it currently offers: the observation this
-    // one replaces describes content the file no longer has, so its bytes are
-    // released instead of staying charged.
+    // Charge the current observation and release bytes from the replaced content.
     let live = existing.filter(|version| !version.is_deleted());
     let mut usage = UsageCounterUpdate::for_group(
         input.group_id,
@@ -637,7 +633,7 @@ async fn tombstone(
     let version_id = Ulid::generate();
     let now = SystemTime::now();
     let next = CurrentVersionPointer::next_for(pointer.as_ref(), version_id)?;
-    for effect in build_head_transition_effects(
+    for effect in build_transition_effects(
         &HeadAliasContext::new(
             scope.realm_id,
             scope.group_id,
@@ -653,7 +649,7 @@ async fn tombstone(
     }
     apply(
         context,
-        write_blob_version_effect(
+        write_version_effect(
             &VersionKey::new(&scope.bucket, key, version_id),
             &BlobVersion::deleted(now, scope.user_id),
             Some(txn_id),

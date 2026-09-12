@@ -1,9 +1,7 @@
 use crate::NodeId;
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained};
 use crate::errors::ConversionError;
-use crate::identifiers::{PlacementHandle, StructuredId};
 use crate::reducer::{AdminDocumentReducerState, RevocationIndex};
-use crate::structs::structs::{Permission, Role};
 use crate::structs::{
     Actor, BandPool, BindingDirectory, BindingError, BindingScope, CandidateMapNode,
     CandidatePlacementMap, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT,
@@ -13,6 +11,8 @@ use crate::structs::{
     PlacementTransition, SHARD_SUBJECT_LEN, StrategyBinding, SubmissionId, band_start,
     shard_for_subject,
 };
+use crate::structs::{Permission, Role};
+use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
@@ -59,7 +59,7 @@ impl RealmId {
         Ok(Self(arr))
     }
 
-    pub fn to_pkcs8_pem_bytes(&self) -> Result<[u8; 113], ConversionError> {
+    pub fn pkcs8_pem_bytes(&self) -> Result<[u8; 113], ConversionError> {
         let verifiying_key = VerifyingKey::from_bytes(&self.0)?;
         let pkcs8 = verifiying_key.to_public_key_pem(LineEnding::default())?;
         Ok(pkcs8.as_bytes().try_into()?)
@@ -123,7 +123,7 @@ impl std::fmt::Display for RealmLevelOperation {
 }
 
 impl RealmAuthorizationDocument {
-    pub fn new_default_realm_doc(realm_id: RealmId) -> Self {
+    pub fn default_realm_doc(realm_id: RealmId) -> Self {
         let mut roles = HashMap::new();
         let admin = Ulid::generate();
         roles.insert(
@@ -268,11 +268,10 @@ impl QuotaConfig {
             .unwrap_or(self.max_groups_per_user)
     }
 
-    /// Resolves the effective pre-grace quota (in bytes) for a group: the group
-    /// override's `quota_bytes` when an override exists (an override with
-    /// `quota_bytes: None` makes the group explicitly unlimited), else
-    /// the realm `default_group_quota_bytes`. `None` means unlimited.
-    pub fn effective_group_quota_bytes(&self, group_id: &GroupId) -> Option<u64> {
+    /// Resolves the effective pre-grace quota (in bytes) for a group: the group override's `quota_bytes`
+    /// when an override exists (an override with `quota_bytes: None` makes the group explicitly unlimited),
+    /// else the realm `default_group_quota_bytes`. `None` means unlimited.
+    pub fn group_quota_bytes(&self, group_id: &GroupId) -> Option<u64> {
         match self
             .group_overrides
             .iter()
@@ -283,19 +282,14 @@ impl QuotaConfig {
         }
     }
 
-    /// Resolves the hard ceiling (in bytes) a group's realm-wide `logical_bytes`
-    /// may reach before writes are rejected: the effective quota
-    /// (`effective_group_quota_bytes`) scaled by the effective grace factor (group
-    /// override if present, else the global `grace_factor_percent`). Returns
-    /// `None` when no quota applies (an existing override with `quota_bytes: None`,
-    /// or no override and no `default_group_quota_bytes`), i.e. the group is
-    /// unlimited and no gate is enforced.
+    /// Returns the effective group quota scaled by its group or global grace factor.
+    /// `None` means the applicable override or realm default leaves the group unlimited.
     pub fn effective_group_ceiling(&self, group_id: &GroupId) -> Option<u64> {
         let over = self
             .group_overrides
             .iter()
             .find(|over| over.group_id == *group_id);
-        let quota = self.effective_group_quota_bytes(group_id)?;
+        let quota = self.group_quota_bytes(group_id)?;
         let grace = over
             .and_then(|over| over.grace_factor_percent)
             .unwrap_or(self.grace_factor_percent);
@@ -352,10 +346,9 @@ pub enum RealmNodeKind {
 }
 
 impl RealmNodeKind {
-    /// Whether nodes of this kind carry shared realm responsibilities: holder
-    /// and placement membership, sync publication and relay, administrative
-    /// event origination, routing and distributed-query targeting. A User node
-    /// has none of them, whoever owns it.
+    /// Whether nodes of this kind carry shared realm responsibilities: holder and placement membership,
+    /// sync publication and relay, administrative event origination, routing and distributed-query
+    /// targeting. A User node has none of them, whoever owns it.
     pub fn is_sync_eligible(&self) -> bool {
         !matches!(self, RealmNodeKind::User { .. })
     }
@@ -395,7 +388,7 @@ pub struct RealmEndpointAnnouncement {
     pub signature: iroh::Signature,
 }
 
-pub fn realm_endpoint_announcement_signing_bytes(
+pub fn endpoint_signing_bytes(
     realm_id: &RealmId,
     node_id: &NodeId,
     endpoint_addr: &iroh::EndpointAddr,
@@ -436,12 +429,8 @@ impl RealmConfigDocument {
         sort_canonical(&mut canonical.placement_handle_ranges)?;
         sort_canonical(&mut canonical.band_pools)?;
         sort_canonical(&mut canonical.placement_activations)?;
-        // Transitions are excluded for the same reason as revocations: their
-        // barrier and proof sets converge independently, and only the
-        // activation they advance changes where a request routes. Candidate
-        // maps an activation references are retained: holders depend on their
-        // contents, so a divergent same-epoch map must break digest agreement.
-        // Unreferenced maps stay excluded because pruning is a per-node moment.
+        // Exclude transition proofs because only activations affect routing. Retain referenced candidate
+        // maps because holders depend on them; unreferenced maps prune independently per node.
         canonical.placement_transitions.clear();
         let referenced: std::collections::BTreeSet<u64> = canonical
             .placement_activations
@@ -452,14 +441,12 @@ impl RealmConfigDocument {
             .candidate_maps
             .retain(|map| referenced.contains(&map.epoch));
         sort_canonical(&mut canonical.candidate_maps)?;
-        // Revocations are excluded: the digest binds routing agreement between
-        // nodes, and a deny-list that converges independently would otherwise
-        // make every revocation reject forwarded requests until it replicated.
+        // Exclude independently converging revocations from routing digests, or each revocation would reject
+        // forwarded requests until it replicated.
         canonical.revoked_tokens.clear();
         canonical.revocation_floor = 0;
-        // Request policies are excluded for the same reason: they never change
-        // where a request routes, the receiving node enforces its own set on
-        // arrival, and nodes that hold no realm-config bucket never see them.
+        // Exclude request policies because they do not route requests; each receiver enforces its local set,
+        // and nodes without a realm-config bucket may never observe them.
         canonical.request_policies.clear();
         let encoded = postcard::to_allocvec(&canonical)?;
         let mut hasher = blake3::Hasher::new();
@@ -477,7 +464,7 @@ impl RealmConfigDocument {
             realm_id,
             metadata_replication: MetadataReplicationConfig::new(default_replication_factor),
             oidc_providers,
-            discovery: default_realm_discovery_config(),
+            discovery: default_discovery_config(),
             nodes: Vec::new(),
             quota: QuotaConfig::default(),
             description: String::new(),
@@ -508,20 +495,8 @@ impl RealmConfigDocument {
         )
     }
 
-    /// Seeds the default placement strategies realm creation installs: a
-    /// `default` strategy using the configured metadata replication factor (the
-    /// realm default) plus an `everywhere` strategy bound to the control-document
-    /// classes. Replaces any existing strategy configuration.
-    ///
-    /// Group, user and metadata-registry documents are bound to `everywhere`
-    /// (`replica_count: None`, i.e. every sync-eligible node) rather than to the
-    /// capped default. They are control documents (O(groups + users), not
-    /// O(documents)), and the permission system structurally requires them
-    /// locally: `CheckPermissionsOperation` reads the group authorization
-    /// document from the local `AUTH_KEYSPACE` and hard-fails when it is absent,
-    /// so a node outside a group's replica set could not authorize any request
-    /// touching that group. `DocumentClass::Group` covers the group document and
-    /// its authorization document alike (see `placement::document_class`).
+    /// Installs `default` metadata replication and `everywhere` control-document strategies.
+    /// Control documents stay local everywhere because permission checks require local authorization data.
     pub fn seed_default_placement(&mut self) {
         let default_strategy = PlacementStrategy {
             strategy_id: Ulid::generate(),
@@ -539,9 +514,8 @@ impl RealmConfigDocument {
             affinity: Vec::new(),
             shard_count: DEFAULT_SHARD_COUNT,
         };
-        // Submission families route through their own strategy for the life of
-        // the realm, so ordinary default-strategy administration stays free
-        // while this identity and its shard count are fenced as immutable.
+        // Submission families retain their dedicated immutable strategy and shard count, leaving ordinary
+        // default-strategy administration independent.
         let job_family_strategy = PlacementStrategy {
             strategy_id: Ulid::generate(),
             name: "job-family".to_string(),
@@ -612,11 +586,11 @@ impl RealmConfigDocument {
         handle
     }
 
-    pub fn metadata_replication_factor_for(&self, group_id: GroupId, path: Option<&str>) -> usize {
+    pub fn replication_factor_for(&self, group_id: GroupId, path: Option<&str>) -> usize {
         self.metadata_replication.factor_for(group_id, path)
     }
 
-    pub fn effective_default_metadata_replication_factor(&self) -> Option<u32> {
+    pub fn effective_replication_factor(&self) -> Option<u32> {
         let strategy = match self.default_strategy_id {
             Some(strategy_id) => self.strategy(&strategy_id),
             None => self.strategies.first(),
@@ -701,7 +675,7 @@ impl RealmConfigDocument {
 
     /// Node ids eligible as sync peers / document holders (excludes User
     /// kind nodes).
-    pub fn sync_eligible_node_ids(&self) -> Result<Vec<NodeId>, ConversionError> {
+    pub fn sync_eligible_nodes(&self) -> Result<Vec<NodeId>, ConversionError> {
         self.nodes
             .iter()
             .filter(|node| node.kind.is_sync_eligible())
@@ -794,10 +768,9 @@ impl RealmConfigDocument {
         })
     }
 
-    /// Eligible-node view derived from the live config: one entry per node with
-    /// a parseable id, `placement_map` fields defaulted, and the derived kind
-    /// label overlaying entry labels (it always wins). This is what a published
-    /// candidate map freezes.
+    /// Eligible-node view derived from the live config: one entry per node with a parseable id,
+    /// `placement_map` fields defaulted, and the derived kind label overlaying entry labels (it always
+    /// wins). This is what a published candidate map freezes.
     pub fn candidate_nodes(&self) -> Vec<CandidateMapNode> {
         let mut nodes = Vec::with_capacity(self.nodes.len());
         for realm_node in &self.nodes {
@@ -835,17 +808,8 @@ impl RealmConfigDocument {
         nodes
     }
 
-    /// Freezes the current view as the next candidate map epoch and activates
-    /// it for every bucket that has no activation yet. Already activated
-    /// buckets keep their epoch: only a transition moves those.
-    ///
-    /// The activations this writes are literal document values. A production
-    /// caller MUST pair it with a reduced `PublishCandidateMap` plus
-    /// `InitializeActivations`, or the buckets can never advance: the reducer
-    /// re-derives activations only for strategies it owns a path for.
-    /// Freezes the current view, strategy selectors, and shard overrides into
-    /// a candidate map at `epoch`. The single constructor for published maps,
-    /// so snapshot and expansion can never freeze different inputs.
+    /// Freezes selectors and shard overrides into the next candidate map, initializing only new
+    /// buckets. Callers must publish the map and initialization together so reducers can advance them.
     pub fn freeze_map(&self, epoch: u64) -> CandidatePlacementMap {
         CandidatePlacementMap {
             epoch,
@@ -1042,7 +1006,7 @@ fn sort_canonical<T: Serialize>(values: &mut Vec<T>) -> Result<(), ConversionErr
     Ok(())
 }
 
-pub fn default_realm_discovery_config() -> RealmDiscoveryConfig {
+pub fn default_discovery_config() -> RealmDiscoveryConfig {
     RealmDiscoveryConfig::Dynamic {
         methods: vec![
             DynamicDiscoveryMethod::IrohDns {
@@ -1127,8 +1091,8 @@ mod test {
         KIND_LABEL_KEY, MetadataGroupReplicationOverride, MetadataPathReplicationOverride,
         NODE_LABEL_KEY, OidcProviderConfig, PlacementOverride, PlacementRef, PlacementStrategy,
         RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, StrategyBinding, SubmissionId, TokenRevocation,
-        default_realm_discovery_config, shard_for_subject,
+        RealmNodeKind, StrategyBinding, SubmissionId, TokenRevocation, default_discovery_config,
+        shard_for_subject,
     };
     use crate::types::UserId;
     use ulid::Ulid;
@@ -1136,8 +1100,8 @@ mod test {
     use super::JobFamilyError;
 
     #[test]
-    pub fn test_realm_auth_doc_conversion() {
-        let auth_doc = RealmAuthorizationDocument::new_default_realm_doc(RealmId([0u8; 32]));
+    pub fn realm_auth_roundtrip() {
+        let auth_doc = RealmAuthorizationDocument::default_realm_doc(RealmId([0u8; 32]));
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
             user_id: crate::UserId::new(Ulid::generate(), RealmId([0u8; 32])),
@@ -1155,7 +1119,7 @@ mod test {
     }
 
     #[test]
-    pub fn test_realm_config_doc_roundtrip() {
+    pub fn realm_config_roundtrip() {
         let group_id = Ulid::generate();
         let document = RealmConfigDocument {
             realm_id: RealmId([4u8; 32]),
@@ -1178,7 +1142,7 @@ mod test {
                 discovery_url: "https://issuer.example/.well-known/openid-configuration"
                     .to_string(),
             }],
-            discovery: default_realm_discovery_config(),
+            discovery: default_discovery_config(),
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
             request_policies: Vec::new(),
@@ -1490,7 +1454,7 @@ mod test {
     }
 
     #[test]
-    fn snapshot_freezes_the_view() {
+    fn snapshot_freezes_view() {
         use crate::structs::NodePlacementEntry;
 
         fn node_id(seed: u8) -> NodeId {
@@ -1634,7 +1598,7 @@ mod test {
     }
 
     #[test]
-    fn effective_group_ceiling_resolves_override_and_grace() {
+    fn group_ceiling_grace() {
         let group = Ulid::from_bytes([1u8; 16]);
         let other = Ulid::from_bytes([2u8; 16]);
         let quota = super::QuotaConfig {
@@ -1694,7 +1658,7 @@ mod test {
     }
 
     #[test]
-    pub fn test_realm_config_replication_resolution() {
+    pub fn replication_resolution() {
         let group_id = Ulid::generate();
         let other_group_id = Ulid::generate();
         let document = RealmConfigDocument {
@@ -1719,7 +1683,7 @@ mod test {
                 ],
             },
             oidc_providers: vec![],
-            discovery: default_realm_discovery_config(),
+            discovery: default_discovery_config(),
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
             request_policies: Vec::new(),
@@ -1741,23 +1705,20 @@ mod test {
             placement_transitions: Vec::new(),
         };
 
+        assert_eq!(document.replication_factor_for(other_group_id, None), 3);
+        assert_eq!(document.replication_factor_for(group_id, None), 5);
         assert_eq!(
-            document.metadata_replication_factor_for(other_group_id, None),
-            3
-        );
-        assert_eq!(document.metadata_replication_factor_for(group_id, None), 5);
-        assert_eq!(
-            document.metadata_replication_factor_for(group_id, Some("/datasets/demo")),
+            document.replication_factor_for(group_id, Some("/datasets/demo")),
             6
         );
         assert_eq!(
-            document.metadata_replication_factor_for(group_id, Some("/datasets/important/item")),
+            document.replication_factor_for(group_id, Some("/datasets/important/item")),
             7
         );
     }
 
     #[test]
-    fn effective_default_replication_uses_placement_strategy_with_legacy_fallback() {
+    fn replication_uses_strategy() {
         let mut document = RealmConfigDocument::new(RealmId([6u8; 32]), Vec::new(), 5);
         document.seed_default_placement();
 
@@ -1769,10 +1730,7 @@ mod test {
                 .replica_count,
             Some(5)
         );
-        assert_eq!(
-            document.effective_default_metadata_replication_factor(),
-            Some(5)
-        );
+        assert_eq!(document.effective_replication_factor(), Some(5));
 
         document
             .strategies
@@ -1780,10 +1738,7 @@ mod test {
             .find(|strategy| strategy.strategy_id == default_strategy_id)
             .unwrap()
             .replica_count = Some(2);
-        assert_eq!(
-            document.effective_default_metadata_replication_factor(),
-            Some(2)
-        );
+        assert_eq!(document.effective_replication_factor(), Some(2));
 
         document
             .strategies
@@ -1791,27 +1746,18 @@ mod test {
             .find(|strategy| strategy.strategy_id == default_strategy_id)
             .unwrap()
             .replica_count = None;
-        assert_eq!(
-            document.effective_default_metadata_replication_factor(),
-            None
-        );
+        assert_eq!(document.effective_replication_factor(), None);
 
         document.default_strategy_id = None;
-        assert_eq!(
-            document.effective_default_metadata_replication_factor(),
-            None
-        );
+        assert_eq!(document.effective_replication_factor(), None);
 
         document.strategies.clear();
-        assert_eq!(
-            document.effective_default_metadata_replication_factor(),
-            Some(5)
-        );
+        assert_eq!(document.effective_replication_factor(), Some(5));
     }
 
     #[test]
     pub fn default_discovery() {
-        let discovery = default_realm_discovery_config();
+        let discovery = default_discovery_config();
 
         match discovery {
             RealmDiscoveryConfig::Dynamic { methods } => {
@@ -1831,7 +1777,7 @@ mod test {
     }
 
     #[test]
-    fn sync_eligible_node_ids_excludes_user_kind_nodes() {
+    fn excludes_user_nodes() {
         fn node_id(seed: u8) -> NodeId {
             let mut bytes = [0u8; 32];
             bytes[0] = seed;
@@ -1847,7 +1793,7 @@ mod test {
         document.ensure_node(user_device, RealmNodeKind::User { owner });
 
         assert_eq!(document.node_ids().unwrap(), vec![server, user_device]);
-        assert_eq!(document.sync_eligible_node_ids().unwrap(), vec![server]);
+        assert_eq!(document.sync_eligible_nodes().unwrap(), vec![server]);
         assert_eq!(document.nodes[1].kind.owner(), Some(owner));
     }
 
@@ -1855,11 +1801,11 @@ mod test {
     fn owner_survives_rebalance() {
         // The derived owner is a pure function of band + binding; arbitrary
         // placement-map, strategy, and override changes never move it.
-        use crate::identifiers::{BucketId, PlacementHandle};
         use crate::structs::{
             DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, JobId,
             JobOwnerError, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementScope,
         };
+        use crate::structured_id::{BucketId, PlacementHandle};
 
         fn node_id(seed: u8) -> NodeId {
             iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -1942,8 +1888,8 @@ mod test {
 
     #[test]
     fn directory_rebuilds_state() {
-        use crate::identifiers::PlacementHandle;
         use crate::structs::{DocumentClass, HandleRange, PlacementBinding, PlacementScope};
+        use crate::structured_id::PlacementHandle;
 
         let owner = iroh::SecretKey::from_bytes(&[3; 32]).public();
         let range_id = Ulid::from_bytes([8; 16]);

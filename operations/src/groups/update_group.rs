@@ -9,8 +9,7 @@ use aruna_core::reducer::{
     AdminDocumentReducerError, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH,
 };
 use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::{
     Actor, AuthContext, Group, Permission, PlacementRef, RealmConfigDocument,
@@ -173,7 +172,7 @@ impl UpdateGroupOperation {
                 ),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                 ),
                 (
                     REALM_CONFIG_KEYSPACE.to_string(),
@@ -204,7 +203,7 @@ impl UpdateGroupOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                aruna_core::reducer::decode_reducer_state(value.as_ref())
                     .map_err(ConversionError::from)
             })
             .transpose()?;
@@ -226,10 +225,8 @@ impl UpdateGroupOperation {
         group.display_name = display_name;
         overlay_reducer_name(&mut group, &reducer_state);
 
-        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
-            previous_reducer_state.as_ref(),
-            Some(&reducer_state),
-        );
+        let stale_conflict_deletes =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let document_target = self.document_ref();
         let realm_config = realm_config_value
             .as_deref()
@@ -249,7 +246,7 @@ impl UpdateGroupOperation {
                 ByteView::from(group.group_id.to_bytes()),
                 group.to_bytes(&self.config.actor)?.into(),
             ),
-            admin_document_reducer_state_write_entry(&reducer_state)?,
+            reducer_state_entry(&reducer_state)?,
         ];
         let record = new_outbox_record_with_id(
             admin_event.event_id,
@@ -262,7 +259,7 @@ impl UpdateGroupOperation {
         )
         .fenced_at(self.fence.generation(&realm_id, &placement));
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
-        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+        writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.state = UpdateGroupState::WriteGroupAndAdminState {
             group,
@@ -495,7 +492,7 @@ fn overlay_reducer_name(group: &mut Group, reducer_state: &AdminDocumentReducerS
     if !reducer_state
         .conflicts
         .contains_key(GROUP_DISPLAY_NAME_PATH)
-        && let Some(display_name) = reducer_state.materialized_group_display_name()
+        && let Some(display_name) = reducer_state.materialized_group_name()
     {
         group.display_name = display_name;
     }
@@ -516,7 +513,7 @@ mod tests {
     };
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentReducerState;
-    use aruna_core::storage_entries::admin_document_reducer_state_key;
+    use aruna_core::storage_entries::reducer_state_key;
     use aruna_core::structs::{Actor, AuthContext, Group, RealmId};
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{GroupId, TxnId, UserId};
@@ -574,7 +571,7 @@ mod tests {
                 ByteView::from(group().to_bytes()),
                 Some(stored_group().to_bytes(&actor()).unwrap().into()),
             ),
-            (admin_document_reducer_state_key(&target), None),
+            (reducer_state_key(&target), None),
             (ByteView::from(*realm().as_bytes()), None),
         ]
     }
@@ -614,7 +611,7 @@ mod tests {
                 assert_eq!(reads[0].0, GROUP_KEYSPACE);
                 assert_eq!(reads[0].1.as_ref(), group().to_bytes().as_slice());
                 assert_eq!(reads[1].0, ADMIN_DOCUMENT_STATE_KEYSPACE);
-                assert_eq!(reads[1].1, admin_document_reducer_state_key(&target));
+                assert_eq!(reads[1].1, reducer_state_key(&target));
                 assert_eq!(reads[2].0, REALM_CONFIG_KEYSPACE);
             }
             other => panic!("unexpected read effect: {other:?}"),
@@ -643,7 +640,7 @@ mod tests {
                 let reducer_state: AdminDocumentReducerState =
                     postcard::from_bytes(reducer_write.2.as_ref()).unwrap();
                 assert_eq!(
-                    reducer_state.materialized_group_display_name().as_deref(),
+                    reducer_state.materialized_group_name().as_deref(),
                     Some("Platform")
                 );
 

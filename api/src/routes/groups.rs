@@ -2,14 +2,13 @@ use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission, permission_granted, require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::metadata::map_metadata_api_error;
+use crate::metadata::map_api_error;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmId, Role,
-    blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
-    usage_group_key,
+    bucket_permission_path, group_permission_path, object_permission_path, usage_group_key,
 };
 use aruna_core::types::RoleId;
 use aruna_operations::device::realm_documents::install_group_docs;
@@ -38,7 +37,7 @@ use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::forward::{
     ForwardGroupError, forward_group_create, is_user_origin,
 };
-use aruna_operations::metadata::stats::count_group_documents_by_purpose;
+use aruna_operations::metadata::stats::count_group_purpose;
 use aruna_operations::realm::get_config::GetRealmConfigOperation;
 use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
@@ -225,12 +224,12 @@ pub struct GroupInfoResponse {
 }
 
 fn map_roles(auth: GroupAuthorizationDocument, realm_id: RealmId) -> Vec<RoleResponse> {
-    map_roles_with_visibility(auth, realm_id, true)
+    map_visible_roles(auth, realm_id, true)
 }
 
 /// Member lists are only visible to group members; open endpoints get the
 /// roles without `assigned_users`.
-fn map_roles_with_visibility(
+fn map_visible_roles(
     auth: GroupAuthorizationDocument,
     realm_id: RealmId,
     include_members: bool,
@@ -281,7 +280,7 @@ fn parse_user_id(user_id: &str) -> ServerResult<UserId> {
     UserId::from_string(user_id).map_err(|_| ServerError::BadRequest)
 }
 
-fn parse_member_user_id(user_id: &str) -> ServerResult<UserId> {
+fn parse_member_id(user_id: &str) -> ServerResult<UserId> {
     let user_id = parse_user_id(user_id)?;
     if user_id.is_nil() {
         return Err(ServerError::BadRequest);
@@ -305,7 +304,7 @@ fn require_unrestricted(auth: Option<AuthContext>) -> ServerResult<AuthContext> 
 pub(crate) async fn refuse_group_edit(state: &ServerState) -> ServerResult<()> {
     let device = is_user_origin(&state.get_ctx(), state.get_realm_id(), state.get_node_id())
         .await
-        .map_err(map_metadata_api_error)?;
+        .map_err(map_api_error)?;
     match device {
         true => Err(ServerError::Conflict(
             "group changes are made through the realm".to_string(),
@@ -331,10 +330,10 @@ async fn load_group(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_get_group_error)
+    .map_err(map_group_error)
 }
 
-fn map_get_group_error(error: GetGroupError) -> ServerError {
+fn map_group_error(error: GetGroupError) -> ServerError {
     match error {
         GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
@@ -456,17 +455,17 @@ pub async fn create_group(
     // ingress, which decides quota and permission under the caller's own token.
     if is_user_origin(&ctx, realm_id, state.get_node_id())
         .await
-        .map_err(map_metadata_api_error)?
+        .map_err(map_api_error)?
     {
         let caller_token = bearer_token.as_ref().ok_or(ServerError::Unauthorized)?;
         let auth_token = forwarded_bearer(Some(caller_token.as_str()))
-            .map_err(map_metadata_api_error)?
+            .map_err(map_api_error)?
             .ok_or(ServerError::Unauthorized)?;
         let forwarded = forward_group_create(&ctx, realm_id, auth_token, name)
             .await
             .map_err(|err| match err {
                 ForwardGroupError::Conflict(reason) => ServerError::Conflict(reason),
-                ForwardGroupError::Api(err) => map_metadata_api_error(err),
+                ForwardGroupError::Api(err) => map_api_error(err),
             })?;
         request_span.record("group_id", field::display(forwarded.0.group_id));
         // Cached here so the new group answers on the next read instead of
@@ -608,7 +607,7 @@ pub async fn list_groups(
     Query(query): Query<ListGroupsQuery>,
 ) -> ServerResult<(StatusCode, Json<ListGroupsResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
-    let include_roles = parse_list_groups_include(query.include.as_deref())?;
+    let include_roles = parse_group_include(query.include.as_deref())?;
     let limit = query.limit_or(100).clamp(1, 1_000);
     let offset = query.offset_or(0);
     let result = drive(
@@ -625,7 +624,7 @@ pub async fn list_groups(
     ))
 }
 
-fn parse_list_groups_include(include: Option<&str>) -> ServerResult<bool> {
+fn parse_group_include(include: Option<&str>) -> ServerResult<bool> {
     let Some(include) = include else {
         return Ok(false);
     };
@@ -660,11 +659,7 @@ async fn build_api_groups(
             .await
             .map_err(|err| ServerError::InternalError(err.to_string()))?;
             let is_member = is_group_member(&auth_doc, caller);
-            Some(map_roles_with_visibility(
-                auth_doc,
-                group.realm_id,
-                is_member,
-            ))
+            Some(map_visible_roles(auth_doc, group.realm_id, is_member))
         } else {
             None
         };
@@ -749,7 +744,7 @@ pub(crate) async fn run_get_group(
         display_name: group.display_name,
         group_id: group.group_id.to_string(),
         realm_id: group.realm_id.to_string(),
-        roles: map_roles_with_visibility(auth_doc, group.realm_id, is_member),
+        roles: map_visible_roles(auth_doc, group.realm_id, is_member),
     })
 }
 
@@ -882,7 +877,7 @@ fn map_rename_error(error: UpdateGroupError) -> ServerError {
     }
 }
 
-fn map_add_member_error(error: AddUserToGroupError) -> ServerError {
+fn map_member_error(error: AddUserToGroupError) -> ServerError {
     match error {
         AddUserToGroupError::Unauthorized => ServerError::Forbidden,
         AddUserToGroupError::InvalidUserId => ServerError::BadRequest,
@@ -893,7 +888,7 @@ fn map_add_member_error(error: AddUserToGroupError) -> ServerError {
     }
 }
 
-fn map_add_role_error(error: AddGroupRoleError) -> ServerError {
+fn map_role_error(error: AddGroupRoleError) -> ServerError {
     match error {
         AddGroupRoleError::Unauthorized => ServerError::Forbidden,
         AddGroupRoleError::InvalidPublicRole
@@ -908,7 +903,7 @@ fn map_add_role_error(error: AddGroupRoleError) -> ServerError {
     }
 }
 
-fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
+fn map_removal_error(error: RemoveUserFromGroupError) -> ServerError {
     match error {
         RemoveUserFromGroupError::Unauthorized => ServerError::Forbidden,
         RemoveUserFromGroupError::InvalidUserId => ServerError::BadRequest,
@@ -1021,7 +1016,7 @@ pub(crate) async fn run_group_usage(
     // warning threshold is evaluated against the same counter.
     let realm_group_logical_bytes = realm.logical_bytes;
     let mut response = crate::routes::info::UsageResponse::for_group(local, realm);
-    match count_group_documents_by_purpose(&state.get_ctx(), state.get_realm_id(), group_id).await {
+    match count_group_purpose(&state.get_ctx(), state.get_realm_id(), group_id).await {
         Ok(Some(counts)) => {
             response.dataset_count = Some(counts.dataset_count);
             response.profile_count = Some(counts.profile_count);
@@ -1240,7 +1235,7 @@ pub async fn add_group_member(
 ) -> ServerResult<(StatusCode, Json<GroupRolesResponse>)> {
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
-    let user_id = parse_member_user_id(&request.user_id)?;
+    let user_id = parse_member_id(&request.user_id)?;
     refuse_group_edit(&state).await?;
 
     ensure_permission(
@@ -1288,7 +1283,7 @@ pub async fn add_group_member(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_add_member_error)?;
+    .map_err(map_member_error)?;
 
     Ok((
         StatusCode::CREATED,
@@ -1338,7 +1333,7 @@ pub async fn remove_group_member(
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
-    let user_id = parse_member_user_id(&user_id)?;
+    let user_id = parse_member_id(&user_id)?;
     let role_ids = query
         .role_id
         .as_deref()
@@ -1372,7 +1367,7 @@ pub async fn remove_group_member(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_remove_member_error)?;
+    .map_err(map_removal_error)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1423,7 +1418,7 @@ pub async fn leave_group(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_remove_member_error)?;
+    .map_err(map_removal_error)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1541,7 +1536,7 @@ pub async fn create_group_role(
     let mut assigned_users = request
         .assigned_users
         .iter()
-        .map(|user_id| parse_member_user_id(user_id))
+        .map(|user_id| parse_member_id(user_id))
         .collect::<ServerResult<HashSet<UserId>>>()?;
     if request.public {
         assigned_users.insert(UserId::nil(realm_id));
@@ -1564,7 +1559,7 @@ pub async fn create_group_role(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_add_role_error)?;
+    .map_err(map_role_error)?;
 
     let role = map_roles(auth_doc, realm_id)
         .into_iter()
@@ -1753,7 +1748,7 @@ pub async fn list_data_paths(
 
     // Permission paths are node-scoped; only paths under this node's group data
     // root are browsable, so a foreign prefix is rejected outright.
-    let group_path = blob_group_permission_path(realm_id, group_id, node_id);
+    let group_path = group_permission_path(realm_id, group_id, node_id);
     let remainder = match query.prefix.as_deref().filter(|prefix| !prefix.is_empty()) {
         Some(prefix) => {
             let rest = prefix
@@ -1764,9 +1759,7 @@ pub async fn list_data_paths(
         None => String::new(),
     };
 
-    // A bare segment that names an existing bucket browses into that bucket's
-    // root so a returned bucket path round-trips; any other bare segment stays a
-    // bucket-name filter.
+    // An existing bare bucket browses its root; other bare segments remain name filters.
     let bucket_target = match remainder.split_once('/') {
         Some((bucket, key_prefix)) => Some((bucket.to_string(), key_prefix.to_string())),
         None => {
@@ -1785,9 +1778,9 @@ pub async fn list_data_paths(
             // Listing inside a bucket requires READ on the bucket, or the prefix
             // being browsed, so path-restricted tokens see only what they may read.
             let listing_path = if key_prefix.is_empty() {
-                blob_bucket_permission_path(realm_id, group_id, node_id, &bucket)
+                bucket_permission_path(realm_id, group_id, node_id, &bucket)
             } else {
-                blob_object_permission_path(realm_id, group_id, node_id, &bucket, &key_prefix)
+                object_permission_path(realm_id, group_id, node_id, &bucket, &key_prefix)
             };
             require_data_read(&state, &auth, listing_path).await?;
             list_bucket_objects(
@@ -1858,7 +1851,7 @@ async fn list_group_buckets(
         .buckets
         .into_iter()
         .map(|(bucket, _info)| DataPathEntry {
-            permission_path: blob_bucket_permission_path(realm_id, group_id, node_id, &bucket),
+            permission_path: bucket_permission_path(realm_id, group_id, node_id, &bucket),
             kind: DataPathKind::Folder,
         })
         .collect();
@@ -1909,15 +1902,13 @@ async fn list_bucket_objects(
     let mut entries = Vec::with_capacity(result.objects.len() + result.common_prefixes.len());
     for prefix in result.common_prefixes {
         entries.push(DataPathEntry {
-            permission_path: blob_object_permission_path(
-                realm_id, group_id, node_id, bucket, &prefix,
-            ),
+            permission_path: object_permission_path(realm_id, group_id, node_id, bucket, &prefix),
             kind: DataPathKind::Folder,
         });
     }
     for object in result.objects {
         entries.push(DataPathEntry {
-            permission_path: blob_object_permission_path(
+            permission_path: object_permission_path(
                 realm_id,
                 group_id,
                 node_id,
@@ -2012,8 +2003,8 @@ mod tests {
     use aruna_core::structs::{
         Actor, AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
         BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities,
-        RealmId, RealmNodeKind, Role, User, VersionKey, blob_bucket_permission_path,
-        blob_object_permission_path,
+        RealmId, RealmNodeKind, Role, User, VersionKey, bucket_permission_path,
+        object_permission_path,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::driver::drive;
@@ -2049,7 +2040,7 @@ mod tests {
     async fn seed_group(state: &ServerState, owner: UserId) -> Ulid {
         let realm_id = state.get_realm_id();
         let group_id = Ulid::generate();
-        let auth_doc = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let auth_doc = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
         let group = Group {
             display_name: "Test".to_string(),
             group_id,
@@ -2261,7 +2252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_refuses_member_add() {
+    async fn device_refuses_add() {
         // A local apply would enqueue an admin record every realm holder rejects,
         // so the device must refuse instead of answering success and diverging.
         let (state, admin, _tempdir) = setup_admin_state().await;
@@ -2525,7 +2516,7 @@ mod tests {
     /// Anonymous callers get 401, foreign-realm tokens 403: neither may
     /// enumerate the local group or usage directory.
     #[tokio::test]
-    async fn group_directory_requires_realm() {
+    async fn directory_requires_realm() {
         let (state, _tempdir) = setup_state().await;
         let group_id = Ulid::generate().to_string();
 
@@ -2588,7 +2579,7 @@ mod tests {
 
     /// Membership is checked before any group metadata aggregate is read.
     #[tokio::test]
-    async fn non_member_cannot_read_group_usage_counts() {
+    async fn nonmember_usage_denied() {
         let (state, _tempdir) = setup_state().await;
         let owner = UserId::local(Ulid::generate(), state.get_realm_id());
         let group_id = seed_group(&state, owner).await;
@@ -2760,8 +2751,8 @@ mod tests {
         assert_eq!(
             paths,
             vec![
-                blob_bucket_permission_path(realm_id, group_id, node_id, "alpha"),
-                blob_bucket_permission_path(realm_id, group_id, node_id, "beta"),
+                bucket_permission_path(realm_id, group_id, node_id, "alpha"),
+                bucket_permission_path(realm_id, group_id, node_id, "beta"),
             ]
         );
     }
@@ -2777,7 +2768,7 @@ mod tests {
         }
         let realm_id = state.get_realm_id();
         let node_id = state.get_node_id();
-        let prefix = blob_bucket_permission_path(realm_id, group_id, node_id, "data") + "/";
+        let prefix = bucket_permission_path(realm_id, group_id, node_id, "data") + "/";
 
         let (status, Json(body)) = list_data_paths(
             State(state.clone()),
@@ -2805,15 +2796,15 @@ mod tests {
 
         assert_eq!(
             folders,
-            vec![blob_object_permission_path(
+            vec![object_permission_path(
                 realm_id, group_id, node_id, "data", "dir/"
             )]
         );
         assert_eq!(
             objects,
             vec![
-                blob_object_permission_path(realm_id, group_id, node_id, "data", "a.txt"),
-                blob_object_permission_path(realm_id, group_id, node_id, "data", "z.txt"),
+                object_permission_path(realm_id, group_id, node_id, "data", "a.txt"),
+                object_permission_path(realm_id, group_id, node_id, "data", "z.txt"),
             ]
         );
         assert!(body.continuation_token.is_none());
@@ -2843,7 +2834,7 @@ mod tests {
         let bucket_path = listing.entries[0].permission_path.clone();
         assert_eq!(
             bucket_path,
-            blob_bucket_permission_path(realm_id, group_id, node_id, "data")
+            bucket_permission_path(realm_id, group_id, node_id, "data")
         );
 
         let (_status, Json(body)) = list_data_paths(
@@ -2865,10 +2856,10 @@ mod tests {
             .iter()
             .map(|entry| entry.permission_path.clone())
             .collect();
-        assert!(paths.contains(&blob_object_permission_path(
+        assert!(paths.contains(&object_permission_path(
             realm_id, group_id, node_id, "data", "a.txt"
         )));
-        assert!(paths.contains(&blob_object_permission_path(
+        assert!(paths.contains(&object_permission_path(
             realm_id, group_id, node_id, "data", "dir/"
         )));
     }
@@ -2884,7 +2875,7 @@ mod tests {
         }
         let realm_id = state.get_realm_id();
         let node_id = state.get_node_id();
-        let prefix = blob_bucket_permission_path(realm_id, group_id, node_id, "data") + "/";
+        let prefix = bucket_permission_path(realm_id, group_id, node_id, "data") + "/";
 
         let mut token = None;
         let mut collected = Vec::new();
@@ -2915,7 +2906,7 @@ mod tests {
         collected.sort();
         let expected: Vec<_> = ["a", "b", "c", "d"]
             .iter()
-            .map(|key| blob_object_permission_path(realm_id, group_id, node_id, "data", key))
+            .map(|key| object_permission_path(realm_id, group_id, node_id, "data", key))
             .collect();
         assert_eq!(collected, expected);
         assert!(pages >= 2);
@@ -2930,7 +2921,7 @@ mod tests {
         seed_object(&state, "data", "reports/q1.csv", owner, 9).await;
         let realm_id = state.get_realm_id();
         let node_id = state.get_node_id();
-        let prefix = blob_bucket_permission_path(realm_id, group_id, node_id, "data") + "/reports/";
+        let prefix = bucket_permission_path(realm_id, group_id, node_id, "data") + "/reports/";
 
         let (_status, Json(body)) = list_data_paths(
             State(state.clone()),
@@ -2948,7 +2939,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             object.permission_path,
-            blob_object_permission_path(realm_id, group_id, node_id, "data", "reports/q1.csv")
+            object_permission_path(realm_id, group_id, node_id, "data", "reports/q1.csv")
         );
     }
 
@@ -2962,7 +2953,7 @@ mod tests {
         seed_object(&state, "secret", "k", owner, 1).await;
         let realm_id = state.get_realm_id();
         let node_id = state.get_node_id();
-        let prefix = blob_bucket_permission_path(realm_id, group_id, node_id, "secret") + "/";
+        let prefix = bucket_permission_path(realm_id, group_id, node_id, "secret") + "/";
 
         let (_status, Json(body)) = list_data_paths(
             State(state.clone()),
@@ -3002,8 +2993,7 @@ mod tests {
         let group_id = seed_group(&state, owner).await;
         let limited = UserId::local(Ulid::generate(), realm_id);
 
-        let mut auth_doc =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let mut auth_doc = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
         let role_id = Ulid::generate();
         auth_doc.roles.insert(
             role_id,
@@ -3060,8 +3050,7 @@ mod tests {
         store_user(&state, owner, "Owner").await;
         let group_id = Ulid::generate();
 
-        let mut auth_doc =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let mut auth_doc = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
         auth_doc.policies = vec![aruna_core::request_policy::RequestPolicy {
             policy_id: Ulid::generate(),
             name: "no-writes".to_string(),

@@ -30,11 +30,8 @@ pub enum SyncState {
     Failed {
         reason: String,
     },
-    /// Serving-only stub left behind when a reference relationship is
-    /// deleted: the target retains `BlobVersion::Reference` records that
-    /// authorize reads through this relationship id, so the source keeps
-    /// honoring native reference requests. Detached relationships are hidden
-    /// from the management API and never queue or mirror new work.
+    /// Serving stub retained after reference deletion because existing `BlobVersion::Reference` rows still
+    /// authorize native reads. It is API-hidden and cannot queue or mirror new work.
     Detached,
 }
 

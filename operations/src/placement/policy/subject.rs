@@ -413,9 +413,7 @@ pub async fn observe_placement(
         context,
     )
     .await?;
-    // Compute follows the same observation: a departing node stops offering
-    // execution and publishes its final snapshots, a returning one advertises
-    // again. Best effort, because departure may never block on it.
+    // Compute follows departure state as best effort because departure cannot block on it.
     if let Err(error) = crate::node::node_info::set_departure_state(
         context,
         node_id,
@@ -718,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_touches_no_jobs() {
+    fn scan_ignores_jobs() {
         // A receipted execution must survive a transition: the scan only ever
         // writes the subject row and managed-copy rows.
         let mut operation = operation(
@@ -775,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn governed_copy_needs_subject() {
+    fn governed_requires_subject() {
         // The gate runs per registration; a governed copy cannot be restored
         // without resolving its rule.
         let mut operation = operation(

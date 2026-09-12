@@ -5,9 +5,8 @@ use std::time::{Duration, Instant};
 use lru::LruCache;
 use ulid::Ulid;
 
-// Two maximum-size list pages worth of documents, capped by bytes so a few
-// unusually large summaries cannot grow the cache without bound. The pair
-// encodes a 16 KiB average summary and roughly 32 MiB of resident memory.
+// Two maximum-size list pages worth of documents, capped by bytes so a few unusually large
+// summaries cannot grow the cache without bound.
 const SUMMARY_CACHE_ENTRIES: usize = 2_048;
 const SUMMARY_CACHE_BYTES: usize = 32 * 1024 * 1024;
 /// Backstop staleness bound, matching the visibility and query cache TTLs, so

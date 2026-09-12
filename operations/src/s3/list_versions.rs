@@ -12,7 +12,7 @@ use aruna_core::structs::{
     SourceMetadata, VersionKey,
 };
 use aruna_core::types::{Effects, Key, Value};
-use aruna_core::util::prefix_upper_bound;
+use aruna_core::keyspaces::prefix_upper_bound;
 use smallvec::smallvec;
 use std::collections::VecDeque;
 use std::time::SystemTime;
@@ -20,7 +20,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::blob::managed_copy::{CopyRequest, validate_registration};
-use crate::s3::listing::{PrefixPage, common_prefix_of, split_after_marker};
+use crate::s3::listing::{PrefixTracker, common_prefix_of, split_after_marker};
 
 /// Whether this node still holds a serveable registration for one governed
 /// copy. A listing never fails on the answer; it only stops describing bytes.
@@ -44,9 +44,8 @@ pub(crate) fn served_copy(
         .is_ok()
 }
 
-// A single key may accumulate more versions than one scan page holds. The
-// storage layer only iterates forward (oldest -> newest), so the version prefix
-// is scanned in full before response ordering and pagination are applied.
+// One key can hold more versions than a scan page; storage iterates only
+// forward, so the version prefix is scanned fully before ordering.
 const VERSION_SCAN_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -143,7 +142,7 @@ pub struct ListObjectVersionsOperation {
     head_exhausted: bool,
     scan_rounds: usize,
     max_scan_rounds: usize,
-    prefixes: PrefixPage,
+    prefixes: PrefixTracker,
     pending_heads: VecDeque<(String, Ulid)>,
     current_key: Option<(String, Ulid)>,
     version_scan_limit: usize,
@@ -175,7 +174,7 @@ impl ListObjectVersionsOperation {
             head_exhausted: false,
             scan_rounds: 0,
             max_scan_rounds: Self::MAX_SCAN_ROUNDS,
-            prefixes: PrefixPage::default(),
+            prefixes: PrefixTracker::default(),
             pending_heads: VecDeque::new(),
             current_key: None,
             version_scan_limit: VERSION_SCAN_LIMIT,
@@ -192,13 +191,13 @@ impl ListObjectVersionsOperation {
     }
 
     #[cfg(test)]
-    fn with_max_scan_rounds(mut self, max_scan_rounds: usize) -> Self {
+    fn with_round_limit(mut self, max_scan_rounds: usize) -> Self {
         self.max_scan_rounds = max_scan_rounds;
         self
     }
 
     #[cfg(test)]
-    fn with_version_scan_limit(mut self, version_scan_limit: usize) -> Self {
+    fn with_scan_limit(mut self, version_scan_limit: usize) -> Self {
         self.version_scan_limit = version_scan_limit;
         self
     }
@@ -399,7 +398,7 @@ impl ListObjectVersionsOperation {
                         continue;
                     }
                     self.prefixes.set_resume(None);
-                    if self.try_emit_common_prefix(group) {
+                    if self.emit_common_prefix(group) {
                         return self.commit();
                     }
                     continue;
@@ -469,9 +468,8 @@ impl ListObjectVersionsOperation {
             return self.issue_version_iter(&key);
         }
 
-        // Collected versions are oldest -> newest; sort by the stored version timestamp
-        // so same-millisecond ULID randomness cannot put the current head behind
-        // an older sibling.
+        // Versions arrive oldest -> newest; sort by stored timestamp so
+        // same-millisecond ULIDs cannot hide the current head.
         let mut versions: Vec<(Ulid, BlobVersion)> = self.version_window.drain(..).collect();
         versions.sort_by(|(left_id, left), (right_id, right)| {
             right
@@ -683,7 +681,7 @@ impl ListObjectVersionsOperation {
         false
     }
 
-    fn try_emit_common_prefix(&mut self, group: String) -> bool {
+    fn emit_common_prefix(&mut self, group: String) -> bool {
         if self.emit_count() >= self.max_keys() {
             self.truncate();
             return true;
@@ -915,7 +913,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_object_versions_returns_newest_first_with_is_latest() {
+    async fn newest_first_returned() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -965,7 +963,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_object_versions_puts_same_timestamp_head_first() {
+    async fn head_breaks_tie() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -1006,7 +1004,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_object_versions_includes_delete_markers() {
+    async fn delete_markers_included() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -1053,7 +1051,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_object_versions_resumes_with_markers() {
+    async fn markers_resume() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -1117,7 +1115,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_object_versions_groups_by_delimiter() {
+    async fn delimiter_groups() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -1159,7 +1157,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_object_versions_returns_reference_metadata() {
+    async fn reference_metadata_returned() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -1225,7 +1223,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_object_versions_orders_keys_lexicographically() {
+    async fn keys_sort() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -1258,7 +1256,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_object_versions_truncates_at_scan_round_cap() {
+    async fn scan_cap_truncates() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -1284,7 +1282,7 @@ mod test {
                 version_id_marker: None,
                 max_keys: Some(3),
             })
-            .with_max_scan_rounds(2),
+            .with_round_limit(2),
             &driver_ctx,
         )
         .await
@@ -1305,7 +1303,7 @@ mod test {
                 version_id_marker: first.next_version_id_marker,
                 max_keys: Some(3),
             })
-            .with_max_scan_rounds(2),
+            .with_round_limit(2),
             &driver_ctx,
         )
         .await
@@ -1334,7 +1332,7 @@ mod test {
 
         let result = drive(
             ListObjectVersionsOperation::new(input(ListObjectVersionsOperation::DEFAULT_MAX_KEYS))
-                .with_version_scan_limit(3),
+                .with_scan_limit(3),
             &driver_ctx,
         )
         .await

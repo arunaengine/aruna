@@ -113,12 +113,12 @@ async fn serve_portal_request(state: &ServerState, request: Request) -> Response
             response
         }
         Ok(_) if request_path.starts_with(ASSETS_PREFIX) => StatusCode::NOT_FOUND.into_response(),
-        Ok(_) => serve_portal_index_fallback(&portal_dir, method, &request_path).await,
+        Ok(_) => serve_index_fallback(&portal_dir, method, &request_path).await,
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
-async fn serve_portal_index_fallback(
+async fn serve_index_fallback(
     portal_dir: &std::path::Path,
     method: Method,
     request_path: &str,
@@ -361,7 +361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_serves_cached_index_and_static_assets() {
+    async fn portal_serves_assets() {
         let (state, tempdir) = setup_state().await;
         let portal_dir = tempdir.path().join("portal");
         std::fs::create_dir_all(portal_dir.join("assets")).unwrap();
@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_compresses_static_assets() {
+    async fn portal_compresses_assets() {
         let tempdir = tempdir().unwrap();
         let portal_dir = tempdir.path().join("portal");
         let (router, _state_dir, _discovery_origin) = setup_serving_node(&portal_dir).await;
@@ -427,7 +427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_falls_back_to_index_for_client_routes() {
+    async fn portal_falls_back() {
         let (state, tempdir) = setup_state().await;
         let portal_dir = tempdir.path().join("portal");
         std::fs::create_dir_all(&portal_dir).unwrap();
@@ -447,7 +447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_assets_do_not_fall_back_to_index() {
+    async fn missing_assets_fail() {
         let (state, tempdir) = setup_state().await;
         let portal_dir = tempdir.path().join("portal");
         std::fs::create_dir_all(&portal_dir).unwrap();
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_returns_not_found_when_disabled_and_unavailable_when_artifact_is_not_ready() {
+    async fn disabled_portal_unavailable() {
         let (state, _tempdir) = setup_state().await;
 
         let disabled = serve_portal_request(&state, request(Method::GET, "/")).await;
@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_fallback_does_not_shadow_reserved_routes() {
+    async fn fallback_preserves_routes() {
         let (state, tempdir) = setup_state().await;
         let portal_dir = tempdir.path().join("portal");
         std::fs::create_dir_all(&portal_dir).unwrap();
@@ -552,7 +552,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_sets_security_headers() {
+    async fn portal_sets_headers() {
         let tempdir = tempdir().unwrap();
         let (router, _state_dir, _discovery_origin) =
             setup_serving_node(&tempdir.path().join("portal")).await;
@@ -599,7 +599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_src_lists_node_origins() {
+    async fn lists_connect_origins() {
         let tempdir = tempdir().unwrap();
         let (router, _state_dir, discovery_origin) =
             setup_serving_node(&tempdir.path().join("portal")).await;

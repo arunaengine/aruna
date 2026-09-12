@@ -115,7 +115,7 @@ fn cleanup_row_write(work: &BlobCleanupWork, key: &Key) -> Option<Effect> {
     }
 }
 
-pub fn schedule_blob_cleanup_effect() -> Effect {
+pub fn schedule_cleanup_effect() -> Effect {
     Effect::Task(TaskEffect::ShortenTimer {
         key: TaskKey::DrainBlobCleanupQueue,
         after: Duration::ZERO,
@@ -681,9 +681,8 @@ mod tests {
 
     #[tokio::test]
     async fn unowned_write_deletes() {
-        // Without a location row naming this copy the commit never landed, so
-        // the bytes have to go; this context has no blob handle, so the delete
-        // fails and the row stays for the next drain.
+        // Without a location row the commit never landed, so the bytes must
+        // go; no blob handle here, so the delete fails and the row waits.
         let (_dir, storage, context) = setup_context();
         let BlobCleanupWork::DeleteBlob { location } =
             BlobCleanupWork::from_bytes(&delete_work()).unwrap()

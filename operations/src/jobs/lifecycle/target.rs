@@ -18,11 +18,11 @@ use aruna_core::structs::{
     AuthContext, CapturedInput, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord,
     JobPayload, JobRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
     Permission, PhysicalExecutionState, PlacementDecision, PlacementPolicyRef, PlacementSubject,
-    PolicyResolution, RealmConfigDocument, WorkspaceMode, blob_group_permission_path,
-    evaluate_placement,
+    PolicyResolution, RealmConfigDocument, WorkspaceMode, evaluate_placement,
+    group_permission_path,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, NodeId};
-use aruna_core::util::unix_timestamp_millis;
 use smallvec::smallvec;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -46,7 +46,7 @@ use crate::jobs::records::{
 };
 use crate::jobs::service::mint_local_job;
 use crate::metadata::api::load_realm_config;
-use crate::node::node_info::{read_node_info_document, read_operator_drain};
+use crate::node::node_info::{read_info_document, read_operator_drain};
 use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use crate::placement::resolve_shard_holders;
 
@@ -87,9 +87,8 @@ pub async fn admit_launch(
         records = family_records(context, family).await?;
     }
     let spec = spec_of(&records, &intent)?;
-    // The launch itself becomes a retained record before it can be receipted.
-    // Missing family evidence is fetchable, so the family is pulled once more
-    // before the offer is answered as undecidable.
+    // The launch becomes a retained record before it can be receipted; missing
+    // family evidence is fetched before the offer is answered as undecidable.
     let origin = RecordOrigin::Peer(intent.scheduler_node_id);
     if !append_record(context, realm_id, local, launch.envelope().clone(), origin).await {
         fetch_family(context, &config, realm_id, family, intent.scheduler_node_id).await;
@@ -230,7 +229,7 @@ async fn store_receipt(
         round.local,
         now,
     )?;
-    let membership_generation = read_node_info_document(&context.storage_handle, round.local)
+    let membership_generation = read_info_document(&context.storage_handle, round.local)
         .await
         .ok()
         .flatten()
@@ -362,9 +361,8 @@ where
         };
         match classify(&error) {
             CommitVerdict::Capacity => return Some(Err(LaunchDecline::Capacity)),
-            // A commit conflict is two admissions racing one launch, never this
-            // node refusing work. The winner's receipt answers the offer, so it
-            // is searched for before the reservation is attempted again.
+            // A commit conflict is two admissions racing one launch, not a refusal: the
+            // winner's receipt is searched before the reservation is attempted again.
             CommitVerdict::Raced => {
                 if let Some(committed) = committed_receipt(context, family, intent).await {
                     return accepted(context, committed).await;
@@ -376,9 +374,8 @@ where
                 debug!(attempt, "Storage refused the reservation write; retrying");
                 tokio::task::yield_now().await;
             }
-            // An unknown commit outcome may already be durable, so the receipt
-            // is reconciled from the store exactly once and never reserved
-            // again: the writes may exist and must not be redone.
+            // An unknown commit outcome may already be durable: the receipt is reconciled
+            // once and never reserved again, so the writes are not redone.
             CommitVerdict::Uncertain => {
                 warn!(error = %error, "Execution commit outcome is unknown; reconciling");
                 let committed = committed_receipt(context, family, intent).await?;
@@ -489,7 +486,7 @@ async fn schedule_local(context: &DriverContext) {
     if let Some(task) = context.task_handle.as_ref() {
         use aruna_core::handle::Handle;
         let _ = task
-            .send_effect(crate::jobs::submit::schedule_job_drain_effect())
+            .send_effect(crate::jobs::submit::schedule_drain_effect())
             .await;
     }
 }
@@ -559,12 +556,12 @@ pub(crate) async fn local_capability(
     intent: &LaunchIntent,
     spec: &LogicalJobSpec,
 ) -> Result<ExecutorCapability, LaunchDecline> {
-    let document = read_node_info_document(&context.storage_handle, local)
+    let document = read_info_document(&context.storage_handle, local)
         .await
         .map_err(|_| LaunchDecline::Draining)?
         .ok_or(LaunchDecline::Draining)?;
     if !config
-        .sync_eligible_node_ids()
+        .sync_eligible_nodes()
         .is_ok_and(|members| members.contains(&local))
     {
         return Err(LaunchDecline::Unauthorized);
@@ -654,7 +651,7 @@ async fn authorize_submitter(
         context,
         spec.realm_id,
         &auth,
-        &blob_group_permission_path(spec.realm_id, spec.group_id, local),
+        &group_permission_path(spec.realm_id, spec.group_id, local),
         &Permission::WRITE,
         PolicyRequestExtras::rest(),
     )

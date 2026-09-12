@@ -6,26 +6,24 @@ use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::identifiers::PlacementHandle;
 use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState,
-    overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
-    realm_config_node_path,
+    AdminDocumentReducerError, AdminDocumentReducerState, config_node_path, overlay_placement,
+    parse_config_node,
 };
 use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::{
     Actor, BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE,
     HandleRange, PlacementBinding, PlacementScope, RealmConfigDocument, RealmNodeKind, band_start,
     coordinator_spans, owned_pools,
 };
+use aruna_core::structured_id::PlacementHandle;
 use aruna_core::task::TaskEvent;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use aruna_core::util::unix_timestamp_millis;
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -53,6 +51,14 @@ pub struct EnsureRealmConfigOperation {
     txn_id: Option<TxnId>,
     state: EnsureRealmConfigState,
     output: Option<Result<RealmConfigDocument, EnsureRealmConfigError>>,
+}
+
+struct EnsureResources {
+    seed_pool: Option<BandPool>,
+    assigned_range: HandleRange,
+    range_is_noop: bool,
+    job_binding: Option<PlacementBinding>,
+    transfer_pool: Option<BandPool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,14 +151,190 @@ impl EnsureRealmConfigOperation {
                 ),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                 ),
             ],
             txn_id: Some(txn_id),
         })]
     }
 
-    fn emit_write_document_and_admin_state(
+    fn plan_resources(
+        &self,
+        document: &RealmConfigDocument,
+        reducer_state: &AdminDocumentReducerState,
+        fresh: bool,
+    ) -> Result<EnsureResources, EnsureRealmConfigError> {
+        let seed_pool = (fresh && document.band_pools.is_empty()).then(|| BandPool {
+            pool_id: Ulid::generate(),
+            parent: None,
+            issuer: self.config.actor.node_id,
+            owner: self.config.actor.node_id,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: band_start(HANDLE_BANDS),
+        });
+        let mut pools = document.band_pools.clone();
+        pools.extend(seed_pool);
+
+        let directory = document.handle_range_directory();
+        let usable_ranges = directory.granted_to(&self.config.target_node_id);
+        // Reuse a grant or consume the lowest free band from the coordinator's disjoint pool.
+        let assigned_range = match usable_ranges.first() {
+            Some(usable) => *usable,
+            None => {
+                let spans = coordinator_spans(&pools, &self.config.actor.node_id);
+                if spans.is_empty() {
+                    return Err(EnsureRealmConfigError::CoordinatorPoolMissing {
+                        node_id: self.config.actor.node_id,
+                    });
+                }
+                let (start, end) = directory
+                    .free_band_in(&spans)
+                    .ok_or(EnsureRealmConfigError::HandleSpaceExhausted)?;
+                HandleRange {
+                    range_id: Ulid::generate(),
+                    owner: self.config.target_node_id,
+                    start,
+                    end,
+                }
+            }
+        };
+        let range_is_noop = reducer_state
+            .materialized_handle_ranges()
+            .get(&assigned_range.range_id)
+            == Some(&assigned_range);
+        let job_handle = PlacementHandle::new(assigned_range.start)
+            .map_err(|_| EnsureRealmConfigError::InvalidBandStart)?;
+        let job_binding = if document
+            .placement_bindings
+            .iter()
+            .any(|binding| binding.handle == job_handle)
+        {
+            None
+        } else {
+            let strategy_id = document
+                .default_strategy_id
+                .or_else(|| {
+                    document
+                        .strategies
+                        .first()
+                        .map(|strategy| strategy.strategy_id)
+                })
+                .ok_or(EnsureRealmConfigError::DefaultStrategyMissing)?;
+            Some(PlacementBinding {
+                handle: job_handle,
+                scope: PlacementScope::Realm(self.config.actor.realm_id),
+                document_class: DocumentClass::JobControl,
+                strategy_id,
+                allocator_range_id: Some(assigned_range.range_id),
+                allocated_by: Some(self.config.target_node_id),
+                allocated_at_ms: Some(unix_timestamp_millis()),
+            })
+        };
+        let transfer_pool = self.transfer_pool(document, &pools, assigned_range);
+        Ok(EnsureResources {
+            seed_pool,
+            assigned_range,
+            range_is_noop,
+            job_binding,
+            transfer_pool,
+        })
+    }
+
+    fn transfer_pool(
+        &self,
+        document: &RealmConfigDocument,
+        pools: &[BandPool],
+        assigned_range: HandleRange,
+    ) -> Option<BandPool> {
+        if self.config.target_node_kind != RealmNodeKind::Management
+            || self.config.target_node_id == self.config.actor.node_id
+            || !coordinator_spans(pools, &self.config.target_node_id).is_empty()
+        {
+            return None;
+        }
+        let spans = coordinator_spans(pools, &self.config.actor.node_id);
+        let mut consumed = document.placement_handle_ranges.clone();
+        consumed.push(assigned_range);
+        let child = pool_transfer_slice(&spans, &consumed).and_then(|(start, end)| {
+            owned_pools(pools, &self.config.actor.node_id)
+                .into_iter()
+                .find(|pool| pool.start <= start && end <= pool.end)
+                .map(|parent| BandPool {
+                    pool_id: Ulid::generate(),
+                    parent: Some(parent.pool_id),
+                    issuer: self.config.actor.node_id,
+                    owner: self.config.target_node_id,
+                    start,
+                    end,
+                })
+        });
+        if child.is_none() {
+            warn!(
+                target_node = %self.config.target_node_id,
+                "New coordinator gets no band pool: the acting pool cannot be split"
+            );
+        }
+        child
+    }
+
+    fn apply_config_events(
+        &self,
+        reducer_state: &mut AdminDocumentReducerState,
+        document: &RealmConfigDocument,
+        fresh: bool,
+        node_is_noop: bool,
+        resources: EnsureResources,
+    ) -> Result<Vec<AdminDocumentEvent>, EnsureRealmConfigError> {
+        let mut events = Vec::with_capacity(5);
+        if !node_is_noop {
+            events.push(apply_node_ensure(
+                reducer_state,
+                &self.config.actor,
+                self.config.target_node_id,
+                self.config.target_node_kind.clone(),
+            )?);
+        }
+        if let Some(pool) = resources.seed_pool {
+            events.push(reducer_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigBandPoolAssigned { pool },
+            )?);
+        }
+        if !resources.range_is_noop {
+            events.push(reducer_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigHandleRangeGranted {
+                    range: resources.assigned_range,
+                },
+            )?);
+        }
+        if let Some(binding) = resources.job_binding {
+            events.push(reducer_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding },
+            )?);
+        }
+        if let Some(pool) = resources.transfer_pool {
+            events.push(reducer_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigBandPoolAssigned { pool },
+            )?);
+        }
+        // Reducer events preserve fresh placement identity and family routing during rebuilds.
+        if fresh
+            && reducer_state.materialized_family_strategy().is_none()
+            && reducer_state.materialized_strategies().is_empty()
+        {
+            events.extend(crate::realm::create_realm::seed_placement_events(
+                reducer_state,
+                &self.config.actor,
+                document,
+            )?);
+        }
+        Ok(events)
+    }
+
+    fn emit_document_write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
@@ -193,7 +375,7 @@ impl EnsureRealmConfigOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                aruna_core::reducer::decode_reducer_state(value.as_ref())
                     .map_err(ConversionError::from)
             })
             .transpose()?;
@@ -207,190 +389,38 @@ impl EnsureRealmConfigOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
-        overlay_realm_config_reducer_materialization(
-            &mut document,
-            &reducer_state,
-            unix_timestamp_millis(),
-        );
+        overlay_reducer_state(&mut document, &reducer_state, unix_timestamp_millis());
 
         let node_is_noop = previous_reducer_state.as_ref().is_some_and(|state| {
-            realm_config_node_ensure_is_noop(
+            node_ensure_noop(
                 &document,
                 state,
                 &self.config.target_node_id,
                 &self.config.target_node_kind,
             )
         });
-        // A fresh document seeds the creating coordinator with the whole space
-        // as a self-issued root pool.
-        let seed_pool = (fresh && document.band_pools.is_empty()).then(|| BandPool {
-            pool_id: Ulid::generate(),
-            parent: None,
-            issuer: self.config.actor.node_id,
-            owner: self.config.actor.node_id,
-            start: FIRST_GRANTABLE_HANDLE,
-            end: band_start(HANDLE_BANDS),
-        });
-        let mut pools = document.band_pools.clone();
-        pools.extend(seed_pool);
-
-        let directory = document.handle_range_directory();
-        let usable_ranges = directory.granted_to(&self.config.target_node_id);
-        // A usable grant is reused; otherwise the acting coordinator consumes
-        // the lowest free band of its own disjoint pool, so two disconnected
-        // coordinators can never mint colliding grants.
-        let assigned_range = match usable_ranges.first() {
-            Some(usable) => *usable,
-            None => {
-                let spans = coordinator_spans(&pools, &self.config.actor.node_id);
-                if spans.is_empty() {
-                    return Err(EnsureRealmConfigError::CoordinatorPoolMissing {
-                        node_id: self.config.actor.node_id,
-                    });
-                }
-                let (start, end) = directory
-                    .free_band_in(&spans)
-                    .ok_or(EnsureRealmConfigError::HandleSpaceExhausted)?;
-                HandleRange {
-                    range_id: Ulid::generate(),
-                    owner: self.config.target_node_id,
-                    start,
-                    end,
-                }
-            }
-        };
-        let range_is_noop = reducer_state
-            .materialized_handle_ranges()
-            .get(&assigned_range.range_id)
-            == Some(&assigned_range);
-        // The band's first handle is the target's JobControl handle; the
-        // immutable binding is appended at most once per handle.
-        let job_handle = PlacementHandle::new(assigned_range.start)
-            .map_err(|_| EnsureRealmConfigError::InvalidBandStart)?;
-        let job_binding = if document
-            .placement_bindings
-            .iter()
-            .any(|binding| binding.handle == job_handle)
-        {
-            None
-        } else {
-            let strategy_id = document
-                .default_strategy_id
-                .or_else(|| document.strategies.first().map(|s| s.strategy_id))
-                .ok_or(EnsureRealmConfigError::DefaultStrategyMissing)?;
-            Some(PlacementBinding {
-                handle: job_handle,
-                scope: PlacementScope::Realm(self.config.actor.realm_id),
-                document_class: DocumentClass::JobControl,
-                strategy_id,
-                allocator_range_id: Some(assigned_range.range_id),
-                allocated_by: Some(self.config.target_node_id),
-                allocated_at_ms: Some(unix_timestamp_millis()),
-            })
-        };
-        // A new management coordinator receives an unused tail slice of the
-        // acting coordinator's pool so it can onboard nodes on its own.
-        let transfer_pool = if self.config.target_node_kind == RealmNodeKind::Management
-            && self.config.target_node_id != self.config.actor.node_id
-            && coordinator_spans(&pools, &self.config.target_node_id).is_empty()
-        {
-            let spans = coordinator_spans(&pools, &self.config.actor.node_id);
-            let mut consumed = document.placement_handle_ranges.clone();
-            consumed.push(assigned_range);
-            // The slice must sit inside one owned parent pool so lineage holds.
-            let child = pool_transfer_slice(&spans, &consumed).and_then(|(start, end)| {
-                owned_pools(&pools, &self.config.actor.node_id)
-                    .into_iter()
-                    .find(|pool| pool.start <= start && end <= pool.end)
-                    .map(|parent| BandPool {
-                        pool_id: Ulid::generate(),
-                        parent: Some(parent.pool_id),
-                        issuer: self.config.actor.node_id,
-                        owner: self.config.target_node_id,
-                        start,
-                        end,
-                    })
-            });
-            if child.is_none() {
-                warn!(
-                    target_node = %self.config.target_node_id,
-                    "New coordinator gets no band pool: the acting pool cannot be split"
-                );
-            }
-            child
-        } else {
-            None
-        };
+        let resources = self.plan_resources(&document, &reducer_state, fresh)?;
         if node_is_noop
-            && range_is_noop
-            && job_binding.is_none()
-            && seed_pool.is_none()
-            && transfer_pool.is_none()
+            && resources.range_is_noop
+            && resources.job_binding.is_none()
+            && resources.seed_pool.is_none()
+            && resources.transfer_pool.is_none()
         {
             self.output = Some(Ok(document.clone()));
             return Ok(self.emit_commit_noop(document));
         }
 
-        let mut admin_events = Vec::with_capacity(5);
-        if !node_is_noop {
-            admin_events.push(apply_realm_config_node_ensure(
-                &mut reducer_state,
-                &self.config.actor,
-                self.config.target_node_id,
-                self.config.target_node_kind.clone(),
-            )?);
-        }
-        if let Some(pool) = seed_pool {
-            admin_events.push(reducer_state.apply_operation(
-                &self.config.actor,
-                AdminDocumentOperation::RealmConfigBandPoolAssigned { pool },
-            )?);
-        }
-        if !range_is_noop {
-            admin_events.push(reducer_state.apply_operation(
-                &self.config.actor,
-                AdminDocumentOperation::RealmConfigHandleRangeGranted {
-                    range: assigned_range,
-                },
-            )?);
-        }
-        if let Some(binding) = job_binding {
-            admin_events.push(reducer_state.apply_operation(
-                &self.config.actor,
-                AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding },
-            )?);
-        }
-        if let Some(pool) = transfer_pool {
-            admin_events.push(reducer_state.apply_operation(
-                &self.config.actor,
-                AdminDocumentOperation::RealmConfigBandPoolAssigned { pool },
-            )?);
-        }
-        // A fresh document seeds its placement identity locally; without the
-        // matching reducer events a later reducer-only rebuild loses them and
-        // the stored family routing with them.
-        if fresh
-            && reducer_state.materialized_family_strategy().is_none()
-            && reducer_state
-                .materialized_realm_config_placement_strategies()
-                .is_empty()
-        {
-            admin_events.extend(crate::realm::create_realm::seed_placement_events(
-                &mut reducer_state,
-                &self.config.actor,
-                &document,
-            )?);
-        }
-        overlay_realm_config_reducer_materialization(
-            &mut document,
-            &reducer_state,
-            unix_timestamp_millis(),
-        );
+        let admin_events = self.apply_config_events(
+            &mut reducer_state,
+            &document,
+            fresh,
+            node_is_noop,
+            resources,
+        )?;
+        overlay_reducer_state(&mut document, &reducer_state, unix_timestamp_millis());
 
-        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
-            previous_reducer_state.as_ref(),
-            Some(&reducer_state),
-        );
+        let stale_conflict_deletes =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let document_target = self.document_ref();
         let placement = placement_ref_for_target(&document, &document_target, Default::default());
         let mut writes = vec![
@@ -399,7 +429,7 @@ impl EnsureRealmConfigOperation {
                 document_target.storage_key(),
                 document.to_bytes(&self.config.actor)?.into(),
             ),
-            admin_document_reducer_state_write_entry(&reducer_state)?,
+            reducer_state_entry(&reducer_state)?,
         ];
         for admin_event in admin_events {
             let record = new_outbox_record_with_id(
@@ -413,7 +443,7 @@ impl EnsureRealmConfigOperation {
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
-        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+        writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
         self.state = EnsureRealmConfigState::WriteDocumentAndAdminState {
@@ -488,10 +518,9 @@ impl Operation for EnsureRealmConfigOperation {
                             format!("{values:?}"),
                         );
                     };
-                    match self.emit_write_document_and_admin_state(
-                        document_value.clone(),
-                        reducer_state_value.clone(),
-                    ) {
+                    match self
+                        .emit_document_write(document_value.clone(), reducer_state_value.clone())
+                    {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }
@@ -628,7 +657,7 @@ fn pool_transfer_slice(spans: &[(u32, u32)], consumed: &[HandleRange]) -> Option
     (bands >= 2).then(|| (start + bands.div_ceil(2) * HANDLE_RANGE_SIZE, end))
 }
 
-fn apply_realm_config_node_ensure(
+fn apply_node_ensure(
     state: &mut AdminDocumentReducerState,
     actor: &Actor,
     node_id: NodeId,
@@ -648,49 +677,49 @@ fn apply_realm_config_node_ensure(
     Ok(event)
 }
 
-pub(crate) fn overlay_realm_config_reducer_materialization(
+pub(crate) fn overlay_reducer_state(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
     now_ms: u64,
 ) {
     for path in reducer_state.conflicts.keys() {
-        if let Some(node_id) = realm_config_node_id_from_path(path) {
-            remove_realm_config_node(config, &node_id);
+        if let Some(node_id) = parse_config_node(path) {
+            remove_config_node(config, &node_id);
         }
     }
 
     for node_id in reducer_state.removed_config_nodes() {
-        remove_realm_config_node(config, &node_id);
+        remove_config_node(config, &node_id);
     }
 
-    for (node_id, kind) in reducer_state.materialized_realm_config_nodes() {
-        let path = realm_config_node_path(&node_id);
+    for (node_id, kind) in reducer_state.materialized_config_nodes() {
+        let path = config_node_path(&node_id);
         if reducer_state.conflicts.contains_key(&path) {
-            remove_realm_config_node(config, &node_id);
+            remove_config_node(config, &node_id);
             continue;
         }
         config.ensure_node(node_id, kind);
     }
 
-    overlay_realm_config_placement_reducer_materialization(config, reducer_state, now_ms);
+    overlay_placement(config, reducer_state, now_ms);
 }
 
-fn realm_config_node_ensure_is_noop(
+fn node_ensure_noop(
     document: &RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
     node_id: &NodeId,
     kind: &RealmNodeKind,
 ) -> bool {
-    let path = realm_config_node_path(node_id);
+    let path = config_node_path(node_id);
     !reducer_state.conflicts.contains_key(&path)
         && reducer_state
-            .materialized_realm_config_nodes()
+            .materialized_config_nodes()
             .get(node_id)
             .is_some_and(|materialized_kind| materialized_kind == kind)
-        && realm_config_document_has_node_kind(document, node_id, kind)
+        && config_node_kind(document, node_id, kind)
 }
 
-fn realm_config_document_has_node_kind(
+fn config_node_kind(
     document: &RealmConfigDocument,
     node_id: &NodeId,
     kind: &RealmNodeKind,
@@ -700,7 +729,7 @@ fn realm_config_document_has_node_kind(
     matches.next().is_some_and(|node| node.kind == *kind) && matches.all(|node| node.kind == *kind)
 }
 
-fn remove_realm_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) {
+fn remove_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) {
     let node_id = node_id.to_string();
     config.nodes.retain(|node| node.node_id != node_id);
 }
@@ -725,7 +754,7 @@ mod tests {
         AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
         REALM_CONFIG_DEFAULT_STRATEGY_PATH,
     };
-    use aruna_core::storage_entries::admin_document_reducer_conflict_key;
+    use aruna_core::storage_entries::reducer_conflict_key;
     use aruna_core::structs::{
         Actor, BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS,
         HANDLE_RANGE_SIZE, HandleRange, NodePlacementEntry, PlacementOverride, PlacementStrategy,
@@ -739,8 +768,7 @@ mod tests {
 
     use super::{
         EnsureRealmConfigConfig, EnsureRealmConfigError, EnsureRealmConfigOperation,
-        EnsureRealmConfigState, overlay_realm_config_reducer_materialization,
-        realm_config_node_path,
+        EnsureRealmConfigState, config_node_path, overlay_reducer_state,
     };
 
     fn node(seed: u8) -> aruna_core::NodeId {
@@ -801,11 +829,11 @@ mod tests {
     }
 
     #[test]
-    fn writes_missing_config_reducer_state_outbox_and_stale_conflict_delete() {
+    fn writes_missing_config() {
         let realm_id = RealmId::from_bytes([1; 32]);
         let actor = actor(1, realm_id);
         let target = AdminDocumentTarget::RealmConfig { realm_id };
-        let path = realm_config_node_path(&actor.node_id);
+        let path = config_node_path(&actor.node_id);
         let mut previous_state = AdminDocumentReducerState::new(target.clone());
         for seed in [3, 4] {
             previous_state.clock.advance(node(seed), 1);
@@ -819,7 +847,7 @@ mod tests {
         operation.txn_id = Some(txn_id);
         let writes = batch_write(
             operation
-                .emit_write_document_and_admin_state(
+                .emit_document_write(
                     None,
                     Some(postcard::to_allocvec(&previous_state).unwrap().into()),
                 )
@@ -842,7 +870,7 @@ mod tests {
             .expect("create-if-missing seeds a default placement strategy");
         assert_eq!(default_strategy.replica_count, Some(7));
         assert_eq!(
-            state.materialized_realm_config_nodes()[&actor.node_id],
+            state.materialized_config_nodes()[&actor.node_id],
             RealmNodeKind::Management
         );
         assert_eq!(outbox.target, DocumentSyncTarget::RealmConfig { realm_id });
@@ -861,7 +889,7 @@ mod tests {
             Some(&Effect::Storage(StorageEffect::BatchDelete {
                 deletes: vec![(
                     ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
-                    admin_document_reducer_conflict_key(&target, &path),
+                    reducer_conflict_key(&target, &path),
                 )],
                 txn_id: Some(txn_id),
             }))
@@ -877,19 +905,14 @@ mod tests {
         let txn_id = TxnId::generate();
         operation.txn_id = Some(txn_id);
 
-        let writes = batch_write(
-            operation
-                .emit_write_document_and_admin_state(None, None)
-                .unwrap(),
-            txn_id,
-        );
+        let writes = batch_write(operation.emit_document_write(None, None).unwrap(), txn_id);
 
         let stored =
             RealmConfigDocument::from_bytes(write_value(&writes, REALM_CONFIG_KEYSPACE)).unwrap();
         let state: AdminDocumentReducerState =
             postcard::from_bytes(write_value(&writes, ADMIN_DOCUMENT_STATE_KEYSPACE)).unwrap();
 
-        let bindings = state.materialized_realm_config_strategy_bindings();
+        let bindings = state.materialized_strategy_bindings();
         assert!(!bindings.is_empty());
         assert_eq!(bindings.len(), stored.strategy_bindings.len());
         for binding in &stored.strategy_bindings {
@@ -943,10 +966,7 @@ mod tests {
         operation.txn_id = Some(txn_id);
         let writes = batch_write(
             operation
-                .emit_write_document_and_admin_state(
-                    Some(document.to_bytes(actor).unwrap().into()),
-                    None,
-                )
+                .emit_document_write(Some(document.to_bytes(actor).unwrap().into()), None)
                 .unwrap(),
             txn_id,
         );
@@ -1025,7 +1045,7 @@ mod tests {
         let txn_id = TxnId::generate();
         operation.txn_id = Some(txn_id);
         let effects = operation
-            .emit_write_document_and_admin_state(
+            .emit_document_write(
                 Some(merged.to_bytes(&actor_a).unwrap().into()),
                 Some(state_a.into()),
             )
@@ -1088,10 +1108,7 @@ mod tests {
         });
         operation.txn_id = Some(TxnId::generate());
         let error = operation
-            .emit_write_document_and_admin_state(
-                Some(document.to_bytes(&actor_a).unwrap().into()),
-                None,
-            )
+            .emit_document_write(Some(document.to_bytes(&actor_a).unwrap().into()), None)
             .unwrap_err();
         assert_eq!(
             error,
@@ -1102,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn idempotent_same_node_ensure_does_not_duplicate_config_node() {
+    fn same_node_idempotent() {
         let realm_id = RealmId::from_bytes([9; 32]);
         let actor = actor(9, realm_id);
         let mut document = pooled_document(realm_id, &[(1, actor.clone(), 0, HANDLE_BANDS)]);
@@ -1112,10 +1129,7 @@ mod tests {
         operation.txn_id = Some(txn_id);
         let writes = batch_write(
             operation
-                .emit_write_document_and_admin_state(
-                    Some(document.to_bytes(&actor).unwrap().into()),
-                    None,
-                )
+                .emit_document_write(Some(document.to_bytes(&actor).unwrap().into()), None)
                 .unwrap(),
             txn_id,
         );
@@ -1126,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_ensure_does_not_write_admin_outbox_event() {
+    fn repeated_ensure_quiet() {
         let realm_id = RealmId::from_bytes([10; 32]);
         let actor = actor(10, realm_id);
         let target = AdminDocumentTarget::RealmConfig { realm_id };
@@ -1169,7 +1183,7 @@ mod tests {
         document
             .placement_bindings
             .push(aruna_core::structs::PlacementBinding {
-                handle: aruna_core::identifiers::PlacementHandle::new(range.start).unwrap(),
+                handle: aruna_core::structured_id::PlacementHandle::new(range.start).unwrap(),
                 scope: aruna_core::structs::PlacementScope::Realm(realm_id),
                 document_class: DocumentClass::JobControl,
                 strategy_id: Ulid::from_bytes([12; 16]),
@@ -1182,7 +1196,7 @@ mod tests {
         let txn_id = TxnId::generate();
         operation.txn_id = Some(txn_id);
         let effects = operation
-            .emit_write_document_and_admin_state(
+            .emit_document_write(
                 Some(document.to_bytes(&actor).unwrap().into()),
                 Some(postcard::to_allocvec(&previous_state).unwrap().into()),
             )
@@ -1211,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_admin_outbox_finishes_without_direct_replication() {
+    fn scheduled_outbox_finishes() {
         let realm_id = RealmId::from_bytes([11; 32]);
         let actor = actor(11, realm_id);
         let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
@@ -1228,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_materializes_placement_fields_from_reducer_state() {
+    fn overlay_materializes_placement() {
         let realm_id = RealmId::from_bytes([21; 32]);
         let actor = actor(21, realm_id);
         let mut state =
@@ -1281,7 +1295,7 @@ mod tests {
         }
 
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        overlay_realm_config_reducer_materialization(&mut config, &state, 0);
+        overlay_reducer_state(&mut config, &state, 0);
 
         assert_eq!(config.placement_map, vec![entry]);
         assert_eq!(config.strategies, vec![strategy.clone()]);
@@ -1312,7 +1326,7 @@ mod tests {
             .unwrap();
 
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        overlay_realm_config_reducer_materialization(&mut config, &state, 0);
+        overlay_reducer_state(&mut config, &state, 0);
         assert!(
             config
                 .nodes
@@ -1326,7 +1340,7 @@ mod tests {
                 AdminDocumentOperation::RealmConfigNodeRemoved { node_id: device },
             )
             .unwrap();
-        overlay_realm_config_reducer_materialization(&mut config, &state, 0);
+        overlay_reducer_state(&mut config, &state, 0);
         assert!(
             config
                 .nodes
@@ -1336,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_clears_prior_default_strategy_on_reducer_conflict() {
+    fn overlay_clears_default() {
         let realm_id = RealmId::from_bytes([22; 32]);
         let actor_a = actor(22, realm_id);
         let actor_b = actor(23, realm_id);
@@ -1346,7 +1360,7 @@ mod tests {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.default_strategy_id = Some(prior_default);
 
-        overlay_realm_config_reducer_materialization(&mut config, &state, 0);
+        overlay_reducer_state(&mut config, &state, 0);
         assert_eq!(config.default_strategy_id, None);
 
         for (event_id, actor, strategy_id) in [
@@ -1379,14 +1393,14 @@ mod tests {
                 .conflicts
                 .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
         );
-        assert_eq!(state.materialized_realm_config_default_strategy(), None);
+        assert_eq!(state.materialized_default_strategy(), None);
 
-        overlay_realm_config_reducer_materialization(&mut config, &state, 0);
+        overlay_reducer_state(&mut config, &state, 0);
         assert_eq!(config.default_strategy_id, None);
     }
 
     #[test]
-    fn rejects_existing_node_kind_mismatch_when_configured() {
+    fn rejects_kind_mismatch() {
         let realm_id = RealmId::from_bytes([8; 32]);
         let actor = actor(8, realm_id);
         let target_node_id = node(7);
@@ -1402,10 +1416,7 @@ mod tests {
         operation.txn_id = Some(TxnId::generate());
 
         let error = operation
-            .emit_write_document_and_admin_state(
-                Some(document.to_bytes(&actor).unwrap().into()),
-                None,
-            )
+            .emit_document_write(Some(document.to_bytes(&actor).unwrap().into()), None)
             .unwrap_err();
 
         assert_eq!(

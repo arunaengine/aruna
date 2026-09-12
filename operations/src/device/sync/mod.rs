@@ -20,7 +20,7 @@ use aruna_core::structs::{
 };
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::types::NodeId;
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_tasks::TaskHandle;
 use thiserror::Error;
 use tracing::warn;
@@ -106,7 +106,7 @@ pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
         }
     }
     match work {
-        true => DrainOutcome::More,
+        true => DrainOutcome::Recheck,
         false => DrainOutcome::Idle,
     }
 }
@@ -356,7 +356,7 @@ async fn arm_timer(context: &Arc<DriverContext>, key: TaskKey) {
         return;
     };
     if let TaskEvent::Error { message, .. } = task_handle
-        .schedule_timer_if_idle(key, Duration::ZERO)
+        .schedule_idle_timer(key, Duration::ZERO)
         .await
     {
         warn!(message = %message, "Failed to arm a synced-folder timer");
@@ -372,7 +372,7 @@ pub async fn restore_sync_timers(context: &Arc<DriverContext>, task_handle: &Tas
         || local_is_device(context).await;
     if due
         && let TaskEvent::Error { message, .. } = task_handle
-            .schedule_timer_if_idle(TaskKey::ReconcileSyncedFolders, Duration::ZERO)
+            .schedule_idle_timer(TaskKey::ReconcileSyncedFolders, Duration::ZERO)
             .await
     {
         warn!(message = %message, "Failed to restore the synced-folder timer");
@@ -399,9 +399,8 @@ mod tests {
         }
     }
 
-    // The in-memory bound and the end of the listing can coincide. The window
-    // must then cover the keys after the last head, and the next pass must start
-    // over instead of listing exactly this window again forever.
+    // The in-memory bound and the listing end can coincide: the window must cover
+    // the keys after the last head, and the next pass restarts instead of repeating it.
     #[test]
     fn clears_final_boundary() {
         let mut exhausted = view("m.txt");

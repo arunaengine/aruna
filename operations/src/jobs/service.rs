@@ -1,7 +1,6 @@
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
-use aruna_core::identifiers::{BucketId, PlacementHandle};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ArtifactRef, AuthContext, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
@@ -11,9 +10,10 @@ use aruna_core::structs::{
     StagingJobCheckpoint, StagingJobSpec, StoragePurgeSpec, WorkspaceMode, pid_dedup_key,
     shard_for_subject, user_dedup_key,
 };
+use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{NodeId, UserId, Value};
-use aruna_core::util::unix_timestamp_millis;
 use bytes::Bytes;
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
@@ -27,12 +27,12 @@ use super::protocol::{JobRequest, JobResponse, JobRouteError, WireRange, send_jo
 use super::runtime::JobsRuntime;
 use super::staging::read_staging_checkpoint;
 use super::store::{
-    CancelRequestOutcome, JobMutationError, find_dedup_plan, list_job_entries, list_jobs_for_user,
-    read_artifact_tombstone, read_job_record, read_run_crate_status, set_cancel_requested,
+    CancelRequestOutcome, JobMutationError, find_dedup_plan, list_job_entries, list_user_jobs,
+    read_artifact_tombstone, read_crate_status, read_job_record, set_cancel_requested,
 };
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
-    schedule_job_drain_effect,
+    schedule_drain_effect,
 };
 use super::workflow::finalize_followups;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
@@ -76,13 +76,13 @@ pub(crate) async fn mint_local_job(
     let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
         SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
     })?;
-    mint_local_job_from_config(&config, owner_node_id, subject)
+    mint_configured_job(&config, owner_node_id, subject)
 }
 
 /// Synchronous form used by producer transactions that already fenced and read
 /// the realm config. The resulting job id and dedup shard can therefore be
 /// written atomically with the producer's own records.
-pub(crate) fn mint_local_job_from_config(
+pub(crate) fn mint_configured_job(
     config: &aruna_core::structs::RealmConfigDocument,
     owner_node_id: NodeId,
     subject: &[u8],
@@ -270,7 +270,7 @@ pub async fn submit_staging_job(
     .await
 }
 
-pub async fn submit_storage_purge_job(
+pub async fn submit_purge_job(
     context: &DriverContext,
     spec: StoragePurgeSpec,
     owner_node_id: NodeId,
@@ -474,11 +474,11 @@ pub async fn submit_export_job(
 }
 
 /// Read the run-crate obligation status surfaced alongside an execution job.
-pub async fn read_job_run_crate_status(
+pub async fn read_crate_obligation(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<RunCrateStatus>, String> {
-    read_run_crate_status(&context.storage_handle, job_id).await
+    read_crate_status(&context.storage_handle, job_id).await
 }
 
 /// Node-local listing: returns only jobs owned by the serving node (every job
@@ -491,7 +491,7 @@ pub async fn list_owned_jobs(
     limit: usize,
     filter: impl Fn(&JobRecord) -> bool,
 ) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
-    list_jobs_for_user(&context.storage_handle, user_id, cursor, limit, filter).await
+    list_user_jobs(&context.storage_handle, user_id, cursor, limit, filter).await
 }
 
 pub async fn read_owned_job(
@@ -632,7 +632,7 @@ pub(crate) async fn local_status(
         .await
         .map_err(JobRouteError::Internal)?
         .ok_or(JobRouteError::NotFound)?;
-    let run_crate = read_job_run_crate_status(context, job_id)
+    let run_crate = read_crate_obligation(context, job_id)
         .await
         .map_err(JobRouteError::Internal)?
         .map(|status| status.to_public_json());
@@ -1314,7 +1314,7 @@ fn artifact_job_matches(artifact: &OwnedArtifact, user_id: UserId, job_id: JobId
 pub(crate) async fn kick_drain(context: &DriverContext) {
     if let Some(task_handle) = context.task_handle.as_ref()
         && let Event::Task(TaskEvent::Error { message, .. }) =
-            task_handle.send_effect(schedule_job_drain_effect()).await
+            task_handle.send_effect(schedule_drain_effect()).await
     {
         warn!(message = %message, "Failed to kick job drain");
     }

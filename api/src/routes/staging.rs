@@ -1,6 +1,6 @@
 use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, bucket_blob_permission_path, ensure_permission,
-    parse_group_id, parse_source_connector_id, require_realm_auth,
+    ValidatedArunaBearerTokenCarrier, blob_permission_path, ensure_permission,
+    parse_group_id, parse_connector_id, require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::connectors::ApiSourceConnectorKind;
@@ -13,7 +13,7 @@ use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::structs::{
     AuthContext, BucketInfo, JobPayload, JobRecord, JobState, Permission, SourceEntry,
     SourceEntryKind, StagingJobCheckpoint, StagingJobItem, StagingJobPhase, StagingJobPrefix,
-    StagingJobSpec, StagingStrategy, blob_bucket_permission_path,
+    StagingJobSpec, StagingStrategy, bucket_permission_path,
 };
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
@@ -403,7 +403,7 @@ pub async fn stage_batch(
 
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&request.group_id)?;
-    let connector_id = parse_source_connector_id(&request.connector_id)?;
+    let connector_id = parse_connector_id(&request.connector_id)?;
     if request.strategy == ApiStagingStrategy::Sync {
         return Err(ServerError::Unimplemented);
     }
@@ -423,7 +423,7 @@ pub async fn stage_batch(
     ensure_batch_capacity(0, items.len(), BATCH_LIMIT)?;
     let prefixes = request.prefixes.unwrap_or_default();
     if !prefixes.is_empty() {
-        crate::routes::connectors::ensure_group_data_permission(
+        crate::routes::connectors::ensure_data_permission(
             &state,
             &auth,
             group_id,
@@ -566,7 +566,7 @@ pub async fn submit_staging(
 ) -> ServerResult<(StatusCode, Json<SubmitStagingJobResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&request.group_id)?;
-    let connector_id = parse_source_connector_id(&request.connector_id)?;
+    let connector_id = parse_connector_id(&request.connector_id)?;
     if request.strategy == ApiStagingStrategy::Sync {
         return Err(ServerError::Unimplemented);
     }
@@ -589,7 +589,7 @@ pub async fn submit_staging(
 
     let mut items = Vec::new();
     for item in request.items.unwrap_or_default() {
-        validate_relative_source_path(&item.source_path)?;
+        validate_source_path(&item.source_path)?;
         if item.target_key.trim().is_empty() {
             return Err(ServerError::BadRequest);
         }
@@ -597,7 +597,7 @@ pub async fn submit_staging(
         ensure_permission(
             &state,
             &auth,
-            bucket_blob_permission_path(&state, group_id, &request.bucket, &item.target_key),
+            blob_permission_path(&state, group_id, &request.bucket, &item.target_key),
             Permission::WRITE,
         )
         .await?;
@@ -621,7 +621,7 @@ pub async fn submit_staging(
         ensure_permission(
             &state,
             &auth,
-            bucket_blob_permission_path(
+            blob_permission_path(
                 &state,
                 group_id,
                 &request.bucket,
@@ -908,7 +908,7 @@ pub async fn list_references(
     ensure_permission(
         &state,
         &auth,
-        blob_bucket_permission_path(
+        bucket_permission_path(
             state.get_realm_id(),
             bucket_info.group_id,
             state.get_node_id(),
@@ -1163,7 +1163,7 @@ fn normalize_prefix(prefix: &str) -> ServerResult<String> {
     if prefix.is_empty() || prefix == "." {
         return Ok(String::new());
     }
-    validate_relative_source_path(prefix)?;
+    validate_source_path(prefix)?;
     Ok(format!("{}/", prefix.trim().trim_end_matches('/')))
 }
 
@@ -1203,7 +1203,7 @@ async fn snapshot_blob(
     request: StageBlobTargetRequest,
 ) -> ServerResult<(StatusCode, Json<StageBlobResponse>)> {
     let group_id = parse_group_id(&request.group_id)?;
-    let connector_id = parse_source_connector_id(&request.connector_id)?;
+    let connector_id = parse_connector_id(&request.connector_id)?;
     let bucket_info = load_bucket_info(&state, &request.bucket).await?;
     if bucket_info.group_id != group_id {
         return Err(ServerError::NotFound);
@@ -1212,13 +1212,13 @@ async fn snapshot_blob(
     ensure_permission(
         &state,
         &auth,
-        bucket_blob_permission_path(&state, group_id, &request.bucket, &request.key),
+        blob_permission_path(&state, group_id, &request.bucket, &request.key),
         Permission::WRITE,
     )
     .await?;
     ensure_source_permission(&state, &auth, group_id, connector_id, &request.source_path).await?;
 
-    let quota_ceiling = resolve_group_quota_ceiling(&state, group_id).await?;
+    let quota_ceiling = resolve_quota_ceiling(&state, group_id).await?;
 
     let result = stage_snapshot_blob(
         &state.get_ctx(),
@@ -1240,7 +1240,7 @@ async fn snapshot_blob(
     .await
     .map_err(map_snapshot_error)?;
 
-    queue_live_version_replication(
+    queue_live_replication(
         &state,
         auth,
         request.bucket.clone(),
@@ -1271,7 +1271,7 @@ async fn reference_blob(
     request: StageBlobTargetRequest,
 ) -> ServerResult<(StatusCode, Json<StageBlobResponse>)> {
     let group_id = parse_group_id(&request.group_id)?;
-    let connector_id = parse_source_connector_id(&request.connector_id)?;
+    let connector_id = parse_connector_id(&request.connector_id)?;
     let bucket_info = load_bucket_info(&state, &request.bucket).await?;
     if bucket_info.group_id != group_id {
         return Err(ServerError::NotFound);
@@ -1280,7 +1280,7 @@ async fn reference_blob(
     ensure_permission(
         &state,
         &auth,
-        bucket_blob_permission_path(&state, group_id, &request.bucket, &request.key),
+        blob_permission_path(&state, group_id, &request.bucket, &request.key),
         Permission::WRITE,
     )
     .await?;
@@ -1303,7 +1303,7 @@ async fn reference_blob(
     .await
     .map_err(map_reference_error)?;
 
-    queue_live_version_replication(
+    queue_live_replication(
         &state,
         auth,
         request.bucket.clone(),
@@ -1331,7 +1331,7 @@ async fn reference_blob(
 /// Resolves the hard byte ceiling for a group's realm-wide `logical_bytes` from
 /// the realm quota config, mirroring the S3 surface's `resolve_quota_ceiling`.
 /// `None` means the group is unlimited.
-async fn resolve_group_quota_ceiling(
+async fn resolve_quota_ceiling(
     state: &ServerState,
     group_id: ulid::Ulid,
 ) -> ServerResult<Option<u64>> {
@@ -1365,12 +1365,12 @@ async fn ensure_source_permission(
     connector_id: ulid::Ulid,
     source_path: &str,
 ) -> ServerResult<()> {
-    validate_relative_source_path(source_path)?;
+    validate_source_path(source_path)?;
 
     ensure_permission(
         state,
         auth,
-        source_connector_permission_path(state, group_id, connector_id, source_path),
+        connector_permission_path(state, group_id, connector_id, source_path),
         Permission::READ,
     )
     .await
@@ -1386,13 +1386,13 @@ async fn ensure_prefix_permission(
     ensure_permission(
         state,
         auth,
-        source_connector_permission_path(state, group_id, connector_id, source_prefix),
+        connector_permission_path(state, group_id, connector_id, source_prefix),
         Permission::READ,
     )
     .await
 }
 
-fn source_connector_permission_path(
+fn connector_permission_path(
     state: &ServerState,
     group_id: ulid::Ulid,
     connector_id: ulid::Ulid,
@@ -1405,7 +1405,7 @@ fn source_connector_permission_path(
     )
 }
 
-fn validate_relative_source_path(source_path: &str) -> ServerResult<()> {
+fn validate_source_path(source_path: &str) -> ServerResult<()> {
     let trimmed = source_path.trim();
     if trimmed.is_empty() {
         return Err(ServerError::BadRequest);
@@ -1437,7 +1437,7 @@ fn validate_relative_source_path(source_path: &str) -> ServerResult<()> {
 
 fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
     match error {
-        MaterializeSnapshotError::Read(error) => map_read_staging_error(error),
+        MaterializeSnapshotError::Read(error) => map_read_error(error),
         MaterializeSnapshotError::Write(PutObjectError::QuotaExceeded { .. }) => {
             ServerError::Forbidden
         }
@@ -1455,7 +1455,7 @@ fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
 
 fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
     match error {
-        MaterializeReferenceError::Head(error) => map_head_staging_error(error),
+        MaterializeReferenceError::Head(error) => map_head_error(error),
         MaterializeReferenceError::Storage(error) => ServerError::InternalError(error.to_string()),
         MaterializeReferenceError::Conversion(error) => {
             ServerError::InternalError(error.to_string())
@@ -1468,23 +1468,23 @@ fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
     }
 }
 
-fn map_head_staging_error(error: HeadStagingSourceError) -> ServerError {
+fn map_head_error(error: HeadStagingSourceError) -> ServerError {
     match error {
-        HeadStagingSourceError::Resolve(error) => map_connector_resolution_error(error),
-        HeadStagingSourceError::Staging(error) => map_staging_source_error(error),
+        HeadStagingSourceError::Resolve(error) => map_resolution_error(error),
+        HeadStagingSourceError::Staging(error) => map_source_error(error),
         _ => ServerError::InternalError(error.to_string()),
     }
 }
 
-fn map_read_staging_error(error: ReadStagingSourceError) -> ServerError {
+fn map_read_error(error: ReadStagingSourceError) -> ServerError {
     match error {
-        ReadStagingSourceError::Resolve(error) => map_connector_resolution_error(error),
-        ReadStagingSourceError::Staging(error) => map_staging_source_error(error),
+        ReadStagingSourceError::Resolve(error) => map_resolution_error(error),
+        ReadStagingSourceError::Staging(error) => map_source_error(error),
         _ => ServerError::InternalError(error.to_string()),
     }
 }
 
-fn map_connector_resolution_error(error: SourceConnectorResolutionError) -> ServerError {
+fn map_resolution_error(error: SourceConnectorResolutionError) -> ServerError {
     match error {
         SourceConnectorResolutionError::NotFound => ServerError::NotFound,
         SourceConnectorResolutionError::InvalidSourcePath
@@ -1493,7 +1493,7 @@ fn map_connector_resolution_error(error: SourceConnectorResolutionError) -> Serv
     }
 }
 
-fn map_staging_source_error(error: StagingSourceError) -> ServerError {
+fn map_source_error(error: StagingSourceError) -> ServerError {
     match error {
         StagingSourceError::NotFound => ServerError::NotFound,
         _ => ServerError::BadGateway,
@@ -1502,13 +1502,13 @@ fn map_staging_source_error(error: StagingSourceError) -> ServerError {
 
 fn map_list_error(error: ListStagingSourceError) -> ServerError {
     match error {
-        ListStagingSourceError::Resolve(error) => map_connector_resolution_error(error),
-        ListStagingSourceError::Staging(error) => map_staging_source_error(error),
+        ListStagingSourceError::Resolve(error) => map_resolution_error(error),
+        ListStagingSourceError::Staging(error) => map_source_error(error),
         _ => ServerError::InternalError(error.to_string()),
     }
 }
 
-async fn queue_live_version_replication(
+async fn queue_live_replication(
     state: &ServerState,
     auth_context: AuthContext,
     bucket: String,
@@ -1605,7 +1605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_requires_concrete_source_read_permission() {
+    async fn snapshot_requires_read() {
         let test = setup_state().await;
 
         let result = snapshot_blob(
@@ -1625,7 +1625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reference_allows_request_past_auth_when_source_read_is_granted() {
+    async fn reference_auth_succeeds() {
         let test = setup_state().await;
 
         let result = reference_blob(
@@ -1751,7 +1751,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staging_queue_failure_after_snapshot_commit_leaves_obligation_repairable() {
+    async fn queue_failure_repairable() {
         let test = setup_state().await;
         let version_id = Ulid::generate();
         write_doc(
@@ -1779,7 +1779,7 @@ mod tests {
         )
         .await;
 
-        queue_live_version_replication(
+        queue_live_replication(
             &test.state,
             test.auth_with_source_read,
             test.bucket,
@@ -1820,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_quota_exceeded_maps_to_forbidden() {
+    fn quota_maps_forbidden() {
         let error = map_snapshot_error(MaterializeSnapshotError::Write(
             PutObjectError::QuotaExceeded {
                 limit: 100,
@@ -1968,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn openapi_includes_staging_path() {
+    fn openapi_has_staging() {
         let openapi = ApiDoc::openapi();
 
         assert!(openapi.paths.paths.contains_key("/data/staging"));
@@ -2132,7 +2132,7 @@ mod tests {
 
         let bucket_group_id = Ulid::generate();
         let source_group_id = Ulid::generate();
-        let mut bucket_auth = GroupAuthorizationDocument::new_default_group_doc(
+        let mut bucket_auth = GroupAuthorizationDocument::default_group_doc(
             user_with_source_read,
             realm_id,
             bucket_group_id,
@@ -2140,7 +2140,7 @@ mod tests {
         for role in bucket_auth.roles.values_mut() {
             role.assigned_users.insert(user_without_source_read);
         }
-        let mut source_auth = GroupAuthorizationDocument::new_default_group_doc(
+        let mut source_auth = GroupAuthorizationDocument::default_group_doc(
             user_with_source_read,
             realm_id,
             source_group_id,
@@ -2225,14 +2225,14 @@ mod tests {
             .await,
         );
 
-        let target_path = crate::auth::bucket_blob_permission_path(
+        let target_path = crate::auth::blob_permission_path(
             state.as_ref(),
             bucket_group_id,
             &bucket,
             &key,
         );
-        let bucket_path = blob_bucket_permission_path(realm_id, bucket_group_id, node_id, &bucket);
-        let source_path_restriction = source_connector_permission_path(
+        let bucket_path = bucket_permission_path(realm_id, bucket_group_id, node_id, &bucket);
+        let source_path_restriction = connector_permission_path(
             state.as_ref(),
             bucket_group_id,
             connector_id,

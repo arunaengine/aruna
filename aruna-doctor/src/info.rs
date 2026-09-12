@@ -106,7 +106,7 @@ pub(crate) fn resolve_token(token: Option<String>) -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-pub(crate) fn default_info_url_from_env() -> Result<String, CliError> {
+pub(crate) fn default_info_url() -> Result<String, CliError> {
     let http_socket_addr: SocketAddr = dotenvy::var("SOCKET_ADDRESS")?.parse()?;
     Ok(info_url(http_socket_addr))
 }
@@ -115,10 +115,10 @@ pub(crate) async fn fetch_info(
     http_socket_addr: SocketAddr,
     token: Option<&str>,
 ) -> Result<InfoResponse, CliError> {
-    fetch_info_url_with_timeout(&info_url(http_socket_addr), Duration::from_secs(10), token).await
+    fetch_info_url(&info_url(http_socket_addr), Duration::from_secs(10), token).await
 }
 
-pub(crate) async fn fetch_info_url_with_timeout(
+pub(crate) async fn fetch_info_url(
     url: &str,
     timeout: Duration,
     token: Option<&str>,
@@ -503,7 +503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn doctor_reports_public_urls_without_fallbacks() {
+    async fn reports_public_urls() {
         let _env_lock = env_lock().lock().await;
         let _guard = TestEnvGuard::set(&[
             ("API_PUBLIC_URL", "https://api.example.test".to_string()),

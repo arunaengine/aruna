@@ -1,9 +1,7 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! Debug probe (not a release gate): measures create-path latency with the
-//! materialization drain running concurrently vs. left idle. Run pinned to a
-//! few cores to mimic a cluster pod:
-//! `taskset -c 0-3 cargo test -p aruna-operations --test metadata_create_backpressure -- --ignored --nocapture`
+//! Debug probe (not a release gate): measures create-path latency with the materialization
+//! drain running concurrently vs.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,7 +17,7 @@ use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::metadata::projector::project_metadata_create_events_from_log;
+use aruna_operations::metadata::projector::project_logged_events;
 use aruna_operations::tasks::incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -137,16 +135,14 @@ async fn run_writer(
         };
         let started = Instant::now();
         let created = drive(
-            CreateMetadataDocumentOperation::new_for_generated_document_id(
-                CreateMetadataDocumentConfig {
-                    actor: actor.clone(),
-                    group_id,
-                    document_id,
-                    document_path,
-                    public: true,
-                    payload,
-                },
-            ),
+            CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+                actor: actor.clone(),
+                group_id,
+                document_id,
+                document_path,
+                public: true,
+                payload,
+            }),
             context.as_ref(),
         )
         .await
@@ -154,13 +150,13 @@ async fn run_writer(
         latencies.push(started.elapsed());
         batch.push((created.record.document_id, created.event_id));
         if batch.len() >= PROJECTION_BATCH {
-            project_metadata_create_events_from_log(context.as_ref(), batch.drain(..))
+            project_logged_events(context.as_ref(), batch.drain(..))
                 .await
                 .map_err(|error| format!("projection failed: {error:?}"))?;
         }
     }
     if !batch.is_empty() {
-        project_metadata_create_events_from_log(context.as_ref(), batch)
+        project_logged_events(context.as_ref(), batch)
             .await
             .map_err(|error| format!("projection failed: {error:?}"))?;
     }

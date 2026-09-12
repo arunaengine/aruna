@@ -5,13 +5,13 @@ use std::time::Duration;
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::identifiers::StructuredId;
+use aruna_core::structured_id::StructuredId;
 use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
 use aruna_core::metadata::{MetadataAuthToken, MetadataError};
 use aruna_core::structs::{Actor, AuthContext, RealmConfigDocument, RealmId};
 use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, TxnId};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
@@ -23,39 +23,39 @@ use crate::metadata::create_document::{
     CreateMetadataDocumentPayload, mint_forward_document,
 };
 use crate::metadata::forward::{
-    MetadataWriteError, apply_batch_routed, create_metadata_document_routed,
+    MetadataWriteError, apply_batch_routed, route_metadata_create,
 };
 use crate::metadata::update_document::UpdateMetadataDocumentError;
 use crate::placement::process_placements::load_realm_config;
 
-use super::backlog::{BacklogDrain, arm_timer, drain_backlog, exhausted, retry_due_ms};
-use super::intake::{
-    IntakeEntry, IntakeKind, IntakeState, MAX_INTAKE_ATTEMPTS, entry_with_state, intake_entry,
-    read_intake, scan_intake,
+use super::backlog::{ForwardOutcome, QueueDrain, arm_timer, drain_queue, exhausted, retry_due_ms};
+use super::publish_queue::{
+    MAX_PUBLISH_ATTEMPTS, PublishEntry, PublishKind, PublishState, entry_with_state, publish_entry,
+    read_publish_entry, scan_publish_queue,
 };
 use super::replica::{read_replica, store_replica};
 use super::selection::track_created;
 
 /// Delay before a deferred pass looks for the realm again.
-pub const INTAKE_DEFER_RETRY_AFTER: Duration = Duration::from_secs(15);
+pub const PUBLISH_DEFER_RETRY_AFTER: Duration = Duration::from_secs(15);
 
 /// Delay between passes while entries are still due.
-pub const INTAKE_CONTINUE_AFTER: Duration = Duration::from_millis(250);
+pub const PUBLISH_CONTINUE_AFTER: Duration = Duration::from_millis(250);
 
 /// What one drain pass achieved, so the caller knows how soon to look again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrainOutcome {
-    /// The realm is not usable yet and nothing was forwarded.
+    /// The pass could not complete; earlier pages may already be forwarded.
     Deferred,
-    /// Entries are still due after this pass.
-    More,
-    /// No entry is due.
+    /// At least one entry asked for another pass; it does not prove entries remain.
+    Recheck,
+    /// No entry asked for another pass.
     Idle,
 }
 
 /// Forwards every due entry of the whole queue, oldest first. The scan pages
 /// past entries it skips, so published and parked ones cannot starve the tail.
-pub async fn drain_intake(context: &Arc<DriverContext>) -> DrainOutcome {
+pub async fn drain_publish_queue(context: &Arc<DriverContext>) -> DrainOutcome {
     let Some(net_handle) = context.net_handle.as_ref() else {
         return DrainOutcome::Deferred;
     };
@@ -66,9 +66,9 @@ pub async fn drain_intake(context: &Arc<DriverContext>) -> DrainOutcome {
     };
 
     let now = unix_timestamp_millis();
-    drain_backlog(
+    drain_queue(
         now,
-        IntakeDrain {
+        PublishDrain {
             context,
             config: &config,
             realm_id,
@@ -78,22 +78,22 @@ pub async fn drain_intake(context: &Arc<DriverContext>) -> DrainOutcome {
     .await
 }
 
-/// One intake drain plane handed to the shared page loop.
-struct IntakeDrain<'a> {
+/// One publish drain queue handed to the shared page loop.
+struct PublishDrain<'a> {
     context: &'a Arc<DriverContext>,
     config: &'a RealmConfigDocument,
     realm_id: RealmId,
     node_id: aruna_core::NodeId,
 }
 
-impl BacklogDrain for IntakeDrain<'_> {
-    type Row = IntakeEntry;
+impl QueueDrain for PublishDrain<'_> {
+    type Entry = PublishEntry;
 
-    async fn read(&mut self, cursor: Option<Key>) -> Option<(Vec<IntakeEntry>, Option<Key>)> {
+    async fn read(&mut self, cursor: Option<Key>) -> Option<(Vec<PublishEntry>, Option<Key>)> {
         read_page(self.context, cursor).await
     }
 
-    async fn forward(&mut self, entry: IntakeEntry) -> bool {
+    async fn forward(&mut self, entry: PublishEntry) -> ForwardOutcome {
         let Some(claim) = claim_entry(
             self.context,
             self.config,
@@ -103,11 +103,13 @@ impl BacklogDrain for IntakeDrain<'_> {
         )
         .await
         else {
-            return true;
+            // A failed claim still asks for another pass: the entry may have
+            // advanced rather than the queue being empty.
+            return ForwardOutcome::Recheck;
         };
-        let next = publish_entry(self.context, self.realm_id, self.node_id, &entry, &claim).await;
+        let next = forward_entry(self.context, self.realm_id, self.node_id, &entry, &claim).await;
         store_entry(self.context, &entry_with_state(&entry, next)).await;
-        true
+        ForwardOutcome::Recheck
     }
 }
 
@@ -116,8 +118,8 @@ impl BacklogDrain for IntakeDrain<'_> {
 async fn read_page(
     context: &Arc<DriverContext>,
     cursor: Option<Key>,
-) -> Option<(Vec<IntakeEntry>, Option<Key>)> {
-    let Effect::Storage(effect) = scan_intake(cursor, None) else {
+) -> Option<(Vec<PublishEntry>, Option<Key>)> {
+    let Effect::Storage(effect) = scan_publish_queue(cursor, None) else {
         return None;
     };
     match context.storage_handle.send_storage_effect(effect).await {
@@ -127,16 +129,16 @@ async fn read_page(
         }) => Some((
             values
                 .into_iter()
-                .filter_map(|(_, bytes)| IntakeEntry::from_bytes(&bytes).ok())
+                .filter_map(|(_, bytes)| PublishEntry::from_bytes(&bytes).ok())
                 .collect(),
             next_start_after,
         )),
         Event::Storage(StorageEvent::Error { error }) => {
-            warn!(error = %error, "Failed to scan the device authoring intake");
+            warn!(error = %error, "Failed to scan the device publish queue");
             None
         }
         other => {
-            warn!(event = ?other, "Unexpected event while scanning the device authoring intake");
+            warn!(event = ?other, "Unexpected event while scanning the device publish queue");
             None
         }
     }
@@ -147,8 +149,8 @@ async fn read_page(
 /// back as `Publishing`.
 pub(super) async fn claim_state(
     context: &Arc<DriverContext>,
-    entry: &IntakeEntry,
-    next: IntakeState,
+    entry: &PublishEntry,
+    next: PublishState,
 ) -> bool {
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
         .storage_handle
@@ -176,23 +178,23 @@ pub(super) async fn claim_state(
 
 async fn write_claim(
     context: &Arc<DriverContext>,
-    entry: &IntakeEntry,
-    next: IntakeState,
+    entry: &PublishEntry,
+    next: PublishState,
     txn_id: TxnId,
 ) -> bool {
-    let Effect::Storage(read) = read_intake(entry.draft_id, Some(txn_id)) else {
+    let Effect::Storage(read) = read_publish_entry(entry.draft_id, Some(txn_id)) else {
         return false;
     };
     let current = match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(bytes), ..
-        }) => IntakeEntry::from_bytes(&bytes).ok(),
+        }) => PublishEntry::from_bytes(&bytes).ok(),
         _ => None,
     };
     if !current.is_some_and(|current| current.state == entry.state) {
         return false;
     }
-    let Ok((key_space, key, value)) = intake_entry(&entry_with_state(entry, next)) else {
+    let Ok((key_space, key, value)) = publish_entry(&entry_with_state(entry, next)) else {
         warn!(draft_id = %entry.draft_id, "Failed to encode a queued draft");
         return false;
     };
@@ -210,8 +212,8 @@ async fn write_claim(
     )
 }
 
-async fn store_entry(context: &Arc<DriverContext>, entry: &IntakeEntry) {
-    let Ok((key_space, key, value)) = intake_entry(entry) else {
+async fn store_entry(context: &Arc<DriverContext>, entry: &PublishEntry) {
+    let Ok((key_space, key, value)) = publish_entry(entry) else {
         warn!(draft_id = %entry.draft_id, "Failed to encode a queued draft");
         return;
     };
@@ -243,13 +245,13 @@ async fn claim_entry(
     config: &RealmConfigDocument,
     realm_id: RealmId,
     node_id: aruna_core::NodeId,
-    entry: &IntakeEntry,
+    entry: &PublishEntry,
 ) -> Option<Claim> {
     let attempts = entry.attempts().saturating_add(1);
     let document_id = match (&entry.kind, &entry.state) {
         // An edit already names its document; nothing is minted for it.
-        (IntakeKind::Edit { document_id, .. }, _) => *document_id,
-        (_, IntakeState::Publishing { document_id, .. }) => *document_id,
+        (PublishKind::Edit { document_id, .. }, _) => *document_id,
+        (_, PublishState::Publishing { document_id, .. }) => *document_id,
         _ => {
             let actor = Actor {
                 node_id,
@@ -267,13 +269,12 @@ async fn claim_entry(
         }
     };
 
-    // The minted id is stored before the forward, so a crash mid-publish re-forwards
-    // the same id and the holder's create fence dedups it. A claim that does not
-    // commit stops the attempt; forwarding anyway would mint a second id on crash.
+    // The minted id is stored before the forward, so a crash re-forwards the
+    // same id and the holder's create fence dedups it; an uncommitted claim stops it.
     claim_state(
         context,
         entry,
-        IntakeState::Publishing {
+        PublishState::Publishing {
             document_id,
             due_at_ms: unix_timestamp_millis(),
             attempts,
@@ -289,13 +290,13 @@ async fn claim_entry(
 /// Forwards one claimed entry and answers with the state it must be stored
 /// under. The entry is `Publishing` by then, so the owner cannot delete it
 /// underneath the forward.
-async fn publish_entry(
+async fn forward_entry(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     node_id: aruna_core::NodeId,
-    entry: &IntakeEntry,
+    entry: &PublishEntry,
     claim: &Claim,
-) -> IntakeState {
+) -> PublishState {
     let actor = Actor {
         node_id,
         user_id: entry.owner,
@@ -311,10 +312,10 @@ async fn publish_entry(
         path_restrictions: None,
         session: None,
     };
-    if matches!(entry.kind, IntakeKind::Edit { .. }) {
+    if matches!(entry.kind, PublishKind::Edit { .. }) {
         return publish_edit(context, realm_id, entry, claim, auth).await;
     }
-    let operation = CreateMetadataDocumentOperation::new_for_generated_document_id(
+    let operation = CreateMetadataDocumentOperation::new_generated_id(
         CreateMetadataDocumentConfig {
             actor,
             group_id: entry.group_id,
@@ -326,7 +327,7 @@ async fn publish_entry(
             },
         },
     );
-    match create_metadata_document_routed(
+    match route_metadata_create(
         operation,
         context.clone(),
         Some(MetadataAuthToken::internal(auth)),
@@ -342,7 +343,7 @@ async fn publish_entry(
                 entry.document_path.clone(),
             )
             .await;
-            IntakeState::Published { document_id }
+            PublishState::Published { document_id }
         }
         // The id was minted for this entry alone, so an existing document under
         // it is this entry's own earlier forward.
@@ -354,9 +355,9 @@ async fn publish_entry(
                 entry.document_path.clone(),
             )
             .await;
-            IntakeState::Published { document_id }
+            PublishState::Published { document_id }
         }
-        Err(error) if permanent(&error) => IntakeState::Failed {
+        Err(error) if permanent(&error) => PublishState::Failed {
             reason: error.to_string(),
             retryable: false,
             document_id: None,
@@ -372,17 +373,17 @@ async fn publish_entry(
 async fn publish_edit(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
-    entry: &IntakeEntry,
+    entry: &PublishEntry,
     claim: &Claim,
     auth: AuthContext,
-) -> IntakeState {
-    let IntakeKind::Edit {
+) -> PublishState {
+    let PublishKind::Edit {
         document_id,
         batch,
         authored,
     } = &entry.kind
     else {
-        return IntakeState::Failed {
+        return PublishState::Failed {
             reason: "not an edit".to_string(),
             retryable: false,
             document_id: None,
@@ -401,11 +402,11 @@ async fn publish_edit(
         Ok(_) => {
             info!(draft_id = %entry.draft_id, document_id = %document_id, "Published an offline edit");
             settle_edit(context, *document_id).await;
-            IntakeState::Published {
+            PublishState::Published {
                 document_id: *document_id,
             }
         }
-        Err(error) if permanent(&error) => IntakeState::Failed {
+        Err(error) if permanent(&error) => PublishState::Failed {
             reason: error.to_string(),
             retryable: false,
             document_id: Some(*document_id),
@@ -437,15 +438,15 @@ fn permanent(error: &MetadataWriteError) -> bool {
 }
 
 /// Backoff before the entry is minted: nothing has been forwarded yet.
-fn retry_state(attempts: u32, reason: String) -> IntakeState {
-    if exhausted(attempts, MAX_INTAKE_ATTEMPTS) {
-        return IntakeState::Failed {
+fn retry_state(attempts: u32, reason: String) -> PublishState {
+    if exhausted(attempts, MAX_PUBLISH_ATTEMPTS) {
+        return PublishState::Failed {
             reason,
             retryable: true,
             document_id: None,
         };
     }
-    IntakeState::Pending {
+    PublishState::Pending {
         due_at_ms: retry_due_ms(attempts),
         attempts,
         last_error: Some(reason),
@@ -454,15 +455,15 @@ fn retry_state(attempts: u32, reason: String) -> IntakeState {
 
 /// Backoff after a forward whose outcome is unknown. The minted id is kept so
 /// the next attempt is the same create rather than a second document.
-fn publishing_retry(document_id: Ulid, attempts: u32, reason: String) -> IntakeState {
-    if exhausted(attempts, MAX_INTAKE_ATTEMPTS) {
-        return IntakeState::Failed {
+fn publishing_retry(document_id: Ulid, attempts: u32, reason: String) -> PublishState {
+    if exhausted(attempts, MAX_PUBLISH_ATTEMPTS) {
+        return PublishState::Failed {
             reason: format!("{reason} (document id {document_id})"),
             retryable: true,
             document_id: Some(document_id),
         };
     }
-    IntakeState::Publishing {
+    PublishState::Publishing {
         document_id,
         due_at_ms: retry_due_ms(attempts),
         attempts,
@@ -470,7 +471,7 @@ fn publishing_retry(document_id: Ulid, attempts: u32, reason: String) -> IntakeS
 }
 
 /// Re-arms the drain when the queue still holds entries.
-pub async fn restore_intake_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+pub async fn restore_publish_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     let event = storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: DEVICE_INTAKE_KEYSPACE.to_string(),
@@ -483,11 +484,11 @@ pub async fn restore_intake_timer(storage: &StorageHandle, task_handle: &TaskHan
     let has_entries = match event {
         Event::Storage(StorageEvent::IterResult { values, .. }) => !values.is_empty(),
         Event::Storage(StorageEvent::Error { error }) => {
-            warn!(error = %error, "Failed to scan the device authoring intake");
+            warn!(error = %error, "Failed to scan the device publish queue");
             return;
         }
         other => {
-            warn!(event = ?other, "Unexpected event while scanning the device authoring intake");
+            warn!(event = ?other, "Unexpected event while scanning the device publish queue");
             return;
         }
     };
@@ -495,7 +496,7 @@ pub async fn restore_intake_timer(storage: &StorageHandle, task_handle: &TaskHan
         arm_timer(
             task_handle,
             TaskKey::DrainDeviceIntake,
-            "Failed to restore the device intake timer",
+            "Failed to restore the device publish timer",
         )
         .await;
     }
@@ -504,11 +505,13 @@ pub async fn restore_intake_timer(storage: &StorageHandle, task_handle: &TaskHan
 #[cfg(test)]
 mod tests {
     use super::{
-        DrainOutcome, claim_state, drain_intake, permanent, publishing_retry, retry_state,
+        DrainOutcome, claim_state, drain_publish_queue, permanent, publishing_retry, retry_state,
     };
     use crate::device::delete_draft::DeleteDraftOperation;
     use crate::device::inspect_draft::{InspectDraftError, InspectDraftOperation};
-    use crate::device::intake::{IntakeEntry, IntakeState, MAX_INTAKE_ATTEMPTS, intake_entry};
+    use crate::device::publish_queue::{
+        MAX_PUBLISH_ATTEMPTS, PublishEntry, PublishState, publish_entry,
+    };
     use crate::device::tests::fixtures::context;
     use crate::driver::{DriverContext, drive};
     use crate::metadata::forward::MetadataWriteError;
@@ -518,8 +521,8 @@ mod tests {
     use std::sync::Arc;
     use ulid::Ulid;
 
-    fn entry() -> IntakeEntry {
-        IntakeEntry::new(
+    fn entry() -> PublishEntry {
+        PublishEntry::new(
             Ulid::generate(),
             UserId::local(Ulid::generate(), RealmId::from_bytes([6u8; 32])),
             Ulid::generate(),
@@ -529,8 +532,8 @@ mod tests {
         )
     }
 
-    async fn store(context: &Arc<DriverContext>, entry: &IntakeEntry) {
-        let (key_space, key, value) = intake_entry(entry).unwrap();
+    async fn store(context: &Arc<DriverContext>, entry: &PublishEntry) {
+        let (key_space, key, value) = publish_entry(entry).unwrap();
         context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -542,8 +545,8 @@ mod tests {
             .await;
     }
 
-    fn publishing() -> IntakeState {
-        IntakeState::Publishing {
+    fn publishing() -> PublishState {
+        PublishState::Publishing {
             document_id: Ulid::from_bytes([4u8; 16]),
             due_at_ms: 1,
             attempts: 1,
@@ -557,14 +560,14 @@ mod tests {
         let context = Arc::new(context);
         let entry = entry();
         store(&context, &entry).await;
-        assert_eq!(drain_intake(&context).await, DrainOutcome::Deferred);
+        assert_eq!(drain_publish_queue(&context).await, DrainOutcome::Deferred);
     }
 
     #[test]
     fn keeps_minted_id() {
         // A forward with an unknown outcome must never mint a second id.
         let document_id = Ulid::generate();
-        let IntakeState::Publishing {
+        let PublishState::Publishing {
             document_id: kept,
             due_at_ms,
             attempts,
@@ -581,16 +584,16 @@ mod tests {
     fn parks_exhausted_entries() {
         let document_id = Ulid::generate();
         assert!(matches!(
-            publishing_retry(document_id, MAX_INTAKE_ATTEMPTS, "unreachable".to_string()),
-            IntakeState::Failed {
+            publishing_retry(document_id, MAX_PUBLISH_ATTEMPTS, "unreachable".to_string()),
+            PublishState::Failed {
                 retryable: true,
                 document_id: Some(kept),
                 ..
             } if kept == document_id
         ));
         assert!(matches!(
-            retry_state(MAX_INTAKE_ATTEMPTS, "no placement".to_string()),
-            IntakeState::Failed {
+            retry_state(MAX_PUBLISH_ATTEMPTS, "no placement".to_string()),
+            PublishState::Failed {
                 retryable: true,
                 document_id: None,
                 ..
@@ -600,7 +603,7 @@ mod tests {
 
     #[test]
     fn backs_off_unminted() {
-        let IntakeState::Pending {
+        let PublishState::Pending {
             attempts,
             last_error,
             ..
@@ -636,8 +639,8 @@ mod tests {
         let (_tempdir, context) = context().await;
         let context = Arc::new(context);
         let entry = entry();
-        let advanced = IntakeEntry {
-            state: IntakeState::Failed {
+        let advanced = PublishEntry {
+            state: PublishState::Failed {
                 reason: "parked".to_string(),
                 retryable: true,
                 document_id: None,

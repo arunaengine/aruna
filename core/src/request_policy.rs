@@ -592,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_partial_policy_json() {
+    fn rejects_partial_json() {
         // A missing kind is predecessor tolerance and must refuse; a missing
         // `when` is a valid current value (serde fills an Option with None).
         let current = serde_json::to_string(&policy("permission == 'write'")).unwrap();

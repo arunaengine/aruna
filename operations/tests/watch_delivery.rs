@@ -16,9 +16,9 @@ use aruna_core::structs::{
     NotificationKind, NotificationRecord, PlacementRef, RealmAuthorizationDocument,
     RealmConfigDocument, RealmId, RealmNodeKind, WatchAuthorizationBinding, WatchEvent,
     WatchEventDetail, WatchEventKind, WatchEventMask, WatchInterestDigest, WatchSubscription,
-    data_watch_resource_path, watch_interest_node_key, watch_notification_id,
+    interest_node_key, watch_notification_id, watch_resource_path,
 };
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{DocumentSyncEffect, NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
@@ -55,14 +55,10 @@ struct TestNode {
     context: Arc<DriverContext>,
 }
 
-// The Definition of Done: a watch created via node A fires for an upload handled
-// by node B and is visible within seconds through node C. The watch owner's inbox
-// holder is node A, so node B only learns the interest through the replicated
-// digest, forwards the origin event over the wire, and node C reads it back by
-// proxying to the holder.
+// The Definition of Done: a watch created via node A fires for an upload handled by node B and
+// is visible within seconds through node C.
 #[tokio::test]
-async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
--> Result<(), Box<dyn std::error::Error>> {
+async fn watch_crosses_nodes() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([90u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
@@ -74,8 +70,8 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     let data_node_id = nodes[1].net.node_id();
     install_group_authorization(&nodes, realm_id, credential_group, watcher).await?;
     install_group_authorization(&nodes, realm_id, bucket_group, watcher).await?;
-    let prefix = data_watch_resource_path(credential_group, data_node_id, "bucket", "reports/");
-    let probe = data_watch_resource_path(bucket_group, data_node_id, "bucket", "reports/probe");
+    let prefix = watch_resource_path(credential_group, data_node_id, "bucket", "reports/");
+    let probe = watch_resource_path(bucket_group, data_node_id, "bucket", "reports/probe");
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
     // This models a persisted watch created by an already-expired bearer token.
@@ -160,7 +156,7 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
         } => {
             assert_eq!(
                 path,
-                &data_watch_resource_path(
+                &watch_resource_path(
                     bucket_group,
                     data_node_id,
                     "bucket",
@@ -190,10 +186,8 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     Ok(())
 }
 
-// The fix's Definition of Done: a watch created through node A whose owner's
-// inbox holder is node B fires for an upload handled by node A itself, before
-// B's interest digest replicates back. Node A learns the holder at create time,
-// forwards the origin event, and the record is readable back through A.
+// The fix's Definition of Done: a watch created through node A whose owner's inbox holder is
+// node B fires for an upload handled by node A itself.
 #[tokio::test]
 async fn same_node_delivery() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([96u8; 32]);
@@ -205,8 +199,8 @@ async fn same_node_delivery() -> Result<(), Box<dyn std::error::Error>> {
     let group_id = Ulid::generate();
     let data_node_id = nodes[0].net.node_id();
     install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
-    let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
-    let probe = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
+    let prefix = watch_resource_path(group_id, data_node_id, "bucket", "reports/");
+    let probe = watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
     let subscription = create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
@@ -276,7 +270,7 @@ async fn same_node_delivery() -> Result<(), Box<dyn std::error::Error>> {
 // An event whose path matches no watched prefix is not forwarded, and no inbox
 // record materializes anywhere.
 #[tokio::test]
-async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
+async fn unmatched_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([91u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
@@ -286,8 +280,8 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
     let group_id = Ulid::generate();
     let data_node_id = nodes[1].net.node_id();
     install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
-    let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
-    let probe = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
+    let prefix = watch_resource_path(group_id, data_node_id, "bucket", "reports/");
+    let probe = watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
     create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
@@ -340,8 +334,8 @@ async fn self_event_delivers() -> Result<(), Box<dyn std::error::Error>> {
     let group_id = Ulid::generate();
     let data_node_id = nodes[1].net.node_id();
     install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
-    let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
-    let probe = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
+    let prefix = watch_resource_path(group_id, data_node_id, "bucket", "reports/");
+    let probe = watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
     let subscription = create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
@@ -383,11 +377,10 @@ async fn self_event_delivers() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Digest convergence in both directions: a remote create makes the holder's entry
-// appear in a peer's interest table, and deleting the last watch publishes an
-// empty digest that retracts the holder from that table.
+// Digest convergence in both directions: a remote create makes the holder's entry appear in a
+// peer's interest table.
 #[tokio::test]
-async fn digest_converges_and_retracts_across_nodes() -> Result<(), Box<dyn std::error::Error>> {
+async fn digest_converges_retracts() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([93u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
@@ -438,13 +431,9 @@ async fn digest_converges_and_retracts_across_nodes() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-// The per-user watch cap is enforced on the holder. Filling it through a
-// non-holder node and then overflowing proves the holder's cap sentinel string
-// round-trips over the wire and maps back to the typed `CapExceeded`, not a
-// generic remote-proxy failure.
+// The per-user watch cap is enforced on the holder.
 #[tokio::test]
-async fn remote_create_surfaces_cap_conflict_over_the_wire()
--> Result<(), Box<dyn std::error::Error>> {
+async fn remote_create_conflicts() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([94u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let config = realm_config_for(&nodes, realm_id);
@@ -461,7 +450,7 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
             nodes[1].context.as_ref(),
             nodes[1].net.node_id(),
             owner,
-            data_watch_resource_path(group_id, data_node_id, "bucket", &format!("{index}/")),
+            watch_resource_path(group_id, data_node_id, "bucket", &format!("{index}/")),
             mask,
             WatchAuthorizationBinding::default(),
         )
@@ -473,7 +462,7 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
         nodes[1].context.as_ref(),
         nodes[1].net.node_id(),
         owner,
-        data_watch_resource_path(group_id, data_node_id, "bucket", "overflow/"),
+        watch_resource_path(group_id, data_node_id, "bucket", "overflow/"),
         mask,
         WatchAuthorizationBinding::default(),
     )
@@ -489,7 +478,7 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
 }
 
 #[tokio::test]
-async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::error::Error>> {
+async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([95u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let full_config = realm_config_for(&nodes, realm_id);
@@ -503,10 +492,10 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
     install_config_document(&nodes, realm_id, &reduced_config).await?;
 
     let (watcher, old_holder, new_holder) =
-        user_with_changed_holder(&reduced_config, &full_config, realm_id);
+        user_changed_holder(&reduced_config, &full_config, realm_id);
     let group_id = Ulid::generate();
     let data_node_id = nodes[0].net.node_id();
-    let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reranked/");
+    let prefix = watch_resource_path(group_id, data_node_id, "bucket", "reranked/");
     let probe = format!("{prefix}probe");
     install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
 
@@ -674,7 +663,7 @@ fn upload_event(
         event_id,
         realm_id,
         kind: WatchEventKind::DataUploaded,
-        path: data_watch_resource_path(group_id, node_id, bucket, key),
+        path: watch_resource_path(group_id, node_id, bucket, key),
         actor,
         occurred_at_ms,
         detail: WatchEventDetail::DataUploaded {
@@ -790,7 +779,7 @@ fn user_with_holder(
     panic!("no user hashed to holder {holder} within the sampling bound");
 }
 
-fn user_with_changed_holder(
+fn user_changed_holder(
     before: &RealmConfigDocument,
     after: &RealmConfigDocument,
     realm_id: RealmId,
@@ -824,7 +813,7 @@ async fn build_realm_nodes(
     mesh_nodes(&nodes).await;
     install_realm_config(&nodes, *realm_id).await?;
     // Mirror production core-document announcement for every node.
-    bootstrap_watch_interest_topic(&nodes, *realm_id).await?;
+    bootstrap_interest_topic(&nodes, *realm_id).await?;
     Ok(nodes)
 }
 
@@ -917,7 +906,7 @@ async fn install_config_document(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(config).await?;
+        node.net.refresh_document_peers(config).await?;
     }
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
@@ -938,8 +927,8 @@ async fn install_group_authorization(
     group_id: Ulid,
     owner: UserId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
     // Policy loading resolves the group record before group policies apply, and
     // every node that evaluates the request needs it locally.
     let group = Group {
@@ -993,7 +982,7 @@ async fn install_group_authorization(
     Ok(())
 }
 
-async fn bootstrap_watch_interest_topic(
+async fn bootstrap_interest_topic(
     nodes: &[TestNode],
     realm_id: RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1014,20 +1003,15 @@ async fn bootstrap_watch_interest_topic(
 
         // All digests share one realm topic. Reconcile each append before the
         // next node writes so concurrent outbox drains cannot race topic setup.
-        let key = watch_interest_node_key(realm_id, node_id);
+        let key = interest_node_key(realm_id, node_id);
         for peer in nodes {
-            wait_for(|| async {
-                read_watch_interest_digest(peer, key.clone())
-                    .await
-                    .is_some()
-            })
-            .await?;
+            wait_for(|| async { read_interest_digest(peer, key.clone()).await.is_some() }).await?;
         }
     }
     Ok(())
 }
 
-async fn read_watch_interest_digest(node: &TestNode, key: Vec<u8>) -> Option<WatchInterestDigest> {
+async fn read_interest_digest(node: &TestNode, key: Vec<u8>) -> Option<WatchInterestDigest> {
     match node
         .context
         .storage_handle

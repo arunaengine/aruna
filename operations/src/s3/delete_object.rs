@@ -1,10 +1,10 @@
-use crate::blob::blob_storage::{
-    HeadAliasContext, blob_location_read, build_head_transition_effects,
-    delete_blob_version_effect, delete_hash_path_index_effect, write_blob_version_effect,
+use crate::blob::records::{
+    HeadAliasContext, blob_location_read, build_transition_effects,
+    delete_version_effect, delete_index_effect, write_version_effect,
 };
 use crate::blob::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
 use crate::node::usage_stats::{
-    UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
+    UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
@@ -229,7 +229,7 @@ impl DeleteObjectOperation {
     }
 
     fn prepare_head_transition(&mut self, next: HeadTransitionContinuation) -> Effects {
-        let effects = match build_head_transition_effects(
+        let effects = match build_transition_effects(
             &self.alias_context(),
             self.pending_new_pointer.take(),
             self.pending_new_current_hash.take(),
@@ -242,10 +242,10 @@ impl DeleteObjectOperation {
         self.pending_head_transition_effects = effects.into_iter().collect();
         self.pending_head_transition_next = Some(next);
         self.state = DeleteObjectState::ApplyHeadTransition;
-        self.emit_next_head_transition_effect_or_continue()
+        self.emit_head_transition()
     }
 
-    fn emit_next_head_transition_effect_or_continue(&mut self) -> Effects {
+    fn emit_head_transition(&mut self) -> Effects {
         if let Some(effect) = self.pending_head_transition_effects.pop_front() {
             return smallvec![effect];
         }
@@ -257,11 +257,11 @@ impl DeleteObjectOperation {
         }
     }
 
-    fn handle_head_transition_applied(&mut self, event: Event) -> Effects {
+    fn head_transition_applied(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::WriteResult { .. })
             | Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                self.emit_next_head_transition_effect_or_continue()
+                self.emit_head_transition()
             }
             _ => self.emit_error(DeleteObjectError::InvalidOperationState),
         }
@@ -281,7 +281,7 @@ impl DeleteObjectOperation {
         }
     }
 
-    fn handle_purge_fence_checked(&mut self, event: Event) -> Effects {
+    fn fence_checked(&mut self, event: Event) -> Effects {
         match check_write_fence(event, &self.input.bucket, &self.input.key) {
             Ok(()) => self.write_tombstone(),
             Err(error) => self.emit_error(error.into()),
@@ -303,7 +303,7 @@ impl DeleteObjectOperation {
         })]
     }
 
-    fn handle_target_version_read(&mut self, event: Event) -> Effects {
+    fn target_version_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -332,7 +332,7 @@ impl DeleteObjectOperation {
         self.read_all_versions()
     }
 
-    fn handle_target_location_read(&mut self, event: Event) -> Effects {
+    fn target_location_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -360,7 +360,7 @@ impl DeleteObjectOperation {
         })]
     }
 
-    fn handle_all_versions_read(&mut self, event: Event) -> Effects {
+    fn versions_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -408,7 +408,7 @@ impl DeleteObjectOperation {
         })]
     }
 
-    fn handle_current_lookup_read(&mut self, event: Event) -> Effects {
+    fn current_lookup_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -425,7 +425,7 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
         if let Some(target_version_id) = self.input.version_id {
-            self.handle_version_delete_current_lookup(target_version_id, existing.as_ref())
+            self.delete_lookup_read(target_version_id, existing.as_ref())
         } else {
             self.pending_new_current_hash = None;
             if let Some(pointer) = existing.as_ref() {
@@ -444,11 +444,11 @@ impl DeleteObjectOperation {
                 })];
             }
             self.live_before_marker = false;
-            self.write_tombstone_current_lookup(version_id, existing.as_ref())
+            self.write_tombstone(version_id, existing.as_ref())
         }
     }
 
-    fn handle_liveness_version_read(&mut self, event: Event) -> Effects {
+    fn liveness_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -461,10 +461,10 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
         let existing = self.existing_pointer.clone();
-        self.write_tombstone_current_lookup(version_id, existing.as_ref())
+        self.write_tombstone(version_id, existing.as_ref())
     }
 
-    fn handle_version_delete_current_lookup(
+    fn delete_lookup_read(
         &mut self,
         target_version_id: Ulid,
         existing: Option<&CurrentVersionPointer>,
@@ -516,7 +516,7 @@ impl DeleteObjectOperation {
             && let Some(materialized_hash) = target_version.materialized_hash
         {
             self.state = DeleteObjectState::DeleteTargetHashPathIndex;
-            let effect = match delete_hash_path_index_effect(
+            let effect = match delete_index_effect(
                 &self.alias_context(),
                 materialized_hash,
                 version_id,
@@ -529,12 +529,12 @@ impl DeleteObjectOperation {
             return smallvec![effect];
         }
 
-        self.delete_target_version_record(version_id)
+        self.delete_version_record(version_id)
     }
 
-    fn delete_target_version_record(&mut self, version_id: Ulid) -> Effects {
+    fn delete_version_record(&mut self, version_id: Ulid) -> Effects {
         self.state = DeleteObjectState::DeleteTargetVersion;
-        let effect = match delete_blob_version_effect(
+        let effect = match delete_version_effect(
             &VersionKey::new(&self.input.bucket, &self.input.key, version_id),
             self.txn_id,
         ) {
@@ -545,7 +545,7 @@ impl DeleteObjectOperation {
         smallvec![effect]
     }
 
-    fn handle_target_hash_path_deleted(&mut self, event: Event) -> Effects {
+    fn target_path_deleted(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -554,10 +554,10 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
 
-        self.delete_target_version_record(version_id)
+        self.delete_version_record(version_id)
     }
 
-    fn handle_target_version_deleted(&mut self, event: Event) -> Effects {
+    fn target_version_deleted(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -616,7 +616,7 @@ impl DeleteObjectOperation {
         })]
     }
 
-    fn handle_multipart_summary_deleted(&mut self, event: Event) -> Effects {
+    fn summary_deleted(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -639,14 +639,14 @@ impl DeleteObjectOperation {
         })]
     }
 
-    fn handle_multipart_parts_read(&mut self, event: Event) -> Effects {
+    fn parts_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
 
         self.multipart_part_keys = values.into_iter().map(|(key, _)| key).collect();
         self.multipart_delete_index = 0;
-        self.delete_next_multipart_part()
+        self.delete_next_part()
     }
 
     /// Queues the copy the deleted version named. Blind and idempotent: two
@@ -760,7 +760,7 @@ impl DeleteObjectOperation {
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
             version_id,
-            occurred_at_ms: aruna_core::util::unix_timestamp_millis(),
+            occurred_at_ms: aruna_core::time::unix_timestamp_millis(),
         };
         let value = match record.to_bytes() {
             Ok(value) => value,
@@ -786,7 +786,7 @@ impl DeleteObjectOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
-    fn delete_next_multipart_part(&mut self) -> Effects {
+    fn delete_next_part(&mut self) -> Effects {
         let Some(key) = self
             .multipart_part_keys
             .get(self.multipart_delete_index)
@@ -803,13 +803,13 @@ impl DeleteObjectOperation {
         })]
     }
 
-    fn handle_multipart_part_deleted(&mut self, event: Event) -> Effects {
+    fn part_deleted(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
 
         self.multipart_delete_index += 1;
-        self.delete_next_multipart_part()
+        self.delete_next_part()
     }
 
     fn write_tombstone(&mut self) -> Effects {
@@ -819,7 +819,7 @@ impl DeleteObjectOperation {
         self.read_current_lookup(version_id)
     }
 
-    fn write_tombstone_current_lookup(
+    fn write_tombstone(
         &mut self,
         version_id: Ulid,
         existing: Option<&CurrentVersionPointer>,
@@ -842,7 +842,7 @@ impl DeleteObjectOperation {
         let mut version = BlobVersion::deleted(created_at, self.input.deleted_by);
         version.metadata = self.metadata.clone();
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
-        let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
+        let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.emit_error(err.into()),
         };
@@ -851,14 +851,14 @@ impl DeleteObjectOperation {
         smallvec![effect]
     }
 
-    fn handle_blob_version_written(&mut self, event: Event) -> Effects {
+    fn version_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
-        self.write_live_replication_obligation()
+        self.write_obligation()
     }
 
-    fn write_live_replication_obligation(&mut self) -> Effects {
+    fn write_obligation(&mut self) -> Effects {
         let Some(version_id) = self.version_id else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -883,7 +883,7 @@ impl DeleteObjectOperation {
         smallvec![effect]
     }
 
-    fn handle_live_replication_obligation_written(&mut self, event: Event) -> Effects {
+    fn obligation_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -908,10 +908,8 @@ impl DeleteObjectOperation {
                     version_id,
                     delete_marker,
                 }));
-                // No reclaim nudge: the sweep owns its cadence, so even a
-                // candidate a one-second grace makes due waits for the next
-                // tick rather than re-arming the timer on every delete.
-                return smallvec![schedule_usage_snapshot_publish_effect()];
+                // The sweep owns reclaim cadence, so deletes do not re-arm its timer.
+                return smallvec![schedule_snapshot_publish()];
             }
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -921,7 +919,7 @@ impl DeleteObjectOperation {
             version_id,
             delete_marker: true,
         }));
-        smallvec![schedule_usage_snapshot_publish_effect()]
+        smallvec![schedule_snapshot_publish()]
     }
 }
 
@@ -943,27 +941,27 @@ impl Operation for DeleteObjectOperation {
         match self.state {
             DeleteObjectState::Init => self.handle_init(),
             DeleteObjectState::StartTransaction => self.handle_transaction_started(event),
-            DeleteObjectState::CheckPurgeFence => self.handle_purge_fence_checked(event),
-            DeleteObjectState::ReadTargetVersion => self.handle_target_version_read(event),
-            DeleteObjectState::ReadTargetLocation => self.handle_target_location_read(event),
-            DeleteObjectState::ReadAllVersions => self.handle_all_versions_read(event),
-            DeleteObjectState::ReadCurrentLookup => self.handle_current_lookup_read(event),
-            DeleteObjectState::ReadLivenessVersion => self.handle_liveness_version_read(event),
-            DeleteObjectState::ApplyHeadTransition => self.handle_head_transition_applied(event),
+            DeleteObjectState::CheckPurgeFence => self.fence_checked(event),
+            DeleteObjectState::ReadTargetVersion => self.target_version_read(event),
+            DeleteObjectState::ReadTargetLocation => self.target_location_read(event),
+            DeleteObjectState::ReadAllVersions => self.versions_read(event),
+            DeleteObjectState::ReadCurrentLookup => self.current_lookup_read(event),
+            DeleteObjectState::ReadLivenessVersion => self.liveness_read(event),
+            DeleteObjectState::ApplyHeadTransition => self.head_transition_applied(event),
             DeleteObjectState::DeleteTargetHashPathIndex => {
-                self.handle_target_hash_path_deleted(event)
+                self.target_path_deleted(event)
             }
-            DeleteObjectState::DeleteTargetVersion => self.handle_target_version_deleted(event),
+            DeleteObjectState::DeleteTargetVersion => self.target_version_deleted(event),
             DeleteObjectState::RemoveManagedCopies => self.handle_copies_removed(event),
             DeleteObjectState::DeleteMultipartSummary => {
-                self.handle_multipart_summary_deleted(event)
+                self.summary_deleted(event)
             }
-            DeleteObjectState::ReadMultipartParts => self.handle_multipart_parts_read(event),
-            DeleteObjectState::DeleteMultipartPart => self.handle_multipart_part_deleted(event),
+            DeleteObjectState::ReadMultipartParts => self.parts_read(event),
+            DeleteObjectState::DeleteMultipartPart => self.part_deleted(event),
             DeleteObjectState::WriteReclaimCandidate => self.handle_candidate_written(event),
-            DeleteObjectState::WriteBlobVersion => self.handle_blob_version_written(event),
+            DeleteObjectState::WriteBlobVersion => self.version_written(event),
             DeleteObjectState::WriteLiveReplicationObligation => {
-                self.handle_live_replication_obligation_written(event)
+                self.obligation_written(event)
             }
             DeleteObjectState::UpdateUsage => self.handle_usage_update(event),
             DeleteObjectState::WriteDeleteAudit => self.handle_delete_audit(event),
@@ -1054,7 +1052,7 @@ mod test {
         .with_restrictions(Some(restrictions.clone()));
         operation.version_id = Some(Ulid::generate());
 
-        let effects = operation.write_live_replication_obligation();
+        let effects = operation.write_obligation();
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected one obligation write, got {effects:?}")
@@ -1400,7 +1398,7 @@ mod test {
         value
     }
 
-    fn version_delete_until_current_lookup(
+    fn delete_until_lookup(
         target_version_id: Ulid,
         all_version_ids: Vec<Ulid>,
         user_id: aruna_core::UserId,
@@ -1459,12 +1457,12 @@ mod test {
     }
 
     #[test]
-    fn version_delete_preserves_current_pointer_when_target_is_not_current() {
+    fn preserves_noncurrent_pointer() {
         let user_id = test_user_id();
         let current_version_id = Ulid::from_bytes([1u8; 16]);
         let target_version_id = Ulid::from_bytes([2u8; 16]);
         let newer_version_id = Ulid::from_bytes([9u8; 16]);
-        let mut op = version_delete_until_current_lookup(
+        let mut op = delete_until_lookup(
             target_version_id,
             vec![current_version_id, target_version_id, newer_version_id],
             user_id,
@@ -1485,11 +1483,11 @@ mod test {
     }
 
     #[test]
-    fn version_delete_rewrites_current_pointer_when_target_is_current() {
+    fn rewrites_current_pointer() {
         let user_id = test_user_id();
         let target_version_id = Ulid::from_bytes([1u8; 16]);
         let fallback_version_id = Ulid::from_bytes([9u8; 16]);
-        let mut op = version_delete_until_current_lookup(
+        let mut op = delete_until_lookup(
             target_version_id,
             vec![target_version_id, fallback_version_id],
             user_id,
@@ -1517,10 +1515,10 @@ mod test {
     }
 
     #[test]
-    fn version_delete_removes_current_pointer_when_current_has_no_fallback() {
+    fn removes_final_pointer() {
         let user_id = test_user_id();
         let target_version_id = Ulid::from_bytes([1u8; 16]);
-        let mut op = version_delete_until_current_lookup(
+        let mut op = delete_until_lookup(
             target_version_id,
             vec![target_version_id],
             user_id,
@@ -1542,7 +1540,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn drive_version_delete_missing_version_returns_no_such_version() {
+    async fn missing_version_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -1573,7 +1571,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_delete_object_tombstone() {
+    async fn creates_tombstone() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let blob_root = format!("{temp_root}/blobstore");
@@ -1728,7 +1726,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_delete_object_version() {
+    async fn deletes_version() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let blob_root = format!("{temp_root}/blobstore");

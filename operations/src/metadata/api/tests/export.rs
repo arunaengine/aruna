@@ -14,7 +14,7 @@ fn raw_request(document_id: Ulid) -> ExportMetadataRoCrateRequest {
 
 async fn seed_raw_document(test: &MetadataTest, record: &MetadataRegistryRecord) {
     seed_policy_docs(test, record.group_id).await;
-    for entry in aruna_core::storage_entries::metadata_registry_write_entries(record)
+    for entry in aruna_core::storage_entries::registry_write_entries(record)
         .expect("registry entries encode")
     {
         write_entry(test, entry).await;
@@ -32,8 +32,7 @@ async fn seed_raw_document(test: &MetadataTest, record: &MetadataRegistryRecord)
     };
     write_entry(
         test,
-        aruna_core::storage_entries::metadata_create_event_write_entry(&event)
-            .expect("event entry encodes"),
+        aruna_core::storage_entries::create_event_entry(&event).expect("event entry encodes"),
     )
     .await;
 }
@@ -71,7 +70,7 @@ async fn raw_export_fenced() {
     );
     write_entry(
         &test,
-        metadata_graph_lifecycle_write_entry(&tombstone).expect("tombstone encodes"),
+        graph_lifecycle_entry(&tombstone).expect("tombstone encodes"),
     )
     .await;
 
@@ -125,7 +124,7 @@ async fn summary_from_cache() {
         Instant::now(),
     );
 
-    let result = list_visible_metadata_documents(
+    let result = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         summary_request(record.group_id, true),
@@ -153,7 +152,7 @@ async fn stale_summary_refused() {
         Instant::now(),
     );
 
-    let result = list_visible_metadata_documents(
+    let result = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         summary_request(record.group_id, true),
@@ -171,7 +170,7 @@ async fn pending_summary_listed() {
     let record = public_record(Ulid::generate(), Ulid::generate());
     write_pending_marker(&test, &record).await;
 
-    let result = list_visible_metadata_documents(
+    let result = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         summary_request(record.group_id, true),
@@ -182,7 +181,7 @@ async fn pending_summary_listed() {
     assert_eq!(result.documents[0].record.document_id, record.document_id);
     assert!(result.documents[0].rocrate_summary_jsonld.is_none());
 
-    let plain = list_visible_metadata_documents(
+    let plain = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         summary_request(record.group_id, false),
@@ -200,10 +199,10 @@ pub(super) async fn seed_registry_cache(test: &MetadataTest, record: &MetadataRe
         .as_ref()
         .expect("metadata handle");
     handle
-        .list_cached_registry_records_for_group(record.group_id)
+        .list_cached_group(record.group_id)
         .await
         .expect("registry cache fills");
-    handle.upsert_cached_registry_record(record.clone());
+    handle.cache_registry_record(record.clone());
 }
 
 // Policy loading fails closed without realm config and group documents.
@@ -215,9 +214,8 @@ pub(super) async fn seed_policy_docs(test: &MetadataTest, group_id: GroupId) {
         realm_id: TEST_REALM_ID,
     };
     let config = RealmConfigDocument::default_for_realm(TEST_REALM_ID, Vec::new());
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(TEST_REALM_ID);
-    let group_auth =
-        GroupAuthorizationDocument::new_default_group_doc(owner, TEST_REALM_ID, group_id);
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(TEST_REALM_ID);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(owner, TEST_REALM_ID, group_id);
     let group = Group {
         display_name: "policy-fixture".to_string(),
         group_id,
@@ -295,9 +293,7 @@ pub(super) async fn write_pending_marker(test: &MetadataTest, record: &MetadataR
         },
         occurred_at_ms: 1,
     };
-    for (key_space, key, value) in
-        metadata_create_event_and_pending_projection_write_entries(&event).expect("event encodes")
-    {
+    for (key_space, key, value) in create_projection_entries(&event).expect("event encodes") {
         match test
             .context
             .storage_handle

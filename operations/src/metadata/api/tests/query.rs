@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn deduplicates_select_rows_from_multiple_nodes() {
+fn deduplicates_select_rows() {
     let results = aggregate_query_results(
         vec![
             MetadataQueryResults::Solutions(vec![
@@ -25,7 +25,7 @@ fn deduplicates_select_rows_from_multiple_nodes() {
 }
 
 #[test]
-fn reapplies_select_limit_after_distributed_merge() {
+fn reapplies_select_limit() {
     let results = aggregate_query_results(
         vec![
             MetadataQueryResults::Solutions(vec![
@@ -49,7 +49,7 @@ fn reapplies_select_limit_after_distributed_merge() {
 }
 
 #[test]
-fn query_select_limit_reads_outermost_limit_only() {
+fn query_select_limit() {
     assert_eq!(
         query_select_limit("SELECT ?s WHERE { ?s ?p ?o } LIMIT 5"),
         Some(5)
@@ -68,7 +68,7 @@ fn query_select_limit_reads_outermost_limit_only() {
 }
 
 #[test]
-fn query_form_accepts_single_line_declarations() {
+fn query_form_accepts() {
     assert_eq!(
         query_form("PREFIX ex: <https://example.org/> SELECT ?s WHERE { ?s ?p ?o }").unwrap(),
         MetadataQueryForm::Select
@@ -81,52 +81,44 @@ fn query_form_accepts_single_line_declarations() {
 }
 
 #[test]
-fn query_validation_rejects_updates_and_service() {
-    assert!(ensure_supported_query_form("SELECT ?s WHERE { ?s ?p ?o }").is_ok());
-    assert!(ensure_supported_query_form("ASK WHERE { ?s ?p ?o }").is_ok());
-    assert!(ensure_supported_query_form("INSERT DATA { <urn:s> <urn:p> <urn:o> }").is_err());
+fn query_validation_rejects() {
+    assert!(ensure_query_form("SELECT ?s WHERE { ?s ?p ?o }").is_ok());
+    assert!(ensure_query_form("ASK WHERE { ?s ?p ?o }").is_ok());
+    assert!(ensure_query_form("INSERT DATA { <urn:s> <urn:p> <urn:o> }").is_err());
     assert!(
-        ensure_supported_query_form(
-            "SELECT ?s WHERE { SERVICE <https://example.org/sparql> { ?s ?p ?o } }"
-        )
-        .is_err()
+        ensure_query_form("SELECT ?s WHERE { SERVICE <https://example.org/sparql> { ?s ?p ?o } }")
+            .is_err()
     );
     assert!(
-        ensure_supported_query_form(
-            "ASK WHERE { FILTER EXISTS { SERVICE SILENT ?endpoint { ?s ?p ?o } } }"
-        )
-        .is_err()
+        ensure_query_form("ASK WHERE { FILTER EXISTS { SERVICE SILENT ?endpoint { ?s ?p ?o } } }")
+            .is_err()
     );
 }
 
 #[test]
-fn distributed_query_validation_accepts_only_union_safe_forms() {
-    assert!(distributed_query_is_union_safe("ASK WHERE { ?s ?p ?o }"));
-    assert!(!distributed_query_is_union_safe(
-        "ASK WHERE { ?s ?p ?o . ?s ?p2 ?o2 }"
-    ));
-    assert!(distributed_query_is_union_safe(
+fn query_validation_accepts() {
+    assert!(query_union_safe("ASK WHERE { ?s ?p ?o }"));
+    assert!(!query_union_safe("ASK WHERE { ?s ?p ?o . ?s ?p2 ?o2 }"));
+    assert!(query_union_safe(
         "SELECT DISTINCT ?s WHERE { ?s ?p ?o } LIMIT 10"
     ));
-    assert!(!distributed_query_is_union_safe(
-        "SELECT ?s WHERE { ?s ?p ?o }"
-    ));
-    assert!(!distributed_query_is_union_safe(
+    assert!(!query_union_safe("SELECT ?s WHERE { ?s ?p ?o }"));
+    assert!(!query_union_safe(
         "SELECT DISTINCT ?s WHERE { ?s ?p ?o . ?s ?p2 ?o2 }"
     ));
-    assert!(!distributed_query_is_union_safe(
+    assert!(!query_union_safe(
         "SELECT DISTINCT ?s WHERE { ?s ?p ?o } OFFSET 1"
     ));
-    assert!(!distributed_query_is_union_safe(
+    assert!(!query_union_safe(
         "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }"
     ));
 }
 
 #[test]
-fn query_validation_enforces_byte_and_row_bounds() {
-    assert!(ensure_supported_query_form(&" ".repeat(METADATA_QUERY_MAX_BYTES + 1)).is_err());
+fn query_validation_enforces() {
+    assert!(ensure_query_form(&" ".repeat(METADATA_QUERY_MAX_BYTES + 1)).is_err());
     assert!(
-        ensure_supported_query_form(&format!(
+        ensure_query_form(&format!(
             "SELECT ?s WHERE {{ ?s ?p ?o }} LIMIT {}",
             METADATA_QUERY_MAX_ROWS + 1
         ))

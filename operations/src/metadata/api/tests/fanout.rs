@@ -4,7 +4,7 @@ use super::*;
 // Fan-out follows the live holders of the stored bucket; the event-time
 // holder stamp on the record is ignored, and no config means local only.
 #[test]
-fn query_fans_out_to_holders() {
+fn query_fans_out() {
     let local_node_id = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
     let remote_node_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
     let stale_node_id = iroh::SecretKey::from_bytes(&[23u8; 32]).public();
@@ -41,13 +41,13 @@ fn query_fans_out_to_holders() {
         last_event_id: Ulid::nil(),
     };
 
-    let nodes = document_replica_query_nodes(Some(&config), &record, local_node_id);
+    let nodes = replica_query_nodes(Some(&config), &record, local_node_id);
     assert_eq!(nodes.len(), 2);
     assert!(nodes.contains(&local_node_id) && nodes.contains(&remote_node_id));
     assert!(!nodes.contains(&stale_node_id));
 
     assert_eq!(
-        document_replica_query_nodes(None, &record, local_node_id),
+        replica_query_nodes(None, &record, local_node_id),
         vec![local_node_id]
     );
 }
@@ -74,7 +74,7 @@ fn fanout_filters_nodes() {
 }
 
 #[test]
-fn deduplicate_fanout_nodes_preserves_first_seen_order() {
+fn deduplicate_fanout_nodes() {
     let first = iroh::SecretKey::from_bytes(&[31u8; 32]).public();
     let second = iroh::SecretKey::from_bytes(&[32u8; 32]).public();
     let third = iroh::SecretKey::from_bytes(&[33u8; 32]).public();

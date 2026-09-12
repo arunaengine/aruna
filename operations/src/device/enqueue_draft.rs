@@ -9,18 +9,18 @@ use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use super::intake::{IntakeEntry, IntakeKind, MAX_INTAKE_ENTRIES, intake_entry};
+use super::publish_queue::{MAX_PUBLISH_ENTRIES, PublishEntry, PublishKind, publish_entry};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnqueueDraftInput {
-    pub entry: IntakeEntry,
+    pub entry: PublishEntry,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct EnqueueDraftOperation {
     input: EnqueueDraftInput,
     state: EnqueueDraftState,
-    output: Option<Result<IntakeEntry, EnqueueDraftError>>,
+    output: Option<Result<PublishEntry, EnqueueDraftError>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -67,7 +67,7 @@ impl EnqueueDraftOperation {
 
     fn emit_write(&mut self, txn_id: TxnId) -> Effects {
         self.state = EnqueueDraftState::WriteEntry { txn_id };
-        let entry = match intake_entry(&self.input.entry) {
+        let entry = match publish_entry(&self.input.entry) {
             Ok(entry) => entry,
             Err(error) => return fail(self, EnqueueDraftError::ConversionError(error)),
         };
@@ -79,7 +79,7 @@ impl EnqueueDraftOperation {
 }
 
 impl Operation for EnqueueDraftOperation {
-    type Output = IntakeEntry;
+    type Output = PublishEntry;
     type Error = EnqueueDraftError;
 
     fn start(&mut self) -> Effects {
@@ -88,7 +88,7 @@ impl Operation for EnqueueDraftOperation {
         }
         // An edit carries its submission in the kind; only a create authors the
         // crate text this field holds.
-        if matches!(self.input.entry.kind, IntakeKind::Create)
+        if matches!(self.input.entry.kind, PublishKind::Create)
             && self.input.entry.jsonld.trim().is_empty()
         {
             return fail(self, EnqueueDraftError::MissingPayload);
@@ -125,7 +125,7 @@ impl Operation for EnqueueDraftOperation {
                     key_space: DEVICE_INTAKE_KEYSPACE.to_string(),
                     prefix: None,
                     start: None,
-                    limit: MAX_INTAKE_ENTRIES,
+                    limit: MAX_PUBLISH_ENTRIES,
                     txn_id: Some(txn_id),
                 })]
             }
@@ -141,11 +141,11 @@ impl Operation for EnqueueDraftOperation {
                         },
                     );
                 };
-                if values.len() >= MAX_INTAKE_ENTRIES {
+                if values.len() >= MAX_PUBLISH_ENTRIES {
                     return fail(
                         self,
                         EnqueueDraftError::QueueFull {
-                            limit: MAX_INTAKE_ENTRIES,
+                            limit: MAX_PUBLISH_ENTRIES,
                         },
                     );
                 }
@@ -229,7 +229,7 @@ fn fail(operation: &mut EnqueueDraftOperation, error: EnqueueDraftError) -> Effe
 #[cfg(test)]
 mod tests {
     use super::{EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation};
-    use crate::device::intake::{IntakeEntry, MAX_INTAKE_ENTRIES, intake_entry};
+    use crate::device::publish_queue::{MAX_PUBLISH_ENTRIES, PublishEntry, publish_entry};
     use crate::device::tests::fixtures::context;
     use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
@@ -241,8 +241,8 @@ mod tests {
         UserId::local(Ulid::generate(), RealmId::from_bytes([9u8; 32]))
     }
 
-    fn entry(owner: UserId) -> IntakeEntry {
-        IntakeEntry::new(
+    fn entry(owner: UserId) -> PublishEntry {
+        PublishEntry::new(
             Ulid::generate(),
             owner,
             Ulid::generate(),
@@ -254,8 +254,8 @@ mod tests {
 
     async fn enqueue(
         context: &DriverContext,
-        entry: IntakeEntry,
-    ) -> Result<IntakeEntry, EnqueueDraftError> {
+        entry: PublishEntry,
+    ) -> Result<PublishEntry, EnqueueDraftError> {
         drive(
             EnqueueDraftOperation::new(EnqueueDraftInput { entry }),
             context,
@@ -292,8 +292,8 @@ mod tests {
         // The cap is a device-local backlog bound, not a realm quota.
         let (_tempdir, context) = context().await;
         let owner = owner();
-        for _ in 0..MAX_INTAKE_ENTRIES {
-            let (key_space, key, value) = intake_entry(&entry(owner)).unwrap();
+        for _ in 0..MAX_PUBLISH_ENTRIES {
+            let (key_space, key, value) = publish_entry(&entry(owner)).unwrap();
             context
                 .storage_handle
                 .send_storage_effect(StorageEffect::Write {
@@ -307,7 +307,7 @@ mod tests {
         assert_eq!(
             enqueue(&context, entry(owner)).await,
             Err(EnqueueDraftError::QueueFull {
-                limit: MAX_INTAKE_ENTRIES
+                limit: MAX_PUBLISH_ENTRIES
             })
         );
     }

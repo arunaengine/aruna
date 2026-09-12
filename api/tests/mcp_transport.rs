@@ -162,7 +162,7 @@ async fn setup_fixture() -> Fixture {
         .await,
     );
     let group_id = Ulid::from_bytes([33u8; 16]);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(user_id, realm_id, group_id);
     let group = Group {
         display_name: "MCP group".to_string(),
         group_id,

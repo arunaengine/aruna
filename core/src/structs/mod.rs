@@ -1,5 +1,6 @@
 mod assistant_chat;
 mod assistant_provider;
+mod auth;
 mod backends;
 mod binding_directory;
 mod blob;
@@ -35,17 +36,17 @@ mod source_access;
 mod source_connector;
 mod staging;
 mod storage_purge;
-#[allow(clippy::module_inception)]
-mod structs;
 mod sync_quarantine;
 mod sync_relationship;
 mod synced_folder;
 mod usage;
+mod user;
 mod user_session;
 mod user_vault;
 
 pub use assistant_chat::*;
 pub use assistant_provider::*;
+pub use auth::*;
 pub use backends::*;
 pub use binding_directory::*;
 pub use blob::*;
@@ -80,10 +81,10 @@ pub use source_access::*;
 pub use source_connector::*;
 pub use staging::*;
 pub use storage_purge::*;
-pub use structs::*;
 pub use sync_quarantine::*;
 pub use sync_relationship::*;
 pub use synced_folder::*;
 pub use usage::*;
+pub use user::*;
 pub use user_session::*;
 pub use user_vault::*;

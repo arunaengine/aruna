@@ -147,7 +147,7 @@ pub async fn acquire_purge_fence(
 /// Read the bucket fence in a job-terminal transaction and return its delete only
 /// when the terminal job still owns it. A cancelled waiter must never clear the
 /// fence held by the purge that beat it to acquisition.
-pub async fn owned_terminal_fence_delete(
+pub async fn delete_owned_terminal(
     storage: &StorageHandle,
     txn_id: TxnId,
     job_id: JobId,

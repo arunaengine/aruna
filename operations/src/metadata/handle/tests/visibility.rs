@@ -60,7 +60,7 @@ pub(super) fn filled_cache(records: Vec<MetadataRegistryRecord>) -> MetadataVisi
 }
 
 #[test]
-fn upsert_replaces_existing_record_and_appends_new_ones() {
+fn upsert_replaces_existing() {
     let mut existing = registry_record("datasets/a");
     let cache = filled_cache(vec![existing.clone()]);
 
@@ -95,7 +95,7 @@ fn upsert_discards_cache() {
     assert!(cache.registry_records().is_none());
 }
 #[test]
-fn upsert_without_filled_cache_is_noop_until_refill() {
+fn upsert_filled_cache() {
     let cache = MetadataVisibilityCache::new();
     cache.upsert_registry_records(&[registry_record("datasets/a")]);
     assert!(cache.registry_records().is_none());
@@ -116,21 +116,21 @@ fn stale_cache_callback() {
     );
 }
 #[test]
-fn remove_by_document_and_graph_drop_records() {
+fn remove_drop_records() {
     let by_document = registry_record("datasets/a");
     let by_graph = registry_record("datasets/b");
     let kept = registry_record("datasets/c");
     let cache = filled_cache(vec![by_document.clone(), by_graph.clone(), kept.clone()]);
 
     cache.remove_registry_record(by_document.document_id);
-    cache.remove_registry_records_by_graph(&by_graph.graph_iri);
+    cache.remove_graph_records(&by_graph.graph_iri);
 
     let records = cache.registry_records().expect("cache entry");
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].document_id, kept.document_id);
 }
 #[test]
-fn group_snapshots_are_scoped_and_invalidate_per_group() {
+fn group_snapshots_scoped() {
     let group_a = Ulid::generate();
     let group_b = Ulid::generate();
     let mut record_a = registry_record("datasets/a");
@@ -140,7 +140,7 @@ fn group_snapshots_are_scoped_and_invalidate_per_group() {
     let cache = filled_cache(vec![record_a.clone(), record_b.clone()]);
 
     let (listed_a, fresh) = cache
-        .registry_records_for_group_any(group_a)
+        .records_group_any(group_a)
         .expect("group A snapshot exists");
     assert!(fresh);
     assert_eq!(listed_a.as_ref(), &vec![record_a.clone()]);
@@ -149,7 +149,7 @@ fn group_snapshots_are_scoped_and_invalidate_per_group() {
     added_b.group_id = group_b;
     cache.upsert_registry_records(std::slice::from_ref(&added_b));
     let (listed_a_again, _) = cache
-        .registry_records_for_group_any(group_a)
+        .records_group_any(group_a)
         .expect("group A snapshot still exists");
     assert!(Arc::ptr_eq(&listed_a, &listed_a_again));
 
@@ -157,13 +157,13 @@ fn group_snapshots_are_scoped_and_invalidate_per_group() {
     added_a.group_id = group_a;
     cache.upsert_registry_records(std::slice::from_ref(&added_a));
     let (listed_a_after, _) = cache
-        .registry_records_for_group_any(group_a)
+        .records_group_any(group_a)
         .expect("group A snapshot refreshes");
     assert_eq!(listed_a_after.len(), 2);
     assert!(!Arc::ptr_eq(&listed_a, &listed_a_after));
 }
 #[test]
-fn upsert_does_not_extend_expiry_or_resurrect_expired_entries() {
+fn upsert_not_extend() {
     let cache = filled_cache(vec![registry_record("datasets/a")]);
     {
         let mut registry = cache.registry.lock().unwrap();
@@ -176,7 +176,7 @@ fn upsert_does_not_extend_expiry_or_resurrect_expired_entries() {
     assert!(cache.registry_records().is_none());
 }
 #[test]
-fn lifecycle_entry_removal_forces_storage_reread() {
+fn lifecycle_entry_removal() {
     let cache = MetadataVisibilityCache::new();
     cache.store_lifecycle_deleted("urn:graph:a".to_string(), false);
     assert_eq!(cache.lifecycle_deleted("urn:graph:a"), Some(false));
@@ -238,7 +238,7 @@ fn eviction_keeps_tombstone() {
     assert!(!scope.graph_visible(&cache, &deleted_record.graph_iri));
 }
 #[test]
-fn expired_registry_entry_is_served_stale_not_dropped() {
+fn expired_entry_served() {
     let record = registry_record("datasets/a");
     let cache = filled_cache(vec![record.clone()]);
     cache.expire_now();
@@ -255,7 +255,7 @@ fn expired_registry_entry_is_served_stale_not_dropped() {
     assert!(cache.registry_records().is_some());
 }
 #[test]
-fn background_visibility_fill_does_not_overwrite_newer_upsert() {
+fn fill_preserves_upsert() {
     let mut stale_record = registry_record("datasets/a");
     let cache = filled_cache(vec![stale_record.clone()]);
     let fill_generation = cache.current_generation();
@@ -278,7 +278,7 @@ fn background_visibility_fill_does_not_overwrite_newer_upsert() {
     assert_eq!(records[0].updated_at_ms, 42);
 }
 #[test]
-fn background_visibility_fill_does_not_resurrect_removed_document() {
+fn fill_preserves_removal() {
     let removed = registry_record("datasets/removed");
     let kept = registry_record("datasets/kept");
     let cache = filled_cache(vec![removed.clone(), kept.clone()]);
@@ -301,7 +301,7 @@ fn background_visibility_fill_does_not_resurrect_removed_document() {
     );
 }
 #[test]
-fn background_visibility_fill_does_not_clear_newer_lifecycle_tombstone() {
+fn fill_preserves_tombstone() {
     let record = registry_record("datasets/deleted");
     let cache = filled_cache(vec![record.clone()]);
     let fill_generation = cache.current_generation();
@@ -316,7 +316,7 @@ fn background_visibility_fill_does_not_clear_newer_lifecycle_tombstone() {
     assert_eq!(cache.lifecycle_deleted(&record.graph_iri), Some(true));
 }
 #[test]
-fn rejected_cold_group_fill_filters_fresh_records_for_requested_group() {
+fn rejected_cold_group() {
     let group_a = Ulid::generate();
     let group_b = Ulid::generate();
     let mut record_a = registry_record("datasets/a");
@@ -329,13 +329,13 @@ fn rejected_cold_group_fill_filters_fresh_records_for_requested_group() {
 
     cache.advance_generation();
     assert!(!cache.store_visibility_fill(fresh_records.clone(), Vec::new(), fill_generation));
-    assert!(cache.registry_records_for_group_any(group_a).is_none());
+    assert!(cache.records_group_any(group_a).is_none());
 
-    let listed = registry_records_for_group(&fresh_records, group_a);
+    let listed = records_for_group(&fresh_records, group_a);
     assert_eq!(listed.as_ref(), &vec![record_a]);
 }
 #[test]
-fn expired_lifecycle_entry_is_served_stale_not_dropped() {
+fn expired_lifecycle_entry() {
     let cache = MetadataVisibilityCache::new();
     cache.store_lifecycle_deleted("urn:graph:a".to_string(), true);
     cache.expire_now();
@@ -347,7 +347,7 @@ fn expired_lifecycle_entry_is_served_stale_not_dropped() {
     );
 }
 #[test]
-fn registry_record_lookup_parses_iri_and_falls_back_to_scan() {
+fn record_lookup_parses() {
     let mut records: Vec<_> = (0..4)
         .map(|index| registry_record(&format!("datasets/{index}")))
         .collect();
@@ -357,20 +357,20 @@ fn registry_record_lookup_parses_iri_and_falls_back_to_scan() {
     records.sort_unstable_by_key(|record| record.document_id);
 
     for record in &records {
-        let found = registry_record_for_graph(&records, &record.graph_iri).expect("record found");
+        let found = record_for_graph(&records, &record.graph_iri).expect("record found");
         assert_eq!(found.document_id, record.document_id);
     }
     assert!(
-        registry_record_for_graph(
+        record_for_graph(
             &records,
             &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
         )
         .is_none()
     );
-    assert!(registry_record_for_graph(&records, "https://example.org/missing").is_none());
+    assert!(record_for_graph(&records, "https://example.org/missing").is_none());
 }
 #[test]
-fn visibility_scope_enforces_public_group_and_lifecycle_rules() {
+fn visibility_scope_enforces() {
     let realm = RealmId([7u8; 32]);
     let mut public_record = registry_record("datasets/public");
     public_record.public = true;

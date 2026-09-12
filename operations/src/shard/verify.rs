@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SHARD_VERIFICATION_KEYSPACE;
 use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::types::Key;
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_net::NetHandle;
 use byteview::ByteView;
 use futures_util::{StreamExt, stream};
@@ -145,12 +145,11 @@ async fn verify_one_shard(
 ) -> bool {
     let topic = shard_topic_id(realm_id, &placement);
 
-    // A sole holder is trivially consistent with itself once its genesis
-    // exists; a genesis-less topic reports the empty fingerprint, so gate on the
-    // local topic actually existing, never on the digest value.
+    // A sole holder converges only after its genesis exists.
+    // A genesis-less topic has an empty fingerprint, so the digest alone is insufficient.
     if co_holders.is_empty() {
         if !net_handle
-            .document_sync_topic_exists(topic)
+            .sync_topic_exists(topic)
             .unwrap_or(false)
         {
             debug!(
@@ -258,11 +257,10 @@ pub async fn converge_with_barrier(
                     return None;
                 }
             };
-            // Never certify convergence without a local genesis: two genesis-less
-            // holders share the (non-zero) empty fingerprint and would otherwise
-            // match, so require the local topic to exist before comparing.
+            // Genesis-less holders share the empty fingerprint.
+            // Require a local genesis before comparing manifests.
             if net_handle
-                .document_sync_topic_exists(topic)
+                .sync_topic_exists(topic)
                 .unwrap_or(false)
                 && manifests_converged(&local, &remote)
                 && dominates_required(&local.cursor, required)
@@ -317,7 +315,7 @@ pub async fn delete_shard_verification(
 /// Topic ids of every shard the local node has durably verified in `realm_id`.
 /// Reconciliation installs a former-holder history cutoff only for these: an
 /// unverified shard's clock is not a trustworthy cutover boundary until proven.
-pub async fn load_verified_shard_topics(
+pub async fn load_verified_topics(
     context: &DriverContext,
     realm_id: RealmId,
 ) -> BTreeSet<::irokle::TopicId> {
@@ -483,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_topic_digest_with_different_entries_does_not_converge() {
+    fn equal_digest_diverges() {
         let local = manifest(vec![entry(1, 1)]);
         let remote = manifest(vec![entry(2, 1)]);
 

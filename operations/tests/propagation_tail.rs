@@ -22,8 +22,8 @@ use aruna_operations::metadata::create_document::{
     mint_local_document,
 };
 use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
-use aruna_operations::metadata::materialization_queue::metadata_materialization_jobs_exist;
-use aruna_operations::metadata::projector::project_metadata_create_events_from_log;
+use aruna_operations::metadata::materialization_queue::materialization_jobs_exist;
+use aruna_operations::metadata::projector::project_logged_events;
 use aruna_operations::realm::announce_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
@@ -74,13 +74,10 @@ fn make_runtime() -> Result<tokio::runtime::Runtime, BoxError> {
         .build()?)
 }
 
-// Reproduces the per-document propagation tail seen in the 3-node cluster:
-// sustained paced ingest (~600 creates/s for ~20s) while a sampler measures,
-// for one probe document every 500ms, the time until that document is visible
-// on all 3 nodes.
+// Reproduces the per-document propagation tail seen in the 3-node cluster.
 #[test]
 #[ignore] // timing gate: run in release, like the metadata_throughput gates
-fn propagation_tail_under_sustained_load() -> Result<(), BoxError> {
+fn sustained_load_converges() -> Result<(), BoxError> {
     init_logging();
     let runtime = make_runtime()?;
     let outcome = runtime.block_on(async {
@@ -124,7 +121,7 @@ fn propagation_tail_under_sustained_load() -> Result<(), BoxError> {
             .collect();
         let convergence = async {
             wait_for_visibility(&contexts, &pairs, Duration::from_millis(200), started).await?;
-            wait_for_empty_materialization_queues(&contexts).await?;
+            wait_empty_queues(&contexts).await?;
             Ok::<f64, BoxError>(started.elapsed().as_secs_f64())
         };
         let (sampler_result, convergence_result) = tokio::join!(sampler, convergence);
@@ -217,21 +214,19 @@ async fn run_sampler(
             .as_ulid();
         let t0 = Instant::now();
         let result = drive(
-            CreateMetadataDocumentOperation::new_for_generated_document_id(
-                CreateMetadataDocumentConfig {
-                    actor,
-                    group_id,
-                    document_id,
-                    document_path,
-                    public: true,
-                    payload: scaffold_payload("probe", 0, index),
-                },
-            ),
+            CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+                actor,
+                group_id,
+                document_id,
+                document_path,
+                public: true,
+                payload: scaffold_payload("probe", 0, index),
+            }),
             context.as_ref(),
         )
         .await
         .map_err(|error| format!("probe create failed index={index}: {error:?}"))?;
-        project_metadata_create_events_from_log(
+        project_logged_events(
             context.as_ref(),
             vec![(result.record.document_id, result.record.last_event_id)],
         )
@@ -241,7 +236,7 @@ async fn run_sampler(
         let probe_id = result.record.document_id;
         let contexts = contexts.clone();
         waiters.push(tokio::spawn(async move {
-            wait_until_visible_on_all(&contexts, group_id, probe_id, t0).await
+            wait_all_visible(&contexts, group_id, probe_id, t0).await
         }));
         index += 1;
     }
@@ -257,7 +252,7 @@ async fn run_sampler(
     Ok((latencies, failures))
 }
 
-async fn wait_until_visible_on_all(
+async fn wait_all_visible(
     contexts: &[Arc<DriverContext>],
     group_id: GroupId,
     document_id: Ulid,
@@ -369,16 +364,14 @@ async fn run_paced_writer(
             rocrate_payload(document_id)
         };
         let result = drive(
-            CreateMetadataDocumentOperation::new_for_generated_document_id(
-                CreateMetadataDocumentConfig {
-                    actor,
-                    group_id,
-                    document_id,
-                    document_path,
-                    public: true,
-                    payload,
-                },
-            ),
+            CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+                actor,
+                group_id,
+                document_id,
+                document_path,
+                public: true,
+                payload,
+            }),
             context.as_ref(),
         )
         .await
@@ -405,7 +398,7 @@ async fn flush_projection_batches(
             continue;
         }
         let drained: Vec<(Ulid, Ulid)> = std::mem::take(batch);
-        project_metadata_create_events_from_log(targets[slot].1.as_ref(), drained)
+        project_logged_events(targets[slot].1.as_ref(), drained)
             .await
             .map_err(|error| format!("projection failed: {error:?}"))?;
     }
@@ -457,13 +450,11 @@ async fn wait_for_visibility(
     }
 }
 
-async fn wait_for_empty_materialization_queues(
-    contexts: &[Arc<DriverContext>],
-) -> Result<(), BoxError> {
+async fn wait_empty_queues(contexts: &[Arc<DriverContext>]) -> Result<(), BoxError> {
     wait_for_convergence("materialization queues never drained", || async {
         let mut busy = 0usize;
         for context in contexts {
-            if metadata_materialization_jobs_exist(&context.storage_handle)
+            if materialization_jobs_exist(&context.storage_handle)
                 .await
                 .map_err(|error| format!("materialization probe failed: {error:?}"))?
             {
@@ -494,7 +485,7 @@ async fn build_realm_nodes(realm_id: &RealmId, count: usize) -> Result<Vec<TestN
         .await?;
     }
 
-    wait_for_realm_node_convergence(&nodes, realm_id).await?;
+    wait_node_convergence(&nodes, realm_id).await?;
     install_realm_config(&nodes, realm_id).await?;
     Ok(nodes)
 }
@@ -606,7 +597,7 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: &RealmId) -> Result<
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
@@ -621,10 +612,7 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: &RealmId) -> Result<
     Ok(())
 }
 
-async fn wait_for_realm_node_convergence(
-    nodes: &[TestNode],
-    realm_id: &RealmId,
-) -> Result<(), BoxError> {
+async fn wait_node_convergence(nodes: &[TestNode], realm_id: &RealmId) -> Result<(), BoxError> {
     let expected: HashSet<_> = nodes.iter().map(|node| node.net.node_id()).collect();
     wait_for_convergence("realm nodes did not converge", || async {
         let mut pending = 0;

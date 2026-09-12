@@ -23,8 +23,8 @@ use thiserror::Error;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::blob::blob_storage::{blob_location_read, iter_hash_path_index_effect};
-use crate::blob::cleanup::schedule_blob_cleanup_effect;
+use crate::blob::cleanup::schedule_cleanup_effect;
+use crate::blob::records::{blob_location_read, iter_index_effect};
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::backends::{RecordReadError, backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
@@ -518,7 +518,7 @@ impl ReclaimBlobOperation {
 
     fn scan_aliases(&mut self, start: Option<Key>) -> Effects {
         self.state = ReclaimState::ScanAliases;
-        match iter_hash_path_index_effect(&self.key.blake3, start, self.txn_id) {
+        match iter_index_effect(&self.key.blake3, start, self.txn_id) {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(error.into()),
         }
@@ -705,7 +705,7 @@ impl ReclaimBlobOperation {
                 self.state = ReclaimState::Finish;
                 match self.output {
                     Some(Ok(ReclaimVerdict::Freed { .. })) => {
-                        smallvec![schedule_blob_cleanup_effect()]
+                        smallvec![schedule_cleanup_effect()]
                     }
                     _ => smallvec![],
                 }

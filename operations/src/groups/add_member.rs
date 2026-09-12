@@ -9,16 +9,15 @@ use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::{
     Actor, AuthContext, GroupAuthorizationDocument, Permission, PlacementRef, RealmConfigDocument,
     ResourceEvent,
 };
 use aruna_core::task::TaskEvent;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, Key, KeySpace, RoleId, TxnId, UserId};
-use aruna_core::util::unix_timestamp_millis;
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::HashSet;
@@ -162,7 +161,7 @@ impl AddUserToGroupOperation {
                 got,
             );
         };
-        match self.emit_read_auth_doc_and_admin_state(txn_id) {
+        match self.emit_auth_read(txn_id) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
@@ -207,10 +206,7 @@ impl AddUserToGroupOperation {
         }
     }
 
-    fn emit_read_auth_doc_and_admin_state(
-        &mut self,
-        txn_id: TxnId,
-    ) -> Result<Effects, AddUserToGroupError> {
+    fn emit_auth_read(&mut self, txn_id: TxnId) -> Result<Effects, AddUserToGroupError> {
         self.state = AddUserToGroupState::ReadAuthDocAndAdminState { txn_id };
         let target = AdminDocumentTarget::Group {
             group_id: self.input.group_id,
@@ -223,7 +219,7 @@ impl AddUserToGroupOperation {
                 ),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                 ),
                 (
                     REALM_CONFIG_KEYSPACE.to_string(),
@@ -234,7 +230,7 @@ impl AddUserToGroupOperation {
         })])
     }
 
-    fn handle_read_auth_doc_and_admin_state(&mut self, event: Event, txn_id: TxnId) -> Effects {
+    fn handle_auth_read(&mut self, event: Event, txn_id: TxnId) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event(
@@ -256,7 +252,7 @@ impl AddUserToGroupOperation {
             );
         };
 
-        match self.emit_write_auth_doc_and_admin_state(
+        match self.emit_auth_write(
             txn_id,
             auth_doc_value.clone(),
             reducer_state_value.clone(),
@@ -267,16 +263,15 @@ impl AddUserToGroupOperation {
         }
     }
 
-    fn emit_write_auth_doc_and_admin_state(
+    fn emit_auth_write(
         &mut self,
         txn_id: TxnId,
         auth_doc: Option<ByteView>,
         reducer_state_value: Option<ByteView>,
         realm_config_value: Option<ByteView>,
     ) -> Result<Effects, AddUserToGroupError> {
-        let mut auth_doc = GroupAuthorizationDocument::from_bytes(
-            &auth_doc.ok_or_else(|| AddUserToGroupError::AuthDocNotFound)?,
-        )?;
+        let mut auth_doc =
+            super::parse_auth_record(auth_doc)?.ok_or(AddUserToGroupError::AuthDocNotFound)?;
         let role_ids = sorted_role_ids(&self.input.role_ids);
         for role_id in &role_ids {
             if !auth_doc.roles.contains_key(role_id) {
@@ -290,7 +285,7 @@ impl AddUserToGroupOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                aruna_core::reducer::decode_reducer_state(value.as_ref())
                     .map_err(ConversionError::from)
             })
             .transpose()?;
@@ -304,14 +299,14 @@ impl AddUserToGroupOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
-        let admin_events = apply_admin_reducer_updates(&mut reducer_state, &self.input, &role_ids)?;
+        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input, &role_ids)?;
 
         let was_member = auth_doc
             .roles
             .values()
             .any(|role| role.assigned_users.contains(&self.input.user_id));
 
-        let materialized_assignments = reducer_state.materialized_group_role_user_assignments();
+        let materialized_assignments = reducer_state.materialized_group_assignments();
         for role_id in role_ids {
             let role = auth_doc
                 .roles
@@ -334,13 +329,11 @@ impl AddUserToGroupOperation {
 
         let key = auth_doc.group_id.to_bytes().into();
         let value = auth_doc.to_bytes(&self.input.actor)?.into();
-        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
-            previous_reducer_state.as_ref(),
-            Some(&reducer_state),
-        );
+        let stale_conflict_deletes =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let mut writes = vec![
             (AUTH_KEYSPACE.to_string(), key, value),
-            admin_document_reducer_state_write_entry(&reducer_state)?,
+            reducer_state_entry(&reducer_state)?,
         ];
         let document_target = DocumentSyncTarget::GroupAuthorization {
             group_id: self.input.group_id,
@@ -371,7 +364,7 @@ impl AddUserToGroupOperation {
             .fenced_at(generation);
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
-        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+        writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.state = AddUserToGroupState::WriteAuthDocAndAdminState {
             txn_id,
@@ -387,7 +380,7 @@ impl AddUserToGroupOperation {
         })])
     }
 
-    fn handle_write_auth_doc_and_admin_state(
+    fn handle_auth_write(
         &mut self,
         event: Event,
         txn_id: TxnId,
@@ -421,7 +414,7 @@ impl AddUserToGroupOperation {
         self.emit_commit_transaction(txn_id, auth_doc, admin_outbox_written, newly_added)
     }
 
-    fn handle_delete_stale_admin_conflicts(
+    fn handle_conflict_deletes(
         &mut self,
         event: Event,
         txn_id: TxnId,
@@ -526,10 +519,10 @@ impl AddUserToGroupOperation {
             return smallvec![schedule_outbox_drain_effect()];
         }
 
-        self.emit_announce_auth_doc(auth_doc, newly_added)
+        self.emit_auth_announce(auth_doc, newly_added)
     }
 
-    fn handle_schedule_admin_document_outbox_drain(
+    fn handle_drain_schedule(
         &mut self,
         event: Event,
         auth_doc: GroupAuthorizationDocument,
@@ -538,7 +531,7 @@ impl AddUserToGroupOperation {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. })
             | Event::Task(TaskEvent::Error { .. }) => {
-                self.emit_membership_notifications_or_finish(auth_doc, newly_added)
+                self.emit_membership_notice(auth_doc, newly_added)
             }
             other => self.unexpected_event(
                 self.state.clone(),
@@ -548,7 +541,7 @@ impl AddUserToGroupOperation {
         }
     }
 
-    fn emit_announce_auth_doc(
+    fn emit_auth_announce(
         &mut self,
         auth_doc: GroupAuthorizationDocument,
         newly_added: bool,
@@ -567,7 +560,7 @@ impl AddUserToGroupOperation {
         )]
     }
 
-    fn handle_announce_auth_doc(
+    fn handle_auth_announce(
         &mut self,
         event: Event,
         auth_doc: GroupAuthorizationDocument,
@@ -584,10 +577,10 @@ impl AddUserToGroupOperation {
         if let Err(error) = result {
             return self.fail(AddUserToGroupError::TopicAnnouncement(error));
         }
-        self.emit_membership_notifications_or_finish(auth_doc, newly_added)
+        self.emit_membership_notice(auth_doc, newly_added)
     }
 
-    fn emit_membership_notifications_or_finish(
+    fn emit_membership_notice(
         &mut self,
         auth_doc: GroupAuthorizationDocument,
         newly_added: bool,
@@ -651,7 +644,7 @@ impl AddUserToGroupOperation {
         )
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn catch_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -688,7 +681,7 @@ impl Operation for AddUserToGroupOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.catch_storage_error(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
@@ -697,7 +690,7 @@ impl Operation for AddUserToGroupOperation {
             AddUserToGroupState::Auth => self.handle_authorization(event),
             AddUserToGroupState::StartTransaction => self.handle_start_transaction(event),
             AddUserToGroupState::ReadAuthDocAndAdminState { txn_id } => {
-                self.handle_read_auth_doc_and_admin_state(event, txn_id)
+                self.handle_auth_read(event, txn_id)
             }
             AddUserToGroupState::WriteAuthDocAndAdminState {
                 txn_id,
@@ -705,7 +698,7 @@ impl Operation for AddUserToGroupOperation {
                 admin_outbox_written,
                 stale_conflict_deletes,
                 newly_added,
-            } => self.handle_write_auth_doc_and_admin_state(
+            } => self.handle_auth_write(
                 event,
                 txn_id,
                 auth_doc,
@@ -718,7 +711,7 @@ impl Operation for AddUserToGroupOperation {
                 auth_doc,
                 admin_outbox_written,
                 newly_added,
-            } => self.handle_delete_stale_admin_conflicts(
+            } => self.handle_conflict_deletes(
                 event,
                 txn_id,
                 auth_doc,
@@ -742,11 +735,11 @@ impl Operation for AddUserToGroupOperation {
             AddUserToGroupState::ScheduleAdminDocumentOutboxDrain {
                 auth_doc,
                 newly_added,
-            } => self.handle_schedule_admin_document_outbox_drain(event, auth_doc, newly_added),
+            } => self.handle_drain_schedule(event, auth_doc, newly_added),
             AddUserToGroupState::AnnounceAuthDoc {
                 auth_doc,
                 newly_added,
-            } => self.handle_announce_auth_doc(event, auth_doc, newly_added),
+            } => self.handle_auth_announce(event, auth_doc, newly_added),
             AddUserToGroupState::EmitNotifications { auth_doc } => {
                 self.handle_emit_notifications(auth_doc)
             }
@@ -791,14 +784,14 @@ fn sorted_role_ids(role_ids: &HashSet<RoleId>) -> Vec<RoleId> {
     role_ids
 }
 
-fn apply_admin_reducer_updates(
+fn apply_reducer_updates(
     state: &mut AdminDocumentReducerState,
     input: &AddUserToGroupInput,
     role_ids: &[RoleId],
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
     let mut admin_events = Vec::new();
     for role_id in role_ids {
-        if should_seed_group_role(state, *role_id) {
+        if should_seed_role(state, *role_id) {
             let event = state.apply_operation(
                 &input.actor,
                 AdminDocumentOperation::GroupRoleAdded { role_id: *role_id },
@@ -818,7 +811,7 @@ fn apply_admin_reducer_updates(
     Ok(admin_events)
 }
 
-fn should_seed_group_role(state: &AdminDocumentReducerState, role_id: RoleId) -> bool {
+fn should_seed_role(state: &AdminDocumentReducerState, role_id: RoleId) -> bool {
     !state.materialized_group_roles().contains(&role_id)
         && !state
             .conflicts
@@ -844,9 +837,7 @@ pub mod test {
         AdminDocumentAttributeVersion, AdminDocumentConflict, AdminDocumentConflictValue,
         AdminDocumentReducerState,
     };
-    use aruna_core::storage_entries::{
-        admin_document_reducer_conflict_key, admin_document_reducer_state_key,
-    };
+    use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, NotificationOutboxRecord, NotificationRecord,
         Permission, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind, Role,
@@ -908,7 +899,7 @@ pub mod test {
         }
     }
 
-    fn reducer_state_with_assignment_conflicts(
+    fn assignment_conflict_state(
         group_id: Ulid,
         role_id: RoleId,
         assigned_user_id: UserId,
@@ -949,10 +940,7 @@ pub mod test {
         }
     }
 
-    fn reducer_state_with_role_conflict(
-        group_id: Ulid,
-        role_id: RoleId,
-    ) -> AdminDocumentReducerState {
+    fn role_conflict_state(group_id: Ulid, role_id: RoleId) -> AdminDocumentReducerState {
         let path = format!("group.roles.{role_id}");
         AdminDocumentReducerState {
             target: AdminDocumentTarget::Group { group_id },
@@ -984,7 +972,7 @@ pub mod test {
     }
 
     #[test]
-    fn rejects_nil_user_id_as_group_member() {
+    fn rejects_nil_member() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let owner_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
         let group_id = Ulid::from_bytes([3u8; 16]);
@@ -1009,7 +997,7 @@ pub mod test {
     }
 
     #[test]
-    fn seeds_missing_group_role_before_assignment_outbox_event() {
+    fn seeds_missing_role() {
         let realm_id = RealmId::from_bytes([12u8; 32]);
         let owner_id = UserId::local(Ulid::from_bytes([13u8; 16]), realm_id);
         let assigned_user_id = UserId::local(Ulid::from_bytes([14u8; 16]), realm_id);
@@ -1043,7 +1031,7 @@ pub mod test {
         let mut operation = AddUserToGroupOperation::new(input);
 
         let effects = operation
-            .emit_write_auth_doc_and_admin_state(
+            .emit_auth_write(
                 TxnId::generate(),
                 Some(auth_doc.to_bytes(&actor).unwrap().into()),
                 None,
@@ -1089,7 +1077,7 @@ pub mod test {
     }
 
     #[test]
-    fn writes_reducer_state_and_conflicts_with_auth_doc_update_transaction() {
+    fn writes_reducer_conflicts() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let owner_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let assigned_user_id = UserId::local(Ulid::from_bytes([4u8; 16]), realm_id);
@@ -1114,7 +1102,7 @@ pub mod test {
                 },
             )]),
         };
-        let previous_state = reducer_state_with_assignment_conflicts(
+        let previous_state = assignment_conflict_state(
             group_id,
             role_id,
             assigned_user_id,
@@ -1155,7 +1143,7 @@ pub mod test {
                     Some(auth_doc.to_bytes(&actor).unwrap().into()),
                 ),
                 (
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                     Some(postcard::to_allocvec(&previous_state).unwrap().into()),
                 ),
                 (
@@ -1227,7 +1215,7 @@ pub mod test {
                 .contains(&assigned_user_id)
         );
         assert_eq!(
-            reducer_state.materialized_group_role_user_assignments(),
+            reducer_state.materialized_group_assignments(),
             BTreeMap::from([(role_id, BTreeSet::from([assigned_user_id]))])
         );
         assert!(
@@ -1250,10 +1238,7 @@ pub mod test {
                     deletes,
                     &vec![(
                         ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
-                        admin_document_reducer_conflict_key(
-                            &target,
-                            &assignment_path(role_id, assigned_user_id),
-                        ),
+                        reducer_conflict_key(&target, &assignment_path(role_id, assigned_user_id),),
                     )]
                 );
             }
@@ -1283,7 +1268,7 @@ pub mod test {
     }
 
     #[test]
-    fn unresolved_role_conflict_does_not_emit_membership_notification() {
+    fn conflict_skips_notification() {
         let realm_id = RealmId::from_bytes([31u8; 32]);
         let actor = Actor {
             node_id: node(32),
@@ -1293,8 +1278,8 @@ pub mod test {
         let member_id = UserId::local(Ulid::from_bytes([34u8; 16]), realm_id);
         let group_id = Ulid::from_bytes([35u8; 16]);
         let role_id = Ulid::from_bytes([36u8; 16]);
-        let auth_doc = seeded_user_role_doc(group_id, role_id);
-        let reducer_state = reducer_state_with_role_conflict(group_id, role_id);
+        let auth_doc = seeded_user_role(group_id, role_id);
+        let reducer_state = role_conflict_state(group_id, role_id);
         let mut operation = AddUserToGroupOperation::new(AddUserToGroupInput {
             actor: actor.clone(),
             group_id,
@@ -1304,7 +1289,7 @@ pub mod test {
         let txn_id = TxnId::generate();
 
         operation
-            .emit_write_auth_doc_and_admin_state(
+            .emit_auth_write(
                 txn_id,
                 Some(auth_doc.to_bytes(&actor).unwrap().into()),
                 Some(postcard::to_allocvec(&reducer_state).unwrap().into()),
@@ -1499,7 +1484,7 @@ pub mod test {
         (actor, group, auth_doc)
     }
 
-    fn role_ids_by_name(auth_doc: &GroupAuthorizationDocument, name: &str) -> HashSet<RoleId> {
+    fn named_role_ids(auth_doc: &GroupAuthorizationDocument, name: &str) -> HashSet<RoleId> {
         auth_doc
             .roles
             .iter()
@@ -1531,7 +1516,7 @@ pub mod test {
         }
     }
 
-    fn seeded_user_role_doc(group_id: Ulid, role_id: Ulid) -> GroupAuthorizationDocument {
+    fn seeded_user_role(group_id: Ulid, role_id: Ulid) -> GroupAuthorizationDocument {
         GroupAuthorizationDocument {
             group_id,
             policies: Vec::new(),
@@ -1548,7 +1533,7 @@ pub mod test {
     }
 
     #[tokio::test]
-    async fn add_user_emits_membership_notifications() {
+    async fn emits_membership_notifications() {
         let (context, net_handle, _tmp) = add_context().await;
         let (actor, group, auth_doc) = setup_group(&context).await;
 
@@ -1558,7 +1543,7 @@ pub mod test {
                 actor: actor.clone(),
                 group_id: group.group_id,
                 user_id: second_admin,
-                role_ids: role_ids_by_name(&auth_doc, "admin"),
+                role_ids: named_role_ids(&auth_doc, "admin"),
             }),
             &context,
         )
@@ -1571,7 +1556,7 @@ pub mod test {
                 actor: actor.clone(),
                 group_id: group.group_id,
                 user_id: member,
-                role_ids: role_ids_by_name(&auth_doc, "user"),
+                role_ids: named_role_ids(&auth_doc, "user"),
             }),
             &context,
         )
@@ -1596,7 +1581,7 @@ pub mod test {
     }
 
     #[test]
-    fn host_result_is_ok_even_when_emit_fails() {
+    fn emit_failure_succeeds() {
         let realm_id = RealmId::from_bytes([12u8; 32]);
         let member_id = UserId::local(Ulid::from_bytes([14u8; 16]), realm_id);
         let group_id = Ulid::from_bytes([15u8; 16]);
@@ -1606,7 +1591,7 @@ pub mod test {
             user_id: UserId::local(Ulid::from_bytes([13u8; 16]), realm_id),
             realm_id,
         };
-        let auth_doc = seeded_user_role_doc(group_id, role_id);
+        let auth_doc = seeded_user_role(group_id, role_id);
         let target = AdminDocumentTarget::Group { group_id };
 
         let mut operation = AddUserToGroupOperation::new(AddUserToGroupInput {
@@ -1627,7 +1612,7 @@ pub mod test {
                     group_id.to_bytes().into(),
                     Some(auth_doc.to_bytes(&actor).unwrap().into()),
                 ),
-                (admin_document_reducer_state_key(&target), None),
+                (reducer_state_key(&target), None),
                 (realm_id.as_bytes().to_vec().into(), None),
             ],
         }));
@@ -1652,7 +1637,7 @@ pub mod test {
     }
 
     #[test]
-    fn emit_state_is_skipped_when_no_recipients() {
+    fn skips_empty_emit() {
         let realm_id = RealmId::from_bytes([12u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([13u8; 16]), realm_id);
         let group_id = Ulid::from_bytes([15u8; 16]);
@@ -1662,7 +1647,7 @@ pub mod test {
             user_id,
             realm_id,
         };
-        let auth_doc = seeded_user_role_doc(group_id, role_id);
+        let auth_doc = seeded_user_role(group_id, role_id);
         let target = AdminDocumentTarget::Group { group_id };
 
         let mut operation = AddUserToGroupOperation::new(AddUserToGroupInput {
@@ -1683,7 +1668,7 @@ pub mod test {
                     group_id.to_bytes().into(),
                     Some(auth_doc.to_bytes(&actor).unwrap().into()),
                 ),
-                (admin_document_reducer_state_key(&target), None),
+                (reducer_state_key(&target), None),
                 (realm_id.as_bytes().to_vec().into(), None),
             ],
         }));
@@ -1703,7 +1688,7 @@ pub mod test {
     }
 
     #[tokio::test]
-    async fn readding_existing_member_emits_nothing() {
+    async fn existing_member_silent() {
         let (context, net_handle, _tmp) = add_context().await;
         let (actor, group, auth_doc) = setup_group(&context).await;
         let member = UserId::local(Ulid::generate(), actor.realm_id);
@@ -1713,7 +1698,7 @@ pub mod test {
                 actor: actor.clone(),
                 group_id: group.group_id,
                 user_id: member,
-                role_ids: role_ids_by_name(&auth_doc, "user"),
+                role_ids: named_role_ids(&auth_doc, "user"),
             }),
             &context,
         )
@@ -1728,7 +1713,7 @@ pub mod test {
                 actor: actor.clone(),
                 group_id: group.group_id,
                 user_id: member,
-                role_ids: role_ids_by_name(&auth_doc, "user"),
+                role_ids: named_role_ids(&auth_doc, "user"),
             }),
             &context,
         )
@@ -1741,7 +1726,7 @@ pub mod test {
                 actor: actor.clone(),
                 group_id: group.group_id,
                 user_id: member,
-                role_ids: role_ids_by_name(&auth_doc, "viewer"),
+                role_ids: named_role_ids(&auth_doc, "viewer"),
             }),
             &context,
         )

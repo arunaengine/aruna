@@ -10,8 +10,7 @@ use aruna_core::reducer::{
 };
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
 use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::{
     Actor, AuthContext, GroupAuthorizationDocument, Permission, PlacementRef, RealmConfigDocument,
@@ -155,7 +154,7 @@ impl SetGroupPoliciesOperation {
                 ),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                 ),
                 (
                     REALM_CONFIG_KEYSPACE.to_string(),
@@ -193,7 +192,7 @@ impl SetGroupPoliciesOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                aruna_core::reducer::decode_reducer_state(value.as_ref())
                     .map_err(ConversionError::from)
             })
             .transpose()?;
@@ -215,10 +214,8 @@ impl SetGroupPoliciesOperation {
         )?;
         apply_reducer_policies(&mut document, &reducer_state);
 
-        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
-            previous_reducer_state.as_ref(),
-            Some(&reducer_state),
-        );
+        let stale_conflict_deletes =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let document_target = self.document_ref();
         let realm_config = realm_config_value
             .as_deref()
@@ -238,7 +235,7 @@ impl SetGroupPoliciesOperation {
                 document_target.storage_key(),
                 document.to_bytes(&self.config.actor)?.into(),
             ),
-            admin_document_reducer_state_write_entry(&reducer_state)?,
+            reducer_state_entry(&reducer_state)?,
         ];
         let record = new_outbox_record_with_id(
             admin_event.event_id,
@@ -251,7 +248,7 @@ impl SetGroupPoliciesOperation {
         )
         .fenced_at(self.fence.generation(&realm_id, &placement));
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
-        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+        writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
         self.state = SetGroupPoliciesState::WriteDocumentAndAdminState {
@@ -543,7 +540,7 @@ mod tests {
     /// The group creator holds the group admin role, but the permission
     /// sub-operation also needs the realm authorization document to exist.
     async fn seed_realm_doc(context: &DriverContext, actor: &Actor) {
-        let document = RealmAuthorizationDocument::new_default_realm_doc(actor.realm_id);
+        let document = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
         match context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {

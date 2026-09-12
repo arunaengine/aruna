@@ -9,7 +9,7 @@ use std::time::Duration;
 use aruna_core::structs::{JobId, JobPayload, JobRecord, JobState, RealmId};
 use aruna_core::types::{NodeId, UserId};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::drain::{JobClassBudget, process_job_queue_batch};
+use aruna_operations::jobs::drain::{JobClassBudget, drain_job_batch};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::{claim_job, insert_job, read_job_record, set_cancel_requested};
 use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle};
@@ -120,7 +120,7 @@ async fn drive_until_terminal(
     context: &Arc<DriverContext>,
     runtime: &Arc<JobsRuntime>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let batch = process_job_queue_batch(
+    let batch = drain_job_batch(
         &context.storage_handle,
         node_id(1),
         JobClassBudget {
@@ -156,7 +156,7 @@ async fn restart_recovery_child() -> Result<(), Box<dyn std::error::Error>> {
     let marker_a = child_env(CHILD_MARKER_A_ENV)?;
     let marker_b = child_env(CHILD_MARKER_B_ENV)?;
 
-    let storage = FjallStorage::open_with_persist_policy(
+    let storage = FjallStorage::open_with_policy(
         storage_path.to_str().ok_or("invalid storage path")?,
         FjallPersistPolicy::SyncAll,
     )?;

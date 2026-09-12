@@ -306,13 +306,13 @@ pub enum AdminDocumentOperation {
 mod tests {
     use super::{AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget};
     use crate::NodeId;
-    use crate::identifiers::PlacementHandle;
     use crate::structs::{
         AffinityEffect, AffinityRule, BandPool, BindingScope, DocumentClass, HandleRange,
         LabelMatch, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
         PlacementBinding, PlacementOverride, PlacementScope, PlacementStrategy, QuotaConfig,
         RealmComputeConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
     };
+    use crate::structured_id::PlacementHandle;
     use crate::types::{GroupId, RoleId, UserId};
     use std::collections::BTreeMap;
     use ulid::Ulid;
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_document_operations_roundtrip() {
+    fn admin_document_roundtrip() {
         let role_id = role_id(1);
         let assigned_user_id = user_id(2);
         let realm_id = RealmId::from_bytes([9; 32]);
@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_document_targets_roundtrip() {
+    fn admin_targets_roundtrip() {
         let realm_id = RealmId::from_bytes([9; 32]);
         let targets = [
             AdminDocumentTarget::Group {
@@ -629,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_config_node_ensured_operation_roundtrips() {
+    fn realm_config_roundtrips() {
         let operation = AdminDocumentOperation::RealmConfigNodeEnsured {
             node_id: node(3),
             kind: RealmNodeKind::Server,
@@ -639,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_config_oidc_provider_operations_roundtrip() {
+    fn realm_config_roundtrip() {
         let operations = [
             AdminDocumentOperation::RealmConfigOidcProviderUpserted {
                 provider: oidc_provider("default"),
@@ -655,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_config_settings_operation_roundtrips() {
+    fn realm_settings_roundtrips() {
         let operation = AdminDocumentOperation::RealmConfigSettingsSet {
             metadata_replication: MetadataReplicationConfig::new(3),
             discovery: RealmDiscoveryConfig::Static {
@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn group_created_operation_roundtrips() {
+    fn group_created_roundtrips() {
         let operation = AdminDocumentOperation::GroupCreated {
             realm_id: RealmId::from_bytes([9; 32]),
             display_name: "Engineering".to_string(),
@@ -678,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_config_description_operation_roundtrips() {
+    fn realm_description_roundtrips() {
         let operation = AdminDocumentOperation::RealmConfigDescriptionSet {
             description: "Demo Realm".to_string(),
         };

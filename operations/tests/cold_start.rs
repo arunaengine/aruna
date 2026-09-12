@@ -144,7 +144,7 @@ async fn timed_query(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "cold-start profile over a 40k-doc node; run manually (release)"]
-async fn first_query_on_cold_node_with_40k_docs() -> Result<(), BoxError> {
+async fn first_cold_query() -> Result<(), BoxError> {
     let docs = env_usize("ARUNA_COLD_START_DOCS", 40_000);
     let writers = env_usize("ARUNA_COLD_START_WRITERS", 16);
 
@@ -193,7 +193,7 @@ async fn first_query_on_cold_node_with_40k_docs() -> Result<(), BoxError> {
 
     // Cold fill of the handle-owned list-path registry cache over the same storage.
     let list_fill_started = Instant::now();
-    let listed = handle.list_cached_registry_records().await?;
+    let listed = handle.list_cached_records().await?;
     println!(
         "registry cache cold fill: {:?} ({} records)",
         list_fill_started.elapsed(),

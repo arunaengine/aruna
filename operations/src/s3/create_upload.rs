@@ -237,7 +237,7 @@ impl CreateMultipartUploadOperation {
         smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
     }
 
-    fn handle_purge_fence_checked(&mut self, event: Event) -> Effects {
+    fn fence_checked(&mut self, event: Event) -> Effects {
         if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
             return self.emit_error(error.into());
         }
@@ -347,7 +347,7 @@ impl Operation for CreateMultipartUploadOperation {
             CreateMultipartUploadState::ReadGateBucket => self.handle_gate_bucket(event),
             CreateMultipartUploadState::PolicyGate => self.handle_policy_gate(event),
             CreateMultipartUploadState::StartTransaction => self.handle_transaction_started(event),
-            CreateMultipartUploadState::CheckPurgeFence => self.handle_purge_fence_checked(event),
+            CreateMultipartUploadState::CheckPurgeFence => self.fence_checked(event),
             CreateMultipartUploadState::FenceBackend => self.handle_backend_fenced(event),
             CreateMultipartUploadState::WriteUpload => self.handle_record_written(event),
             CreateMultipartUploadState::CommitTransaction => {

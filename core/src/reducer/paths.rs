@@ -30,7 +30,7 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         | AdminDocumentOperation::GroupRoleRemoved { role_id } => vec![group_role_path(role_id)],
         AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id }
         | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id } => {
-            vec![group_role_user_assignment_path(role_id, user_id)]
+            vec![group_user_path(role_id, user_id)]
         }
         AdminDocumentOperation::GroupJoinRequested { request } => {
             vec![crate::join_request::request_path(request.request_id)]
@@ -41,7 +41,7 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
                 decision
                     .role_ids
                     .iter()
-                    .map(|role_id| group_role_user_assignment_path(role_id, &decision.user_id)),
+                    .map(|role_id| group_user_path(role_id, &decision.user_id)),
             );
             paths
         }
@@ -50,7 +50,7 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         AdminDocumentOperation::UserNameSet { .. } => vec![USER_NAME_PATH.to_string()],
         AdminDocumentOperation::UserSubjectIdAdded { subject_id }
         | AdminDocumentOperation::UserSubjectIdRemoved { subject_id } => {
-            vec![user_subject_id_path(subject_id)]
+            vec![user_subject_path(subject_id)]
         }
         AdminDocumentOperation::RealmRoleAdded { role_id }
         | AdminDocumentOperation::RealmRoleCreated {
@@ -58,17 +58,17 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         } => vec![realm_role_path(role_id)],
         AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id }
         | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id } => {
-            vec![realm_role_user_assignment_path(role_id, user_id)]
+            vec![realm_user_path(role_id, user_id)]
         }
         AdminDocumentOperation::RealmConfigNodeEnsured { node_id, .. }
         | AdminDocumentOperation::RealmConfigNodeRemoved { node_id } => {
-            vec![realm_config_node_path(node_id)]
+            vec![config_node_path(node_id)]
         }
         AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider } => {
-            vec![realm_config_oidc_provider_path(&provider.id)]
+            vec![config_oidc_path(&provider.id)]
         }
         AdminDocumentOperation::RealmConfigOidcProviderRemoved { provider_id } => {
-            vec![realm_config_oidc_provider_path(provider_id)]
+            vec![config_oidc_path(provider_id)]
         }
         AdminDocumentOperation::RealmConfigSettingsSet { .. } => vec![
             REALM_CONFIG_METADATA_REPLICATION_PATH.to_string(),
@@ -98,16 +98,16 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
             vec![GROUP_POLICIES_PATH.to_string()]
         }
         AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
-            vec![realm_config_placement_node_path(&entry.node_id)]
+            vec![placement_node_path(&entry.node_id)]
         }
         AdminDocumentOperation::RealmConfigNodePlacementRemoved { node_id } => {
-            vec![realm_config_placement_node_path(node_id)]
+            vec![placement_node_path(node_id)]
         }
         AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy } => {
-            vec![realm_config_placement_strategy_path(&strategy.strategy_id)]
+            vec![placement_strategy_path(&strategy.strategy_id)]
         }
         AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id } => {
-            vec![realm_config_placement_strategy_path(strategy_id)]
+            vec![placement_strategy_path(strategy_id)]
         }
         AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => {
             vec![REALM_CONFIG_DEFAULT_STRATEGY_PATH.to_string()]
@@ -116,16 +116,16 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
             vec![REALM_CONFIG_JOB_FAMILY_PATH.to_string()]
         }
         AdminDocumentOperation::RealmConfigStrategyBindingSet { binding } => {
-            vec![realm_config_strategy_binding_path(&binding.scope)]
+            vec![strategy_binding_path(&binding.scope)]
         }
         AdminDocumentOperation::RealmConfigStrategyBindingRemoved { scope } => {
-            vec![realm_config_strategy_binding_path(scope)]
+            vec![strategy_binding_path(scope)]
         }
         AdminDocumentOperation::RealmConfigPlacementOverrideSet { record } => {
-            vec![realm_config_placement_override_path(&record.subject)]
+            vec![placement_override_path(&record.subject)]
         }
         AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { subject } => {
-            vec![realm_config_placement_override_path(subject)]
+            vec![placement_override_path(subject)]
         }
         AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding } => {
             vec![placement_binding_path(binding.handle)]
@@ -207,7 +207,7 @@ pub fn user_attribute_path(key: &str) -> String {
     format!("user.attributes.{key}")
 }
 
-pub fn user_subject_id_path(subject_id: &str) -> String {
+pub fn user_subject_path(subject_id: &str) -> String {
     format!("user.subject_ids.{subject_id}")
 }
 
@@ -215,7 +215,7 @@ pub fn group_role_path(role_id: &RoleId) -> String {
     format!("group.roles.{role_id}")
 }
 
-pub fn group_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
+pub fn group_user_path(role_id: &RoleId, user_id: &UserId) -> String {
     format!("group.roles.{role_id}.assigned_users.{user_id}")
 }
 
@@ -223,15 +223,15 @@ pub fn realm_role_path(role_id: &RoleId) -> String {
     format!("realm.roles.{role_id}")
 }
 
-pub fn realm_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
+pub fn realm_user_path(role_id: &RoleId, user_id: &UserId) -> String {
     format!("realm.roles.{role_id}.assigned_users.{user_id}")
 }
 
-pub fn realm_config_node_path(node_id: &NodeId) -> String {
+pub fn config_node_path(node_id: &NodeId) -> String {
     format!("realm_config.nodes.{node_id}")
 }
 
-pub fn realm_config_oidc_provider_path(provider_id: &str) -> String {
+pub fn config_oidc_path(provider_id: &str) -> String {
     format!("realm_config.oidc_providers.{provider_id}")
 }
 pub fn binding_scope_key(scope: &BindingScope) -> String {
@@ -332,11 +332,11 @@ pub(super) fn oidc_provider_value(provider: &OidcProviderConfig) -> String {
     serde_json::to_string(provider).expect("admin document OIDC provider config serializes")
 }
 
-pub(super) fn realm_node_kind_value(kind: &RealmNodeKind) -> String {
+pub(super) fn node_kind_value(kind: &RealmNodeKind) -> String {
     serde_json::to_string(kind).expect("realm node kind serializes")
 }
 
-pub fn group_role_id_from_path(path: &str) -> Option<RoleId> {
+pub fn parse_group_role(path: &str) -> Option<RoleId> {
     let role_id = path.strip_prefix("group.roles.")?;
 
     if role_id.contains(".assigned_users.") {
@@ -346,7 +346,7 @@ pub fn group_role_id_from_path(path: &str) -> Option<RoleId> {
     Ulid::from_string(role_id).ok()
 }
 
-pub fn group_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserId)> {
+pub fn parse_group_assignment(path: &str) -> Option<(RoleId, UserId)> {
     let path = path.strip_prefix("group.roles.")?;
     let (role_id, user_id) = path.split_once(".assigned_users.")?;
 
@@ -356,11 +356,11 @@ pub fn group_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserI
     ))
 }
 
-pub(super) fn group_role_user_assignment_role_id_from_path(path: &str) -> Option<RoleId> {
-    group_role_user_assignment_from_path(path).map(|(role_id, _)| role_id)
+pub(super) fn group_assignment_role(path: &str) -> Option<RoleId> {
+    parse_group_assignment(path).map(|(role_id, _)| role_id)
 }
 
-pub fn realm_role_id_from_path(path: &str) -> Option<RoleId> {
+pub fn parse_realm_role(path: &str) -> Option<RoleId> {
     let role_id = path.strip_prefix("realm.roles.")?;
 
     if role_id.contains(".assigned_users.") {
@@ -370,7 +370,7 @@ pub fn realm_role_id_from_path(path: &str) -> Option<RoleId> {
     Ulid::from_string(role_id).ok()
 }
 
-pub fn realm_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserId)> {
+pub fn parse_realm_assignment(path: &str) -> Option<(RoleId, UserId)> {
     let path = path.strip_prefix("realm.roles.")?;
     let (role_id, user_id) = path.split_once(".assigned_users.")?;
 
@@ -380,28 +380,28 @@ pub fn realm_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserI
     ))
 }
 
-pub(super) fn realm_role_user_assignment_role_id_from_path(path: &str) -> Option<RoleId> {
-    realm_role_user_assignment_from_path(path).map(|(role_id, _)| role_id)
+pub(super) fn realm_assignment_role(path: &str) -> Option<RoleId> {
+    parse_realm_assignment(path).map(|(role_id, _)| role_id)
 }
 
-pub fn realm_config_node_id_from_path(path: &str) -> Option<NodeId> {
+pub fn parse_config_node(path: &str) -> Option<NodeId> {
     let node_id = path.strip_prefix("realm_config.nodes.")?;
     NodeId::from_str(node_id).ok()
 }
 
-pub fn realm_config_oidc_provider_id_from_path(path: &str) -> Option<&str> {
+pub fn parse_config_oidc(path: &str) -> Option<&str> {
     path.strip_prefix("realm_config.oidc_providers.")
 }
 
-pub(super) fn oidc_provider_from_value(value: &str) -> Option<OidcProviderConfig> {
+pub(super) fn decode_oidc_provider(value: &str) -> Option<OidcProviderConfig> {
     serde_json::from_str(value).ok()
 }
 
-pub(super) fn metadata_replication_from_value(value: &str) -> Option<MetadataReplicationConfig> {
+pub(super) fn decode_metadata_replication(value: &str) -> Option<MetadataReplicationConfig> {
     serde_json::from_str(value).ok()
 }
 
-pub(super) fn realm_discovery_from_value(value: &str) -> Option<RealmDiscoveryConfig> {
+pub(super) fn decode_realm_discovery(value: &str) -> Option<RealmDiscoveryConfig> {
     serde_json::from_str(value).ok()
 }
 
@@ -432,6 +432,6 @@ pub(super) fn quota_from_value(value: &str) -> Option<QuotaConfig> {
         .ok()
         .map(|quota| supported_quota(&quota))
 }
-pub(super) fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
+pub(super) fn decode_node_kind(value: &str) -> Option<RealmNodeKind> {
     serde_json::from_str(value).ok()
 }

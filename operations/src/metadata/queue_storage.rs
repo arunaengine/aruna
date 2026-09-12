@@ -45,7 +45,7 @@ pub(super) async fn commit_storage_transaction(
     }
 }
 
-pub(super) async fn abort_storage_transaction_best_effort(
+pub(super) async fn abort_storage_transaction(
     storage: &StorageHandle,
     txn_id: Ulid,
     storage_error_message: &'static str,

@@ -4,7 +4,7 @@ use aruna_core::keyspaces::STAGING_JOB_STATE_KEYSPACE;
 use aruna_core::structs::{
     BucketInfo, JobError, JobId, JobResultPayload, Permission, SourceEntry, SourceEntryKind,
     StagingJobCheckpoint, StagingJobDirectory, StagingJobError, StagingJobPhase, StagingJobSpec,
-    StagingPendingItem, StagingStrategy, blob_object_permission_path,
+    StagingPendingItem, StagingStrategy, object_permission_path,
 };
 use byteview::ByteView;
 use tracing::warn;
@@ -389,7 +389,7 @@ async fn ensure_item_permission(
         ));
     }
     let source_path = source_permission_path(spec, &item.source_path);
-    let target_path = blob_object_permission_path(
+    let target_path = object_permission_path(
         spec.auth_context.realm_id,
         spec.group_id,
         spec.node_id,

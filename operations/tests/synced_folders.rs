@@ -46,10 +46,6 @@ fn body(bytes: &'static [u8]) -> BackendStream<Result<bytes::Bytes, StreamError>
 }
 
 /// Waits until the realm has pulled every queued upload.
-///
-/// The drain is a timer task the reconciliation arms, so it runs concurrently
-/// with an explicit pass and may hold the row this one wanted. Publishing is
-/// therefore complete when the outbox is empty, never after one call.
 async fn await_uploads(realm: &Topology) -> TestResult<()> {
     let device = realm.user_node();
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(

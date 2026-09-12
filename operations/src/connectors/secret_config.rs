@@ -5,9 +5,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::connectors::repository::{
-    StorageReadError, parse_connector_secret_read, read_connector_secret_effect,
-};
+use crate::connectors::repository::{StorageReadError, parse_secret_read, read_secret_effect};
 
 #[derive(Debug, PartialEq)]
 pub struct ConnectorHasSecretConfigOperation {
@@ -48,7 +46,7 @@ impl ConnectorHasSecretConfigOperation {
     }
 
     fn handle_secret_read(&mut self, event: Event) -> Effects {
-        match parse_connector_secret_read(event) {
+        match parse_secret_read(event) {
             Ok(secret) => {
                 self.state = ConnectorHasSecretConfigState::Finish;
                 self.output = Some(Ok(secret.is_some()));
@@ -65,7 +63,7 @@ impl Operation for ConnectorHasSecretConfigOperation {
 
     fn start(&mut self) -> Effects {
         self.state = ConnectorHasSecretConfigState::ReadSecret;
-        smallvec![read_connector_secret_effect(self.connector_id, None)]
+        smallvec![read_secret_effect(self.connector_id, None)]
     }
 
     fn step(&mut self, event: Event) -> Effects {

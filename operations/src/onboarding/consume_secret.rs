@@ -12,7 +12,7 @@ use ulid::Ulid;
 
 use crate::onboarding::create_secret::secret_record_key;
 use crate::onboarding::secret_state::{
-    resolve_secret_state, secret_state_key, secret_state_write_entry,
+    resolve_secret_state, secret_state_key, secret_state_entry,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,7 +256,7 @@ impl Operation for ConsumeOnboardingSecretOperation {
                     txn_id,
                     record: record.clone(),
                 };
-                let state_entry = match secret_state_write_entry(
+                let state_entry = match secret_state_entry(
                     self.input.enrollment_id,
                     OnboardingSecretState::Consumed {
                         node_id: self.input.node_id.clone(),
@@ -377,7 +377,7 @@ mod tests {
     use ulid::Ulid;
 
     #[tokio::test]
-    async fn claims_secret_idempotently_for_same_node() {
+    async fn claims_same_node() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {

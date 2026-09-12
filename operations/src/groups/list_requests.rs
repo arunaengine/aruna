@@ -6,8 +6,8 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::join_request::{JoinDecisionKind, JoinRequestState};
 use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::decode_admin_document_reducer_state;
-use aruna_core::storage_entries::admin_document_reducer_state_key;
+use aruna_core::reducer::decode_reducer_state;
+use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::{AuthContext, Permission};
 use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
@@ -83,13 +83,11 @@ impl ListJoinRequestsOperation {
         self.state = State::Read;
         let prefix = self.input.group_id.map_or_else(
             || Key::from(vec![b'g']),
-            |group_id| admin_document_reducer_state_key(&AdminDocumentTarget::Group { group_id }),
+            |group_id| reducer_state_key(&AdminDocumentTarget::Group { group_id }),
         );
         let start = after.map(IterStart::After).or_else(|| {
             self.input.start_after.map(|(group_id, _)| {
-                IterStart::At(admin_document_reducer_state_key(
-                    &AdminDocumentTarget::Group { group_id },
-                ))
+                IterStart::At(reducer_state_key(&AdminDocumentTarget::Group { group_id }))
             })
         });
         smallvec![Effect::Storage(StorageEffect::Iter {
@@ -107,12 +105,11 @@ impl ListJoinRequestsOperation {
         next: Option<Key>,
     ) -> Result<Effects, ListJoinRequestsError> {
         for (key, value) in values {
-            let state =
-                decode_admin_document_reducer_state(&value).map_err(ConversionError::from)?;
+            let state = decode_reducer_state(&value).map_err(ConversionError::from)?;
             let AdminDocumentTarget::Group { group_id } = state.target else {
                 return Err(ListJoinRequestsError::UnexpectedEvent);
             };
-            if key != admin_document_reducer_state_key(&state.target) {
+            if key != reducer_state_key(&state.target) {
                 return Err(ListJoinRequestsError::UnexpectedEvent);
             }
             for entry in state.join_requests() {

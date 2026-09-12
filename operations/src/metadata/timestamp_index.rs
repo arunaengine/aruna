@@ -12,7 +12,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::metadata::get_document::load_metadata_record_by_document;
+use crate::metadata::get_document::load_document_record;
 use crate::metadata::repository::{StorageReadError, delete_index_keys};
 use crate::storage_read::parse_storage_scan;
 
@@ -71,7 +71,7 @@ pub async fn enumerate_updated(
                     stale_keys,
                 });
             }
-            match load_metadata_record_by_document(context, document_id).await? {
+            match load_document_record(context, document_id).await? {
                 Some(record) if record.updated_at_ms == updated_at_ms => {
                     records.push(record);
                     if records.len() >= limit {
@@ -144,7 +144,7 @@ async fn sweep_bounded(
                 parse_updated_key(key.as_ref()).map_err(StorageReadError::Conversion)?;
             scanned += 1;
             resume = Some(key.clone());
-            match load_metadata_record_by_document(context, document_id).await? {
+            match load_document_record(context, document_id).await? {
                 Some(record) if record.updated_at_ms == updated_at_ms => {}
                 _ => stale.push(key),
             }
@@ -209,7 +209,7 @@ fn iter_effect(start: IterStart) -> Effect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::repository::create_records_and_outbox_write_entries;
+    use crate::metadata::repository::create_outbox_entries;
     use aruna_core::NodeId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -266,9 +266,7 @@ mod tests {
     }
 
     async fn store(context: &DriverContext, record: &MetadataRegistryRecord) {
-        let writes =
-            create_records_and_outbox_write_entries(record, &audit(record), Ulid::generate(), None)
-                .unwrap();
+        let writes = create_outbox_entries(record, &audit(record), Ulid::generate(), None).unwrap();
         let event = context
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::BatchWrite {
@@ -327,7 +325,7 @@ mod tests {
         let event = context
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::BatchDelete {
-                deletes: aruna_core::storage_entries::metadata_registry_delete_entries(&record),
+                deletes: aruna_core::storage_entries::registry_delete_entries(&record),
                 txn_id: None,
             }))
             .await;

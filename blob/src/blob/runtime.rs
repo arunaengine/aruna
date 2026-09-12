@@ -173,7 +173,7 @@ impl Handle for BlobHandle {
         match effect {
             Effect::Blob(blob_effect) => self.send_blob_effect(blob_effect).await,
             Effect::StagingSource(staging_source_effect) => {
-                self.send_staging_source_effect(staging_source_effect).await
+                self.send_staging_effect(staging_source_effect).await
             }
             Effect::LocalFile(file_effect) => self.send_file_effect(file_effect).await,
             _ => Event::Blob(BlobEvent::Error(BlobError::InvalidEffect)),
@@ -340,7 +340,7 @@ impl BlobHandle {
         })
     }
 
-    pub async fn send_staging_source_effect(&self, effect: StagingSourceEffect) -> Event {
+    pub async fn send_staging_effect(&self, effect: StagingSourceEffect) -> Event {
         let staging_source_event = match effect {
             StagingSourceEffect::Check { access } => {
                 self.handler.check_staging_source(access).await
@@ -673,9 +673,9 @@ impl BlobHandler {
     }
 
     pub async fn open_connection(&self, node_id: NodeId) -> BlobEvent {
-        match super::control_plane::with_control_plane_timeout(
+        match super::control_plane::with_timeout(
             self.net.open_stream(node_id, Alpn::Bao),
-            self.control_plane_connect_timeout(),
+            self.connect_timeout(),
             super::ControlPlaneTimeoutKind::Connection,
             "opening bao replication stream",
         )
@@ -698,10 +698,10 @@ impl BlobHandler {
         let mut stream = stream.lock().await;
         let sx = &mut stream.0;
 
-        if let Err(event) = super::control_plane::send_framed_message_with_timeout(
+        if let Err(event) = super::control_plane::send_framed_message(
             sx,
             &payload,
-            self.control_plane_io_timeout(),
+            self.io_timeout(),
             "sending control-plane message",
         )
         .await
@@ -720,9 +720,9 @@ impl BlobHandler {
         let mut stream = stream.lock().await;
         let rx = &mut stream.1;
 
-        let buf = match super::control_plane::read_framed_message_with_timeout(
+        let buf = match super::control_plane::read_framed_message(
             rx,
-            self.control_plane_io_timeout(),
+            self.io_timeout(),
             "reading control-plane message",
         )
         .await

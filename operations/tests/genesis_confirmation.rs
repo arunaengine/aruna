@@ -37,11 +37,10 @@ struct TestNode {
     context: Arc<DriverContext>,
 }
 
-// If the final ensure/create step fails after the topic was selected for
-// ensuring, no pending placement record exists yet. The reconciler must still
-// report retry-worthy work so the missing/invalid genesis path is retried.
+// If the final ensure/create step fails after the topic was selected for ensuring, no pending
+// placement record exists yet.
 #[tokio::test]
-async fn rank0_topic_ensure_failure_schedules_retry() -> Result<(), Box<dyn std::error::Error>> {
+async fn ensure_failure_retries() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([153u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let config = install_realm_config(&nodes, realm_id).await?;
@@ -50,7 +49,7 @@ async fn rank0_topic_ensure_failure_schedules_retry() -> Result<(), Box<dyn std:
     let (rank0, co_holder) = (&nodes[0], &nodes[1]);
     let placement = rank0_shard_of(&config, rank0.net.node_id(), co_holder.net.node_id());
     let topic = shard_topic_id(realm_id, &placement);
-    seed_wrong_event_type_topic(&rank0.net, topic)?;
+    seed_wrong_topic(&rank0.net, topic)?;
 
     let outcome = process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
 
@@ -66,8 +65,7 @@ async fn rank0_topic_ensure_failure_schedules_retry() -> Result<(), Box<dyn std:
 // A reachable, topic-less co-holder is positive confirmation that no genesis
 // exists: the rank-0 holder creates one.
 #[tokio::test]
-async fn reachable_topicless_co_holder_lets_rank0_create_the_genesis()
--> Result<(), Box<dyn std::error::Error>> {
+async fn peer_allows_genesis() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([150u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let config = install_realm_config(&nodes, realm_id).await?;
@@ -77,14 +75,14 @@ async fn reachable_topicless_co_holder_lets_rank0_create_the_genesis()
     let placement = rank0_shard_of(&config, rank0.net.node_id(), co_holder.net.node_id());
     let topic = shard_topic_id(realm_id, &placement);
     assert!(
-        !rank0.net.document_sync_topic_exists(topic).unwrap_or(false),
+        !rank0.net.sync_topic_exists(topic).unwrap_or(false),
         "no genesis exists before the placement reconciler runs"
     );
 
     process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
 
     assert!(
-        rank0.net.document_sync_topic_exists(topic).unwrap_or(false),
+        rank0.net.sync_topic_exists(topic).unwrap_or(false),
         "an all-reached-none-know probe must let the rank-0 holder create the genesis"
     );
 
@@ -92,14 +90,9 @@ async fn reachable_topicless_co_holder_lets_rank0_create_the_genesis()
     Ok(())
 }
 
-// An unreachable co-holder might hold a genesis, so creation is withheld.
-// Withholding schedules a SyncPlacements retry, so a returning
-// co-holder re-runs the reconciler on its own (no placement record exists to
-// drive it). The retry is driven here through the real task handler rather than
-// by re-running the reconciler by hand, which is what masked the liveness gap.
+// An unreachable co-holder might hold a genesis, so withholding must schedule a retry.
 #[tokio::test]
-async fn unreachable_co_holder_withholds_then_creates_on_retry()
--> Result<(), Box<dyn std::error::Error>> {
+async fn unreachable_peer_retries() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([151u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let config = install_realm_config(&nodes, realm_id).await?;
@@ -111,7 +104,7 @@ async fn unreachable_co_holder_withholds_then_creates_on_retry()
 
     let outcome = process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
     assert!(
-        !rank0.net.document_sync_topic_exists(topic).unwrap_or(false),
+        !rank0.net.sync_topic_exists(topic).unwrap_or(false),
         "an unreachable co-holder must withhold genesis creation (a fork would be permanent)"
     );
     assert!(
@@ -119,22 +112,18 @@ async fn unreachable_co_holder_withholds_then_creates_on_retry()
         "withholding must schedule a SyncPlacements retry so a returning co-holder re-runs the reconciler"
     );
 
-    // The co-holder returns; the scheduled retry is fired immediately (instead of
-    // after the 30s production delay) through the task handler. The test never
-    // calls process_shard_placements itself past this point; convergence proves
-    // the armed retry, not a hand-driven loop, re-creates the genesis.
+    // The co-holder returns; the scheduled retry is fired immediately (instead of after the 30s
+    // production delay) through the task handler.
     mesh_nodes(&nodes).await;
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "genesis retry did not create topic",
         || async {
-            fire_sync_placements_retry(rank0, realm_id).await;
-            Ok(
-                if rank0.net.document_sync_topic_exists(topic).unwrap_or(false) {
-                    0
-                } else {
-                    1
-                },
-            )
+            fire_placement_retry(rank0, realm_id).await;
+            Ok(if rank0.net.sync_topic_exists(topic).unwrap_or(false) {
+                0
+            } else {
+                1
+            })
         },
     )
     .await?;
@@ -145,7 +134,7 @@ async fn unreachable_co_holder_withholds_then_creates_on_retry()
 
 // Fires the SyncPlacements timer now (compressing the 30s production retry), so
 // the task handler re-runs the reconciler through its real dispatch path.
-async fn fire_sync_placements_retry(node: &TestNode, realm_id: RealmId) {
+async fn fire_placement_retry(node: &TestNode, realm_id: RealmId) {
     let task_handle = node.context.task_handle.as_ref().expect("task handle");
     let event = task_handle
         .send_effect(Effect::Task(TaskEffect::ResetTimer {
@@ -162,13 +151,10 @@ async fn fire_sync_placements_retry(node: &TestNode, realm_id: RealmId) {
     );
 }
 
-// A co-holder that HAS the topic but has not yet admitted the prober silently
-// omits its summary (irokle refuses the Open). A never-member rank-0 holder must
-// read that as possibly-existing and withhold, not mint a forking genesis; once
-// the co-holder's member top-up admits it, it adopts the existing genesis.
+// A co-holder that HAS the topic but has not yet admitted the prober silently omits its summary
+// (irokle refuses the Open).
 #[tokio::test]
-async fn never_member_rank0_adopts_existing_genesis_after_top_up()
--> Result<(), Box<dyn std::error::Error>> {
+async fn nonmember_adopts_genesis() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([152u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let config = install_realm_config(&nodes, realm_id).await?;
@@ -178,23 +164,19 @@ async fn never_member_rank0_adopts_existing_genesis_after_top_up()
     let placement = rank0_shard_of(&config, rank0.net.node_id(), co_holder.net.node_id());
     let topic = shard_topic_id(realm_id, &placement);
 
-    // The co-holder holds the genesis with only itself as a member (passing its
-    // own id leaves an empty sync-peer set), so it refuses the rank-0 holder's
-    // probe and its summary is silently omitted.
+    // The co-holder holds the genesis with only itself as a member (passing its own id leaves
+    // an empty sync-peer set).
     co_holder
         .net
-        .ensure_document_sync_topics(&[topic], vec![co_holder.net.node_id()])?;
+        .ensure_sync_topics(&[topic], vec![co_holder.net.node_id()])?;
     assert!(
-        co_holder
-            .net
-            .document_sync_topic_exists(topic)
-            .unwrap_or(false),
+        co_holder.net.sync_topic_exists(topic).unwrap_or(false),
         "the co-holder must hold the genesis before the probe"
     );
 
     process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
     assert!(
-        !rank0.net.document_sync_topic_exists(topic).unwrap_or(false),
+        !rank0.net.sync_topic_exists(topic).unwrap_or(false),
         "a refused (held-but-not-a-member) probe must withhold creation, not fork a genesis"
     );
 
@@ -205,13 +187,11 @@ async fn never_member_rank0_adopts_existing_genesis_after_top_up()
         "genesis top-up did not adopt topic",
         || async {
             process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
-            Ok(
-                if rank0.net.document_sync_topic_exists(topic).unwrap_or(false) {
-                    0
-                } else {
-                    1
-                },
-            )
+            Ok(if rank0.net.sync_topic_exists(topic).unwrap_or(false) {
+                0
+            } else {
+                1
+            })
         },
     )
     .await?;
@@ -220,20 +200,9 @@ async fn never_member_rank0_adopts_existing_genesis_after_top_up()
     Ok(())
 }
 
-// A node admitted to the realm after the buckets already exist becomes a holder
-// of buckets whose genesis lives on a co-holder, and it cannot add itself to a
-// topic it does not have. An incumbent that can reach it pushes the genesis, but
-// nothing guarantees one does: the incumbents here have no route to the newcomer
-// when they admit it (which is what a partitioned member, or the shard's origin
-// drained out of the holder set, looks like), so their pushes never land. The
-// newcomer's own config-apply pass must then pull its held-but-unknown topics,
-// or it stays passive forever and the buckets it now holds never reach it.
-//
-// Rank-0 is pinned away from the newcomer on every bucket, so a pass that skips
-// its missing member topics dials nobody at all: the incumbents then never learn
-// its address and can never push, which is what makes the pull the only path.
+// A new holder must pull bucket genesis when incumbent pushes cannot reach it.
 #[tokio::test]
-async fn new_holder_pulls_topics() -> Result<(), Box<dyn std::error::Error>> {
+async fn holder_pulls_topics() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([154u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let (incumbents, newcomer_nodes) = nodes.split_at(2);
@@ -254,9 +223,8 @@ async fn new_holder_pulls_topics() -> Result<(), Box<dyn std::error::Error>> {
     let newcomer = newcomer_node.net.node_id();
     config.ensure_node(newcomer, RealmNodeKind::Management);
     write_realm_config(&nodes, realm_id, &config).await?;
-    // The incumbents' own config-apply pass: it admits the newcomer to every
-    // bucket's membership (a local control op), which is all a holder can do for
-    // another. They have no address for it, so nothing is pushed.
+    // The incumbents' own config-apply pass: it admits the newcomer to every bucket's
+    // membership (a local control op), which is all a holder can do for another.
     for node in incumbents {
         process_shard_placements(&node.context, realm_id, node.net.node_id()).await;
     }
@@ -274,7 +242,7 @@ async fn new_holder_pulls_topics() -> Result<(), Box<dyn std::error::Error>> {
     }
     for topic in &held {
         assert!(
-            !newcomer_node.net.document_sync_topic_exists(*topic)?,
+            !newcomer_node.net.sync_topic_exists(*topic)?,
             "the newcomer must start without the genesis of {topic}"
         );
     }
@@ -283,7 +251,7 @@ async fn new_holder_pulls_topics() -> Result<(), Box<dyn std::error::Error>> {
 
     for topic in &held {
         assert!(
-            newcomer_node.net.document_sync_topic_exists(*topic)?,
+            newcomer_node.net.sync_topic_exists(*topic)?,
             "newly held bucket topic {topic} was not pulled from a co-holder"
         );
     }
@@ -352,7 +320,7 @@ fn rank0_shard_of(config: &RealmConfigDocument, rank0: NodeId, co_holder: NodeId
     panic!("no shard has {rank0} as rank-0 with {co_holder} as a co-holder");
 }
 
-fn seed_wrong_event_type_topic(
+fn seed_wrong_topic(
     net: &NetHandle,
     topic: ::irokle::TopicId,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -472,7 +440,7 @@ async fn write_realm_config(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(config).await?;
+        node.net.refresh_document_peers(config).await?;
     }
     Ok(())
 }
@@ -483,11 +451,8 @@ async fn shutdown_nodes(nodes: Vec<TestNode>) {
     }
 }
 
-// The realm-config document is a SHARED restore target (see `shared_targets`)
-// and it carries every transition barrier and proof. A peer that cannot be
-// reached might already hold its genesis, so a restart must withhold rather
-// than mint a second one: a forked realm config splits membership, makes peers
-// refuse each other's topics, and wedges transitions permanently.
+// The realm-config document is a SHARED restore target (see `shared_targets`) and it carries
+// every transition barrier and proof.
 #[tokio::test]
 async fn withholds_shared_genesis() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([154u8; 32]);
@@ -511,7 +476,7 @@ async fn withholds_shared_genesis() -> Result<(), Box<dyn std::error::Error>> {
     .await;
 
     assert!(
-        !node.net.document_sync_topic_exists(topic).unwrap_or(false),
+        !node.net.sync_topic_exists(topic).unwrap_or(false),
         "an unreachable peer must withhold the shared realm-config genesis (a fork is permanent)"
     );
     assert!(
@@ -523,10 +488,8 @@ async fn withholds_shared_genesis() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Positive absence is a snapshot, not a lock: two reachable nodes starting from
-// an empty realm both see the shared realm-config topic absent everywhere, and
-// both would mint. Only the designated minter (lowest configured sync-eligible
-// node id) may create it; the other withholds, stays retryable, and adopts.
+// Positive absence is a snapshot, not a lock: two reachable nodes starting from an empty realm
+// both see the shared realm-config topic absent everywhere, and both would mint.
 #[tokio::test]
 async fn single_shared_minter() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([155u8; 32]);
@@ -547,10 +510,7 @@ async fn single_shared_minter() -> Result<(), Box<dyn std::error::Error>> {
     // every reached peer confirms absence, which used to authorize a rival.
     let pass = run_restore_pass(follower, realm_id).await;
     assert!(
-        !follower
-            .net
-            .document_sync_topic_exists(topic)
-            .unwrap_or(false),
+        !follower.net.sync_topic_exists(topic).unwrap_or(false),
         "a non-minter must never create the shared realm-config genesis"
     );
     assert!(

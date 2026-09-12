@@ -1,10 +1,10 @@
-use crate::blob::blob_storage::blob_location_read;
+use crate::blob::records::blob_location_read;
 use crate::blob::managed_copy::ManagedCopyError;
 use crate::connectors::{
-    ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
+    ResolveVersionSourceBindingInput, resolve_binding_effect,
 };
 use crate::s3::object_lookup::{
-    CopyNodeId, LookupError, location_from_read, managed_copy_check, managed_copy_read,
+    ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read, summary_from_read,
 };
 use aruna_core::effects::{Effect, StagingSourceEffect, StorageEffect};
@@ -246,7 +246,7 @@ impl HeadObjectOperation {
         self.read_version(version_id, version, self.input.version_id.is_some())
     }
 
-    fn handle_received_current_version(&mut self, event: Event) -> Effects {
+    fn current_version_received(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(HeadObjectError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -348,7 +348,7 @@ impl HeadObjectOperation {
         blob_hash: [u8; 32],
         backend: BackendRef,
     ) -> Effects {
-        let check = match managed_copy_check(
+        let check = match begin_copy_check(
             &self.input.bucket,
             &self.input.key,
             version_id,
@@ -366,12 +366,12 @@ impl HeadObjectOperation {
     }
 
     fn handle_managed_copy(&mut self, event: Event) -> Effects {
-        let key = match managed_copy_read(
+        let key = match finish_copy_check(
             event,
             &mut self.pending_copy,
             &mut self.pending_location,
             &self.source_policies,
-            CopyNodeId::Subject,
+            ExpectedNode::Subject,
         ) {
             Ok(key) => key,
             Err(err) => {
@@ -382,10 +382,9 @@ impl HeadObjectOperation {
         self.read_blob_location(key)
     }
 
-    fn handle_blob_location_read(&mut self, event: Event) -> Effects {
+    fn location_read(&mut self, event: Event) -> Effects {
         let location = match location_from_read(event) {
-            Ok(Some(location)) => location,
-            Ok(None) => return self.emit_error(HeadObjectError::HeadObjectFailed),
+            Ok(location) => location,
             Err(err) => {
                 let error = self.lookup_error("Event::Storage(StorageEvent::ReadResult)", err);
                 return self.emit_error(error);
@@ -397,14 +396,14 @@ impl HeadObjectOperation {
 
     fn read_multipart_summary(
         &mut self,
-        location: BackendLocation,
+        location: Option<BackendLocation>,
         resolved_version_id: Option<Ulid>,
     ) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(HeadObjectError::NoTransactionFound);
         };
 
-        self.location = Some(location);
+        self.location = location;
         self.resolved_version_id = resolved_version_id;
 
         let Some(version_id) = resolved_version_id else {
@@ -420,7 +419,7 @@ impl HeadObjectOperation {
         smallvec![effect]
     }
 
-    fn handle_multipart_summary_read(&mut self, event: Event) -> Effects {
+    fn summary_read(&mut self, event: Event) -> Effects {
         let summary = match summary_from_read(event) {
             Ok(summary) => summary,
             Err(err) => {
@@ -442,10 +441,6 @@ impl HeadObjectOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(HeadObjectError::NoTransactionFound);
         };
-        if self.location.is_none() && self.source_metadata.is_none() {
-            return self.emit_error(HeadObjectError::HeadObjectFailed);
-        }
-
         self.state = HeadObjectState::CommitTransaction;
         self.output = Some(Ok(HeadObjectResult {
             location: self.location.clone(),
@@ -469,7 +464,7 @@ impl HeadObjectOperation {
             self.txn_id = None;
             if let Some(source) = self.reference_source.take() {
                 self.state = HeadObjectState::ResolveReferenceAccess;
-                return smallvec![resolve_version_source_binding_suboperation(
+                return smallvec![resolve_binding_effect(
                     ResolveVersionSourceBindingInput { source },
                 )];
             }
@@ -554,9 +549,9 @@ impl Operation for HeadObjectOperation {
             HeadObjectState::StartTransaction => self.handle_transaction_started(event),
             HeadObjectState::GetVersion => self.handle_received_version(event),
             HeadObjectState::CheckManagedCopy => self.handle_managed_copy(event),
-            HeadObjectState::GetBlobLocation => self.handle_blob_location_read(event),
-            HeadObjectState::GetCurrentVersion => self.handle_received_current_version(event),
-            HeadObjectState::ReadMultipartSummary => self.handle_multipart_summary_read(event),
+            HeadObjectState::GetBlobLocation => self.location_read(event),
+            HeadObjectState::GetCurrentVersion => self.current_version_received(event),
+            HeadObjectState::ReadMultipartSummary => self.summary_read(event),
             HeadObjectState::CommitTransaction => self.handle_transaction_committed(event),
             HeadObjectState::ResolveReferenceAccess => self.handle_reference_access(event),
             HeadObjectState::HeadReferenceSource => self.handle_reference_head(event),
@@ -632,7 +627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn head_object_reads_current_version_pointer() {
+    async fn current_version_read() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
@@ -746,7 +741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn head_object_reads_specific_version() {
+    async fn specific_version_read() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
@@ -939,7 +934,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn head_object_returns_cached_reference_metadata() {
+    async fn cached_metadata_returned() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();

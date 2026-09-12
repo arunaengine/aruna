@@ -1,14 +1,7 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! The anti-reshuffle regression: once a bucket is activated, no config edit
-//! moves its holder set.
-//!
-//! Before activation pinning, holder resolution rebuilt its view from the live
-//! `placement_map` on every call, so a weight change, a label, or a joining node
-//! silently re-ranked every bucket and stranded documents on nodes that were no
-//! longer holders. These tests edit exactly those inputs and require the holder
-//! sets - on every node's own replicated view - to stay byte-identical, and the
-//! documents already written to stay readable.
+//! The anti-reshuffle regression: once a bucket is activated, no config edit moves its holder
+//! set.
 
 mod topology;
 
@@ -17,12 +10,8 @@ use std::collections::BTreeMap;
 use aruna_core::StructuredId;
 use aruna_core::structs::{NodePlacementEntry, PlacementRef};
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
-};
+use aruna_operations::metadata::create_document::mint_local_document;
 use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
-use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::placement::resolve_shard_holders;
 use ulid::Ulid;
 
@@ -33,7 +22,7 @@ const USER_NODES: usize = 1;
 const REPLICATION_FACTOR: u32 = 3;
 
 #[tokio::test]
-async fn config_edits_never_move_holders() -> TestResult<()> {
+async fn config_preserves_holders() -> TestResult<()> {
     let mut realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
     let path = "datasets/pinned";
@@ -52,7 +41,9 @@ async fn config_edits_never_move_holders() -> TestResult<()> {
         "the fixture must cap at least one bucket below the node count"
     );
 
-    create_document(&realm, origin, group_id, document_id, path).await?;
+    realm
+        .create_document(origin, group_id, document_id, path, "pinning fixture")
+        .await?;
     for holder in realm.assert_holder(origin_id, &placement) {
         let node = realm.find(holder);
         wait_until("document reaches holder", node.node_id(), || {
@@ -110,7 +101,15 @@ async fn config_edits_never_move_holders() -> TestResult<()> {
         second_path,
     )?
     .as_ulid();
-    let stamped = create_document(&realm, second_origin, group_id, second_id, second_path).await?;
+    let stamped = realm
+        .create_document(
+            second_origin,
+            group_id,
+            second_id,
+            second_path,
+            "pinning fixture",
+        )
+        .await?;
     assert!(
         resolve_shard_holders(&realm.config, &stamped).contains(&second_origin.node_id()),
         "create stamped a bucket its origin does not hold"
@@ -118,34 +117,6 @@ async fn config_edits_never_move_holders() -> TestResult<()> {
 
     realm.shutdown().await;
     Ok(())
-}
-
-async fn create_document(
-    realm: &Topology,
-    node: &TestNode,
-    group_id: Ulid,
-    document_id: Ulid,
-    document_path: &str,
-) -> TestResult<PlacementRef> {
-    let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
-            actor: realm.actor(node),
-            group_id,
-            document_id,
-            document_path: document_path.to_string(),
-            public: false,
-            payload: CreateMetadataDocumentPayload::Scaffold {
-                name: document_path.to_string(),
-                description: "pinning fixture".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: None,
-            },
-        }),
-        node.context.as_ref(),
-    )
-    .await?;
-    replay_metadata_event_log(node.context.as_ref()).await?;
-    Ok(created.record.placement)
 }
 
 async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {

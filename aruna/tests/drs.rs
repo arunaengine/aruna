@@ -10,9 +10,9 @@ use aws_sdk_s3::primitives::ByteStream;
 use reqwest::StatusCode;
 use serde_json::Value;
 use shared::{
-    TestResult, create_bearer_token, create_group_via_http, create_onboarding_secret_via_http,
-    create_s3_credentials_via_http, s3_client, shutdown_pair, spawn_full_joiner_node,
-    spawn_full_seed_node, spawn_seed_node, wait_for_group_via_http, wait_for_realm_nodes,
+    TestResult, create_bearer_token, create_group_http, create_onboarding_secret,
+    create_s3_credentials, s3_client, shutdown_pair, spawn_complete_joiner,
+    spawn_complete_seed, spawn_seed_node, wait_group_http, wait_realm_nodes,
 };
 use ulid::Ulid;
 
@@ -22,7 +22,7 @@ fn fixture_bytes() -> Vec<u8> {
     FIXTURE_BYTES.to_vec()
 }
 
-async fn iter_hash_path_index(
+async fn iter_hash_index(
     context: &aruna_operations::driver::DriverContext,
     hash: [u8; 32],
 ) -> TestResult<Vec<HashPathIndexKey>> {
@@ -32,8 +32,8 @@ async fn iter_hash_path_index(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn drs_get_object_content_hash_arn_returns_404_on_non_owner_node() -> TestResult<()> {
-    let seed = spawn_full_seed_node().await?;
+async fn content_hash_missing() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
 
     let result = async {
         let bearer_token = create_bearer_token(
@@ -44,14 +44,14 @@ async fn drs_get_object_content_hash_arn_returns_404_on_non_owner_node() -> Test
         )
         .await?;
 
-        let group = create_group_via_http(&seed.base_url, &bearer_token, "drs-hash-lookup-e2e")
+        let group = create_group_http(&seed.base_url, &bearer_token, "drs-hash-lookup-e2e")
             .await?;
         let seed_s3 = seed
             .s3
             .as_ref()
             .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
         let credentials =
-            create_s3_credentials_via_http(&seed.base_url, &bearer_token, &group.group_id)
+            create_s3_credentials(&seed.base_url, &bearer_token, &group.group_id)
                 .await?;
         let s3 = s3_client(seed_s3, &credentials);
 
@@ -124,15 +124,15 @@ async fn drs_get_object_content_hash_arn_returns_404_on_non_owner_node() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn drs_historical_materialized_hash_resolves_non_current_version() -> TestResult<()> {
+async fn historical_hash_resolves() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let onboarding_secret =
-        create_onboarding_secret_via_http(&seed, aruna_core::onboarding::OnboardingMode::Server)
+        create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server)
             .await?;
-    let joiner = spawn_full_joiner_node(&seed, onboarding_secret).await?;
+    let joiner = spawn_complete_joiner(&seed, onboarding_secret).await?;
 
     let result = async {
-        wait_for_realm_nodes(
+        wait_realm_nodes(
             &[seed.context.as_ref(), joiner.context.as_ref()],
             &seed.realm_id,
             2,
@@ -148,15 +148,15 @@ async fn drs_historical_materialized_hash_resolves_non_current_version() -> Test
         .await?;
 
         let group =
-            create_group_via_http(&seed.base_url, &bearer_token, "drs-historical-hash-e2e").await?;
-        wait_for_group_via_http(&joiner.base_url, &bearer_token, &group.group_id).await?;
+            create_group_http(&seed.base_url, &bearer_token, "drs-historical-hash-e2e").await?;
+        wait_group_http(&joiner.base_url, &bearer_token, &group.group_id).await?;
 
         let joiner_s3 = joiner
             .s3
             .as_ref()
             .ok_or_else(|| std::io::Error::other("joiner node did not start S3 server"))?;
         let credentials =
-            create_s3_credentials_via_http(&joiner.base_url, &bearer_token, &group.group_id)
+            create_s3_credentials(&joiner.base_url, &bearer_token, &group.group_id)
                 .await?;
         let s3 = s3_client(joiner_s3, &credentials);
 
@@ -191,7 +191,7 @@ async fn drs_historical_materialized_hash_resolves_non_current_version() -> Test
             std::io::Error::other("second put_object did not return a version id")
         })?)?;
 
-        let old_mappings = iter_hash_path_index(joiner.context.as_ref(), old_hash).await?;
+        let old_mappings = iter_hash_index(joiner.context.as_ref(), old_hash).await?;
         assert!(
             old_mappings.iter().any(|mapping| {
                 mapping.realm_id == seed.realm_id
@@ -203,7 +203,7 @@ async fn drs_historical_materialized_hash_resolves_non_current_version() -> Test
             "hash-path index did not retain historical alias for {bucket}/{key}@{old_version_id}"
         );
 
-        let new_mappings = iter_hash_path_index(joiner.context.as_ref(), new_hash).await?;
+        let new_mappings = iter_hash_index(joiner.context.as_ref(), new_hash).await?;
         assert!(
             new_mappings.iter().any(|mapping| {
                 mapping.realm_id == seed.realm_id

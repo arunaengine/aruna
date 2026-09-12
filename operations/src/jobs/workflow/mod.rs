@@ -19,27 +19,28 @@ use aruna_core::compute::{
 };
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
+use aruna_core::structs::tail_str;
 use aruna_core::structs::{
     AttemptControl, AttemptIntent, ExecutionSpec, InputMode, JobError, JobId, JobPayload,
     JobRecord, JobRecordError, JobResultPayload, MAX_RESULT_MESSAGE_BYTES, OutputObject,
     PhysicalExecutionState, WorkspaceMode,
 };
 use aruna_core::task::TaskEvent;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::NodeId;
-use aruna_core::util::{tail_str, unix_timestamp_millis};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::JOB_HEARTBEAT_MS;
 use super::output_record::store_outputs;
 use super::store::{
-    ExecutionCompleteOutcome, JobMutationError, ParkOutcome, cancel_execution, cancel_running_job,
-    complete_cancelled, complete_execution, fail_execution, mark_indeterminate, put_job_entry,
-    read_attempt_control, read_job_record, record_attempt_intent, record_attempt_started,
-    record_attempt_tombstone, renew_lease, requeue_before_attempt, transition_external_to_running,
-    transition_to_cancelling, transition_to_preparing, transition_to_ready,
+    ExecutionCompleteOutcome, JobMutationError, ParkOutcome, begin_external_running,
+    cancel_execution, cancel_running_job, complete_cancelled, complete_execution, fail_execution,
+    mark_indeterminate, put_job_entry, read_attempt_control, read_job_record,
+    record_attempt_intent, record_attempt_started, record_attempt_tombstone, renew_lease,
+    requeue_before_attempt, transition_to_cancelling, transition_to_preparing, transition_to_ready,
 };
-use super::submit::schedule_job_drain_effect;
+use super::submit::schedule_drain_effect;
 use crate::driver::DriverContext;
 use crate::jobs::lifecycle::ids::session_of;
 use crate::jobs::lifecycle::reservation::job_reservation;
@@ -107,13 +108,12 @@ pub async fn run_execution_job(
         return;
     };
 
-    // A fenced refusal is retryable: the job returns to the queue instead of
-    // failing, because the site may still come back or another target may take
-    // it.
+    // A fenced refusal is retryable: the job returns to the queue, because the
+    // site may come back or another target may take it.
     let backend = match resolve_backend(&context, &spec, job_id).await {
         Ok(backend) => backend,
         Err(error) => {
-            Box::pin(requeue_or_fail_pre_submit(
+            Box::pin(pre_submit_failure(
                 &context, job_id, token, &record, error, false,
             ))
             .await;
@@ -147,7 +147,7 @@ pub async fn run_execution_job(
             match Box::pin(prepare_task(&context, &spec, &record, node_id, &bucket)).await {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    Box::pin(requeue_or_fail_pre_submit(
+                    Box::pin(pre_submit_failure(
                         &context, job_id, token, &record, error, false,
                     ))
                     .await;
@@ -175,7 +175,7 @@ pub async fn run_execution_job(
                 } else {
                     JobError::permanent(format!("image resolution failed: {error}"))
                 };
-                Box::pin(requeue_or_fail_pre_submit(
+                Box::pin(pre_submit_failure(
                     &context, job_id, token, &record, job_error, true,
                 ))
                 .await;
@@ -273,7 +273,7 @@ pub async fn run_execution_job(
         };
 
         // Ready -> Running only after the backend accepted the fenced attempt.
-        let running = match transition_external_to_running(
+        let running = match begin_external_running(
             storage,
             job_id,
             token,
@@ -700,7 +700,7 @@ async fn recover_failed_submit(
             };
             let status = evidence.status;
             if status.is_terminal() {
-                let running = match transition_external_to_running(
+                let running = match begin_external_running(
                     storage,
                     job_id,
                     token,
@@ -732,7 +732,7 @@ async fn recover_failed_submit(
                 .await;
                 return false;
             }
-            let running = match transition_external_to_running(
+            let running = match begin_external_running(
                 storage,
                 job_id,
                 token,
@@ -785,7 +785,7 @@ async fn recover_failed_submit(
                     return false;
                 }
             };
-            let running = match transition_external_to_running(
+            let running = match begin_external_running(
                 storage,
                 job_id,
                 token,
@@ -918,7 +918,7 @@ pub(super) async fn requeue_after_tombstone(
     } else {
         JobError::permanent(format!("submit failed: {error}"))
     };
-    Box::pin(requeue_or_fail_pre_submit(
+    Box::pin(pre_submit_failure(
         context, job_id, token, record, job_error, false,
     ))
     .await;
@@ -1957,7 +1957,7 @@ fn log_compute_summary(record: &JobRecord) {
 pub(super) async fn finalize_followups(context: &DriverContext, job_id: JobId) {
     if let Some(task_handle) = context.task_handle.as_ref()
         && let Event::Task(TaskEvent::Error { message, .. }) =
-            task_handle.send_effect(schedule_job_drain_effect()).await
+            task_handle.send_effect(schedule_drain_effect()).await
     {
         warn!(job_id = %job_id, message = %message, "Failed to kick run-crate drain");
     }
@@ -1982,7 +1982,7 @@ async fn fail_and_crate(
     Box::pin(cleanup_and_crate(context, job_id, terminal)).await;
 }
 
-async fn requeue_or_fail_pre_submit(
+async fn pre_submit_failure(
     context: &DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
@@ -2257,16 +2257,16 @@ mod tests {
     use crate::jobs::JOB_MAX_ATTEMPTS;
     use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
     use crate::jobs::store::{
-        ClaimOutcome, claim_job, insert_job, put_run_crate_status, set_cancel_requested,
+        ClaimOutcome, claim_job, insert_job, put_crate_status, set_cancel_requested,
     };
     use crate::jobs::workflow::workspace::mint_workspace_credential;
     use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
     use aruna_compute::ExecutorRegistry;
     use aruna_core::compute::{LogTails, NOBODY, TaskOutput};
-    use aruna_core::identifiers::{BucketId, PlacementHandle};
     use aruna_core::structs::{
         FIRST_GRANTABLE_HANDLE, JobErrorKind, JobState, OutputDestination, OutputSelection, RealmId,
     };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
@@ -2557,8 +2557,7 @@ mod tests {
     }
 
     // A submit error with an unobservable backend parks the job Indeterminate and
-    // keeps the write-ahead intent, so the possibly-started container a{N} stays
-    // adoptable and no second container is ever launched under a{N+1}.
+    // keeps the write-ahead intent, so container a{N} stays adoptable, never a{N+1}.
     #[tokio::test]
     async fn ambiguous_submit_parks() {
         let dir = tempdir().unwrap();
@@ -2604,7 +2603,7 @@ mod tests {
         let (ctx, _net) = net_context(storage.clone()).await;
         let (record, token, _attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, None, 6)
+        begin_external_running(&storage, job_id, token, None, 6)
             .await
             .unwrap();
 
@@ -2666,7 +2665,7 @@ mod tests {
         Arc::get_mut(&mut ctx).unwrap().task_handle = None;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, Some(1), 6)
+        begin_external_running(&storage, job_id, token, Some(1), 6)
             .await
             .unwrap();
         let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
@@ -2714,7 +2713,7 @@ mod tests {
         Arc::get_mut(&mut ctx).unwrap().task_handle = None;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, Some(1), 6)
+        begin_external_running(&storage, job_id, token, Some(1), 6)
             .await
             .unwrap();
         let stub = StubBackend::new(StubReconcile::NotFound);
@@ -2741,9 +2740,8 @@ mod tests {
         assert!(stored.finished_at_ms.is_some());
     }
 
-    // A capture failing retryably on every pass must terminalize at the attempt cap.
-    // Without the charge it parks Indeterminate forever and the lease sweep re-drives
-    // the same attempt at the lease cadence.
+    // A retryably failing capture must terminalize at the attempt cap; without the
+    // charge it parks Indeterminate and the lease sweep re-drives it forever.
     #[tokio::test]
     async fn capture_failure_caps() {
         let dir = tempdir().unwrap();
@@ -2752,7 +2750,7 @@ mod tests {
         Arc::get_mut(&mut ctx).unwrap().task_handle = None;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, Some(1), 6)
+        begin_external_running(&storage, job_id, token, Some(1), 6)
             .await
             .unwrap();
         let stub = StubBackend::new(StubReconcile::NotFound);
@@ -2801,7 +2799,7 @@ mod tests {
         Arc::get_mut(&mut ctx).unwrap().task_handle = None;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
+        begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
             .await
             .unwrap();
         let backend = StubBackend::new(StubReconcile::NotFound);
@@ -2940,7 +2938,7 @@ mod tests {
         })
         .await
         .unwrap();
-        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
+        begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
             .await
             .unwrap();
         let backend = StubBackend::new(StubReconcile::Waiting);
@@ -2998,7 +2996,7 @@ mod tests {
         let (ctx, net, _registry) = session_context(storage.clone()).await;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
+        begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
             .await
             .unwrap();
         let backend = StubBackend::new(StubReconcile::Waiting);
@@ -3031,7 +3029,7 @@ mod tests {
         let (ctx, net, registry) = session_context(storage.clone()).await;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
+        begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
             .await
             .unwrap();
         let backend = StubBackend::new(StubReconcile::Waiting);
@@ -3067,7 +3065,7 @@ mod tests {
         let (ctx, net) = net_context(storage.clone()).await;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
+        begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
             .await
             .unwrap();
         let backend = StubBackend::new(StubReconcile::NotFound);
@@ -3103,7 +3101,7 @@ mod tests {
         Arc::get_mut(&mut ctx).unwrap().task_handle = None;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, Some(1), 6)
+        begin_external_running(&storage, job_id, token, Some(1), 6)
             .await
             .unwrap();
         let backend = StubBackend::new(StubReconcile::Waiting);
@@ -3268,9 +3266,8 @@ mod tests {
         assert!(stored.attempt_intent.is_some());
     }
 
-    // A re-driven crate job must return the already-written resource instead of minting a
-    // second document. Without the durable-status early return it would fall through and
-    // fail here on the missing net handle.
+    // A re-driven crate job must return the already-written resource, not mint a
+    // second document; without the durable-status return it fails on no net handle.
     #[tokio::test]
     async fn crate_write_idempotent() {
         let dir = tempdir().unwrap();
@@ -3278,7 +3275,7 @@ mod tests {
         let (record, token, _attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
 
-        put_run_crate_status(
+        put_crate_status(
             &storage,
             job_id,
             &aruna_core::structs::RunCrateStatus::Written {
@@ -3298,7 +3295,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&record.progress),
         };
-        let outcome = super::run_crate::run_write_run_crate(&ctx, job_id).await;
+        let outcome = super::run_crate::write_run_crate(&ctx, job_id).await;
         match outcome {
             JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource }) => {
                 assert_eq!(resource, "already-there");
@@ -3354,7 +3351,7 @@ mod tests {
     }
 
     #[test]
-    fn carries_requested_network_access() {
+    fn carries_network_access() {
         let mut execution = execution_spec();
         execution
             .tags
@@ -3483,7 +3480,7 @@ mod tests {
             panic!("a drifted subject must refuse the start");
         };
 
-        requeue_or_fail_pre_submit(&ctx, record.job_id, token, &record, error, false).await;
+        pre_submit_failure(&ctx, record.job_id, token, &record, error, false).await;
 
         let stored = read_job_record(&storage, record.job_id, None)
             .await

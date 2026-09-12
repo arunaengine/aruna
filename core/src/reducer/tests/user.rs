@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn apply_operation_uses_next_origin_sequence_and_applies_event() {
+fn apply_operation_event() {
     let mut state = user_state();
     let actor = actor(node(1));
 
@@ -37,9 +37,9 @@ fn apply_operation_uses_next_origin_sequence_and_applies_event() {
 }
 
 #[test]
-fn admin_document_paths_preserve_strings_and_round_trip() {
+fn admin_document_trip() {
     let role_id = role_id(4);
-    let user_id = user_id_with_seed(5);
+    let user_id = user_id_seed(5);
     let node_id = node(6);
 
     assert_eq!(USER_NAME_PATH, "user.name");
@@ -58,71 +58,56 @@ fn admin_document_paths_preserve_strings_and_round_trip() {
         user_attribute_path("department"),
         "user.attributes.department"
     );
-    assert_eq!(
-        user_subject_id_path("subject-1"),
-        "user.subject_ids.subject-1"
-    );
+    assert_eq!(user_subject_path("subject-1"), "user.subject_ids.subject-1");
 
     let group_role = group_role_path(&role_id);
-    let group_assignment = group_role_user_assignment_path(&role_id, &user_id);
+    let group_assignment = group_user_path(&role_id, &user_id);
     assert_eq!(group_role, format!("group.roles.{role_id}"));
     assert_eq!(
         group_assignment,
         format!("group.roles.{role_id}.assigned_users.{user_id}")
     );
-    assert_eq!(group_role_id_from_path(&group_role), Some(role_id));
-    assert_eq!(group_role_id_from_path(&group_assignment), None);
+    assert_eq!(parse_group_role(&group_role), Some(role_id));
+    assert_eq!(parse_group_role(&group_assignment), None);
     assert_eq!(
-        group_role_user_assignment_from_path(&group_assignment),
+        parse_group_assignment(&group_assignment),
         Some((role_id, user_id))
     );
 
     let realm_role = realm_role_path(&role_id);
-    let realm_assignment = realm_role_user_assignment_path(&role_id, &user_id);
+    let realm_assignment = realm_user_path(&role_id, &user_id);
     assert_eq!(realm_role, format!("realm.roles.{role_id}"));
     assert_eq!(
         realm_assignment,
         format!("realm.roles.{role_id}.assigned_users.{user_id}")
     );
-    assert_eq!(realm_role_id_from_path(&realm_role), Some(role_id));
-    assert_eq!(realm_role_id_from_path(&realm_assignment), None);
+    assert_eq!(parse_realm_role(&realm_role), Some(role_id));
+    assert_eq!(parse_realm_role(&realm_assignment), None);
     assert_eq!(
-        realm_role_user_assignment_from_path(&realm_assignment),
+        parse_realm_assignment(&realm_assignment),
         Some((role_id, user_id))
     );
 
-    let node_path = realm_config_node_path(&node_id);
+    let node_path = config_node_path(&node_id);
     assert_eq!(node_path, format!("realm_config.nodes.{node_id}"));
-    assert_eq!(realm_config_node_id_from_path(&node_path), Some(node_id));
+    assert_eq!(parse_config_node(&node_path), Some(node_id));
     assert_eq!(
-        realm_config_oidc_provider_path("default"),
+        config_oidc_path("default"),
         "realm_config.oidc_providers.default"
     );
     assert_eq!(
-        realm_config_oidc_provider_id_from_path("realm_config.oidc_providers.default"),
+        parse_config_oidc("realm_config.oidc_providers.default"),
         Some("default")
     );
 
-    assert_eq!(
-        group_role_user_assignment_from_path("group.roles.invalid"),
-        None
-    );
-    assert_eq!(
-        realm_role_user_assignment_from_path("realm.roles.invalid"),
-        None
-    );
-    assert_eq!(
-        realm_config_node_id_from_path("realm_config.nodes.invalid"),
-        None
-    );
-    assert_eq!(
-        realm_config_oidc_provider_id_from_path("unknown.path"),
-        None
-    );
+    assert_eq!(parse_group_assignment("group.roles.invalid"), None);
+    assert_eq!(parse_realm_assignment("realm.roles.invalid"), None);
+    assert_eq!(parse_config_node("realm_config.nodes.invalid"), None);
+    assert_eq!(parse_config_oidc("unknown.path"), None);
 }
 
 #[test]
-fn user_disjoint_attribute_updates_merge() {
+fn user_disjoint_merge() {
     let mut state = user_state();
 
     assert_eq!(
@@ -145,7 +130,7 @@ fn user_disjoint_attribute_updates_merge() {
 }
 
 #[test]
-fn invalid_user_attribute_key_is_rejected_without_state_change() {
+fn invalid_user_change() {
     let mut state = user_state();
     let before = state.clone();
 
@@ -159,7 +144,7 @@ fn invalid_user_attribute_key_is_rejected_without_state_change() {
 }
 
 #[test]
-fn invalid_user_attribute_value_is_rejected_without_state_change() {
+fn invalid_attribute_change() {
     let mut state = user_state();
     let before = state.clone();
 
@@ -173,7 +158,7 @@ fn invalid_user_attribute_value_is_rejected_without_state_change() {
 }
 
 #[test]
-fn same_user_attribute_conflict_is_recorded() {
+fn same_user_recorded() {
     let mut state = user_state();
 
     state
@@ -208,27 +193,27 @@ fn same_user_attribute_conflict_is_recorded() {
 }
 
 #[test]
-fn disjoint_subject_additions_merge() {
+fn disjoint_subject_merge() {
     let mut state = user_state();
 
     state.apply(&add_subject(1, 1, "subject-1")).unwrap();
     state.apply(&add_subject(2, 2, "subject-2")).unwrap();
 
     assert_eq!(
-        state.materialized_user_subject_ids(),
+        state.materialized_subject_ids(),
         BTreeSet::from(["subject-1".to_string(), "subject-2".to_string()])
     );
     assert!(state.conflicts.is_empty());
 }
 
 #[test]
-fn subject_add_remove_conflict_fails_closed_and_materializes_absent() {
+fn subject_add_absent() {
     let mut state = user_state();
 
     state.apply(&add_subject(1, 1, "subject-1")).unwrap();
     state.apply(&remove_subject(2, 2, "subject-1")).unwrap();
 
-    assert!(!state.materialized_user_subject_ids().contains("subject-1"));
+    assert!(!state.materialized_subject_ids().contains("subject-1"));
     let conflict = state
         .conflicts
         .get("user.subject_ids.subject-1")
@@ -244,7 +229,7 @@ fn subject_add_remove_conflict_fails_closed_and_materializes_absent() {
 }
 
 #[test]
-fn duplicate_event_id_is_idempotent() {
+fn duplicate_event_idempotent() {
     let mut state = user_state();
     let event = set_attr(1, 1, "department", "biology");
 
@@ -256,7 +241,7 @@ fn duplicate_event_id_is_idempotent() {
 }
 
 #[test]
-fn same_origin_out_of_order_disjoint_updates_converge() {
+fn same_origin_converge() {
     let origin = node(1);
     let newer = event(
         2,
@@ -305,7 +290,7 @@ fn same_origin_out_of_order_disjoint_updates_converge() {
 }
 
 #[test]
-fn same_origin_out_of_order_same_field_is_stale_and_duplicate_replay_is_idempotent() {
+fn same_origin_idempotent() {
     let origin = node(1);
     let older = event(
         1,
@@ -367,7 +352,7 @@ fn same_origin_out_of_order_same_field_is_stale_and_duplicate_replay_is_idempote
 }
 
 #[test]
-fn newer_same_origin_value_replaces_its_older_conflict_value_in_any_order() {
+fn newer_same_order() {
     let first_origin = node(1);
     let concurrent_origin = node(2);
     let older = event(
@@ -421,7 +406,7 @@ fn newer_same_origin_value_replaces_its_older_conflict_value_in_any_order() {
 }
 
 #[test]
-fn same_origin_out_of_order_multi_field_operation_is_atomically_stale() {
+fn same_origin_stale() {
     let origin = node(1);
     let older = realm_config_event(
         1,
@@ -463,18 +448,18 @@ fn same_origin_out_of_order_multi_field_operation_is_atomically_stale() {
 
     assert_eq!(newer_first, older_first);
     assert_eq!(
-        newer_first.materialized_realm_config_metadata_replication(),
+        newer_first.materialized_metadata_replication(),
         Some(newer_metadata)
     );
     assert_eq!(
-        newer_first.materialized_realm_config_discovery(),
+        newer_first.materialized_realm_discovery(),
         Some(newer_discovery)
     );
     assert!(newer_first.conflicts.is_empty());
 }
 
 #[test]
-fn observed_sequential_user_attribute_update_replaces_prior_value() {
+fn observed_sequential_value() {
     let mut state = user_state();
     let first_origin = node(1);
     let first = event(
@@ -512,7 +497,7 @@ fn observed_sequential_user_attribute_update_replaces_prior_value() {
 }
 
 #[test]
-fn observed_name_update_replaces_prior_name() {
+fn observed_name_name() {
     let mut state = user_state();
     let first_origin = node(1);
     let first = event(
@@ -542,7 +527,7 @@ fn observed_name_update_replaces_prior_name() {
 }
 
 #[test]
-fn concurrent_name_conflict_is_recorded() {
+fn concurrent_name_recorded() {
     let mut state = user_state();
 
     state.apply(&set_name(1, 1, "Alice")).unwrap();

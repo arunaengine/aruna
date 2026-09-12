@@ -6,10 +6,10 @@ use std::collections::{BTreeSet, HashMap};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::identifiers::{BucketId, BucketNotInRange, PlacementHandle, StructuredId};
 use crate::structs::{
     BindingTuple, DocumentClass, HandleRangeDirectory, PlacementBinding, PlacementScope,
 };
+use crate::structured_id::{BucketId, BucketNotInRange, PlacementHandle, StructuredId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum BindingError {
@@ -209,8 +209,8 @@ impl BindingDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identifiers::MetaResourceId;
     use crate::structs::RealmId;
+    use crate::structured_id::MetaResourceId;
 
     fn handle(value: u32) -> PlacementHandle {
         PlacementHandle::new(value).unwrap()

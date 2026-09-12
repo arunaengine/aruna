@@ -45,7 +45,7 @@ impl DrainSyncOutcome {
     }
 }
 
-pub(super) fn document_publish_from_outbox(
+pub(super) fn publish_from_outbox(
     event_id: ulid::Ulid,
     target: DocumentSyncTarget,
     event: DocumentSyncOutboxEvent,
@@ -79,7 +79,7 @@ pub(super) fn document_publish_from_outbox(
     }
 }
 
-pub(super) async fn load_realm_config_for_drain(
+pub(super) async fn load_drain_config(
     context: &Arc<DriverContext>,
     realm_id: aruna_core::structs::RealmId,
 ) -> Option<aruna_core::structs::RealmConfigDocument> {
@@ -111,9 +111,7 @@ pub(super) fn resolve_publish_placement(
         return current;
     }
     match config {
-        Some(config) => {
-            crate::placement::placement_ref_for_target(config, target, Default::default())
-        }
+        Some(config) => crate::placement::target_placement_ref(config, target, Default::default()),
         None => aruna_core::structs::PlacementRef::NIL,
     }
 }
@@ -210,11 +208,10 @@ pub(super) fn classify_deferred_record(
         return DeferOutcome::Retry;
     };
     let node_id = net_handle.node_id();
-    // A draining former-holder keeps publish rights until flushed (flush-then-leave),
-    // so its retained records are publishable; a true non-holder stays undeliverable
-    // (DECISIONS K3), as the receiver's history cutoff bounds a departing holder.
+    // Draining former holders may publish until flushed; true non-holders remain undeliverable.
+    // The receiver history cutoff bounds a departing holder.
     if crate::placement::holds_placement(config, &record.placement, node_id)
-        || crate::placement::is_draining_former_holder(config, &record.placement, node_id)
+        || crate::placement::is_draining_holder(config, &record.placement, node_id)
         || crate::placement::retained_departing_holder(config, &record.placement, node_id)
     {
         DeferOutcome::Retry
@@ -366,7 +363,7 @@ impl OperationsTaskHandler {
         };
 
         let realm_id = *net_handle.realm_id();
-        let realm_config = load_realm_config_for_drain(&self.context, realm_id).await;
+        let realm_config = load_drain_config(&self.context, realm_id).await;
 
         let rotation = self.take_rotation();
         let Some(rotation) = self.open_rotation(&retry_key, rotation).await else {
@@ -423,7 +420,7 @@ impl OperationsTaskHandler {
     /// Runs one bounded invocation of the open rotation, then continues, yields
     /// through the timer, or closes it. No record is ever deleted, truncated, or
     /// overwritten to satisfy a bound.
-    pub(super) async fn drain_document_sync_outbox(&self) {
+    pub(super) async fn drain_sync_outbox(&self) {
         let _drain = self.drain_guard.lock().await;
         #[cfg(debug_assertions)]
         if let Some(barrier) = OutboxBarrier::new() {
@@ -549,11 +546,7 @@ impl OperationsTaskHandler {
             records,
             &mut invocation.defer,
             !self.is_device(config),
-            |topic| {
-                net_handle
-                    .document_sync_topic_exists(topic)
-                    .unwrap_or(false)
-            },
+            |topic| net_handle.sync_topic_exists(topic).unwrap_or(false),
             |record| classify_deferred_record(config, net_handle, record),
         );
         invocation.deferred += deferred.len();
@@ -630,15 +623,13 @@ impl OperationsTaskHandler {
                         config,
                         &record.placement,
                         net_handle.node_id(),
-                    ) || crate::placement::is_draining_former_holder(
+                    ) || crate::placement::is_draining_holder(
                         config,
                         &record.placement,
                         net_handle.node_id(),
                     )
                 })
-                || net_handle
-                    .document_sync_topic_exists(*topic)
-                    .unwrap_or(false)
+                || net_handle.sync_topic_exists(*topic).unwrap_or(false)
             {
                 continue;
             }
@@ -667,7 +658,7 @@ impl OperationsTaskHandler {
                 .sync_document_topics(topics.into_iter().collect(), peers)
                 .await;
             let outcome = self
-                .finish_sync_drain_subbatch(
+                .finish_sync_batch(
                     retry_key,
                     Vec::new(),
                     Vec::new(),
@@ -678,11 +669,10 @@ impl OperationsTaskHandler {
             invocation.outcome.merge(outcome);
         }
 
-        // Publish to the bucket's sync members (admitted targets and retained
-        // departing holders included), but keep stamped peers above as genesis
-        // sources: a target must see writes made during the window.
+        // Publish to the bucket's sync members (admitted targets and retained departing holders included), but
+        // keep stamped peers above as genesis sources: a target must see writes made during the window.
         if let Some(config) = config {
-            let now_ms = aruna_core::util::unix_timestamp_millis();
+            let now_ms = aruna_core::time::unix_timestamp_millis();
             for (_, record, _) in &mut records {
                 if !record.target.uses_shard_topic() {
                     continue;
@@ -810,7 +800,7 @@ impl OperationsTaskHandler {
         > = BTreeMap::new();
         for (record_key, record, topic) in records {
             let origin = admin_origin(&record);
-            let document = document_publish_from_outbox(
+            let document = publish_from_outbox(
                 record.outbox_id,
                 record.target.clone(),
                 record.event,
@@ -875,7 +865,7 @@ impl OperationsTaskHandler {
             .await;
         outcome.sync_elapsed = sync_started.elapsed();
         let mut outcome = self
-            .finish_sync_drain_subbatch(
+            .finish_sync_batch(
                 retry_key,
                 subbatch.record_keys,
                 requested_targets,
@@ -1021,7 +1011,7 @@ impl OutboxDrainer {
 
     /// Runs one bounded invocation of the open rotation.
     pub async fn run_once(&self) {
-        self.handler.drain_document_sync_outbox().await;
+        self.handler.drain_sync_outbox().await;
     }
 
     /// Records examined so far, and whether the cursor is parked mid-rotation.
@@ -1037,16 +1027,16 @@ impl OutboxDrainer {
 
 /// Kicks the installed document-sync drain owner without replacing an existing
 /// persisted retry deadline.
-pub async fn drive_document_sync_outbox_drain(context: Arc<DriverContext>) {
+pub async fn drive_sync_drain(context: Arc<DriverContext>) {
     let Some(task_handle) = context.task_handle.as_ref() else {
         warn!("Cannot kick document sync outbox drain without task handle");
         return;
     };
-    restore_document_sync_outbox_timers(&context.storage_handle, task_handle).await;
+    restore_outbox_timers(&context.storage_handle, task_handle).await;
 }
 
 impl OperationsTaskHandler {
-    async fn project_reconciled_metadata_create_events(
+    async fn project_create_events(
         &self,
         retry_key: &TaskKey,
         targets: Vec<DocumentSyncTarget>,
@@ -1087,7 +1077,7 @@ impl OperationsTaskHandler {
 }
 
 impl OperationsTaskHandler {
-    pub(super) async fn finish_sync_drain_subbatch(
+    pub(super) async fn finish_sync_batch(
         &self,
         retry_key: &TaskKey,
         record_keys: Vec<Vec<u8>>,
@@ -1107,7 +1097,7 @@ impl OperationsTaskHandler {
                 let mut refresh_targets = targets.clone();
                 refresh_targets.extend(requested_targets);
                 if let Some(net_handle) = self.context.net_handle.as_ref() {
-                    refresh_realm_usage_summary_for_targets(
+                    refresh_usage_targets(
                         self.context.as_ref(),
                         net_handle.node_id(),
                         &refresh_targets,
@@ -1117,11 +1107,7 @@ impl OperationsTaskHandler {
                 refresh_watch_interest_for_targets(self.context.as_ref(), &refresh_targets).await;
                 let project_started = Instant::now();
                 let projected = self
-                    .project_reconciled_metadata_create_events(
-                        retry_key,
-                        targets,
-                        metadata_create_events,
-                    )
+                    .project_create_events(retry_key, targets, metadata_create_events)
                     .await;
                 outcome.project_elapsed = project_started.elapsed();
                 if projected.is_err() {

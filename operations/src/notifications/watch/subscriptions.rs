@@ -8,14 +8,11 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::metrics::WatchAuthorizationMetricReason;
-use aruna_core::storage_entries::{
-    document_sync_revision_write_entry, watch_subscription_delete_entry,
-    watch_subscription_write_entry,
-};
+use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
 use aruna_core::structs::{
     AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, PlacementRef,
-    RealmId, WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
-    parse_watch_subscription_key, watch_subscription_prefix,
+    RealmId, WatchAuthorizationBinding, WatchEventMask, WatchSubscription, parse_watch_key,
+    watch_subscription_prefix,
 };
 use aruna_core::types::{TxnId, UserId};
 use aruna_storage::StorageHandle;
@@ -25,9 +22,9 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 use crate::notifications::protocol::NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP;
 use crate::notifications::watch::authorization::{WatchAuthorization, evaluate_watch_creation};
-use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
+use crate::notifications::watch::interest::dirty_marker_write;
 use crate::sync::document_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 
 /// Single owner-prefix scan bound. Watches are hard-capped per user, so one page
@@ -80,7 +77,7 @@ struct WatchReplication {
     outbox: DocumentSyncOutboxRecord,
 }
 
-pub async fn create_watch_subscription(
+pub async fn create_local_watch(
     storage: &StorageHandle,
     owner: UserId,
     path_prefix: String,
@@ -100,7 +97,7 @@ pub async fn create_watch_subscription(
 /// The one holder-side create path, used by both the local API arm and the holder
 /// RPC. A proxying peer's assertion is not authority, so the holder re-derives
 /// the permission path and checks READ before any durable write.
-pub async fn create_replicated_watch_subscription(
+pub async fn create_holder_watch(
     context: &DriverContext,
     local_node_id: aruna_core::NodeId,
     owner: UserId,
@@ -171,9 +168,8 @@ fn validate_subscription_fields(
     if path_prefix.is_empty() {
         return Err(WatchSubscriptionError::EmptyPrefix);
     }
-    // Emitted event paths carry no leading slash (`s3/{group}/{node}/{bucket}/{key}`,
-    // `meta/{group_id}/{document_path}`), so a leading-slash prefix could never
-    // match; reject it as a backstop behind the API-layer validation.
+    // Event paths have no leading slash, so such a prefix can never match.
+    // Reject it behind the API validation.
     if path_prefix.starts_with('/') {
         return Err(WatchSubscriptionError::LeadingSlash);
     }
@@ -262,7 +258,7 @@ async fn create_once(
         return Err(CreateFailure::Cap);
     }
 
-    let subscription_write = match watch_subscription_write_entry(subscription) {
+    let subscription_write = match watch_write_entry(subscription) {
         Ok(entry) => entry,
         Err(error) => {
             abort_txn(storage, txn_id).await;
@@ -270,19 +266,16 @@ async fn create_once(
         }
     };
     let mut writes = vec![subscription_write];
-    writes.push(watch_interest_dirty_marker_write(
-        subscription.owner.realm_id,
-    ));
+    writes.push(dirty_marker_write(subscription.owner.realm_id));
     if let Some(replication) = replication {
         let target = watch_subscription_target(subscription.owner, subscription.watch_id);
-        let revision_entry =
-            match document_sync_revision_write_entry(&target, &replication.revision) {
-                Ok(entry) => entry,
-                Err(error) => {
-                    abort_txn(storage, txn_id).await;
-                    return Err(CreateFailure::Fatal(error.to_string()));
-                }
-            };
+        let revision_entry = match sync_revision_entry(&target, &replication.revision) {
+            Ok(entry) => entry,
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(CreateFailure::Fatal(error.to_string()));
+            }
+        };
         let outbox_entry = match outbox_write_entry(&replication.outbox) {
             Ok(entry) => entry,
             Err(error) => {
@@ -324,7 +317,7 @@ async fn create_once(
     }
 }
 
-pub async fn delete_watch_subscription(
+pub async fn delete_local_watch(
     storage: &StorageHandle,
     owner: UserId,
     watch_id: Ulid,
@@ -334,7 +327,7 @@ pub async fn delete_watch_subscription(
         .map(|_| ())
 }
 
-pub async fn delete_replicated_watch_subscription(
+pub async fn delete_holder_watch(
     context: &DriverContext,
     local_node_id: aruna_core::NodeId,
     owner: UserId,
@@ -404,7 +397,7 @@ async fn delete_once(
         }
     };
 
-    let (_, subscription_key) = watch_subscription_delete_entry(owner, watch_id);
+    let (_, subscription_key) = watch_delete_entry(owner, watch_id);
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
@@ -429,7 +422,7 @@ async fn delete_once(
         }
     }
 
-    let (key_space, key) = watch_subscription_delete_entry(owner, watch_id);
+    let (key_space, key) = watch_delete_entry(owner, watch_id);
     match storage
         .send_storage_effect(StorageEffect::Delete {
             key_space,
@@ -450,17 +443,16 @@ async fn delete_once(
         }
     }
 
-    let mut writes = vec![watch_interest_dirty_marker_write(owner.realm_id)];
+    let mut writes = vec![dirty_marker_write(owner.realm_id)];
     if let Some(replication) = replication {
         let target = watch_subscription_target(owner, watch_id);
-        let revision_entry =
-            match document_sync_revision_write_entry(&target, &replication.revision) {
-                Ok(entry) => entry,
-                Err(error) => {
-                    abort_txn(storage, txn_id).await;
-                    return Err(CreateFailure::Fatal(error.to_string()));
-                }
-            };
+        let revision_entry = match sync_revision_entry(&target, &replication.revision) {
+            Ok(entry) => entry,
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(CreateFailure::Fatal(error.to_string()));
+            }
+        };
         let outbox_entry = match outbox_write_entry(&replication.outbox) {
             Ok(entry) => entry,
             Err(error) => {
@@ -523,7 +515,7 @@ fn watch_upsert_replication(
         placement: PlacementRef::NIL,
     };
     let target = watch_subscription_target(subscription.owner, subscription.watch_id);
-    let outbox = new_outbox_record_with_id(
+    let outbox = new_identified_record(
         outbox_id,
         local_node_id,
         target,
@@ -558,7 +550,7 @@ fn watch_delete_replication(
         kind: DocumentSyncChangeKind::Delete,
         placement: PlacementRef::NIL,
     };
-    let outbox = new_outbox_record_with_id(
+    let outbox = new_identified_record(
         outbox_id,
         local_node_id,
         watch_subscription_target(owner, watch_id),
@@ -574,17 +566,15 @@ async fn schedule_replication(context: &DriverContext) {
     let Some(task_handle) = context.task_handle.as_ref() else {
         return;
     };
-    let _ = task_handle
-        .send_effect(schedule_outbox_drain_effect())
-        .await;
+    let _ = task_handle.send_effect(schedule_drain_effect()).await;
 }
 
 fn decode_stored_subscription(
     key: &[u8],
     value: &[u8],
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
-    let (key_owner, key_watch_id) = parse_watch_subscription_key(key)
-        .map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?;
+    let (key_owner, key_watch_id) =
+        parse_watch_key(key).map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?;
     let subscription = WatchSubscription::from_bytes(value)
         .map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?;
     if key_owner.is_nil()
@@ -654,7 +644,7 @@ pub async fn list_watch_subscriptions(
 /// Pages every watch subscription this node holds for `realm_id` (all owners),
 /// used by holder-side watch-event expansion. Subscription keys are realm-first,
 /// so one realm's rows form a single contiguous scan range.
-pub async fn list_realm_watch_subscriptions(
+pub async fn list_realm_subscriptions(
     storage: &StorageHandle,
     realm_id: RealmId,
 ) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
@@ -791,7 +781,7 @@ mod tests {
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
-        RealmId, WatchEventKind, data_watch_resource_path,
+        RealmId, WatchEventKind, watch_resource_path,
     };
 
     fn mask() -> WatchEventMask {
@@ -821,9 +811,8 @@ mod tests {
             user_id: owner,
             realm_id,
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
+        let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
         // Policy loading resolves the group record before group policies apply.
         let group = Group {
             display_name: "watch".to_string(),
@@ -871,13 +860,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_then_list_roundtrips() {
+    async fn create_list_roundtrip() {
         let (_dir, storage) = temp_storage();
         let owner = user(1, 1);
-        let created =
-            create_watch_subscription(&storage, owner, "bucket".to_string(), mask(), 1_000)
-                .await
-                .expect("create succeeds");
+        let created = create_local_watch(&storage, owner, "bucket".to_string(), mask(), 1_000)
+            .await
+            .expect("create succeeds");
 
         let listed = list_watch_subscriptions(&storage, owner)
             .await
@@ -886,20 +874,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_rejects_invalid_input() {
+    async fn invalid_create_rejected() {
         let (_dir, storage) = temp_storage();
         let owner = user(1, 1);
 
         assert_eq!(
-            create_watch_subscription(&storage, owner, String::new(), mask(), 1).await,
+            create_local_watch(&storage, owner, String::new(), mask(), 1).await,
             Err(WatchSubscriptionError::EmptyPrefix)
         );
         assert_eq!(
-            create_watch_subscription(&storage, owner, "/bucket".to_string(), mask(), 1).await,
+            create_local_watch(&storage, owner, "/bucket".to_string(), mask(), 1).await,
             Err(WatchSubscriptionError::LeadingSlash)
         );
         assert_eq!(
-            create_watch_subscription(
+            create_local_watch(
                 &storage,
                 owner,
                 "x".repeat(NOTIFICATION_WATCH_MAX_PREFIX_LEN + 1),
@@ -910,7 +898,7 @@ mod tests {
             Err(WatchSubscriptionError::PrefixTooLong)
         );
         assert_eq!(
-            create_watch_subscription(
+            create_local_watch(
                 &storage,
                 owner,
                 "bucket".to_string(),
@@ -929,16 +917,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_enforces_per_user_cap() {
+    async fn create_enforces_cap() {
         let (_dir, storage) = temp_storage();
         let owner = user(1, 1);
         for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
-            create_watch_subscription(&storage, owner, format!("p/{index}"), mask(), index as u64)
+            create_local_watch(&storage, owner, format!("p/{index}"), mask(), index as u64)
                 .await
                 .expect("create under cap succeeds");
         }
         assert_eq!(
-            create_watch_subscription(&storage, owner, "overflow".to_string(), mask(), 9_999).await,
+            create_local_watch(&storage, owner, "overflow".to_string(), mask(), 9_999).await,
             Err(WatchSubscriptionError::CapExceeded)
         );
         assert_eq!(
@@ -953,7 +941,7 @@ mod tests {
     // Revocation hides a watch but does not delete its replicated row. Those
     // durable rows keep occupying the owner's cap until explicit deletion.
     #[tokio::test]
-    async fn revoked_rows_still_count_toward_cap() {
+    async fn revoked_rows_count() {
         let (_dir, storage) = temp_storage();
         let realm_id = RealmId([7u8; 32]);
         let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
@@ -961,9 +949,9 @@ mod tests {
         let node_id = node(3);
         install_auth(&storage, realm_id, owner, group_id, node_id).await;
 
-        let dead_prefix = data_watch_resource_path(Ulid::nil(), node_id, "bucket", "");
+        let dead_prefix = watch_resource_path(Ulid::nil(), node_id, "bucket", "");
         for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
-            create_watch_subscription(
+            create_local_watch(
                 &storage,
                 owner,
                 dead_prefix.clone(),
@@ -975,9 +963,9 @@ mod tests {
         }
 
         let driver_ctx = context(&storage);
-        let authorized_prefix = data_watch_resource_path(group_id, node_id, "bucket", "reports/");
+        let authorized_prefix = watch_resource_path(group_id, node_id, "bucket", "reports/");
         assert_eq!(
-            create_replicated_watch_subscription(
+            create_local_watch(
                 &driver_ctx,
                 node_id,
                 owner,
@@ -999,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_rows_require_valid_key_payload_identity() {
+    fn stored_identity_required() {
         let owner = user(1, 1);
         let watch_id = Ulid::from_bytes([9u8; 16]);
         let mut subscription = WatchSubscription::new(owner, "prefix".to_string(), mask(), 1);
@@ -1039,16 +1027,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cap_is_scoped_per_owner() {
+    async fn cap_owner_scoped() {
         let (_dir, storage) = temp_storage();
         let alice = user(1, 1);
         let bob = user(1, 2);
         for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
-            create_watch_subscription(&storage, alice, format!("a/{index}"), mask(), index as u64)
+            create_local_watch(&storage, alice, format!("a/{index}"), mask(), index as u64)
                 .await
                 .expect("alice fills her cap");
         }
-        create_watch_subscription(&storage, bob, "b".to_string(), mask(), 1)
+        create_local_watch(&storage, bob, "b".to_string(), mask(), 1)
             .await
             .expect("bob is unaffected by alice's cap");
 
@@ -1066,13 +1054,13 @@ mod tests {
         let (_dir, storage) = temp_storage();
         let owner = user(1, 7);
         for index in 0..NOTIFICATION_WATCH_PER_USER_CAP - 1 {
-            create_watch_subscription(&storage, owner, format!("p/{index}"), mask(), index as u64)
+            create_local_watch(&storage, owner, format!("p/{index}"), mask(), index as u64)
                 .await
                 .expect("prefill succeeds");
         }
         let (left, right) = tokio::join!(
-            create_watch_subscription(&storage, owner, "p/left".to_string(), mask(), 99),
-            create_watch_subscription(&storage, owner, "p/right".to_string(), mask(), 100),
+            create_local_watch(&storage, owner, "p/left".to_string(), mask(), 99),
+            create_local_watch(&storage, owner, "p/right".to_string(), mask(), 100),
         );
         assert_eq!(left.is_ok() as usize + right.is_ok() as usize, 1);
         assert_eq!(
@@ -1085,20 +1073,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_is_idempotent_and_owner_scoped() {
+    async fn delete_owner_scoped() {
         let (_dir, storage) = temp_storage();
         let owner = user(1, 1);
-        let created = create_watch_subscription(&storage, owner, "x".to_string(), mask(), 1)
+        let created = create_local_watch(&storage, owner, "x".to_string(), mask(), 1)
             .await
             .expect("create succeeds");
 
-        delete_watch_subscription(&storage, owner, created.watch_id)
+        delete_local_watch(&storage, owner, created.watch_id)
             .await
             .expect("delete succeeds");
-        delete_watch_subscription(&storage, owner, created.watch_id)
+        delete_local_watch(&storage, owner, created.watch_id)
             .await
             .expect("deleting a missing row is ok");
-        delete_watch_subscription(&storage, owner, Ulid::generate())
+        delete_local_watch(&storage, owner, Ulid::generate())
             .await
             .expect("deleting an unknown id is ok");
 
@@ -1111,7 +1099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_realm_scan_covers_every_owner_in_realm() {
+    async fn realm_scan_complete() {
         let (_dir, storage) = temp_storage();
         let realm = RealmId([1u8; 32]);
         let other_realm = RealmId([2u8; 32]);
@@ -1119,23 +1107,23 @@ mod tests {
         let bob = user(1, 2);
         let outsider = UserId::new(Ulid::from_bytes([3u8; 16]), other_realm);
 
-        create_watch_subscription(&storage, alice, "a".to_string(), mask(), 1)
+        create_local_watch(&storage, alice, "a".to_string(), mask(), 1)
             .await
             .expect("alice create");
-        create_watch_subscription(&storage, bob, "b".to_string(), mask(), 2)
+        create_local_watch(&storage, bob, "b".to_string(), mask(), 2)
             .await
             .expect("bob create");
-        create_watch_subscription(&storage, outsider, "c".to_string(), mask(), 3)
+        create_local_watch(&storage, outsider, "c".to_string(), mask(), 3)
             .await
             .expect("outsider create");
 
-        let realm_subs = list_realm_watch_subscriptions(&storage, realm)
+        let realm_subs = list_realm_subscriptions(&storage, realm)
             .await
             .expect("realm scan succeeds");
         assert_eq!(realm_subs.len(), 2);
         assert!(realm_subs.iter().all(|sub| sub.owner.realm_id == realm));
 
-        let other_subs = list_realm_watch_subscriptions(&storage, other_realm)
+        let other_subs = list_realm_subscriptions(&storage, other_realm)
             .await
             .expect("other realm scan succeeds");
         assert_eq!(other_subs.len(), 1);
@@ -1157,7 +1145,7 @@ mod tests {
                 let mut subscription =
                     WatchSubscription::new(owner, format!("p/{index}"), mask(), index as u64);
                 subscription.watch_id = Ulid::from_bytes(((index + 1) as u128).to_be_bytes());
-                watch_subscription_write_entry(&subscription).expect("subscription encodes")
+                watch_write_entry(&subscription).expect("subscription encodes")
             })
             .collect();
         assert!(matches!(
@@ -1180,14 +1168,14 @@ mod tests {
         assert_eq!(tail.len(), WATCH_SUBSCRIPTION_PAGE_LIMIT);
 
         assert!(matches!(
-            list_realm_watch_subscriptions(&storage, realm).await,
+            list_realm_subscriptions(&storage, realm).await,
                 Err(WatchSubscriptionError::Storage(reason))
                 if reason.contains("subscription scan cap")
         ));
     }
 
     #[test]
-    fn cap_reason_matches_sentinel() {
+    fn cap_reason_matches() {
         assert_eq!(
             WatchSubscriptionError::CapExceeded.to_string(),
             WATCH_SUBSCRIPTION_CAP_REACHED

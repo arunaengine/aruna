@@ -293,7 +293,7 @@ pub async fn create_source_connector(
 ) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
     let result = drive(
         CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
@@ -307,7 +307,7 @@ pub async fn create_source_connector(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_connector_error)?;
+    .map_err(map_create_error)?;
 
     Ok((
         StatusCode::CREATED,
@@ -375,19 +375,19 @@ pub async fn list_source_connectors(
 ) -> ServerResult<(StatusCode, Json<ListSourceConnectorsResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::READ).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
 
     let result = drive(
         ListSourceConnectorsOperation::new(ListSourceConnectorsInput { group_id }),
         &state.get_ctx(),
     )
     .await
-    .map_err(map_list_connector_error)?;
+    .map_err(map_list_error)?;
 
     let mut connectors = Vec::with_capacity(result.connectors.len());
     for connector in result.connectors {
         let has_secret_config =
-            connector_has_secret_config(state.as_ref(), connector.connector_id).await?;
+            connector_has_secret(state.as_ref(), connector.connector_id).await?;
         connectors.push(map_connector_response(connector, has_secret_config));
     }
 
@@ -464,7 +464,7 @@ pub async fn get_source_connector(
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::READ).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
 
     let result = drive(
         GetSourceConnectorOperation::new(GetSourceConnectorInput {
@@ -474,7 +474,7 @@ pub async fn get_source_connector(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_get_connector_error)?;
+    .map_err(map_get_error)?;
 
     Ok((
         StatusCode::OK,
@@ -581,7 +581,7 @@ pub async fn replace_source_connector(
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
     let result = drive(
         ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
@@ -595,7 +595,7 @@ pub async fn replace_source_connector(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_replace_connector_error)?;
+    .map_err(map_replace_error)?;
 
     Ok((
         StatusCode::OK,
@@ -662,7 +662,7 @@ pub async fn delete_source_connector(
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
     drive(
         DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
@@ -672,7 +672,7 @@ pub async fn delete_source_connector(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_delete_connector_error)?;
+    .map_err(map_delete_error)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -764,7 +764,7 @@ pub async fn check_source_connector(
 ) -> ServerResult<Json<ConnectorCheckResponse>> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
     let kind: SourceConnectorKind = request.kind.into();
     validate_connector_input(
@@ -854,7 +854,7 @@ pub async fn check_stored_connector(
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::READ).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
 
     let resolved = drive(
         ResolveSourceConnectorOperation::new(ResolveSourceConnectorInput {
@@ -963,7 +963,7 @@ pub async fn list_connector_entries(
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::READ).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
     let source_path = normalize_browse_path(&query.path)?;
     let limit = query.limit.unwrap_or(DEFAULT_ENTRY_LIMIT);
     if limit == 0 {
@@ -1070,7 +1070,7 @@ fn parse_connector_id(connector_id: &str) -> ServerResult<Ulid> {
     Ulid::from_str(connector_id).map_err(|_| ServerError::BadRequest)
 }
 
-pub(crate) async fn ensure_group_data_permission(
+pub(crate) async fn ensure_data_permission(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,
@@ -1085,7 +1085,7 @@ pub(crate) async fn ensure_group_data_permission(
     .await
 }
 
-async fn connector_has_secret_config(
+async fn connector_has_secret(
     state: &ServerState,
     connector_id: Ulid,
 ) -> ServerResult<bool> {
@@ -1094,10 +1094,10 @@ async fn connector_has_secret_config(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_connector_secret_config_error)
+    .map_err(map_secret_error)
 }
 
-fn map_connector_secret_config_error(error: ConnectorHasSecretConfigError) -> ServerError {
+fn map_secret_error(error: ConnectorHasSecretConfigError) -> ServerError {
     ServerError::InternalError(error.to_string())
 }
 
@@ -1122,18 +1122,18 @@ fn format_system_time(value: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(value).to_rfc3339()
 }
 
-fn map_create_connector_error(error: CreateSourceConnectorError) -> ServerError {
+fn map_create_error(error: CreateSourceConnectorError) -> ServerError {
     match error {
         CreateSourceConnectorError::ValidationError(_) => ServerError::BadRequest,
         _ => ServerError::InternalError(error.to_string()),
     }
 }
 
-fn map_list_connector_error(error: ListSourceConnectorsError) -> ServerError {
+fn map_list_error(error: ListSourceConnectorsError) -> ServerError {
     ServerError::InternalError(error.to_string())
 }
 
-fn map_get_connector_error(
+fn map_get_error(
     error: aruna_operations::connectors::get_connector::GetSourceConnectorError,
 ) -> ServerError {
     match error {
@@ -1146,7 +1146,7 @@ fn map_get_connector_error(
     }
 }
 
-fn map_replace_connector_error(error: ReplaceSourceConnectorError) -> ServerError {
+fn map_replace_error(error: ReplaceSourceConnectorError) -> ServerError {
     match error {
         ReplaceSourceConnectorError::ValidationError(_) => ServerError::BadRequest,
         ReplaceSourceConnectorError::NotFound => ServerError::NotFound,
@@ -1157,7 +1157,7 @@ fn map_replace_connector_error(error: ReplaceSourceConnectorError) -> ServerErro
     }
 }
 
-fn map_delete_connector_error(error: DeleteSourceConnectorError) -> ServerError {
+fn map_delete_error(error: DeleteSourceConnectorError) -> ServerError {
     match error {
         DeleteSourceConnectorError::NotFound => ServerError::NotFound,
         DeleteSourceConnectorError::ReferencedByObjectVersion => {
@@ -1208,7 +1208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connector_routes_crud_and_redact_secret_config() {
+    async fn connector_crud_redacts() {
         let test = setup_state().await;
 
         let (_, Json(created)) = create_source_connector(
@@ -1297,7 +1297,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connector_routes_require_group_data_permission() {
+    async fn connectors_require_permission() {
         let test = setup_state().await;
 
         let result = create_source_connector(
@@ -1490,17 +1490,17 @@ mod tests {
     fn referenced_connector_conflicts() {
         // A still-referenced credential is a policy refusal, not an internal error.
         assert!(matches!(
-            map_replace_connector_error(ReplaceSourceConnectorError::ReferencedByObjectVersion),
+            map_replace_error(ReplaceSourceConnectorError::ReferencedByObjectVersion),
             ServerError::Conflict(_)
         ));
         assert!(matches!(
-            map_delete_connector_error(DeleteSourceConnectorError::ReferencedByObjectVersion),
+            map_delete_error(DeleteSourceConnectorError::ReferencedByObjectVersion),
             ServerError::Conflict(_)
         ));
     }
 
     #[test]
-    fn openapi_includes_connector_paths() {
+    fn openapi_has_connectors() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
         assert!(

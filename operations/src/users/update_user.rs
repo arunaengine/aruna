@@ -12,9 +12,8 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, document_sync_revision_key,
-    document_sync_revision_write_entry, stale_admin_document_conflict_delete_entries,
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    sync_revision_entry, sync_revision_key,
 };
 use aruna_core::structs::{
     Actor, AuthContext, Permission, PlacementRef, RealmConfigDocument, RealmId, User,
@@ -22,10 +21,10 @@ use aruna_core::structs::{
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId};
 use aruna_core::user_validation::{
-    UserAttributeValidationError, validate_user_attribute_count, validate_user_attribute_key,
-    validate_user_attribute_value,
+    UserAttributeValidationError, validate_attribute_count, validate_attribute_key,
+    validate_attribute_value,
 };
-use aruna_core::util::unix_timestamp_millis as current_timestamp_ms;
+use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::{ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -34,9 +33,9 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::placement_ref_for_target;
+use crate::placement::target_placement_ref;
 use crate::sync::document_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
 
@@ -168,7 +167,7 @@ impl UpdateUserOperation {
         cleanup
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn fail_storage(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -262,11 +261,11 @@ impl UpdateUserOperation {
                 ),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    admin_document_reducer_state_key(&admin_target),
+                    reducer_state_key(&admin_target),
                 ),
                 (
                     DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
-                    document_sync_revision_key(&document_target),
+                    sync_revision_key(&document_target),
                 ),
                 (
                     REALM_CONFIG_KEYSPACE.to_string(),
@@ -277,7 +276,7 @@ impl UpdateUserOperation {
         })]
     }
 
-    fn handle_read_user_admin_state_and_document_revision(
+    fn accept_admin_state(
         &mut self,
         event: Event,
         txn_id: TxnId,
@@ -332,7 +331,7 @@ impl UpdateUserOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                aruna_core::reducer::decode_reducer_state(value.as_ref())
                     .map_err(ConversionError::from)
             })
             .transpose()?;
@@ -345,7 +344,7 @@ impl UpdateUserOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(admin_target));
-        let admin_events = apply_admin_reducer_updates(&mut reducer_state, &self.input)?;
+        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
         let previous_document_revision = revision_value
             .as_ref()
             .map(|value| {
@@ -362,21 +361,21 @@ impl UpdateUserOperation {
             .transpose()?;
         let placement = realm_config
             .as_ref()
-            .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
+            .map(|config| target_placement_ref(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
         let realm_id = self.input.actor.realm_id;
         if let Some(config) = realm_config.as_ref() {
             self.fence.add(realm_id, config, [placement]);
         }
         let generation = self.fence.generation(&realm_id, &placement);
-        let document_revision = local_user_document_sync_change(
+        let document_revision = local_sync_change(
             previous_document_revision.as_ref(),
             &self.input.actor,
             placement,
         );
 
         let bytes = user.reconcile_bytes(Some(&current), &self.input.actor)?;
-        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
+        let stale_conflict_deletes = stale_conflict_deletes(
             previous_reducer_state.as_ref(),
             Some(&reducer_state),
         );
@@ -386,14 +385,14 @@ impl UpdateUserOperation {
                 ByteView::from(user.user_id.to_bytes()),
                 ByteView::from(bytes),
             ),
-            admin_document_reducer_state_write_entry(&reducer_state)?,
+            reducer_state_entry(&reducer_state)?,
         ];
-        writes.push(document_sync_revision_write_entry(
+        writes.push(sync_revision_entry(
             &document_target,
             &document_revision,
         )?);
         for event in &admin_events {
-            let record = new_outbox_record_with_id(
+            let record = new_identified_record(
                 event.event_id,
                 self.input.actor.node_id,
                 document_target.clone(),
@@ -405,7 +404,7 @@ impl UpdateUserOperation {
             .fenced_at(generation);
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
-        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+        writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.state = UpdateUserState::WriteUserAdminStateAndDocumentRevision {
             txn_id,
@@ -446,7 +445,7 @@ impl UpdateUserOperation {
         self.emit_commit_transaction(txn_id, user, admin_outbox_written)
     }
 
-    fn handle_delete_stale_admin_conflicts(
+    fn accept_conflict_delete(
         &mut self,
         event: Event,
         txn_id: TxnId,
@@ -524,13 +523,13 @@ impl UpdateUserOperation {
         };
         if admin_outbox_written {
             self.state = UpdateUserState::ScheduleAdminDocumentOutboxDrain { user };
-            return smallvec![schedule_outbox_drain_effect()];
+            return smallvec![schedule_drain_effect()];
         }
 
         self.emit_announce_user(user)
     }
 
-    fn handle_schedule_admin_document_outbox_drain(&mut self, event: Event, user: User) -> Effects {
+    fn schedule_outbox_drain(&mut self, event: Event, user: User) -> Effects {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. })
             | Event::Task(TaskEvent::Error { .. }) => {
@@ -588,7 +587,7 @@ impl Operation for UpdateUserOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.fail_storage(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
@@ -597,7 +596,7 @@ impl Operation for UpdateUserOperation {
             UpdateUserState::Auth => self.handle_auth_result(event),
             UpdateUserState::StartTransaction => self.handle_start_transaction(event),
             UpdateUserState::ReadUserAdminStateAndDocumentRevision { txn_id } => {
-                self.handle_read_user_admin_state_and_document_revision(event, txn_id)
+                self.accept_admin_state(event, txn_id)
             }
             UpdateUserState::WriteUserAdminStateAndDocumentRevision {
                 txn_id,
@@ -616,7 +615,7 @@ impl Operation for UpdateUserOperation {
                 user,
                 admin_outbox_written,
             } => {
-                self.handle_delete_stale_admin_conflicts(event, txn_id, user, admin_outbox_written)
+                self.accept_conflict_delete(event, txn_id, user, admin_outbox_written)
             }
             UpdateUserState::ReadBucketFence {
                 txn_id,
@@ -629,7 +628,7 @@ impl Operation for UpdateUserOperation {
                 ..
             } => self.handle_commit_transaction(event, user, admin_outbox_written),
             UpdateUserState::ScheduleAdminDocumentOutboxDrain { user } => {
-                self.handle_schedule_admin_document_outbox_drain(event, user)
+                self.schedule_outbox_drain(event, user)
             }
             UpdateUserState::AnnounceUser { user } => self.handle_announce_user(event, user),
             UpdateUserState::Init | UpdateUserState::Finish | UpdateUserState::Error => {
@@ -661,7 +660,7 @@ impl Operation for UpdateUserOperation {
     }
 }
 
-fn local_user_document_sync_change(
+fn local_sync_change(
     previous_change: Option<&DocumentSyncChange>,
     actor: &Actor,
     placement: PlacementRef,
@@ -683,7 +682,7 @@ fn local_user_document_sync_change(
     }
 }
 
-fn apply_admin_reducer_updates(
+fn apply_reducer_updates(
     state: &mut AdminDocumentReducerState,
     input: &UpdateUserInput,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
@@ -736,7 +735,7 @@ fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateU
 
     let mut removals = HashSet::new();
     for key in &input.remove_attributes {
-        validate_user_attribute_key(key)?;
+        validate_attribute_key(key)?;
         removals.insert(key.clone());
     }
     for key in removals {
@@ -744,12 +743,12 @@ fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateU
     }
 
     for (key, value) in &input.set_attributes {
-        validate_user_attribute_key(key)?;
-        validate_user_attribute_value(key, value)?;
+        validate_attribute_key(key)?;
+        validate_attribute_value(key, value)?;
         user.attributes.insert(key.clone(), value.clone());
     }
 
-    validate_user_attribute_count(user.attributes.len())?;
+    validate_attribute_count(user.attributes.len())?;
 
     Ok(())
 }
@@ -770,8 +769,7 @@ mod tests {
         AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
     };
     use aruna_core::storage_entries::{
-        admin_document_reducer_conflict_key, admin_document_reducer_state_key,
-        document_sync_revision_key,
+        reducer_conflict_key, reducer_state_key, sync_revision_key,
     };
     use aruna_core::structs::{Actor, AuthContext, PlacementRef, RealmId, User};
     use aruna_core::task::{TaskEvent, TaskKey};
@@ -866,7 +864,7 @@ mod tests {
         }
     }
 
-    fn reducer_state_with_conflicts(user_id: UserId) -> AdminDocumentReducerState {
+    fn conflict_state(user_id: UserId) -> AdminDocumentReducerState {
         let name_first = dot(11);
         let name_second = dot(12);
         let title_first = dot(13);
@@ -902,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn updates_user_attributes_and_queues_admin_operations() {
+    fn updates_user_attributes() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let original = stored_user(user_id);
@@ -926,9 +924,9 @@ mod tests {
                 assert_eq!(reads[0].0, USER_KEYSPACE);
                 assert_eq!(reads[0].1.as_ref(), user_id.to_bytes().as_slice());
                 assert_eq!(reads[1].0, ADMIN_DOCUMENT_STATE_KEYSPACE);
-                assert_eq!(reads[1].1, admin_document_reducer_state_key(&target));
+                assert_eq!(reads[1].1, reducer_state_key(&target));
                 assert_eq!(reads[2].0, DOCUMENT_SYNC_REVISION_KEYSPACE);
-                assert_eq!(reads[2].1, document_sync_revision_key(&document));
+                assert_eq!(reads[2].1, sync_revision_key(&document));
                 assert_eq!(reads[3].0, REALM_CONFIG_KEYSPACE);
             }
             other => panic!("unexpected read effect: {other:?}"),
@@ -940,8 +938,8 @@ mod tests {
                     user_id.to_bytes().into(),
                     Some(original.to_bytes(&actor(realm_id, user_id)).unwrap().into()),
                 ),
-                (admin_document_reducer_state_key(&target), None),
-                (document_sync_revision_key(&document), None),
+                (reducer_state_key(&target), None),
+                (sync_revision_key(&document), None),
                 (ByteView::from(*realm_id.as_bytes()), None),
             ],
         }));
@@ -1033,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_document_sync_revision_sidecar_with_user_update() {
+    fn writes_sync_sidecar() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let original = stored_user(user_id);
@@ -1059,9 +1057,9 @@ mod tests {
                     user_id.to_bytes().into(),
                     Some(original.to_bytes(&actor(realm_id, user_id)).unwrap().into()),
                 ),
-                (admin_document_reducer_state_key(&admin_target), None),
+                (reducer_state_key(&admin_target), None),
                 (
-                    document_sync_revision_key(&document_target),
+                    sync_revision_key(&document_target),
                     Some(postcard::to_allocvec(&previous_revision).unwrap().into()),
                 ),
                 (ByteView::from(*realm_id.as_bytes()), None),
@@ -1095,7 +1093,7 @@ mod tests {
                 )
             })
             .expect("revision sidecar write exists");
-        assert_eq!(revision_key, &document_sync_revision_key(&document_target));
+        assert_eq!(revision_key, &sync_revision_key(&document_target));
         assert_eq!(revision.base, Some(previous_revision.current));
         assert_eq!(revision.current.actor, expected_actor.node_id);
         assert!(revision.current.generation > previous_revision.current.generation);
@@ -1104,11 +1102,11 @@ mod tests {
     }
 
     #[test]
-    fn writes_reducer_state_and_conflicts_with_user_update_transaction() {
+    fn writes_reducer_conflicts() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let original = stored_user(user_id);
-        let previous_state = reducer_state_with_conflicts(user_id);
+        let previous_state = conflict_state(user_id);
         let target = AdminDocumentTarget::User { user_id };
         let document = DocumentSyncTarget::User { user_id };
         let mut operation = UpdateUserOperation::new(input(realm_id, user_id, user_id));
@@ -1124,10 +1122,10 @@ mod tests {
                     Some(original.to_bytes(&actor(realm_id, user_id)).unwrap().into()),
                 ),
                 (
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                     Some(postcard::to_allocvec(&previous_state).unwrap().into()),
                 ),
-                (document_sync_revision_key(&document), None),
+                (sync_revision_key(&document), None),
                 (ByteView::from(*realm_id.as_bytes()), None),
             ],
         }));
@@ -1186,7 +1184,7 @@ mod tests {
                     deletes,
                     &vec![(
                         ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
-                        admin_document_reducer_conflict_key(&target, "user.name"),
+                        reducer_conflict_key(&target, "user.name"),
                     )]
                 );
                 deletes.clone()
@@ -1204,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_attribute_key_uses_update_user_error() {
+    fn rejects_attribute_key() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let mut input = input(realm_id, user_id, user_id);
@@ -1237,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn scoped_self_update_fails() {
+    fn rejects_scoped_update() {
         let realm_id = RealmId::from_bytes([6u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([7u8; 16]), realm_id);
         let mut input = input(realm_id, user_id, user_id);
@@ -1293,8 +1291,8 @@ mod tests {
                     user_id.to_bytes().into(),
                     Some(stored_user(user_id).to_bytes(&caller).unwrap().into()),
                 ),
-                (admin_document_reducer_state_key(&admin_target), None),
-                (document_sync_revision_key(&document_target), None),
+                (reducer_state_key(&admin_target), None),
+                (sync_revision_key(&document_target), None),
                 (
                     ByteView::from(*realm_id.as_bytes()),
                     Some(config.to_bytes(&caller).unwrap().into()),

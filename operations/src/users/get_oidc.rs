@@ -76,7 +76,7 @@ impl GetOidcUserOperation {
         cleanup
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn fail_storage(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -100,13 +100,13 @@ impl GetOidcUserOperation {
             );
         };
 
-        match self.emit_read_subject_index(txn_id) {
+        match self.read_subject(txn_id) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn emit_read_subject_index(&mut self, txn_id: TxnId) -> Result<Effects, GetOidcUserError> {
+    fn read_subject(&mut self, txn_id: TxnId) -> Result<Effects, GetOidcUserError> {
         self.state = GetOidcUserState::ReadSubjectIndex { txn_id };
         let key = ByteView::from(self.subject_key()?.into_bytes());
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
@@ -116,7 +116,7 @@ impl GetOidcUserOperation {
         })])
     }
 
-    fn handle_read_subject_idx(&mut self, event: Event, txn_id: TxnId) -> Effects {
+    fn accept_subject(&mut self, event: Event, txn_id: TxnId) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
@@ -125,13 +125,13 @@ impl GetOidcUserOperation {
             );
         };
 
-        match self.emit_read_existing_user(txn_id, value) {
+        match self.read_existing(txn_id, value) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn emit_read_existing_user(
+    fn read_existing(
         &mut self,
         txn_id: TxnId,
         value: Option<ByteView>,
@@ -146,7 +146,7 @@ impl GetOidcUserOperation {
         })])
     }
 
-    fn handle_read_existing_user(&mut self, event: Event, txn_id: TxnId) -> Effects {
+    fn accept_existing(&mut self, event: Event, txn_id: TxnId) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
@@ -197,17 +197,17 @@ impl Operation for GetOidcUserOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.fail_storage(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
         match self.state.clone() {
             GetOidcUserState::StartTransaction => self.handle_start_txn(event),
             GetOidcUserState::ReadSubjectIndex { txn_id } => {
-                self.handle_read_subject_idx(event, txn_id)
+                self.accept_subject(event, txn_id)
             }
             GetOidcUserState::ReadExistingUser { txn_id } => {
-                self.handle_read_existing_user(event, txn_id)
+                self.accept_existing(event, txn_id)
             }
             GetOidcUserState::CommitTransaction { user } => {
                 self.handle_commit_transaction(event, user)

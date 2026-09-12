@@ -9,7 +9,7 @@ use chats::{
 };
 use proxy::{__path_proxy_get, __path_proxy_post, proxy_get, proxy_post};
 
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::compute::Secret;
@@ -18,7 +18,7 @@ use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
     AssistantProviderStatus, AuthContext,
 };
-use aruna_core::util::unix_timestamp_secs;
+use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::assistant::provider::{
     CreateProviderOperation, DeleteProviderOperation, GetProviderOperation, ListProviderOperation,
     ProviderStoreError, UpdateProviderOperation,
@@ -410,7 +410,7 @@ pub async fn list_providers(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<ListProvidersResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let providers = drive(ListProviderOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(map_store_error)?
@@ -481,7 +481,7 @@ pub async fn create_provider(
     request: Request,
 ) -> ServerResult<(StatusCode, Json<ProviderSummary>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let request: CreateProviderRequest = parse_json(request).await?;
     let kind = parse_provider_kind(&request.kind)?;
     if kind == AssistantProviderKind::Chatgpt {
@@ -583,7 +583,7 @@ pub async fn patch_provider(
     request: Request,
 ) -> ServerResult<(StatusCode, Json<ProviderSummary>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let request: PatchProviderRequest = parse_json(request).await?;
     let mut provider = load_provider(&state, auth.user_id, provider_id).await?;
     let expected = provider.clone();
@@ -648,7 +648,7 @@ pub async fn delete_provider(
     Path(provider_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     drive(
         DeleteProviderOperation::new(provider_id, auth.user_id),
         &state.get_ctx(),
@@ -701,7 +701,7 @@ pub async fn get_models(
     Path(provider_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ProviderModelsResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let provider = load_provider(&state, auth.user_id, provider_id).await?;
     let models = if provider.kind == AssistantProviderKind::Chatgpt {
         // The backend list is not a published contract; the static set covers a refusal.
@@ -747,7 +747,7 @@ pub async fn test_provider(
     Path(provider_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ProviderTestResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let provider = load_provider(&state, auth.user_id, provider_id).await?;
     let result = if provider.kind == AssistantProviderKind::Chatgpt {
         chatgpt::fresh_provider(&state, provider).await.map(|_| ())

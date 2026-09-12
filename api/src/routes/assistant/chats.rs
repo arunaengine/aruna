@@ -1,10 +1,10 @@
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::sessions::unix_rfc3339;
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{AssistantChatHead, AssistantChatTurn, AuthContext};
-use aruna_core::util::unix_timestamp_secs;
+use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::assistant::{
     ChatStoreError, DeleteChatOperation, ListChatHeadsOperation, ReadChatTurnsOperation,
     WriteChatHeadOperation, WriteChatTurnOperation,
@@ -198,7 +198,7 @@ pub async fn list_chats(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<ChatHeadListResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let chats = drive(ListChatHeadsOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(map_chat_error)?
@@ -266,7 +266,7 @@ pub async fn put_chat(
     Path(id): Path<String>,
     Json(request): Json<SaveChatHeadRequest>,
 ) -> ServerResult<(StatusCode, Json<ChatHeadResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let id = check_chat_id(id)?;
     let title = check_title(&request.title)?;
     let subject = check_subject(request.subject)?;
@@ -327,7 +327,7 @@ pub async fn get_turns(
     Path(id): Path<String>,
     Query(query): Query<ChatTurnsQuery>,
 ) -> ServerResult<(StatusCode, Json<ChatTurnListResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let id = check_chat_id(id)?;
     let turns = drive(
         ReadChatTurnsOperation::new(auth.user_id, id, query.after),
@@ -408,7 +408,7 @@ pub async fn put_turn(
     Path((id, seq)): Path<(String, u32)>,
     Json(request): Json<SaveChatTurnRequest>,
 ) -> ServerResult<(StatusCode, Json<ChatHeadResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let id = check_chat_id(id)?;
     let head = drive(
         WriteChatTurnOperation::new(
@@ -454,7 +454,7 @@ pub async fn delete_chat(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let id = check_chat_id(id)?;
     drive(
         DeleteChatOperation::new(auth.user_id, id, unix_timestamp_secs()),

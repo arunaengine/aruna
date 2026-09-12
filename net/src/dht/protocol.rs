@@ -354,7 +354,7 @@ pub(crate) fn dht_io_kind(io: &DhtIo) -> &'static str {
     }
 }
 
-pub(crate) fn dht_io_op_id(io: &DhtIo) -> Option<OpId> {
+pub(crate) fn io_op_id(io: &DhtIo) -> Option<OpId> {
     match io {
         DhtIo::RpcResponse { op_id, .. }
         | DhtIo::RpcError { op_id, .. }
@@ -370,7 +370,7 @@ pub(crate) fn dht_io_op_id(io: &DhtIo) -> Option<OpId> {
     }
 }
 
-pub(crate) fn dht_io_inbound_id(io: &DhtIo) -> Option<InboundId> {
+pub(crate) fn io_inbound_id(io: &DhtIo) -> Option<InboundId> {
     match io {
         DhtIo::InboundRequest { inbound_id, .. }
         | DhtIo::InboundReadError { inbound_id, .. }

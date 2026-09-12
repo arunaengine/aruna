@@ -791,11 +791,11 @@ impl Serialize for JsonStoredEntry {
     }
 }
 
-fn craqle_term_id_string(id: CraqleTermId) -> String {
+fn term_id_string(id: CraqleTermId) -> String {
     format!("{:032x}", id.0)
 }
 
-fn decode_craqle_term_id(bytes: &[u8], context: &'static str) -> Result<CraqleTermId, String> {
+fn decode_term_id(bytes: &[u8], context: &'static str) -> Result<CraqleTermId, String> {
     let raw: [u8; 16] = bytes.try_into().map_err(|_| {
         format!(
             "invalid {context}: expected 16 bytes, found {}",
@@ -812,34 +812,34 @@ fn decode_craqle_u64(bytes: &[u8], context: &'static str) -> Result<u64, String>
     Ok(u64::from_be_bytes(raw))
 }
 
-fn json_craqle_quad_key(parts: CraqleQuadKeyParts) -> JsonCraqleQuadKey {
+fn json_quad_key(parts: CraqleQuadKeyParts) -> JsonCraqleQuadKey {
     JsonCraqleQuadKey {
-        graph: craqle_term_id_string(parts.graph),
-        subject: craqle_term_id_string(parts.subject),
-        predicate: craqle_term_id_string(parts.predicate),
-        object: craqle_term_id_string(parts.object),
+        graph: term_id_string(parts.graph),
+        subject: term_id_string(parts.subject),
+        predicate: term_id_string(parts.predicate),
+        object: term_id_string(parts.object),
     }
 }
 
-fn json_craqle_graph_key(parts: CraqleGraphKeyParts) -> JsonCraqleGraphKey {
+fn json_graph_key(parts: CraqleGraphKeyParts) -> JsonCraqleGraphKey {
     match parts {
         CraqleGraphKeyParts::Meta { graph } => JsonCraqleGraphKey::Meta {
-            graph: craqle_term_id_string(graph),
+            graph: term_id_string(graph),
         },
         CraqleGraphKeyParts::Dirty { graph, subject } => JsonCraqleGraphKey::Dirty {
-            graph: craqle_term_id_string(graph),
-            subject: craqle_term_id_string(subject),
+            graph: term_id_string(graph),
+            subject: term_id_string(subject),
         },
         CraqleGraphKeyParts::Reindex { graph } => JsonCraqleGraphKey::Reindex {
-            graph: craqle_term_id_string(graph),
+            graph: term_id_string(graph),
         },
     }
 }
 
-fn json_craqle_log_key(parts: CraqleLogKeyParts) -> JsonCraqleLogKey {
+fn json_log_key(parts: CraqleLogKeyParts) -> JsonCraqleLogKey {
     match parts {
         CraqleLogKeyParts::Head { graph, actor } => JsonCraqleLogKey::Head {
-            graph: craqle_term_id_string(graph),
+            graph: term_id_string(graph),
             actor: actor.to_string(),
         },
         CraqleLogKeyParts::Batch {
@@ -847,7 +847,7 @@ fn json_craqle_log_key(parts: CraqleLogKeyParts) -> JsonCraqleLogKey {
             actor,
             counter,
         } => JsonCraqleLogKey::Batch {
-            graph: craqle_term_id_string(graph),
+            graph: term_id_string(graph),
             actor: actor.to_string(),
             counter,
         },
@@ -861,7 +861,7 @@ fn json_craqle_dot(dot: CraqleDot) -> JsonCraqleDot {
     }
 }
 
-fn json_craqle_vector_clock(clock: CraqleVectorClock) -> JsonCraqleVectorClock {
+fn json_vector_clock(clock: CraqleVectorClock) -> JsonCraqleVectorClock {
     JsonCraqleVectorClock {
         entries: clock
             .0
@@ -874,7 +874,7 @@ fn json_craqle_vector_clock(clock: CraqleVectorClock) -> JsonCraqleVectorClock {
     }
 }
 
-fn json_craqle_graph_policy(policy: CraqleGraphPolicy) -> JsonCraqleGraphPolicy {
+fn json_graph_policy(policy: CraqleGraphPolicy) -> JsonCraqleGraphPolicy {
     let mut permission_paths = policy.permission_paths;
     permission_paths.sort();
     permission_paths.dedup();
@@ -884,23 +884,20 @@ fn json_craqle_graph_policy(policy: CraqleGraphPolicy) -> JsonCraqleGraphPolicy 
     }
 }
 
-fn json_craqle_graph_meta(graph: CraqleTermId, meta: CraqleStoredGraphMeta) -> JsonCraqleGraphMeta {
+fn json_graph_meta(graph: CraqleTermId, meta: CraqleStoredGraphMeta) -> JsonCraqleGraphMeta {
     JsonCraqleGraphMeta {
-        graph: craqle_term_id_string(graph),
-        policy: json_craqle_graph_policy(meta.policy),
-        clock: json_craqle_vector_clock(meta.clock),
+        graph: term_id_string(graph),
+        policy: json_graph_policy(meta.policy),
+        clock: json_vector_clock(meta.clock),
     }
 }
 
-fn json_craqle_stored_batch(
-    graph: CraqleTermId,
-    batch: CraqleStoredBatch,
-) -> JsonCraqleStoredBatch {
+fn json_stored_batch(graph: CraqleTermId, batch: CraqleStoredBatch) -> JsonCraqleStoredBatch {
     JsonCraqleStoredBatch {
-        graph: craqle_term_id_string(graph),
+        graph: term_id_string(graph),
         actor: batch.actor.to_string(),
         counter: batch.counter,
-        base_clock: json_craqle_vector_clock(batch.base_clock),
+        base_clock: json_vector_clock(batch.base_clock),
         ops: batch
             .ops
             .into_iter()
@@ -911,9 +908,9 @@ fn json_craqle_stored_batch(
                     object,
                     dot,
                 } => JsonCraqleStoredBatchOp::Add {
-                    subject: craqle_term_id_string(subject),
-                    predicate: craqle_term_id_string(predicate),
-                    object: craqle_term_id_string(object),
+                    subject: term_id_string(subject),
+                    predicate: term_id_string(predicate),
+                    object: term_id_string(object),
                     dot: json_craqle_dot(dot),
                 },
                 CraqleStoredQuadOp::Remove {
@@ -922,10 +919,10 @@ fn json_craqle_stored_batch(
                     object,
                     witnessed,
                 } => JsonCraqleStoredBatchOp::Remove {
-                    subject: craqle_term_id_string(subject),
-                    predicate: craqle_term_id_string(predicate),
-                    object: craqle_term_id_string(object),
-                    witnessed: json_craqle_vector_clock(witnessed),
+                    subject: term_id_string(subject),
+                    predicate: term_id_string(predicate),
+                    object: term_id_string(object),
+                    witnessed: json_vector_clock(witnessed),
                 },
             })
             .collect(),
@@ -933,7 +930,7 @@ fn json_craqle_stored_batch(
     }
 }
 
-fn decode_craqle_quad_key(key: &[u8]) -> Result<CraqleQuadKeyParts, String> {
+fn decode_quad_key(key: &[u8]) -> Result<CraqleQuadKeyParts, String> {
     if key.len() != 64 {
         return Err(format!(
             "invalid craqle quad key: expected 64 bytes, found {}",
@@ -941,24 +938,24 @@ fn decode_craqle_quad_key(key: &[u8]) -> Result<CraqleQuadKeyParts, String> {
         ));
     }
     Ok(CraqleQuadKeyParts {
-        graph: decode_craqle_term_id(&key[0..16], "craqle quad graph")?,
-        subject: decode_craqle_term_id(&key[16..32], "craqle quad subject")?,
-        predicate: decode_craqle_term_id(&key[32..48], "craqle quad predicate")?,
-        object: decode_craqle_term_id(&key[48..64], "craqle quad object")?,
+        graph: decode_term_id(&key[0..16], "craqle quad graph")?,
+        subject: decode_term_id(&key[16..32], "craqle quad subject")?,
+        predicate: decode_term_id(&key[32..48], "craqle quad predicate")?,
+        object: decode_term_id(&key[48..64], "craqle quad object")?,
     })
 }
 
-fn decode_craqle_graph_key(key: &[u8]) -> Result<CraqleGraphKeyParts, String> {
+fn decode_graph_key(key: &[u8]) -> Result<CraqleGraphKeyParts, String> {
     match key.first().copied() {
         Some(CRAQLE_GRAPH_META_PREFIX) if key.len() == 17 => Ok(CraqleGraphKeyParts::Meta {
-            graph: decode_craqle_term_id(&key[1..17], "craqle graph meta graph")?,
+            graph: decode_term_id(&key[1..17], "craqle graph meta graph")?,
         }),
         Some(CRAQLE_GRAPH_DIRTY_PREFIX) if key.len() == 33 => Ok(CraqleGraphKeyParts::Dirty {
-            graph: decode_craqle_term_id(&key[1..17], "craqle graph dirty graph")?,
-            subject: decode_craqle_term_id(&key[17..33], "craqle graph dirty subject")?,
+            graph: decode_term_id(&key[1..17], "craqle graph dirty graph")?,
+            subject: decode_term_id(&key[17..33], "craqle graph dirty subject")?,
         }),
         Some(CRAQLE_GRAPH_REINDEX_PREFIX) if key.len() == 17 => Ok(CraqleGraphKeyParts::Reindex {
-            graph: decode_craqle_term_id(&key[1..17], "craqle graph reindex graph")?,
+            graph: decode_term_id(&key[1..17], "craqle graph reindex graph")?,
         }),
         Some(prefix) => Err(format!(
             "invalid craqle graph key prefix `{}` with length {}",
@@ -969,10 +966,10 @@ fn decode_craqle_graph_key(key: &[u8]) -> Result<CraqleGraphKeyParts, String> {
     }
 }
 
-fn decode_craqle_log_key(key: &[u8]) -> Result<CraqleLogKeyParts, String> {
+fn decode_log_key(key: &[u8]) -> Result<CraqleLogKeyParts, String> {
     match key.first().copied() {
         Some(CRAQLE_LOG_HEAD_PREFIX) if key.len() == 49 => Ok(CraqleLogKeyParts::Head {
-            graph: decode_craqle_term_id(&key[1..17], "craqle log head graph")?,
+            graph: decode_term_id(&key[1..17], "craqle log head graph")?,
             actor: CraqleActorId::from_bytes(
                 key[17..49]
                     .try_into()
@@ -980,7 +977,7 @@ fn decode_craqle_log_key(key: &[u8]) -> Result<CraqleLogKeyParts, String> {
             ),
         }),
         Some(CRAQLE_LOG_BATCH_PREFIX) if key.len() == 57 => Ok(CraqleLogKeyParts::Batch {
-            graph: decode_craqle_term_id(&key[1..17], "craqle log batch graph")?,
+            graph: decode_term_id(&key[1..17], "craqle log batch graph")?,
             actor: CraqleActorId::from_bytes(
                 key[17..49]
                     .try_into()
@@ -1016,13 +1013,13 @@ fn decode_craqle_dots(value: &[u8]) -> Result<Vec<JsonCraqleDot>, String> {
     Ok(dots.into_iter().map(json_craqle_dot).collect())
 }
 
-fn decode_craqle_graph_value(key: &[u8], value: &[u8]) -> DecodedValue {
-    match decode_craqle_graph_key(key) {
+fn decode_graph_value(key: &[u8], value: &[u8]) -> DecodedValue {
+    match decode_graph_key(key) {
         Ok(CraqleGraphKeyParts::Meta { graph }) => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<CraqleStoredGraphMeta>(bytes),
             |data| DecodedValue::CraqleGraphMeta {
-                data: json_craqle_graph_meta(graph, data),
+                data: json_graph_meta(graph, data),
             },
         ),
         Ok(CraqleGraphKeyParts::Dirty { .. }) => decode_value_with(
@@ -1039,8 +1036,8 @@ fn decode_craqle_graph_value(key: &[u8], value: &[u8]) -> DecodedValue {
     }
 }
 
-fn decode_craqle_log_batch(key: &[u8], value: &[u8]) -> Result<JsonCraqleStoredBatch, String> {
-    let CraqleLogKeyParts::Batch { graph, .. } = decode_craqle_log_key(key)? else {
+fn decode_log_batch(key: &[u8], value: &[u8]) -> Result<JsonCraqleStoredBatch, String> {
+    let CraqleLogKeyParts::Batch { graph, .. } = decode_log_key(key)? else {
         return Err("craqle log batch value requires a batch key".to_string());
     };
     if value.first().copied() != Some(CRAQLE_BATCH_LOG_ENCODING_TAG) {
@@ -1048,11 +1045,11 @@ fn decode_craqle_log_batch(key: &[u8], value: &[u8]) -> Result<JsonCraqleStoredB
     }
     let batch = postcard::from_bytes::<CraqleStoredBatch>(&value[1..])
         .map_err(|error| error.to_string())?;
-    Ok(json_craqle_stored_batch(graph, batch))
+    Ok(json_stored_batch(graph, batch))
 }
 
-fn decode_craqle_log_value(key: &[u8], value: &[u8]) -> DecodedValue {
-    match decode_craqle_log_key(key) {
+fn decode_log_value(key: &[u8], value: &[u8]) -> DecodedValue {
+    match decode_log_key(key) {
         Ok(CraqleLogKeyParts::Head { .. }) => decode_value_with(
             value,
             |bytes| decode_craqle_u64(bytes, "craqle log head"),
@@ -1060,7 +1057,7 @@ fn decode_craqle_log_value(key: &[u8], value: &[u8]) -> DecodedValue {
         ),
         Ok(CraqleLogKeyParts::Batch { .. }) => decode_value_with(
             value,
-            |bytes| decode_craqle_log_batch(key, bytes),
+            |bytes| decode_log_batch(key, bytes),
             |data| DecodedValue::CraqleLogBatch { data },
         ),
         Err(error) => raw_value(value, Some(error)),
@@ -1395,25 +1392,25 @@ fn decode_entry(keyspace_name: &str, key: &[u8], value: &[u8]) -> EntryOutput {
 fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
     match keyspace_name {
         GROUP_KEYSPACE | AUTH_KEYSPACE => decode_ulid_key(key),
-        REALM_CONFIG_KEYSPACE => decode_realm_id_key(key),
-        CRAQLE_TERMS_KEYSPACE => decode_craqle_term_id(key, "craqle term key")
+        REALM_CONFIG_KEYSPACE => decode_realm_id(key),
+        CRAQLE_TERMS_KEYSPACE => decode_term_id(key, "craqle term key")
             .map(|value| DecodedField::CraqleTermId {
-                value: craqle_term_id_string(value),
+                value: term_id_string(value),
             })
             .unwrap_or_else(|_| raw_field(key)),
-        CRAQLE_QUADS_KEYSPACE => decode_craqle_quad_key(key)
+        CRAQLE_QUADS_KEYSPACE => decode_quad_key(key)
             .map(|value| DecodedField::CraqleQuadKey {
-                value: json_craqle_quad_key(value),
+                value: json_quad_key(value),
             })
             .unwrap_or_else(|_| raw_field(key)),
-        CRAQLE_GRAPHS_KEYSPACE => decode_craqle_graph_key(key)
+        CRAQLE_GRAPHS_KEYSPACE => decode_graph_key(key)
             .map(|value| DecodedField::CraqleGraphKey {
-                value: json_craqle_graph_key(value),
+                value: json_graph_key(value),
             })
             .unwrap_or_else(|_| raw_field(key)),
-        CRAQLE_LOG_KEYSPACE => decode_craqle_log_key(key)
+        CRAQLE_LOG_KEYSPACE => decode_log_key(key)
             .map(|value| DecodedField::CraqleLogKey {
-                value: json_craqle_log_key(value),
+                value: json_log_key(value),
             })
             .unwrap_or_else(|_| raw_field(key)),
         USER_ACCESS_KEYSPACE
@@ -1435,9 +1432,9 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         JOB_PLAN_EXPLAIN_KEYSPACE => decode_explain_key(key),
         JOB_RESERVATION_KEYSPACE => decode_ulid_key(key),
         PLACEMENT_POLICY_KEYSPACE | POLICY_MUTATION_KEYSPACE | POLICY_BULK_RUN_KEYSPACE => {
-            decode_policy_id_key(keyspace_name, key)
+            decode_policy_id(keyspace_name, key)
         }
-        PLACEMENT_POLICY_CACHE_KEYSPACE => decode_policy_cache_key(key),
+        PLACEMENT_POLICY_CACHE_KEYSPACE => decode_policy_cache(key),
         POLICY_BULK_INTENT_KEYSPACE => PolicyBulkIntentKey::from_bytes(key)
             .map(|value| DecodedField::PolicyBulkIntentKey {
                 operation_id: value.operation_id.to_string(),
@@ -1636,9 +1633,9 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
                 DecodedValue::MultipartUploadPart { data }
             })
         }
-        S3_MULTIPART_OBJECT_METADATA_KEYSPACE => decode_multipart_object_metadata_value(key, value),
+        S3_MULTIPART_OBJECT_METADATA_KEYSPACE => decode_object_metadata(key, value),
         AUTH_KEYSPACE => decode_auth_value(value),
-        API_STATE_KEYSPACE => decode_api_state_value(key, value),
+        API_STATE_KEYSPACE => decode_api_state(key, value),
         DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE => {
             raw_value(value, Some("document sync applied op".to_string()))
         }
@@ -1669,8 +1666,8 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         CRAQLE_QUADS_KEYSPACE => decode_value_with(value, decode_craqle_dots, |data| {
             DecodedValue::CraqleQuadDots { data }
         }),
-        CRAQLE_GRAPHS_KEYSPACE => decode_craqle_graph_value(key, value),
-        CRAQLE_LOG_KEYSPACE => decode_craqle_log_value(key, value),
+        CRAQLE_GRAPHS_KEYSPACE => decode_graph_value(key, value),
+        CRAQLE_LOG_KEYSPACE => decode_log_value(key, value),
         DHT_KEYSPACE => decode_value_with(value, decode_dht_entries, |data| {
             DecodedValue::DhtEntries { data }
         }),
@@ -1680,7 +1677,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
 
 /// Policy, mutation and bulk-run rows are all keyed by a postcard-encoded id;
 /// the placement-policy document keyspace stores the raw ulid bytes instead.
-fn decode_policy_id_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
+fn decode_policy_id(keyspace_name: &str, key: &[u8]) -> DecodedField {
     if keyspace_name == PLACEMENT_POLICY_KEYSPACE {
         return decode_ulid_key(key);
     }
@@ -1691,7 +1688,7 @@ fn decode_policy_id_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         .unwrap_or_else(|_| raw_field(key))
 }
 
-fn decode_policy_cache_key(key: &[u8]) -> DecodedField {
+fn decode_policy_cache(key: &[u8]) -> DecodedField {
     let Some((policy_id, digest)) = key.split_at_checked(16) else {
         return raw_field(key);
     };
@@ -1826,7 +1823,7 @@ fn decode_auth_value(value: &[u8]) -> DecodedValue {
     )
 }
 
-fn decode_api_state_value(key: &[u8], value: &[u8]) -> DecodedValue {
+fn decode_api_state(key: &[u8], value: &[u8]) -> DecodedValue {
     match key {
         TRUSTED_REALMS_LIST_KEY => postcard::from_bytes::<HashSet<RealmId>>(value)
             .map(|data| {
@@ -1845,7 +1842,7 @@ fn decode_api_state_value(key: &[u8], value: &[u8]) -> DecodedValue {
     }
 }
 
-fn decode_multipart_object_metadata_value(key: &[u8], value: &[u8]) -> DecodedValue {
+fn decode_object_metadata(key: &[u8], value: &[u8]) -> DecodedValue {
     match MultipartObjectMetadataKey::from_bytes(key) {
         Ok(MultipartObjectMetadataKey::Summary { .. }) => {
             decode_value_with(value, MultipartObjectSummary::from_bytes, |data| {
@@ -1887,7 +1884,7 @@ fn decode_ulid_key(key: &[u8]) -> DecodedField {
     }
 }
 
-fn decode_realm_id_key(key: &[u8]) -> DecodedField {
+fn decode_realm_id(key: &[u8]) -> DecodedField {
     if key.len() == 32 {
         let mut bytes = [0_u8; 32];
         bytes.copy_from_slice(key);
@@ -2192,7 +2189,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_job_family_rows() {
+    fn decodes_family_rows() {
         // Every append-only family keyspace must decode: an operator inspecting
         // a stuck submission cannot be told the rows are opaque bytes.
         let envelope = test_envelope();
@@ -2607,7 +2604,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_typed_group_entries() {
+    fn decodes_group_entries() {
         let temp = tempdir().unwrap();
         let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([7_u8; 32]);
@@ -2653,7 +2650,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_raw_for_unknown_keyspace() {
+    fn unknown_keyspace_raw() {
         let entry = decode_entry("unknown", b"\x01\x02", b"\x03\x04");
         assert_eq!(entry.key, raw_field(b"\x01\x02"));
         match entry.value {
@@ -2663,7 +2660,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_realm_config_key() {
+    fn decodes_realm_key() {
         let realm_id = RealmId::from_bytes([5_u8; 32]);
         let entry = decode_entry(REALM_CONFIG_KEYSPACE, realm_id.as_bytes(), b"not-a-config");
         assert_eq!(
@@ -2675,14 +2672,14 @@ mod tests {
     }
 
     #[test]
-    fn returns_missing_keyspace_error() {
+    fn missing_keyspace_errors() {
         let temp = tempdir().unwrap();
         let error = list_entries(temp.path().to_str().unwrap(), "missing").unwrap_err();
         assert!(error.to_string().contains("keyspace not found"));
     }
 
     #[test]
-    fn decodes_typed_realm_config_value_with_raw_error_fallback() {
+    fn decodes_realm_config() {
         let realm_id = RealmId::from_bytes([1_u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[3_u8; 32]).public(),
@@ -2715,7 +2712,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_onboarding_secret_record_value() {
+    fn decodes_onboarding_secret() {
         let record = OnboardingSecretRecord {
             enrollment_id: Ulid::generate(),
             secret_hash: "hash123".to_string(),
@@ -2740,7 +2737,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_node_state_value() {
+    fn decodes_node_state() {
         let realm_id = RealmId::from_bytes([4_u8; 32]);
         let state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
@@ -2769,7 +2766,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_pending_topic_placement_value() {
+    fn decodes_pending_placement() {
         let realm_id = RealmId::from_bytes([4_u8; 32]);
         let placement_ref = aruna_core::structs::PlacementRef {
             strategy_id: ulid::Ulid::from_bytes([9_u8; 16]),
@@ -2849,7 +2846,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_multipart_upload_entry() {
+    fn decodes_upload_entry() {
         let realm_id = RealmId::from_bytes([3_u8; 32]);
         let created_by = aruna_core::UserId::local(Ulid::generate(), realm_id);
         let upload = MultipartUpload {
@@ -2887,7 +2884,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_multipart_upload_part_entry() {
+    fn decodes_upload_part() {
         let realm_id = RealmId::from_bytes([9_u8; 32]);
         let created_by = aruna_core::UserId::local(Ulid::generate(), realm_id);
         let key = MultipartUploadPartKey::new(Ulid::from_bytes([2_u8; 16]), 5);
@@ -2928,7 +2925,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_multipart_object_summary_entry() {
+    fn decodes_object_summary() {
         let key = MultipartObjectMetadataKey::summary(Ulid::from_bytes([1_u8; 16]));
         let summary = MultipartObjectSummary {
             checksum_type: MultipartChecksumType::Composite,
@@ -2952,7 +2949,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_multipart_object_part_entry() {
+    fn decodes_object_part() {
         let key = MultipartObjectMetadataKey::part(Ulid::from_bytes([5_u8; 16]), 2);
         let part = MultipartObjectPart {
             part_number: 2,
@@ -2979,7 +2976,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_raw_for_invalid_multipart_object_metadata_value() {
+    fn invalid_metadata_raw() {
         let key = MultipartObjectMetadataKey::summary(Ulid::from_bytes([3_u8; 16]));
         let decoded = decode_entry(
             S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
@@ -2996,7 +2993,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_craqle_term_entry() {
+    fn decodes_term_entry() {
         let term_id = 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10_u128;
         let decoded = decode_entry(
             CRAQLE_TERMS_KEYSPACE,
@@ -3019,7 +3016,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_craqle_quad_entry() {
+    fn decodes_quad_entry() {
         let graph = 1_u128;
         let subject = 2_u128;
         let predicate = 3_u128;
@@ -3059,7 +3056,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_craqle_graph_meta_entry() {
+    fn decodes_graph_meta() {
         let graph = 9_u128;
         let actor = CraqleActorId::from_bytes([5_u8; 32]);
         let mut key = vec![CRAQLE_GRAPH_META_PREFIX];
@@ -3098,7 +3095,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_craqle_log_batch_entry() {
+    fn decodes_log_batch() {
         let graph = 12_u128;
         let subject = 13_u128;
         let predicate = 14_u128;
@@ -3167,7 +3164,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_raw_for_invalid_node_state_value() {
+    fn invalid_node_raw() {
         let decoded = decode_entry(NODE_STATE_KEYSPACE, b"node_state", b"broken");
         match decoded.value {
             DecodedValue::Raw {
@@ -3179,7 +3176,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_new_blob_keyspaces() {
+    fn decodes_blob_keyspaces() {
         let realm_id = RealmId::from_bytes([1_u8; 32]);
         let group_id = Ulid::from_bytes([2_u8; 16]);
         let node_id = iroh::SecretKey::from_bytes(&[3_u8; 32]).public();

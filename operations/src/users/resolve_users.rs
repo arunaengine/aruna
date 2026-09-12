@@ -81,7 +81,7 @@ impl ResolveUsersOperation {
         smallvec![]
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn fail_storage(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -168,7 +168,7 @@ impl Operation for ResolveUsersOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.fail_storage(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn omits_foreign_realm_user() {
+    fn omits_foreign_user() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let foreign_id = RealmId::from_bytes([3u8; 32]);
         let local = user(realm_id, 2, "Local");

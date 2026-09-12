@@ -1,13 +1,13 @@
 use super::*;
 
 #[test]
-fn realm_config_disjoint_nodes_merge_deterministically() {
+fn realm_config_deterministically() {
     let mut state = realm_config_state();
     let first_node = node(11);
     let second_node = node(12);
 
     state
-        .apply(&ensure_realm_config_node(
+        .apply(&ensure_realm_node(
             1,
             1,
             first_node,
@@ -15,16 +15,11 @@ fn realm_config_disjoint_nodes_merge_deterministically() {
         ))
         .unwrap();
     state
-        .apply(&ensure_realm_config_node(
-            2,
-            2,
-            second_node,
-            RealmNodeKind::Server,
-        ))
+        .apply(&ensure_realm_node(2, 2, second_node, RealmNodeKind::Server))
         .unwrap();
 
     assert_eq!(
-        state.materialized_realm_config_nodes(),
+        state.materialized_config_nodes(),
         BTreeMap::from([
             (first_node, RealmNodeKind::Management),
             (second_node, RealmNodeKind::Server),
@@ -34,12 +29,12 @@ fn realm_config_disjoint_nodes_merge_deterministically() {
 }
 
 #[test]
-fn concurrent_realm_config_same_node_different_kind_conflicts_fail_closed() {
+fn concurrent_realm_closed() {
     let mut state = realm_config_state();
     let config_node = node(11);
 
     state
-        .apply(&ensure_realm_config_node(
+        .apply(&ensure_realm_node(
             1,
             1,
             config_node,
@@ -47,26 +42,17 @@ fn concurrent_realm_config_same_node_different_kind_conflicts_fail_closed() {
         ))
         .unwrap();
     state
-        .apply(&ensure_realm_config_node(
-            2,
-            2,
-            config_node,
-            RealmNodeKind::Server,
-        ))
+        .apply(&ensure_realm_node(2, 2, config_node, RealmNodeKind::Server))
         .unwrap();
 
-    assert!(
-        !state
-            .materialized_realm_config_nodes()
-            .contains_key(&config_node)
-    );
+    assert!(!state.materialized_config_nodes().contains_key(&config_node));
     let conflict = state
         .conflicts
         .get(&format!("realm_config.nodes.{config_node}"))
         .expect("conflict is recorded");
     assert_eq!(conflict.values.len(), 2);
     for kind in [RealmNodeKind::Management, RealmNodeKind::Server] {
-        let encoded = realm_node_kind_value(&kind);
+        let encoded = node_kind_value(&kind);
         assert!(
             conflict
                 .values
@@ -83,7 +69,7 @@ fn removes_config_node() {
     let mut state = realm_config_state();
     let config_node = node(11);
     let origin = node(1);
-    let ensured = ensure_realm_config_node(
+    let ensured = ensure_realm_node(
         1,
         1,
         config_node,
@@ -104,13 +90,13 @@ fn removes_config_node() {
     state.apply(&ensured).unwrap();
     state.apply(&removed).unwrap();
 
-    assert!(state.materialized_realm_config_nodes().is_empty());
+    assert!(state.materialized_config_nodes().is_empty());
     assert_eq!(state.removed_config_nodes(), BTreeSet::from([config_node]));
     assert!(state.conflicts.is_empty());
 }
 
 #[test]
-fn observed_realm_config_node_update_replaces_conflict() {
+fn observed_realm_conflict() {
     let mut state = realm_config_state();
     let config_node = node(11);
     let first_origin = node(1);
@@ -155,7 +141,7 @@ fn observed_realm_config_node_update_replaces_conflict() {
     state.apply(&replacement).unwrap();
 
     assert_eq!(
-        state.materialized_realm_config_nodes(),
+        state.materialized_config_nodes(),
         BTreeMap::from([(
             config_node,
             RealmNodeKind::User {
@@ -179,14 +165,14 @@ fn node_kinds_roundtrip() {
             owner: UserId::nil(realm_id()),
         },
     ] {
-        let encoded = realm_node_kind_value(&kind);
-        assert_eq!(realm_node_kind_from_value(&encoded), Some(kind));
+        let encoded = node_kind_value(&kind);
+        assert_eq!(decode_node_kind(&encoded), Some(kind));
     }
-    assert_eq!(realm_node_kind_from_value("not-a-kind"), None);
+    assert_eq!(decode_node_kind("not-a-kind"), None);
 }
 
 #[test]
-fn realm_config_disjoint_oidc_providers_merge_deterministically() {
+fn realm_disjoint_deterministically() {
     let mut state = realm_config_state();
     let first = oidc_provider("default", "one");
     let second = oidc_provider("partner", "two");
@@ -199,7 +185,7 @@ fn realm_config_disjoint_oidc_providers_merge_deterministically() {
         .unwrap();
 
     assert_eq!(
-        state.materialized_realm_config_oidc_providers(),
+        state.materialized_oidc_providers(),
         BTreeMap::from([
             ("default".to_string(), first),
             ("partner".to_string(), second),
@@ -209,17 +195,16 @@ fn realm_config_disjoint_oidc_providers_merge_deterministically() {
 }
 
 #[test]
-fn concurrent_realm_config_node_provider_and_settings_ops_converge_independent_of_order() {
+fn concurrent_realm_order() {
     let config_node = node(11);
     let provider = oidc_provider("default", "one");
     let metadata_replication = MetadataReplicationConfig::new(5);
     let discovery = RealmDiscoveryConfig::Static {
         endpoints: Vec::new(),
     };
-    let node_event = ensure_realm_config_node(1, 1, config_node, RealmNodeKind::Management);
+    let node_event = ensure_realm_node(1, 1, config_node, RealmNodeKind::Management);
     let provider_event = upsert_oidc_provider(2, 2, provider.clone());
-    let settings_event =
-        set_realm_config_settings(3, 3, metadata_replication.clone(), discovery.clone());
+    let settings_event = set_realm_settings(3, 3, metadata_replication.clone(), discovery.clone());
 
     let mut left = realm_config_state();
     left.apply(&node_event).unwrap();
@@ -233,31 +218,31 @@ fn concurrent_realm_config_node_provider_and_settings_ops_converge_independent_o
 
     assert_eq!(left.user_subject_ids, right.user_subject_ids);
     assert_eq!(
-        left.materialized_realm_config_nodes(),
+        left.materialized_config_nodes(),
         BTreeMap::from([(config_node, RealmNodeKind::Management)])
     );
     assert_eq!(
-        left.materialized_realm_config_oidc_providers(),
+        left.materialized_oidc_providers(),
         BTreeMap::from([("default".to_string(), provider)])
     );
     assert_eq!(
-        left.materialized_realm_config_metadata_replication(),
+        left.materialized_metadata_replication(),
         Some(metadata_replication)
     );
-    assert_eq!(left.materialized_realm_config_discovery(), Some(discovery));
+    assert_eq!(left.materialized_realm_discovery(), Some(discovery));
     assert!(left.conflicts.is_empty());
     assert!(right.conflicts.is_empty());
 }
 
 #[test]
-fn concurrent_realm_config_settings_conflict_is_order_independent() {
+fn concurrent_realm_independent() {
     let first_metadata = MetadataReplicationConfig::new(3);
     let second_metadata = MetadataReplicationConfig::new(5);
     let discovery = RealmDiscoveryConfig::Dynamic {
         methods: Vec::new(),
     };
-    let first = set_realm_config_settings(1, 1, first_metadata, discovery.clone());
-    let second = set_realm_config_settings(2, 2, second_metadata, discovery.clone());
+    let first = set_realm_settings(1, 1, first_metadata, discovery.clone());
+    let second = set_realm_settings(2, 2, second_metadata, discovery.clone());
 
     let mut left = realm_config_state();
     left.apply(&first).unwrap();
@@ -268,17 +253,14 @@ fn concurrent_realm_config_settings_conflict_is_order_independent() {
     right.apply(&first).unwrap();
 
     assert_eq!(left.conflicts, right.conflicts);
-    assert_eq!(left.materialized_realm_config_metadata_replication(), None);
-    assert_eq!(right.materialized_realm_config_metadata_replication(), None);
-    assert_eq!(
-        left.materialized_realm_config_discovery(),
-        Some(discovery.clone())
-    );
-    assert_eq!(right.materialized_realm_config_discovery(), Some(discovery));
+    assert_eq!(left.materialized_metadata_replication(), None);
+    assert_eq!(right.materialized_metadata_replication(), None);
+    assert_eq!(left.materialized_realm_discovery(), Some(discovery.clone()));
+    assert_eq!(right.materialized_realm_discovery(), Some(discovery));
 }
 
 #[test]
-fn concurrent_realm_config_same_oidc_provider_different_body_conflicts_fail_closed() {
+fn concurrent_config_closed() {
     let mut state = realm_config_state();
     let first = oidc_provider("default", "one");
     let second = oidc_provider("default", "two");
@@ -288,11 +270,7 @@ fn concurrent_realm_config_same_oidc_provider_different_body_conflicts_fail_clos
     state.apply(&upsert_oidc_provider(1, 1, first)).unwrap();
     state.apply(&upsert_oidc_provider(2, 2, second)).unwrap();
 
-    assert!(
-        !state
-            .materialized_realm_config_oidc_providers()
-            .contains_key("default")
-    );
+    assert!(!state.materialized_oidc_providers().contains_key("default"));
     let conflict = state
         .conflicts
         .get("realm_config.oidc_providers.default")
@@ -313,7 +291,7 @@ fn concurrent_realm_config_same_oidc_provider_different_body_conflicts_fail_clos
 }
 
 #[test]
-fn observed_realm_config_oidc_provider_remove_removes_provider() {
+fn observed_realm_provider() {
     let mut state = realm_config_state();
     let provider = oidc_provider("default", "one");
     let upsert_origin = node(1);
@@ -337,12 +315,12 @@ fn observed_realm_config_oidc_provider_remove_removes_provider() {
     state.apply(&upsert).unwrap();
     state.apply(&removal).unwrap();
 
-    assert!(state.materialized_realm_config_oidc_providers().is_empty());
+    assert!(state.materialized_oidc_providers().is_empty());
     assert!(state.conflicts.is_empty());
 }
 
 #[test]
-fn realm_config_settings_materialize_metadata_replication_and_discovery() {
+fn realm_config_discovery() {
     let mut state = realm_config_state();
     let metadata_replication = MetadataReplicationConfig::new(5);
     let discovery = RealmDiscoveryConfig::Static {
@@ -350,7 +328,7 @@ fn realm_config_settings_materialize_metadata_replication_and_discovery() {
     };
 
     state
-        .apply(&set_realm_config_settings(
+        .apply(&set_realm_settings(
             1,
             1,
             metadata_replication.clone(),
@@ -359,23 +337,23 @@ fn realm_config_settings_materialize_metadata_replication_and_discovery() {
         .unwrap();
 
     assert_eq!(
-        state.materialized_realm_config_metadata_replication(),
+        state.materialized_metadata_replication(),
         Some(metadata_replication)
     );
-    assert_eq!(state.materialized_realm_config_discovery(), Some(discovery));
+    assert_eq!(state.materialized_realm_discovery(), Some(discovery));
     assert!(state.conflicts.is_empty());
 }
 
 #[test]
-fn realm_config_description_materializes() {
+fn realm_config_materializes() {
     let mut state = realm_config_state();
 
     state
-        .apply(&set_realm_config_description(1, 1, "Demo Realm"))
+        .apply(&set_realm_description(1, 1, "Demo Realm"))
         .unwrap();
 
     assert_eq!(
-        state.materialized_realm_config_description().as_deref(),
+        state.materialized_realm_description().as_deref(),
         Some("Demo Realm")
     );
     assert!(state.conflicts.is_empty());
@@ -407,10 +385,7 @@ fn keeps_device_cap() {
         ))
         .unwrap();
 
-    assert_eq!(
-        state.materialized_realm_config_quota(),
-        Some(expected.clone())
-    );
+    assert_eq!(state.materialized_realm_quota(), Some(expected.clone()));
 
     let stored_value = state
         .user_subject_ids
@@ -426,15 +401,15 @@ fn keeps_device_cap() {
         .get_mut(REALM_CONFIG_QUOTA_PATH)
         .expect("quota reducer value exists")
         .value = Some(serde_json::to_string(&quota).unwrap());
-    assert_eq!(state.materialized_realm_config_quota(), Some(expected));
+    assert_eq!(state.materialized_realm_quota(), Some(expected));
 }
 
 #[test]
-fn realm_config_quota_override_order_is_canonical_for_conflict_detection() {
+fn realm_config_detection() {
     let group_a = Ulid::from_bytes([1; 16]);
     let group_b = Ulid::from_bytes([2; 16]);
-    let user_a = user_id_with_seed(3);
-    let user_b = user_id_with_seed(4);
+    let user_a = user_id_seed(3);
+    let user_b = user_id_seed(4);
     let expected = QuotaConfig {
         default_group_quota_bytes: Some(1_000),
         grace_factor_percent: 125,
@@ -499,10 +474,7 @@ fn realm_config_quota_override_order_is_canonical_for_conflict_detection() {
     state.apply(&second).unwrap();
 
     assert!(state.conflicts.is_empty());
-    assert_eq!(
-        state.materialized_realm_config_quota(),
-        Some(expected.clone())
-    );
+    assert_eq!(state.materialized_realm_quota(), Some(expected.clone()));
 
     let stored_value = state
         .user_subject_ids
@@ -514,7 +486,7 @@ fn realm_config_quota_override_order_is_canonical_for_conflict_detection() {
 }
 
 #[test]
-fn realm_config_settings_metadata_conflict_withholds_only_metadata_replication() {
+fn realm_config_replication() {
     let mut state = realm_config_state();
     let first_metadata = MetadataReplicationConfig::new(3);
     let second_metadata = MetadataReplicationConfig::new(5);
@@ -525,15 +497,10 @@ fn realm_config_settings_metadata_conflict_withholds_only_metadata_replication()
     let second_value = metadata_replication_value(&second_metadata);
 
     state
-        .apply(&set_realm_config_settings(
-            1,
-            1,
-            first_metadata,
-            discovery.clone(),
-        ))
+        .apply(&set_realm_settings(1, 1, first_metadata, discovery.clone()))
         .unwrap();
     state
-        .apply(&set_realm_config_settings(
+        .apply(&set_realm_settings(
             2,
             2,
             second_metadata,
@@ -541,8 +508,8 @@ fn realm_config_settings_metadata_conflict_withholds_only_metadata_replication()
         ))
         .unwrap();
 
-    assert_eq!(state.materialized_realm_config_metadata_replication(), None);
-    assert_eq!(state.materialized_realm_config_discovery(), Some(discovery));
+    assert_eq!(state.materialized_metadata_replication(), None);
+    assert_eq!(state.materialized_realm_discovery(), Some(discovery));
     assert!(!state.conflicts.contains_key(REALM_CONFIG_DISCOVERY_PATH));
     let conflict = state
         .conflicts
@@ -564,7 +531,7 @@ fn realm_config_settings_metadata_conflict_withholds_only_metadata_replication()
 }
 
 #[test]
-fn realm_config_settings_discovery_conflict_withholds_only_discovery() {
+fn realm_settings_discovery() {
     let mut state = realm_config_state();
     let metadata_replication = MetadataReplicationConfig::new(3);
     let first_discovery = RealmDiscoveryConfig::Static {
@@ -577,7 +544,7 @@ fn realm_config_settings_discovery_conflict_withholds_only_discovery() {
     let second_value = realm_discovery_value(&second_discovery);
 
     state
-        .apply(&set_realm_config_settings(
+        .apply(&set_realm_settings(
             1,
             1,
             metadata_replication.clone(),
@@ -585,7 +552,7 @@ fn realm_config_settings_discovery_conflict_withholds_only_discovery() {
         ))
         .unwrap();
     state
-        .apply(&set_realm_config_settings(
+        .apply(&set_realm_settings(
             2,
             2,
             metadata_replication.clone(),
@@ -594,10 +561,10 @@ fn realm_config_settings_discovery_conflict_withholds_only_discovery() {
         .unwrap();
 
     assert_eq!(
-        state.materialized_realm_config_metadata_replication(),
+        state.materialized_metadata_replication(),
         Some(metadata_replication)
     );
-    assert_eq!(state.materialized_realm_config_discovery(), None);
+    assert_eq!(state.materialized_realm_discovery(), None);
     assert!(
         !state
             .conflicts
@@ -623,7 +590,7 @@ fn realm_config_settings_discovery_conflict_withholds_only_discovery() {
 }
 
 #[test]
-fn user_operation_is_rejected_for_group_target_without_state_change() {
+fn user_operation_change() {
     let mut state = group_state();
     let before = state.clone();
     let event = group_event(
@@ -644,7 +611,7 @@ fn user_operation_is_rejected_for_group_target_without_state_change() {
 }
 
 #[test]
-fn oidc_provider_operation_is_rejected_for_non_realm_config_target_without_state_change() {
+fn oidc_provider_change() {
     let mut state = user_state();
     let before = state.clone();
     let event = event(
@@ -665,7 +632,7 @@ fn oidc_provider_operation_is_rejected_for_non_realm_config_target_without_state
 }
 
 #[test]
-fn realm_config_settings_op_is_rejected_for_non_realm_config_target() {
+fn realm_config_target() {
     let mut state = user_state();
     let before = state.clone();
     let event = event(

@@ -9,7 +9,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::types::Key;
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use byteview::ByteView;
 use tracing::{debug, warn};
 
@@ -32,7 +32,7 @@ struct HeldTopicOutcome {
     pull_pending: bool,
 }
 
-async fn ensure_held_shard_topics(
+async fn ensure_held_topics(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
     config: &RealmConfigDocument,
@@ -52,9 +52,7 @@ async fn ensure_held_shard_topics(
                 shard,
             };
             let holders = resolve_shard_holders(config, &placement);
-            // Admitted targets join for delivery and retained departing holders
-            // stay through grace (#399 bounds the peak at |old U new|); publish
-            // authority stays with activated plus retained holders only.
+            // Admitted targets join; only activated and retained holders may publish.
             let membership = bucket_membership(config, &placement, now_ms);
             if !membership.members.contains(&local_node_id) {
                 continue;
@@ -114,7 +112,7 @@ async fn ensure_held_shard_topics(
             co_members = co_members.len(),
             "Ensuring rank-0 shard topic geneses"
         );
-        outcome.withheld |= ensure_rank0_shard_group(
+        outcome.withheld |= ensure_genesis_group(
             context,
             net_handle,
             local_node_id,
@@ -127,9 +125,7 @@ async fn ensure_held_shard_topics(
         )
         .await;
     }
-    // Non-rank-0 held shards: an unknown topic is pulled from a co-holder
-    // (`sync_document_topics` is join-only and can never fork), and known topics
-    // are topped up with the current co-holder set.
+    // Pull unknown non-leading topics from a co-holder; top up known topics from current holders.
     for ((co_members, publishers, retained), topics) in member_groups {
         if co_members.is_empty() {
             continue;
@@ -137,9 +133,7 @@ async fn ensure_held_shard_topics(
         let mut current_members = co_members.clone();
         current_members.push(local_node_id);
         sort_node_ids(&mut current_members);
-        // Install the current publisher policy before pulling any history. A
-        // missing topic is expected here; the exact membership pass below is
-        // repeated after a successful pull.
+        // Install publisher policy before pulling, then repeat membership after a successful pull.
         let _ = net_handle
             .reconcile_shard_membership(
                 &topics,
@@ -231,9 +225,7 @@ pub(crate) async fn resolve_creatable_topics(
         return (to_ensure, withheld);
     }
 
-    // A peer already unreachable in this pass is not probed again: waiting its
-    // full deadline a second time cannot change the verdict. A stale entry can
-    // only withhold, never mint, so a peer that recovers costs one more pass.
+    // Probe an unreachable peer once per pass; recovery is observed on the next pass.
     let (live, skipped): (Vec<NodeId>, Vec<NodeId>) = co_members
         .iter()
         .copied()
@@ -242,7 +234,7 @@ pub(crate) async fn resolve_creatable_topics(
         aruna_net::ShardGenesisProbe::default()
     } else {
         net_handle
-            .probe_shard_topic_geneses(missing.clone(), live)
+            .probe_shard_geneses(missing.clone(), live)
             .await
     };
     // Skipped peers stay in `unreachable` so an all-dead set still withholds:
@@ -288,7 +280,7 @@ pub(crate) async fn resolve_creatable_topics(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn ensure_rank0_shard_group(
+pub(crate) async fn ensure_genesis_group(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
     local_node_id: NodeId,
@@ -326,7 +318,7 @@ pub(crate) async fn ensure_rank0_shard_group(
     .await;
 
     if !to_ensure.is_empty() {
-        match net_handle.ensure_document_sync_topics(&to_ensure, co_members) {
+        match net_handle.ensure_sync_topics(&to_ensure, co_members) {
             Ok(()) => {
                 if let Err(error) = net_handle
                     .reconcile_shard_membership(
@@ -431,7 +423,7 @@ async fn reconcile_placements(
     local_node_id: NodeId,
     run_transitions: bool,
 ) -> PlacementReconcileOutcome {
-    let config = match load_realm_config_outcome(context, realm_id).await {
+    let config = match load_config_outcome(context, realm_id).await {
         RealmConfigLoadOutcome::Found(config) => config,
         RealmConfigLoadOutcome::Absent => {
             warn!(%realm_id, "Cannot process shard placements without a realm config");
@@ -446,12 +438,10 @@ async fn reconcile_placements(
     };
 
     // Former-holder history cutoffs are frozen only for durably verified shards.
-    let verified = crate::shard::verify::load_verified_shard_topics(context, realm_id).await;
+    let verified = crate::shard::verify::load_verified_topics(context, realm_id).await;
 
-    // A withheld genesis or an unpulled held topic leaves no placement record,
-    // so it alone must still arm the retry below (otherwise writes defer at 1s
-    // forever).
-    let held = ensure_held_shard_topics(
+    // Retry withheld genesis and pending pulls even when no placement record exists yet.
+    let held = ensure_held_topics(
         context,
         net_handle,
         &config,
@@ -475,7 +465,7 @@ async fn reconcile_placements(
     {
         // A pure transition target never mutates the config, so nothing else
         // arms its timer; fire the deferred execution now.
-        let effect = crate::sync::shard_placement::schedule_placement_retry_after(
+        let effect = crate::sync::shard_placement::schedule_retry_after(
             realm_id,
             local_node_id,
             std::time::Duration::ZERO,
@@ -483,15 +473,11 @@ async fn reconcile_placements(
         let _ = task_handle.send_effect(effect).await;
     }
 
-    // Release is a deadline, not an event: a record that is released in the
-    // local view is pruned here, because no later event may ever re-materialize
-    // the document for it.
+    // Prune locally released records because no later event may rematerialize them.
     let deadline_now = unix_timestamp_millis();
     retry_needed |=
         prune_released_transitions(context, realm_id, local_node_id, &config, deadline_now).await;
-    // Arm the timer for the earliest pending grace end (shorten-only, so a
-    // sooner retry is never postponed) and keep the normal retry driving
-    // post-grace drain scans.
+    // Arm the earliest grace deadline without postponing an earlier retry.
     retry_needed |= crate::placement::drain_pending(&config, deadline_now);
     if let Some(deadline) = crate::placement::next_release_ms(&config, deadline_now)
         && let Some(task_handle) = context.task_handle.as_ref()
@@ -550,7 +536,7 @@ async fn reconcile_placements(
             // A resolution failure keeps the durable record: deleting it on a
             // missing or conflicted activation would destroy the only retry.
             let holders =
-                match crate::placement::resolve_shard_holders_checked(&config, &record.placement) {
+                match crate::placement::try_resolve_holders(&config, &record.placement) {
                     Ok(holders) => holders,
                     Err(error) => {
                         debug!(error = %error, "Keeping placement record for unresolvable bucket");
@@ -591,9 +577,7 @@ async fn reconcile_placements(
             }
 
             let topic = shard_topic_id(realm_id, &record.placement);
-            // Genesis creation is owned by `ensure_rank0_shard_topics`; this loop
-            // only tops up membership on a locally known topic, keeping records
-            // whose genesis is not local yet for the next pass instead of forking.
+            // This loop tops up known topics and retains missing genesis records for another pass.
             if !net_handle
                 .document_sync_topic_exists(topic)
                 .unwrap_or(false)
@@ -657,15 +641,13 @@ async fn reconcile_placements(
     }
 
     if retry_needed && let Some(task_handle) = context.task_handle.as_ref() {
-        // A pending pull is join-only and usually one gossip push away, so it
-        // retries on the short cadence; a withheld genesis waits out the full
-        // interval (re-probing a down co-holder is expensive).
+        // Pending pulls retry quickly; withheld genesis waits before probing its co-holder again.
         let after = if held.pull_pending {
             crate::sync::shard_placement::SHARD_TOPIC_PULL_RETRY_AFTER
         } else {
             crate::sync::shard_placement::SYNC_PLACEMENT_RETRY_AFTER
         };
-        let effect = crate::sync::shard_placement::schedule_placement_retry_after(
+        let effect = crate::sync::shard_placement::schedule_retry_after(
             realm_id,
             local_node_id,
             after,
@@ -703,7 +685,7 @@ fn has_transition_work(config: &RealmConfigDocument, now_ms: u64) -> bool {
         })
 }
 
-async fn load_realm_config_outcome(
+async fn load_config_outcome(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
 ) -> RealmConfigLoadOutcome {
@@ -744,7 +726,7 @@ pub(crate) async fn load_realm_config(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
 ) -> Option<RealmConfigDocument> {
-    match load_realm_config_outcome(context, realm_id).await {
+    match load_config_outcome(context, realm_id).await {
         RealmConfigLoadOutcome::Found(config) => Some(config),
         RealmConfigLoadOutcome::Absent | RealmConfigLoadOutcome::StorageFailure => None,
     }
@@ -802,7 +784,7 @@ async fn prune_released_transitions(
                 ),
                 (
                     aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    aruna_core::storage_entries::admin_document_reducer_state_key(&target),
+                    aruna_core::storage_entries::reducer_state_key(&target),
                 ),
             ],
             txn_id: Some(txn_id),
@@ -825,7 +807,7 @@ async fn prune_released_transitions(
     };
     let (Ok(mut stored), Ok(state)) = (
         RealmConfigDocument::from_bytes(stored.as_ref()),
-        aruna_core::reducer::decode_admin_document_reducer_state(state.as_ref()),
+        aruna_core::reducer::decode_reducer_state(state.as_ref()),
     ) else {
         warn!("Undecodable realm config or reducer state; transition release skipped");
         abort_release_txn(storage, txn_id).await;
@@ -932,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_holders_are_deterministic_across_node_ordering() {
+    fn shard_holders_deterministic() {
         let (config, placement) = config_with(&[node(1), node(2), node(3), node(4)], None);
         let first = resolve_shard_holders(&config, &placement);
 
@@ -944,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn replica_capped_shard_holder_set_is_bounded() {
+    fn replica_cap_bounds() {
         let (config, placement) = config_with(&[node(1), node(2), node(3), node(4)], Some(2));
         let holders = resolve_shard_holders(&config, &placement);
         assert_eq!(holders.len(), 2);

@@ -1,5 +1,5 @@
 use crate::node::usage_stats::{
-    UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
+    UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -194,7 +194,7 @@ impl CreateBucketOperation {
         self.txn_id = None;
         self.state = CreateBucketState::Finish;
         self.output = Some(Ok(self.bucket_info.clone()));
-        smallvec![schedule_usage_snapshot_publish_effect()]
+        smallvec![schedule_snapshot_publish()]
     }
 }
 
@@ -294,7 +294,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn drive_duplicate_bucket_returns_already_exists() {
+    async fn duplicate_bucket_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();

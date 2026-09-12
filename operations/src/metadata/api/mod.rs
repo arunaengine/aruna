@@ -18,14 +18,13 @@ use aruna_core::metadata::{
     MetadataGraphLifecycleRecord, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::storage_entries::{
-    metadata_document_lifecycle_key, metadata_event_log_key, metadata_graph_lifecycle_key,
-    metadata_pending_projection_target,
+    document_lifecycle_key, event_log_key, graph_lifecycle_key, pending_projection_target,
 };
 use aruna_core::structs::{
     ARUNA_DATA_PREFIX, AuthContext, BlobHeadKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, MetadataRegistryRecord, PathClaimRecord, Permission, PlacementRef,
-    RealmConfigDocument, RealmId, VersionKey, W3idDataIdentifier, blob_bucket_permission_path,
-    blob_object_permission_path,
+    RealmConfigDocument, RealmId, VersionKey, W3idDataIdentifier, bucket_permission_path,
+    object_permission_path,
 };
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
@@ -40,38 +39,35 @@ use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
 pub use self::distributed::{aggregate_query_results, query_form, query_select_limit};
-use self::distributed::{
-    object_search_fingerprint, record_object_result, record_preflight_node_result,
-};
-use self::export::export_rocrate_summary_jsonld;
-pub use self::export::{export_metadata_rocrate, get_visible_metadata_document};
+use self::distributed::{object_search_fingerprint, record_object_result, record_preflight_node};
+use self::export::export_summary_jsonld;
+pub use self::export::{export_metadata_rocrate, get_visible_document};
 pub use self::fanout::forwarded_bearer;
-pub(crate) use self::fanout::graph_pattern_contains_service;
+pub(crate) use self::fanout::pattern_contains_service;
 pub use self::fanout::search_buckets_distributed;
 use self::fanout::{
-    MetadataFanoutOperation, MetadataNodeCall, distributed_query_is_union_safe, fanout_bearer,
-    metadata_node_call, run_metadata_fanout,
+    MetadataFanoutOperation, MetadataNodeCall, fanout_bearer, metadata_node_call, query_union_safe,
+    run_metadata_fanout,
 };
 pub(crate) use self::path::local_path_candidates;
-pub use self::path::{deduplicate_fanout_nodes, document_replica_query_nodes};
+pub use self::path::{deduplicate_fanout_nodes, replica_query_nodes};
 use self::path::{
     forward_path_resolution, load_path_holder, merge_path_views, reduce_path_candidates,
     select_fanout_nodes, select_path_holders, validate_path_candidate,
 };
 pub(crate) use self::preflight::{discover_realm_nodes, references_preflight_local};
-pub use self::preflight::{load_metadata_realm_nodes, load_realm_config};
+pub use self::preflight::{load_realm_config, load_realm_nodes};
 use self::preflight::{
     preflight_fingerprint, reference_document_title, resolve_graph_reference,
     resolve_preflight_targets,
 };
 pub(crate) use self::read::{
-    can_read_record, ensure_record_readable, filter_live_records, load_record_by_document,
+    can_read_record, ensure_record_readable, filter_live_records, load_document_record,
     metadata_read_request,
 };
 use self::read::{
-    check_policy_limit, effective_list_limit, ensure_record_materialized_for_graph_read,
-    load_group_records, load_pending_records, merge_pending_metadata_records,
-    metadata_record_matches_filters,
+    check_policy_limit, effective_list_limit, ensure_record_materialized, load_group_records,
+    load_pending_records, merge_pending_records, record_matches_filters,
 };
 pub use self::read::{
     query_metadata, query_metadata_document, references_metadata, search_metadata,
@@ -97,12 +93,10 @@ use crate::auth::permission_rules::GroupPermissionRules;
 use crate::blob::permission_paths::ResolveBlobPermissionPathsOperation;
 use crate::driver::{DriverContext, drive};
 use crate::groups::list_groups::ListGroupOperation;
-use crate::metadata::get_document::{
-    is_metadata_record_materialized_for_graph_read, load_metadata_record_by_document,
-};
+use crate::metadata::get_document::{load_document_record, record_materialized_read};
 use crate::metadata::repository::{
     LIST_METADATA_PAGE_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
-    parse_registry_read, read_registry_by_document_effect,
+    parse_registry_read, read_document_registry,
 };
 use crate::placement::selector::{
     ROLE_NODE, neg_log2_q48, peer_rank, select_top_peers, selector_hash,
@@ -429,7 +423,7 @@ impl SignedCursor<ObjectSearchCursorPayload> {
                 "invalid object search cursor".to_string(),
             ));
         }
-        let cursor = Self::decode_envelope(
+        let cursor = Self::decode_verified(
             raw,
             OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT,
             authorized_signers,
@@ -795,7 +789,7 @@ pub enum MetadataQueryForm {
     Ask,
 }
 
-pub async fn list_visible_metadata_documents(
+pub async fn list_visible_documents(
     context: &DriverContext,
     realm_id: RealmId,
     request: ListVisibleMetadataDocumentsRequest,
@@ -815,9 +809,8 @@ pub async fn list_visible_metadata_documents(
         .map(|group| group.group_id)
         .collect(),
     })?;
-    // Summary listings and recency listings must show documents whose projection
-    // has not landed yet; the pending keyspace is scanned once per request,
-    // never once per group.
+    // Summary listings and recency listings must show documents whose projection has not landed
+    // yet; the pending keyspace is scanned once per request, never once per group.
     let recent = request.order == MetadataListOrder::Recent;
     let mut pending = if request.include_summary || recent {
         load_pending_records(context, request.group_id, METADATA_REGISTRY_CANDIDATE_LIMIT).await?
@@ -830,7 +823,7 @@ pub async fn list_visible_metadata_documents(
         let remaining = METADATA_REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());
         let mut group_records = load_group_records(context, group_id, remaining).await?;
         if let Some(pending_records) = pending.remove(&group_id) {
-            merge_pending_metadata_records(&mut group_records, pending_records);
+            merge_pending_records(&mut group_records, pending_records);
             if group_records.len() > remaining {
                 return Err(MetadataApiError::ServiceUnavailable);
             }
@@ -849,9 +842,7 @@ pub async fn list_visible_metadata_documents(
         });
     }
 
-    // One rule collection (a read per distinct group) replaces the per-record
-    // permission drives; `record_visible` mirrors `can_read_record` for the
-    // same caller and record, so every later check is pure memory.
+    // One rule collection per group keeps every later visibility check in memory.
     let auth = request
         .auth
         .as_ref()
@@ -892,9 +883,7 @@ pub async fn list_visible_metadata_documents(
     if limit >= METADATA_ESTIMATE_MIN_LIMIT {
         let matching = records
             .iter()
-            .filter(|record| {
-                metadata_record_matches_filters(record, request.path_prefix.as_deref())
-            })
+            .filter(|record| record_matches_filters(record, request.path_prefix.as_deref()))
             .filter(|record| record_visible(record))
             .count();
         total_estimate = Some(matching);
@@ -904,7 +893,7 @@ pub async fn list_visible_metadata_documents(
     let mut selected = Vec::with_capacity(limit.min(records.len()));
     let mut visible_count = 0usize;
     for record in records {
-        if !metadata_record_matches_filters(&record, request.path_prefix.as_deref()) {
+        if !record_matches_filters(&record, request.path_prefix.as_deref()) {
             continue;
         }
         if !record_visible(&record) {
@@ -924,12 +913,9 @@ pub async fn list_visible_metadata_documents(
         let exports = selected
             .iter()
             .map(|record| async move {
-                // Registry cursor advances at event acceptance but graph only at
-                // materialization; exporting in between would hand out (and cache)
-                // superseded content, so pending documents list without a summary.
-                ensure_record_materialized_for_graph_read(context, record).await?;
-                export_rocrate_summary_jsonld(context, &record.graph_iri, record.last_event_id)
-                    .await
+                // A pending graph cannot export content from before its accepted event.
+                ensure_record_materialized(context, record).await?;
+                export_summary_jsonld(context, &record.graph_iri, record.last_event_id).await
             })
             .collect::<Vec<_>>();
         let summaries = stream::iter(exports)
@@ -1306,7 +1292,7 @@ pub async fn references_preflight(
                 METADATA_SEARCH_MAX_PAGINATION_DEPTH,
             );
             handle
-                .request_remote_reference_preflight(
+                .request_remote_preflight(
                     node_id,
                     auth_token,
                     MetadataReferencePreflightNodeRequest { targets, limit },
@@ -1325,7 +1311,7 @@ pub async fn references_preflight(
         MetadataFanoutOperation::ReferencePreflight,
         local_call,
         remote_call,
-        record_preflight_node_result,
+        record_preflight_node,
         map_read_error,
     )
     .await?;
@@ -1486,7 +1472,7 @@ fn authorized_realm_nodes(
     nodes: HashSet<NodeId>,
 ) -> Result<HashSet<NodeId>, ConversionError> {
     let authorized = config
-        .sync_eligible_node_ids()?
+        .sync_eligible_nodes()?
         .into_iter()
         .collect::<HashSet<_>>();
     Ok(nodes
@@ -1494,17 +1480,17 @@ fn authorized_realm_nodes(
         .filter(|node_id| authorized.contains(node_id))
         .collect())
 }
-fn map_metadata_event_error(error: MetadataError) -> MetadataApiError {
+fn map_event_error(error: MetadataError) -> MetadataApiError {
     match error {
         MetadataError::GraphNotFound => MetadataApiError::ServiceUnavailable,
         other => MetadataApiError::Internal(other.to_string()),
     }
 }
 
-fn map_metadata_query_error(error: MetadataError) -> MetadataApiError {
+fn map_query_error(error: MetadataError) -> MetadataApiError {
     match error {
         MetadataError::InvalidInput(_) => MetadataApiError::BadRequest,
-        other => map_metadata_event_error(other),
+        other => map_event_error(other),
     }
 }
 
@@ -1518,7 +1504,7 @@ fn map_read_error(error: MetadataReadError) -> MetadataApiError {
     }
 }
 
-fn map_metadata_internal_error(error: MetadataError) -> MetadataApiError {
+fn map_internal_error(error: MetadataError) -> MetadataApiError {
     MetadataApiError::Internal(error.to_string())
 }
 

@@ -68,7 +68,7 @@ impl GetUserAccessOperation {
         }
     }
 
-    fn handle_user_access_received(&mut self, event: Event) -> Effects {
+    fn access_received(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::ReadResult { value, .. }) = event {
             let output = value.map(|value| {
                 UserAccess::from_bytes(&value).map_err(GetUserAccessError::ConversionError)
@@ -106,7 +106,7 @@ impl Operation for GetUserAccessOperation {
         }
         match self.state {
             GetUserAccessState::Init => self.handle_init(),
-            GetUserAccessState::GetUserAccess => self.handle_user_access_received(event),
+            GetUserAccessState::GetUserAccess => self.access_received(event),
             GetUserAccessState::Finish => smallvec![],
             GetUserAccessState::Error => self.abort(),
         }
@@ -147,7 +147,7 @@ mod test {
     use ulid::Ulid;
 
     #[tokio::test]
-    pub async fn test_get_user_access() {
+    pub async fn gets_user_access() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();

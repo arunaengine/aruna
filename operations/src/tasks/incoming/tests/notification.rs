@@ -2,7 +2,7 @@ use super::harness::*;
 use super::*;
 
 #[tokio::test]
-async fn notification_drain_delivers_locally_when_self_is_holder() {
+async fn notification_drain_holder() {
     let realm_id = RealmId::from_bytes([5u8; 32]);
     let temp_dir = tempdir().expect("temp dir");
     let storage =
@@ -14,7 +14,7 @@ async fn notification_drain_delivers_locally_when_self_is_holder() {
     write_realm_config(&storage, realm_id, &config, net_handle.node_id()).await;
 
     let record = notification_record(realm_id, 1_700_000_000_000);
-    let outbox = new_notification_outbox_record(record.clone());
+    let outbox = new_outbox_record(record.clone());
     write_notification_outbox(&storage, &outbox).await;
 
     let context = Arc::new(DriverContext {
@@ -30,14 +30,14 @@ async fn notification_drain_delivers_locally_when_self_is_holder() {
 
     let inbox = read_inbox_records(&storage).await;
     assert_eq!(inbox, vec![record]);
-    let remaining = read_notification_outbox_batch(&storage, None, 1024, None)
+    let remaining = read_outbox_batch(&storage, None, 1024, None)
         .await
         .expect("outbox read");
     assert!(remaining.records.is_empty());
 }
 
 #[tokio::test]
-async fn notification_drain_retries_when_holder_unresolvable() {
+async fn notification_drain_unresolvable() {
     let realm_id = RealmId::from_bytes([6u8; 32]);
     let temp_dir = tempdir().expect("temp dir");
     let storage =
@@ -45,7 +45,7 @@ async fn notification_drain_retries_when_holder_unresolvable() {
     let net_handle = make_net_handle(realm_id, &storage, [22u8; 32]).await;
 
     let record = notification_record(realm_id, 1_700_000_000_000);
-    let outbox = new_notification_outbox_record(record);
+    let outbox = new_outbox_record(record);
     write_notification_outbox(&storage, &outbox).await;
 
     let task_handle = TaskHandle::new();
@@ -60,7 +60,7 @@ async fn notification_drain_retries_when_holder_unresolvable() {
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     handler.drain_notification_outbox().await;
 
-    let remaining = read_notification_outbox_batch(&storage, None, 1024, None)
+    let remaining = read_outbox_batch(&storage, None, 1024, None)
         .await
         .expect("outbox read");
     assert_eq!(remaining.records.len(), 1);
@@ -82,7 +82,7 @@ async fn notification_drain_retries_when_holder_unresolvable() {
 }
 
 #[tokio::test]
-async fn notification_drain_delivers_to_remote_holder() {
+async fn notification_delivers_holder() {
     let realm_id = RealmId::from_bytes([8u8; 32]);
 
     let dir_a = tempdir().expect("temp dir");
@@ -120,7 +120,7 @@ async fn notification_drain_delivers_to_remote_holder() {
         },
         1_700_000_000_000,
     );
-    let outbox = new_notification_outbox_record(record.clone());
+    let outbox = new_outbox_record(record.clone());
     write_notification_outbox(&storage_a, &outbox).await;
 
     let context_b = Arc::new(DriverContext {
@@ -145,14 +145,14 @@ async fn notification_drain_delivers_to_remote_holder() {
     handler.drain_notification_outbox().await;
 
     assert_eq!(read_inbox_records(&storage_b).await, vec![record]);
-    let remaining = read_notification_outbox_batch(&storage_a, None, 1024, None)
+    let remaining = read_outbox_batch(&storage_a, None, 1024, None)
         .await
         .expect("outbox read");
     assert!(remaining.records.is_empty());
 }
 
 #[tokio::test]
-async fn notification_drain_drops_expired_records_with_warn() {
+async fn notification_drain_warn() {
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let temp_dir = tempdir().expect("temp dir");
     let storage =
@@ -181,7 +181,7 @@ async fn notification_drain_drops_expired_records_with_warn() {
     handler.drain_notification_outbox().await;
 
     assert!(read_inbox_records(&storage).await.is_empty());
-    let remaining = read_notification_outbox_batch(&storage, None, 1024, None)
+    let remaining = read_outbox_batch(&storage, None, 1024, None)
         .await
         .expect("outbox read");
     assert!(remaining.records.is_empty());
@@ -191,7 +191,7 @@ async fn write_notification_outbox(
     storage: &aruna_storage::StorageHandle,
     record: &NotificationOutboxRecord,
 ) {
-    let (key_space, key, value) = notification_outbox_write_entry(record).expect("outbox entry");
+    let (key_space, key, value) = outbox_write_entry(record).expect("outbox entry");
     match storage
         .send_storage_effect(StorageEffect::Write {
             key_space,

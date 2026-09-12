@@ -170,8 +170,8 @@ fn compaction_canonicalizes() {
     state
         .applied_event_ids
         .extend([longer.event_id, equal.event_id, shorter.event_id]);
-    let description_first = set_realm_config_description(23, 4, "first");
-    let description_second = set_realm_config_description(24, 5, "second");
+    let description_first = set_realm_description(23, 4, "first");
+    let description_second = set_realm_description(24, 5, "second");
     state.apply(&description_first).unwrap();
     state.apply(&description_second).unwrap();
 
@@ -226,8 +226,8 @@ fn revocation_origin_count() {
 
 #[test]
 fn owner_conflict_order() {
-    let owner_a = user_id_with_seed(1);
-    let owner_b = user_id_with_seed(2);
+    let owner_a = user_id_seed(1);
+    let owner_b = user_id_seed(2);
     let first = revoke_token_owned(40, 1, "owned", 5_000, owner_a);
     let second = revoke_token_owned(41, 2, "owned", 5_000, owner_b);
     let mut left = realm_config_state();
@@ -298,8 +298,8 @@ fn expired_count() {
 
 #[test]
 fn owner_count() {
-    let owner_a = user_id_with_seed(3);
-    let owner_b = user_id_with_seed(4);
+    let owner_a = user_id_seed(3);
+    let owner_b = user_id_seed(4);
     let mut state = realm_config_state();
     for (seed, token, owner) in [
         (46u8, "owner-a-one", owner_a),
@@ -354,7 +354,7 @@ fn expiry_schedule_bounds() {
     assert!(!state.revocation_compaction_due(2_000 + REVOCATION_GRACE_SECS));
 
     state
-        .apply(&set_realm_config_description(53, 2, "unrelated"))
+        .apply(&set_realm_description(53, 2, "unrelated"))
         .unwrap();
     state.advance_revocation_floor(2_100);
     assert!(!state.revocation_compaction_due(2_100));
@@ -489,16 +489,14 @@ fn compaction_keeps_unexpired() {
 #[test]
 fn compaction_spares_paths() {
     let mut state = realm_config_state();
-    state
-        .apply(&set_realm_config_description(1, 1, "realm"))
-        .unwrap();
+    state.apply(&set_realm_description(1, 1, "realm")).unwrap();
     state.apply(&revoke_token(2, 1, "token")).unwrap();
 
     state.compact_revocations(9_000);
 
     assert!(state.materialized_revoked_tokens().is_empty());
     assert_eq!(
-        state.materialized_realm_config_description(),
+        state.materialized_realm_description(),
         Some("realm".to_string())
     );
 }

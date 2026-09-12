@@ -15,7 +15,7 @@ use crate::document_repository::read_effect;
 use crate::placement::{document_class, plan_target_placement};
 use crate::sync::announce::AnnounceTopicOperation;
 use crate::sync::shard_placement::{
-    delete_placement_effect, new_placement, placement_satisfied, schedule_placement_retry_effect,
+    delete_placement_effect, new_placement, placement_satisfied, schedule_retry_effect,
     write_placement_effect,
 };
 
@@ -146,9 +146,7 @@ impl ReplicateDocumentsOperation {
             return self.emit_next_publish();
         }
 
-        // A metadata document's bucket is the one its create stamped on the
-        // registry record; deriving it from the target here would hash it onto a
-        // second topic. Metadata replicates through its own outbox, never here.
+        // Metadata uses its recorded bucket and its own outbox, never a rederived target bucket.
         if matches!(
             document_class(&document),
             DocumentClass::Metadata | DocumentClass::MetadataRegistry
@@ -163,16 +161,14 @@ impl ReplicateDocumentsOperation {
         let Some(realm_config) = self.realm_config.as_ref() else {
             return self.emit_next_publish();
         };
-        // Placement plan for the document's bound strategy. `None` means the
-        // realm has no strategy for this target (skip, like the old
-        // desired_peer_count == 0 case).
+        // No bound strategy means this target has no placement work.
         let plan = match plan_target_placement(realm_config, &document, Default::default()) {
             Ok(Some(plan)) => plan,
             Ok(None) => return self.emit_next_publish(),
             Err(_) => {
                 // Unresolvable bucket: keep a durable pending record so the
                 // reconciler retries, and announce nothing to nonholders.
-                let placement = crate::placement::placement_ref_for_target(
+                let placement = crate::placement::target_placement_ref(
                     realm_config,
                     &document,
                     Default::default(),
@@ -230,7 +226,7 @@ impl ReplicateDocumentsOperation {
 
         self.state = ReplicateDocumentsState::Publish;
         smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceTopicOperation::new_for_document_with_peers_and_placement(
+            AnnounceTopicOperation::new_with_placement(
                 document.topic_id(),
                 self.config.local_node_id,
                 Some(document),
@@ -266,7 +262,7 @@ impl ReplicateDocumentsOperation {
         }
     }
 
-    fn emit_failed_publish_retry(&mut self, error: String) -> Effects {
+    fn retry_failed_publish(&mut self, error: String) -> Effects {
         let Some(action) = self.placement_action.take() else {
             return self.fail(ReplicateDocumentsError::DocumentSync(error));
         };
@@ -329,7 +325,7 @@ impl Operation for ReplicateDocumentsOperation {
                             Ok(effects) => effects,
                             Err(error) => self.fail(error),
                         },
-                        Err(error) => self.emit_failed_publish_retry(error),
+                        Err(error) => self.retry_failed_publish(error),
                     }
                 }
                 other => self.unexpected_event("document sync result", format!("{other:?}")),
@@ -339,7 +335,7 @@ impl Operation for ReplicateDocumentsOperation {
                 | Event::Storage(StorageEvent::DeleteResult { .. }) => {
                     if self.retry_needed {
                         self.state = ReplicateDocumentsState::ScheduleRetry;
-                        smallvec![schedule_placement_retry_effect(
+                        smallvec![schedule_retry_effect(
                             self.config.realm_id,
                             self.config.local_node_id,
                         )]
@@ -436,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn task_schedule_error_is_non_blocking_after_placement_write() {
+    fn schedule_error_nonblocking() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id,
@@ -494,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn two_remote_peers_satisfy_default_document_placement() {
+    fn peers_satisfy_placement() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let target = node_usage_target(realm_id, node(4));
         let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
@@ -516,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_placement_records_authoritative_origin() {
+    fn pending_records_origin() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let target = node_usage_target(realm_id, node(5));
         let local_node_id = node(1);
@@ -541,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_node_usage_publishes_without_remote_peers() {
+    fn node_usage_peerless() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let local_node_id = node(1);
         let target = node_usage_target(realm_id, local_node_id);
@@ -565,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_watch_interest_publishes_without_remote_peers() {
+    fn watch_interest_peerless() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let local_node_id = node(1);
         let target = watch_interest_target(realm_id, local_node_id);
@@ -591,7 +587,7 @@ mod tests {
     // Node info rides the shared realm topic, so a single-node realm still
     // publishes it instead of parking it behind a placement retry.
     #[test]
-    fn node_info_publishes_peerless() {
+    fn node_info_peerless() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let local_node_id = node(1);
         let target = node_info_target(realm_id, local_node_id);
@@ -615,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_failure_keeps_authoritative_origin() {
+    fn failure_keeps_origin() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let target = node_usage_target(realm_id, node(6));
         let local_node_id = node(1);
@@ -649,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn replicate_documents_selection_uses_rendezvous_not_local_salt() {
+    fn selection_uses_rendezvous() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let target = node_usage_target(realm_id, node(7));
 
@@ -687,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_target_creates_no_placement() {
+    fn admin_skips_placement() {
         let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id: RealmId::from_bytes([7u8; 32]),
             local_node_id: node(1),
