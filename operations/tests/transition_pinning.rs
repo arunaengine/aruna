@@ -8,7 +8,7 @@ mod topology;
 use std::collections::BTreeMap;
 
 use aruna_core::StructuredId;
-use aruna_core::structs::{NodePlacementEntry, PlacementRef};
+use aruna_core::structs::NodePlacementEntry;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::mint_local_document;
 use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
