@@ -242,7 +242,7 @@ impl Compactor {
         }
     }
 
-    /// Queues a compaction unless one for this keyspace is still pending.
+    /// Keeps at most one queued compaction per keyspace, including while one runs.
     fn submit(&self, key_space: &str, deletes: u64, keyspace: OptimisticTxKeyspace) {
         let Some(sender) = self.sender.as_ref() else {
             return;
@@ -305,6 +305,10 @@ fn run_compaction(job: CompactionJob, active: &Arc<Mutex<HashSet<String>>>) {
         deletes,
         run,
     } = job;
+    active
+        .lock()
+        .expect("storage compaction mutex poisoned")
+        .remove(&key_space);
     let started = Instant::now();
     match run() {
         Ok(()) => debug!(
@@ -322,10 +326,6 @@ fn run_compaction(job: CompactionJob, active: &Arc<Mutex<HashSet<String>>>) {
             "Keyspace compaction failed"
         ),
     }
-    active
-        .lock()
-        .expect("storage compaction mutex poisoned")
-        .remove(&key_space);
 }
 
 pub struct FjallStorage {
@@ -5721,12 +5721,32 @@ mod tests {
         assert_eq!(job.key_space, "dht_meta_v2");
         assert_eq!(job.deletes, super::COMPACT_AFTER_DELETES);
         assert_eq!(storage.deletes.get("dht_meta_v2").copied(), Some(0));
-        (job.run)().expect("keyspace compacts");
-
-        // The keyspace stays active until the compaction thread releases it, so
-        // a second crossing queues nothing.
-        storage.process_effect(delete_batch(super::COMPACT_AFTER_DELETES));
-        assert!(jobs.try_recv().is_err());
+        let active = storage.compactor.active.clone();
+        super::run_compaction(
+            super::CompactionJob {
+                key_space: job.key_space,
+                deletes: job.deletes,
+                run: Box::new(move || {
+                    (job.run)().expect("keyspace compacts");
+                    // Deletes after rotation need a successor before this job returns.
+                    storage.process_effect(delete_batch(super::COMPACT_AFTER_DELETES));
+                    let successor = jobs.try_recv().expect("successor is queued");
+                    storage.process_effect(delete_batch(super::COMPACT_AFTER_DELETES));
+                    assert!(jobs.try_recv().is_err(), "only one successor is queued");
+                    super::run_compaction(successor, &storage.compactor.active);
+                    assert!(
+                        storage
+                            .compactor
+                            .active
+                            .lock()
+                            .expect("compaction mutex")
+                            .is_empty()
+                    );
+                    Ok(())
+                }),
+            },
+            &active,
+        );
     }
 
     #[test]
@@ -5787,7 +5807,9 @@ mod tests {
             .expect("next job is queued");
         drop(sender);
 
-        finished.recv().expect("the thread ran the next job");
+        finished
+            .recv_timeout(std::time::Duration::from_secs(300))
+            .expect("the thread ran the next job");
         compactor.shutdown();
         assert!(
             compactor
