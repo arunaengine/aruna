@@ -84,10 +84,7 @@ async fn setup() -> Fixture {
         .await,
     );
     state
-        .register_rest_interface_with_public_url(
-            "127.0.0.1:0".parse().unwrap(),
-            Some("https://node.test"),
-        )
+        .register_rest_public("127.0.0.1:0".parse().unwrap(), Some("https://node.test"))
         .await;
     let actor = Actor {
         node_id,

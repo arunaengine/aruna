@@ -23,14 +23,13 @@ use aruna_core::{DocumentSyncEffect, NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::dispatch::{
-    WatchDispatchError, create_watch_for_user, delete_watch_for_user, list_notifications_for_user,
-    list_watches_for_user,
+    WatchDispatchError, create_for_user, delete_for_user, list_for_user, list_watches,
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::watch::emit::emit_watch_event;
 use aruna_operations::notifications::watch::interest::{
-    ensure_local_watch_interest_digest, mark_watch_interest_dirty, refresh_target_interest,
+    ensure_interest_digest, mark_interest_dirty, refresh_target_interest,
 };
 use aruna_operations::notifications::watch::subscriptions::list_watch_subscriptions;
 use aruna_operations::sync::incoming::initialize_net_incoming;
@@ -78,7 +77,7 @@ async fn watch_crosses_nodes() -> Result<(), Box<dyn std::error::Error>> {
         expires_at_secs: 1,
         ..Default::default()
     };
-    let subscription = create_watch_for_user(
+    let subscription = create_for_user(
         nodes[0].context.as_ref(),
         nodes[0].net.node_id(),
         watcher,
@@ -256,7 +255,7 @@ async fn same_node_delivery() -> Result<(), Box<dyn std::error::Error>> {
     // Deleting through the creating node retracts its local registration.
     delete_watch_via(&nodes[0], watcher, subscription.watch_id).await?;
     wait_for(|| async {
-        list_watches_for_user(nodes[0].context.as_ref(), nodes[0].net.node_id(), watcher)
+        list_watches(nodes[0].context.as_ref(), nodes[0].net.node_id(), watcher)
             .await
             .is_ok_and(|rows| rows.is_empty())
     })
@@ -445,7 +444,7 @@ async fn remote_create_conflicts() -> Result<(), Box<dyn std::error::Error>> {
 
     // Node B is not the holder, so every create proxies to node A over the wire.
     for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
-        create_watch_for_user(
+        create_for_user(
             nodes[1].context.as_ref(),
             nodes[1].net.node_id(),
             owner,
@@ -457,7 +456,7 @@ async fn remote_create_conflicts() -> Result<(), Box<dyn std::error::Error>> {
         .expect("remote create under cap succeeds");
     }
 
-    let error = create_watch_for_user(
+    let error = create_for_user(
         nodes[1].context.as_ref(),
         nodes[1].net.node_id(),
         owner,
@@ -578,7 +577,7 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
     };
     refresh_target_interest(new_holder_node.context.as_ref(), &reconciled).await;
     for node in &nodes {
-        mark_watch_interest_dirty(node.context.as_ref(), realm_id).await?;
+        mark_interest_dirty(node.context.as_ref(), realm_id).await?;
     }
 
     wait_for(|| async {
@@ -596,7 +595,7 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
     })
     .await?;
     assert_eq!(
-        list_watches_for_user(nodes[1].context.as_ref(), nodes[1].net.node_id(), watcher).await?,
+        list_watches(nodes[1].context.as_ref(), nodes[1].net.node_id(), watcher).await?,
         vec![subscription.clone()]
     );
 
@@ -628,7 +627,7 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
 
     delete_watch_via(&nodes[0], watcher, subscription.watch_id).await?;
     wait_for(|| async {
-        list_watches_for_user(nodes[1].context.as_ref(), nodes[1].net.node_id(), watcher)
+        list_watches(nodes[1].context.as_ref(), nodes[1].net.node_id(), watcher)
             .await
             .is_ok_and(|rows| rows.is_empty())
     })
@@ -681,7 +680,7 @@ async fn create_watch_via(
     path_prefix: &str,
     event_mask: WatchEventMask,
 ) -> Result<WatchSubscription, Box<dyn std::error::Error>> {
-    Ok(create_watch_for_user(
+    Ok(create_for_user(
         node.context.as_ref(),
         node.net.node_id(),
         owner,
@@ -697,7 +696,7 @@ async fn delete_watch_via(
     owner: UserId,
     watch_id: Ulid,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    delete_watch_for_user(node.context.as_ref(), node.net.node_id(), owner, watch_id).await?;
+    delete_for_user(node.context.as_ref(), node.net.node_id(), owner, watch_id).await?;
     Ok(())
 }
 
@@ -720,7 +719,7 @@ async fn wait_for_holder(
 }
 
 async fn list_via(node: &TestNode, recipient: UserId) -> Vec<NotificationRecord> {
-    list_notifications_for_user(
+    list_for_user(
         node.context.as_ref(),
         node.net.node_id(),
         recipient,
@@ -987,7 +986,7 @@ async fn bootstrap_interest_topic(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (index, node) in nodes.iter().enumerate() {
         let node_id = node.net.node_id();
-        ensure_local_watch_interest_digest(&node.context.storage_handle, realm_id, node_id).await?;
+        ensure_interest_digest(&node.context.storage_handle, realm_id, node_id).await?;
         drive(
             ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
                 realm_id,
