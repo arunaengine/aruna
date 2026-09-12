@@ -1,5 +1,5 @@
-use crate::blob::records::blob_location_read;
 use crate::blob::managed_copy::ManagedCopyError;
+use crate::blob::records::blob_location_read;
 use crate::s3::object_lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read,
@@ -478,14 +478,10 @@ impl Operation for GetObjectAttributesOperation {
             GetObjectAttributesState::Init => self.handle_init(),
             GetObjectAttributesState::StartTransaction => self.handle_transaction_started(event),
             GetObjectAttributesState::GetVersion => self.handle_received_version(event),
-            GetObjectAttributesState::GetCurrentVersion => {
-                self.current_version_received(event)
-            }
+            GetObjectAttributesState::GetCurrentVersion => self.current_version_received(event),
             GetObjectAttributesState::CheckManagedCopy => self.handle_managed_copy(event),
             GetObjectAttributesState::GetBlobLocation => self.location_read(event),
-            GetObjectAttributesState::ReadMultipartSummary => {
-                self.summary_read(event)
-            }
+            GetObjectAttributesState::ReadMultipartSummary => self.summary_read(event),
             GetObjectAttributesState::ReadMultipartParts => self.parts_read(event),
             GetObjectAttributesState::CommitTransaction => self.handle_transaction_committed(event),
             GetObjectAttributesState::Finish | GetObjectAttributesState::Error => smallvec![],

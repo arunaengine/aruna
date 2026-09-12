@@ -1,6 +1,4 @@
-use crate::node::usage_stats::{
-    UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
-};
+use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -427,9 +425,7 @@ impl Operation for DeleteBucketOperation {
             DeleteBucketState::ReadBucket => self.handle_bucket_read(event),
             DeleteBucketState::CheckCurrentObjects => self.objects_checked(event),
             DeleteBucketState::CheckVersions => self.handle_versions_checked(event),
-            DeleteBucketState::CheckMultipartUploads => {
-                self.uploads_checked(event)
-            }
+            DeleteBucketState::CheckMultipartUploads => self.uploads_checked(event),
             DeleteBucketState::ScanOutRelationships | DeleteBucketState::ScanInRelationships => {
                 self.handle_relationship_scan(event)
             }
