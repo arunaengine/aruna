@@ -840,7 +840,7 @@ pub async fn stage_inputs(
             Err(error) => {
                 failed.push(FailedInputResponse {
                     dest_key,
-                    error: error.to_string(),
+                    error: error.public_message(),
                 });
                 refusal = refusal.or(Some(error));
             }
