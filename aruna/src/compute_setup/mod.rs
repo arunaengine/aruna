@@ -186,6 +186,19 @@ async fn build_apptainer(
     ))
 }
 
+#[cfg(feature = "kubernetes")]
+use kubernetes::build as build_kubernetes;
+#[cfg(not(feature = "kubernetes"))]
+async fn build_kubernetes(
+    _settings: &ComputeSettings,
+    _kubernetes: &KubernetesSettings,
+    _config: &Config,
+) -> Result<ExecutorRegistry, ComputeBuildError> {
+    Err(ComputeBuildError::Unsupported(
+        "Kubernetes executor feature is not compiled".to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::{ComputeBuildError, optional_tolerates};
@@ -220,17 +233,4 @@ mod pure_tests {
             "optional compute may disable"
         );
     }
-}
-
-#[cfg(feature = "kubernetes")]
-use kubernetes::build as build_kubernetes;
-#[cfg(not(feature = "kubernetes"))]
-async fn build_kubernetes(
-    _settings: &ComputeSettings,
-    _kubernetes: &KubernetesSettings,
-    _config: &Config,
-) -> Result<ExecutorRegistry, ComputeBuildError> {
-    Err(ComputeBuildError::Unsupported(
-        "Kubernetes executor feature is not compiled".to_string(),
-    ))
 }
