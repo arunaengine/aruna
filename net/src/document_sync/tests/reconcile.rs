@@ -1014,7 +1014,7 @@ async fn rejection_advances_cursor() {
         .expect("unauthorized placement events are skipped");
     assert!(result.targets.contains(&target));
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert_eq!(config.description, "");
     assert_eq!(
         config.placement_map,
@@ -1142,7 +1142,7 @@ async fn unknown_report_quarantined() {
         .expect("an unknown transition report never blocks reconciliation");
 
     assert_eq!(
-        read_realm_config(&storage, realm_id).await.description,
+        stored_realm_config(&storage, realm_id).await.description,
         "progress after the invented report",
         "a valid mutation behind an invented report must still apply"
     );
@@ -1286,7 +1286,7 @@ async fn plan_report_coalesce() {
         .await
         .expect("a plan and its report reconcile in one batch");
 
-    let stored = read_realm_config(&storage, realm_id).await;
+    let stored = stored_realm_config(&storage, realm_id).await;
     let transition = stored
         .transition(&transition_id)
         .expect("the plan materialized");
