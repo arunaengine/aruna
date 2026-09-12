@@ -172,7 +172,7 @@ impl<'a> Planner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduling::tests::fixtures::{candidate, config, node, request};
+    use crate::tests::fixtures::scheduling::{candidate, config, node, request};
 
     fn planner(compute: &RealmComputeConfig) -> Planner<'_> {
         Planner::new(&request(Vec::new()), compute).expect("request is well formed")

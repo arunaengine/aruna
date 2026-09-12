@@ -492,7 +492,7 @@ pub enum NetError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effects::tests::fixtures::sized_envelope;
+    use crate::tests::fixtures::effects::sized_envelope;
 
     fn frame(objects: usize, key_bytes: usize) -> JobRecordFrame {
         JobRecordFrame::new(sized_envelope(objects, key_bytes)).expect("bounded record")

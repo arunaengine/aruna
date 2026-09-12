@@ -1,4 +1,6 @@
-use super::*;
+use crate::compute::ExecutionTargetId;
+use crate::structs::{JobRecordEnvelope, RealmId};
+use ulid::Ulid;
 
 /// Test fixture shared with the event frames: one signed output record whose
 /// encoded size grows with the output count and key width.
@@ -36,7 +38,7 @@ pub(crate) fn sized_envelope(objects: usize, key_bytes: usize) -> JobRecordEnvel
 }
 
 /// One signed launch whose encoded size grows with the executor-kind width.
-pub(super) fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
+pub(crate) fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
     use crate::structs::{JobFamilyRecord, JobId, LaunchIntent, PlacementRef, SubmissionId};
 
     let secret = iroh::SecretKey::from_bytes(&[4u8; 32]);

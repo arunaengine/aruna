@@ -13,30 +13,24 @@ use super::{
     realm_role_path, realm_user_path, revoked_token_path, role_definition_value,
     strategy_binding_path, user_attribute_path, user_subject_path,
 };
-use crate::admin_documents::{
-    AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition,
-    AdminDocumentTarget,
-};
+use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation};
 use crate::auth::REVOCATION_GRACE_SECS;
 use crate::structs::{
-    Actor, AffinityEffect, AffinityRule, BindingError, BindingScope, BucketPlan, CandidateMapNode,
+    AffinityEffect, AffinityRule, BindingError, BindingScope, BucketPlan, CandidateMapNode,
     CandidatePlacementMap, CompletionProof, DocumentClass, FIRST_GRANTABLE_HANDLE,
     GroupQuotaOverride, HandleRange, KIND_LABEL_KEY, LabelMatch, MAX_PLACEMENT_SHARD_COUNT,
-    MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-    PlacementBinding, PlacementOverride, PlacementScope, PlacementStrategy, ProofClaim,
-    QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind,
-    STORAGE_CLASS_LABEL_PREFIX, StrategyBinding, TransitionLimits, TransitionPlan,
-    TransitionStatus, UserGroupCapOverride,
+    MetadataReplicationConfig, NodePlacementEntry, PlacementBinding, PlacementOverride,
+    PlacementScope, PlacementStrategy, ProofClaim, QuotaConfig, RealmConfigDocument,
+    RealmDiscoveryConfig, RealmNodeKind, STORAGE_CLASS_LABEL_PREFIX, StrategyBinding,
+    TransitionLimits, TransitionPlan, TransitionStatus, UserGroupCapOverride,
 };
 use crate::structured_id::PlacementHandle;
-use crate::types::{GroupId, RoleId};
 use crate::user_validation::UserAttributeValidationError;
 use crate::{NodeId, UserId};
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
 
-mod fixtures;
-use fixtures::*;
+use crate::tests::fixtures::reducer::*;
 mod group;
 mod placement;
 mod realm_config;
