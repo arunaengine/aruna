@@ -15,9 +15,9 @@ use crate::error::{NetError, Result};
 use super::admin::{apply_admin_operation, coalescible_config_op, flush_config_run};
 use super::materialize::reduced_admin_target;
 use super::metadata::{MetadataOutcome, apply_metadata_event, apply_policy_event};
+use super::satisfied_dependencies;
 use super::shared::{SharedOutcome, apply_shared_event, apply_watch_event};
 use super::validate::{AdminEventValidation, ConfigValidationCache, validate_admin_event};
-use super::satisfied_dependencies;
 
 #[derive(Default)]
 pub(super) struct BatchOutcome {

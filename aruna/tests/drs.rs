@@ -11,8 +11,8 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use shared::{
     TestResult, create_bearer_token, create_group_http, create_onboarding_secret,
-    create_s3_credentials, s3_client, shutdown_pair, spawn_complete_joiner,
-    spawn_complete_seed, spawn_seed_node, wait_group_http, wait_realm_nodes,
+    create_s3_credentials, s3_client, shutdown_pair, spawn_complete_joiner, spawn_complete_seed,
+    spawn_seed_node, wait_group_http, wait_realm_nodes,
 };
 use ulid::Ulid;
 
@@ -127,8 +127,7 @@ async fn content_hash_missing() -> TestResult<()> {
 async fn historical_hash_resolves() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let onboarding_secret =
-        create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server)
-            .await?;
+        create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server).await?;
     let joiner = spawn_complete_joiner(&seed, onboarding_secret).await?;
 
     let result = async {
@@ -156,8 +155,7 @@ async fn historical_hash_resolves() -> TestResult<()> {
             .as_ref()
             .ok_or_else(|| std::io::Error::other("joiner node did not start S3 server"))?;
         let credentials =
-            create_s3_credentials(&joiner.base_url, &bearer_token, &group.group_id)
-                .await?;
+            create_s3_credentials(&joiner.base_url, &bearer_token, &group.group_id).await?;
         let s3 = s3_client(joiner_s3, &credentials);
 
         let bucket = "drs-historical-hash-e2e";

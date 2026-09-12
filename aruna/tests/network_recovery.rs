@@ -16,8 +16,8 @@ use aruna_tasks::TaskHandle;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use shared::{
-    TestResult, create_bearer_token, create_group_http, create_onboarding_secret,
-    shutdown_pair, spawn_complete_joiner, spawn_complete_seed, wait_realm_nodes, wait_until,
+    TestResult, create_bearer_token, create_group_http, create_onboarding_secret, shutdown_pair,
+    spawn_complete_joiner, spawn_complete_seed, wait_realm_nodes, wait_until,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -233,8 +233,7 @@ async fn check_recovery(
 async fn realm_outage_recovers() -> TestResult<()> {
     let seed = spawn_complete_seed().await?;
     let onboarding =
-        create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server)
-            .await?;
+        create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server).await?;
     let joiner = spawn_complete_joiner(&seed, onboarding).await?;
     let result = async {
         let token = create_bearer_token(

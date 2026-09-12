@@ -21,8 +21,8 @@ use rmcp::transport::{
 use rmcp::{ClientLifecycleMode, ClientServiceExt, RoleClient};
 use serde_json::{Value, json};
 use shared::{
-    S3Credentials, TestResult, create_bearer_token, create_group_http,
-    create_s3_credentials, s3_client, spawn_compute_seed, wait_group_http,
+    S3Credentials, TestResult, create_bearer_token, create_group_http, create_s3_credentials,
+    s3_client, spawn_compute_seed, wait_group_http,
 };
 use ulid::Ulid;
 

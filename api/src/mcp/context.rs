@@ -171,17 +171,16 @@ impl McpServer {
         };
         let mut groups = Vec::new();
         for group in member_groups(self, &auth).await? {
-            let counts =
-                count_group_purpose(&self.state.get_ctx(), realm_id, group.group_id)
-                    .await
-                    .map_err(internal_error)?
-                    .ok_or_else(|| {
-                        explained(
-                            crate::error::ServerError::ServiceUnavailable,
-                            "this node has no metadata subsystem, so dataset counts are \
+            let counts = count_group_purpose(&self.state.get_ctx(), realm_id, group.group_id)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    explained(
+                        crate::error::ServerError::ServiceUnavailable,
+                        "this node has no metadata subsystem, so dataset counts are \
                              unavailable here; call get_node_info",
-                        )
-                    })?;
+                    )
+                })?;
             total.dataset_count += counts.dataset_count;
             total.profile_count += counts.profile_count;
             total.process_run_count += counts.process_run_count;

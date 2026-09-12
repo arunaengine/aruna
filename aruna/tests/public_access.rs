@@ -9,8 +9,8 @@ use aws_sdk_s3::primitives::ByteStream;
 use reqwest::StatusCode;
 use serde_json::json;
 use shared::{
-    TestResult, create_bearer_token, create_group_http, create_s3_credentials,
-    s3_client, spawn_complete_seed,
+    TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
+    spawn_complete_seed,
 };
 use ulid::Ulid;
 
@@ -32,11 +32,9 @@ async fn public_grants_read() -> TestResult<()> {
         )
         .await?;
 
-        let group =
-            create_group_http(&seed.base_url, &bearer_token, "public-access-e2e").await?;
+        let group = create_group_http(&seed.base_url, &bearer_token, "public-access-e2e").await?;
         let credential_group =
-            create_group_http(&seed.base_url, &bearer_token, "public-access-credentials")
-                .await?;
+            create_group_http(&seed.base_url, &bearer_token, "public-access-credentials").await?;
         let member_id = UserId::local(Ulid::generate(), seed.realm_id);
         let member_token = create_bearer_token(
             seed.context.as_ref(),
@@ -66,12 +64,9 @@ async fn public_grants_read() -> TestResult<()> {
         let credentials =
             create_s3_credentials(&seed.base_url, &bearer_token, &group.group_id).await?;
         let s3 = s3_client(s3_endpoint, &credentials);
-        let cross_group_credentials = create_s3_credentials(
-            &seed.base_url,
-            &member_token,
-            &credential_group.group_id,
-        )
-        .await?;
+        let cross_group_credentials =
+            create_s3_credentials(&seed.base_url, &member_token, &credential_group.group_id)
+                .await?;
         let cross_group_s3 = s3_client(s3_endpoint, &cross_group_credentials);
 
         let bucket = "public-profiles";

@@ -117,12 +117,9 @@ pub async fn prepare_core_documents(
     allow_genesis: bool,
     include_node_info: bool,
 ) -> Result<Vec<DocumentSyncTarget>, Box<dyn std::error::Error>> {
-    let digest_created =
-        ensure_interest_digest(&driver_ctx.storage_handle, realm_id, node_id)
-            .await
-            .map_err(|error| {
-                format!("failed to initialize local watch interest digest: {error}")
-            })?;
+    let digest_created = ensure_interest_digest(&driver_ctx.storage_handle, realm_id, node_id)
+        .await
+        .map_err(|error| format!("failed to initialize local watch interest digest: {error}"))?;
     if digest_created {
         mark_interest_dirty(driver_ctx, realm_id)
             .await
@@ -541,8 +538,8 @@ pub async fn ensure_onboarding_secret(
 #[cfg(test)]
 mod tests {
     use super::{
-        backoff, node_is_ready, prepare_core_documents, publish_core_documents,
-        sync_peer_topic, sync_with_retry, unique_user_topic, watch_target_needed,
+        backoff, node_is_ready, prepare_core_documents, publish_core_documents, sync_peer_topic,
+        sync_with_retry, unique_user_topic, watch_target_needed,
     };
     use crate::config::PersistedNodeIdentity;
     use aruna_core::NodeId;
@@ -812,9 +809,7 @@ mod tests {
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
         assert!(net.sync_topic_exists(topic).unwrap());
         assert_eq!(net.realm_peers().await, vec![peer_id]);
-        net.reconcile_sync_topics(vec![topic])
-            .await
-            .unwrap();
+        net.reconcile_sync_topics(vec![topic]).await.unwrap();
         topic
     }
 
@@ -900,8 +895,7 @@ mod tests {
         )
         .await;
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        net.ensure_sync_topics(&[topic], Vec::new())
-            .unwrap();
+        net.ensure_sync_topics(&[topic], Vec::new()).unwrap();
 
         for _ in 0..2 {
             let targets = prepare_core_documents(&context, node_id, realm_id, true, false)

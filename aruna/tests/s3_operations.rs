@@ -12,9 +12,8 @@ use aws_sdk_s3::types::{
     VersioningConfiguration,
 };
 use shared::{
-    SeedNode, TestResult, create_bearer_token, create_group_http,
-    create_s3_credentials, create_restricted_credentials, s3_client,
-    spawn_complete_seed,
+    SeedNode, TestResult, create_bearer_token, create_group_http, create_restricted_credentials,
+    create_s3_credentials, s3_client, spawn_complete_seed,
 };
 use ulid::Ulid;
 
@@ -39,8 +38,7 @@ async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client)> {
     )
     .await?;
     let group = create_group_http(&seed.base_url, &admin_token, group_name).await?;
-    let credentials =
-        create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
+    let credentials = create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
     let endpoint = seed
         .s3
         .as_ref()

@@ -8,8 +8,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, ServerSideEncryption};
 use shared::{
     S3Credentials, SeedNode, TestResult, create_bearer_token, create_group_http,
-    create_s3_credentials, revoke_s3_credentials, s3_client, s3_client_once,
-    spawn_complete_seed,
+    create_s3_credentials, revoke_s3_credentials, s3_client, s3_client_once, spawn_complete_seed,
 };
 
 fn service_error_code<T, E>(result: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> Option<String>
@@ -33,8 +32,7 @@ async fn security_setup(group_name: &str) -> TestResult<(SeedNode, String, S3Cre
     )
     .await?;
     let group = create_group_http(&seed.base_url, &admin_token, group_name).await?;
-    let credentials =
-        create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
+    let credentials = create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
     Ok((seed, admin_token, credentials))
 }
 
@@ -98,8 +96,7 @@ async fn revoked_credentials_rejected() -> TestResult<()> {
         // The credential works before revocation.
         client(&seed, &credentials)?.list_buckets().send().await?;
 
-        revoke_s3_credentials(&seed.base_url, &admin_token, &credentials.access_key_id)
-            .await?;
+        revoke_s3_credentials(&seed.base_url, &admin_token, &credentials.access_key_id).await?;
 
         let revoked = client(&seed, &credentials)?.list_buckets().send().await;
         assert_eq!(

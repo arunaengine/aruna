@@ -3,9 +3,8 @@
 #![recursion_limit = "256"]
 
 use aruna::bootstrap::{
-    ensure_onboarding_secret, fetch_core_documents,
-    prepare_core_documents, publish_core_documents, realm_bootstrap_exists,
-    wait_for_placement,
+    ensure_onboarding_secret, fetch_core_documents, prepare_core_documents, publish_core_documents,
+    realm_bootstrap_exists, wait_for_placement,
 };
 use aruna::config::{
     Config, PortalConfig, StartupMode, load, mark_onboarding_phase, mark_state_complete,
@@ -1423,11 +1422,8 @@ async fn build_kubernetes(
         dotenvy::var("ARUNA_COMPUTE_K8S_S3_PORT").ok().as_deref(),
         workspace.as_deref(),
     )?;
-    let (s3_cidrs, s3_mount_driver) = kubernetes_s3_access(
-        workspace.as_deref(),
-        s3_cidrs,
-        read_mount_driver(),
-    );
+    let (s3_cidrs, s3_mount_driver) =
+        kubernetes_s3_access(workspace.as_deref(), s3_cidrs, read_mount_driver());
     let policy_manifests = dotenvy::var("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS")
         .ok()
         .map(|value| policy_paths(&value))
@@ -1469,7 +1465,10 @@ async fn build_kubernetes(
         .apply_network()
         .await
         .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
-    info!(local_only = workspace.is_none(), "Kubernetes executor backend enabled");
+    info!(
+        local_only = workspace.is_none(),
+        "Kubernetes executor backend enabled"
+    );
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
         .with_workspace_endpoint(workspace, "eu-central-1".to_string()))

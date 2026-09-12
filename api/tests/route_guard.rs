@@ -712,7 +712,9 @@ fn load_sources(sources: &BTreeMap<String, String>) -> BTreeMap<String, Module> 
             let boundaries = syntax::use_paths(source)
                 .into_iter()
                 .filter_map(|(local, path)| {
-                    EXTERNAL_BOUNDARIES.contains(&path.as_str()).then_some(local)
+                    EXTERNAL_BOUNDARIES
+                        .contains(&path.as_str())
+                        .then_some(local)
                 })
                 .collect();
             let source = syntax::production(source);

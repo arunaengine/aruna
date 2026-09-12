@@ -276,18 +276,12 @@ mod tests {
 
     #[test]
     fn slow_threshold_defaults() {
-        assert_eq!(
-            parse_slow_threshold(None),
-            Duration::from_millis(500)
-        );
+        assert_eq!(parse_slow_threshold(None), Duration::from_millis(500));
         assert_eq!(
             parse_slow_threshold(Some("garbage")),
             Duration::from_millis(500)
         );
-        assert_eq!(
-            parse_slow_threshold(Some("")),
-            Duration::from_millis(500)
-        );
+        assert_eq!(parse_slow_threshold(Some("")), Duration::from_millis(500));
     }
 
     #[test]
