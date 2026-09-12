@@ -135,7 +135,6 @@ fn routes_at(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    pub(crate) mod fixtures;
 
     use super::rest_openapi;
     use std::collections::BTreeSet;

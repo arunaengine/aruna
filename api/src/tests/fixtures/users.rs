@@ -1,5 +1,5 @@
-use crate::routes::tests::fixtures::{test_context, test_state, test_storage};
 use crate::server_state::ServerState;
+use crate::tests::fixtures::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::{AuthContext, NodeCapabilities, RealmId};
