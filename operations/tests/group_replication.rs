@@ -17,7 +17,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::placement::{
-    PlacementResolutionContext, placement_ref_for_target, resolve_shard_holders,
+    PlacementResolutionContext, target_placement_ref, resolve_shard_holders,
 };
 use aruna_operations::sync::incoming::initialize_net_incoming;
 use aruna_operations::tasks::incoming::initialize_task_incoming;
@@ -109,7 +109,7 @@ async fn unheld_group_replicates() -> Result<(), Box<dyn std::error::Error>> {
 /// the strategy the realm actually binds the group class to.
 fn group_holders(config: &RealmConfigDocument, group_id: Ulid) -> Vec<NodeId> {
     let target = DocumentSyncTarget::GroupAuthorization { group_id };
-    let placement = placement_ref_for_target(
+    let placement = target_placement_ref(
         config,
         &target,
         PlacementResolutionContext {

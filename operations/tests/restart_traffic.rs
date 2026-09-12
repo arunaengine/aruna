@@ -1136,7 +1136,7 @@ fn incident_record(
     };
     let registry = incident_registry(realm_id, target, placement, holders, index)?;
     Ok(
-        aruna_operations::sync::document_outbox::new_outbox_record_with_id(
+        aruna_operations::sync::document_outbox::new_identified_record(
             Ulid::from_parts(1, index as u128),
             local,
             target.clone(),
@@ -1177,7 +1177,7 @@ fn incident_delete(
         graph_iri: format!("https://aruna.example/incident/graph/{index}"),
     };
     Ok(
-        aruna_operations::sync::document_outbox::new_outbox_record_with_id(
+        aruna_operations::sync::document_outbox::new_identified_record(
             Ulid::from_parts(1, index as u128),
             local,
             target,
