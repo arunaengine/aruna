@@ -1057,6 +1057,115 @@ mod tests {
         assert_eq!(pv["spec"]["csi"]["driver"], "s3.csi.example.org");
     }
 
+    fn session_spec() -> TaskSpec {
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/session:latest");
+        spec.session = true;
+        spec.workdir = Some("/work".to_string());
+        spec.workspace = Some(WorkspaceBinding {
+            s3_endpoint: "https://s3.example".to_string(),
+            bucket_name: "workspace-bucket".to_string(),
+            region: "us-east-1".to_string(),
+        });
+        spec.secret_env.insert(
+            "AWS_ACCESS_KEY_ID".to_string(),
+            Secret::new("session-access"),
+        );
+        spec.secret_env.insert(
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            Secret::new("session-secret"),
+        );
+        spec
+    }
+
+    #[test]
+    fn mounts_session_data() {
+        // The workspace bucket's data prefix shows up writable below the workdir.
+        let spec = session_spec();
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        let mounts = pod.containers[0].volume_mounts.clone().unwrap();
+        assert!(mounts.iter().any(|mount| mount.mount_path == "/work"));
+        let data = mounts
+            .iter()
+            .find(|mount| mount.mount_path == "/work/data")
+            .unwrap();
+        assert_eq!(data.name, "aruna-job-a1-data");
+        assert_eq!(data.read_only, Some(false));
+        let volume = pod
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|volume| volume.name == "aruna-job-a1-data")
+            .unwrap();
+        assert_eq!(
+            volume.persistent_volume_claim.unwrap().claim_name,
+            "aruna-job-a1-data"
+        );
+
+        let pv = serde_json::to_value(
+            data_pv_manifest(&context(), &config(), "workspace-bucket").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pv["metadata"]["name"], "aruna-job-a1-data");
+        assert_eq!(pv["metadata"]["labels"][ROLE_LABEL], "s3-mount");
+        assert_eq!(pv["metadata"]["annotations"][EPOCH_ANNOTATION], "7");
+        assert_eq!(
+            pv["spec"]["mountOptions"],
+            json!([
+                "uid=65534",
+                "gid=65534",
+                "allow-other",
+                "prefix=data/",
+                "allow-delete",
+                "allow-overwrite",
+                "file-mode=0644",
+                "dir-mode=0755"
+            ])
+        );
+        assert_eq!(pv["spec"]["csi"]["readOnly"], false);
+        assert_eq!(
+            pv["spec"]["csi"]["volumeAttributes"]["bucketName"],
+            "workspace-bucket"
+        );
+        assert_eq!(
+            pv["spec"]["csi"]["nodePublishSecretRef"]["name"],
+            "aruna-job-a1-env"
+        );
+        let pvc = serde_json::to_value(data_pvc_manifest(&context(), &config()).unwrap()).unwrap();
+        assert_eq!(pvc["metadata"]["labels"][ROLE_LABEL], "s3-mount");
+        assert_eq!(pvc["metadata"]["annotations"][EPOCH_ANNOTATION], "7");
+        assert_eq!(pvc["spec"]["volumeName"], "aruna-job-a1-data");
+
+        let secret = secret_manifest(&context(), &config(), &spec).unwrap();
+        let data = secret.string_data.unwrap();
+        assert_eq!(data["access_key_id"], "session-access");
+        assert_eq!(data["secret_access_key"], "session-secret");
+        assert_eq!(data["AWS_ACCESS_KEY_ID"], "session-access");
+    }
+
+    #[test]
+    fn skips_data_mount() {
+        // Without a CSI driver a session keeps its plain scratch workdir.
+        let spec = session_spec();
+        let mut config = config();
+        config.s3_mount_driver = None;
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config, &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        let mounts = pod.containers[0].volume_mounts.clone().unwrap();
+        assert!(mounts.iter().any(|mount| mount.mount_path == "/work"));
+        assert!(mounts.iter().all(|mount| mount.mount_path != "/work/data"));
+        assert!(
+            pod.volumes
+                .unwrap()
+                .iter()
+                .all(|volume| volume.name != "aruna-job-a1-data")
+        );
+        let secret = secret_manifest(&context(), &config, &spec).unwrap();
+        assert!(!secret.string_data.unwrap().contains_key("access_key_id"));
+    }
+
     #[test]
     fn mounts_scratch_dir() {
         // Mounted jobs get a writable working directory instead of a workspace.

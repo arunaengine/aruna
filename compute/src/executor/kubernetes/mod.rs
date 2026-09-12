@@ -2606,6 +2606,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creates_data_volume() {
+        // A session with a workspace gets its data mount PV and PVC.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let client = fake_client(move |method, path| {
+            recorder
+                .lock()
+                .expect("record request")
+                .push(format!("{method} {path}"));
+            match (method, path) {
+                ("POST", "/api/v1/persistentvolumes") => {
+                    (201, core_object("PersistentVolume", "aruna-job-a1-data"))
+                }
+                ("POST", "/api/v1/namespaces/compute/persistentvolumeclaims") => (
+                    201,
+                    core_object("PersistentVolumeClaim", "aruna-job-a1-data"),
+                ),
+                _ => (404, status_json(404)),
+            }
+        });
+        let mut config = test_config();
+        config.s3_mount_driver = Some("s3.csi.scality.com".to_string());
+        let backend = KubernetesBackend {
+            client,
+            config,
+            policies: Vec::new(),
+        };
+        let mut spec = TaskSpec::new(context().attempt, "session:latest");
+        spec.session = true;
+        spec.workdir = Some("/work".to_string());
+        backend.ensure_data(&context(), &spec).await.unwrap();
+        assert!(seen.lock().expect("read requests").is_empty());
+
+        spec.workspace = Some(aruna_core::compute::WorkspaceBinding {
+            s3_endpoint: "https://s3.example".to_string(),
+            bucket_name: "workspace-bucket".to_string(),
+            region: String::new(),
+        });
+        backend.ensure_data(&context(), &spec).await.unwrap();
+        assert_eq!(
+            seen.lock().expect("read requests").clone(),
+            [
+                "POST /api/v1/persistentvolumes",
+                "POST /api/v1/namespaces/compute/persistentvolumeclaims",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn removes_data_volume() {
+        // Cleanup finds the data mount through the shared s3-mount role label.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let client = fake_client(move |method, path| {
+            recorder
+                .lock()
+                .expect("record request")
+                .push(format!("{method} {path}"));
+            match (method, path) {
+                ("GET", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                    (200, job_json("tombstone"))
+                }
+                ("GET", "/api/v1/namespaces/compute/pods") => (200, pod_list()),
+                ("GET", "/api/v1/namespaces/compute/persistentvolumeclaims") => (
+                    200,
+                    json!({
+                        "apiVersion":"v1","kind":"PersistentVolumeClaimList",
+                        "items":[core_object("PersistentVolumeClaim", "aruna-job-a1-data")]
+                    }),
+                ),
+                ("GET", "/api/v1/persistentvolumes") => (
+                    200,
+                    json!({
+                        "apiVersion":"v1","kind":"PersistentVolumeList",
+                        "items":[core_object("PersistentVolume", "aruna-job-a1-data")]
+                    }),
+                ),
+                (
+                    "DELETE",
+                    "/api/v1/namespaces/compute/persistentvolumeclaims/aruna-job-a1-data",
+                ) => (
+                    200,
+                    core_object("PersistentVolumeClaim", "aruna-job-a1-data"),
+                ),
+                ("DELETE", "/api/v1/persistentvolumes/aruna-job-a1-data") => {
+                    (200, core_object("PersistentVolume", "aruna-job-a1-data"))
+                }
+                ("DELETE", "/api/v1/namespaces/compute/pods/task-pod") => {
+                    (200, core_object("Pod", "task-pod"))
+                }
+                ("DELETE", "/api/v1/namespaces/compute/persistentvolumeclaims/aruna-job-a1-ws") => {
+                    (200, core_object("PersistentVolumeClaim", "aruna-job-a1-ws"))
+                }
+                ("DELETE", "/api/v1/namespaces/compute/secrets/aruna-job-a1-env") => {
+                    (200, core_object("Secret", "aruna-job-a1-env"))
+                }
+                ("DELETE", "/api/v1/namespaces/compute/configmaps/aruna-job-a1-logs")
+                | ("DELETE", "/api/v1/namespaces/compute/configmaps/aruna-job-a1-staged") => {
+                    (200, core_object("ConfigMap", "marker"))
+                }
+                ("DELETE", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                    (200, job_json("tombstone"))
+                }
+                _ => (404, status_json(404)),
+            }
+        });
+        let backend = KubernetesBackend {
+            client,
+            config: test_config(),
+            policies: Vec::new(),
+        };
+
+        backend.cleanup(&context()).await.unwrap();
+
+        let seen = seen.lock().expect("read requests").clone();
+        for volume in [
+            "DELETE /api/v1/namespaces/compute/persistentvolumeclaims/aruna-job-a1-data",
+            "DELETE /api/v1/persistentvolumes/aruna-job-a1-data",
+        ] {
+            assert!(seen.iter().any(|entry| entry == volume), "{volume}");
+        }
+    }
+
+    #[tokio::test]
     async fn cancels_without_logs() {
         // A stuck pod rejects log reads with 400; cancel must still complete.
         let client = fake_client(|method, path| match (method, path) {
