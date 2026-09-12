@@ -1,14 +1,23 @@
-use super::*;
+use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
+use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::types::GroupId;
+use aruna_core::{MetaResourceId, StructuredId};
+use aruna_storage::storage;
+use tempfile::{TempDir, tempdir};
+use ulid::Ulid;
 
-pub(super) const TEST_REALM_ID: RealmId = RealmId([7u8; 32]);
+use crate::driver::DriverContext;
+use crate::metadata::handle::MetadataHandle;
 
-pub(super) struct MetadataTest {
-    pub(super) context: DriverContext,
+pub(crate) const TEST_REALM_ID: RealmId = RealmId([7u8; 32]);
+
+pub(crate) struct MetadataTest {
+    pub(crate) context: DriverContext,
     _storage_dir: TempDir,
     _metadata_dir: TempDir,
 }
 
-pub(super) fn metadata_test() -> MetadataTest {
+pub(crate) fn metadata_test() -> MetadataTest {
     let storage_dir = tempdir().expect("storage dir");
     let metadata_dir = tempdir().expect("metadata dir");
     let storage_handle =
@@ -37,7 +46,7 @@ pub(super) fn metadata_test() -> MetadataTest {
     }
 }
 
-pub(super) fn public_record(group_id: GroupId, document_id: Ulid) -> MetadataRegistryRecord {
+pub(crate) fn public_record(group_id: GroupId, document_id: Ulid) -> MetadataRegistryRecord {
     let event_id = Ulid::generate();
     let document_id = MetaResourceId::from_parts(
         document_id.timestamp_ms(),

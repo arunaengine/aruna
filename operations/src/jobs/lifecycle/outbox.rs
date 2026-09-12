@@ -503,7 +503,7 @@ async fn read_record(context: &DriverContext, key: &Key) -> Option<JobRecordFram
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixtures::{Family, node};
+    use crate::tests::fixtures::records::{Family, node};
     use aruna_core::types::Value;
 
     #[test]

@@ -913,7 +913,7 @@ mod tests {
     use aruna_core::structs::{InputMode, InputSelection, JobId, WorkspaceOutput};
 
     use super::*;
-    use crate::jobs::records::tests::fixtures::Family;
+    use crate::tests::fixtures::records::Family;
 
     #[test]
     fn materializes_captured_inputs() {

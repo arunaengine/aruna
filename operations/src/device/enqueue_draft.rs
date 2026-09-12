@@ -230,8 +230,8 @@ fn fail(operation: &mut EnqueueDraftOperation, error: EnqueueDraftError) -> Effe
 mod tests {
     use super::{EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation};
     use crate::device::publish_queue::{MAX_PUBLISH_ENTRIES, PublishEntry, publish_entry};
-    use crate::device::tests::fixtures::context;
     use crate::driver::{DriverContext, drive};
+    use crate::tests::fixtures::device::context;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::RealmId;
     use aruna_core::types::UserId;

@@ -963,11 +963,11 @@ mod tests {
     use super::{BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, PolicyBulkOperation};
     use crate::driver::{DriverContext, drive, gate_context};
     use crate::placement::policy::cache::cache_key;
-    use crate::placement::policy::tests::fixtures::{seed_gate, subject};
     use crate::realm::claim_admin::{ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::s3::bucket_placement::{PutBucketPlacementInput, PutBucketPlacementOperation};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use crate::tests::fixtures::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};

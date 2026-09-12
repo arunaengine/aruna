@@ -739,7 +739,7 @@ impl Operation for ListObjectsV2Operation {
 mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::s3::tests::fixtures::{test_context, test_storage};
+    use crate::tests::fixtures::s3::{test_context, test_storage};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};

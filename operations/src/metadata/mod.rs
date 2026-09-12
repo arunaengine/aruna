@@ -7,7 +7,7 @@ pub mod delete_document;
 pub mod device_pull;
 pub mod forward;
 pub mod get_document;
-mod handle;
+pub(crate) mod handle;
 mod iri_index;
 pub mod list_documents;
 pub mod materialization_queue;

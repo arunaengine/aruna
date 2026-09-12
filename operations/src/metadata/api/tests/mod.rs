@@ -16,16 +16,12 @@ use aruna_core::storage_entries::{
     create_projection_entries, document_lifecycle_entry, graph_lifecycle_entry,
 };
 use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, PlacementRef, RealmAuthorizationDocument,
-    RealmNodeKind, Role,
+    Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmNodeKind, Role,
 };
-use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::{Key, RoleId};
 use aruna_storage::storage;
 use byteview::ByteView;
-use tempfile::{TempDir, tempdir};
-
-use crate::metadata::MetadataHandle;
+use tempfile::tempdir;
 
 mod export;
 mod fanout;
@@ -35,5 +31,4 @@ mod preflight;
 mod query;
 mod search;
 
-mod fixtures;
-use fixtures::*;
+use crate::tests::fixtures::metadata_api::*;

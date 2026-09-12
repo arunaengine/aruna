@@ -528,7 +528,7 @@ pub async fn list_transfers(context: &Arc<DriverContext>) -> Result<Vec<SyncUplo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::tests::fixtures::context;
+    use crate::tests::fixtures::device::context;
     use aruna_core::structs::{EntrySide, SyncedBytes};
 
     #[test]

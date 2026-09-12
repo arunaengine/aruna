@@ -321,7 +321,7 @@ async fn resolve_local(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixtures::payload;
+    use crate::tests::fixtures::records::payload;
     use aruna_core::compute::{AttemptStatus, BackendError, FenceContext};
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
@@ -629,7 +629,7 @@ mod tests {
     async fn refuses_device_launch() {
         // The realm's own launch path declines a device whatever it advertises,
         // so local compute never becomes a dispatch target.
-        use crate::jobs::records::tests::fixtures::Family;
+        use crate::tests::fixtures::records::Family;
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let local = node(1);

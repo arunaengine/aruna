@@ -328,8 +328,8 @@ mod tests {
 
     use crate::blob::records::HeadAliasContext;
     use crate::placement::policy::cache::PolicyCacheEntry;
-    use crate::placement::policy::tests::fixtures::signed_document;
     use crate::s3::policy_successor::SuccessorError;
+    use crate::tests::fixtures::policy::signed_document;
 
     fn realm_id() -> RealmId {
         RealmId::from_bytes([1u8; 32])
@@ -450,7 +450,7 @@ mod tests {
         operation.step(authorized(false));
         operation.step(authorized(true));
         operation.step(cached(&policy));
-        let effects = operation.step(crate::placement::policy::tests::fixtures::group_authority(
+        let effects = operation.step(crate::tests::fixtures::policy::group_authority(
             realm_id(),
             group_id(),
         ));
@@ -470,7 +470,7 @@ mod tests {
         operation.start();
         operation.step(authorized(true));
         operation.step(cached(&policy));
-        let effects = operation.step(crate::placement::policy::tests::fixtures::group_authority(
+        let effects = operation.step(crate::tests::fixtures::policy::group_authority(
             realm_id(),
             foreign,
         ));
@@ -515,9 +515,7 @@ mod tests {
         operation.start();
         operation.step(authorized(true));
         operation.step(cached(&policy));
-        let effects = operation.step(crate::placement::policy::tests::fixtures::authority(
-            realm_id(),
-        ));
+        let effects = operation.step(crate::tests::fixtures::policy::authority(realm_id()));
 
         assert!(matches!(
             effects.as_slice(),
@@ -535,9 +533,7 @@ mod tests {
         operation.start();
         operation.step(authorized(true));
         operation.step(cached(&policy));
-        operation.step(crate::placement::policy::tests::fixtures::authority(
-            realm_id(),
-        ));
+        operation.step(crate::tests::fixtures::policy::authority(realm_id()));
         let txn_id = Ulid::from_bytes([5u8; 16]);
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(Event::Storage(StorageEvent::ReadResult {

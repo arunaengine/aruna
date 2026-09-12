@@ -321,8 +321,8 @@ async fn validate_destination_upload(
 mod test {
     use super::*;
     use crate::driver::gate_context;
-    use crate::placement::policy::tests::fixtures::{seed_gate, subject};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use crate::tests::fixtures::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::hash::Hasher;
     use aruna_core::effects::StorageEffect;
