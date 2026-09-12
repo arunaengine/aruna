@@ -56,6 +56,7 @@ struct Acquired {
     metadata_handle: Option<MetadataHandle>,
     blob_handle: Option<BlobHandle>,
     driver_ctx: Option<Arc<DriverContext>>,
+    monitoring: Option<Arc<MonitoringState>>,
     ops_handle: Option<tokio::task::JoinHandle<()>>,
     task_queues: Option<TaskQueues>,
     usage_counters_rebuilt: bool,
@@ -75,6 +76,7 @@ impl Acquired {
             metadata_handle: None,
             blob_handle: None,
             driver_ctx: None,
+            monitoring: None,
             ops_handle: None,
             task_queues: None,
             usage_counters_rebuilt: false,
@@ -86,6 +88,16 @@ impl Acquired {
     /// then storage, and aborts the ops listener last.
     pub(crate) async fn cleanup(self) {
         info!("Startup stopped early; releasing the acquired resources");
+        // The ops task and the driver context are stopped after the ordered
+        // teardown and joined, so no detached clone keeps storage open when
+        // cleanup returns.
+        let ops = self.ops_handle;
+        let driver_ctx = self.driver_ctx;
+        // Stop the metrics refresher before storage closes so its in-flight
+        // driver context cannot keep the store open past cleanup.
+        if let Some(monitoring) = &self.monitoring {
+            monitoring.stop_queue_refresher();
+        }
         NodeShutdown {
             shutdown: self.shutdown,
             readiness: self.readiness,
@@ -98,11 +110,16 @@ impl Acquired {
             metadata_handle: self.metadata_handle,
             blob_handle: self.blob_handle,
             storage_handle: self.storage_handle,
-            ops: self.ops_handle,
+            ops: None,
             grace: shutdown_grace_env(),
         }
         .run()
         .await;
+        if let Some(ops) = ops {
+            ops.abort();
+            let _ = ops.await;
+        }
+        drop(driver_ctx);
     }
 
     fn finish(self, config: Config) -> NodeResources {
@@ -129,14 +146,39 @@ impl Acquired {
     }
 }
 
+/// One acquired stage boundary. A failure reported here is handled exactly
+/// like a failure inside the following acquisition, so startup tests can walk
+/// every partial state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartupStage {
+    Net,
+    Metadata,
+    Blob,
+    Compute,
+    Ops,
+    UsageCounters,
+    TaskQueues,
+}
+
 pub(crate) async fn acquire() -> Result<NodeResources, Box<dyn std::error::Error>> {
     let (config, storage_handle) = load().await?;
     // The node runtime always exists here; a missing one is a concrete startup
     // error, never a scheduler-less handle that only looks started.
     let task_handle = TaskHandle::try_new().map_err(std::io::Error::other)?;
-    let mut acquired = Acquired::new(storage_handle, task_handle);
+    acquire_resources(config, storage_handle, task_handle, |_| Ok(())).await
+}
 
-    match fill(&config, &mut acquired).await {
+/// Acquires the node resources and, on any failure, releases exactly what was
+/// acquired. `checkpoint` observes each stage boundary; production passes a
+/// no-op.
+pub(crate) async fn acquire_resources(
+    config: Config,
+    storage_handle: aruna_storage::StorageHandle,
+    task_handle: TaskHandle,
+    mut checkpoint: impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<NodeResources, Box<dyn std::error::Error>> {
+    let mut acquired = Acquired::new(storage_handle, task_handle);
+    match fill(&config, &mut acquired, &mut checkpoint).await {
         Ok(()) => Ok(acquired.finish(config)),
         Err(error) => {
             acquired.cleanup().await;
@@ -147,7 +189,11 @@ pub(crate) async fn acquire() -> Result<NodeResources, Box<dyn std::error::Error
 
 /// Acquires every fallible resource in order, assigning each one to `acquired`
 /// as soon as it exists so a later failure owns it.
-async fn fill(config: &Config, acquired: &mut Acquired) -> Result<(), Box<dyn std::error::Error>> {
+async fn fill(
+    config: &Config,
+    acquired: &mut Acquired,
+    checkpoint: &mut impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let net_handle = NetHandle::new(
         NetConfig {
             bind_addr: config.p2p_socket_addr,
@@ -171,6 +217,7 @@ async fn fill(config: &Config, acquired: &mut Acquired) -> Result<(), Box<dyn st
         warn!(error = %error, "Failed to refresh realm peers from persisted config during startup");
     }
     acquired.net_handle = Some(net_handle.clone());
+    checkpoint(StartupStage::Net)?;
 
     let metadata_handle = MetadataHandle::new_with_options(
         &config.metadata_storage_path,
@@ -184,6 +231,7 @@ async fn fill(config: &Config, acquired: &mut Acquired) -> Result<(), Box<dyn st
             .with_sync_policy(config.fjall_persist_policy),
     )?;
     acquired.metadata_handle = Some(metadata_handle.clone());
+    checkpoint(StartupStage::Metadata)?;
 
     let blob_handle = BlobHandler::with_registry(
         BackendRegistry::from_config(&config.blob_backends).map_err(std::io::Error::other)?,
@@ -193,10 +241,12 @@ async fn fill(config: &Config, acquired: &mut Acquired) -> Result<(), Box<dyn st
     )
     .await?;
     acquired.blob_handle = Some(blob_handle.clone());
+    checkpoint(StartupStage::Blob)?;
 
     let compute_handle = build_registry(config)
         .await
         .map_err(std::io::Error::other)?;
+    checkpoint(StartupStage::Compute)?;
 
     let driver_ctx = Arc::new(DriverContext {
         storage_handle: acquired.storage_handle.clone(),
@@ -217,6 +267,7 @@ async fn fill(config: &Config, acquired: &mut Acquired) -> Result<(), Box<dyn st
     .await;
     let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
     let bound = ops_listener.local_addr()?;
+    let monitoring = ops_state.clone();
     let ops_handle = tokio::spawn(async move {
         if let Err(error) = serve_ops(ops_listener, ops_state).await {
             error!(error = %error, "Ops server stopped");
@@ -225,9 +276,12 @@ async fn fill(config: &Config, acquired: &mut Acquired) -> Result<(), Box<dyn st
     info!(ops_address = %bound, "Ops server listening");
     acquired.ops_handle = Some(ops_handle);
     acquired.driver_ctx = Some(driver_ctx.clone());
+    acquired.monitoring = Some(monitoring);
+    checkpoint(StartupStage::Ops)?;
 
     // A rebuild is the only local evidence that counters were not carried over.
     acquired.usage_counters_rebuilt = ensure_usage_counters(driver_ctx.as_ref()).await?;
+    checkpoint(StartupStage::UsageCounters)?;
 
     // Bind compute reconciliation before startup recovery.
     initialize_net_holder(
@@ -244,6 +298,7 @@ async fn fill(config: &Config, acquired: &mut Acquired) -> Result<(), Box<dyn st
     )
     .await;
     acquired.task_queues = Some(task_queues);
+    checkpoint(StartupStage::TaskQueues)?;
 
     Ok(())
 }
@@ -436,5 +491,66 @@ mod tests {
                 error: StorageError::Closed
             })
         ));
+    }
+    // A failure after any acquisition stage must release exactly the acquired
+    // subset: every later stage is absent and the store lock is given back.
+    #[tokio::test]
+    async fn stops_after_each_stage_and_releases_acquired_resources() {
+        use crate::config::resolve_settings;
+        use crate::settings::read_settings_from;
+
+        let stages = [
+            StartupStage::Net,
+            StartupStage::Metadata,
+            StartupStage::Blob,
+            StartupStage::Compute,
+            StartupStage::Ops,
+            StartupStage::UsageCounters,
+            StartupStage::TaskQueues,
+        ];
+        for stage in stages {
+            let temp = tempdir().expect("temp dir");
+            let path = temp.path().to_str().expect("utf8 path").to_string();
+            let map: std::collections::BTreeMap<String, String> = [
+                ("STORAGE_PATH".to_string(), path.clone()),
+                ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+                ("P2P_SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+                ("S3_HOST".to_string(), "127.0.0.1:0".to_string()),
+                ("S3_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+                ("PORTAL_MODE".to_string(), "disabled".to_string()),
+                ("ARUNA_FJALL_PERSIST_MODE".to_string(), "buffer".to_string()),
+            ]
+            .into_iter()
+            .collect();
+
+            let (config, storage) = resolve_settings(read_settings_from(&map).unwrap())
+                .await
+                .expect("test settings resolve");
+            let task_handle = TaskHandle::new();
+            let error = match acquire_resources(config, storage, task_handle, |observed| {
+                if observed == stage {
+                    Err(format!("injected failure after {stage:?}").into())
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+            {
+                Ok(_) => panic!("the injected stage failure must stop acquisition"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("injected failure"),
+                "{stage:?}: {error}"
+            );
+
+            // Cleanup released every store handle: reopening the same root works.
+            let reopened = aruna_storage::FjallStorage::open(&path);
+            assert!(
+                reopened.is_ok(),
+                "{stage:?}: storage stayed locked after cleanup: {:?}",
+                reopened.err()
+            );
+        }
     }
 }

@@ -104,6 +104,10 @@ pub struct MonitoringState {
     metrics: Arc<NodeMetrics>,
     readiness: Readiness,
     recovery: RecoveryStatus,
+    /// Stops the background queue-lag refresher. Without it the task's
+    /// in-flight driver context outlives an aborted ops server during partial
+    /// startup cleanup.
+    queue_refresher_cancel: tokio_util::sync::CancellationToken,
 }
 
 impl MonitoringState {
@@ -125,7 +129,8 @@ impl MonitoringState {
         recovery: RecoveryStatus,
     ) -> Arc<Self> {
         register_storage_source(&metrics, ctx.clone()).await;
-        register_queue_metrics(&metrics, ctx.clone()).await;
+        let queue_refresher_cancel = tokio_util::sync::CancellationToken::new();
+        register_queue_metrics(&metrics, ctx.clone(), queue_refresher_cancel.clone()).await;
         register_recovery_metrics(&metrics, recovery.clone()).await;
         if let Some(net_handle) = &ctx.net_handle {
             net_handle
@@ -138,7 +143,14 @@ impl MonitoringState {
             metrics,
             readiness,
             recovery,
+            queue_refresher_cancel,
         })
+    }
+
+    /// Stops the queue-lag refresher and waits for it to release the driver
+    /// context. Call before the storage close on a partial startup teardown.
+    pub fn stop_queue_refresher(&self) {
+        self.queue_refresher_cancel.cancel();
     }
 }
 
@@ -553,22 +565,36 @@ impl QueueMetrics {
     }
 }
 
-fn spawn_queue_refresher(ctx: Weak<DriverContext>, queue_metrics: Arc<QueueMetrics>) {
+fn spawn_queue_refresher(
+    ctx: Weak<DriverContext>,
+    queue_metrics: Arc<QueueMetrics>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(QUEUE_LAG_INTERVAL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut reporter = QueueLagReporter::default();
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = interval.tick() => {}
+            }
             let Some(ctx) = ctx.upgrade() else {
                 return;
             };
-            queue_metrics.refresh(ctx.as_ref(), &mut reporter).await;
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = queue_metrics.refresh(ctx.as_ref(), &mut reporter) => {}
+            }
         }
     });
 }
 
-async fn register_queue_metrics(metrics: &NodeMetrics, ctx: Arc<DriverContext>) {
+async fn register_queue_metrics(
+    metrics: &NodeMetrics,
+    ctx: Arc<DriverContext>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
     let depth = Family::<QueueLabels, Gauge>::default();
     metrics
         .register("queue_depth", "Durable work queue depth", depth.clone())
@@ -615,7 +641,7 @@ async fn register_queue_metrics(metrics: &NodeMetrics, ctx: Arc<DriverContext>) 
         probe_last_success_timestamp_seconds,
     });
     queue_metrics.seed();
-    spawn_queue_refresher(Arc::downgrade(&ctx), queue_metrics);
+    spawn_queue_refresher(Arc::downgrade(&ctx), queue_metrics, cancel);
 }
 
 #[cfg(test)]
