@@ -10,13 +10,13 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::repository::{IntakeEntry, IntakeState, intake_key, read_intake};
+use super::publish_queue::{PublishEntry, PublishState, publish_key, read_publish_entry};
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteDraftOperation {
     draft_id: Ulid,
     state: DeleteDraftState,
-    output: Option<Result<IntakeEntry, DeleteDraftError>>,
+    output: Option<Result<PublishEntry, DeleteDraftError>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -28,10 +28,10 @@ enum DeleteDraftState {
     },
     DeleteEntry {
         txn_id: TxnId,
-        entry: Box<IntakeEntry>,
+        entry: Box<PublishEntry>,
     },
     CommitTransaction {
-        entry: Box<IntakeEntry>,
+        entry: Box<PublishEntry>,
     },
     Finish,
     Error,
@@ -68,7 +68,7 @@ impl DeleteDraftOperation {
 }
 
 impl Operation for DeleteDraftOperation {
-    type Output = IntakeEntry;
+    type Output = PublishEntry;
     type Error = DeleteDraftError;
 
     fn start(&mut self) -> Effects {
@@ -100,7 +100,7 @@ impl Operation for DeleteDraftOperation {
                     );
                 };
                 self.state = DeleteDraftState::ReadEntry { txn_id };
-                smallvec![read_intake(self.draft_id, Some(txn_id))]
+                smallvec![read_publish_entry(self.draft_id, Some(txn_id))]
             }
             DeleteDraftState::ReadEntry { txn_id } => {
                 let got = format!("{event:?}");
@@ -117,13 +117,13 @@ impl Operation for DeleteDraftOperation {
                 let Some(bytes) = value else {
                     return fail(self, DeleteDraftError::NotFound);
                 };
-                let entry = match IntakeEntry::from_bytes(&bytes) {
+                let entry = match PublishEntry::from_bytes(&bytes) {
                     Ok(entry) => entry,
                     Err(error) => return fail(self, DeleteDraftError::ConversionError(error)),
                 };
                 // A forward may already have reached a holder, so the outcome
                 // must be recorded before the owner can drop the entry.
-                if matches!(entry.state, IntakeState::Publishing { .. }) {
+                if matches!(entry.state, PublishState::Publishing { .. }) {
                     return fail(self, DeleteDraftError::PublishInFlight);
                 }
                 self.state = DeleteDraftState::DeleteEntry {
@@ -133,7 +133,7 @@ impl Operation for DeleteDraftOperation {
                 smallvec![Effect::Storage(StorageEffect::BatchDelete {
                     deletes: vec![(
                         DEVICE_INTAKE_KEYSPACE.to_string(),
-                        intake_key(self.draft_id)
+                        publish_key(self.draft_id)
                     )],
                     txn_id: Some(txn_id),
                 })]
@@ -216,33 +216,16 @@ fn fail(operation: &mut DeleteDraftOperation, error: DeleteDraftError) -> Effect
 #[cfg(test)]
 mod tests {
     use super::{DeleteDraftError, DeleteDraftOperation};
-    use crate::device::repository::{IntakeEntry, IntakeState, intake_entry};
+    use crate::device::publish_queue::{PublishEntry, PublishState, publish_entry};
     use crate::driver::{DriverContext, drive};
+    use crate::tests::fixtures::device::context;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::RealmId;
     use aruna_core::types::UserId;
-    use aruna_storage::storage;
-    use tempfile::tempdir;
     use ulid::Ulid;
 
-    async fn context() -> (tempfile::TempDir, DriverContext) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        (
-            tempdir,
-            DriverContext {
-                storage_handle,
-                net_handle: None,
-                blob_handle: None,
-                metadata_handle: None,
-                task_handle: None,
-                compute_handle: None,
-            },
-        )
-    }
-
-    fn entry() -> IntakeEntry {
-        IntakeEntry::new(
+    fn entry() -> PublishEntry {
+        PublishEntry::new(
             Ulid::generate(),
             UserId::local(Ulid::generate(), RealmId::from_bytes([5u8; 32])),
             Ulid::generate(),
@@ -252,8 +235,8 @@ mod tests {
         )
     }
 
-    async fn store(context: &DriverContext, entry: &IntakeEntry) {
-        let (key_space, key, value) = intake_entry(entry).unwrap();
+    async fn store(context: &DriverContext, entry: &PublishEntry) {
+        let (key_space, key, value) = publish_entry(entry).unwrap();
         context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -285,7 +268,7 @@ mod tests {
         // The forward may already have applied, so the outcome must land first.
         let (_tempdir, context) = context().await;
         let mut entry = entry();
-        entry.state = IntakeState::Publishing {
+        entry.state = PublishState::Publishing {
             document_id: Ulid::generate(),
             due_at_ms: 0,
             attempts: 1,
@@ -301,7 +284,7 @@ mod tests {
     async fn deletes_failed_draft() {
         let (_tempdir, context) = context().await;
         let mut entry = entry();
-        entry.state = IntakeState::Failed {
+        entry.state = PublishState::Failed {
             reason: "group is gone".to_string(),
             retryable: false,
             document_id: None,

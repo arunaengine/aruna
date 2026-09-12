@@ -13,8 +13,6 @@ use aruna_core::structs::{
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
-use super::fixture::context as fixture;
-use super::fixture::{Family, REALM, actor, node, secret};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::keys::record_key;
@@ -23,6 +21,8 @@ use crate::jobs::records::verify::EvidencePlan;
 use crate::jobs::records::{
     AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin, RecordStoreError,
 };
+use crate::tests::fixtures::records::context as fixture;
+use crate::tests::fixtures::records::{Family, REALM, actor, node, secret};
 
 /// Rows past the 256-record prefix the append used to read.
 const OVERFLOW: u16 = 260;
@@ -220,9 +220,8 @@ async fn admits_late_output() {
 
 #[tokio::test]
 async fn pages_receipt_kind() {
-    // A launch whose scheduler this view no longer ranks as a holder is
-    // authentic only through the receipt that stored it, and that receipt lies
-    // on a later page of its own kind.
+    // A launch whose scheduler this view no longer ranks is authentic only through
+    // its receipt, which lies on a later page of its own kind.
     let mut family = Family::new([25u8; 32]);
     family.config.ensure_node(node(7), RealmNodeKind::Server);
     let (_dir, context) = fixture(&family.config, family.holder.public()).await;

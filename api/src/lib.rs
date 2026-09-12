@@ -9,8 +9,9 @@ mod download;
 pub mod error;
 pub mod forwarded;
 pub mod mcp;
+pub mod metadata;
+pub mod monitoring;
 pub mod openapi;
-pub mod ops;
 pub mod portal;
 pub mod rate_limit;
 pub mod routes;
@@ -18,3 +19,6 @@ pub mod s3;
 pub mod server;
 pub mod server_state;
 pub mod telemetry;
+
+#[cfg(test)]
+mod tests;

@@ -11,11 +11,11 @@ use aruna_core::types::Value;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::updates::chain_for;
 use crate::jobs::records::keys::record_key;
-use crate::jobs::records::tests::fixture::{Family, REALM, context};
 use crate::jobs::records::{
     AppendRecordConfig, AppendRecordOperation, FamilyReadError, RecordOrigin, load_family_complete,
     load_kind_complete,
 };
+use crate::tests::fixtures::records::{Family, REALM, context};
 
 /// Spec, claim, budget, launch, and the receipt that authorizes one execution.
 async fn seed(ctx: &DriverContext, family: &Family) -> (LogicalJobSpec, ExecutionReceipt) {
@@ -136,7 +136,7 @@ async fn resolves_session_alias() {
     assert_eq!(record.job_id, spec.job_id);
     assert_eq!(record.owner_node_id, family.target.public());
     assert_eq!(physical, Some(receipt.physical_job_id));
-    let now = aruna_core::util::unix_timestamp_millis();
+    let now = aruna_core::time::unix_timestamp_millis();
     let mut physical = aruna_core::structs::JobRecord::new(
         receipt.physical_job_id,
         aruna_core::structs::JobPayload::Execution(spec.payload.clone()),

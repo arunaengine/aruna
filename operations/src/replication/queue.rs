@@ -12,14 +12,14 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, ReferenceHandling, SyncMode, SyncRelationship, SyncState, WatchEvent,
-    WatchEventDetail, WatchEventKind, data_watch_resource_path, sync_relationship_key,
-    sync_relationship_prefix,
+    ArunaArn, AuthContext, RealmId, ReferenceHandling, SyncMode, SyncRelationship, SyncState,
+    WatchEvent, WatchEventDetail, WatchEventKind, sync_relationship_key, sync_relationship_prefix,
+    watch_resource_path,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, Key};
-use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -35,10 +35,10 @@ use super::version_replication::{
     SourceAuthorization, SourceAuthorizationError,
 };
 use crate::driver::{DriverContext, drive, gate_context, now_ms, quota_marked_routing};
-use crate::notifications::watch::emit::emit_resource_watch_event;
-use crate::queue_backoff::queue_retry_after_ms;
-use crate::s3::get_bucket_info::GetBucketInfoOperation;
-use crate::sync_mirror_repair::{kick_mirror_repair, store_sync_status};
+use crate::notifications::watch::emit::emit_watch_event;
+use crate::s3::get_bucket::GetBucketInfoOperation;
+use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
+use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 
 const REPLICATION_SCAN_PAGE_SIZE: usize = 512;
 const REPLICATION_BATCH_SIZE: usize = 64;
@@ -293,7 +293,7 @@ impl LiveReplicationObligationRecord {
     }
 }
 
-pub fn blob_replication_job_key(record: &BlobReplicationJobRecord) -> Result<Key, ConversionError> {
+pub fn blob_job_key(record: &BlobReplicationJobRecord) -> Result<Key, ConversionError> {
     let identity = BlobReplicationJobIdentity {
         mode: record.input.mode,
         bucket: &record.input.bucket,
@@ -309,24 +309,24 @@ pub fn blob_replication_job_key(record: &BlobReplicationJobRecord) -> Result<Key
     Ok(ByteView::from(key))
 }
 
-fn blob_replication_job_write_entry(
+fn blob_job_entry(
     record: &BlobReplicationJobRecord,
 ) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((
         BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
-        blob_replication_job_key(record)?,
+        blob_job_key(record)?,
         ByteView::from(record.to_bytes()?),
     ))
 }
 
-fn blob_replication_job_preferred(
+fn blob_job_preferred(
     candidate: &BlobReplicationJobRecord,
     current: &BlobReplicationJobRecord,
 ) -> bool {
     (candidate.attempts, candidate.due_at_ms) > (current.attempts, current.due_at_ms)
 }
 
-pub fn live_replication_obligation_key(
+pub fn live_obligation_key(
     record: &LiveReplicationObligationRecord,
 ) -> Result<Key, ConversionError> {
     let identity = LiveReplicationObligationIdentity {
@@ -344,7 +344,7 @@ pub(crate) fn live_obligation_entry(
 ) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((
         BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
-        live_replication_obligation_key(record)?,
+        live_obligation_key(record)?,
         ByteView::from(record.to_bytes()?),
     ))
 }
@@ -362,7 +362,7 @@ pub(crate) fn live_obligation_effect(
     }))
 }
 
-pub fn write_live_replication_obligation_effect(
+pub fn build_live_obligation(
     local_node_id: NodeId,
     auth_context: AuthContext,
     bucket: String,
@@ -382,7 +382,7 @@ pub fn write_live_replication_obligation_effect(
     live_obligation_effect(record, txn_id)
 }
 
-pub fn schedule_blob_replication_drain_effect() -> Effect {
+pub fn schedule_blob_drain() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainBlobReplicationQueue,
         after: Duration::ZERO,
@@ -443,7 +443,7 @@ impl QueueBlobReplicationOperation {
     }
 
     fn read_existing(&mut self) -> Effects {
-        let key = match blob_replication_job_key(&self.job) {
+        let key = match blob_job_key(&self.job) {
             Ok(key) => key,
             Err(error) => return self.fail(error.into()),
         };
@@ -456,7 +456,7 @@ impl QueueBlobReplicationOperation {
     }
 
     fn write_job(&mut self) -> Effects {
-        let (key_space, key, value) = match blob_replication_job_write_entry(&self.job) {
+        let (key_space, key, value) = match blob_job_entry(&self.job) {
             Ok(entry) => entry,
             Err(error) => return self.fail(error.into()),
         };
@@ -471,7 +471,7 @@ impl QueueBlobReplicationOperation {
 
     fn schedule_drain(&mut self) -> Effects {
         self.state = QueueBlobReplicationState::ScheduleDrain;
-        smallvec![schedule_blob_replication_drain_effect()]
+        smallvec![schedule_blob_drain()]
     }
 
     fn finish(&mut self, scheduled: bool) -> Effects {
@@ -499,7 +499,7 @@ impl Operation for QueueBlobReplicationOperation {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
                 }) => match BlobReplicationJobRecord::from_bytes(&value) {
-                    Ok(existing) if blob_replication_job_preferred(&existing, &self.job) => {
+                    Ok(existing) if blob_job_preferred(&existing, &self.job) => {
                         self.schedule_drain()
                     }
                     Ok(_) | Err(_) => self.write_job(),
@@ -701,7 +701,7 @@ impl QueueLiveVersionReplicationOperation {
 
     fn schedule_drain(&mut self) -> Effects {
         self.state = QueueLiveVersionReplicationState::ScheduleDrain;
-        smallvec![schedule_blob_replication_drain_effect()]
+        smallvec![schedule_blob_drain()]
     }
 
     fn finish(&mut self, queued: usize, scheduled: bool) -> Effects {
@@ -815,6 +815,68 @@ impl Operation for QueueLiveVersionReplicationOperation {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_put(
+    context: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    auth: AuthContext,
+    group_id: GroupId,
+    bucket: String,
+    key: String,
+    version_id: Ulid,
+    size_bytes: u64,
+) {
+    let actor = auth.user_id;
+    match drive(
+        QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+            local_node_id: node_id,
+            auth_context: auth,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
+            delete_marker: false,
+        }),
+        context,
+    )
+    .await
+    {
+        Ok(result) => {
+            if result.queued > 0 && !result.scheduled {
+                warn!(bucket, key, version_id = %version_id, queued = result.queued, "Live replication jobs persisted but drain scheduling was not acknowledged");
+            }
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                bucket,
+                key,
+                version_id = %version_id,
+                delete_marker = false,
+                "Failed to queue live replication after committed write; durable obligation remains for repair"
+            );
+        }
+    }
+
+    let path = watch_resource_path(group_id, node_id, &bucket, &key);
+    let event = WatchEvent {
+        event_id: Ulid::generate(),
+        realm_id,
+        kind: WatchEventKind::DataUploaded,
+        path,
+        actor,
+        occurred_at_ms: unix_timestamp_millis(),
+        detail: WatchEventDetail::DataUploaded {
+            group_id,
+            node_id,
+            bucket,
+            key,
+            size_bytes,
+        },
+    };
+    emit_watch_event(context, event).await;
+}
+
 /// Identifies the object version a replication job is being derived for.
 struct RelationshipJobTarget<'a> {
     bucket: &'a str,
@@ -921,8 +983,8 @@ fn validate_sync_key(
     Ok(())
 }
 
-pub async fn restore_blob_replication_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    match next_blob_replication_timer_after(storage).await {
+pub async fn restore_blob_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+    match next_blob_timer(storage).await {
         Ok(None) => {}
         Ok(Some(after)) => {
             let event = task_handle
@@ -939,10 +1001,8 @@ pub async fn restore_blob_replication_timer(storage: &StorageHandle, task_handle
     }
 }
 
-pub async fn blob_replication_jobs_exist(
-    storage: &StorageHandle,
-) -> Result<bool, BlobReplicationQueueError> {
-    if live_replication_obligations_exist(storage).await? {
+pub async fn blob_jobs_exist(storage: &StorageHandle) -> Result<bool, BlobReplicationQueueError> {
+    if live_obligations_exist(storage).await? {
         return Ok(true);
     }
 
@@ -1013,10 +1073,10 @@ pub async fn relationship_job_stats(
     }
 }
 
-pub async fn next_blob_replication_timer_after(
+pub async fn next_blob_timer(
     storage: &StorageHandle,
 ) -> Result<Option<Duration>, BlobReplicationQueueError> {
-    if live_replication_obligations_exist(storage).await? {
+    if live_obligations_exist(storage).await? {
         return Ok(Some(Duration::ZERO));
     }
 
@@ -1036,7 +1096,7 @@ pub async fn next_blob_replication_timer_after(
         .map(|due_at_ms| due_after(now_ms, due_at_ms)))
 }
 
-async fn live_replication_obligations_exist(
+async fn live_obligations_exist(
     storage: &StorageHandle,
 ) -> Result<bool, BlobReplicationQueueError> {
     match storage
@@ -1057,7 +1117,7 @@ async fn live_replication_obligations_exist(
     }
 }
 
-pub async fn process_blob_replication_batch(
+pub async fn process_blob_batch(
     context: &DriverContext,
 ) -> Result<BlobReplicationDrainResult, BlobReplicationQueueError> {
     let batch_started = Instant::now();
@@ -1084,19 +1144,18 @@ pub async fn process_blob_replication_batch(
                 .get(&(job.input.bucket.clone(), relationship_id))
                 .cloned()
         });
-        match process_blob_replication_job(context, &job, relationship, &mut relationships).await {
+        match process_blob_job(context, &job, relationship, &mut relationships).await {
             Ok(BlobReplicationJobOutcome::Succeeded) => {
-                delete_blob_replication_job(&context.storage_handle, job_key).await?;
+                delete_blob_job(&context.storage_handle, job_key).await?;
                 succeeded = succeeded.saturating_add(1);
             }
             Ok(BlobReplicationJobOutcome::TerminalFailure) => {
-                delete_blob_replication_job(&context.storage_handle, job_key).await?;
+                delete_blob_job(&context.storage_handle, job_key).await?;
                 failed = failed.saturating_add(1);
             }
             Err(error) => {
                 let retry_due_at =
-                    reschedule_blob_replication_job(&context.storage_handle, job_key, &job, error)
-                        .await?;
+                    reschedule_blob_job(&context.storage_handle, job_key, &job, error).await?;
                 next_due_at_ms = min_due_at(next_due_at_ms, retry_due_at);
                 failed = failed.saturating_add(1);
             }
@@ -1255,13 +1314,13 @@ async fn emit_sync_watch(
             },
         ),
     };
-    emit_resource_watch_event(
+    emit_watch_event(
         context,
         WatchEvent {
             event_id: Ulid::generate(),
             realm_id: relationship.source.realm_id,
             kind,
-            path: data_watch_resource_path(
+            path: watch_resource_path(
                 group_id,
                 node_id,
                 bucket,
@@ -1291,7 +1350,32 @@ fn job_source_auth<'a>(
     }
 }
 
-async fn process_blob_replication_job(
+fn relationship_bucket<'a>(
+    job: &BlobReplicationJobRecord,
+    relationship: &'a SyncRelationship,
+    relationship_id: Ulid,
+) -> Result<&'a str, BlobReplicationJobOutcome> {
+    if relationship.state != SyncState::Enabled {
+        info!(
+            %relationship_id,
+            state = ?relationship.state,
+            "Skipping replication job for disabled sync relationship"
+        );
+        return Err(BlobReplicationJobOutcome::Succeeded);
+    }
+    if job.reference_advance.is_some()
+        && relationship.mode != SyncMode::Reference
+        && relationship.reference_handling != ReferenceHandling::Preserve
+    {
+        return Err(BlobReplicationJobOutcome::TerminalFailure);
+    }
+    relationship
+        .source
+        .bucket()
+        .ok_or(BlobReplicationJobOutcome::TerminalFailure)
+}
+
+async fn process_blob_job(
     context: &DriverContext,
     job: &BlobReplicationJobRecord,
     stored_relationship: Option<SyncRelationship>,
@@ -1321,7 +1405,7 @@ async fn process_blob_replication_job(
         operation = operation.with_gate(gate);
     }
     let mut watch_group_id = None;
-    let mut relationship = if let Some(relationship_id) = job.relationship_id {
+    let relationship = if let Some(relationship_id) = job.relationship_id {
         let Some(relationship) = stored_relationship else {
             info!(
                 relationship_id = %relationship_id,
@@ -1329,22 +1413,9 @@ async fn process_blob_replication_job(
             );
             return Ok(BlobReplicationJobOutcome::Succeeded);
         };
-        if relationship.state != SyncState::Enabled {
-            info!(
-                relationship_id = %relationship_id,
-                state = ?relationship.state,
-                "Skipping replication job for disabled sync relationship"
-            );
-            return Ok(BlobReplicationJobOutcome::Succeeded);
-        }
-        if job.reference_advance.is_some()
-            && relationship.mode != SyncMode::Reference
-            && relationship.reference_handling != ReferenceHandling::Preserve
-        {
-            return Ok(BlobReplicationJobOutcome::TerminalFailure);
-        }
-        let Some(bucket) = relationship.source.bucket() else {
-            return Ok(BlobReplicationJobOutcome::TerminalFailure);
+        let bucket = match relationship_bucket(job, &relationship, relationship_id) {
+            Ok(bucket) => bucket,
+            Err(outcome) => return Ok(outcome),
         };
         let creator = AuthContext {
             user_id: relationship.created_by,
@@ -1441,6 +1512,25 @@ async fn process_blob_replication_job(
         None
     };
 
+    finish_blob_job(
+        context,
+        job,
+        operation,
+        relationship,
+        watch_group_id,
+        relationships,
+    )
+    .await
+}
+
+async fn finish_blob_job(
+    context: &DriverContext,
+    job: &BlobReplicationJobRecord,
+    operation: ReplicateScopeOperation,
+    mut relationship: Option<SyncRelationship>,
+    watch_group_id: Option<GroupId>,
+    relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
+) -> Result<BlobReplicationJobOutcome, String> {
     let error = match drive(operation, context).await {
         Ok(Some(Ok(result))) if result.failed == 0 => {
             if let Some(relationship) = relationship.as_mut() {
@@ -2009,7 +2099,14 @@ async fn write_live_jobs(
         }
     }
     let continuation = (!cursor.relationships_complete).then_some(cursor);
-    let jobs = relationship_jobs;
+    persist_live_jobs(storage, relationship_jobs, continuation).await
+}
+
+async fn persist_live_jobs(
+    storage: &StorageHandle,
+    jobs: Vec<BlobReplicationJobRecord>,
+    continuation: Option<LiveReplicationContinuation>,
+) -> Result<LiveRepairWrite, BlobReplicationQueueError> {
     if jobs.is_empty() {
         return Ok(LiveRepairWrite {
             queued: 0,
@@ -2023,7 +2120,7 @@ async fn write_live_jobs(
         .map(|job| {
             Ok((
                 BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
-                blob_replication_job_key(job)?,
+                blob_job_key(job)?,
             ))
         })
         .collect::<Result<Vec<_>, ConversionError>>()?;
@@ -2052,10 +2149,10 @@ async fn write_live_jobs(
     for (job, (_, value)) in jobs.iter().zip(values) {
         match value {
             Some(value) => match BlobReplicationJobRecord::from_bytes(&value) {
-                Ok(existing) if blob_replication_job_preferred(&existing, job) => {}
-                Ok(_) | Err(_) => writes.push(blob_replication_job_write_entry(job)?),
+                Ok(existing) if blob_job_preferred(&existing, job) => {}
+                Ok(_) | Err(_) => writes.push(blob_job_entry(job)?),
             },
-            None => writes.push(blob_replication_job_write_entry(job)?),
+            None => writes.push(blob_job_entry(job)?),
         }
     }
     if writes.is_empty() {
@@ -2395,29 +2492,27 @@ async fn scan_due_jobs(
             Ok(job) => job,
             Err(error) => {
                 warn!(error = %error, key = ?key, "Deleting malformed blob replication job");
-                delete_blob_replication_job(storage, key).await?;
+                delete_blob_job(storage, key).await?;
                 continue;
             }
         };
-        let canonical_key = blob_replication_job_key(&job)?.to_vec();
+        let canonical_key = blob_job_key(&job)?.to_vec();
         if canonical_key.as_slice() != key.as_slice() {
             warn!(key = ?key, "Repairing blob replication job stored under non-canonical key");
-            if let Some(existing) =
-                read_blob_replication_job_at_key(storage, &canonical_key).await?
-                && blob_replication_job_preferred(&existing, &job)
+            if let Some(existing) = read_blob_job(storage, &canonical_key).await?
+                && blob_job_preferred(&existing, &job)
             {
-                delete_blob_replication_job(storage, key).await?;
+                delete_blob_job(storage, key).await?;
                 job = existing;
             } else {
-                write_blob_replication_job(storage, &job).await?;
-                delete_blob_replication_job(storage, key).await?;
+                write_blob_job(storage, &job).await?;
+                delete_blob_job(storage, key).await?;
                 canonical_changed = true;
                 jobs.retain(|(existing_key, _)| existing_key != &canonical_key);
             }
             key = canonical_key;
         } else if canonical_changed
-            && let Some(existing) =
-                read_blob_replication_job_at_key(storage, &canonical_key).await?
+            && let Some(existing) = read_blob_job(storage, &canonical_key).await?
         {
             job = existing;
         }
@@ -2468,7 +2563,7 @@ async fn scan_due_jobs(
     })
 }
 
-async fn read_blob_replication_job_at_key(
+async fn read_blob_job(
     storage: &StorageHandle,
     key: &[u8],
 ) -> Result<Option<BlobReplicationJobRecord>, BlobReplicationQueueError> {
@@ -2491,11 +2586,11 @@ async fn read_blob_replication_job_at_key(
     }
 }
 
-async fn write_blob_replication_job(
+async fn write_blob_job(
     storage: &StorageHandle,
     job: &BlobReplicationJobRecord,
 ) -> Result<(), BlobReplicationQueueError> {
-    let (key_space, key, value) = blob_replication_job_write_entry(job)?;
+    let (key_space, key, value) = blob_job_entry(job)?;
     match storage
         .send_storage_effect(StorageEffect::Write {
             key_space,
@@ -2513,7 +2608,7 @@ async fn write_blob_replication_job(
     }
 }
 
-async fn delete_blob_replication_job(
+async fn delete_blob_job(
     storage: &StorageHandle,
     key: Vec<u8>,
 ) -> Result<(), BlobReplicationQueueError> {
@@ -2533,14 +2628,14 @@ async fn delete_blob_replication_job(
     }
 }
 
-async fn reschedule_blob_replication_job(
+async fn reschedule_blob_job(
     storage: &StorageHandle,
     key: Vec<u8>,
     job: &BlobReplicationJobRecord,
     error: String,
 ) -> Result<u64, BlobReplicationQueueError> {
     let attempts = job.attempts.saturating_add(1);
-    let due_at_ms = unix_timestamp_millis().saturating_add(queue_retry_after_ms(attempts));
+    let due_at_ms = unix_timestamp_millis().saturating_add(retry_delay_ms(attempts));
     let next_job = BlobReplicationJobRecord {
         input: job.input.clone(),
         source_delete_marker: job.source_delete_marker,
@@ -2571,10 +2666,6 @@ async fn reschedule_blob_replication_job(
     }
 }
 
-fn min_due_at(current: Option<u64>, due_at_ms: u64) -> Option<u64> {
-    Some(current.map_or(due_at_ms, |current| current.min(due_at_ms)))
-}
-
 fn merge_due_job(
     jobs: &mut Vec<(Vec<u8>, BlobReplicationJobRecord)>,
     key: Vec<u8>,
@@ -2585,7 +2676,7 @@ fn merge_due_job(
         .iter_mut()
         .find(|(existing_key, _)| existing_key.as_slice() == key.as_slice())
     {
-        if blob_replication_job_preferred(&job, existing) {
+        if blob_job_preferred(&job, existing) {
             *existing = job;
         }
         false
@@ -2593,10 +2684,6 @@ fn merge_due_job(
         jobs.push((key, job));
         jobs.len() >= limit
     }
-}
-
-fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
-    Duration::from_millis(due_at_ms.saturating_sub(now_ms))
 }
 
 #[cfg(test)]
@@ -2651,7 +2738,7 @@ mod tests {
     use aruna_core::structs::{
         Actor, ArunaArn, BackendRef, BlobVersion, BucketInfo, Group, GroupAuthorizationDocument,
         PathRestriction, Permission, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-        ReferenceHandling, SyncStatusSnapshot, VersionKey, blob_object_permission_path,
+        ReferenceHandling, SyncStatusSnapshot, VersionKey, object_permission_path,
         sync_relationship_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -2725,7 +2812,7 @@ mod tests {
         }
     }
 
-    async fn write_raw_queue_record(
+    async fn write_queue_record(
         storage: &StorageHandle,
         key_space: &str,
         key: Vec<u8>,
@@ -2745,8 +2832,8 @@ mod tests {
         }
     }
 
-    async fn write_corrupt_blob_job(storage: &StorageHandle, key: &str) {
-        write_raw_queue_record(
+    async fn write_corrupt_job(storage: &StorageHandle, key: &str) {
+        write_queue_record(
             storage,
             BLOB_REPLICATION_JOB_KEYSPACE,
             key.as_bytes().to_vec(),
@@ -2755,8 +2842,8 @@ mod tests {
         .await;
     }
 
-    async fn write_corrupt_live_obligation(storage: &StorageHandle, key: &str) {
-        write_raw_queue_record(
+    async fn write_corrupt_obligation(storage: &StorageHandle, key: &str) {
+        write_queue_record(
             storage,
             BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
             key.as_bytes().to_vec(),
@@ -2796,7 +2883,7 @@ mod tests {
             realm_id: realm(),
         };
         // Policy loading fails closed without the realm config document.
-        write_raw_queue_record(
+        write_queue_record(
             storage,
             REALM_CONFIG_KEYSPACE,
             realm().as_bytes().to_vec(),
@@ -2805,20 +2892,20 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        write_raw_queue_record(
+        write_queue_record(
             storage,
             AUTH_KEYSPACE,
             realm().as_bytes().to_vec(),
-            RealmAuthorizationDocument::new_default_realm_doc(realm())
+            RealmAuthorizationDocument::default_realm_doc(realm())
                 .to_bytes(&actor)
                 .unwrap(),
         )
         .await;
-        write_raw_queue_record(
+        write_queue_record(
             storage,
             AUTH_KEYSPACE,
             group_id.to_bytes().to_vec(),
-            GroupAuthorizationDocument::new_default_group_doc(user(), realm(), group_id)
+            GroupAuthorizationDocument::default_group_doc(user(), realm(), group_id)
                 .to_bytes(&actor)
                 .unwrap(),
         )
@@ -2832,7 +2919,7 @@ mod tests {
             user_id: user(),
             realm_id: realm(),
         };
-        let auth = GroupAuthorizationDocument::new_default_group_doc(user(), realm(), group_id);
+        let auth = GroupAuthorizationDocument::default_group_doc(user(), realm(), group_id);
         let group = Group {
             display_name: "replication-group".to_string(),
             group_id,
@@ -2840,7 +2927,7 @@ mod tests {
             roles: auth.roles.keys().copied().collect(),
             owner: user(),
         };
-        write_raw_queue_record(
+        write_queue_record(
             storage,
             GROUP_KEYSPACE,
             group_id.to_bytes().to_vec(),
@@ -2855,8 +2942,7 @@ mod tests {
             user_id: user(),
             realm_id: realm(),
         };
-        let mut document =
-            GroupAuthorizationDocument::new_default_group_doc(user(), realm(), group_id);
+        let mut document = GroupAuthorizationDocument::default_group_doc(user(), realm(), group_id);
         document.policies.push(RequestPolicy {
             policy_id: Ulid::from_parts(7, 7),
             name: "replication-policy".to_string(),
@@ -2865,7 +2951,7 @@ mod tests {
             expression: expression.to_string(),
             enabled: true,
         });
-        write_raw_queue_record(
+        write_queue_record(
             storage,
             AUTH_KEYSPACE,
             group_id.to_bytes().to_vec(),
@@ -2984,7 +3070,7 @@ mod tests {
     }
 
     async fn write_live_obligation(storage: &StorageHandle, version_id: Ulid) {
-        let Effect::Storage(effect) = write_live_replication_obligation_effect(
+        let Effect::Storage(effect) = build_live_obligation(
             node(1),
             auth_context(),
             "bucket".to_string(),
@@ -3038,7 +3124,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_blob_replication_persists_before_returning() {
+    async fn queue_persists_first() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
@@ -3066,7 +3152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_blob_replication_requests_coalesce() {
+    async fn duplicate_requests_coalesce() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
@@ -3093,6 +3179,21 @@ mod tests {
         .expect("second queue succeeds");
 
         assert_eq!(read_jobs(&storage).await.len(), 1);
+    }
+
+    #[test]
+    fn queue_rejects_event() {
+        let mut operation = QueueBlobReplicationOperation::new(on_demand_input(), None);
+        operation.start();
+
+        let effects = operation.step(Event::Search());
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(BlobReplicationQueueError::UnexpectedEvent(_))
+        ));
     }
 
     #[tokio::test]
@@ -3125,7 +3226,7 @@ mod tests {
         .expect("queue succeeds");
         let enqueued_at_ms = read_jobs(&storage).await[0].1.enqueued_at_ms;
 
-        let result = process_blob_replication_batch(&context)
+        let result = process_blob_batch(&context)
             .await
             .expect("drain stores retry metadata");
 
@@ -3160,9 +3261,9 @@ mod tests {
         )
         .with_reference_advance(advance);
         job.writer_auth_context = None;
-        let key = blob_replication_job_key(&job).unwrap().to_vec();
+        let key = blob_job_key(&job).unwrap().to_vec();
 
-        reschedule_blob_replication_job(&storage, key, &job, "retry".to_string())
+        reschedule_blob_job(&storage, key, &job, "retry".to_string())
             .await
             .unwrap();
 
@@ -3196,7 +3297,7 @@ mod tests {
         .await
         .expect("queue succeeds");
 
-        let result = process_blob_replication_batch(&context)
+        let result = process_blob_batch(&context)
             .await
             .expect("missing relationship is terminal");
 
@@ -3213,7 +3314,7 @@ mod tests {
         write_bucket(&storage, "bucket").await;
         write_auth_docs(&storage, group_id).await;
         write_group(&storage, group_id).await;
-        let path = blob_object_permission_path(realm(), group_id, node(1), "bucket", "key");
+        let path = object_permission_path(realm(), group_id, node(1), "bucket", "key");
         write_group_policy(&storage, group_id, &format!("path == '{path}'")).await;
         write_materialized_version(&storage, "bucket", "key", Ulid::from_parts(5, 5)).await;
         let relationship = relationship(79, 2, None, true);
@@ -3237,7 +3338,7 @@ mod tests {
         .await
         .expect("queue succeeds");
 
-        let result = process_blob_replication_batch(&context)
+        let result = process_blob_batch(&context)
             .await
             .expect("denied relationship is terminal");
 
@@ -3304,7 +3405,7 @@ mod tests {
         .await
         .expect("queue succeeds");
 
-        let result = process_blob_replication_batch(&context)
+        let result = process_blob_batch(&context)
             .await
             .expect("empty relationship scope succeeds");
 
@@ -3432,7 +3533,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_blob_replication_request_preserves_future_retry() {
+    async fn duplicate_preserves_retry() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
@@ -3450,7 +3551,7 @@ mod tests {
             writer_auth_context: Some(auth_context()),
             reference_advance: None,
         };
-        let (key_space, key, value) = blob_replication_job_write_entry(&future_job).unwrap();
+        let (key_space, key, value) = blob_job_entry(&future_job).unwrap();
         match storage
             .send_storage_effect(StorageEffect::Write {
                 key_space,
@@ -3482,10 +3583,7 @@ mod tests {
         let jobs = read_jobs(&storage).await;
         assert_eq!(
             jobs,
-            vec![(
-                blob_replication_job_key(&future_job).unwrap().to_vec(),
-                future_job
-            )]
+            vec![(blob_job_key(&future_job).unwrap().to_vec(), future_job)]
         );
     }
 
@@ -3515,8 +3613,8 @@ mod tests {
             42,
         );
         assert_ne!(
-            blob_replication_job_key(&first).unwrap(),
-            blob_replication_job_key(&second).unwrap()
+            blob_job_key(&first).unwrap(),
+            blob_job_key(&second).unwrap()
         );
         assert!(is_access_denied("Replication requires WRITE permission"));
         assert!(is_access_denied("access_denied"));
@@ -3968,7 +4066,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_version_queue_preserves_future_retry_job() {
+    async fn live_queue_retry() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
@@ -3995,7 +4093,7 @@ mod tests {
             last_error: Some("transient".to_string()),
             ..future_job
         };
-        let (key_space, key, value) = blob_replication_job_write_entry(&future_job).unwrap();
+        let (key_space, key, value) = blob_job_entry(&future_job).unwrap();
         match storage
             .send_storage_effect(StorageEffect::Write {
                 key_space,
@@ -4036,10 +4134,7 @@ mod tests {
         let jobs = read_jobs(&storage).await;
         assert_eq!(
             jobs,
-            vec![(
-                blob_replication_job_key(&future_job).unwrap().to_vec(),
-                future_job
-            )]
+            vec![(blob_job_key(&future_job).unwrap().to_vec(), future_job)]
         );
     }
 
@@ -4110,13 +4205,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn future_blob_replication_job_does_not_report_more_due() {
+    async fn future_job_pending() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
         let due_at_ms = unix_timestamp_millis().saturating_add(60_000);
         let record = BlobReplicationJobRecord::new(on_demand_input(), None, due_at_ms);
-        let (key_space, key, value) = blob_replication_job_write_entry(&record).unwrap();
+        let (key_space, key, value) = blob_job_entry(&record).unwrap();
         match storage
             .send_storage_effect(StorageEffect::Write {
                 key_space,
@@ -4138,7 +4233,7 @@ mod tests {
             compute_handle: None,
         };
 
-        let result = process_blob_replication_batch(&context)
+        let result = process_blob_batch(&context)
             .await
             .expect("future-only drain succeeds");
 
@@ -4153,9 +4248,7 @@ mod tests {
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
         let job = BlobReplicationJobRecord::new(on_demand_input(), None, unix_timestamp_millis());
-        write_blob_replication_job(&storage, &job)
-            .await
-            .expect("job writes");
+        write_blob_job(&storage, &job).await.expect("job writes");
 
         let before = storage.snapshot_metrics().requests_total;
         let scan = scan_due_jobs(&storage, unix_timestamp_millis(), 1)
@@ -4181,10 +4274,10 @@ mod tests {
             key: "other".to_string(),
         };
         let second = BlobReplicationJobRecord::new(second_input, None, unix_timestamp_millis());
-        write_blob_replication_job(&storage, &first)
+        write_blob_job(&storage, &first)
             .await
             .expect("first job writes");
-        write_blob_replication_job(&storage, &second)
+        write_blob_job(&storage, &second)
             .await
             .expect("second job writes");
 
@@ -4229,14 +4322,14 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        write_raw_queue_record(
+        write_queue_record(
             &storage,
             NODE_STATE_KEYSPACE,
             REPLICATION_CURSOR_KEY.to_vec(),
             vec![0xff],
         )
         .await;
-        write_blob_replication_job(
+        write_blob_job(
             &storage,
             &BlobReplicationJobRecord::new(on_demand_input(), None, unix_timestamp_millis()),
         )
@@ -4264,10 +4357,10 @@ mod tests {
             last_error: Some("retry".to_string()),
             ..job.clone()
         };
-        write_blob_replication_job(&storage, &job)
+        write_blob_job(&storage, &job)
             .await
             .expect("canonical job writes");
-        write_raw_queue_record(
+        write_queue_record(
             &storage,
             BLOB_REPLICATION_JOB_KEYSPACE,
             b"legacy-job".to_vec(),
@@ -4281,10 +4374,7 @@ mod tests {
 
         assert_eq!(scan.jobs.len(), 1);
         assert_eq!(scan.jobs[0].1.attempts, 1);
-        assert_eq!(
-            scan.jobs[0].0,
-            blob_replication_job_key(&preferred).unwrap().as_ref()
-        );
+        assert_eq!(scan.jobs[0].0, blob_job_key(&preferred).unwrap().as_ref());
     }
 
     #[tokio::test]
@@ -4333,11 +4423,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_blob_replication_job_only_is_deleted() {
+    async fn deletes_corrupt_job() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        write_corrupt_blob_job(&storage, "000-corrupt-blob-job").await;
+        write_corrupt_job(&storage, "000-corrupt-blob-job").await;
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
@@ -4347,18 +4437,18 @@ mod tests {
             compute_handle: None,
         };
 
-        let result = process_blob_replication_batch(&context)
+        let result = process_blob_batch(&context)
             .await
             .expect("corrupt-only drain succeeds");
 
         assert_eq!(result.processed, 0);
         assert!(!result.has_more_due);
         assert!(result.next_due_after.is_none());
-        assert!(!blob_replication_jobs_exist(&storage).await.unwrap());
+        assert!(!blob_jobs_exist(&storage).await.unwrap());
     }
 
     #[tokio::test]
-    async fn corrupt_blob_replication_job_before_valid_is_deleted() {
+    async fn corrupt_precedes_valid() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
@@ -4370,7 +4460,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
-        write_corrupt_blob_job(&storage, "000-corrupt-blob-job").await;
+        write_corrupt_job(&storage, "000-corrupt-blob-job").await;
         drive(
             QueueBlobReplicationOperation::new(on_demand_input(), None),
             &context,
@@ -4378,7 +4468,7 @@ mod tests {
         .await
         .expect("queue succeeds");
 
-        let result = process_blob_replication_batch(&context)
+        let result = process_blob_batch(&context)
             .await
             .expect("mixed corrupt/valid drain succeeds");
 
@@ -4390,11 +4480,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_live_replication_obligation_only_is_deleted() {
+    async fn deletes_corrupt_obligation() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        write_corrupt_live_obligation(&storage, "000-corrupt-live-obligation").await;
+        write_corrupt_obligation(&storage, "000-corrupt-live-obligation").await;
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
@@ -4404,18 +4494,18 @@ mod tests {
             compute_handle: None,
         };
 
-        let result = process_blob_replication_batch(&context)
+        let result = process_blob_batch(&context)
             .await
             .expect("corrupt-only live drain succeeds");
 
         assert_eq!(result.processed, 0);
         assert!(!result.has_more_due);
         assert!(result.next_due_after.is_none());
-        assert!(!blob_replication_jobs_exist(&storage).await.unwrap());
+        assert!(!blob_jobs_exist(&storage).await.unwrap());
     }
 
     #[tokio::test]
-    async fn corrupt_live_replication_obligations_before_valid_are_deleted() {
+    async fn deletes_corrupt_obligations() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
@@ -4426,7 +4516,7 @@ mod tests {
         write_materialized_version(&storage, "bucket", "key", version_id).await;
         for index in 0..LIVE_REPLICATION_OBLIGATION_BATCH_SIZE {
             let key = format!("000-corrupt-live-{index:03}");
-            write_corrupt_live_obligation(&storage, &key).await;
+            write_corrupt_obligation(&storage, &key).await;
         }
         write_live_obligation(&storage, version_id).await;
         let context = DriverContext {
@@ -4438,7 +4528,7 @@ mod tests {
             compute_handle: None,
         };
 
-        let first = process_blob_replication_batch(&context)
+        let first = process_blob_batch(&context)
             .await
             .expect("corrupt live page drain succeeds");
 
@@ -4446,7 +4536,7 @@ mod tests {
         assert!(first.has_more_due);
         assert_eq!(read_obligations(&storage).await.len(), 1);
 
-        let second = process_blob_replication_batch(&context)
+        let second = process_blob_batch(&context)
             .await
             .expect("valid live obligation drains after corrupt page");
 
@@ -4502,7 +4592,7 @@ mod tests {
         super::write_live_obligation(&storage, &record)
             .await
             .expect("obligation persists");
-        let key = live_replication_obligation_key(&record)
+        let key = live_obligation_key(&record)
             .expect("obligation key builds")
             .to_vec();
         let observed = LiveReplicationContinuation {
@@ -4581,8 +4671,7 @@ mod tests {
         )
         .await
         .expect("net handle starts");
-        let path =
-            blob_object_permission_path(realm(), group_id, net_handle.node_id(), "bucket", "key");
+        let path = object_permission_path(realm(), group_id, net_handle.node_id(), "bucket", "key");
         write_group_policy(&storage, group_id, &format!("path == '{path}'")).await;
         let context = DriverContext {
             storage_handle: storage.clone(),
@@ -4599,7 +4688,7 @@ mod tests {
         .await
         .expect("queue succeeds");
 
-        let result = process_blob_replication_batch(&context)
+        let result = process_blob_batch(&context)
             .await
             .expect("denied writer is terminal");
 
@@ -4609,7 +4698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_replication_obligation_repairs_missing_jobs() {
+    async fn live_obligation_repairs() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
@@ -4629,7 +4718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_replication_drain_retains_job_with_retry_metadata() {
+    async fn failed_drain_retains() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
@@ -4648,7 +4737,7 @@ mod tests {
         .await
         .expect("queue succeeds");
 
-        let result = process_blob_replication_batch(&context)
+        let result = process_blob_batch(&context)
             .await
             .expect("drain stores retry metadata");
 
@@ -4660,7 +4749,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_empty_scope_drain_deletes_job() {
+    async fn empty_drain_deletes() {
         // Standalone jobs revalidate the writer against the local node.
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
@@ -4700,9 +4789,7 @@ mod tests {
         .await
         .expect("queue succeeds");
 
-        let result = process_blob_replication_batch(&context)
-            .await
-            .expect("drain succeeds");
+        let result = process_blob_batch(&context).await.expect("drain succeeds");
 
         assert_eq!(result.succeeded, 1);
         assert!(read_jobs(&storage).await.is_empty());

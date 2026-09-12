@@ -1,10 +1,6 @@
 //! The metadata documents this device keeps a local craqle replica of.
-//!
-//! The ledger is what makes a device usable offline: it names the documents the
-//! owner selected, remembers how far each replica has been synced, and carries
-//! the registry record and the last valid render so a read answers without a
-//! holder. Nothing here is realm authority; a replica becomes realm state only
-//! when the intake drain forwards the edits made on it.
+//! The ledger names selected documents, sync progress, registry records and last
+//! valid renders so reads work offline; only the publish drain makes it realm state.
 
 use std::sync::Arc;
 
@@ -22,7 +18,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
-use super::repository::{IntakeEntry, IntakeState};
+use super::publish_queue::{PublishEntry, PublishState};
 
 /// Documents one device may keep a replica of. A device serves one person, so
 /// this is a working set rather than an archive.
@@ -41,7 +37,7 @@ pub enum ReplicaOrigin {
 }
 
 /// What the last refresh or forward left the replica in. Pending and failed
-/// edits are not stored here: they are the intake rows joined onto the record.
+/// edits are not stored here: they are the publish queue rows joined onto the record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplicaState {
     /// Created on this device and not published yet.
@@ -154,19 +150,19 @@ impl DocumentState {
     }
 }
 
-/// Joins one replica with the intake entries that publish onto it. A failure
+/// Joins one replica with the publish entries that go onto it. A failure
 /// the owner has to answer outranks work still in flight, which outranks the
 /// state the last refresh left.
-pub fn document_state(replica: &ReplicaRecord, intake: &[&IntakeEntry]) -> DocumentState {
+pub fn document_state(replica: &ReplicaRecord, entries: &[&PublishEntry]) -> DocumentState {
     let mut queued = None;
-    for entry in intake {
+    for entry in entries {
         match &entry.state {
-            IntakeState::Failed { .. } => return DocumentState::Failed,
-            IntakeState::Pending { .. } => queued = Some(DocumentState::Pending),
-            IntakeState::Publishing { .. } => {
+            PublishState::Failed { .. } => return DocumentState::Failed,
+            PublishState::Pending { .. } => queued = Some(DocumentState::Pending),
+            PublishState::Publishing { .. } => {
                 queued.get_or_insert(DocumentState::Publishing);
             }
-            IntakeState::Published { .. } => {}
+            PublishState::Published { .. } => {}
         }
     }
     if let Some(queued) = queued {
@@ -308,8 +304,8 @@ mod tests {
         )
     }
 
-    fn entry(state: IntakeState) -> IntakeEntry {
-        let mut entry = IntakeEntry::new(
+    fn entry(state: PublishState) -> PublishEntry {
+        let mut entry = PublishEntry::new(
             Ulid::generate(),
             UserId::local(Ulid::generate(), RealmId::from_bytes([8u8; 32])),
             Ulid::from_bytes([1u8; 16]),
@@ -340,17 +336,17 @@ mod tests {
         // What the owner still has to act on outranks work in flight, which
         // outranks the state the last refresh left.
         let replica = replica();
-        let pending = entry(IntakeState::Pending {
+        let pending = entry(PublishState::Pending {
             due_at_ms: 0,
             attempts: 1,
             last_error: None,
         });
-        let publishing = entry(IntakeState::Publishing {
+        let publishing = entry(PublishState::Publishing {
             document_id: replica.document_id,
             due_at_ms: 0,
             attempts: 1,
         });
-        let failed = entry(IntakeState::Failed {
+        let failed = entry(PublishState::Failed {
             reason: "denied".to_string(),
             retryable: false,
             document_id: Some(replica.document_id),
@@ -375,7 +371,7 @@ mod tests {
     fn reports_replica_state() {
         // A published entry is history: the record's own state answers again.
         let mut replica = replica();
-        let published = entry(IntakeState::Published {
+        let published = entry(PublishState::Published {
             document_id: replica.document_id,
         });
         replica.state = ReplicaState::Invalid;

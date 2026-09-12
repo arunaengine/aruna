@@ -8,13 +8,13 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::repository::{IntakeEntry, read_intake};
+use super::publish_queue::{PublishEntry, read_publish_entry};
 
 #[derive(Debug, PartialEq)]
 pub struct InspectDraftOperation {
     draft_id: Ulid,
     state: InspectDraftState,
-    output: Option<Result<IntakeEntry, InspectDraftError>>,
+    output: Option<Result<PublishEntry, InspectDraftError>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -54,12 +54,12 @@ impl InspectDraftOperation {
 }
 
 impl Operation for InspectDraftOperation {
-    type Output = IntakeEntry;
+    type Output = PublishEntry;
     type Error = InspectDraftError;
 
     fn start(&mut self) -> Effects {
         self.state = InspectDraftState::ReadEntry;
-        smallvec![read_intake(self.draft_id, None)]
+        smallvec![read_publish_entry(self.draft_id, None)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
@@ -86,7 +86,7 @@ impl Operation for InspectDraftOperation {
                 let Some(bytes) = value else {
                     return fail(self, InspectDraftError::NotFound);
                 };
-                match IntakeEntry::from_bytes(&bytes) {
+                match PublishEntry::from_bytes(&bytes) {
                     Ok(entry) => {
                         self.state = InspectDraftState::Finish;
                         self.output = Some(Ok(entry));
@@ -131,34 +131,17 @@ fn fail(operation: &mut InspectDraftOperation, error: InspectDraftError) -> Effe
 mod tests {
     use super::{InspectDraftError, InspectDraftOperation};
     use crate::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
-    use crate::device::repository::IntakeEntry;
-    use crate::driver::{DriverContext, drive};
+    use crate::device::publish_queue::PublishEntry;
+    use crate::driver::drive;
+    use crate::tests::fixtures::device::context;
     use aruna_core::structs::RealmId;
     use aruna_core::types::UserId;
-    use aruna_storage::storage;
-    use tempfile::tempdir;
     use ulid::Ulid;
-
-    async fn context() -> (tempfile::TempDir, DriverContext) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        (
-            tempdir,
-            DriverContext {
-                storage_handle,
-                net_handle: None,
-                blob_handle: None,
-                metadata_handle: None,
-                task_handle: None,
-                compute_handle: None,
-            },
-        )
-    }
 
     #[tokio::test]
     async fn reads_queued_draft() {
         let (_tempdir, context) = context().await;
-        let entry = IntakeEntry::new(
+        let entry = PublishEntry::new(
             Ulid::generate(),
             UserId::local(Ulid::generate(), RealmId::from_bytes([2u8; 32])),
             Ulid::generate(),

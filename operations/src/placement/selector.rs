@@ -1,7 +1,10 @@
 //! Integer-only weighted two-level rendezvous primitives.
-//!
-//! Determinism is the whole contract: identical inputs must produce identical
-//! rankings on every platform, so no floating point appears outside `#[cfg(test)]`.
+//! Determinism is the contract: identical inputs must produce identical rankings
+//! on every platform, so no floating point appears outside `#[cfg(test)]`.
+
+use std::cmp::Ordering;
+
+use aruna_core::NodeId;
 
 pub const PLACEMENT_DOMAIN: &[u8] = b"aruna-placement-rendezvous-v3";
 pub const ROLE_LOCATION: u8 = b'L';
@@ -24,10 +27,8 @@ pub fn selector_hash(role: u8, subject: &[u8], id: &[u8]) -> u64 {
 }
 
 /// Exact UQ16.48 fixed-point encoding of `-log2(h / 2^64)` for nonzero `h`.
-///
-/// Normalises `h` by its leading zeros to a mantissa `m ∈ [1, 2)`; the integer
-/// part is `leading_zeros + 1`. The 48 fraction bits are peeled by repeated
-/// squaring: `m² ≥ 2` yields a set bit and halves the mantissa back into range.
+/// Normalises `h` to a mantissa in [1, 2), with integer part `leading_zeros + 1`;
+/// the 48 fraction bits are peeled by repeated squaring.
 pub fn neg_log2_q48(h: u64) -> u64 {
     debug_assert!(h != 0);
     let z = h.leading_zeros();
@@ -46,10 +47,64 @@ pub fn neg_log2_q48(h: u64) -> u64 {
     (((z as u64) + 1) << 48) - f
 }
 
+/// Rendezvous rank of one node under `subject`; lower is better.
+pub(crate) fn peer_rank(subject: &[u8], node_id: NodeId) -> u64 {
+    neg_log2_q48(selector_hash(ROLE_NODE, subject, node_id.as_bytes()))
+}
+
+fn rank_order(left: &(u64, NodeId), right: &(u64, NodeId)) -> Ordering {
+    left.0
+        .cmp(&right.0)
+        .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+}
+
+/// Keeps the `limit` best-ranked nodes, ties by node bytes ascending and
+/// deduplicated. Each candidate that leaves the selection is reported to
+/// `on_omitted` in scan order.
+pub(crate) fn select_top_peers<I, F>(
+    nodes: I,
+    subject: &[u8],
+    limit: usize,
+    mut on_omitted: F,
+) -> Vec<NodeId>
+where
+    I: IntoIterator<Item = NodeId>,
+    F: FnMut(NodeId),
+{
+    let mut selected: Vec<(u64, NodeId)> = Vec::with_capacity(limit);
+    for node_id in nodes {
+        if selected.iter().any(|(_, candidate)| *candidate == node_id) {
+            continue;
+        }
+        let score = peer_rank(subject, node_id);
+        if selected.len() < limit {
+            selected.push((score, node_id));
+            continue;
+        }
+        let worst = selected
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| rank_order(left, right))
+            .map(|(index, candidate)| (index, *candidate));
+        match worst {
+            Some((index, (worst_score, worst_node))) => {
+                if (score, node_id.as_bytes()) < (worst_score, worst_node.as_bytes()) {
+                    selected[index] = (score, node_id);
+                    on_omitted(worst_node);
+                } else {
+                    on_omitted(node_id);
+                }
+            }
+            None => on_omitted(node_id),
+        }
+    }
+    selected.sort_unstable_by(rank_order);
+    selected.into_iter().map(|(_, node_id)| node_id).collect()
+}
+
 /// Ranks candidate indices best-first by weighted rendezvous score `-log2(u)/weight`.
-///
-/// `i` precedes `j` iff `L_i·w_j < L_j·w_i`; ties break by `(L, id bytes)` ascending,
-/// so zero-weight candidates (never a numerator advantage) sort after all positive ones.
+/// `i` precedes `j` iff `L_i·w_j < L_j·w_i`; ties break by `(L, id bytes)`, so
+/// zero-weight candidates sort after all positive ones.
 pub fn rank_weighted<I: AsRef<[u8]>>(
     role: u8,
     subject: &[u8],
@@ -105,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn neg_log2_exact_vectors() {
+    fn neg_log2_vectors() {
         assert_eq!(neg_log2_q48(1 << 63), Q48_ONE);
         assert_eq!(neg_log2_q48(1 << 62), 2 * Q48_ONE);
         assert_eq!(neg_log2_q48(1), 64 * Q48_ONE);
@@ -114,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn neg_log2_matches_float_reference() {
+    fn neg_log2_matches() {
         let mut worst = 0f64;
         for counter in 0u64..4096 {
             let h = counter_hash(counter);
@@ -127,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn rank_weighted_golden_order() {
+    fn weighted_golden_order() {
         let ids: [[u8; 32]; 6] = [[1; 32], [2; 32], [3; 32], [4; 32], [5; 32], [6; 32]];
         let weights = [100u64, 100, 100, 300, 50, 200];
         let candidates: Vec<([u8; 32], u64)> =
@@ -137,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn weighted_top_one_frequency_tracks_weight() {
+    fn frequency_tracks_weight() {
         let light = [0xAAu8; 32];
         let heavy = [0xBBu8; 32];
         let candidates = [(light, 100u64), (heavy, 300u64)];
@@ -156,7 +211,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn neg_log2_is_monotone(a in any::<u64>(), b in any::<u64>()) {
+        fn neg_log2_monotone(a in any::<u64>(), b in any::<u64>()) {
             let h1 = a | 1;
             let h2 = b | 1;
             let (lo, hi) = if h1 <= h2 { (h1, h2) } else { (h2, h1) };
@@ -164,7 +219,7 @@ mod tests {
         }
 
         #[test]
-        fn rank_is_permutation_and_deterministic(candidates in candidate_strategy()) {
+        fn rank_deterministic_permutation(candidates in candidate_strategy()) {
             let first = rank_weighted(ROLE_NODE, b"subject", &candidates);
             let second = rank_weighted(ROLE_NODE, b"subject", &candidates);
             prop_assert_eq!(&first, &second);
@@ -174,7 +229,7 @@ mod tests {
         }
 
         #[test]
-        fn rank_is_input_order_independent(
+        fn rank_order_independent(
             candidates in candidate_strategy(),
             keys in prop::collection::vec(any::<u64>(), 0..12),
         ) {
@@ -191,7 +246,7 @@ mod tests {
         }
 
         #[test]
-        fn rank_is_weight_scale_invariant(
+        fn rank_scale_invariant(
             candidates in candidate_strategy(),
             k in 1u64..1_048_576,
         ) {
@@ -203,7 +258,7 @@ mod tests {
         }
 
         #[test]
-        fn zero_weight_ranks_after_positive(candidates in candidate_strategy()) {
+        fn zero_weight_last(candidates in candidate_strategy()) {
             prop_assume!(candidates.len() >= 2);
             let mut candidates = candidates;
             candidates[0].1 = 0;
@@ -220,7 +275,7 @@ mod tests {
         }
 
         #[test]
-        fn removing_candidate_preserves_relative_order(
+        fn removal_preserves_order(
             candidates in candidate_strategy(),
             victim in any::<u64>(),
         ) {

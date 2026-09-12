@@ -168,9 +168,8 @@ mod tests {
         }
     }
 
-    // Every stat value has to move the fingerprint. Size and mtime alone are not
-    // enough: a rewrite can restore both, and the change time cannot be, so a
-    // file that changed under a preserved mtime must still look different.
+    // The fingerprint includes every stat value: size and mtime can be restored after a rewrite,
+    // so change time must still distinguish changed content.
     #[test]
     fn fingerprint_tracks_stat() {
         let base = weak_fingerprint(&stat());

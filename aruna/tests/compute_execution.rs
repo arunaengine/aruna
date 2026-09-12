@@ -23,8 +23,8 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::reconcile::ExternalReconciler;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::{
-    ClaimOutcome, JobMutation, claim_job, insert_job, mutate_job, read_job_record,
-    read_run_crate_status,
+    ClaimOutcome, JobMutation, claim_job, insert_job, mutate_job, read_crate_status,
+    read_job_record,
 };
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::jobs::workflow::reconcile::ComputeReconciler;
@@ -32,8 +32,8 @@ use aruna_operations::jobs::workflow::run_execution_job;
 use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
 use shared::{
-    S3Credentials, TestResult, create_bearer_token, create_group_via_http,
-    create_s3_credentials_via_http, s3_client, spawn_full_seed_node, wait_for_group_via_http,
+    S3Credentials, TestResult, create_bearer_token, create_group_http, create_s3_credentials,
+    s3_client, spawn_complete_seed, wait_group_http,
 };
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
@@ -78,7 +78,7 @@ struct Fixture {
 
 /// Full node + Docker-backed compute context + a group with a source object staged.
 async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
-    let seed = spawn_full_seed_node().await?;
+    let seed = spawn_complete_seed().await?;
     let endpoint = seed.s3.clone().expect("full node exposes S3");
 
     let bearer = create_bearer_token(
@@ -88,10 +88,10 @@ async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
         seed.capabilities.clone(),
     )
     .await?;
-    let group = create_group_via_http(&seed.base_url, &bearer, "compute-e2e").await?;
-    wait_for_group_via_http(&seed.base_url, &bearer, &group.group_id).await?;
+    let group = create_group_http(&seed.base_url, &bearer, "compute-e2e").await?;
+    wait_group_http(&seed.base_url, &bearer, &group.group_id).await?;
     let group_id = Ulid::from_string(&group.group_id)?;
-    let creds = create_s3_credentials_via_http(&seed.base_url, &bearer, &group.group_id).await?;
+    let creds = create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
 
     // A multi-chunk source object (~1 MiB) the workflow snapshots into the
     // workspace, so staging, container upload, and output capture all stream.
@@ -202,7 +202,7 @@ async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobR
 }
 
 fn now_ms() -> u64 {
-    aruna_core::util::unix_timestamp_millis()
+    aruna_core::time::unix_timestamp_millis()
 }
 
 /// The inputs admission captures before a run is claimed. Outputs inherit
@@ -310,7 +310,7 @@ async fn wait_run_crate(
 ) -> Option<RunCrateStatus> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(Some(status)) = read_run_crate_status(&ctx.storage_handle, job_id).await
+        if let Ok(Some(status)) = read_crate_status(&ctx.storage_handle, job_id).await
             && !matches!(
                 status,
                 RunCrateStatus::Pending | RunCrateStatus::Minted { .. }
@@ -325,11 +325,10 @@ async fn wait_run_crate(
     }
 }
 
-// Full happy path: an input staged from the bucket it lives in, a container that
-// reads it and writes an output, terminal success, durable output, and a run
-// crate. The run creates no bucket of its own.
+// Covers staged input, container output, terminal success, durable output, and run crate.
+// The run must not create a bucket of its own.
 #[tokio::test]
-async fn execution_end_to_end() -> TestResult<()> {
+async fn executes_job() -> TestResult<()> {
     let Some(backend) = docker_or_skip().await else {
         return Ok(());
     };
@@ -508,9 +507,8 @@ async fn execution_restart_adopts() -> TestResult<()> {
         "exactly one container before adopt"
     );
 
-    // In production the reconciler is only handed a job after the lease sweep
-    // observes its expired lease; a live lease means the holder is still alive and
-    // must not be adopted. Simulate the sweep by expiring the crashed holder's lease.
+    // Reconciliation receives only jobs with leases expired by the sweep.
+    // Expire the crashed holder's lease to reproduce that admission condition.
     mutate_job(&fixture.compute_ctx.storage_handle, job_id, |record| {
         if let Some(claim) = record.claim.as_mut() {
             claim.lease_expires_at_ms = 1;

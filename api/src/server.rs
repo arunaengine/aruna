@@ -16,12 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_MAX_HTTP_BODY_SIZE: usize = 1024 * 1024;
 
-// Backstop only, far above any legitimate request: the interactive bounds live
-// in the discovery/fanout/open_stream deadlines. This catches handler paths
-// that would otherwise hold the connection for unbounded peer I/O. Streaming
-// response bodies (SSE, archive downloads) are not covered — the layer bounds
-// the time to produce the response, not the body. Routes that read the request
-// body inside the handler are exempt, see TIMEOUT_EXEMPT_ROUTES.
+// Backstop for handler response creation; interactive operations use tighter deadlines.
+// Streaming bodies are unbounded, and handler-owned request bodies use exempt routes.
 const REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 // Body-streaming routes: upload duration counts against the handler, so a
@@ -53,7 +49,7 @@ impl Server {
         }
     }
 
-    pub fn with_api_public_url(mut self, api_public_url: Option<String>) -> Self {
+    pub fn with_public_url(mut self, api_public_url: Option<String>) -> Self {
         self.api_public_url = api_public_url;
         self
     }
@@ -112,7 +108,7 @@ impl Server {
     ) -> Result<(), ServerSetupError> {
         let bound_addr = listener.local_addr()?;
         self.state
-            .register_rest_interface_with_public_url(bound_addr, self.api_public_url.as_deref())
+            .register_rest_public(bound_addr, self.api_public_url.as_deref())
             .await;
         if self.mcp_enabled {
             self.state.register_mcp_interface().await;

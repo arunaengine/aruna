@@ -851,12 +851,6 @@ pub struct LogTails {
     pub stderr_truncated: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LogStream {
-    Stdout,
-    Stderr,
-}
-
 pub struct TaskOutput {
     pub size: u64,
     pub chunks: OutputChunks,

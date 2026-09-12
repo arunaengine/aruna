@@ -1,9 +1,6 @@
 //! Replication of locally published records to the other family holders.
-//!
-//! The append-only store queues every record this node authored and proved
-//! against the replicated chain. Delivery is asynchronous and needs no quorum:
-//! every current holder eventually accepts the immutable record, and an
-//! unreachable family leaves the entry queued instead of losing the record.
+//! Delivery is asynchronous and needs no quorum: every current holder eventually
+//! accepts the immutable record, and an unreachable family leaves it queued.
 
 use std::time::Duration;
 
@@ -506,7 +503,7 @@ async fn read_record(context: &DriverContext, key: &Key) -> Option<JobRecordFram
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::{Family, node};
+    use crate::tests::fixtures::records::{Family, node};
     use aruna_core::types::Value;
 
     #[test]

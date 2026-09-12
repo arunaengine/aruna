@@ -1,10 +1,6 @@
-//! Realm-admin administration of the compute plane.
-//!
-//! Three things live here: the realm compute configuration the planner and the
-//! standing quota gate read, the eventually consistent demand and reservation
-//! snapshots an operator judges pressure by, and the operator drain that stops
-//! this node taking new work. Every number reported is approximate across
-//! partitions and says so; none of these surfaces cancels admitted work.
+//! Realm compute configuration, approximate demand snapshots, and operator drain controls.
+//! Configuration drives planning and quota gates; drain controls stop new local work.
+//! Reported distributed values are approximate, and these controls do not cancel admitted work.
 
 use std::sync::Arc;
 
@@ -14,12 +10,11 @@ use aruna_core::structs::{
     policy_admin_path,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
-use aruna_operations::node_info::{
-    departure_report, group_demand, read_node_info_documents, read_operator_drain,
-    set_operator_drain,
+use aruna_operations::node::node_info::{
+    departure_report, group_demand, read_info_documents, read_operator_drain, set_operator_drain,
 };
-use aruna_operations::set_realm_compute::{
+use aruna_operations::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
+use aruna_operations::realm::set_compute::{
     SetRealmComputeConfig, SetRealmComputeError, SetRealmComputeOperation,
 };
 use axum::extract::{Query, State};
@@ -604,7 +599,7 @@ pub async fn get_compute_snapshots(
     let members = config
         .node_ids()
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    let documents = read_node_info_documents(&context, &members)
+    let documents = read_info_documents(&context, &members)
         .await
         .map_err(ServerError::InternalError)?;
 
@@ -794,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_group_id() {
+    fn rejects_group_id() {
         let mut body = config_body(&RealmComputeConfig::default());
         body.group_quotas.push(GroupQuotaBody {
             group_id: "not-a-ulid".to_string(),

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::endpoint;
+use crate::endpoint_screening;
 use aruna_core::structs::{OFFERED_DIRECTORY_BUCKET, SourceConnectorKind};
 use thiserror::Error;
 
@@ -117,12 +117,12 @@ pub fn validate_connector_input(
     }
 
     if let Some(endpoint) = public_config.get("endpoint")
-        && !endpoint::is_canonical(endpoint)
+        && !endpoint_screening::is_canonical(endpoint)
     {
         return Err(ValidationError::AmbiguousEndpoint(endpoint.clone()));
     }
     if let Some(bucket) = public_config.get("bucket")
-        && endpoint::breaks_authority(bucket)
+        && endpoint_screening::breaks_authority(bucket)
     {
         return Err(ValidationError::UnsafeBucket(bucket.clone()));
     }
@@ -206,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_public_key() {
+    fn unknown_public_rejected() {
         let err = validate_connector_input(
             "http",
             SourceConnectorKind::Http,
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_required_public_key() {
+    fn missing_public_rejected() {
         let err = validate_connector_input(
             "s3",
             SourceConnectorKind::S3,
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_secret_key() {
+    fn unknown_secret_rejected() {
         let err = validate_connector_input(
             "webdav",
             SourceConnectorKind::Webdav,
@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_aruna_native_connector_kind() {
+    fn unsupported_native_rejected() {
         let err = validate_connector_input(
             "native",
             SourceConnectorKind::ArunaNative,

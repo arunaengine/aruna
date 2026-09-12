@@ -21,10 +21,9 @@ pub fn is_builtin_profile(iri: &str) -> bool {
     iri == PROCESS_RUN_CRATE_PROFILE_IRI
 }
 
-/// Supported RO-Crate specification IRIs and the remaining RO-Crate community
-/// profiles (workflow run crates, Workflow RO-Crate) are version markers, not
-/// Profiles. A built-in Profile is deliberately not a marker: it has to reach
-/// validation as a Profile tag for its embedded shapes to run.
+/// Supported RO-Crate specification IRIs and the remaining RO-Crate community profiles (workflow run
+/// crates, Workflow RO-Crate) are version markers, not Profiles. A built-in Profile is deliberately not
+/// a marker: it has to reach validation as a Profile tag for its embedded shapes to run.
 pub fn is_rocrate_specification(iri: &str) -> bool {
     !is_builtin_profile(iri)
         && (matches!(
@@ -39,7 +38,7 @@ mod specification_tests {
     use super::{PROCESS_RUN_CRATE_PROFILE_IRI, is_builtin_profile, is_rocrate_specification};
 
     #[test]
-    fn community_profiles_are_markers() {
+    fn community_profiles_markers() {
         assert!(is_rocrate_specification("https://w3id.org/ro/crate/1.3"));
         assert!(is_rocrate_specification(
             "https://w3id.org/ro/wfrun/workflow/0.5"
@@ -115,22 +114,11 @@ impl<'de> Deserialize<'de> for MetadataBearerToken {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("metadata bearer token length {length} exceeds maximum {MAX_METADATA_BEARER_TOKEN_LEN}")]
 pub struct MetadataAuthTokenError {
     length: usize,
 }
-
-impl std::fmt::Display for MetadataAuthTokenError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "metadata bearer token length {} exceeds maximum {}",
-            self.length, MAX_METADATA_BEARER_TOKEN_LEN
-        )
-    }
-}
-
-impl std::error::Error for MetadataAuthTokenError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataGraphPolicy {
@@ -149,17 +137,14 @@ impl MetadataGraphPolicy {
 /// Durability policy for metadata backend mutations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataRequestDurability {
-    /// Persist the metadata backend before acknowledging the request.
-    ///
-    /// The local flush strength is controlled by `ARUNA_FJALL_PERSIST_MODE`:
-    /// `buffer` flushes to OS buffers, while `sync_all` waits for Fjall's
-    /// data-and-metadata fsync path.
+    /// Persist the metadata backend before acknowledging the request. The local flush strength is
+    /// controlled by `ARUNA_FJALL_PERSIST_MODE`: `buffer` flushes to OS buffers, while `sync_all` waits for
+    /// Fjall's data-and-metadata fsync path.
     #[default]
     Durable,
-    /// Use when the metadata event has already been accepted by the WAL path.
-    ///
-    /// Craqle/document-sync projection persistence may be deferred, but this does not
-    /// upgrade the WAL write beyond the configured Fjall persist mode.
+    /// Use when the metadata event has already been accepted by the WAL path. Craqle/document-sync
+    /// projection persistence may be deferred, but this does not upgrade the WAL write beyond the
+    /// configured Fjall persist mode.
     WalAlreadyDurable,
 }
 
@@ -365,10 +350,8 @@ pub fn raw_context_digest(jsonld: &str) -> Result<[u8; 32], MetadataError> {
     Ok(*blake3::hash(raw_context.context.get().as_bytes()).as_bytes())
 }
 
-/// The crate text an event installs as the raw base, if it is a base event.
-///
-/// A batch event answers with its authored crate: the replay only serves a
-/// document until its first merge renders the graph.
+/// The crate text an event installs as the raw base, if it is a base event. A batch event answers with
+/// its authored crate: the replay only serves a document until its first merge renders the graph.
 pub fn raw_base_jsonld(payload: &MetadataCreateEventPayload) -> Option<&str> {
     match payload {
         MetadataCreateEventPayload::RoCrate { jsonld }
@@ -1266,7 +1249,7 @@ mod tests {
     use ulid::Ulid;
 
     #[test]
-    fn compares_metadata_vector_clocks() {
+    fn compares_metadata_clocks() {
         let empty = VectorClock::default();
         let local = VectorClock(BTreeMap::from([(ActorId::from_bytes([1u8; 32]), 2)]));
         let remote = VectorClock(BTreeMap::from([(ActorId::from_bytes([1u8; 32]), 1)]));
@@ -1291,7 +1274,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_query_results_kind_labels_variants() {
+    fn metadata_query_variants() {
         assert_eq!(
             MetadataQueryResults::Solutions(Vec::new()).kind(),
             "solutions"
@@ -1626,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_document_lifecycle_upsert_wraps_create_event() {
+    fn metadata_document_event() {
         let document_id = Ulid::generate();
         let event_id = Ulid::generate();
         let create = create_event(document_id, event_id);
@@ -1647,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_document_lifecycle_delete_carries_tombstone_and_fence() {
+    fn metadata_document_fence() {
         let document_id = Ulid::generate();
         let event_id = Ulid::generate();
         let deleted_after_event_id = Ulid::generate();

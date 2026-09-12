@@ -1,19 +1,19 @@
 #![allow(dead_code)]
 
 use aruna::bootstrap::{
-    fetch_core_onboarding_documents, prepare_core_documents, publish_core_documents,
-    realm_bootstrap_exists, wait_for_onboarding_placement,
+    fetch_core_documents, prepare_core_documents, publish_core_documents, realm_bootstrap_exists,
+    wait_for_placement,
 };
 use aruna::config::{
-    Config, mark_node_state_complete, mark_onboarding_phase, read_settings, resolve_settings,
+    Config, mark_onboarding_phase, mark_state_complete, read_settings, resolve_settings,
 };
 use aruna_api::cors::CorsConfig;
-use aruna_api::ops::{OpsState, Readiness, serve_ops};
+use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
 use aruna_api::routes::credentials::{
     CreateS3CredentialsRequest, CreateS3CredentialsResponse, CreateS3PathRestriction,
 };
 use aruna_api::routes::groups::{CreateGroupRequest, CreateGroupResponse, GroupInfoResponse};
-use aruna_api::s3::s3_server::{S3Server, S3ServerTimeouts};
+use aruna_api::s3::server::{S3Server, S3ServerTimeouts};
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
@@ -29,22 +29,22 @@ use aruna_core::structs::{
     NodeCapabilities, NodeUrls, PathRestriction, RealmId, TokenClaims, UserAccess,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::announce_realm_presence::{
+use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::node::node_info::seed_info_document;
+use aruna_operations::placement::policy::{SubjectScanMode, sync_subject};
+use aruna_operations::realm::announce_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
-use aruna_operations::claim_initial_realm_admin::{
+use aruna_operations::realm::claim_admin::{
     ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
 };
-use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::node_info::seed_node_info_document;
-use aruna_operations::placement_policy::{SubjectScanMode, sync_subject};
-use aruna_operations::s3::get_user_access::GetUserAccessOperation;
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
+use aruna_operations::s3::get_access::GetUserAccessOperation;
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::tasks::incoming::initialize_task_incoming;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use aws_sdk_s3::Client as S3Client;
@@ -289,7 +289,7 @@ where
     }
 }
 
-pub(crate) async fn wait_for_realm_nodes(
+pub(crate) async fn wait_realm_nodes(
     contexts: &[&DriverContext],
     realm_id: &RealmId,
     expected: usize,
@@ -334,7 +334,7 @@ pub(crate) async fn create_bearer_token(
     .await?)
 }
 
-pub(crate) fn sign_scoped_bearer_token(
+pub(crate) fn sign_scoped_token(
     seed: &SeedNode,
     user_id: UserId,
     path_restrictions: Vec<PathRestriction>,
@@ -381,7 +381,7 @@ pub(crate) async fn get_user_access(
     Ok(access)
 }
 
-pub(crate) async fn create_group_via_http(
+pub(crate) async fn create_group_http(
     base_url: &str,
     bearer_token: &str,
     name: &str,
@@ -406,7 +406,7 @@ pub(crate) async fn create_group_via_http(
     Ok(response.json().await?)
 }
 
-pub(crate) async fn get_group_via_http(
+pub(crate) async fn get_group_http(
     base_url: &str,
     bearer_token: &str,
     group_id: &str,
@@ -428,7 +428,7 @@ pub(crate) async fn get_group_via_http(
     Ok(response.json().await?)
 }
 
-pub(crate) async fn wait_for_group_via_http(
+pub(crate) async fn wait_group_http(
     base_url: &str,
     bearer_token: &str,
     group_id: &str,
@@ -438,31 +438,31 @@ pub(crate) async fn wait_for_group_via_http(
         WAIT_CAP,
         Duration::from_millis(100),
         || async {
-            get_group_via_http(base_url, bearer_token, group_id)
+            get_group_http(base_url, bearer_token, group_id)
                 .await
                 .is_ok()
         },
     )
     .await?;
 
-    get_group_via_http(base_url, bearer_token, group_id).await
+    get_group_http(base_url, bearer_token, group_id).await
 }
 
-pub(crate) async fn create_s3_credentials_via_http(
+pub(crate) async fn create_s3_credentials(
     base_url: &str,
     bearer_token: &str,
     group_id: &str,
 ) -> TestResult<S3Credentials> {
-    create_s3_credentials_with_restrictions_via_http(base_url, bearer_token, group_id, None).await
+    create_restricted_credentials(base_url, bearer_token, group_id, None).await
 }
 
-pub(crate) async fn create_s3_credentials_with_restrictions_via_http(
+pub(crate) async fn create_restricted_credentials(
     base_url: &str,
     bearer_token: &str,
     group_id: &str,
     path_restrictions: Option<Vec<CreateS3PathRestriction>>,
 ) -> TestResult<S3Credentials> {
-    wait_for_group_via_http(base_url, bearer_token, group_id).await?;
+    wait_group_http(base_url, bearer_token, group_id).await?;
 
     let client = reqwest::Client::new();
     let deadline = Instant::now() + WAIT_CAP;
@@ -500,7 +500,7 @@ pub(crate) async fn create_s3_credentials_with_restrictions_via_http(
 }
 
 #[allow(dead_code)]
-pub(crate) async fn revoke_s3_credentials_via_http(
+pub(crate) async fn revoke_s3_credentials(
     base_url: &str,
     bearer_token: &str,
     access_key_id: &str,
@@ -524,17 +524,17 @@ pub(crate) async fn revoke_s3_credentials_via_http(
 }
 
 pub(crate) fn s3_client(endpoint: &S3Endpoint, credentials: &S3Credentials) -> S3Client {
-    s3_client_with_retries(endpoint, credentials, true)
+    s3_client_retries(endpoint, credentials, true)
 }
 
 /// Builds a client with SDK retries disabled so deterministic rejections (for
 /// example a 501 for unsupported SSE) surface immediately instead of retrying.
 #[allow(dead_code)]
-pub(crate) fn s3_client_no_retry(endpoint: &S3Endpoint, credentials: &S3Credentials) -> S3Client {
-    s3_client_with_retries(endpoint, credentials, false)
+pub(crate) fn s3_client_once(endpoint: &S3Endpoint, credentials: &S3Credentials) -> S3Client {
+    s3_client_retries(endpoint, credentials, false)
 }
 
-fn s3_client_with_retries(
+fn s3_client_retries(
     endpoint: &S3Endpoint,
     credentials: &S3Credentials,
     retries: bool,
@@ -566,12 +566,12 @@ pub(crate) fn bucket_arn(realm_id: &RealmId, node_id: iroh::PublicKey, bucket: &
 
 #[allow(dead_code)]
 pub(crate) async fn spawn_seed_node() -> TestResult<SeedNode> {
-    spawn_seed_node_with_mode(NodeServiceMode::Minimal, None).await
+    spawn_seed_mode(NodeServiceMode::Minimal, None).await
 }
 
 #[allow(dead_code)]
-pub(crate) async fn spawn_full_seed_node() -> TestResult<SeedNode> {
-    spawn_seed_node_with_mode(NodeServiceMode::Full, None).await
+pub(crate) async fn spawn_complete_seed() -> TestResult<SeedNode> {
+    spawn_seed_mode(NodeServiceMode::Full, None).await
 }
 
 /// A full node whose own runtime can launch and run executions: the registry is
@@ -579,10 +579,10 @@ pub(crate) async fn spawn_full_seed_node() -> TestResult<SeedNode> {
 /// backend a launch is admitted against.
 #[allow(dead_code)]
 pub(crate) async fn spawn_compute_seed(compute: Arc<ExecutorRegistry>) -> TestResult<SeedNode> {
-    spawn_seed_node_with_mode(NodeServiceMode::Full, Some(compute)).await
+    spawn_seed_mode(NodeServiceMode::Full, Some(compute)).await
 }
 
-pub(crate) async fn create_onboarding_secret_via_http(
+pub(crate) async fn create_onboarding_secret(
     seed: &SeedNode,
     mode: OnboardingMode,
 ) -> TestResult<String> {
@@ -619,22 +619,22 @@ pub(crate) async fn create_onboarding_secret_via_http(
 }
 
 #[allow(dead_code)]
+pub(crate) async fn spawn_complete_joiner(
+    seed: &SeedNode,
+    onboarding_secret: String,
+) -> TestResult<JoinerNode> {
+    spawn_joiner_mode(seed, onboarding_secret, NodeServiceMode::Minimal).await
+}
+
+#[allow(dead_code)]
 pub(crate) async fn spawn_joiner_node(
     seed: &SeedNode,
     onboarding_secret: String,
 ) -> TestResult<JoinerNode> {
-    spawn_joiner_node_with_mode(seed, onboarding_secret, NodeServiceMode::Minimal).await
+    spawn_joiner_mode(seed, onboarding_secret, NodeServiceMode::Full).await
 }
 
-#[allow(dead_code)]
-pub(crate) async fn spawn_full_joiner_node(
-    seed: &SeedNode,
-    onboarding_secret: String,
-) -> TestResult<JoinerNode> {
-    spawn_joiner_node_with_mode(seed, onboarding_secret, NodeServiceMode::Full).await
-}
-
-async fn spawn_seed_node_with_mode(
+async fn spawn_seed_mode(
     mode: NodeServiceMode,
     compute: Option<Arc<ExecutorRegistry>>,
 ) -> TestResult<SeedNode> {
@@ -693,7 +693,7 @@ async fn spawn_seed_node_with_mode(
         .await
         .map_err(std::io::Error::other)?;
     }
-    seed_node_info_document(
+    seed_info_document(
         context.as_ref(),
         net.node_id(),
         realm_id,
@@ -707,10 +707,8 @@ async fn spawn_seed_node_with_mode(
     let documents =
         prepare_core_documents(context.as_ref(), net.node_id(), realm_id, true, true).await?;
     publish_core_documents(context.as_ref(), net.node_id(), realm_id, true, documents).await?;
-    // Mirrors the startup path in main.rs: the seed is rank-0 holder of every
-    // shard in its single-node realm and must create the shard topic geneses
-    // eagerly, or its first shard-classed writes defer forever.
-    aruna_operations::process_placements::process_shard_placements(
+    // The single-node seed owns rank zero and creates shard geneses before writes.
+    aruna_operations::placement::process_placements::process_shard_placements(
         &context,
         realm_id,
         net.node_id(),
@@ -738,7 +736,7 @@ async fn spawn_seed_node_with_mode(
     )
     .await?;
     let metrics = state.metrics();
-    let (s3, s3_task) = spawn_optional_s3_server(
+    let (s3, s3_task) = spawn_optional_s3(
         mode,
         context.clone(),
         realm_id,
@@ -765,13 +763,13 @@ async fn spawn_seed_node_with_mode(
     })
 }
 
-async fn spawn_joiner_node_with_mode(
+async fn spawn_joiner_mode(
     seed: &SeedNode,
     onboarding_secret: String,
     mode: NodeServiceMode,
 ) -> TestResult<JoinerNode> {
     let joiner_dir = tempfile::tempdir()?;
-    let (config, storage_handle) = load_config_with_env(&joiner_dir, onboarding_secret).await?;
+    let (config, storage_handle) = load_env_config(&joiner_dir, onboarding_secret).await?;
 
     let joiner_net = NetHandle::new(
         NetConfig {
@@ -804,7 +802,7 @@ async fn spawn_joiner_node_with_mode(
     seed.net.add_peer_addr(joiner_net.endpoint_addr()).await;
     announce_realm_presence(seed.context.as_ref(), &seed.realm_id, seed.net.node_id()).await?;
 
-    fetch_core_onboarding_documents(
+    fetch_core_documents(
         &joiner_context,
         &config.node_state,
         &config.realm_id,
@@ -813,7 +811,7 @@ async fn spawn_joiner_node_with_mode(
     )
     .await?;
     assert!(realm_bootstrap_exists(joiner_context.as_ref(), &config.realm_id).await?);
-    wait_for_onboarding_placement(
+    wait_for_placement(
         &joiner_context,
         config.realm_id,
         config.node_id,
@@ -828,7 +826,7 @@ async fn spawn_joiner_node_with_mode(
         OnboardingPhase::CoreDocumentsFetched,
     )
     .await?;
-    seed_node_info_document(
+    seed_info_document(
         joiner_context.as_ref(),
         config.node_id,
         config.realm_id,
@@ -855,17 +853,16 @@ async fn spawn_joiner_node_with_mode(
         documents,
     )
     .await?;
-    mark_node_state_complete(&joiner_context.storage_handle, &config.node_state).await?;
-    // Mirrors the startup path in main.rs: join the held shard topics from
-    // co-holders, then create the geneses of shards this node is now rank-0
-    // holder of (join-before-create adopts geneses the seed already made).
-    aruna_operations::startup::restore_shard_subscriptions(
+    mark_state_complete(&joiner_context.storage_handle, &config.node_state).await?;
+    // Join co-holder shard topics before creating rank-zero geneses.
+    // This ordering adopts geneses already created by the seed.
+    aruna_operations::node::startup::restore_shard_subscriptions(
         &joiner_context,
         config.node_id,
         config.realm_id,
     )
     .await;
-    aruna_operations::process_placements::reconcile_shard_topics(
+    aruna_operations::placement::process_placements::reconcile_shard_topics(
         &joiner_context,
         config.realm_id,
         config.node_id,
@@ -880,7 +877,7 @@ async fn spawn_joiner_node_with_mode(
         config.node_capabilities.clone(),
     )
     .await?;
-    let (s3, s3_task) = spawn_optional_s3_server(
+    let (s3, s3_task) = spawn_optional_s3(
         mode,
         joiner_context.clone(),
         config.realm_id,
@@ -1020,7 +1017,7 @@ async fn spawn_ops_server(
     metrics: Arc<NodeMetrics>,
 ) -> TestResult<(String, Readiness, JoinHandle<()>)> {
     let readiness = Readiness::new();
-    let ops_state = OpsState::new(context, metrics, readiness.clone()).await;
+    let ops_state = MonitoringState::new(context, metrics, readiness.clone()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let task = tokio::spawn(async move {
@@ -1029,7 +1026,7 @@ async fn spawn_ops_server(
     Ok((format!("http://{addr}"), readiness, task))
 }
 
-async fn spawn_optional_s3_server(
+async fn spawn_optional_s3(
     mode: NodeServiceMode,
     context: Arc<DriverContext>,
     realm_id: RealmId,
@@ -1083,7 +1080,7 @@ async fn spawn_s3_server(
     ))
 }
 
-async fn load_config_with_env(
+async fn load_env_config(
     joiner_dir: &TempDir,
     onboarding_secret: String,
 ) -> TestResult<(Config, StorageHandle)> {

@@ -12,7 +12,7 @@ use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
     JobPayload, JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, NodeCapabilities,
     OutputDestination, OutputSelection, PhysicalExecutionResult, ResultMessage, WorkspaceMode,
-    blob_group_permission_path,
+    group_permission_path,
 };
 use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
 use aruna_operations::driver::drive;
@@ -21,7 +21,7 @@ use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_exte
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
 };
-use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
+use aruna_operations::s3::get_access::{GetUserAccessError, GetUserAccessOperation};
 use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
@@ -34,7 +34,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_realm_auth};
+use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_auth};
 use crate::error::ServerError;
 use crate::forwarded::external_base_url;
 use crate::routes::device::require_owner;
@@ -106,9 +106,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     )
 }
 
-// ---------------------------------------------------------------------------
-// TES wire types (GA4GH TES v1.1, snake_case per the TES OpenAPI).
-// ---------------------------------------------------------------------------
+// GA4GH TES v1.1 wire types use the OpenAPI snake_case names.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -454,10 +452,6 @@ fn parse_tag_filters(raw_query: Option<&str>) -> Vec<(String, String)> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Handlers
-// ---------------------------------------------------------------------------
-
 #[utoipa::path(
     get,
     path = "/ga4gh/tes/v1/service-info",
@@ -678,7 +672,7 @@ pub async fn create_task(
         return error.into_response();
     }
 
-    let (spec, idempotency_key) = match map_task_to_spec(&task, caller.credential_group, target) {
+    let (spec, idempotency_key) = match map_execution_spec(&task, caller.credential_group, target) {
         Ok(mapped) => mapped,
         Err(error) => return error.into_response(),
     };
@@ -891,9 +885,7 @@ pub async fn get_task(
         }),
         Err(error) => return TesError::from_server(error).into_response(),
     };
-    // A distributed external job is projected from the replicated family, so
-    // this surface reports the same logical view and the same exact output
-    // VersionIds as the native REST status.
+    // TES and native REST project the same family and exact output version identifiers.
     let (record, details) = match family_report(&state.get_ctx(), &caller.auth, job_id).await {
         Some(Ok(report)) => (family_record(&report), TaskDetails::from_report(&report)),
         Some(Err(error)) => return TesError::from_job_route(error).into_response(),
@@ -1203,10 +1195,6 @@ pub async fn cancel_task(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Mapping: TesTask -> ExecutionSpec
-// ---------------------------------------------------------------------------
-
 /// Resolve the effective group from the tag or credential alone, without
 /// touching the rest of the untrusted task payload.
 fn resolve_task_group(task: &TesTask, credential_group: Option<Ulid>) -> Result<Ulid, TesError> {
@@ -1240,11 +1228,43 @@ fn target_modes(target: ExecutionTarget) -> (InputMode, WorkspaceMode) {
 
 /// Map a TES task onto the internal execution plan and optional dedup key.
 /// Pure and self-contained: the group-write permission check happens separately.
-fn map_task_to_spec(
+fn map_execution_spec(
     task: &TesTask,
     credential_group: Option<Ulid>,
     target: ExecutionTarget,
 ) -> Result<(ExecutionSpec, Option<String>), TesError> {
+    let executor = validate_task_shape(task)?;
+    let group_id = resolve_task_group(task, credential_group)?;
+    let (input_mode, _) = target_modes(target);
+    let inputs = map_task_inputs(task, input_mode)?;
+    let file_outputs = map_task_outputs(task, &inputs)?;
+    let resources = map_task_resources(task)?;
+
+    let spec = ExecutionSpec {
+        group_id,
+        name: task.name.clone(),
+        description: task.description.clone(),
+        tags: task.tags.clone(),
+        image: executor.image.clone(),
+        // TES `command` is the full argv, so it replaces the image entrypoint.
+        entrypoint: Some(executor.command.clone()),
+        command: Vec::new(),
+        workdir: executor.workdir.clone(),
+        env: executor.env.clone(),
+        resources,
+        executor_constraint: task.tags.get(EXECUTOR_TAG_KEY).cloned(),
+        inputs,
+        file_outputs,
+        workspace_outputs: Vec::new(),
+        output_prefixes: Vec::new(),
+        collision_policy: Default::default(),
+    };
+
+    // Ingress adds the per-user namespace to this raw idempotency key.
+    Ok((spec, task.tags.get(IDEMPOTENCY_TAG_KEY).cloned()))
+}
+
+fn validate_task_shape(task: &TesTask) -> Result<&TesExecutor, TesError> {
     if task.id.is_some()
         || task.state.is_some()
         || !task.logs.is_empty()
@@ -1293,12 +1313,13 @@ fn map_task_to_spec(
         return Err(TesError::bad_request("task volumes are not supported"));
     }
 
-    let group_id = resolve_task_group(task, credential_group)?;
+    Ok(executor)
+}
 
+fn map_task_inputs(task: &TesTask, input_mode: InputMode) -> Result<Vec<InputSelection>, TesError> {
     if task.inputs.len() > MAX_TASK_IO {
         return Err(TesError::bad_request("too many task inputs"));
     }
-    let (input_mode, _) = target_modes(target);
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(task.inputs.len());
     for input in &task.inputs {
         let input = map_input(input, input_mode)?;
@@ -1319,6 +1340,13 @@ fn map_task_to_spec(
         }
         inputs.push(input);
     }
+    Ok(inputs)
+}
+
+fn map_task_outputs(
+    task: &TesTask,
+    inputs: &[InputSelection],
+) -> Result<Vec<OutputSelection>, TesError> {
     if task.outputs.len() > MAX_EXECUTION_OUTPUTS {
         return Err(TesError::bad_request("too many task outputs"));
     }
@@ -1361,7 +1389,7 @@ fn map_task_to_spec(
         if parent == "/" {
             return Err(TesError::bad_request("root output parent is forbidden"));
         }
-        for input in &inputs {
+        for input in inputs {
             if let Some(path) = input.container_path.as_deref()
                 && (path == output.container_path
                     || pattern.as_ref().is_some_and(|glob| glob.is_match(path))
@@ -1373,6 +1401,10 @@ fn map_task_to_spec(
         }
     }
 
+    Ok(file_outputs)
+}
+
+fn map_task_resources(task: &TesTask) -> Result<ComputeResources, TesError> {
     let cpu_cores = task.resources.as_ref().and_then(|r| r.cpu_cores);
     if cpu_cores == Some(0) {
         return Err(TesError::bad_request("invalid cpu_cores"));
@@ -1397,7 +1429,7 @@ fn map_task_to_spec(
         .and_then(|r| r.disk_gb)
         .map(|gb| gb_to_bytes(gb, "disk_gb"))
         .transpose()?;
-    let resources = ComputeResources {
+    Ok(ComputeResources {
         cpu_cores,
         ram_bytes,
         disk_bytes,
@@ -1407,34 +1439,7 @@ fn map_task_to_spec(
             .as_ref()
             .and_then(|resources| resources.preemptible)
             .unwrap_or(false),
-    };
-
-    let spec = ExecutionSpec {
-        group_id,
-        name: task.name.clone(),
-        description: task.description.clone(),
-        tags: task.tags.clone(),
-        image: executor.image.clone(),
-        // TES `command` is the full argv; override the image ENTRYPOINT with it and
-        // leave the image CMD unset so exactly the requested argv runs.
-        entrypoint: Some(executor.command.clone()),
-        command: Vec::new(),
-        workdir: executor.workdir.clone(),
-        env: executor.env.clone(),
-        resources,
-        executor_constraint: task.tags.get(EXECUTOR_TAG_KEY).cloned(),
-        inputs,
-        file_outputs,
-        workspace_outputs: Vec::new(),
-        output_prefixes: Vec::new(),
-        collision_policy: Default::default(),
-    };
-
-    // Handed over as the raw idempotency key: the ingress applies the per-user
-    // `user/` namespacing itself, so TES inherits dedup scoping for free.
-    let idempotency_key = task.tags.get(IDEMPOTENCY_TAG_KEY).cloned();
-
-    Ok((spec, idempotency_key))
+    })
 }
 
 fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesError> {
@@ -1562,10 +1567,6 @@ fn gb_to_bytes(gb: f64, field: &str) -> Result<u64, TesError> {
     Ok(bytes)
 }
 
-// ---------------------------------------------------------------------------
-// Mapping: JobRecord -> TesTask / TesState
-// ---------------------------------------------------------------------------
-
 /// Map an internal job state onto its TES external state. `Failed` splits on
 /// evidence: a non-zero container exit is an executor error; post-processing and
 /// evidence-free failures are system errors. `Indeterminate` maps to TES `UNKNOWN`.
@@ -1591,10 +1592,8 @@ fn tes_state(record: &JobRecord) -> TesState {
     }
 }
 
-/// The reduced family as the local row shape every TES projection reads. Only
-/// the canonical successful execution supplies outputs, and they keep their
-/// exact VersionIds, so a later unrelated write never becomes this task's
-/// result.
+/// Reduces a family to the local row used by every TES projection.
+/// Only canonical success supplies exact output versions, excluding later unrelated writes.
 fn family_record(report: &FamilyReport) -> JobRecord {
     let mut record = JobRecord::new(
         report.job.job_id,
@@ -1912,10 +1911,6 @@ fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 #[derive(Debug)]
 struct TesCaller {
     auth: AuthContext,
@@ -1928,8 +1923,7 @@ async fn authenticate_tes(
     headers: &HeaderMap,
 ) -> Result<TesCaller, TesError> {
     if let Some(auth) = auth {
-        let auth =
-            require_unrestricted_realm_auth(state, Some(auth)).map_err(TesError::from_server)?;
+        let auth = require_unrestricted_auth(state, Some(auth)).map_err(TesError::from_server)?;
         return Ok(TesCaller {
             auth,
             credential_group: None,
@@ -1967,7 +1961,7 @@ async fn authenticate_tes(
     }
 
     let credential_group = access.group_id;
-    let auth = require_unrestricted_realm_auth(
+    let auth = require_unrestricted_auth(
         state,
         Some(AuthContext {
             user_id: access.user_identity,
@@ -2027,7 +2021,7 @@ async fn ensure_group_write(
     crate::auth::ensure_permission(
         state,
         auth,
-        blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
+        group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
         aruna_core::structs::Permission::WRITE,
     )
     .await
@@ -2279,9 +2273,8 @@ mod tests {
             user_id: owner,
             realm_id: realm(),
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm());
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm(), group_id);
+        let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm());
+        let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm(), group_id);
         let group = Group {
             display_name: "tes-group".to_string(),
             group_id,
@@ -2411,7 +2404,7 @@ mod tests {
         // executor logs appear only once the task is terminal.
         let group = Ulid::from_bytes([5u8; 16]);
         let (spec, _) =
-            map_task_to_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
+            map_execution_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
         let mut record = execution_record(JobId::from_bytes([9u8; 16]), user(2), spec);
 
         let running = build_task_log(&record, "");
@@ -2547,12 +2540,12 @@ mod tests {
         let group = Ulid::from_bytes([5u8; 16]);
         let mut task = sample_task(group);
         task.inputs = vec![task.inputs[0].clone(); MAX_TASK_IO + 1];
-        let error = map_task_to_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+        let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
 
         let mut task = sample_task(group);
         task.outputs = vec![task.outputs[0].clone(); MAX_EXECUTION_OUTPUTS + 1];
-        let error = map_task_to_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+        let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
@@ -2560,7 +2553,7 @@ mod tests {
     fn maps_task() {
         let group = Ulid::from_bytes([5u8; 16]);
         let (spec, dedup) =
-            map_task_to_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
+            map_execution_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
         assert_eq!(spec.group_id, group);
         assert_eq!(spec.name.as_deref(), Some("align reads"));
         assert_eq!(spec.description.as_deref(), Some("sample task"));
@@ -2606,7 +2599,7 @@ mod tests {
     fn filters_tasks() {
         let group = Ulid::from_bytes([5u8; 16]);
         let (spec, _) =
-            map_task_to_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
+            map_execution_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
         let mut record = execution_record(JobId::from_bytes([6u8; 16]), user(2), spec);
         record.state = JobState::Running;
         let uri: axum::http::Uri = "/ga4gh/tes/v1/tasks?state=RUNNING&name_prefix=align&tag_key=project&tag_key=aruna-engine.org%2Fgroup&tag_value=alpha"
@@ -2695,7 +2688,7 @@ mod tests {
         input.url = Some("s3://src/other.csv".to_string());
         task.inputs.push(input);
         assert_eq!(
-            map_task_to_spec(&task, None, ExecutionTarget::Realm)
+            map_execution_spec(&task, None, ExecutionTarget::Realm)
                 .unwrap_err()
                 .status,
             StatusCode::BAD_REQUEST
@@ -2708,7 +2701,7 @@ mod tests {
         for size_gb in [-1.0, 0.0, f64::NAN, 1e-10, f64::MAX] {
             task.resources.as_mut().unwrap().ram_gb = Some(size_gb);
             assert_eq!(
-                map_task_to_spec(&task, None, ExecutionTarget::Realm)
+                map_execution_spec(&task, None, ExecutionTarget::Realm)
                     .unwrap_err()
                     .status,
                 StatusCode::BAD_REQUEST
@@ -2716,7 +2709,7 @@ mod tests {
             task.resources.as_mut().unwrap().ram_gb = Some(4.0);
             task.resources.as_mut().unwrap().disk_gb = Some(size_gb);
             assert_eq!(
-                map_task_to_spec(&task, None, ExecutionTarget::Realm)
+                map_execution_spec(&task, None, ExecutionTarget::Realm)
                     .unwrap_err()
                     .status,
                 StatusCode::BAD_REQUEST
@@ -2729,7 +2722,7 @@ mod tests {
     fn rejects_multi_executor() {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.executors.push(task.executors[0].clone());
-        let error = map_task_to_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+        let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.message.contains("single executor"));
     }
@@ -2738,7 +2731,7 @@ mod tests {
     fn rejects_missing_group() {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.tags.clear();
-        let error = map_task_to_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+        let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.message.contains(GROUP_TAG_KEY));
     }
@@ -2748,7 +2741,7 @@ mod tests {
         let group = Ulid::from_bytes([5u8; 16]);
         let mut task = sample_task(group);
         task.tags.remove(GROUP_TAG_KEY);
-        let (spec, _) = map_task_to_spec(&task, Some(group), ExecutionTarget::Realm).unwrap();
+        let (spec, _) = map_execution_spec(&task, Some(group), ExecutionTarget::Realm).unwrap();
         assert_eq!(spec.group_id, group);
     }
 
@@ -2756,7 +2749,7 @@ mod tests {
     fn rejects_group_override() {
         let group = Ulid::from_bytes([5u8; 16]);
         let credential_group = Ulid::from_bytes([6u8; 16]);
-        let error = map_task_to_spec(
+        let error = map_execution_spec(
             &sample_task(group),
             Some(credential_group),
             ExecutionTarget::Realm,
@@ -2770,7 +2763,7 @@ mod tests {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.executors[0].workdir = Some("work".to_string());
         assert_eq!(
-            map_task_to_spec(&task, None, ExecutionTarget::Realm)
+            map_execution_spec(&task, None, ExecutionTarget::Realm)
                 .unwrap_err()
                 .status,
             StatusCode::BAD_REQUEST
@@ -2778,7 +2771,7 @@ mod tests {
         task.executors[0].workdir = Some("/work".to_string());
         task.inputs[0].path = "/in/../data.csv".to_string();
         assert_eq!(
-            map_task_to_spec(&task, None, ExecutionTarget::Realm)
+            map_execution_spec(&task, None, ExecutionTarget::Realm)
                 .unwrap_err()
                 .status,
             StatusCode::BAD_REQUEST
@@ -2786,7 +2779,7 @@ mod tests {
         task.inputs[0].path = "/in/data.csv".to_string();
         task.outputs[0].path = "/out//report.txt".to_string();
         assert_eq!(
-            map_task_to_spec(&task, None, ExecutionTarget::Realm)
+            map_execution_spec(&task, None, ExecutionTarget::Realm)
                 .unwrap_err()
                 .status,
             StatusCode::BAD_REQUEST
@@ -2797,26 +2790,26 @@ mod tests {
     fn rejects_unsupported_fields() {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.id = Some("server-owned".to_string());
-        assert!(map_task_to_spec(&task, None, ExecutionTarget::Realm).is_err());
+        assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
         task.id = None;
         task.inputs[0].kind = TesFileType::Directory;
-        assert!(map_task_to_spec(&task, None, ExecutionTarget::Realm).is_err());
+        assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
         task.inputs[0].kind = TesFileType::File;
         task.outputs[0].kind = TesFileType::Directory;
-        assert!(map_task_to_spec(&task, None, ExecutionTarget::Realm).is_err());
+        assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
         task.outputs[0].kind = TesFileType::File;
         task.executors[0].stdout = Some("/logs/out".to_string());
-        assert!(map_task_to_spec(&task, None, ExecutionTarget::Realm).is_err());
+        assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
         task.executors[0].stdout = None;
         task.volumes.push("/data".to_string());
-        assert!(map_task_to_spec(&task, None, ExecutionTarget::Realm).is_err());
+        assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
         task.volumes.clear();
         task.resources
             .as_mut()
             .unwrap()
             .zones
             .push("zone-a".to_string());
-        assert!(map_task_to_spec(&task, None, ExecutionTarget::Realm).is_err());
+        assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
     }
 
     #[test]
@@ -2826,7 +2819,7 @@ mod tests {
         task.outputs[0].path_prefix = Some("/out".to_string());
         task.outputs[0].url = Some("s3://dest/results".to_string());
 
-        let (spec, _) = map_task_to_spec(&task, None, ExecutionTarget::Realm).unwrap();
+        let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
 
         assert_eq!(spec.file_outputs[0].container_path, "/out/*.txt");
         assert_eq!(spec.file_outputs[0].path_prefix.as_deref(), Some("/out"));
@@ -2840,7 +2833,7 @@ mod tests {
         task.outputs[0].path = "/in/*.csv".to_string();
         task.outputs[0].path_prefix = Some("/in".to_string());
 
-        let error = map_task_to_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+        let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
 
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
@@ -2850,7 +2843,7 @@ mod tests {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.outputs[0].path = "/out/*.txt".to_string();
 
-        let error = map_task_to_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+        let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
 
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.message.contains("/out/*.txt"), "{}", error.message);
@@ -2862,14 +2855,14 @@ mod tests {
         task.outputs[0].path = "/out/sub/*.txt".to_string();
         for prefix in ["/other", "/out/s", "/out/*", "out"] {
             task.outputs[0].path_prefix = Some(prefix.to_string());
-            let error = map_task_to_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+            let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
             assert_eq!(error.status, StatusCode::BAD_REQUEST, "{prefix}");
         }
         // The pattern itself must still compile.
         task.outputs[0].path = "/out/[a.txt".to_string();
         task.outputs[0].path_prefix = Some("/out".to_string());
         assert_eq!(
-            map_task_to_spec(&task, None, ExecutionTarget::Realm)
+            map_execution_spec(&task, None, ExecutionTarget::Realm)
                 .unwrap_err()
                 .status,
             StatusCode::BAD_REQUEST
@@ -2882,7 +2875,7 @@ mod tests {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.outputs[0].path_prefix = Some("/out".to_string());
 
-        let (spec, _) = map_task_to_spec(&task, None, ExecutionTarget::Realm).unwrap();
+        let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
 
         assert!(spec.file_outputs[0].path_prefix.is_none());
     }
@@ -2893,7 +2886,7 @@ mod tests {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.inputs[0].path = "/in/*.csv".to_string();
 
-        let error = map_task_to_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+        let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
 
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
@@ -2904,15 +2897,15 @@ mod tests {
         let mut output = task.outputs[0].clone();
         output.url = Some("s3://dest/out/other.txt".to_string());
         task.outputs.push(output);
-        assert!(map_task_to_spec(&task, None, ExecutionTarget::Realm).is_err());
+        assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
 
         task.outputs[1].path = "/out/other.txt".to_string();
         task.outputs[1].url = task.outputs[0].url.clone();
-        assert!(map_task_to_spec(&task, None, ExecutionTarget::Realm).is_err());
+        assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
 
         task.outputs.truncate(1);
         task.outputs[0].path = task.inputs[0].path.clone();
-        assert!(map_task_to_spec(&task, None, ExecutionTarget::Realm).is_err());
+        assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
     }
 
     #[test]
@@ -2920,7 +2913,7 @@ mod tests {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.inputs[0].path = "/work/.command.sh".to_string();
         task.outputs[0].path = "/work/out.txt".to_string();
-        assert!(map_task_to_spec(&task, None, ExecutionTarget::Realm).is_ok());
+        assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_ok());
     }
 
     #[test]
@@ -2984,7 +2977,7 @@ mod tests {
 
     #[test]
     fn view_projections() {
-        let (spec, _) = map_task_to_spec(
+        let (spec, _) = map_execution_spec(
             &sample_task(Ulid::from_bytes([5u8; 16])),
             None,
             ExecutionTarget::Realm,
@@ -3215,10 +3208,8 @@ mod tests {
     }
 
     #[test]
-    fn family_keeps_exact_versions() {
-        // The TES view of a distributed job is the same logical projection as
-        // the native REST one: the canonical execution's exact VersionIds, and
-        // no result at all while the family has no canonical success.
+    fn family_preserves_versions() {
+        // TES preserves canonical output versions and reports none before canonical success.
         use aruna_core::structs::LogicalJobState;
 
         let report = family_fixture();
@@ -3436,7 +3427,7 @@ mod tests {
         task.tags
             .insert(TARGET_TAG_KEY.to_string(), "local".to_string());
 
-        let (spec, _) = map_task_to_spec(&task, None, ExecutionTarget::Local).unwrap();
+        let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Local).unwrap();
 
         assert_eq!(
             project_tags(&spec).get(TARGET_TAG_KEY).map(String::as_str),
@@ -3451,7 +3442,7 @@ mod tests {
         task.tags
             .insert(EXECUTOR_KIND_TAG_KEY.to_string(), "docker".to_string());
 
-        let error = map_task_to_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+        let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert_eq!(error.code.as_deref(), Some("reserved_tag"));
     }
@@ -3528,9 +3519,7 @@ mod tests {
 
     #[tokio::test]
     async fn creates_tagless_basic() {
-        // Tagless basic auth infers the group and reaches admission; the
-        // fixture has no network handle, so no family holder exists and the
-        // honest single-node answer is the fixed-text 503, not an auth failure.
+        // Tagless auth reaches admission, then this holder-free fixture returns the expected 503.
         let (_dir, state) = build_state().await;
         let group = Ulid::from_bytes([5u8; 16]);
         let access = issued_access(&state, group);
@@ -3540,7 +3529,7 @@ mod tests {
         task.tags.remove(GROUP_TAG_KEY);
 
         let (spec, workspace) =
-            map_task_to_spec(&task, Some(group), ExecutionTarget::Realm).unwrap();
+            map_execution_spec(&task, Some(group), ExecutionTarget::Realm).unwrap();
         assert_eq!(spec.group_id, group);
         assert!(workspace.is_none());
 
@@ -3571,14 +3560,14 @@ mod tests {
         write_auth(&state, group, access.user_identity).await;
 
         let (spec, _) =
-            map_task_to_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
+            map_execution_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
         assert_eq!(spec.inputs[0].mode, InputMode::Mount);
         assert_eq!(
             target_modes(ExecutionTarget::Realm),
             (InputMode::Mount, WorkspaceMode::None)
         );
         let (local, _) =
-            map_task_to_spec(&sample_task(group), None, ExecutionTarget::Local).unwrap();
+            map_execution_spec(&sample_task(group), None, ExecutionTarget::Local).unwrap();
         assert_eq!(local.inputs[0].mode, InputMode::Snapshot);
         assert_eq!(
             target_modes(ExecutionTarget::Local),
@@ -3615,7 +3604,7 @@ mod tests {
         let hidden_id = JobId::from_bytes([10u8; 16]);
         for (job_id, group_id) in [(visible_id, group), (hidden_id, sibling)] {
             let (spec, _) =
-                map_task_to_spec(&sample_task(group_id), None, ExecutionTarget::Realm).unwrap();
+                map_execution_spec(&sample_task(group_id), None, ExecutionTarget::Realm).unwrap();
             insert_job(
                 &state.get_ctx().storage_handle,
                 &execution_record(job_id, owner, spec),
@@ -3694,7 +3683,7 @@ mod tests {
         write_credential(&state, &access).await;
         let headers = basic_headers(&access, TES_SECRET);
         let (spec, _) =
-            map_task_to_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
+            map_execution_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
         insert_job(
             &state.get_ctx().storage_handle,
             &execution_record(JobId::from_bytes([9u8; 16]), owner, spec),
@@ -3737,7 +3726,7 @@ mod tests {
             JobId::from_bytes([10u8; 16]),
         ] {
             let (spec, _) =
-                map_task_to_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
+                map_execution_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
             insert_job(
                 &state.get_ctx().storage_handle,
                 &execution_record(job_id, owner, spec),
@@ -3778,7 +3767,7 @@ mod tests {
     async fn get_resolves() {
         let (_dir, state) = build_state().await;
         let owner = user(2);
-        let (spec, _) = map_task_to_spec(
+        let (spec, _) = map_execution_spec(
             &sample_task(Ulid::from_bytes([5u8; 16])),
             None,
             ExecutionTarget::Realm,
@@ -3824,7 +3813,7 @@ mod tests {
     async fn cancel_maps_through() {
         let (_dir, state) = build_state().await;
         let owner = user(2);
-        let (spec, _) = map_task_to_spec(
+        let (spec, _) = map_execution_spec(
             &sample_task(Ulid::from_bytes([5u8; 16])),
             None,
             ExecutionTarget::Realm,

@@ -1,10 +1,6 @@
-//! What the external surfaces report about one request family.
-//!
-//! Everything here is derived from the immutable records this responder holds,
-//! plus two explicitly responder-local diagnostics: the plan this node stored
-//! when it was a witness, and whether it still has a retry armed. Both are kept
-//! outside the replicated projection digest, so a client can tell a local view
-//! apart from realm-wide truth.
+//! What the external surfaces report about one request family: immutable records
+//! plus two responder-local diagnostics kept outside the projection digest, the
+//! stored witness plan and retry state, so clients see local versus realm truth.
 
 use aruna_core::compute::ExecutionTargetId;
 use aruna_core::effects::{FetchCursor, PageLimit};
@@ -36,10 +32,9 @@ const MAX_SIBLING_SCAN: usize = 256;
 /// Explain rows one report reads; only this node ever writes them.
 const MAX_EXPLAIN_ROWS: usize = 4;
 
-/// The placement behind one family: the plan this responder's own witness round
-/// stored, or, when it never planned the request, the newest launch record any
-/// witness published. The counted alternatives and rejections exist only in the
-/// first case, because only a local round keeps them.
+/// The placement behind one family: the plan this responder's witness round
+/// stored, or the newest launch record any witness published when it never
+/// planned. Counted alternatives and rejections exist only in the first case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanEstimate {
     pub target: Option<ExecutionTargetId>,
@@ -131,7 +126,8 @@ pub async fn family_report(
             continue;
         }
         if let Ok(Some(document)) =
-            crate::node_info::read_node_info_document(&context.storage_handle, output.node_id).await
+            crate::node::node_info::read_info_document(&context.storage_handle, output.node_id)
+                .await
             && let Some(endpoint) = document.urls.s3
         {
             output_endpoints.insert(output.node_id, endpoint);
@@ -441,7 +437,7 @@ pub async fn audit_endpoints(
                 continue;
             }
             if let Ok(Some(document)) =
-                crate::node_info::read_node_info_document(&context.storage_handle, object.node_id)
+                crate::node::node_info::read_info_document(&context.storage_handle, object.node_id)
                     .await
                 && let Some(endpoint) = document.urls.s3
             {

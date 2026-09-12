@@ -1,9 +1,6 @@
-//! Assembling the pinned values one planning round decides on.
-//!
-//! Everything here is resolved before the pure planner runs: exact input
-//! versions and their known holders, the advertised targets, and the membership
-//! details of the nodes that published them. Membership comes from the
-//! authenticated realm config, never from an advertisement's own claims.
+//! Assembling the pinned values one planning round decides on: exact input
+//! versions and holders, advertised targets, and publisher membership. Membership
+//! comes from the authenticated realm config, never from an advertisement's claims.
 
 use std::collections::BTreeMap;
 
@@ -16,7 +13,7 @@ use aruna_core::structs::{
     AuthContext, BlobVersion, BlobVersionState, CapturedInput, InputSource, LogicalJobSpec,
     NodeInfoDocument, Permission, PlacementPolicyRef, PlacementSubject, PolicyResolution,
     RealmConfigDocument, RealmNodeKind, VersionKey, VersionedObjectArn, WorkspaceMode,
-    blob_group_permission_path, storage_subject,
+    group_permission_path, storage_subject,
 };
 use aruna_core::types::NodeId;
 use thiserror::Error;
@@ -24,12 +21,12 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::ids;
-use crate::blob_holders::GetBlobHoldersOperation;
+use crate::auth::request_authorization::authorize;
+use crate::auth::request_policy::PolicyRequestExtras;
+use crate::blob::holders::GetBlobHoldersOperation;
 use crate::driver::{DriverContext, drive};
-use crate::node_info::read_node_info_document;
-use crate::placement_policy::{ResolvePolicyConfig, ResolvePolicyOperation};
-use crate::request_authorization::authorize;
-use crate::request_policy::PolicyRequestExtras;
+use crate::node::node_info::read_info_document;
+use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 
 /// Tag that pins the container network mode, shared with the executor path.
 const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
@@ -121,12 +118,12 @@ async fn advertisements(
     config: &RealmConfigDocument,
 ) -> (BTreeMap<NodeId, NodeInfoDocument>, bool) {
     let mut documents = BTreeMap::new();
-    let Ok(members) = config.sync_eligible_node_ids() else {
+    let Ok(members) = config.sync_eligible_nodes() else {
         return (documents, true);
     };
     let mut unread = false;
     for node_id in members {
-        match read_node_info_document(&context.storage_handle, node_id).await {
+        match read_info_document(&context.storage_handle, node_id).await {
             Ok(Some(document)) => {
                 documents.insert(node_id, document);
             }
@@ -147,9 +144,8 @@ struct Scan {
 }
 
 /// One candidate per advertised backend, screened in pages of at most
-/// [`MAX_TARGET_SCAN`]. `node_kind` and `active` come from the realm config; a
-/// document may only describe a backend, never its own standing. Eligibility is
-/// decided by the planner over the whole scan, never here.
+/// [`MAX_TARGET_SCAN`]. A document may only describe a backend, never its own
+/// standing; eligibility is decided by the planner over the whole scan.
 async fn candidates(
     context: &DriverContext,
     config: &RealmConfigDocument,
@@ -229,7 +225,7 @@ async fn target_allowed(context: &DriverContext, spec: &LogicalJobSpec, target: 
         context,
         spec.realm_id,
         &auth,
-        &blob_group_permission_path(spec.realm_id, spec.group_id, target),
+        &group_permission_path(spec.realm_id, spec.group_id, target),
         &Permission::WRITE,
         PolicyRequestExtras::rest(),
     )
@@ -352,9 +348,8 @@ pub async fn version_hash(
 }
 
 /// The source endpoint owns the stored bucket/key/version, and every node the
-/// DHT lists for the same content hash holds a registered copy of the bytes, so
-/// running next to one of them saves the transfer. A failed lookup adds no
-/// holder, which leaves the source endpoint as the only route.
+/// DHT lists for the same content hash holds a registered copy, so running next
+/// to one saves the transfer; a failed lookup leaves the source as the only route.
 async fn input_holders(
     context: &DriverContext,
     config: &RealmConfigDocument,
@@ -470,15 +465,14 @@ pub(crate) fn network_access(spec: &LogicalJobSpec) -> NetworkAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::{Family, REALM, context, node};
+    use crate::tests::fixtures::records::{Family, REALM, context, node};
     use aruna_core::compute::{ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
     use aruna_core::scheduling::plan_execution;
     use aruna_core::structs::{
-        AdvertisementEpoch, InputMode, InputSelection, NodeUrls, NodeUtilization,
-        node_info_storage_key,
+        AdvertisementEpoch, InputMode, InputSelection, NodeUrls, NodeUtilization, node_info_key,
     };
 
     /// A realm of `members` servers, each advertising eight backends, which is
@@ -542,7 +536,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: NODE_INFO_KEYSPACE.to_string(),
-                key: node_info_storage_key(document.node_id).into(),
+                key: node_info_key(document.node_id).into(),
                 value: document.to_bytes().expect("advertisement is valid").into(),
                 txn_id: None,
             })

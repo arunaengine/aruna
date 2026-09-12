@@ -64,6 +64,7 @@ hyper-util = { workspace = true }
 s3s = { workspace = true }
 
 [dev-dependencies]
+syn = { workspace = true }
 aruna-net = { workspace = true }
 aruna-storage = { workspace = true }
 rmcp = { workspace = true, features = [

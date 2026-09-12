@@ -151,6 +151,7 @@ pub async fn copy_object(
 
     let source_version_id = source.version_id;
     let source_last_modified = source
+        .info
         .version_created_at
         .or_else(|| source.location.as_ref().map(|location| location.created_at))
         .or_else(|| {
@@ -227,9 +228,7 @@ pub async fn copy_object(
         .and_then(|result| result.transpose())?;
     let put_result = put_result.ok_or(PutObjectError::PutObjectFailed)?;
 
-    // Dedup can point the copy at the source's BackendLocation, so its
-    // created_at is the source's, not the copy's. The freshly minted destination
-    // version ULID encodes when this copy was written.
+    // The new version time owns copy time when dedup reuses an older location.
     let created_at = UNIX_EPOCH + Duration::from_millis(put_result.version_id.timestamp_ms());
 
     Ok(CopyObjectResultData {
@@ -244,8 +243,8 @@ pub async fn copy_object(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::placement_policy::fixtures::{seed_gate, subject};
     use crate::s3::get_object::{GetObjectOperation, MAX_AUTO_ADVANCES};
+    use crate::tests::fixtures::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;
     use aruna_core::egress::EgressPolicy;
@@ -534,7 +533,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn materialized_copy_dedups_source_blob() {
+    async fn materialized_copy_deduplicates() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = Ulid::generate();
@@ -604,7 +603,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn reference_copy_materializes_bytes_with_snapshot_binding() {
+    async fn reference_copy_materializes() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let group_id = Ulid::generate();
@@ -780,7 +779,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn delete_marker_source_errors() {
+    async fn delete_marker_errors() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let group_id = Ulid::generate();
@@ -845,7 +844,7 @@ mod test {
     }
 
     #[test]
-    fn if_match_requires_matching_etag() {
+    fn matching_etag_required() {
         let conditions = CopySourceConditions {
             if_match: Some("abc".to_string()),
             ..Default::default()
@@ -863,7 +862,7 @@ mod test {
     }
 
     #[test]
-    fn wildcard_etag_conditions_use_source_existence() {
+    fn wildcard_uses_existence() {
         let if_match = CopySourceConditions {
             if_match: Some("*".to_string()),
             ..Default::default()
@@ -886,7 +885,7 @@ mod test {
     }
 
     #[test]
-    fn if_none_match_rejects_matching_etag() {
+    fn matching_etag_rejected() {
         let conditions = CopySourceConditions {
             if_none_match: Some("abc".to_string()),
             ..Default::default()
@@ -958,7 +957,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn precondition_failure_leaves_no_new_version() {
+    async fn precondition_preserves_versions() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let group_id = Ulid::generate();

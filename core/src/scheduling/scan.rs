@@ -1,10 +1,5 @@
-//! The paged advertisement scan.
-//!
-//! Discovery hands the planner one page of advertisements at a time. Each page
-//! is screened and ranked as it arrives and only the bounded best of everything
-//! seen so far is retained, so one planning operation reaches the end of the
-//! realm's advertisements and stores its plan after the last page instead of at
-//! a scan bound.
+//! Screens each advertisement page and retains only the bounded best candidates across the full scan.
+//! The plan is stored after the final page, rather than when an intermediate scan bound is reached.
 
 use std::cmp::Ordering;
 
@@ -53,10 +48,9 @@ impl<'a> Planner<'a> {
         })
     }
 
-    /// Screens, routes, and ranks one page of at most [`MAX_TARGET_SCAN`]
-    /// advertisements. The page must be in canonical target order and start
-    /// strictly after the cursor, which is what proves the scan repeats and
-    /// skips nothing. An empty page changes nothing.
+    /// Screens, routes, and ranks one page of at most [`MAX_TARGET_SCAN`] advertisements. The page must be
+    /// in canonical target order and start strictly after the cursor, which is what proves the scan repeats
+    /// and skips nothing. An empty page changes nothing.
     pub fn rank_page(&mut self, page: &[TargetCandidate]) -> Result<(), PlanError> {
         if page.len() > MAX_TARGET_SCAN {
             return Err(PlanError::ScanCount);
@@ -178,7 +172,7 @@ impl<'a> Planner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduling::tests::{candidate, config, node, request};
+    use crate::tests::fixtures::scheduling::{candidate, config, node, request};
 
     fn planner(compute: &RealmComputeConfig) -> Planner<'_> {
         Planner::new(&request(Vec::new()), compute).expect("request is well formed")

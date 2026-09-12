@@ -3,24 +3,16 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
     parse_ulid, request_auth, server_error, tool_extras,
 };
-use aruna_core::StructuredId;
 use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
-use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, mint_forward_document, mint_local_document,
-};
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, MetadataDocumentQueryRequest, MetadataQueryRequest,
-    MetadataReferencesRequest, MetadataRoCrateExportView, MetadataSearchRequest, load_realm_config,
-    query_metadata, query_metadata_document, references_metadata, search_metadata,
+    MetadataReferencesRequest, MetadataRoCrateExportView, MetadataSearchRequest, query_metadata,
+    query_metadata_document, references_metadata, search_metadata,
 };
-use aruna_operations::metadata::forward::{
-    create_metadata_document_routed, export_rocrate_routed, is_user_origin,
-    update_metadata_document_routed,
-};
+use aruna_operations::metadata::create_document::CreateMetadataDocumentPayload;
+use aruna_operations::metadata::forward::{export_rocrate_routed, route_metadata_update};
 use aruna_operations::metadata::profile_validation::preview_submission;
-use aruna_operations::notifications::watch::emit::emit_metadata_created;
-use aruna_operations::update_metadata_document::UpdateMetadataDocumentMutation;
+use aruna_operations::metadata::update_document::UpdateMetadataDocumentMutation;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
@@ -31,24 +23,18 @@ use ulid::Ulid;
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct IdInput {
-    /// The metadata document's bare 26-character ULID, for example
-    /// `01JZ8Y6T0K4W7M2N9Q5R3S8V1X`. Read `document_id` from a `search_datasets`
-    /// hit, a `list_profiles` entry, or a `create_dataset` answer. It is the id
-    /// alone, never the `path@id` permission form and never a graph IRI.
+    /// Bare metadata document ULID from search, profile listing, or dataset creation.
+    /// Do not pass the permission-path form or a graph IRI.
     pub id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct DatasetSearchInput {
-    /// Free-text query over the indexed name, description, keywords, and
-    /// identifier literals, for example `rna-seq mouse liver`. Plain terms only:
-    /// quotes, wildcards, and boolean operators are stripped and the remaining
-    /// terms are combined with OR. May be empty when `conforms_to` is set.
+    /// Plain-text query over indexed names, descriptions, keywords, and identifiers.
+    /// Operators are stripped and terms use OR. It may be empty with `conforms_to`.
     pub q: String,
-    /// Exact absolute IRI the root entity must declare in `conformsTo`, for
-    /// example `https://w3id.org/ro/crate/1.3` for the specification or
-    /// `https://w3id.org/aruna/profile/<document id>` for a Profile from
-    /// `list_profiles`. Matched exactly, never as a prefix.
+    /// Exact absolute `conformsTo` IRI declared by the root entity.
+    /// Use an RO-Crate specification IRI or a Profile IRI from `list_profiles`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conforms_to: Option<String>,
     /// Restrict hits to one group's bare 26-character ULID. Call `list_groups`
@@ -63,18 +49,11 @@ pub struct DatasetSearchInput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ValidateInput {
-    /// The draft crate as one RO-Crate JSON-LD object with a top-level
-    /// `@context` and a `@graph` array, not a bare array of entities. The graph
-    /// needs the root Dataset `./` carrying name, description, and exactly one
-    /// datePublished, plus the `ro-crate-metadata.json` descriptor of type
-    /// CreativeWork whose `about` points at `./`. At most one non-specification
-    /// `conformsTo` IRI on the root, and File entities use `s3://bucket/key`
-    /// contentUrl values.
+    /// RO-Crate JSON-LD object with `@context`, `@graph`, a complete `./` Dataset, and descriptor.
+    /// The descriptor targets `./`; one Profile may be named and files use `s3://bucket/key` URLs.
     pub rocrate: JsonPayload,
-    /// The group the draft would be saved in, from list_groups. A Profile of
-    /// that group is checked even while it is not public; without it only
-    /// public Profiles resolve and a group Profile reports
-    /// `profile_not_registered`.
+    /// Target group from `list_groups`. Its private Profile is eligible during validation.
+    /// Without a group, only public Profiles resolve.
     #[serde(default)]
     pub group_id: Option<String>,
 }
@@ -85,10 +64,8 @@ pub struct CreateDatasetInput {
     /// `01JZ8Y6T0K4W7M2N9Q5R3S8V1X`. Call `list_groups` for the ids the caller
     /// may use; the caller needs write permission on the group.
     pub group_id: String,
-    /// Document path inside the group, for example
-    /// `datasets/mouse-liver-2026`. Leading and trailing slashes are trimmed
-    /// and the remainder must not be empty. It is a metadata document path, not
-    /// a bucket and key and not a URL; `profiles/` holds Aruna Profiles.
+    /// Metadata document path inside the group. Surrounding slashes are trimmed.
+    /// It must be nonempty and is distinct from a bucket key or URL.
     pub path: String,
     /// The crate to store, as one RO-Crate JSON-LD object with a top-level
     /// `@context` and a `@graph` array. Check it with `validate_dataset` first:
@@ -117,12 +94,8 @@ pub struct ReplaceDatasetInput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SparqlInput {
-    /// SPARQL query text of at most 65536 bytes, for example
-    /// `SELECT DISTINCT ?s WHERE { ?s <http://schema.org/name> ?n }`. SELECT and
-    /// ASK only: CONSTRUCT, DESCRIBE, updates, any SERVICE clause, and a LIMIT
-    /// above 10000 are refused. Declare every prefix the query uses. Without
-    /// `document_id` it must additionally be an ASK or a SELECT DISTINCT over a
-    /// single triple pattern with no OFFSET.
+    /// SPARQL SELECT or ASK query of at most 65536 bytes and LIMIT at most 10000.
+    /// Realm-wide SELECT must be DISTINCT over one triple pattern with no OFFSET or SERVICE.
     pub query: String,
     /// Run the query against one document's graph instead of all visible
     /// metadata, given as that document's bare 26-character ULID from
@@ -167,10 +140,10 @@ impl McpServer {
     ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         metadata_probe(self, &auth, "list_profiles", empty_extras("list_profiles")).await?;
-        let response = crate::routes::metadata::run_list_metadata_documents(
+        let response = crate::metadata::run_document_list(
             &self.state,
             Some(auth.clone()),
-            crate::routes::metadata::ListMetadataQuery {
+            crate::metadata::ListMetadataQuery {
                 group_id: None,
                 path_prefix: Some("profiles/".to_string()),
                 include: Some("summary".to_string()),
@@ -306,13 +279,13 @@ impl McpServer {
             },
         )
         .await
-        .map_err(crate::routes::metadata::map_metadata_api_error)
+        .map_err(crate::metadata::map_api_error)
         .map_err(search_error)?;
-        let response = crate::routes::metadata::MetadataSearchResponse {
+        let response = crate::metadata::MetadataSearchResponse {
             hits: result
                 .hits
                 .into_iter()
-                .map(crate::routes::metadata::map_search_hit)
+                .map(crate::metadata::map_search_hit)
                 .collect(),
             next_cursor: result.next_cursor,
             nodes_queried: result.fanout_stats.nodes_queried,
@@ -377,9 +350,9 @@ impl McpServer {
         let jsonld = rocrate_json(&input.rocrate.0)?;
         let preview = preview_submission(&self.state.get_ctx(), group_id, &jsonld)
             .await
-            .map_err(crate::routes::metadata::map_metadata_error)
+            .map_err(crate::metadata::map_metadata_error)
             .map_err(server_error)?;
-        let response = crate::routes::metadata::ProfileValidationPreviewResponse::from(preview);
+        let response = crate::metadata::ProfileValidationPreviewResponse::from(preview);
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -395,105 +368,28 @@ impl McpServer {
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<CreateDatasetInput>,
     ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
-        let extras = tool_extras("create_dataset", &input)?;
         let group_id = parse_group(&input.group_id)?;
-        let path = MetadataRegistryRecord::normalize_document_path(&input.path);
-        if path.is_empty() {
-            return Err(bad_request(
+        let jsonld = rocrate_json(&input.rocrate.0)?;
+        let record = crate::metadata::run_create_metadata(
+            &self.state,
+            &auth,
+            tool_extras("create_dataset", &input)?,
+            request_bearer(&parts),
+            group_id,
+            input.path,
+            input.public.unwrap_or(false),
+            CreateMetadataDocumentPayload::RoCrate { jsonld },
+        )
+        .await
+        .map_err(|error| match error {
+            crate::error::ServerError::BadRequest => bad_request(
                 "path must name a document inside the group, such as \
                  datasets/mouse-liver-2026; it is empty once leading and trailing slashes are \
                  trimmed",
-            ));
-        }
-        let jsonld = rocrate_json(&input.rocrate.0)?;
-        let ctx = self.state.get_ctx();
-        let realm = load_realm_config(ctx.as_ref(), self.state.get_realm_id())
-            .await
-            .ok_or_else(|| server_error(crate::error::ServerError::ServiceUnavailable))?;
-        let actor = Actor {
-            node_id: self.state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: self.state.get_realm_id(),
-        };
-        let user_origin = is_user_origin(&ctx, self.state.get_realm_id(), self.state.get_node_id())
-            .await
-            .map_err(crate::routes::metadata::map_metadata_api_error)
-            .map_err(server_error)?;
-        let document_id = if user_origin {
-            mint_forward_document(&realm, &actor, group_id, &path)
-                .map_err(crate::routes::metadata::map_create_error)
-                .map_err(server_error)?
-                .as_ulid()
-        } else {
-            match mint_local_document(&realm, &actor, group_id, &path) {
-                Ok(document_id) => document_id.as_ulid(),
-                Err(CreateMetadataDocumentError::OriginHoldsNoBucket) => {
-                    mint_forward_document(&realm, &actor, group_id, &path)
-                        .map_err(crate::routes::metadata::map_create_error)
-                        .map_err(server_error)?
-                        .as_ulid()
-                }
-                Err(error) => {
-                    return Err(server_error(crate::routes::metadata::map_create_error(
-                        error,
-                    )));
-                }
-            }
-        };
-        authorize_tool(
-            &self.state,
-            &auth,
-            metadata_group_path(self, group_id),
-            Permission::WRITE,
-            extras.clone(),
-        )
-        .await
-        .map_err(write_error)?;
-        authorize_tool(
-            &self.state,
-            &auth,
-            MetadataRegistryRecord::permission_path_for(
-                &auth.realm_id,
-                group_id,
-                &path,
-                document_id,
             ),
-            Permission::WRITE,
-            extras,
-        )
-        .await
-        .map_err(write_error)?;
-        let created = create_metadata_document_routed(
-            CreateMetadataDocumentOperation::new_for_generated_document_id(
-                CreateMetadataDocumentConfig {
-                    actor,
-                    group_id,
-                    document_id,
-                    document_path: path,
-                    public: input.public.unwrap_or(false),
-                    payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
-                },
-            ),
-            ctx.clone(),
-            crate::routes::metadata::forwarded_auth_token(request_bearer(&parts))
-                .map_err(server_error)?,
-        )
-        .await
-        .map_err(crate::routes::metadata::map_metadata_write_error)
-        .map_err(server_error)?;
-        let event_id = created.event_id;
-        let record = created.record;
-        emit_metadata_created(
-            ctx.as_ref(),
-            self.state.get_realm_id(),
-            auth.user_id,
-            record.group_id,
-            record.document_id,
-            &record.document_path,
-            event_id,
-        )
-        .await;
-        let summary = crate::routes::metadata::MetadataDocumentSummary::from(&record);
+            error => write_error(error),
+        })?;
+        let summary = crate::metadata::MetadataDocumentSummary::from(&record);
         Ok(Json(JsonPayload(
             serde_json::to_value(summary).map_err(internal_error)?,
         )))
@@ -512,18 +408,14 @@ impl McpServer {
         let document_id = parse_document(&input.id)?;
         let jsonld = rocrate_json(&input.rocrate.0)?;
         let extras = tool_extras("replace_dataset", &input)?;
-        let record = crate::routes::metadata::local_write_record(
-            &self.state,
-            &auth,
-            document_id,
-            extras.clone(),
-        )
-        .await
-        .map_err(update_error)?;
+        let record =
+            crate::metadata::local_write_record(&self.state, &auth, document_id, extras.clone())
+                .await
+                .map_err(update_error)?;
         if record.is_none() {
             metadata_probe(self, &auth, "replace_dataset", extras).await?;
         }
-        let updated = update_metadata_document_routed(
+        let updated = route_metadata_update(
             &self.state.get_ctx(),
             Actor {
                 node_id: self.state.get_node_id(),
@@ -534,13 +426,12 @@ impl McpServer {
             document_id,
             input.public,
             UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld },
-            crate::routes::metadata::forwarded_auth_token(request_bearer(&parts))
-                .map_err(server_error)?,
+            crate::metadata::forwarded_auth_token(request_bearer(&parts)).map_err(server_error)?,
         )
         .await
-        .map_err(crate::routes::metadata::map_metadata_write_error)
+        .map_err(crate::metadata::map_write_error)
         .map_err(update_error)?;
-        let summary = crate::routes::metadata::MetadataDocumentSummary::from(&updated);
+        let summary = crate::metadata::MetadataDocumentSummary::from(&updated);
         Ok(Json(JsonPayload(
             serde_json::to_value(summary).map_err(internal_error)?,
         )))
@@ -565,10 +456,9 @@ impl McpServer {
         let document_scoped = input.document_id.is_some();
         let execution = if let Some(document_id) = input.document_id.as_deref() {
             let document_id = parse_document(document_id)?;
-            let record =
-                crate::routes::metadata::load_metadata_record_by_document(&self.state, document_id)
-                    .await
-                    .map_err(|error| query_error(error, true))?;
+            let record = crate::metadata::load_document_record(&self.state, document_id)
+                .await
+                .map_err(|error| query_error(error, true))?;
             authorize_tool(
                 &self.state,
                 &auth,
@@ -610,10 +500,10 @@ impl McpServer {
             )
             .await
         }
-        .map_err(crate::routes::metadata::map_metadata_api_error)
+        .map_err(crate::metadata::map_api_error)
         .map_err(|error| query_error(error, document_scoped))?;
         let response =
-            crate::routes::metadata::map_query_results(execution.results, execution.fanout_stats)
+            crate::metadata::map_query_results(execution.results, execution.fanout_stats)
                 .map_err(server_error)?;
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
@@ -653,9 +543,9 @@ impl McpServer {
             },
         )
         .await
-        .map_err(crate::routes::metadata::map_metadata_api_error)
+        .map_err(crate::metadata::map_api_error)
         .map_err(references_error)?;
-        let response = crate::routes::metadata::map_references_response(execution);
+        let response = crate::metadata::map_references_response(execution);
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -665,7 +555,7 @@ impl McpServer {
 /// The REST parsers answer a malformed id or crate with a bare "Bad request",
 /// which leaves a tool caller nothing to correct.
 fn parse_document(id: &str) -> Result<Ulid, CallToolResult> {
-    crate::routes::metadata::parse_document_id(id).map_err(|_| {
+    crate::metadata::parse_document_id(id).map_err(|_| {
         bad_request(
             "document id must be a bare 26-character ULID such as 01JZ8Y6T0K4W7M2N9Q5R3S8V1X; read \
              document_id from search_datasets, list_profiles, or a create_dataset answer",
@@ -682,7 +572,7 @@ fn parse_group(group_id: &str) -> Result<Ulid, CallToolResult> {
 }
 
 fn rocrate_json(value: &Value) -> Result<String, CallToolResult> {
-    crate::routes::metadata::serialize_jsonld_object(value).map_err(|_| {
+    crate::metadata::serialize_jsonld_object(value).map_err(|_| {
         bad_request(
             "rocrate must be one JSON object holding a top-level @context and a @graph array; send \
              the object itself, not a bare array of entities and not a JSON string",
@@ -794,7 +684,7 @@ async fn metadata_probe(
     server: &McpServer,
     auth: &AuthContext,
     _tool: &str,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(&server.state, auth, Permission::READ, extras)
         .await
@@ -812,11 +702,10 @@ async fn authorize_summary(
     path: &str,
     document_id: &str,
     _tool: &str,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     let group_id = crate::auth::parse_group_id(group_id).map_err(server_error)?;
-    let document_id =
-        crate::routes::metadata::parse_document_id(document_id).map_err(server_error)?;
+    let document_id = crate::metadata::parse_document_id(document_id).map_err(server_error)?;
     authorize_tool(
         &server.state,
         auth,
@@ -841,10 +730,9 @@ pub(crate) async fn load_raw(
     tool: &str,
 ) -> Result<(MetadataRegistryRecord, Value), CallToolResult> {
     let document_id = parse_document(&input.id)?;
-    let record =
-        crate::routes::metadata::load_metadata_record_by_document(&server.state, document_id)
-            .await
-            .map_err(document_error)?;
+    let record = crate::metadata::load_document_record(&server.state, document_id)
+        .await
+        .map_err(document_error)?;
     authorize_tool(
         &server.state,
         auth,
@@ -854,8 +742,8 @@ pub(crate) async fn load_raw(
     )
     .await
     .map_err(document_error)?;
-    let params = crate::routes::metadata::MetadataRoCrateExportParams {
-        view: Some(crate::routes::metadata::MetadataRoCrateView::Raw),
+    let params = crate::metadata::MetadataRoCrateExportParams {
+        view: Some(crate::metadata::MetadataRoCrateView::Raw),
         limit: None,
         offset: None,
         after: None,
@@ -871,16 +759,16 @@ pub(crate) async fn load_raw(
             offset: None,
             after: None,
         },
-        crate::routes::metadata::forwarded_auth_token(bearer).map_err(server_error)?,
+        crate::metadata::forwarded_auth_token(bearer).map_err(server_error)?,
         server.state.rocrate_limits().metadata_bytes,
     )
     .await
-    .map_err(crate::routes::metadata::map_metadata_api_error)
+    .map_err(crate::metadata::map_api_error)
     .map_err(server_error)?;
-    let response = crate::routes::metadata::map_rocrate_export_response(
+    let response = crate::metadata::map_export_response(
         export,
         &params,
-        crate::routes::metadata::MetadataRoCrateView::Raw,
+        crate::metadata::MetadataRoCrateView::Raw,
     )
     .map_err(server_error)?;
     Ok((

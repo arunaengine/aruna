@@ -56,10 +56,8 @@ pub(crate) struct ManifestPagePlan {
     ranges: Vec<Range<usize>>,
 }
 
-#[allow(dead_code)]
 #[derive(Serialize)]
 enum BorrowedShardTransportResponse<'a> {
-    Reject,
     ManifestPage(BorrowedShardManifestPage<'a>),
 }
 
@@ -478,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_request_round_trips() {
+    fn request_round_trips() {
         let mut placement = placement();
         placement.shard = u32::MAX;
         let message = ShardTransportMessage::ManifestRequest {
@@ -494,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_response_round_trips() {
+    fn response_round_trips() {
         let holder = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let manifest = ShardManifest {
             placement: placement(),

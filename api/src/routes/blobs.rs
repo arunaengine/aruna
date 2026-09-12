@@ -2,12 +2,11 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::structs::{
-    AuthContext, BucketInfo, CopyOrigin, Permission, blob_bucket_permission_path,
-    blob_object_permission_path,
+    AuthContext, BucketInfo, CopyOrigin, Permission, bucket_permission_path, object_permission_path,
 };
-use aruna_operations::blob_holders::{GetBlobHoldersError, GetBlobHoldersOperation};
+use aruna_operations::blob::holders::{GetBlobHoldersError, GetBlobHoldersOperation};
 use aruna_operations::driver::{drive, drive_until};
-use aruna_operations::replication::location_summary::{
+use aruna_operations::replication::locations::{
     LocationSummaryError, LocationSummaryOperation, QueuedReplicaNodesOperation, QueuedReplicas,
     RelationshipReplicaNodesOperation, RemoteLocationSummaryOperation,
 };
@@ -18,7 +17,7 @@ use aruna_operations::replication::queue::QueueBlobReplicationOperation;
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -155,14 +154,14 @@ pub async fn replicate_blob(
     let bucket_info = load_bucket(&state, &request.bucket).await?;
 
     let permission_path = match request.path.as_deref() {
-        Some(path) => blob_object_permission_path(
+        Some(path) => object_permission_path(
             state.get_realm_id(),
             bucket_info.group_id,
             state.get_node_id(),
             &request.bucket,
             path,
         ),
-        None => blob_bucket_permission_path(
+        None => bucket_permission_path(
             state.get_realm_id(),
             bucket_info.group_id,
             state.get_node_id(),
@@ -530,7 +529,7 @@ pub async fn blob_locations(
     crate::auth::ensure_permission(
         &state,
         &auth,
-        blob_object_permission_path(
+        object_permission_path(
             state.get_realm_id(),
             load_bucket(&state, &query.bucket).await?.group_id,
             local_node,
@@ -569,9 +568,7 @@ pub async fn blob_locations(
     let mut candidates: BTreeSet<Destination> = BTreeSet::new();
     let mut expected: BTreeSet<Destination> = BTreeSet::new();
     let mut capped = false;
-    // First, because these are the only candidates that carry the path the copy
-    // is actually stored under; the source path every other source has is a
-    // guess whenever a relationship rewrites the key.
+    // Relationship candidates come first because only they carry the stored copy path.
     match drive(
         RelationshipReplicaNodesOperation::new(
             local_node,
@@ -623,17 +620,13 @@ pub async fn blob_locations(
             QueuedReplicas::default()
         }
     };
-    // Queue records and holder entries carry the source path, so they are asked
-    // about it. A relationship that rewrites the key already contributed the
-    // stored path above, and both destinations get their own entry.
+    // Queue and holder entries use the source path; rewritten relationships already added theirs.
     for node_id in queued.nodes.iter().filter(|node| **node != local_node) {
         let destination = (*node_id, query.bucket.clone(), query.path.clone());
         expected.insert(destination.clone());
         capped |= !add_candidate(&mut candidates, destination);
     }
-    // Config and queue only name copies that are planned. A destination dropped
-    // from the config, or one whose queue record is already consumed, still
-    // stores the bytes and is only found through the holder index.
+    // The holder index retains stored copies no longer present in configuration or the queue.
     match holder_nodes(&ctx, blake3, state.get_realm_id(), local_node).await {
         Ok(holders) => {
             for node_id in holders {
@@ -819,7 +812,7 @@ mod tests {
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_operations::driver::DriverContext;
-    use aruna_operations::replication::location_summary::LocationSummaryError;
+    use aruna_operations::replication::locations::LocationSummaryError;
     use aruna_operations::replication::protocol::CopyCompliance;
     use aruna_operations::replication::protocol::{LocationCopyStorage, LocationSummary};
     use aruna_storage::FjallStorage;
@@ -1024,9 +1017,8 @@ mod tests {
 
     #[test]
     fn drops_unheld_holder() {
-        // A node holding the same bytes under another object is not a copy of
-        // this version, but a configured or queued target that has not received
-        // it yet still is.
+        // Identical bytes under another object are not this version's copy.
+        // Configured and queued targets remain copies before receipt.
         let absent = LocationSummary::absent();
         let destination = (node_id(), "raw".to_string(), "a.tar".to_string());
         assert!(super::peer_copy(&destination, false, Ok(absent.clone())).is_none());
@@ -1076,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn openapi_includes_replicate_blob_response_schema() {
+    fn openapi_has_replication() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
         assert!(openapi["paths"].get("/data/blobs/replicate").is_some());
@@ -1154,14 +1146,13 @@ mod tests {
             AUTH_KEYSPACE,
             ByteView::from(realm_id.as_bytes().to_vec()),
             ByteView::from(
-                RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                RealmAuthorizationDocument::default_realm_doc(realm_id)
                     .to_bytes(&actor)
                     .expect("realm auth serializes"),
             ),
         )
         .await;
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
         write_fixture(
             &state,
             AUTH_KEYSPACE,

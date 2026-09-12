@@ -1,0 +1,656 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::METADATA_MATERIALIZATION_JOB_KEYSPACE;
+use aruna_core::metadata::{
+    MetadataApplyRoCrateRequest, MetadataBatch, MetadataCreateCrateRequest,
+    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataEffect, MetadataEvent,
+    MetadataGraphPolicy, MetadataMaterializationState, MetadataMaterializationStatusRecord,
+    MetadataRequestDurability, MetadataUpsertEntityRequest, deterministic_materialization_actor,
+    resolve_raw_revision,
+};
+use aruna_core::storage_entries::{
+    create_event_entry, document_job_entry, materialization_job_entry,
+    materialization_status_entry, materialization_status_key,
+};
+use aruna_core::structs::{Actor, MetadataRegistryRecord, PlacementRef, RealmId};
+use aruna_operations::driver::DriverContext;
+use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::materialization_queue::{
+    new_materialization_job, new_pending_status, process_materialization_batch,
+};
+use aruna_storage::{FjallStorage, StorageHandle};
+use craqle::{
+    CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateEntityRequest,
+    GrantAuthorizer, GraphId, GraphPolicy, PatchEntityRequest, PermissionGrant, PermissionLevel,
+};
+use tempfile::TempDir;
+use ulid::Ulid;
+
+struct TestContext {
+    _storage_dir: TempDir,
+    _metadata_dir: Option<TempDir>,
+    actor: Actor,
+    context: Arc<DriverContext>,
+}
+
+#[tokio::test]
+async fn raw_projection_diverges() -> Result<(), Box<dyn std::error::Error>> {
+    // Concurrent CRDT writes remain multi-valued while raw replay uses event order.
+    let test = build_context(false).await?;
+    let document_id = Ulid::from_bytes([9u8; 16]);
+    let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+    let base_jsonld = serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": graph_iri}
+            },
+            {
+                "@id": graph_iri,
+                "@type": "Dataset",
+                "name": "Original",
+                "description": "Concurrent update fixture",
+                "datePublished": "2026-01-01"
+            },
+            {
+                "@id": "#lab",
+                "@type": "Organization",
+                "name": "base"
+            }
+        ]
+    })
+    .to_string();
+    let base = create_payload_event(
+        &test,
+        document_id,
+        Ulid::from_parts(40, 1),
+        "divergence",
+        MetadataCreateEventPayload::RoCrate {
+            jsonld: base_jsonld.clone(),
+        },
+    );
+    let graph = GraphId::new(&base.record.graph_iri);
+
+    let dir = tempfile::tempdir()?;
+    let irokle_a = irokle::Irokle::builder().build()?;
+    let irokle_b = irokle::Irokle::builder().build()?;
+    // craqle 0.2 denies replicated policy changes unless the node opts in; the
+    // peers here trust each other so the synced graph stays writable.
+    let accept_policies = || -> Arc<dyn craqle::RemotePolicyAuthorizer> {
+        Arc::new(|_: &GraphId, _: &craqle::ActorId, _: &GraphPolicy| true)
+    };
+    let node_a = CraqleNode::open_with_options(
+        dir.path().join("a"),
+        CraqleOptions::new()
+            .with_remote_policy_authorizer(accept_policies())
+            .with_irokle(
+                irokle_a.clone(),
+                CraqleIrokleOptions::new().with_initial_peers(BTreeSet::from([irokle_b.peer_id()])),
+            ),
+    )?;
+    let node_b = CraqleNode::open_with_options(
+        dir.path().join("b"),
+        CraqleOptions::new()
+            .with_remote_policy_authorizer(accept_policies())
+            .with_irokle(
+                irokle_b.clone(),
+                CraqleIrokleOptions::new().with_initial_peers(BTreeSet::from([irokle_a.peer_id()])),
+            ),
+    )?;
+    let writer = GrantAuthorizer::new(vec![PermissionGrant::new(
+        "/datasets/**",
+        PermissionLevel::Write,
+    )]);
+    node_a.apply_rocrate_document_checked_with_policy(
+        &writer,
+        graph.clone(),
+        &base_jsonld,
+        GraphPolicy {
+            public: true,
+            permission_paths: vec!["/datasets/public/divergence".to_string()],
+        },
+    )?;
+    let topic_id = node_a
+        .irokle_topic_id(&graph)?
+        .expect("created graph has an Irokle topic");
+    sync_craqle(&irokle_a, &irokle_b, &node_b, topic_id)?;
+
+    node_a.patch_contextual_with(
+        &writer,
+        PatchEntityRequest {
+            entity: CreateEntityRequest {
+                graph: graph.clone(),
+                entity_id: "#lab".to_string(),
+                entity_type: "Organization".to_string(),
+                name: "Peer A".to_string(),
+                additional_triples: Vec::new(),
+            },
+            replaced_predicates: Vec::new(),
+        },
+        CraqleRequestDurability::Durable,
+        None,
+    )?;
+    node_b.patch_contextual_with(
+        &writer,
+        PatchEntityRequest {
+            entity: CreateEntityRequest {
+                graph: graph.clone(),
+                entity_id: "#lab".to_string(),
+                entity_type: "Organization".to_string(),
+                name: "Peer B".to_string(),
+                additional_triples: Vec::new(),
+            },
+            replaced_predicates: Vec::new(),
+        },
+        CraqleRequestDurability::Durable,
+        None,
+    )?;
+    for _ in 0..3 {
+        sync_craqle(&irokle_a, &irokle_b, &node_b, topic_id)?;
+        sync_craqle(&irokle_b, &irokle_a, &node_a, topic_id)?;
+    }
+
+    assert_eq!(
+        node_a.graph_fingerprint(&graph)?,
+        node_b.graph_fingerprint(&graph)?
+    );
+    let mut projected_names = node_a
+        .describe_subject(
+            &GrantAuthorizer::default(),
+            craqle::DescribeRequest {
+                graph: &graph,
+                subject_id: "#lab",
+            },
+        )?
+        .iter()
+        .filter_map(|(predicate, object)| {
+            (predicate == &craqle::EncodedTerm::from_named_node(&craqle::vocab::schema_name()))
+                .then(|| object.to_term())
+                .flatten()
+        })
+        .filter_map(|object| match object {
+            oxrdf::Term::Literal(value) => Some(value.value().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    projected_names.sort();
+    assert_eq!(projected_names, ["Peer A", "Peer B"]);
+
+    let update_a = create_payload_event(
+        &test,
+        document_id,
+        Ulid::from_parts(41, 1),
+        "divergence",
+        MetadataCreateEventPayload::UpsertContextualEntity {
+            jsonld: serde_json::json!({
+                "@id": "#lab",
+                "@type": "Organization",
+                "name": "Peer A"
+            })
+            .to_string(),
+        },
+    );
+    let update_b = create_payload_event(
+        &test,
+        document_id,
+        Ulid::from_parts(41, 2),
+        "divergence",
+        MetadataCreateEventPayload::UpsertContextualEntity {
+            jsonld: serde_json::json!({
+                "@id": "#lab",
+                "@type": "Organization",
+                "name": "Peer B"
+            })
+            .to_string(),
+        },
+    );
+    let revision = resolve_raw_revision(&[base, update_a, update_b])?.expect("raw base exists");
+    let raw: serde_json::Value = serde_json::from_str(&revision.jsonld)?;
+    let lab = raw["@graph"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["@id"] == "#lab"))
+        .expect("raw lab exists");
+    assert_eq!(lab["name"], "Peer B");
+    let projected = node_a.export_rocrate(&GrantAuthorizer::default(), &graph)?;
+    assert_ne!(
+        craqle::canonicalize_jsonld(&projected)?.digest,
+        revision.dataset_digest.expect("raw digest exists")
+    );
+    Ok(())
+}
+
+fn sync_craqle(
+    sender: &irokle::Irokle,
+    receiver: &irokle::Irokle,
+    receiver_node: &CraqleNode,
+    topic_id: irokle::TopicId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let summary = receiver.sync_summary(topic_id)?;
+    let data = sender.plan_sync_data(receiver.peer_id(), &summary)?;
+    if data.ops.is_empty() {
+        return Ok(());
+    }
+    let ack = receiver.receive_sync_data_from(sender.peer_id(), data)?;
+    let _ = sender.apply_sync_ack(&ack.0);
+    receiver_node.reconcile_irokle()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn retries_interrupted_apply() -> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context(true).await?;
+    let document_id = Ulid::from_bytes([1u8; 16]);
+    let event_id = Ulid::from_parts(10, 1);
+    let event = create_event(&test, document_id, event_id, "crash-window");
+    let status = new_pending_status(&event, 1);
+    let job = new_materialization_job(&event, 1);
+    write_entries(
+        &test.context.storage_handle,
+        vec![
+            create_event_entry(&event)?,
+            materialization_status_entry(&status)?,
+            materialization_job_entry(&job)?,
+            document_job_entry(&job)?,
+        ],
+    )
+    .await?;
+
+    let metadata_handle = test
+        .context
+        .metadata_handle
+        .as_ref()
+        .expect("metadata handle installed");
+    match metadata_handle
+        .send_effect(materialization_effect(&event))
+        .await
+    {
+        Event::Metadata(MetadataEvent::CreateCrateResult { .. }) => {}
+        other => return Err(format!("unexpected metadata event: {other:?}").into()),
+    }
+
+    let drained = process_materialization_batch(test.context.as_ref()).await?;
+
+    assert_eq!(drained.processed, 1);
+    assert_eq!(job_count(&test.context.storage_handle).await?, 0);
+    let status = read_status(&test.context.storage_handle, document_id)
+        .await?
+        .expect("materialization status exists");
+    assert_eq!(status.event_id, event_id);
+    assert_eq!(status.state, MetadataMaterializationState::Materialized);
+    assert_eq!(status.last_error, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleans_leftover_job() -> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context(false).await?;
+    let document_id = Ulid::from_bytes([2u8; 16]);
+    let event_id = Ulid::from_parts(20, 1);
+    let event = create_event(&test, document_id, event_id, "final-leftover");
+    let job = new_materialization_job(&event, 1);
+    let final_status = MetadataMaterializationStatusRecord {
+        document_id,
+        event_id,
+        graph_iri: event.record.graph_iri.clone(),
+        context_digest: None,
+        dataset_digest: None,
+        state: MetadataMaterializationState::Materialized,
+        attempts: 1,
+        failures: 0,
+        last_error: None,
+        updated_at_ms: 2,
+    };
+    write_entries(
+        &test.context.storage_handle,
+        vec![
+            materialization_status_entry(&final_status)?,
+            materialization_job_entry(&job)?,
+            document_job_entry(&job)?,
+        ],
+    )
+    .await?;
+
+    let drained = process_materialization_batch(test.context.as_ref()).await?;
+
+    // The final status obsoletes the leftover job, so the scan prunes it as
+    // not-live rather than reapplying: nothing is processed, both rows go.
+    assert_eq!(drained.processed, 0);
+    assert_eq!(job_count(&test.context.storage_handle).await?, 0);
+    assert_eq!(
+        read_status(&test.context.storage_handle, document_id).await?,
+        Some(final_status)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn upsert_replay_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context(true).await?;
+    let document_id = Ulid::from_bytes([3u8; 16]);
+    let create_event = create_event(&test, document_id, Ulid::from_parts(30, 1), "entity-replay");
+    let metadata_handle = test
+        .context
+        .metadata_handle
+        .as_ref()
+        .expect("metadata handle installed");
+    match metadata_handle
+        .send_effect(materialization_effect(&create_event))
+        .await
+    {
+        Event::Metadata(MetadataEvent::CreateCrateResult { .. }) => {}
+        other => return Err(format!("unexpected metadata event: {other:?}").into()),
+    }
+
+    let upsert_event_id = Ulid::from_parts(30, 2);
+    let upsert_event = create_payload_event(
+        &test,
+        document_id,
+        upsert_event_id,
+        "entity-replay",
+        MetadataCreateEventPayload::UpsertDataEntity {
+            jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file","description":"preserved"}"#.to_string(),
+        },
+    );
+
+    assert_upsert_replayed(metadata_handle, &upsert_event).await?;
+
+    let patch_event = create_payload_event(
+        &test,
+        document_id,
+        Ulid::from_parts(30, 3),
+        "entity-replay",
+        MetadataCreateEventPayload::UpsertDataEntity {
+            jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"renamed"}"#.to_string(),
+        },
+    );
+    materialize_entity_upsert(metadata_handle, &patch_event).await?;
+    let projected: serde_json::Value = serde_json::from_str(
+        &metadata_handle
+            .export_rocrate_jsonld(create_event.record.graph_iri.clone())
+            .await?,
+    )?;
+    let entity = projected["@graph"]
+        .as_array()
+        .and_then(|graph| graph.iter().find(|entry| entry["@id"] == "./data/file.txt"))
+        .expect("patched entity exists");
+    assert_eq!(entity["name"], "renamed");
+    assert_eq!(entity["description"], "preserved");
+
+    let contextual_event_id = Ulid::from_parts(30, 4);
+    let contextual_event = create_payload_event(
+        &test,
+        document_id,
+        contextual_event_id,
+        "entity-replay",
+        MetadataCreateEventPayload::UpsertContextualEntity {
+            jsonld: r##"{"@id":"#lab","@type":"Organization","name":"lab"}"##.to_string(),
+        },
+    );
+    assert_upsert_replayed(metadata_handle, &contextual_event).await?;
+    Ok(())
+}
+
+async fn assert_upsert_replayed(
+    metadata_handle: &MetadataHandle,
+    event: &MetadataCreateEventRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let first_batch = materialize_entity_upsert(metadata_handle, event).await?;
+    assert_eq!(
+        first_batch.actor,
+        deterministic_materialization_actor(event.event_id)
+    );
+    assert!(!first_batch.ops.is_empty());
+
+    let replay_batch = materialize_entity_upsert(metadata_handle, event).await?;
+    assert_eq!(
+        replay_batch.actor,
+        deterministic_materialization_actor(event.event_id)
+    );
+    assert_eq!(replay_batch.counter, 0);
+    assert!(replay_batch.ops.is_empty());
+    Ok(())
+}
+
+async fn materialize_entity_upsert(
+    metadata_handle: &MetadataHandle,
+    event: &MetadataCreateEventRecord,
+) -> Result<MetadataBatch, Box<dyn std::error::Error>> {
+    match metadata_handle
+        .send_effect(materialization_effect(event))
+        .await
+    {
+        Event::Metadata(MetadataEvent::EntityUpsertResult { batch, .. }) => Ok(batch),
+        other => Err(format!("unexpected metadata event: {other:?}").into()),
+    }
+}
+
+fn create_event(
+    test: &TestContext,
+    document_id: Ulid,
+    event_id: Ulid,
+    name: &str,
+) -> MetadataCreateEventRecord {
+    create_payload_event(
+        test,
+        document_id,
+        event_id,
+        name,
+        MetadataCreateEventPayload::Scaffold {
+            name: name.to_string(),
+            description: "Materialization recovery".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+        },
+    )
+}
+
+fn create_payload_event(
+    test: &TestContext,
+    document_id: Ulid,
+    event_id: Ulid,
+    name: &str,
+    payload: MetadataCreateEventPayload,
+) -> MetadataCreateEventRecord {
+    let group_id = Ulid::from_parts(1, 1);
+    let document_path = format!("datasets/{name}");
+    let record = MetadataRegistryRecord {
+        realm_id: test.actor.realm_id,
+        group_id,
+        document_id,
+        document_path: document_path.clone(),
+        graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+        public: true,
+        permission_path: MetadataRegistryRecord::permission_path_for(
+            &test.actor.realm_id,
+            group_id,
+            &document_path,
+            document_id,
+        ),
+        placement: PlacementRef::NIL,
+        holder_node_ids: vec![test.actor.node_id],
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        establishing_event_id: event_id,
+        last_event_id: event_id,
+    };
+    MetadataCreateEventRecord {
+        event_id,
+        record,
+        user_id: test.actor.user_id,
+        node_id: test.actor.node_id,
+        payload,
+        occurred_at_ms: 1,
+    }
+}
+
+fn materialization_effect(event: &MetadataCreateEventRecord) -> Effect {
+    let policy = MetadataGraphPolicy {
+        public: event.record.public,
+        permission_paths: vec![event.record.permission_path.clone()],
+    }
+    .normalized();
+    let deterministic_actor = Some(deterministic_materialization_actor(event.event_id));
+    match &event.payload {
+        MetadataCreateEventPayload::Scaffold {
+            name,
+            description,
+            date_published,
+            license,
+        } => Effect::Metadata(MetadataEffect::CreateCrate {
+            request: MetadataCreateCrateRequest {
+                graph_iri: event.record.graph_iri.clone(),
+                name: name.clone(),
+                description: description.clone(),
+                date_published: date_published.clone(),
+                license: license.clone(),
+                policy,
+                durability: MetadataRequestDurability::WalAlreadyDurable,
+                deterministic_actor,
+            },
+        }),
+        MetadataCreateEventPayload::RoCrate { jsonld }
+        | MetadataCreateEventPayload::ReplaceRoCrate { jsonld } => {
+            Effect::Metadata(MetadataEffect::ApplyRoCrate {
+                request: MetadataApplyRoCrateRequest {
+                    graph_iri: event.record.graph_iri.clone(),
+                    jsonld: jsonld.clone(),
+                    policy,
+                    durability: MetadataRequestDurability::WalAlreadyDurable,
+                    deterministic_actor,
+                },
+            })
+        }
+        MetadataCreateEventPayload::UpsertDataEntity { jsonld } => {
+            Effect::Metadata(MetadataEffect::UpsertDataEntity {
+                request: MetadataUpsertEntityRequest {
+                    graph_iri: event.record.graph_iri.clone(),
+                    jsonld: jsonld.clone(),
+                    durability: MetadataRequestDurability::WalAlreadyDurable,
+                    deterministic_actor,
+                },
+            })
+        }
+        MetadataCreateEventPayload::UpsertContextualEntity { jsonld } => {
+            Effect::Metadata(MetadataEffect::UpsertContextualEntity {
+                request: MetadataUpsertEntityRequest {
+                    graph_iri: event.record.graph_iri.clone(),
+                    jsonld: jsonld.clone(),
+                    durability: MetadataRequestDurability::WalAlreadyDurable,
+                    deterministic_actor,
+                },
+            })
+        }
+        MetadataCreateEventPayload::ApplyBatch { batch, .. } => {
+            Effect::Metadata(MetadataEffect::MergeBatch {
+                graph_iri: event.record.graph_iri.clone(),
+                batch: batch.clone(),
+            })
+        }
+    }
+}
+
+async fn write_entries(
+    storage: &StorageHandle,
+    writes: Vec<(String, aruna_core::types::Key, aruna_core::types::Value)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match storage
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(format!("unexpected storage event: {other:?}").into()),
+    }
+}
+
+async fn read_status(
+    storage: &StorageHandle,
+    document_id: Ulid,
+) -> Result<Option<MetadataMaterializationStatusRecord>, Box<dyn std::error::Error>> {
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: aruna_core::keyspaces::METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
+            key: materialization_status_key(document_id),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => Ok(Some(postcard::from_bytes(&value)?)),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(format!("unexpected storage event: {other:?}").into()),
+    }
+}
+
+async fn job_count(storage: &StorageHandle) -> Result<usize, Box<dyn std::error::Error>> {
+    match storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 10,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values.len()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(format!("unexpected storage event: {other:?}").into()),
+    }
+}
+
+async fn build_context(with_metadata: bool) -> Result<TestContext, Box<dyn std::error::Error>> {
+    let storage_dir = tempfile::tempdir()?;
+    let storage_handle = FjallStorage::open(storage_dir.path().to_str().ok_or("invalid path")?)?;
+    let realm_id = RealmId::from_bytes([8u8; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+    let actor = Actor {
+        node_id,
+        user_id: aruna_core::UserId::local(Ulid::from_parts(8, 1), realm_id),
+        realm_id,
+    };
+    let metadata_dir = if with_metadata {
+        Some(tempfile::tempdir()?)
+    } else {
+        None
+    };
+    let metadata_handle = match metadata_dir.as_ref() {
+        Some(dir) => Some(MetadataHandle::new(
+            dir.path(),
+            node_id,
+            storage_handle.clone(),
+            None,
+            None,
+            None,
+        )?),
+        None => None,
+    };
+    let context = Arc::new(DriverContext {
+        storage_handle,
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle,
+        task_handle: None,
+        compute_handle: None,
+    });
+    Ok(TestContext {
+        _storage_dir: storage_dir,
+        _metadata_dir: metadata_dir,
+        actor,
+        context,
+    })
+}

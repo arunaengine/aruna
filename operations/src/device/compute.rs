@@ -1,9 +1,6 @@
 //! Owner-initiated local execution on a user device.
 //!
-//! The device runs its owner's jobs against device-local data and nothing else.
-//! The realm never dispatches here and no record of a local run is forwarded or
-//! replicated. An input the device does not hold must name the realm version
-//! that holds it, which staging then reads straight into the container.
+//! Runs only its owner's jobs on device-local data; staging reads realm-held inputs.
 
 use aruna_core::compute::{ExecutorKind, ResourceEnvelope};
 use aruna_core::structs::{
@@ -17,8 +14,8 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::service::{list_owned_jobs, submit_execution_job};
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::metadata::api::load_realm_config;
-use crate::mutate_realm_placement::node_kind;
-use crate::node_info::read_operator_drain;
+use crate::node::node_info::read_operator_drain;
+use crate::realm::mutate_placement::node_kind;
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Unfinished runs one status scan counts before it stops. A device queues its
@@ -67,9 +64,7 @@ pub enum LocalExecutionError {
 
 /// Accepts one local run on behalf of the device owner.
 ///
-/// Every refusal it can decide is decided before the job exists; the run
-/// ceiling is counted by the admitting transaction, so two concurrent
-/// submissions cannot both pass it.
+/// Refusals are decided before the job exists; the admitting transaction bounds concurrent submissions.
 pub async fn submit_local_execution(
     context: &DriverContext,
     mut config: LocalExecutionConfig,
@@ -134,8 +129,7 @@ pub struct ComputeStatus {
 
 /// Reports the local compute plane and the owner's runs on it.
 ///
-/// The counters come from the durable job records, so they survive a restart,
-/// and stop at [`MAX_RUN_SCAN`] unfinished runs.
+/// Counters come from durable job records; scanning stops at [`MAX_RUN_SCAN`].
 pub async fn compute_status(
     context: &DriverContext,
     owner: UserId,
@@ -237,10 +231,9 @@ async fn count_runs(
     })
 }
 
-/// Refuses at submit time what staging could only discover mid-run: an input
-/// naming another node is fetched by exact version, anything else must already
-/// be readable here. A local input the request left open is pinned to the
-/// version it resolves to now, because staging reads it by version.
+/// Refuses at submit time what staging could only discover mid-run: other-node
+/// inputs are fetched by exact version, local ones must be readable and open
+/// inputs are pinned to the version staging will read.
 async fn resolve_inputs(
     context: &DriverContext,
     config: &mut LocalExecutionConfig,
@@ -328,7 +321,7 @@ async fn resolve_local(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::payload;
+    use crate::tests::fixtures::records::payload;
     use aruna_core::compute::{AttemptStatus, BackendError, FenceContext};
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
@@ -463,7 +456,7 @@ mod tests {
         let local = node(1);
         let config = realm_config(local, RealmNodeKind::User { owner: owner(2) });
         write_config(&ctx, &config, local).await;
-        crate::node_info::set_operator_drain(&ctx, local, REALM, true)
+        crate::node::node_info::set_operator_drain(&ctx, local, REALM, true)
             .await
             .unwrap();
 
@@ -636,13 +629,13 @@ mod tests {
     async fn refuses_device_launch() {
         // The realm's own launch path declines a device whatever it advertises,
         // so local compute never becomes a dispatch target.
-        use crate::jobs::records::tests::fixture::Family;
+        use crate::tests::fixtures::records::Family;
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let local = node(1);
         let config = realm_config(local, RealmNodeKind::User { owner: owner(2) });
         write_config(&ctx, &config, local).await;
-        crate::node_info::seed_node_info_document(
+        crate::node::node_info::seed_info_document(
             &ctx,
             local,
             REALM,

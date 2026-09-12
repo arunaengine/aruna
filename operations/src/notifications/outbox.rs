@@ -17,14 +17,14 @@ pub const NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE: usize = 512;
 pub const NOTIFICATION_DELIVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub const NOTIFICATION_OUTBOX_RETENTION_MS: u64 = 48 * 60 * 60 * 1000;
 
-pub fn new_notification_outbox_record(record: NotificationRecord) -> NotificationOutboxRecord {
+pub fn new_outbox_record(record: NotificationRecord) -> NotificationOutboxRecord {
     NotificationOutboxRecord {
         outbox_id: Ulid::generate(),
         record,
     }
 }
 
-pub fn schedule_notification_outbox_drain_effect() -> Effect {
+pub fn schedule_drain_effect() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainNotificationOutbox,
         after: Duration::ZERO,
@@ -37,7 +37,7 @@ pub struct NotificationOutboxBatch {
     pub next_start_after: Option<Vec<u8>>,
 }
 
-pub async fn read_notification_outbox_batch(
+pub async fn read_outbox_batch(
     storage: &StorageHandle,
     start_after: Option<Vec<u8>>,
     limit: usize,
@@ -65,7 +65,7 @@ pub async fn read_notification_outbox_batch(
                     Err(error) => {
                         let key = key.to_vec();
                         warn!(error = %error, key = ?key, "Deleting malformed notification outbox record");
-                        delete_notification_outbox_records(storage, vec![key]).await?;
+                        delete_outbox_records(storage, vec![key]).await?;
                     }
                 }
             }
@@ -80,7 +80,7 @@ pub async fn read_notification_outbox_batch(
     }
 }
 
-pub async fn delete_notification_outbox_records(
+pub async fn delete_outbox_records(
     storage: &StorageHandle,
     keys: Vec<Vec<u8>>,
 ) -> Result<(), String> {
@@ -111,23 +111,23 @@ pub async fn delete_notification_outbox_records(
 
 // ShortenTimer, never ResetTimer: this path may wake earlier, but must not push
 // an existing retry deadline later.
-pub async fn restore_notification_outbox_timer(
+pub async fn restore_outbox_timer(
     storage: &StorageHandle,
     task_handle: &TaskHandle,
     after: Duration,
 ) {
-    restore_notification_outbox_timer_with(storage, task_handle, after, false).await;
+    restore_timer_with(storage, task_handle, after, false).await;
 }
 
-pub async fn restore_notification_outbox_timer_if_idle(
+pub async fn restore_idle_timer(
     storage: &StorageHandle,
     task_handle: &TaskHandle,
     after: Duration,
 ) {
-    restore_notification_outbox_timer_with(storage, task_handle, after, true).await;
+    restore_timer_with(storage, task_handle, after, true).await;
 }
 
-async fn restore_notification_outbox_timer_with(
+async fn restore_timer_with(
     storage: &StorageHandle,
     task_handle: &TaskHandle,
     after: Duration,
@@ -159,7 +159,7 @@ async fn restore_notification_outbox_timer_with(
         let event = if if_idle {
             Event::Task(
                 task_handle
-                    .schedule_timer_if_idle(TaskKey::DrainNotificationOutbox, after)
+                    .schedule_idle_timer(TaskKey::DrainNotificationOutbox, after)
                     .await,
             )
         } else {
@@ -179,15 +179,11 @@ async fn restore_notification_outbox_timer_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{
-        NotificationClass, NotificationKind, RealmId, notification_outbox_key,
-    };
-    use aruna_core::types::UserId;
-    use aruna_storage::FjallStorage;
+    use crate::tests::fixtures::notifications::{record, temp_storage, user};
+    use aruna_core::structs::{NotificationClass, notification_outbox_key};
     use aruna_tasks::InboundTaskHandler;
     use async_trait::async_trait;
     use std::sync::Arc;
-    use tempfile::tempdir;
     use tokio::sync::{Semaphore, mpsc};
 
     struct RecordingHandler {
@@ -219,29 +215,10 @@ mod tests {
         }
     }
 
-    fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        (dir, storage)
-    }
-
-    fn make_record() -> NotificationRecord {
-        NotificationRecord::new(
-            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
-            NotificationClass::Direct,
-            NotificationKind::AddedToGroup {
-                group_id: Ulid::generate(),
-                actor_user_id: UserId::new(Ulid::from_bytes([3u8; 16]), RealmId([1u8; 32])),
-            },
-            1_000,
-        )
-    }
-
-    fn outbox_record_with_id(id: Ulid) -> NotificationOutboxRecord {
+    fn record_with_id(id: Ulid) -> NotificationOutboxRecord {
         NotificationOutboxRecord {
             outbox_id: id,
-            record: make_record(),
+            record: record(user(1, 2), NotificationClass::Direct, 1_000),
         }
     }
 
@@ -282,16 +259,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbox_batch_reads_fifo() {
+    async fn batch_reads_fifo() {
         let (_dir, storage) = temp_storage();
         let records: Vec<NotificationOutboxRecord> = (1..=3u128)
-            .map(|seq| outbox_record_with_id(Ulid::from_parts(seq as u64, 0)))
+            .map(|seq| record_with_id(Ulid::from_parts(seq as u64, 0)))
             .collect();
         for record in &records {
             write_outbox(&storage, record).await;
         }
 
-        let batch = read_notification_outbox_batch(&storage, None, 3, None)
+        let batch = read_outbox_batch(&storage, None, 3, None)
             .await
             .expect("outbox read succeeds");
         assert!(!batch.has_more);
@@ -305,7 +282,7 @@ mod tests {
             ]
         );
 
-        let partial = read_notification_outbox_batch(&storage, None, 2, None)
+        let partial = read_outbox_batch(&storage, None, 2, None)
             .await
             .expect("outbox read succeeds");
         assert!(partial.has_more);
@@ -313,16 +290,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbox_snapshot_excludes_records_appended_between_pages() {
+    async fn snapshot_excludes_appends() {
         let (_dir, storage) = temp_storage();
         let records: Vec<NotificationOutboxRecord> = (1..=3u128)
-            .map(|seq| outbox_record_with_id(Ulid::from_parts(seq as u64, 0)))
+            .map(|seq| record_with_id(Ulid::from_parts(seq as u64, 0)))
             .collect();
         write_outbox(&storage, &records[0]).await;
         write_outbox(&storage, &records[1]).await;
 
         let txn_id = start_read_snapshot(&storage).await;
-        let first = read_notification_outbox_batch(&storage, None, 1, Some(txn_id))
+        let first = read_outbox_batch(&storage, None, 1, Some(txn_id))
             .await
             .expect("first snapshot page");
         assert_eq!(first.records[0].1, records[0]);
@@ -330,24 +307,23 @@ mod tests {
 
         write_outbox(&storage, &records[2]).await;
 
-        let second =
-            read_notification_outbox_batch(&storage, first.next_start_after, 1, Some(txn_id))
-                .await
-                .expect("second snapshot page");
+        let second = read_outbox_batch(&storage, first.next_start_after, 1, Some(txn_id))
+            .await
+            .expect("second snapshot page");
         assert_eq!(second.records[0].1, records[1]);
         assert!(!second.has_more);
         close_read_snapshot(&storage, txn_id).await;
 
-        let appended = read_notification_outbox_batch(&storage, second.next_start_after, 1, None)
+        let appended = read_outbox_batch(&storage, second.next_start_after, 1, None)
             .await
             .expect("live page after snapshot");
         assert_eq!(appended.records[0].1, records[2]);
     }
 
     #[tokio::test]
-    async fn snapshot_cursor_advances_past_malformed_records() {
+    async fn cursor_skips_malformed() {
         let (_dir, storage) = temp_storage();
-        let valid = outbox_record_with_id(Ulid::from_parts(2, 0));
+        let valid = record_with_id(Ulid::from_parts(2, 0));
         write_outbox(&storage, &valid).await;
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -363,26 +339,25 @@ mod tests {
         }
 
         let txn_id = start_read_snapshot(&storage).await;
-        let malformed = read_notification_outbox_batch(&storage, None, 1, Some(txn_id))
+        let malformed = read_outbox_batch(&storage, None, 1, Some(txn_id))
             .await
             .expect("malformed snapshot page");
         assert!(malformed.records.is_empty());
         assert!(malformed.has_more);
         assert!(malformed.next_start_after.is_some());
 
-        let next =
-            read_notification_outbox_batch(&storage, malformed.next_start_after, 1, Some(txn_id))
-                .await
-                .expect("snapshot page after malformed row");
+        let next = read_outbox_batch(&storage, malformed.next_start_after, 1, Some(txn_id))
+            .await
+            .expect("snapshot page after malformed row");
         assert_eq!(next.records[0].1, valid);
         assert!(!next.has_more);
         close_read_snapshot(&storage, txn_id).await;
     }
 
     #[tokio::test]
-    async fn malformed_outbox_record_is_deleted() {
+    async fn malformed_record_deleted() {
         let (_dir, storage) = temp_storage();
-        let valid = outbox_record_with_id(Ulid::from_parts(2, 0));
+        let valid = record_with_id(Ulid::from_parts(2, 0));
         write_outbox(&storage, &valid).await;
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -397,14 +372,9 @@ mod tests {
             other => panic!("unexpected write event: {other:?}"),
         }
 
-        let batch = read_notification_outbox_batch(
-            &storage,
-            None,
-            NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
-            None,
-        )
-        .await
-        .expect("outbox read succeeds");
+        let batch = read_outbox_batch(&storage, None, NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE, None)
+            .await
+            .expect("outbox read succeeds");
         assert_eq!(batch.records.len(), 1);
         assert_eq!(batch.records[0].1, valid);
 
@@ -432,12 +402,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_arms_timer_when_rows_exist() {
+    async fn restore_arms_timer() {
         let (_dir, storage) = temp_storage();
-        write_outbox(&storage, &outbox_record_with_id(Ulid::from_parts(1, 0))).await;
+        write_outbox(&storage, &record_with_id(Ulid::from_parts(1, 0))).await;
         let (task_handle, mut seen_rx) = recording_task_handle().await;
 
-        restore_notification_outbox_timer(&storage, &task_handle, Duration::ZERO).await;
+        restore_outbox_timer(&storage, &task_handle, Duration::ZERO).await;
 
         let key = tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
             .await
@@ -447,23 +417,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_is_silent_when_empty() {
+    async fn empty_restore_silent() {
         let (_dir, storage) = temp_storage();
         let (task_handle, mut seen_rx) = recording_task_handle().await;
 
-        restore_notification_outbox_timer(&storage, &task_handle, Duration::ZERO).await;
+        restore_outbox_timer(&storage, &task_handle, Duration::ZERO).await;
 
+        // A zero-delay timer armed by restore is dispatched before this abort
+        // command, so the running count witnesses whether a timer was armed.
+        let TaskEvent::RunningHandlersAborted { count, .. } = task_handle
+            .abort_running_handlers(TaskKey::DrainNotificationOutbox)
+            .await
+        else {
+            panic!("expected running handler abort event");
+        };
+        assert_eq!(count, 0, "empty outbox must not arm a drain timer");
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), seen_rx.recv())
-                .await
-                .is_err()
+            seen_rx.try_recv().is_err(),
+            "empty outbox must not invoke the drain handler"
         );
     }
 
     #[tokio::test]
-    async fn restore_uses_shorten_timer_semantics() {
+    async fn restore_shortens_timer() {
         let (_dir, storage) = temp_storage();
-        write_outbox(&storage, &outbox_record_with_id(Ulid::from_parts(1, 0))).await;
+        write_outbox(&storage, &record_with_id(Ulid::from_parts(1, 0))).await;
         let task_handle = TaskHandle::new();
 
         let Event::Task(TaskEvent::TimerScheduled { .. }) = task_handle
@@ -476,7 +454,7 @@ mod tests {
             panic!("expected timer scheduled");
         };
 
-        restore_notification_outbox_timer(&storage, &task_handle, Duration::from_secs(7200)).await;
+        restore_outbox_timer(&storage, &task_handle, Duration::from_secs(7200)).await;
 
         let Event::Task(TaskEvent::TimerScheduled { after, .. }) = task_handle
             .send_effect(Effect::Task(TaskEffect::ShortenTimer {
@@ -494,9 +472,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_if_idle_does_not_refire_running_drain() {
+    async fn running_drain_unchanged() {
         let (_dir, storage) = temp_storage();
-        write_outbox(&storage, &outbox_record_with_id(Ulid::from_parts(1, 0))).await;
+        write_outbox(&storage, &record_with_id(Ulid::from_parts(1, 0))).await;
         let task_handle = TaskHandle::new();
         let (seen_tx, mut seen_rx) = mpsc::channel(2);
         let release = Arc::new(Semaphore::new(0));
@@ -522,13 +500,20 @@ mod tests {
             .expect("handler should send first key");
         assert_eq!(first, TaskKey::DrainNotificationOutbox);
 
-        restore_notification_outbox_timer_if_idle(&storage, &task_handle, Duration::ZERO).await;
-        release.add_permits(1);
+        restore_idle_timer(&storage, &task_handle, Duration::from_secs(10)).await;
 
+        // A timer left by restore_if_idle would report its ~10s deadline here;
+        // a running drain returns the 3600s requested by the probe instead.
+        let TaskEvent::TimerScheduled { after, .. } = task_handle
+            .schedule_idle_timer(TaskKey::DrainNotificationOutbox, Duration::from_secs(3600))
+            .await
+        else {
+            panic!("expected timer scheduled");
+        };
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), seen_rx.recv())
-                .await
-                .is_err()
+            after > Duration::from_secs(3000),
+            "restore_if_idle must not arm a drain timer while the drain runs"
         );
+        release.add_permits(1);
     }
 }

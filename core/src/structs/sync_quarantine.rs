@@ -1,4 +1,5 @@
 use crate::NodeId;
+#[cfg(test)]
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{DocumentSyncEvent, DocumentSyncTarget};
 use crate::errors::ConversionError;
@@ -37,10 +38,9 @@ impl SyncQuarantineFamily {
     }
 }
 
-/// Immutable transport identity of a rejected operation: the topic it arrived
-/// on, the signed publisher actor, and that actor's sequence. No payload field
-/// takes part, so two publishers reusing one `event_id` keep distinct rows and
-/// a redelivery replaces exactly its own row.
+/// Immutable transport identity of a rejected operation: the topic it arrived on, the signed publisher
+/// actor, and that actor's sequence. No payload field takes part, so two publishers reusing one
+/// `event_id` keep distinct rows and a redelivery replaces exactly its own row.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SyncQuarantineIdentity {
     pub topic: TopicId,
@@ -104,10 +104,9 @@ impl SyncQuarantineEvidence {
     }
 }
 
-/// A replicated sync event that failed permanent validation, retained for
-/// inspection instead of being silently dropped (#338). Evidence is committed in
-/// the same transaction as the cursor that advances past it, so a topic never
-/// moves ahead of an unpersisted rejection.
+/// A replicated sync event that failed permanent validation, retained for inspection instead of being
+/// silently dropped (#338). Evidence is committed in the same transaction as the cursor that advances
+/// past it, so a topic never moves ahead of an unpersisted rejection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncQuarantineRecord {
     pub identity: SyncQuarantineIdentity,
@@ -208,23 +207,6 @@ fn event_origin(event: &DocumentSyncEvent) -> NodeId {
             change.current.actor
         }
         DocumentSyncEvent::AdminOperation { event, .. } => event.origin_node_id,
-    }
-}
-
-/// The document-sync target an admin operation rides under, mirroring the arms
-/// of the admin apply dispatch.
-pub fn admin_sync_target(target: &AdminDocumentTarget) -> DocumentSyncTarget {
-    match target {
-        AdminDocumentTarget::Group { group_id } => DocumentSyncTarget::GroupAuthorization {
-            group_id: *group_id,
-        },
-        AdminDocumentTarget::Realm { realm_id } => DocumentSyncTarget::RealmAuthorization {
-            realm_id: *realm_id,
-        },
-        AdminDocumentTarget::RealmConfig { realm_id } => DocumentSyncTarget::RealmConfig {
-            realm_id: *realm_id,
-        },
-        AdminDocumentTarget::User { user_id } => DocumentSyncTarget::User { user_id: *user_id },
     }
 }
 

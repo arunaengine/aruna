@@ -1,18 +1,9 @@
-mod archive;
+pub(crate) mod archive;
 #[cfg(test)]
 mod consortium;
 mod reader;
-mod rewrite;
+pub(crate) mod rewrite;
 mod upload;
-
-#[cfg(test)]
-pub(crate) mod fixture {
-    pub(crate) use super::archive::{
-        file_id_candidates, inspect_archive, open_archive, payload_entries, read_metadata,
-        signature_entry,
-    };
-    pub(crate) use super::rewrite::{RewriteTarget, rewrite_document, validate_document};
-}
 
 pub use upload::{
     CreateRoCrateUploadConfig, CreateRoCrateUploadError, CreateRoCrateUploadOperation,
@@ -37,10 +28,9 @@ use aruna_core::structs::{
     ImportReportRow, ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec,
     JOB_SYSTEM_ENTRY_PREFIX, JobError, JobResultPayload, MetadataRegistryRecord,
     OBJECT_CONTENT_TYPE_KEY, Permission, ReasonCode, RoCrateCheckpointRefs, RoCrateMediaType,
-    VersionedObjectArn, blob_bucket_permission_path, blob_object_permission_path, job_entry_key,
+    VersionedObjectArn, bucket_permission_path, job_entry_key, object_permission_path,
     rocrate_plan_key,
 };
-use aruna_core::types::Value;
 use bytes::Bytes;
 use byteview::ByteView;
 use futures_util::{StreamExt, stream};
@@ -58,22 +48,22 @@ use self::reader::HiddenRangeReader;
 use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document, validate_document};
 use super::executor::{JobContext, JobRunOutcome};
 use super::metadata_class::MetadataFailure;
-use super::store::{list_job_entries, put_job_entry, put_rocrate_checkpoint, put_rocrate_plan};
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::create_metadata_document::{
+use super::store::{list_job_entries, put_job_entry, put_state, read_state};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
+use crate::metadata::MetadataAuthToken;
+use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
-use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
-use crate::get_realm_config::GetRealmConfigOperation;
-use crate::metadata::MetadataAuthToken;
-use crate::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
+use crate::metadata::forward::{MetadataWriteError, route_metadata_create};
 use crate::notifications::watch::emit::emit_metadata_created;
+use crate::realm::get_config::GetRealmConfigOperation;
 use crate::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
 use crate::s3::delete_object::DeleteObjectError;
 use crate::s3::delete_objects::{DeleteObjectsEntry, DeleteObjectsInput, delete_objects};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::read_source::{
@@ -377,7 +367,7 @@ async fn acquire_source(
                 *upload_id,
                 spec.auth_context.user_id,
                 ctx.job_id,
-                aruna_core::util::unix_timestamp_millis(),
+                aruna_core::time::unix_timestamp_millis(),
             )
             .await
             .map_err(|error| match error {
@@ -401,7 +391,7 @@ async fn acquire_source(
             ensure_permission(
                 ctx,
                 &spec.auth_context,
-                blob_object_permission_path(
+                object_permission_path(
                     spec.auth_context.realm_id,
                     bucket_info.group_id,
                     ctx.owner_node_id,
@@ -748,10 +738,8 @@ async fn validate_source(
 }
 
 /// Rejects a crate that would fail validation before anything is written.
-///
-/// Every rewritten identifier is already known here. The placeholder content
-/// hash is a literal value rather than a reference, so it cannot change the
-/// graph the validator walks.
+/// Every rewritten identifier is known here, and the literal placeholder content
+/// hash cannot change the graph the validator walks.
 fn preflight_crate(
     spec: &ImportRoCrateSpec,
     node_id: aruna_core::NodeId,
@@ -812,7 +800,7 @@ async fn write_next(
     ensure_permission(
         ctx,
         &spec.auth_context,
-        blob_object_permission_path(
+        object_permission_path(
             spec.auth_context.realm_id,
             bucket_info.group_id,
             ctx.owner_node_id,
@@ -1020,17 +1008,15 @@ async fn create_document(
         user_id: spec.auth_context.user_id,
         realm_id: spec.auth_context.realm_id,
     };
-    match create_metadata_document_routed(
-        CreateMetadataDocumentOperation::new_for_generated_document_id(
-            CreateMetadataDocumentConfig {
-                actor,
-                group_id: spec.metadata.group_id,
-                document_id: spec.document_id,
-                document_path: spec.metadata.path.clone(),
-                public: spec.metadata.public,
-                payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
-            },
-        ),
+    match route_metadata_create(
+        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+            actor,
+            group_id: spec.metadata.group_id,
+            document_id: spec.document_id,
+            document_path: spec.metadata.path.clone(),
+            public: spec.metadata.public,
+            payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
+        }),
         ctx.driver.clone(),
         Some(MetadataAuthToken::internal(spec.auth_context.clone())),
     )
@@ -1109,9 +1095,8 @@ fn rollback_required(checkpoint: &ImportCheckpoint) -> bool {
 }
 
 /// Deletes exactly the object versions this import wrote.
-///
-/// Every version id is minted by this job, so a version another writer owns can
-/// never be removed, even where the import landed on an existing key.
+/// Every version id is minted by this job, so versions another writer owns are
+/// never removed, even where the import landed on an existing key.
 async fn rollback_writes(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
@@ -1195,7 +1180,7 @@ async fn ensure_targets(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<()
     ensure_permission(
         ctx,
         &spec.auth_context,
-        blob_bucket_permission_path(
+        bucket_permission_path(
             spec.auth_context.realm_id,
             bucket.group_id,
             ctx.owner_node_id,
@@ -1580,68 +1565,46 @@ async fn load_reports(ctx: &JobContext) -> Result<HashMap<String, ImportReportRo
 }
 
 async fn read_checkpoint(ctx: &JobContext) -> Result<Option<ImportCheckpoint>, String> {
-    match ctx
-        .driver
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(ctx.job_id.to_bytes().to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => postcard::from_bytes(value.as_ref())
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected import checkpoint event: {other:?}")),
-    }
+    read_state(
+        &ctx.driver.storage_handle,
+        ROCRATE_JOB_STATE_KEYSPACE,
+        ByteView::from(ctx.job_id.to_bytes().to_vec()),
+        "import checkpoint",
+    )
+    .await
 }
 
 async fn read_plan(ctx: &JobContext) -> Result<Option<ImportPlan>, String> {
-    match ctx
-        .driver
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
-            key: rocrate_plan_key(ctx.job_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => postcard::from_bytes(value.as_ref())
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected import plan event: {other:?}")),
-    }
+    read_state(
+        &ctx.driver.storage_handle,
+        ROCRATE_JOB_STATE_KEYSPACE,
+        rocrate_plan_key(ctx.job_id),
+        "import plan",
+    )
+    .await
 }
 
 async fn persist_checkpoint(ctx: &JobContext, checkpoint: &ImportCheckpoint) -> Result<(), String> {
-    let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
-    put_rocrate_checkpoint(
+    put_state(
         &ctx.driver.storage_handle,
         ctx.job_id,
         ctx.claim_token,
-        Value::from(value),
+        ROCRATE_JOB_STATE_KEYSPACE,
+        ByteView::from(ctx.job_id.to_bytes().to_vec()),
+        checkpoint,
     )
     .await
     .map_err(|error| error.to_string())
 }
 
 async fn persist_plan(ctx: &JobContext, plan: &ImportPlan) -> Result<(), String> {
-    let value = postcard::to_allocvec(plan).map_err(|error| error.to_string())?;
-    put_rocrate_plan(
+    put_state(
         &ctx.driver.storage_handle,
         ctx.job_id,
         ctx.claim_token,
-        Value::from(value),
+        ROCRATE_JOB_STATE_KEYSPACE,
+        rocrate_plan_key(ctx.job_id),
+        plan,
     )
     .await
     .map_err(|error| error.to_string())
@@ -1885,8 +1848,15 @@ fn retryable_error(message: impl Into<String>) -> JobRunOutcome {
     JobRunOutcome::Failed(JobError::retryable(message.into()))
 }
 
+/// A node that cannot build a destination gate is retryable: the transition it
+/// is in ends on its own, and the import resumes from its checkpoint.
+fn classify_gate(error: GateContextError) -> ImportFailure {
+    ImportFailure::Retryable(error.to_string())
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+
     use super::*;
     use aruna_core::structs::{
         ImportMetadataTarget, ImportRoCrateTarget, JobClaim, JobId, JobPayload, JobRecord,
@@ -1897,7 +1867,7 @@ mod tests {
 
     use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::insert_job;
-    use crate::staging::test_utils::setup_driver_context;
+    use crate::tests::fixtures::staging::setup_driver_context;
 
     #[test]
     fn target_checks_limits() {
@@ -1995,7 +1965,7 @@ mod tests {
     }
 
     #[test]
-    fn import_path_keeps_profile_gate_rejections_permanent() {
+    fn profile_rejections_permanent() {
         let finding = aruna_core::metadata::MetadataProfileValidationFinding {
             code: "unsupported_constraint".to_string(),
             severity: aruna_core::metadata::MetadataProfileValidationSeverity::Violation,
@@ -2007,7 +1977,7 @@ mod tests {
             completeness: aruna_core::metadata::MetadataProfileValidationCompleteness::Incomplete,
         };
         let failure = classify_metadata(MetadataWriteError::Create(
-            crate::create_metadata_document::CreateMetadataDocumentError::MetadataError(
+            crate::metadata::create_document::CreateMetadataDocumentError::MetadataError(
                 aruna_core::metadata::MetadataError::ProfileValidation(vec![finding]),
             ),
         ));
@@ -2145,10 +2115,4 @@ mod tests {
             Event::Blob(BlobEvent::HiddenListed { entries, .. }) if entries.is_empty()
         ));
     }
-}
-
-/// A node that cannot build a destination gate is retryable: the transition it
-/// is in ends on its own, and the import resumes from its checkpoint.
-fn classify_gate(error: GateContextError) -> ImportFailure {
-    ImportFailure::Retryable(error.to_string())
 }

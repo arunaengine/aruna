@@ -13,23 +13,24 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USER_KEYSPACE,
+    AUTH_KEYSPACE, GROUP_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    S3_BUCKET_KEYSPACE, USER_KEYSPACE,
 };
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::{
     Actor, Backend, BackendConfig, BucketInfo, Group, GroupAuthorizationDocument, NodeCapabilities,
-    RealmId, User,
+    OfferedDirectory, RealmId, User,
 };
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::claim_initial_realm_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-};
-use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::realm::claim_admin::{
+    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+};
+use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::http::{HeaderValue, header};
@@ -161,7 +162,7 @@ async fn setup_fixture() -> Fixture {
         .await,
     );
     let group_id = Ulid::from_bytes([33u8; 16]);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(user_id, realm_id, group_id);
     let group = Group {
         display_name: "MCP group".to_string(),
         group_id,
@@ -618,6 +619,74 @@ async fn data_guard_keys() {
 }
 
 #[tokio::test]
+async fn refuses_offered_write() {
+    let fixture = setup_fixture().await;
+    let bucket = "offered-data";
+    let offered = OfferedDirectory {
+        bucket: bucket.to_string(),
+        group_id: fixture.group_id,
+        root: "offered/root".to_string(),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: fixture.actor.user_id,
+    };
+    write_value(
+        &fixture.state,
+        OFFERED_DIRECTORY_KEYSPACE,
+        bucket.as_bytes().to_vec(),
+        offered.to_bytes().unwrap(),
+    )
+    .await;
+    write_value(
+        &fixture.state,
+        S3_BUCKET_KEYSPACE,
+        bucket.as_bytes().to_vec(),
+        BucketInfo {
+            group_id: fixture.group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: fixture.actor.user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+        }
+        .to_bytes()
+        .unwrap(),
+    )
+    .await;
+
+    let (url, shutdown, task) = start_server(fixture.state.clone()).await;
+    let client = connect(&url, &fixture.token).await;
+
+    let refused = call(
+        &client,
+        "write_object",
+        json!({ "bucket": bucket, "key": "note.txt", "text": "no" }),
+    )
+    .await;
+    assert!(is_error(&refused));
+    assert_eq!(code(&refused), "Forbidden");
+    let reason = refused.structured_content.as_ref().unwrap()["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(reason.contains("read-only"), "{reason}");
+
+    // Only the write is guarded; the read reaches the empty object lookup.
+    let read = call(
+        &client,
+        "read_object",
+        json!({ "bucket": bucket, "key": "note.txt" }),
+    )
+    .await;
+    assert_eq!(code(&read), "Not found");
+
+    client.cancel().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    fixture.net.shutdown().await;
+}
+
+#[tokio::test]
 async fn stat_reports_version() {
     let fixture = setup_fixture().await;
     let (url, shutdown, task) = start_server(fixture.state.clone()).await;
@@ -827,6 +896,90 @@ async fn metadata_explains_refusals() {
     .await;
     assert!(is_error(&foreign_scope));
     assert_eq!(code(&foreign_scope), "Forbidden");
+
+    client.cancel().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    fixture.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn metadata_transports_match() {
+    let fixture = setup_fixture().await;
+    let (url, shutdown, task) = start_server(fixture.state.clone()).await;
+    let client = connect(&url, &fixture.token).await;
+    let group = fixture.group_id.to_string();
+    let rocrate = json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                "about": { "@id": "urn:dataset:transport-parity" }
+            },
+            {
+                "@id": "urn:dataset:transport-parity",
+                "@type": "Dataset",
+                "name": "Transport Parity",
+                "description": "Created through one transport",
+                "datePublished": "2026-01-01",
+                "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" }
+            }
+        ]
+    });
+
+    let mut realm = drive(
+        GetRealmConfigOperation::new(fixture.state.get_realm_id()),
+        &fixture.state.get_ctx(),
+    )
+    .await
+    .unwrap();
+    realm.request_policies = vec![RequestPolicy {
+        policy_id: Ulid::generate(),
+        name: "deny-mcp".to_string(),
+        kind: PolicyKind::Deny,
+        when: None,
+        expression: "operation.startsWith(\"mcp:\")".to_string(),
+        enabled: true,
+    }];
+    write_value(
+        &fixture.state,
+        REALM_CONFIG_KEYSPACE,
+        fixture.state.get_realm_id().as_bytes().to_vec(),
+        realm.to_bytes(&fixture.actor).unwrap(),
+    )
+    .await;
+
+    let denied = call(
+        &client,
+        "create_dataset",
+        json!({
+            "group_id": group,
+            "path": "datasets/transport-parity",
+            "rocrate": rocrate.clone()
+        }),
+    )
+    .await;
+    assert!(is_error(&denied));
+    assert_eq!(code(&denied), "Forbidden");
+
+    let base = url.strip_suffix("/mcp").unwrap();
+    let created = reqwest::Client::new()
+        .post(format!("{base}/api/v1/metadata"))
+        .bearer_auth(&fixture.token)
+        .json(&json!({
+            "group_id": group,
+            "path": "datasets/transport-parity",
+            "public": false,
+            "rocrate": rocrate
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = created.status();
+    let body = created.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
 
     client.cancel().await.unwrap();
     shutdown.cancel();

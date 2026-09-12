@@ -11,15 +11,17 @@ use aruna_core::compute::{
 use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Barrier, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// A backend whose channels are in-memory pipes. Each `open_session` hands out
 /// the next one, so a reconnect gets a fresh exec like a real backend.
 struct FakeBackend {
     helpers: Mutex<VecDeque<DuplexStream>>,
+    opens: Arc<AtomicUsize>,
 }
 
 impl FakeBackend {
@@ -33,6 +35,7 @@ impl FakeBackend {
         }
         let backend = Arc::new(Self {
             helpers: Mutex::new(helpers),
+            opens: Arc::new(AtomicUsize::new(0)),
         });
         (backend, nodes)
     }
@@ -105,6 +108,7 @@ impl ExecutorBackend for FakeBackend {
     }
 
     async fn open_session(&self, _context: &FenceContext) -> Result<SessionChannel, BackendError> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
         let stream = self
             .helpers
             .lock()
@@ -198,6 +202,46 @@ async fn reopens_lost_channel() {
     wait_for_starting(&session).await;
     announce_idle(&session, &mut second).await;
     assert_eq!(session.snapshot().state, SessionPhase::Ready);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dedupes_concurrent_opens() {
+    // Two racing opens must return one session and start one backend channel.
+    let (backend, _nodes) = FakeBackend::new(1);
+    let opens = Arc::clone(&backend.opens);
+    let registry = Arc::new(SessionRegistry::new());
+    let barrier = Arc::new(Barrier::new(2));
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let registry = Arc::clone(&registry);
+        let backend = Arc::clone(&backend);
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            registry.open(config(), backend, fence())
+        }));
+    }
+    let mut opened = Vec::new();
+    for task in tasks {
+        opened.push(task.await.expect("the open task panicked"));
+    }
+
+    assert!(Arc::ptr_eq(&opened[0], &opened[1]));
+    let registered = registry.get(&config().job_id).expect("session registered");
+    assert!(Arc::ptr_eq(&registered, &opened[0]));
+    wait_for_opens(&opens, 1).await;
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+}
+
+/// Waits for the backend channel to open. The timeout only caps a hang.
+async fn wait_for_opens(opens: &AtomicUsize, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while opens.load(Ordering::SeqCst) < expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the backend channel was never opened");
 }
 
 /// Waits until the pump noticed the lost channel. The reopen is paced, so the

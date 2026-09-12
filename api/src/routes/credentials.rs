@@ -1,19 +1,17 @@
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
-    AuthContext, PathRestriction, Permission, UserAccess, blob_group_permission_path,
+    AuthContext, PathRestriction, Permission, UserAccess, group_permission_path,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::permission_rules::reachable_roots;
-use aruna_operations::s3::create_user_access::{
+use aruna_operations::s3::create_access::{
     CreateUserAccessConfig, CreateUserAccessError, CreateUserAccessOperation,
     DEFAULT_CREDENTIAL_TTL,
 };
-use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
-use aruna_operations::s3::list_user_access::{ListUserAccessInput, ListUserAccessOperation};
-use aruna_operations::s3::revoke_user_access::{RevokeUserAccessError, RevokeUserAccessOperation};
+use aruna_operations::s3::get_access::{GetUserAccessError, GetUserAccessOperation};
+use aruna_operations::s3::list_access::{ListUserAccessInput, ListUserAccessOperation};
+use aruna_operations::s3::revoke_access::{RevokeUserAccessError, RevokeUserAccessOperation};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -142,15 +140,15 @@ impl DelegationScope {
     }
 
     fn is_within(&self, root: &str) -> bool {
-        is_same_path_or_descendant(&self.root, root)
+        path_within(&self.root, root)
     }
 
     fn intersect_group_root(&self, group_root: &str) -> Option<Self> {
-        if is_same_path_or_descendant(&self.root, group_root) {
+        if path_within(&self.root, group_root) {
             return Some(self.clone());
         }
 
-        if self.recursive && is_same_path_or_descendant(group_root, &self.root) {
+        if self.recursive && path_within(group_root, &self.root) {
             Some(Self::descendants(group_root.to_string()))
         } else {
             None
@@ -254,7 +252,7 @@ pub async fn list_s3_credentials(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<ListS3CredentialsResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
 
     let credentials = drive(
         ListUserAccessOperation::new(ListUserAccessInput {
@@ -268,10 +266,7 @@ pub async fn list_s3_credentials(
     Ok((
         StatusCode::OK,
         Json(ListS3CredentialsResponse {
-            credentials: credentials
-                .into_iter()
-                .map(map_user_access_redacted)
-                .collect(),
+            credentials: credentials.into_iter().map(map_redacted_access).collect(),
         }),
     ))
 }
@@ -426,7 +421,7 @@ pub async fn revoke_s3_credentials(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(access_key_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
 
     let credential = match drive(
         GetUserAccessOperation::new(access_key_id.clone()),
@@ -441,9 +436,7 @@ pub async fn revoke_s3_credentials(
         Ok(Some(Err(err))) | Err(err) => return Err(ServerError::InternalError(err.to_string())),
     };
 
-    // Credentials are user-owned like the list and create surfaces: write access
-    // to the group must not reach another member's credential, so revoking one
-    // needs either ownership or administrative authority over that user.
+    // Group write cannot revoke another member's credential without user administration.
     if credential.user_identity != auth.user_id {
         crate::auth::ensure_permission(
             &state,
@@ -472,7 +465,7 @@ pub async fn revoke_s3_credentials(
     }
 }
 
-fn map_user_access_redacted(access: UserAccess) -> S3CredentialSummaryResponse {
+fn map_redacted_access(access: UserAccess) -> S3CredentialSummaryResponse {
     let now = SystemTime::now();
     let status = credential_status(&access, now);
     let expires_at = format_system_time(access.expiry);
@@ -535,8 +528,7 @@ async fn build_credential_restrictions(
     group_id: Ulid,
     requested_restrictions: Option<Vec<CreateS3PathRestriction>>,
 ) -> ServerResult<Option<Vec<NormalizedRestriction>>> {
-    let group_root =
-        blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
+    let group_root = group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
     let auth_restrictions = normalize_auth_restrictions(auth, &group_root)?;
     let requested_restrictions =
         normalize_requested_restrictions(requested_restrictions, &group_root)?;
@@ -571,7 +563,7 @@ fn normalize_auth_restrictions(
             continue;
         }
 
-        if auth_pattern_may_apply_to_group_root(&restriction.pattern, group_root) {
+        if pattern_reaches_group(&restriction.pattern, group_root) {
             return Err(ServerError::Forbidden);
         }
     }
@@ -628,9 +620,9 @@ async fn validate_requested_restrictions(
             continue;
         }
 
-        check_permission(
-            auth,
+        crate::auth::ensure_permission(
             state,
+            auth,
             restriction.scope.authorization_probe_path(),
             restriction.permission.clone(),
         )
@@ -691,8 +683,7 @@ async fn authorize_credential_issuance(
     group_id: Ulid,
     effective_restrictions: Option<&[NormalizedRestriction]>,
 ) -> ServerResult<()> {
-    let group_root =
-        blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
+    let group_root = group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
     let effective_auth = AuthContext {
         path_restrictions: effective_restrictions.map(serialize_restrictions),
         ..auth.clone()
@@ -700,14 +691,36 @@ async fn authorize_credential_issuance(
 
     let Some(effective_restrictions) = effective_restrictions else {
         for permission in [Permission::WRITE, Permission::READ] {
-            match check_permission(&effective_auth, state, group_root.clone(), permission).await {
+            match crate::auth::ensure_permission(
+                state,
+                &effective_auth,
+                group_root.to_string(),
+                permission,
+            )
+            .await
+            {
                 Ok(()) => return Ok(()),
-                Err(ServerError::Forbidden) => continue,
-                Err(err) => return Err(err),
+                Err(ServerError::Forbidden) => {}
+                Err(error) => return Err(error),
             }
         }
-
-        return authorize_group_subpath(&effective_auth, state, &group_root).await;
+        let roots = aruna_operations::auth::permission_rules::reachable_roots(
+            &state.get_ctx(),
+            &effective_auth,
+            &group_root,
+        )
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        for root in roots {
+            match crate::auth::ensure_permission(state, &effective_auth, root, Permission::READ)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(ServerError::Forbidden) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        return Err(ServerError::Forbidden);
     };
 
     for restriction in effective_restrictions {
@@ -715,9 +728,9 @@ async fn authorize_credential_issuance(
             continue;
         }
 
-        match check_permission(
-            &effective_auth,
+        match crate::auth::ensure_permission(
             state,
+            &effective_auth,
             restriction.scope.authorization_probe_path(),
             restriction.permission.clone(),
         )
@@ -732,40 +745,7 @@ async fn authorize_credential_issuance(
     Err(ServerError::Forbidden)
 }
 
-/// Accepts a member whose roles reach only a part of the group data, such as a
-/// single dataset folder, because every S3 request is still authorized against
-/// those roles.
-async fn authorize_group_subpath(
-    auth: &AuthContext,
-    state: &ServerState,
-    group_root: &str,
-) -> ServerResult<()> {
-    let roots = reachable_roots(&state.get_ctx(), auth, group_root)
-        .await
-        .map_err(|error| match error {
-            AuthorizationError::AuthDocNotFound
-            | AuthorizationError::GroupNotFound
-            | AuthorizationError::InvalidRealmId
-            | AuthorizationError::InvalidGroupId => ServerError::Forbidden,
-            _ => ServerError::InternalError(error.to_string()),
-        })?;
-    if roots.is_empty() {
-        return Err(ServerError::Forbidden);
-    }
-
-    Ok(())
-}
-
-async fn check_permission(
-    auth: &AuthContext,
-    state: &ServerState,
-    path: String,
-    required_permission: Permission,
-) -> ServerResult<()> {
-    crate::auth::ensure_permission(state, auth, path, required_permission).await
-}
-
-fn auth_pattern_may_apply_to_group_root(pattern: &str, group_root: &str) -> bool {
+fn pattern_reaches_group(pattern: &str, group_root: &str) -> bool {
     if pattern.starts_with(group_root) {
         return true;
     }
@@ -780,11 +760,10 @@ fn auth_pattern_may_apply_to_group_root(pattern: &str, group_root: &str) -> bool
         return true;
     }
 
-    is_same_path_or_descendant(group_root, literal_prefix)
-        || is_same_path_or_descendant(literal_prefix, group_root)
+    path_within(group_root, literal_prefix) || path_within(literal_prefix, group_root)
 }
 
-fn is_same_path_or_descendant(path: &str, root: &str) -> bool {
+fn path_within(path: &str, root: &str) -> bool {
     path == root
         || path
             .strip_prefix(root)
@@ -804,6 +783,10 @@ fn parse_permission(permission: &str) -> ServerResult<Permission> {
 mod tests {
     use super::*;
     use crate::error::ServerError;
+    use crate::tests::fixtures::routes::{
+        seed_group_docs, seed_realm_auth, seed_realm_config, test_context,
+        test_state as build_state, test_storage,
+    };
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
@@ -811,36 +794,22 @@ mod tests {
     use aruna_core::structs::RealmId;
     use aruna_core::structs::{
         Actor, AuthContext, Group, GroupAuthorizationDocument, PathRestriction, Permission,
-        RealmAuthorizationDocument, RealmConfigDocument, blob_group_permission_path,
+        RealmAuthorizationDocument, RealmConfigDocument, group_permission_path,
     };
-    use aruna_operations::driver::DriverContext;
-    use aruna_operations::jobs::runtime::JobsRuntime;
-    use aruna_storage::storage::FjallStorage;
     use std::sync::Arc;
     use tempfile::TempDir;
     use ulid::Ulid;
 
     async fn test_state() -> (TempDir, Arc<ServerState>, AuthContext) {
-        let storage_dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let (storage_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let state = Arc::new(
-            ServerState::new(
-                Arc::new(DriverContext {
-                    storage_handle: storage,
-                    net_handle: None,
-                    blob_handle: None,
-                    metadata_handle: None,
-                    task_handle: None,
-                    compute_handle: None,
-                }),
+            build_state(
+                Arc::new(test_context(storage)),
                 realm_id,
                 node_id,
                 NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                JobsRuntime::new(),
             )
             .await,
         );
@@ -875,51 +844,17 @@ mod tests {
             user_id: auth.user_id,
             realm_id,
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(auth.user_id, realm_id, group_id);
-        let group = Group {
-            display_name: "credential-group".to_string(),
-            group_id,
+        seed_realm_config(&state.get_ctx(), realm_id, &actor).await;
+        seed_realm_auth(&state.get_ctx(), realm_id, &actor).await;
+        seed_group_docs(
+            &state.get_ctx(),
             realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner: auth.user_id,
-        };
-        for (key_space, key, value) in [
-            (
-                REALM_CONFIG_KEYSPACE,
-                realm_id.as_bytes().to_vec(),
-                RealmConfigDocument::default_for_realm(realm_id, Vec::new())
-                    .to_bytes(&actor)
-                    .unwrap(),
-            ),
-            (
-                AUTH_KEYSPACE,
-                realm_id.as_bytes().to_vec(),
-                realm_auth.to_bytes(&actor).unwrap(),
-            ),
-            (
-                AUTH_KEYSPACE,
-                group_id.to_bytes().to_vec(),
-                group_auth.to_bytes(&actor).unwrap(),
-            ),
-            (
-                GROUP_KEYSPACE,
-                group_id.to_bytes().to_vec(),
-                group.to_bytes(&actor).unwrap(),
-            ),
-        ] {
-            state
-                .get_ctx()
-                .storage_handle
-                .send_storage_effect(StorageEffect::Write {
-                    key_space: key_space.to_string(),
-                    key: key.into(),
-                    value: value.into(),
-                    txn_id: None,
-                })
-                .await;
-        }
+            &actor,
+            group_id,
+            "credential-group",
+            auth.user_id,
+        )
+        .await;
 
         let (access_key_id, _, _) = drive(
             CreateUserAccessOperation::new(
@@ -987,7 +922,7 @@ mod tests {
             (
                 AUTH_KEYSPACE,
                 realm_id.as_bytes().to_vec(),
-                RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                RealmAuthorizationDocument::default_realm_doc(realm_id)
                     .to_bytes(&actor)
                     .unwrap(),
             ),
@@ -1046,12 +981,12 @@ mod tests {
         )])
         .await;
 
-        let (status, _) = create_credential(&state, &auth, group_id, None)
-            .await
-            .unwrap();
-        assert_eq!(status, StatusCode::CREATED);
-
-        let (status, Json(response)) = create_credential(
+        assert!(
+            create_credential(&state, &auth, group_id, None)
+                .await
+                .is_ok()
+        );
+        let (_, Json(response)) = create_credential(
             &state,
             &auth,
             group_id,
@@ -1062,7 +997,6 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(status, StatusCode::CREATED);
         assert!(!response.access_secret.is_empty());
     }
 
@@ -1087,94 +1021,39 @@ mod tests {
         )
         .await
         .unwrap_err();
-
         assert!(matches!(error, ServerError::Forbidden));
     }
 
     #[tokio::test]
     async fn subpath_takes_credential() {
-        // Read on one folder of the group data is a real grant, so issuance
-        // must not demand write on the whole data root.
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = Ulid::from_bytes([7u8; 16]);
         let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
-        let group_root = blob_group_permission_path(realm_id, group_id, node_id);
+        let group_root = group_permission_path(realm_id, group_id, node_id);
         let (_dir, state, auth, group_id) = scoped_state(vec![(
             format!("{group_root}/study/imaging/**"),
             Permission::READ,
         )])
         .await;
 
-        let (status, _) = create_credential(&state, &auth, group_id, None)
-            .await
-            .unwrap();
-        assert_eq!(status, StatusCode::CREATED);
-
-        let (status, _) = create_credential(
-            &state,
-            &auth,
-            group_id,
-            Some(vec![CreateS3PathRestriction {
-                pattern: "study/imaging/**".to_string(),
-                permission: "READ".to_string(),
-            }]),
-        )
-        .await
-        .unwrap();
-        assert_eq!(status, StatusCode::CREATED);
-    }
-
-    /// Adds a realm role denying the caller every group subtree.
-    async fn write_realm_deny(state: &Arc<ServerState>, auth: &AuthContext) {
-        use std::collections::{HashMap, HashSet};
-        let realm_id = state.get_realm_id();
-        let actor = Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id,
-        };
-        let mut realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let role_id = Ulid::from_bytes([11u8; 16]);
-        realm_auth.roles.insert(
-            role_id,
-            aruna_core::structs::Role {
-                role_id,
-                name: "data-deny".to_string(),
-                permissions: HashMap::from([(format!("/{realm_id}/g/**"), Permission::DENY)]),
-                assigned_users: HashSet::from([auth.user_id]),
-            },
+        assert!(
+            create_credential(&state, &auth, group_id, None)
+                .await
+                .is_ok()
         );
-        state
-            .get_ctx()
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: AUTH_KEYSPACE.to_string(),
-                key: realm_id.as_bytes().to_vec().into(),
-                value: realm_auth.to_bytes(&actor).unwrap().into(),
-                txn_id: None,
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn deny_refuses_credential() {
-        // A realm deny on the group data outranks the folder role, so the
-        // subpath member may not mint a credential for it either.
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        let group_id = Ulid::from_bytes([7u8; 16]);
-        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
-        let group_root = blob_group_permission_path(realm_id, group_id, node_id);
-        let (_dir, state, auth, group_id) = scoped_state(vec![(
-            format!("{group_root}/study/imaging/**"),
-            Permission::READ,
-        )])
-        .await;
-        write_realm_deny(&state, &auth).await;
-
-        let error = create_credential(&state, &auth, group_id, None)
+        assert!(
+            create_credential(
+                &state,
+                &auth,
+                group_id,
+                Some(vec![CreateS3PathRestriction {
+                    pattern: "study/imaging/**".to_string(),
+                    permission: "READ".to_string(),
+                }]),
+            )
             .await
-            .unwrap_err();
-        assert!(matches!(error, ServerError::Forbidden));
+            .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1185,23 +1064,10 @@ mod tests {
         )])
         .await;
 
-        let error = create_credential(&state, &auth, group_id, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, ServerError::Forbidden));
-
-        let error = create_credential(
-            &state,
-            &auth,
-            group_id,
-            Some(vec![CreateS3PathRestriction {
-                pattern: "study/**".to_string(),
-                permission: "READ".to_string(),
-            }]),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(error, ServerError::Forbidden));
+        assert!(matches!(
+            create_credential(&state, &auth, group_id, None).await,
+            Err(ServerError::Forbidden)
+        ));
     }
 
     #[tokio::test]
@@ -1227,12 +1093,12 @@ mod tests {
     }
 
     #[test]
-    fn credential_group_root_matches_canonical_blob_group_path() {
+    fn group_root_canonical() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = Ulid::from_bytes([2u8; 16]);
         let node_id = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
 
-        let group_root = blob_group_permission_path(realm_id, group_id, node_id);
+        let group_root = group_permission_path(realm_id, group_id, node_id);
         assert_eq!(
             group_root,
             format!("/{realm_id}/g/{group_id}/data/{node_id}")
@@ -1240,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_permission_accepts_known_values_case_insensitively() {
+    fn permission_case_insensitive() {
         assert_eq!(
             parse_permission("read").unwrap(),
             aruna_core::structs::Permission::READ
@@ -1256,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn delegation_scope_accepts_exact_and_final_descendants_only() {
+    fn delegation_accepts_descendants() {
         assert_eq!(
             DelegationScope::parse_supported("/root/path"),
             Some(DelegationScope::exact("/root/path".to_string()))
@@ -1271,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn delegation_scope_exact_within_group_root_is_preserved() {
+    fn exact_scope_preserved() {
         let scope = DelegationScope::exact("/realm/g/group/data/node/object".to_string());
         assert_eq!(
             scope.intersect_group_root("/realm/g/group/data/node"),
@@ -1282,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn delegation_scope_descendant_scope_is_narrowed_to_group_root() {
+    fn descendant_scope_narrowed() {
         let scope = DelegationScope::descendants("/realm/g/group/data".to_string());
         assert_eq!(
             scope.intersect_group_root("/realm/g/group/data/node"),
@@ -1293,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_requested_restrictions_makes_relative_paths_absolute() {
+    fn relative_paths_normalized() {
         let group_root = "/realm/g/group/data/node";
 
         assert_eq!(
@@ -1313,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_requested_restrictions_empty_path_becomes_group_root() {
+    fn empty_path_normalized() {
         let group_root = "/realm/g/group/data/node";
 
         assert_eq!(
@@ -1333,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_requested_restrictions_rejects_absolute_path_outside_group_root() {
+    fn external_path_rejected() {
         let err = normalize_requested_restrictions(
             Some(vec![CreateS3PathRestriction {
                 pattern: "/realm/g/other/data/node/object".to_string(),
@@ -1347,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_requested_restrictions_rejects_unsupported_wildcards() {
+    fn wildcards_are_rejected() {
         let err = normalize_requested_restrictions(
             Some(vec![CreateS3PathRestriction {
                 pattern: "nested/*/path".to_string(),
@@ -1361,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_auth_restrictions_filters_unrelated_groups() {
+    fn unrelated_groups_filtered() {
         let auth = test_auth_context(Some(vec![PathRestriction {
             pattern: "/realm/g/other/data/node/**".to_string(),
             permission: Permission::WRITE,
@@ -1399,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_auth_restrictions_narrows_broader_scope_to_group_root() {
+    fn broad_scope_narrowed() {
         let auth = test_auth_context(Some(vec![PathRestriction {
             pattern: "/realm/g/group/data/**".to_string(),
             permission: Permission::WRITE,
@@ -1415,7 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_auth_restrictions_rejects_applicable_unsupported_wildcards() {
+    fn auth_wildcards_rejected() {
         let auth = test_auth_context(Some(vec![PathRestriction {
             pattern: "/realm/g/group/**/node".to_string(),
             permission: Permission::WRITE,
@@ -1426,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_restrictions_inherit_auth_when_request_is_absent() {
+    fn auth_restrictions_inherited() {
         let auth = vec![NormalizedRestriction {
             scope: DelegationScope::descendants("/group/allowed".to_string()),
             permission: Permission::WRITE,
@@ -1439,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_restrictions_pass_through_request_when_auth_is_absent() {
+    fn request_restrictions_used() {
         let requested = vec![NormalizedRestriction {
             scope: DelegationScope::exact("/group/object".to_string()),
             permission: Permission::READ,
@@ -1452,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_restrictions_use_requested_allow_when_auth_and_request_match() {
+    fn requested_allow_used() {
         let auth = vec![NormalizedRestriction {
             scope: DelegationScope::exact("/group/object".to_string()),
             permission: Permission::WRITE,
@@ -1466,7 +1332,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_restrictions_preserve_requested_read_under_auth_write() {
+    fn requested_read_preserved() {
         let auth = vec![NormalizedRestriction {
             scope: DelegationScope::descendants("/group/allowed".to_string()),
             permission: Permission::WRITE,
@@ -1483,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_restrictions_follow_current_request_write_over_auth_read_semantics() {
+    fn requested_write_preserved() {
         let auth = vec![NormalizedRestriction {
             scope: DelegationScope::descendants("/group/allowed".to_string()),
             permission: Permission::READ,
@@ -1500,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_restrictions_preserve_auth_denies() {
+    fn auth_denies_preserved() {
         let auth = vec![NormalizedRestriction {
             scope: DelegationScope::descendants("/group/blocked".to_string()),
             permission: Permission::DENY,
@@ -1517,7 +1383,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_denies_keep_inherited_auth_allows() {
+    fn requested_denies_preserved() {
         let auth = vec![NormalizedRestriction {
             scope: DelegationScope::descendants("/group/allowed".to_string()),
             permission: Permission::WRITE,

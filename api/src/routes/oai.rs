@@ -1,10 +1,6 @@
-//! OAI-PMH 2.0 data provider over the local realm's metadata registry.
-//!
-//! Read-only and unauthenticated. Records are enumerated through the anonymous
-//! visibility index, which contains only documents an anonymous caller is
-//! authorized to read; every candidate is re-checked before it is rendered, and
-//! each record is exported through the routed holder path. GET and POST share
-//! one duplicate-preserving argument parser and one per-verb argument matrix.
+//! Read-only OAI-PMH 2.0 provider over the anonymous metadata visibility index.
+//! Candidates are reauthorized and exported through their routed holder path.
+//! GET and POST share duplicate-preserving parsing with verb-specific validation.
 
 use std::sync::Arc;
 
@@ -21,13 +17,13 @@ use utoipa_axum::routes;
 
 use aruna_core::structs::{MetadataRegistryRecord, RealmId};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::get_metadata_document::load_metadata_record_by_document;
-use aruna_operations::harvest::oai::mapping::jsonld_to_dc;
-use aruna_operations::harvest::oai::request::format_from;
+use aruna_operations::harvest::oai_pmh::mapping::jsonld_to_dc;
+use aruna_operations::harvest::oai_pmh::request::format_from;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataRoCrateExportView,
 };
 use aruna_operations::metadata::forward::export_rocrate_routed;
+use aruna_operations::metadata::get_document::load_document_record;
 use aruna_operations::metadata::visibility_index::{
     VisibilityError, earliest_visible, effective_datestamp, visible_page,
 };
@@ -426,11 +422,8 @@ async fn list(
     let page = visible_page(ctx.as_ref(), from_ms, until_ms, start_cursor, PAGE_SIZE + 1)
         .await
         .map_err(visibility_fault)?;
-    // An authorization-emptied or budget-stopped batch is a continuation, not the
-    // end of the enumeration; only an exhausted window has no records. And
-    // `noRecordsMatch` is legal only on the first request of a sequence: a
-    // continuation whose remaining records vanished closes with the empty
-    // terminal token, or a harvester discards the partial harvest.
+    // Empty partial batches continue; only an exhausted initial window yields `noRecordsMatch`.
+    // An emptied continuation closes with a terminal token to preserve the partial harvest.
     if page.entries.is_empty() && !page.more && params.resumption_token.is_none() {
         return Err(protocol("noRecordsMatch", "No records match the request"));
     }
@@ -544,9 +537,7 @@ fn resolve_window(
         ));
     }
     let from_ms = from.map(|(ms, _)| ms).unwrap_or(0);
-    // An omitted upper bound freezes at the current instant instead of staying
-    // open, so records written later in the same second cannot join the sequence
-    // the token is already walking.
+    // Freeze an omitted upper bound so later records cannot enter an active sequence.
     let until_ms = until.map(|(ms, _)| ms).unwrap_or_else(current_time_ms);
     if from_ms > until_ms {
         return Err(protocol("badArgument", "from must not be after until"));
@@ -613,7 +604,7 @@ async fn get_record(
     let Some(document_id) = parse_identifier(identifier) else {
         return Err(protocol("idDoesNotExist", "Unknown identifier"));
     };
-    let record = load_metadata_record_by_document(ctx.as_ref(), document_id)
+    let record = load_document_record(ctx.as_ref(), document_id)
         .await
         .map_err(|_| OaiFault::Internal)?
         // A record from another realm is not this repository's to serve, and a
@@ -840,7 +831,7 @@ mod tests {
         PlacementRef, RealmConfigDocument, RoCrateLimits,
     };
     use aruna_core::types::{Key, Value};
-    use aruna_operations::metadata::repository::create_records_and_outbox_write_entries;
+    use aruna_operations::metadata::repository::create_outbox_entries;
     use aruna_operations::metadata::visibility_index::{CANDIDATE_BUDGET, rebuild_index};
     use std::collections::{HashMap, HashSet};
 
@@ -1025,9 +1016,7 @@ mod tests {
             occurred_at_ms: record.updated_at_ms,
             details: None,
         };
-        let writes =
-            create_records_and_outbox_write_entries(record, &audit, Ulid::generate(), None)
-                .unwrap();
+        let writes = create_outbox_entries(record, &audit, Ulid::generate(), None).unwrap();
         store(&fixture.ctx, writes).await;
     }
 
@@ -1514,7 +1503,7 @@ mod tests {
         let fixture = fixture(RoCrateLimits::default()).await;
         fixture
             .state
-            .register_rest_interface_with_public_url(
+            .register_rest_public(
                 "127.0.0.1:8080".parse().unwrap(),
                 Some("https://public.test"),
             )

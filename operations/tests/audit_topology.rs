@@ -8,16 +8,16 @@ mod topology;
 
 use aruna_core::StructuredId;
 use aruna_core::structs::PlacementRef;
-use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
-};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::audit::{
     AUDIT_DEADLINE_SECS, AuditAggregate, ListAuditOperation, ListAuditRequest,
     LocalAuditPageOperation, MAX_AUDIT_PAGE_SIZE, list_audit,
 };
-use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::metadata::create_document::{
+    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_local_document,
+};
+use aruna_operations::metadata::projector::replay_event_log;
 use std::cell::RefCell;
 use ulid::Ulid;
 
@@ -289,7 +289,7 @@ async fn create_document(
         node.context.as_ref(),
     )
     .await?;
-    replay_metadata_event_log(node.context.as_ref()).await?;
+    replay_event_log(node.context.as_ref()).await?;
     Ok(created.record.placement)
 }
 

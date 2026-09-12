@@ -16,12 +16,32 @@ pub(crate) async fn abort_partial_writer(
     writer: &mut opendal::Writer,
     timeout_duration: Duration,
 ) -> Result<(), BlobError> {
+    abort_writer(writer, timeout_duration, UnsupportedAbort::Uncertain).await
+}
+
+/// How an abort reports a backend that does not support aborting partial writes.
+pub(crate) enum UnsupportedAbort {
+    /// Report a delete error: the partial object may still exist.
+    Uncertain,
+    /// Report `CleanupUnsupported`, so the caller deletes the final path.
+    DeletePath,
+}
+
+pub(crate) async fn abort_writer(
+    writer: &mut opendal::Writer,
+    timeout_duration: Duration,
+    unsupported: UnsupportedAbort,
+) -> Result<(), BlobError> {
     match timeout(timeout_duration, writer.abort()).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => {
-            tracing::warn!(error = %err, "failed to abort partial blob writer");
+        Ok(Err(error)) => {
+            if matches!(unsupported, UnsupportedAbort::Uncertain) {
+                tracing::warn!(error = %error, "failed to abort partial blob writer");
+            } else if error.kind() == opendal::ErrorKind::Unsupported {
+                return Err(BlobError::CleanupUnsupported);
+            }
             Err(BlobError::DeleteError(format!(
-                "partial blob cleanup is uncertain: {err}"
+                "partial blob cleanup is uncertain: {error}"
             )))
         }
         Err(_) => Err(BlobError::DeleteError(
@@ -39,12 +59,12 @@ pub(crate) fn init_operator(
 ) -> Result<Operator, BlobError> {
     match backend_type {
         Backend::S3 => build_service::<services::S3>(s3_operator_config(config), None)
-            .map_err(blob_operator_creation_error),
+            .map_err(blob_creation_error),
         Backend::FileSystem => {
-            build_service::<services::Fs>(config, None).map_err(blob_operator_creation_error)
+            build_service::<services::Fs>(config, None).map_err(blob_creation_error)
         }
         Backend::Group(kind) => {
-            build_group_service(kind, config, guard).map_err(blob_operator_creation_error)
+            build_group_service(kind, config, guard).map_err(blob_creation_error)
         }
     }
 }
@@ -114,7 +134,7 @@ pub(crate) async fn head_staging_source(
         Some(version) => operator.stat_with(path).version(version).await,
         None => operator.stat(path).await,
     }
-    .map_err(|error| map_staging_source_error(error, true))?;
+    .map_err(|error| map_source_error(error, true))?;
 
     Ok(SourceMetadata {
         content_length: metadata.content_length(),
@@ -167,16 +187,16 @@ pub(crate) async fn read_staging_source(
     }
     let reader = reader
         .await
-        .map_err(|error| map_staging_source_error(error, false))?;
+        .map_err(|error| map_source_error(error, false))?;
     let stream = match range {
         Some(range) => reader
             .into_bytes_stream(range)
             .await
-            .map_err(|error| map_staging_source_error(error, false))?,
+            .map_err(|error| map_source_error(error, false))?,
         None => reader
             .into_bytes_stream(..)
             .await
-            .map_err(|error| map_staging_source_error(error, false))?,
+            .map_err(|error| map_source_error(error, false))?,
     };
 
     Ok((metadata, BackendStream::new(stream)))
@@ -275,21 +295,19 @@ async fn build_source_operator<'access>(
             let operator = match kind {
                 SourceConnectorKind::Http => {
                     build_service::<services::Http>(config.clone(), Some(guard.layer()))
-                        .map_err(staging_operator_creation_error)?
+                        .map_err(staging_creation_error)?
                 }
                 SourceConnectorKind::S3 => build_service::<services::S3>(
                     s3_operator_config(config.clone()),
                     Some(guard.layer()),
                 )
-                .map_err(staging_operator_creation_error)?,
+                .map_err(staging_creation_error)?,
                 SourceConnectorKind::Webdav => {
                     build_service::<services::Webdav>(config.clone(), Some(guard.layer()))
-                        .map_err(staging_operator_creation_error)?
+                        .map_err(staging_creation_error)?
                 }
-                // opendal's ftp service exposes no way to constrain the passive
-                // data address, so the data socket cannot be screened.
-                // Native and local-directory sources never reach an operator:
-                // both are answered before one is built.
+                // opendal's ftp service cannot constrain the passive data
+                // address, so the data socket cannot be screened.
                 SourceConnectorKind::Ftp
                 | SourceConnectorKind::ArunaNative
                 | SourceConnectorKind::LocalDirectory => {
@@ -318,9 +336,8 @@ where
     })
 }
 
-// reqsign resolves lazily on every request, so the switches live in the config.
-// These two are all opendal exposes; sso, web identity, process and ecs stay in
-// the chain, closed only by the static credential both surfaces require.
+// reqsign resolves lazily, so the switches live in the config; sso, web
+// identity, process and ecs stay in the chain, gated by the credentials.
 fn s3_operator_config(mut config: HashMap<String, String>) -> HashMap<String, String> {
     config.insert("disable_config_load".to_string(), "true".to_string());
     config.insert("disable_ec2_metadata".to_string(), "true".to_string());
@@ -336,15 +353,15 @@ fn s3_operator_config(mut config: HashMap<String, String>) -> HashMap<String, St
     config
 }
 
-fn blob_operator_creation_error(error: String) -> BlobError {
+fn blob_creation_error(error: String) -> BlobError {
     BlobError::OperatorCreationFailed(error)
 }
 
-fn staging_operator_creation_error(error: String) -> StagingSourceError {
+fn staging_creation_error(error: String) -> StagingSourceError {
     StagingSourceError::OperatorCreationFailed(error)
 }
 
-fn map_staging_source_error(error: opendal::Error, stat: bool) -> StagingSourceError {
+fn map_source_error(error: opendal::Error, stat: bool) -> StagingSourceError {
     if error.kind() == opendal::ErrorKind::NotFound {
         return StagingSourceError::NotFound;
     }
@@ -919,7 +936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filesystem_like_http_config_is_not_required_for_build_helper_tests() {
+    async fn builds_sparse_config() {
         let access = ResolvedSourceAccess::OpenDal {
             kind: SourceConnectorKind::Http,
             config: HashMap::from([("endpoint".to_string(), "https://example.org".to_string())]),
@@ -933,7 +950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn head_and_read_support_filesystem_backed_s3_shape_via_fs_service_test() {
+    async fn builds_fs_operator() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_str().unwrap().to_string();
         tokio::fs::write(dir.path().join("hello.txt"), b"hello world")

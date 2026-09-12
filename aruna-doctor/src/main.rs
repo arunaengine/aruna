@@ -10,9 +10,7 @@ use crate::migrate::migrate;
 use crate::portal::update_portal;
 use crate::reclaim::{print_status as reclaim_status, seed_backend};
 use crate::storage::{import, snapshot};
-use crate::tokens::{
-    create_local_bootstrap_token, create_oidc_token, recover_initial_admin, view_token,
-};
+use crate::tokens::{create_bootstrap_token, create_oidc_token, recover_initial_admin, view_token};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -25,7 +23,7 @@ mod portal;
 mod reclaim;
 mod storage;
 #[cfg(test)]
-mod test_support;
+mod tests;
 mod tokens;
 
 /// Operational CLI for inspecting, recovering and maintaining an Aruna node.
@@ -99,8 +97,9 @@ pub enum Commands {
         #[command(subcommand)]
         command: ReclaimCommands,
     },
-    /// Rewrite job family records stored before execution results carried
-    /// stdout and stderr tails. Run with the node stopped; safe to repeat.
+    /// Rewrite legacy job results and realm configs, then clear the projection cache.
+    /// Writes the database and must run while the node is stopped. Current rows stay
+    /// unchanged, so repeating the migration is safe.
     Migrate {
         database_path: String,
     },
@@ -203,8 +202,7 @@ pub async fn main() -> Result<(), CliError> {
             bootstrap_secret,
         } => {
             let token = if let Some(secret) = bootstrap_secret {
-                create_local_bootstrap_token(oidc_username, oidc_password, oidc_scope, secret)
-                    .await?
+                create_bootstrap_token(oidc_username, oidc_password, oidc_scope, secret).await?
             } else {
                 create_oidc_token(oidc_username, oidc_password, oidc_scope, oidc_only).await?
             };
@@ -286,8 +284,4 @@ pub async fn main() -> Result<(), CliError> {
     };
 
     Ok(())
-}
-
-pub async fn connect() -> () {
-    todo!()
 }

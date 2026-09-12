@@ -1,26 +1,23 @@
 use std::path::{Component, Path};
 
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::STAGING_JOB_STATE_KEYSPACE;
 use aruna_core::structs::{
     BucketInfo, JobError, JobId, JobResultPayload, Permission, SourceEntry, SourceEntryKind,
     StagingJobCheckpoint, StagingJobDirectory, StagingJobError, StagingJobPhase, StagingJobSpec,
-    StagingPendingItem, StagingStrategy, blob_object_permission_path,
+    StagingPendingItem, StagingStrategy, object_permission_path,
 };
-use aruna_core::types::Value;
 use byteview::ByteView;
 use tracing::warn;
 
 use super::executor::{JobContext, JobRunOutcome};
-use super::store::put_staging_checkpoint;
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use super::store::{put_state, read_state};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
-use crate::get_realm_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetRealmConfigOperation;
 use crate::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::staging::head_source::{HeadStagingSourceInput, HeadStagingSourceOperation};
 use crate::staging::list_source::{ListStagingSourceInput, ListStagingSourceOperation};
 use crate::staging::reference::{MaterializeReferenceInput, stage_reference_blob};
@@ -32,26 +29,13 @@ pub async fn read_staging_checkpoint(
     context: &crate::driver::DriverContext,
     job_id: JobId,
 ) -> Result<Option<StagingJobCheckpoint>, String> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: STAGING_JOB_STATE_KEYSPACE.to_string(),
-            key: staging_checkpoint_key(job_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => postcard::from_bytes(value.as_ref())
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected staging checkpoint read event: {other:?}"
-        )),
-    }
+    read_state(
+        &context.storage_handle,
+        STAGING_JOB_STATE_KEYSPACE,
+        staging_checkpoint_key(job_id),
+        "staging checkpoint read",
+    )
+    .await
 }
 
 pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunOutcome {
@@ -405,7 +389,7 @@ async fn ensure_item_permission(
         ));
     }
     let source_path = source_permission_path(spec, &item.source_path);
-    let target_path = blob_object_permission_path(
+    let target_path = object_permission_path(
         spec.auth_context.realm_id,
         spec.group_id,
         spec.node_id,
@@ -606,12 +590,13 @@ async fn persist_checkpoint(
     job_id: JobId,
     checkpoint: &StagingJobCheckpoint,
 ) -> Result<(), String> {
-    let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
-    put_staging_checkpoint(
+    put_state(
         &ctx.driver.storage_handle,
         job_id,
         ctx.claim_token,
-        Value::from(value),
+        STAGING_JOB_STATE_KEYSPACE,
+        staging_checkpoint_key(job_id),
+        checkpoint,
     )
     .await
     .map_err(|error| error.to_string())

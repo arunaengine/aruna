@@ -1,9 +1,6 @@
-//! Local admission of one submission.
-//!
-//! A holder commits the immutable spec and its claim in one transaction, or it
-//! commits nothing: a matching claim replays the canonical alias and a claim of
-//! another request under the same key is a visible conflict. The candidate
-//! records are signed before this runs, so the transaction only decides.
+//! Local admission of one submission: a holder commits the immutable spec and
+//! its claim in one transaction, or nothing. A matching claim replays the alias
+//! and a conflicting claim is visible; signed candidates make this decide only.
 
 use aruna_core::compute_quota::QuotaDenied;
 use aruna_core::document::DocumentSyncTarget;
@@ -19,7 +16,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{
     JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, LogicalJobSpec,
     RealmConfigDocument, RealmId, RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode,
-    job_owner_index_key, job_record_key,
+    job_record_key, owner_index_key,
 };
 use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
 use smallvec::smallvec;
@@ -308,7 +305,7 @@ impl AdmitSubmissionOperation {
         ));
         writes.push((
             JOB_OWNER_INDEX_KEYSPACE.to_string(),
-            job_owner_index_key(record.created_by, record.created_at_ms, record.job_id),
+            owner_index_key(record.created_by, record.created_at_ms, record.job_id),
             Value::from(Vec::<u8>::new().as_slice()),
         ));
         writes.push((
@@ -525,7 +522,7 @@ fn logical_record(spec: &LogicalJobSpec) -> JobRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::{Family, REALM};
+    use crate::tests::fixtures::records::{Family, REALM};
 
     // A state that expects no event must reject one instead of ignoring it.
     #[test]

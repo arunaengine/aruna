@@ -2,17 +2,17 @@ use crate::auth::{
     ValidatedArunaBearerTokenCarrier, claims_for_revocation, ensure_permission, require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::metadata::map_metadata_api_error;
+use crate::metadata::map_api_error;
 use crate::server_state::ServerState;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::structs::{Actor, AuthContext, Permission};
-use aruna_core::util::unix_timestamp_secs;
+use aruna_core::time::unix_timestamp_secs;
+use aruna_operations::auth::revoke_token::{
+    RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
+};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::forward::{forward_token_revoke, is_user_origin};
-use aruna_operations::revoke_token::{
-    RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
-};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -85,10 +85,8 @@ pub async fn revoke_token(
     let ctx = state.get_ctx();
     let user_origin = is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
         .await
-        .map_err(map_metadata_api_error)?;
-    // Only a real bearer token of a trusted realm may enter the revocation set,
-    // and only its own subject or a realm admin may revoke it, so a token holder
-    // cannot invalidate other users' sessions.
+        .map_err(map_api_error)?;
+    // Trusted bearers may revoke only their own subject unless they are realm admins.
     let claims = claims_for_revocation(&state, &request.token)
         .await
         .map_err(|_| ServerError::BadRequest)?;
@@ -119,7 +117,7 @@ pub async fn revoke_token(
     if user_origin {
         let caller_token = bearer_token.as_ref().ok_or(ServerError::Unauthorized)?;
         let auth_token = forwarded_bearer(Some(caller_token.as_str()))
-            .map_err(map_metadata_api_error)?
+            .map_err(map_api_error)?
             .ok_or(ServerError::Unauthorized)?;
         forward_token_revoke(
             &ctx,
@@ -128,7 +126,7 @@ pub async fn revoke_token(
             request.token.clone(),
         )
         .await
-        .map_err(map_metadata_api_error)?;
+        .map_err(map_api_error)?;
         return Ok(StatusCode::NO_CONTENT);
     }
 
@@ -179,11 +177,11 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{Actor, NodeCapabilities, PathRestriction, RealmId, TokenRevocation};
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
+    use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::driver::DriverContext;
-    use aruna_operations::get_realm_config::GetRealmConfigOperation;
     use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::realm::get_config::GetRealmConfigOperation;
     use aruna_storage::storage::FjallStorage;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;
@@ -388,7 +386,7 @@ mod tests {
     /// Assigns every realm role, including `realm_admin`, to one user.
     async fn grant_realm_admin(ctx: &DriverContext, realm_id: RealmId, user_id: UserId) {
         let mut auth_doc =
-            aruna_core::structs::RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+            aruna_core::structs::RealmAuthorizationDocument::default_realm_doc(realm_id);
         for role in auth_doc.roles.values_mut() {
             role.assigned_users.insert(user_id);
         }

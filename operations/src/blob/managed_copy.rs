@@ -607,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_node_serves_nothing() {
+    fn rejects_blocked_serving() {
         // A rejoin blocks every governed serve until the inventory is revalidated,
         // even for rows that still read as registered.
         let registered = record(ManagedCopyState::Registered);

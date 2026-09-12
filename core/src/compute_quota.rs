@@ -1,10 +1,5 @@
-//! Compute quota contracts: the bounded snapshots a node publishes, the
-//! standing quota an operator configures, and the pure admission evaluator.
-//!
-//! Two controls stay apart on purpose. Logical admission demand is group-scoped,
-//! replicated, and approximate across partitions; physical reservation is
-//! node-local and exact. Neither ever cancels work: a view that converges above
-//! a cap only stops new logical admissions.
+//! Compute quota contracts separate approximate replicated group admission demand from exact node-local
+//! physical reservations. Converged excess demand only blocks new admissions; it never cancels work.
 
 use crate::compute::{ExecutorAvailability, ResourceEnvelope};
 use crate::structs::{AdvertisementEpoch, EffectiveResources, JobId, SubmissionId};
@@ -194,11 +189,8 @@ pub fn merge_demand<'a>(
     (totals, truncated)
 }
 
-/// Bounds one publisher's own demand to what a snapshot may report: at most
-/// [`MAX_DEMAND_GROUPS`] groups sharing [`MAX_DEMAND_FAMILIES`] families. The
-/// budget is handed out one family per group per round, so a busy group cannot
-/// truncate a quiet one, and only a group whose own families were cut is
-/// flagged. The returned bool reports groups the snapshot names nowhere.
+/// Bounds a snapshot to `MAX_DEMAND_GROUPS` groups and `MAX_DEMAND_FAMILIES` families.
+/// Round-robin allocation protects quiet groups; the result identifies groups omitted entirely.
 pub fn bound_demand(groups: &mut Vec<DemandGroup>) -> bool {
     let dropped = groups.len() > MAX_DEMAND_GROUPS;
     groups.truncate(MAX_DEMAND_GROUPS);
@@ -305,14 +297,8 @@ pub struct QuotaDenied {
     pub limit: u64,
 }
 
-/// Whether one new logical admission fits the standing quota given the locally
-/// observed demand of its group.
-///
-/// `view` is the merged replicated demand of admitted-but-nonterminal work, so
-/// it is exact for this node and approximate across partitions. Deciding
-/// against a stale view may overshoot a cap; that is the accepted bound. The
-/// only outcome of a converged overshoot is refusing new admissions: nothing
-/// already admitted, queued, preparing, or running is ever revoked here.
+/// Checks a new admission against merged, approximate replicated group demand. A stale view may
+/// overshoot the cap; convergence only refuses later admissions and never revokes accepted work.
 pub fn admits(
     view: &ResourceTotals,
     quota: &ComputeQuota,
@@ -365,10 +351,9 @@ pub fn admits(
     )
 }
 
-/// Refusal of a new admission whose group demand view is understated: nothing
-/// below the cap can be shown, so the group is treated as standing at its first
-/// configured group cap. `None` when the quota caps nothing group-scoped, since
-/// such a quota never reads the demand view at all.
+/// Refusal of a new admission whose group demand view is understated: nothing below the cap can be
+/// shown, so the group is treated as standing at its first configured group cap. `None` when the quota
+/// caps nothing group-scoped, since such a quota never reads the demand view at all.
 pub fn understated_denial(
     quota: &ComputeQuota,
     request: &EffectiveResources,
@@ -484,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_counts_family_once() {
+    fn merge_counts_once() {
         // Two holders admitting one request family are one logical demand.
         let group_id = Ulid::from_bytes([1; 16]);
         let left = snapshot(group_id, vec![family(1, 2), family(2, 2)]);
@@ -651,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn denies_per_job_ceiling() {
+    fn denies_per_ceiling() {
         // A request above a per-job ceiling is refused on an empty view too.
         let quota = ComputeQuota {
             max_job_cpu_cores: Some(4),

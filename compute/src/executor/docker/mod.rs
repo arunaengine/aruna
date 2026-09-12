@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use aruna_core::compute::runtimes::{SESSION_CLIENT_MODE, SESSION_HELPER_PATH};
@@ -36,6 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
+use super::channel::ChannelStream;
 use super::config::{DockerConfig, SESSION_NETWORK};
 use super::logs::BoundedTail;
 use super::staging::StageLayout;
@@ -729,17 +728,6 @@ fn transfer_error() -> BackendError {
     BackendError::InvalidSpec(TransferLimitError.to_string())
 }
 
-/// `mpsc::Receiver` as a `Stream`; carries archive chunks across task borders.
-struct ChannelStream<T>(mpsc::Receiver<T>);
-
-impl<T> Stream for ChannelStream<T> {
-    type Item = T;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        self.0.poll_recv(cx)
-    }
-}
-
 /// Byte-counting tar sink feeding the upload body channel.
 struct ChannelWriter {
     tx: mpsc::Sender<io::Result<Bytes>>,
@@ -1352,10 +1340,8 @@ impl ExecutorBackend for DockerBackend {
             .attempt
             .validate()
             .map_err(BackendError::InvalidSpec)?;
-        // The daemon's wait endpoint (condition "not-running") answers instantly
-        // for a created-but-never-started container, which would surface a
-        // non-terminal status and break the wait contract. Poll inspect to
-        // terminal evidence or the cancel token, like the trait default.
+        // The daemon's wait endpoint answers instantly for a created-but-never-started
+        // container; poll inspect to terminal evidence or the cancel token instead.
         loop {
             let control = self.daemon_lock.read(context)?;
             validate_control(control.clone(), context)?;
@@ -1447,7 +1433,10 @@ impl ExecutorBackend for DockerBackend {
         let mut stream = self.docker.logs(container_id, Some(opts));
         let mut stdout = BoundedTail::new(limits.max_bytes_per_stream);
         let mut stderr = BoundedTail::new(limits.max_bytes_per_stream);
-        while let Some(item) = stream.next().await {
+        while let Some(item) = tokio::time::timeout(self.config.pull_deadline, stream.next())
+            .await
+            .map_err(|_| BackendError::Timeout("Docker log fetch timed out".to_string()))?
+        {
             use bollard::container::LogOutput;
             match item.map_err(|e| classify(&e))? {
                 LogOutput::StdOut { message } | LogOutput::Console { message } => {
@@ -1755,10 +1744,6 @@ impl ExecutorBackend for DockerBackend {
                 attempt.external_name()
             ))),
         }
-    }
-
-    async fn sweep_orphans(&self, _grace: Duration) -> Result<(), BackendError> {
-        Ok(())
     }
 }
 
@@ -2399,6 +2384,107 @@ mod tests {
         assert!(error.retryable());
     }
 
+    /// Answers container inspect, then streams one log frame and stalls.
+    async fn fake_docker(listener: tokio::net::TcpListener, frames: tokio::sync::mpsc::Sender<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let frames = frames.clone();
+            tokio::spawn(async move {
+                loop {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let read = stream.read(&mut buf).await.unwrap_or(0);
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    if String::from_utf8_lossy(&request).contains("/logs") {
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.raw-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                        let frame = [1u8, 0, 0, 0, 0, 0, 0, 5, b'h', b'e', b'l', b'l', b'o'];
+                        let framed = stream.write_all(head.as_bytes()).await.is_ok()
+                            && stream.write_all(b"d\r\n").await.is_ok()
+                            && stream.write_all(&frame).await.is_ok()
+                            && stream.write_all(b"\r\n").await.is_ok()
+                            && stream.flush().await.is_ok();
+                        if !framed {
+                            return;
+                        }
+                        let _ = frames.send(()).await;
+                        // Keep the body open without a terminating chunk.
+                        std::future::pending::<()>().await;
+                    } else {
+                        let body = serde_json::to_vec(&serde_json::json!({
+                            "Id": "abc",
+                            "Config": {"Labels": {
+                                "aruna-engine.org/job-id": "j1",
+                                "aruna-engine.org/attempt": "0"
+                            }}
+                        }))
+                        .expect("encode inspect response");
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes()).await;
+                        let _ = stream.write_all(&body).await;
+                        let _ = stream.flush().await;
+                    }
+                }
+            });
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_logs_timeout() {
+        // A logs stream that stalls after one frame must surface the pull
+        // deadline per item instead of hanging the capture.
+        tokio::time::resume();
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(1);
+        let daemon = tokio::spawn(fake_docker(listener, frame_tx));
+        let docker = Docker::connect_with_http(
+            &format!("http://127.0.0.1:{port}"),
+            3600,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let backend = DockerBackend::from_parts(
+            docker,
+            DockerConfig {
+                state_root: root.path().to_path_buf(),
+                pull_deadline: Duration::from_millis(100),
+                ..DockerConfig::default()
+            },
+        )
+        .unwrap();
+        // Warm the pooled connection, then let the virtual clock drive the stall.
+        backend
+            .inspect(&fence().attempt)
+            .await
+            .expect("warm up the fake daemon");
+        tokio::time::pause();
+
+        let result = backend.fetch_logs(&fence(), &LogLimits::default()).await;
+
+        assert!(
+            matches!(result, Err(BackendError::Timeout(_))),
+            "got {result:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(60), frame_rx.recv())
+            .await
+            .expect("the fake daemon never wrote the log frame")
+            .expect("the fake daemon stopped");
+        daemon.abort();
+    }
+
     #[test]
     fn pull_classification() {
         use bollard::errors::Error;
@@ -2440,7 +2526,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_stream_error_classification() {
+    fn pull_stream_classification() {
         let error = bollard::errors::Error::DockerStreamError {
             error: "manifest unknown".to_string(),
         };

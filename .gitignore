@@ -8,3 +8,5 @@ docker/
 !.env.example
 docker/*
 portal*
+aruna/compute-state/
+__pycache__/

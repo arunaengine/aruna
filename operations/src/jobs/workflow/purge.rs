@@ -6,24 +6,24 @@ use aruna_core::keyspaces::BLOB_DELETE_AUDIT_KEYSPACE;
 use aruna_core::structs::{
     BlobDeleteAuditKind, BlobDeleteAuditRecord, BlobPurgeScopeKind, JobError, JobProgress,
     JobResultPayload, MultipartUpload, Permission, StoragePurgeCheckpoint, StoragePurgeResult,
-    StoragePurgeScope, StoragePurgeSpec, blob_object_permission_path, delete_audit_key,
+    StoragePurgeScope, StoragePurgeSpec, delete_audit_key, object_permission_path,
 };
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{flush_progress, put_purge_checkpoint, read_purge_checkpoint};
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::drive;
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::s3::abort_multipart_upload::{
+use crate::s3::abort_upload::{
     AbortMultipartUploadError, AbortMultipartUploadInput, AbortMultipartUploadOperation,
 };
 use crate::s3::delete_bucket::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::delete_object::DeleteObjectError;
 use crate::s3::delete_objects::{DeleteObjectsEntry, DeleteObjectsInput, delete_objects};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::s3::list_multipart_uploads::{ListMultipartUploadsInput, ListMultipartUploadsOperation};
-use crate::s3::list_object_versions::{
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::list_uploads::{ListMultipartUploadsInput, ListMultipartUploadsOperation};
+use crate::s3::list_versions::{
     ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
 };
 use crate::s3::purge_fence::{PurgeFenceError, acquire_purge_fence};
@@ -336,7 +336,7 @@ async fn authorize_object(
     spec: &StoragePurgeSpec,
     key: &str,
 ) -> Result<(), PurgeRunError> {
-    let path = blob_object_permission_path(
+    let path = object_permission_path(
         spec.auth_context.realm_id,
         spec.group_id,
         spec.node_id,
@@ -423,14 +423,8 @@ async fn count_multipart(
     let mut total = 0u64;
     loop {
         check_stop(ctx)?;
-        let page = list_multipart_page_with_cursor(
-            ctx,
-            scope,
-            PURGE_BATCH_SIZE,
-            key_marker,
-            upload_marker,
-        )
-        .await?;
+        let page =
+            list_multipart_cursor(ctx, scope, PURGE_BATCH_SIZE, key_marker, upload_marker).await?;
         total = total.saturating_add(page.uploads.len() as u64);
         if !page.is_truncated {
             return Ok(total);
@@ -503,11 +497,9 @@ async fn list_multipart_page(
     scope: &StoragePurgeScope,
     limit: usize,
 ) -> Result<Vec<MultipartUpload>, PurgeRunError> {
-    Ok(
-        list_multipart_page_with_cursor(ctx, scope, limit, None, None)
-            .await?
-            .uploads,
-    )
+    Ok(list_multipart_cursor(ctx, scope, limit, None, None)
+        .await?
+        .uploads)
 }
 
 struct MultipartPage {
@@ -517,7 +509,7 @@ struct MultipartPage {
     next_upload_id_marker: Option<ulid::Ulid>,
 }
 
-async fn list_multipart_page_with_cursor(
+async fn list_multipart_cursor(
     ctx: &JobContext,
     scope: &StoragePurgeScope,
     limit: usize,

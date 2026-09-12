@@ -115,12 +115,6 @@ pub struct BlobState {
     pub backends: Vec<BackendState>,
 }
 
-pub struct InterfaceState {
-    pub s3_status: Status,
-    pub rest_status: Status,
-    pub db_status: Status,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
     Available,

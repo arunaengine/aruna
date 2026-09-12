@@ -1,19 +1,6 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 //! A hand-off that cannot finish, and the only way out of it (#400).
-//!
-//! One target of the bucket is a node that exists in the map and nowhere else,
-//! so its proof never arrives. Everything else works: the old holders fence,
-//! the reachable targets pull the real history and sign it. The bucket still
-//! must not cut over - authority stays with the old holders, nobody mints a
-//! rival genesis to make progress, and the bucket simply stays incomplete and
-//! visible in the health counts.
-//!
-//! The unreachable target is expressed as a node in the candidate map with no
-//! process behind it rather than a killed one: the outcome the executor sees is
-//! the same, and it needs no restart to recover. Recovery is the operator's
-//! force-finalize, which the reducer accepts only because a reachable target
-//! did prove - the last verified copy is never the one cut away.
 
 mod topology;
 
@@ -22,17 +9,13 @@ use std::collections::BTreeMap;
 use aruna_core::NodeId;
 use aruna_core::StructuredId;
 use aruna_core::structs::{NodePlacementEntry, PlacementRef, RealmNodeKind, TransitionLimits};
-use aruna_core::util::unix_timestamp_millis;
-use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
-};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::drive;
-use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
-use aruna_operations::metadata::projector::replay_metadata_event_log;
-use aruna_operations::mutate_realm_placement::RealmPlacementMutation;
+use aruna_operations::metadata::create_document::mint_local_document;
+use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
 use aruna_operations::placement::transition::{preview_transition, transition_health};
 use aruna_operations::placement::{holds_placement, resolve_shard_holders};
+use aruna_operations::realm::mutate_placement::RealmPlacementMutation;
 use ulid::Ulid;
 
 use topology::{LOCATIONS, NODE_WEIGHT, TestNode, TestResult, Topology, wait_until};
@@ -57,7 +40,9 @@ async fn unreachable_target_stalls() -> TestResult<()> {
     let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
-    let placement = create_document(&realm, origin, group_id, document_id, path).await?;
+    let placement = realm
+        .create_document(origin, group_id, document_id, path, "stall fixture")
+        .await?;
     let before = realm.assert_holder(origin.node_id(), &placement);
     for holder in &before {
         let node = realm.find(*holder);
@@ -67,9 +52,8 @@ async fn unreachable_target_stalls() -> TestResult<()> {
         .await?;
     }
 
-    // A node the map knows and the realm cannot reach, plus every current
-    // holder marked full: the bucket's target set is the two remaining nodes
-    // and the phantom.
+    // A node the map knows and the realm cannot reach, plus every current holder marked full:
+    // the bucket's target set is the two remaining nodes and the phantom.
     let phantom = register_phantom(&mut realm).await?;
     for holder in &before {
         let mut entry = realm
@@ -169,9 +153,8 @@ async fn unreachable_target_stalls() -> TestResult<()> {
         .await?;
     assert_eq!(realm.holders(&placement), preview.new_holders);
 
-    // No rival genesis: what the reachable targets serve afterwards is the
-    // history they pulled from the old holders, not one they minted to get
-    // unstuck - the same document, on a set that shares no node with its author.
+    // No rival genesis: what the reachable targets serve afterwards is the history they pulled
+    // from the old holders, not one they minted to get unstuck - the same document.
     for target in &reachable {
         let node = realm.find(*target);
         wait_until("target serves the pulled history", *target, || {
@@ -200,34 +183,6 @@ async fn register_phantom(realm: &mut Topology) -> TestResult<NodeId> {
     });
     realm.apply_config(config).await?;
     Ok(phantom)
-}
-
-async fn create_document(
-    realm: &Topology,
-    node: &TestNode,
-    group_id: Ulid,
-    document_id: Ulid,
-    document_path: &str,
-) -> TestResult<PlacementRef> {
-    let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
-            actor: realm.actor(node),
-            group_id,
-            document_id,
-            document_path: document_path.to_string(),
-            public: false,
-            payload: CreateMetadataDocumentPayload::Scaffold {
-                name: document_path.to_string(),
-                description: "stall fixture".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: None,
-            },
-        }),
-        node.context.as_ref(),
-    )
-    .await?;
-    replay_metadata_event_log(node.context.as_ref()).await?;
-    Ok(created.record.placement)
 }
 
 async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {

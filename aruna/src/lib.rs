@@ -4,6 +4,7 @@
 
 pub mod bootstrap;
 pub mod config;
+pub mod default_env;
 pub mod portal;
 pub mod shutdown;
 pub mod telemetry;

@@ -1,15 +1,11 @@
 //! Offering a directory as a read-only bucket on the device that holds it.
-//!
-//! The bucket's objects are observations: a reference version per file, bound
-//! to the device-local registration and never to a path. Writes to such a
-//! bucket are refused; the files change only on the owner's own filesystem.
+//! Objects are reference versions bound to the device-local registration, not a
+//! path; writes are refused and files change only on the owner's filesystem.
 
-use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, build_head_transition_effects, write_blob_version_effect,
-};
+use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::driver::{DriverContext, drive};
+use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
-use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StagingSourceError, StorageError};
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
@@ -138,17 +134,14 @@ pub async fn guard_bucket_write(
 }
 
 /// Registers `root` as a read-only bucket and mints one reference version per
-/// file it currently holds. Re-offering the same bucket refreshes the inventory:
-/// unchanged files keep their version, changed ones gain a successor and files
-/// that vanished are tombstoned.
+/// file. Re-offering refreshes the inventory: unchanged files keep their version,
+/// changed ones gain a successor, and vanished files are tombstoned.
 pub async fn offer_directory(
     context: &DriverContext,
     input: OfferDirectoryInput,
 ) -> Result<OfferDirectoryResult, OfferedDirectoryError> {
     check_root(context, &input.root).await?;
-    // The whole walk happens before anything is written, so an offer over the
-    // file cap is refused whole instead of leaving a bucket and half an
-    // inventory behind.
+    // Finish the walk before writes so exceeding the cap cannot leave a partial inventory.
     let entries = walk_root(context, &input.root).await?;
     register_bucket(context, &input).await?;
 
@@ -215,12 +208,9 @@ pub async fn list_offers(
     }
 }
 
-/// Withdraws one offer: the registration goes first, then every observation it
-/// made becomes a delete marker. Answers how many live objects it removed.
-///
-/// The registration is what a read resolves the root through, so an interrupted
-/// sweep still leaves the bucket unservable rather than half-offered. A realm
-/// node that references an offered version can no longer resolve it.
+/// Withdraws one offer: registration first, then observations become delete
+/// markers (returning the live count removed). An interrupted sweep leaves the
+/// bucket unservable, and referencing realm nodes can no longer resolve versions.
 pub async fn withdraw_offer(
     context: &DriverContext,
     input: WithdrawOfferInput,
@@ -375,7 +365,7 @@ async fn send_source_effect(
         .blob_handle
         .as_ref()
         .ok_or(OfferedDirectoryError::HandleMissing)?;
-    match blob_handle.send_staging_source_effect(effect).await {
+    match blob_handle.send_staging_effect(effect).await {
         Event::StagingSource(event) => Ok(event),
         _ => Err(StagingSourceError::InvalidEffect.into()),
     }
@@ -488,7 +478,7 @@ async fn observe(
     let version_id = Ulid::generate();
     let now = SystemTime::now();
     let next = CurrentVersionPointer::next_for(pointer.as_ref(), version_id)?;
-    for effect in build_head_transition_effects(
+    for effect in build_transition_effects(
         &HeadAliasContext::new(
             input.realm_id,
             input.group_id,
@@ -504,7 +494,7 @@ async fn observe(
     }
     apply(
         context,
-        write_blob_version_effect(
+        write_version_effect(
             &VersionKey::new(&input.bucket, &entry.path, version_id),
             &BlobVersion::reference(binding.clone(), metadata.clone(), now, input.user_id, now),
             Some(txn_id),
@@ -512,9 +502,7 @@ async fn observe(
     )
     .await?;
 
-    // An offered bucket charges what it currently offers: the observation this
-    // one replaces describes content the file no longer has, so its bytes are
-    // released instead of staying charged.
+    // Charge the current observation and release bytes from the replaced content.
     let live = existing.filter(|version| !version.is_deleted());
     let mut usage = UsageCounterUpdate::for_group(
         input.group_id,
@@ -643,7 +631,7 @@ async fn tombstone(
     let version_id = Ulid::generate();
     let now = SystemTime::now();
     let next = CurrentVersionPointer::next_for(pointer.as_ref(), version_id)?;
-    for effect in build_head_transition_effects(
+    for effect in build_transition_effects(
         &HeadAliasContext::new(
             scope.realm_id,
             scope.group_id,
@@ -659,7 +647,7 @@ async fn tombstone(
     }
     apply(
         context,
-        write_blob_version_effect(
+        write_version_effect(
             &VersionKey::new(&scope.bucket, key, version_id),
             &BlobVersion::deleted(now, scope.user_id),
             Some(txn_id),
@@ -839,7 +827,7 @@ async fn commit(context: &DriverContext, txn_id: TxnId) -> Result<(), OfferedDir
 mod tests {
     use super::*;
     use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
-    use crate::staging::test_utils::setup_driver_context;
+    use crate::tests::fixtures::staging::setup_driver_context;
     use aruna_core::structs::{UsageCounters, usage_group_key};
     use futures_util::StreamExt;
 
@@ -919,7 +907,7 @@ mod tests {
         let context = &fixture.driver_context;
         let root = tempfile::tempdir().expect("root must be created");
         let offer = input("taken", root.path().to_str().expect("utf-8 root"));
-        crate::staging::test_utils::create_test_bucket(
+        crate::tests::fixtures::staging::create_test_bucket(
             context,
             offer.group_id,
             offer.user_id,

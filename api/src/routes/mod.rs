@@ -134,7 +134,8 @@ fn routes_at(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+
     use super::rest_openapi;
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};

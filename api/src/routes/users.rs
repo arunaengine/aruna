@@ -10,41 +10,41 @@ use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument,
     Role, SessionKind, User,
 };
-use aruna_core::util::unix_timestamp_secs as now_timestamp;
-use aruna_operations::consume_onboarding_secret::{
-    ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
-};
-use aruna_operations::delete_onboarding_secret::{
-    DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
-};
-use aruna_operations::driver::drive;
-use aruna_operations::ensure_canonical_user_token_subject::{
+use aruna_core::time::unix_timestamp_secs as now_timestamp;
+use aruna_operations::auth::token_subject::{
     EnsureCanonicalUserTokenSubjectError, EnsureCanonicalUserTokenSubjectOperation,
 };
-use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::get_oidc_user::{GetOidcUserInput, GetOidcUserOperation};
-use aruna_operations::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
-use aruna_operations::get_user::{GetUserInput, GetUserOperation};
-use aruna_operations::inspect_onboarding_secret::{
-    InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
-};
-use aruna_operations::list_groups::ListGroupOperation;
-use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
-use aruna_operations::list_users::{ListUsersInput, ListUsersOperation};
-use aruna_operations::read_realm_authorization::{
-    ReadRealmAuthorizationError, ReadRealmAuthorizationOperation,
-};
-use aruna_operations::read_user_document::{ReadUserDocumentError, ReadUserDocumentOperation};
-use aruna_operations::register_or_get_oidc_user::{
-    RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
-};
-use aruna_operations::remove_device_node::{
+use aruna_operations::device::remove_node::{
     DeviceEvictionScope, RemoveDeviceNodeConfig, RemoveDeviceNodeError, RemoveDeviceNodeOperation,
 };
-use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
-use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
+use aruna_operations::driver::drive;
+use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
+use aruna_operations::groups::list_groups::ListGroupOperation;
+use aruna_operations::onboarding::consume_secret::{
+    ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
+};
+use aruna_operations::onboarding::delete_secret::{
+    DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
+};
+use aruna_operations::onboarding::inspect_secret::{
+    InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
+};
+use aruna_operations::onboarding::list_secrets::ListOnboardingSecretsOperation;
+use aruna_operations::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
+use aruna_operations::realm::read_authorization::{
+    ReadRealmAuthorizationError, ReadRealmAuthorizationOperation,
+};
 use aruna_operations::session::{CreateSessionConfig, CreateSessionError, CreateSessionOperation};
-use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
+use aruna_operations::users::get_oidc::{GetOidcUserInput, GetOidcUserOperation};
+use aruna_operations::users::get_user::{GetUserInput, GetUserOperation};
+use aruna_operations::users::list_users::{ListUsersInput, ListUsersOperation};
+use aruna_operations::users::oidc_user::{
+    RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
+};
+use aruna_operations::users::read_document::{ReadUserDocumentError, ReadUserDocumentOperation};
+use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
+use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
+use aruna_operations::users::update_user::{UpdateUserInput, UpdateUserOperation};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use http::{HeaderMap, StatusCode};
@@ -239,7 +239,7 @@ impl From<User> for GetUserResponse {
     }
 }
 
-fn map_user_info_role(role_id: Ulid, role: Role) -> UserInfoRoleResponse {
+fn map_user_role(role_id: Ulid, role: Role) -> UserInfoRoleResponse {
     UserInfoRoleResponse {
         role_id: role_id.to_string(),
         name: role.name,
@@ -256,7 +256,7 @@ fn map_user_info_role(role_id: Ulid, role: Role) -> UserInfoRoleResponse {
     }
 }
 
-fn user_preferences_from_attributes(
+fn preferences_from_attributes(
     attributes: &HashMap<String, String>,
 ) -> UserInfoPreferencesResponse {
     UserInfoPreferencesResponse {
@@ -290,7 +290,7 @@ impl From<User> for RegisterUserResponse {
     }
 }
 
-fn map_consume_onboarding_error(error: ConsumeOnboardingSecretError) -> ServerError {
+fn map_consume_error(error: ConsumeOnboardingSecretError) -> ServerError {
     match error {
         ConsumeOnboardingSecretError::NotFound
         | ConsumeOnboardingSecretError::Expired
@@ -300,7 +300,7 @@ fn map_consume_onboarding_error(error: ConsumeOnboardingSecretError) -> ServerEr
     }
 }
 
-fn map_inspect_onboarding_error(error: InspectOnboardingSecretError) -> ServerError {
+fn map_inspect_error(error: InspectOnboardingSecretError) -> ServerError {
     match error {
         InspectOnboardingSecretError::NotFound
         | InspectOnboardingSecretError::Expired
@@ -340,22 +340,19 @@ async fn issue_user_session(
     Ok(created.token.expose().to_string())
 }
 
-async fn ensure_canonical_user_token_subject(
-    state: &Arc<ServerState>,
-    user_id: UserId,
-) -> ServerResult<()> {
+async fn ensure_token_subject(state: &Arc<ServerState>, user_id: UserId) -> ServerResult<()> {
     drive(
         EnsureCanonicalUserTokenSubjectOperation::new(user_id),
         &state.get_ctx(),
     )
     .await
-    .map_err(map_canonical_subject_error)
+    .map_err(map_subject_error)
 }
 
 async fn read_current_user(state: &ServerState, user_id: UserId) -> ServerResult<User> {
     drive(ReadUserDocumentOperation::new(user_id), &state.get_ctx())
         .await
-        .map_err(map_read_user_document_error)
+        .map_err(map_user_error)
 }
 
 async fn read_realm_authorization(
@@ -366,10 +363,10 @@ async fn read_realm_authorization(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_read_realm_authorization_error)
+    .map_err(map_realm_error)
 }
 
-fn map_canonical_subject_error(error: EnsureCanonicalUserTokenSubjectError) -> ServerError {
+fn map_subject_error(error: EnsureCanonicalUserTokenSubjectError) -> ServerError {
     match error {
         EnsureCanonicalUserTokenSubjectError::Unauthorized => ServerError::Unauthorized,
         EnsureCanonicalUserTokenSubjectError::Forbidden => ServerError::Forbidden,
@@ -377,18 +374,18 @@ fn map_canonical_subject_error(error: EnsureCanonicalUserTokenSubjectError) -> S
     }
 }
 
-fn map_read_user_document_error(error: ReadUserDocumentError) -> ServerError {
+fn map_user_error(error: ReadUserDocumentError) -> ServerError {
     match error {
         ReadUserDocumentError::NotFound => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
     }
 }
 
-fn map_read_realm_authorization_error(error: ReadRealmAuthorizationError) -> ServerError {
+fn map_realm_error(error: ReadRealmAuthorizationError) -> ServerError {
     ServerError::InternalError(error.to_string())
 }
 
-fn collect_user_realm_roles(
+fn collect_realm_roles(
     auth_doc: Option<RealmAuthorizationDocument>,
     user_id: UserId,
 ) -> Vec<UserInfoRoleResponse> {
@@ -396,11 +393,11 @@ fn collect_user_realm_roles(
         .into_iter()
         .flat_map(|document| document.roles)
         .filter(|(_, role)| role.assigned_users.contains(&user_id))
-        .map(|(role_id, role)| map_user_info_role(role_id, role))
+        .map(|(role_id, role)| map_user_role(role_id, role))
         .collect()
 }
 
-fn collect_assigned_group_roles(
+fn collect_group_roles(
     auth_doc: GroupAuthorizationDocument,
     user_id: UserId,
 ) -> Vec<UserInfoRoleResponse> {
@@ -408,11 +405,11 @@ fn collect_assigned_group_roles(
         .roles
         .into_iter()
         .filter(|(_, role)| role.assigned_users.contains(&user_id))
-        .map(|(role_id, role)| map_user_info_role(role_id, role))
+        .map(|(role_id, role)| map_user_role(role_id, role))
         .collect()
 }
 
-async fn collect_user_group_memberships(
+async fn collect_group_memberships(
     state: &ServerState,
     user_id: UserId,
 ) -> ServerResult<Vec<UserInfoGroupResponse>> {
@@ -427,7 +424,7 @@ async fn collect_user_group_memberships(
         )
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
-        let roles = collect_assigned_group_roles(auth_doc, user_id);
+        let roles = collect_group_roles(auth_doc, user_id);
         if roles.is_empty() {
             continue;
         }
@@ -440,7 +437,7 @@ async fn collect_user_group_memberships(
     Ok(memberships)
 }
 
-async fn build_user_info_response(
+async fn build_user_response(
     state: &ServerState,
     auth: AuthContext,
 ) -> ServerResult<GetUserInfoResponse> {
@@ -448,10 +445,9 @@ async fn build_user_info_response(
         return Err(ServerError::Forbidden);
     }
     let user = read_current_user(state, auth.user_id).await?;
-    let preferences = user_preferences_from_attributes(&user.attributes);
-    let realm_roles =
-        collect_user_realm_roles(read_realm_authorization(state).await?, auth.user_id);
-    let groups = collect_user_group_memberships(state, auth.user_id).await?;
+    let preferences = preferences_from_attributes(&user.attributes);
+    let realm_roles = collect_realm_roles(read_realm_authorization(state).await?, auth.user_id);
+    let groups = collect_group_memberships(state, auth.user_id).await?;
 
     Ok(GetUserInfoResponse {
         user: user.into(),
@@ -464,14 +460,14 @@ async fn build_user_info_response(
     })
 }
 
-async fn try_claim_initial_admin(state: &Arc<ServerState>, user_id: UserId) {
+async fn claim_initial_admin(state: &Arc<ServerState>, user_id: UserId) {
     let auth_context = AuthContext {
         user_id,
         realm_id: state.get_realm_id(),
         path_restrictions: None,
         session: None,
     };
-    if let Err(error) = state.claim_initial_realm_admin(&auth_context).await {
+    if let Err(error) = state.claim_initial_admin(&auth_context).await {
         error!(error = %error, "Failed to claim initial realm admin after user registration");
     }
 }
@@ -487,7 +483,7 @@ async fn validate_oidc_token(
         .token_selector(token)
         .map_err(|_| ServerError::Unauthorized)?;
     let provider = state
-        .get_oidc_provider_by_token(&selector)
+        .get_oidc_provider(&selector)
         .await
         .map_err(|_| ServerError::Unauthorized)?;
     let oidc_identity = validator
@@ -520,7 +516,7 @@ async fn register_admin(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_inspect_onboarding_error)?;
+    .map_err(map_inspect_error)?;
     if inspected.purpose != OnboardingPurpose::InitialAdministrator {
         return Err(ServerError::Forbidden);
     }
@@ -535,7 +531,7 @@ async fn register_admin(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_consume_onboarding_error)?;
+    .map_err(map_consume_error)?;
 
     let user = drive(
         RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
@@ -554,7 +550,7 @@ async fn register_admin(
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
 
-    try_claim_initial_admin(state, user.user_id).await;
+    claim_initial_admin(state, user.user_id).await;
     Ok(user)
 }
 
@@ -707,7 +703,7 @@ async fn get_token(
             if aruna_ctx.path_restrictions.is_some() {
                 return Err(ServerError::Forbidden);
             }
-            ensure_canonical_user_token_subject(&state, aruna_ctx.user_id).await?;
+            ensure_token_subject(&state, aruna_ctx.user_id).await?;
             let kind = aruna_ctx
                 .session
                 .as_ref()
@@ -818,7 +814,7 @@ async fn get_user_info(
     let auth = auth.ok_or(ServerError::Unauthorized)?;
     Ok((
         StatusCode::OK,
-        Json(build_user_info_response(&state, auth).await?),
+        Json(build_user_response(&state, auth).await?),
     ))
 }
 
@@ -936,16 +932,20 @@ async fn patch_user_info(
     )
     .await
     .map_err(|err| match err {
-        aruna_operations::update_user::UpdateUserError::Unauthorized => ServerError::Forbidden,
-        aruna_operations::update_user::UpdateUserError::UserNotFound => ServerError::NotFound,
-        aruna_operations::update_user::UpdateUserError::InvalidUserName
-        | aruna_operations::update_user::UpdateUserError::InvalidAttributeKey(_)
-        | aruna_operations::update_user::UpdateUserError::InvalidAttributeValue(_)
-        | aruna_operations::update_user::UpdateUserError::TooManyAttributes
-        | aruna_operations::update_user::UpdateUserError::ConversionError(_) => {
+        aruna_operations::users::update_user::UpdateUserError::Unauthorized => {
+            ServerError::Forbidden
+        }
+        aruna_operations::users::update_user::UpdateUserError::UserNotFound => {
+            ServerError::NotFound
+        }
+        aruna_operations::users::update_user::UpdateUserError::InvalidUserName
+        | aruna_operations::users::update_user::UpdateUserError::InvalidAttributeKey(_)
+        | aruna_operations::users::update_user::UpdateUserError::InvalidAttributeValue(_)
+        | aruna_operations::users::update_user::UpdateUserError::TooManyAttributes
+        | aruna_operations::users::update_user::UpdateUserError::ConversionError(_) => {
             ServerError::BadRequest
         }
-        aruna_operations::update_user::UpdateUserError::AuthorizationError(_) => {
+        aruna_operations::users::update_user::UpdateUserError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.to_string()),
@@ -953,7 +953,7 @@ async fn patch_user_info(
 
     Ok((
         StatusCode::OK,
-        Json(build_user_info_response(&state, auth).await?),
+        Json(build_user_response(&state, auth).await?),
     ))
 }
 
@@ -1040,9 +1040,11 @@ async fn list_users(
     )
     .await
     .map_err(|err| match err {
-        aruna_operations::list_users::ListUsersError::Unauthorized => ServerError::Forbidden,
-        aruna_operations::list_users::ListUsersError::ConversionError(_) => ServerError::BadRequest,
-        aruna_operations::list_users::ListUsersError::AuthorizationError(_) => {
+        aruna_operations::users::list_users::ListUsersError::Unauthorized => ServerError::Forbidden,
+        aruna_operations::users::list_users::ListUsersError::ConversionError(_) => {
+            ServerError::BadRequest
+        }
+        aruna_operations::users::list_users::ListUsersError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.to_string()),
@@ -1062,7 +1064,7 @@ pub(crate) async fn authorize_directory(
     auth: &AuthContext,
     user_id: Option<&str>,
 ) -> ServerResult<()> {
-    crate::auth::require_unrestricted_realm_auth(state, Some(auth.clone()))?;
+    crate::auth::require_unrestricted_auth(state, Some(auth.clone()))?;
     if auth.user_id.is_nil() || auth.user_id.realm_id != auth.realm_id {
         return Err(ServerError::Forbidden);
     }
@@ -1071,19 +1073,19 @@ pub(crate) async fn authorize_directory(
         state.get_realm_id(),
         user_id.unwrap_or("**")
     );
-    aruna_operations::request_policy::enforce_policies(
+    aruna_operations::auth::request_policy::enforce_policies(
         &state.get_ctx(),
         state.get_realm_id(),
-        &aruna_operations::request_policy::policy_request_with(
+        &aruna_operations::auth::request_policy::policy_request_with(
             &path,
             &Permission::READ,
             Some(auth),
-            aruna_operations::request_policy::PolicyRequestExtras::rest(),
+            aruna_operations::auth::request_policy::PolicyRequestExtras::rest(),
         ),
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::request_policy::PolicyEnforcementError::Denied { .. } => {
+        aruna_operations::auth::request_policy::PolicyEnforcementError::Denied { .. } => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.to_string()),
@@ -1367,8 +1369,8 @@ async fn get_user(
     )
     .await
     .map_err(|err| match err {
-        aruna_operations::get_user::GetUserError::Unauthorized => ServerError::Forbidden,
-        aruna_operations::get_user::GetUserError::UserNotFound => ServerError::NotFound,
+        aruna_operations::users::get_user::GetUserError::Unauthorized => ServerError::Forbidden,
+        aruna_operations::users::get_user::GetUserError::UserNotFound => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
     })?;
 
@@ -1473,16 +1475,20 @@ async fn update_user(
     )
     .await
     .map_err(|err| match err {
-        aruna_operations::update_user::UpdateUserError::Unauthorized => ServerError::Forbidden,
-        aruna_operations::update_user::UpdateUserError::UserNotFound => ServerError::NotFound,
-        aruna_operations::update_user::UpdateUserError::InvalidUserName
-        | aruna_operations::update_user::UpdateUserError::InvalidAttributeKey(_)
-        | aruna_operations::update_user::UpdateUserError::InvalidAttributeValue(_)
-        | aruna_operations::update_user::UpdateUserError::TooManyAttributes
-        | aruna_operations::update_user::UpdateUserError::ConversionError(_) => {
+        aruna_operations::users::update_user::UpdateUserError::Unauthorized => {
+            ServerError::Forbidden
+        }
+        aruna_operations::users::update_user::UpdateUserError::UserNotFound => {
+            ServerError::NotFound
+        }
+        aruna_operations::users::update_user::UpdateUserError::InvalidUserName
+        | aruna_operations::users::update_user::UpdateUserError::InvalidAttributeKey(_)
+        | aruna_operations::users::update_user::UpdateUserError::InvalidAttributeValue(_)
+        | aruna_operations::users::update_user::UpdateUserError::TooManyAttributes
+        | aruna_operations::users::update_user::UpdateUserError::ConversionError(_) => {
             ServerError::BadRequest
         }
-        aruna_operations::update_user::UpdateUserError::AuthorizationError(_) => {
+        aruna_operations::users::update_user::UpdateUserError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.to_string()),
@@ -1534,7 +1540,7 @@ async fn owned_devices(
     let secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
         .await
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    let now = aruna_core::util::unix_timestamp_secs();
+    let now = aruna_core::time::unix_timestamp_secs();
     for entry in secrets {
         if entry.record.mode.owner() != Some(owner) {
             continue;
@@ -1775,6 +1781,7 @@ async fn delete_enrollment(state: &Arc<ServerState>, enrollment_id: Ulid) -> Ser
 
 #[cfg(test)]
 mod tests {
+
     use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse, enrollment_status};
     use crate::auth::{OidcValidator, handle_token};
     use crate::routes::sessions::{CreateSessionRequest, CreateSessionResponse};
@@ -1795,20 +1802,20 @@ mod tests {
         RealmConfigDocument, RealmId, SessionKind, TokenClaims, User, oidc_subject_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::announce_realm_presence::{
-        AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-    };
-    use aruna_operations::claim_initial_realm_admin::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    };
-    use aruna_operations::create_onboarding_secret::{
+    use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::onboarding::create_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
-    use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::incoming::initialize_net_incoming;
-    use aruna_operations::task_incoming::initialize_task_incoming;
+    use aruna_operations::realm::announce_presence::{
+        AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    };
+    use aruna_operations::realm::claim_admin::{
+        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    };
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::sync::incoming::initialize_net_incoming;
+    use aruna_operations::tasks::incoming::initialize_task_incoming;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use axum::Json;
@@ -1946,7 +1953,7 @@ mod tests {
         .unwrap()
     }
 
-    fn sign_scoped_aruna_token(node: &TestNode, user_id: UserId) -> String {
+    fn sign_scoped_token(node: &TestNode, user_id: UserId) -> String {
         sign_aruna_token(
             node,
             user_id,
@@ -2190,7 +2197,7 @@ mod tests {
         (registered, token.token)
     }
 
-    async fn create_local_onboarding_secret(node: &TestNode) -> String {
+    async fn create_local_secret(node: &TestNode) -> String {
         let onboarding_secret = OnboardingSecret {
             seed_url: node.base_url.clone(),
             enrollment_id: Ulid::generate(),
@@ -2699,7 +2706,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issued_user_token_carries_bounded_expiry() {
+    async fn token_expiry_bounded() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
         let signing_key = generate_signing_key();
@@ -2732,14 +2739,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_registration_consumes_secret() {
+    async fn registration_consumes_secret() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
         let signing_key = generate_signing_key();
         let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
         let node = spawn_test_node(provider, false).await;
 
-        let onboarding_secret = create_local_onboarding_secret(&node).await;
+        let onboarding_secret = create_local_secret(&node).await;
         let (body, _token) = register_via_oidc(
             &node,
             issuer,
@@ -2988,7 +2995,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_user_requires_authentication() {
+    async fn user_requires_authentication() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
         let signing_key = generate_signing_key();
@@ -3013,7 +3020,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_user_returns_unimplemented_for_foreign_realm_token() {
+    async fn foreign_realm_unimplemented() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
         let signing_key = generate_signing_key();
@@ -3112,7 +3119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_token_returns_aruna_token_for_registered_oidc_user() {
+    async fn registered_user_token() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
         let signing_key = generate_signing_key();
@@ -3195,7 +3202,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_token_rejects_scoped_aruna_token() {
+    async fn scoped_token_rejected() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
         let signing_key = generate_signing_key();
@@ -3212,8 +3219,7 @@ mod tests {
             None,
         )
         .await;
-        let scoped_token =
-            sign_scoped_aruna_token(&node, UserId::from_string(&registered.id).unwrap());
+        let scoped_token = sign_scoped_token(&node, UserId::from_string(&registered.id).unwrap());
 
         let token_response = reqwest::Client::new()
             .get(format!("{}/api/v1/access/token", node.base_url))
@@ -3230,7 +3236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_token_rejects_alias_aruna_token() {
+    async fn alias_token_rejected() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
         let signing_key = generate_signing_key();
@@ -3299,54 +3305,12 @@ mod tests {
 mod resolve_tests {
     use super::{ResolveUsersRequest, resolve_users};
     use crate::error::ServerError;
-    use crate::server_state::ServerState;
+    use crate::tests::fixtures::users::{realm_auth, setup_state};
     use aruna_core::UserId;
-    use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::{AuthContext, NodeCapabilities, RealmId};
-    use aruna_operations::driver::DriverContext;
-    use aruna_storage::FjallStorage;
+    use aruna_core::structs::RealmId;
     use axum::extract::State;
     use axum::{Extension, Json};
-    use std::sync::Arc;
-    use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
-
-    pub(super) async fn setup_state() -> (Arc<ServerState>, TempDir) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let driver_ctx = Arc::new(DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
-        let realm_signing_key = generate_signing_key();
-        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-        let state = Arc::new(
-            ServerState::new(
-                driver_ctx,
-                realm_id,
-                iroh::SecretKey::generate().public(),
-                NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
-            )
-            .await,
-        );
-        (state, tempdir)
-    }
-
-    pub(super) fn realm_auth(realm_id: RealmId) -> AuthContext {
-        AuthContext {
-            user_id: UserId::local(Ulid::generate(), realm_id),
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        }
-    }
 
     #[tokio::test]
     async fn requires_auth() {
@@ -3423,8 +3387,8 @@ mod resolve_tests {
 #[cfg(test)]
 mod device_tests {
     use super::{
-        UserDeviceResponse, evict_device, list_user_devices, revoke_user_device,
-        user_preferences_from_attributes,
+        UserDeviceResponse, evict_device, list_user_devices, preferences_from_attributes,
+        revoke_user_device,
     };
     use crate::error::ServerError;
     use crate::server_state::ServerState;
@@ -3432,15 +3396,15 @@ mod device_tests {
     use aruna_core::keys::generate_signing_key;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmId, RealmNodeKind};
-    use aruna_operations::claim_initial_realm_admin::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    };
-    use aruna_operations::create_onboarding_secret::{
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::onboarding::create_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::ensure_realm_config::{
+    use aruna_operations::realm::claim_admin::{
+        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    };
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::realm::ensure_config::{
         EnsureRealmConfigConfig, EnsureRealmConfigOperation,
     };
     use aruna_storage::FjallStorage;
@@ -3794,7 +3758,7 @@ mod device_tests {
     fn decodes_dashboard_scope() {
         // Only the two documented values decode; anything else reads as unset.
         let scope = |value: &str| {
-            user_preferences_from_attributes(&std::collections::HashMap::from([(
+            preferences_from_attributes(&std::collections::HashMap::from([(
                 "ui.dashboard_scope".to_string(),
                 value.to_string(),
             )]))
@@ -3804,7 +3768,7 @@ mod device_tests {
         assert_eq!(scope(" realm ").as_deref(), Some("realm"));
         assert_eq!(scope("everything"), None);
         assert_eq!(
-            user_preferences_from_attributes(&std::collections::HashMap::new()).dashboard_scope,
+            preferences_from_attributes(&std::collections::HashMap::new()).dashboard_scope,
             None
         );
     }

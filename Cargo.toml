@@ -17,7 +17,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.79"
+version = "3.0.0-alpha.80"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -174,6 +174,7 @@ sysinfo = { version = "0.39.6", default-features = false, features = [
 ] }
 tar = "0.4.46"
 tempfile = "3.27.0"
+syn = { version = "2.0.119", features = ["full", "visit"] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full", "tracing"] }
 toml = "1.1.6"

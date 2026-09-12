@@ -1,4 +1,4 @@
-use crate::group_routing::load_group_inputs;
+use crate::groups::storage_routing::load_group_inputs;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -103,6 +103,9 @@ impl Operation for PutBucketRoutingOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.fail(error.clone().into());
+        }
         match self.state {
             PutBucketRoutingState::Init => self.start(),
             PutBucketRoutingState::LoadInputs => {
@@ -304,6 +307,9 @@ impl Operation for GetBucketRoutingOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.fail(error.clone().into());
+        }
         match self.state {
             GetBucketRoutingState::Init => self.start(),
             GetBucketRoutingState::ReadBucket => {

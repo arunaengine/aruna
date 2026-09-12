@@ -2,10 +2,16 @@ pub mod api;
 pub mod audit;
 pub(crate) mod builtin;
 pub mod contact;
+pub mod create_document;
+pub mod delete_document;
+pub mod device_pull;
 pub mod forward;
-mod handle;
+pub mod get_document;
+pub(crate) mod handle;
 mod iri_index;
+pub mod list_documents;
 pub mod materialization_queue;
+pub mod persistent_id;
 mod profile_cache;
 pub(crate) mod profile_shacl;
 pub mod profile_validation;
@@ -15,14 +21,16 @@ pub mod prune_queue;
 pub mod public_preview;
 mod query_cache;
 mod queue_storage;
-pub mod raw;
+pub mod raw_revision;
 pub mod repository;
 mod search_cursor;
 mod search_enrichment;
 pub mod stats;
 mod summary_cache;
-pub mod sync_pull;
+#[cfg(test)]
+mod tests;
 pub mod timestamp_index;
+pub mod update_document;
 pub mod visibility_index;
 
 use std::sync::Arc;
@@ -53,7 +61,7 @@ pub fn spawn_metadata_warmup(context: Arc<DriverContext>, shutdown: &Shutdown) {
             warn!(error = %error, "Metadata visibility cache warmup failed");
             return;
         }
-        if let Err(error) = iri_index::rebuild_metadata_iri_reference_index(&context).await {
+        if let Err(error) = iri_index::rebuild_index(&context).await {
             warn!(error = %error, "Metadata IRI reference index rebuild failed");
         }
     });

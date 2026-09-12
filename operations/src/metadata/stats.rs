@@ -11,8 +11,8 @@ use serde_json::Value;
 use super::api::MetadataApiError;
 use super::repository::StorageReadError;
 use crate::driver::DriverContext;
-use crate::get_metadata_document::is_metadata_record_materialized_for_graph_read;
 use crate::jobs::workflow::run_crate::PROCESS_PROFILE;
+use crate::metadata::get_document::record_materialized_read;
 
 const GROUP_COUNT_PAGE_SIZE: usize = 1_000;
 const GROUP_PURPOSE_SUMMARY_FANOUT_LIMIT: usize = 8;
@@ -26,18 +26,9 @@ pub struct GroupDocumentPurposeCounts {
     pub process_run_count: u64,
 }
 
-/// Realm-wide number of live metadata documents, not filtered by what any
-/// caller may read.
-///
-/// The count comes from the cached registry snapshot plus one bounded lifecycle
-/// batch, and excludes lifecycle-deleted documents. Returns `None` when the node
-/// runs without a metadata subsystem, so an absent count stays distinguishable
-/// from zero documents.
-///
-/// An exact per-caller count would need per-document glob evaluation, because
-/// read visibility is glob-granular: a `DENY` can subtract a single document
-/// from a group-wide grant. The realm total discloses only document volume,
-/// which callers already reach realm auth to see.
+/// Realm-wide count of live metadata documents, unfiltered by readability and
+/// excluding lifecycle-deleted ones. `None` without a metadata subsystem. Only
+/// document volume is disclosed, never a per-caller glob evaluation.
 pub async fn count_realm_documents(
     context: &DriverContext,
     realm_id: RealmId,
@@ -46,7 +37,7 @@ pub async fn count_realm_documents(
         return Ok(None);
     };
     let records = metadata_handle
-        .list_cached_registry_records()
+        .list_cached_records()
         .await
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
     let records =
@@ -59,11 +50,9 @@ pub async fn count_realm_documents(
     ))
 }
 
-/// Number of stored groups belonging to one realm.
-///
-/// The group keyspace is read in bounded pages under one read transaction, so
-/// the returned count is a consistent snapshot rather than the 10,000-row
-/// default page exposed by `ListGroupOperation`.
+/// Number of stored groups belonging to one realm. Bounded pages under one
+/// read transaction yield a consistent snapshot, not the default page
+/// `ListGroupOperation` exposes.
 pub async fn count_realm_groups(
     context: &DriverContext,
     realm_id: RealmId,
@@ -147,14 +136,9 @@ pub async fn count_realm_groups(
 }
 
 /// Exact lifecycle-live metadata-document counts for one group, classified
-/// solely from each document's root RO-Crate entity.
-///
-/// The cached group registry plus the shared lifecycle filter select at most
-/// the metadata registry candidate limit. For each live document, the graph
-/// store's root-summary export is read with at most eight reads in flight; full
-/// crates and storage paths are never read for classification. Returns `None`
-/// when this node has no metadata subsystem.
-pub async fn count_group_documents_by_purpose(
+/// solely from each document's root RO-Crate entity via bounded root-summary
+/// reads; full paths never load. `None` without a metadata subsystem.
+pub async fn count_group_purpose(
     context: &DriverContext,
     realm_id: RealmId,
     group_id: GroupId,
@@ -163,7 +147,7 @@ pub async fn count_group_documents_by_purpose(
         return Ok(None);
     };
     let records = metadata_handle
-        .list_cached_registry_records_for_group(group_id)
+        .list_cached_group(group_id)
         .await
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
     let records = super::api::filter_live_records(&context.storage_handle, records.as_ref())
@@ -175,7 +159,7 @@ pub async fn count_group_documents_by_purpose(
     let classifications = stream::iter(records.into_iter().map(|record| {
         let metadata_handle = metadata_handle.clone();
         async move {
-            if !is_metadata_record_materialized_for_graph_read(context, &record)
+            if !record_materialized_read(context, &record)
                 .await
                 .map_err(|error| match error {
                     StorageReadError::Storage(error) => {
@@ -189,7 +173,7 @@ pub async fn count_group_documents_by_purpose(
                 return Err(MetadataApiError::ServiceUnavailable);
             }
             let summary = metadata_handle
-                .export_rocrate_summary_jsonld(record.graph_iri.clone())
+                .export_summary_jsonld(record.graph_iri.clone())
                 .await
                 .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
             classify_root_summary(&summary, &record.graph_iri)
@@ -234,7 +218,7 @@ pub(crate) fn classify_root_summary(
             MetadataApiError::Internal("RO-Crate summary has no root entity".to_string())
         })?;
 
-    if jsonld_value_contains_iri(root.get("@type"), PROFILE_TYPE_IRI) {
+    if jsonld_contains_iri(root.get("@type"), PROFILE_TYPE_IRI) {
         return Ok(DocumentPurpose::Profile);
     }
 
@@ -242,22 +226,16 @@ pub(crate) fn classify_root_summary(
         "conformsTo".to_string(),
         DCTERMS_CONFORMS_TO_IRI.to_string(),
     ]);
-    collect_conforms_to_terms(document.get("@context"), &mut conforms_to_keys);
+    collect_conforms_terms(document.get("@context"), &mut conforms_to_keys);
     if root.as_object().is_some_and(|root| {
         root.iter().any(|(key, value)| {
-            conforms_to_keys.contains(key)
-                && jsonld_value_contains_iri(Some(value), PROCESS_PROFILE)
+            conforms_to_keys.contains(key) && jsonld_contains_iri(Some(value), PROCESS_PROFILE)
         })
     }) {
         return Ok(DocumentPurpose::ProcessRun);
     }
 
     Ok(DocumentPurpose::Dataset)
-}
-
-pub fn summary_is_profile(summary: &str, graph_iri: &str) -> Result<bool, MetadataApiError> {
-    classify_root_summary(summary, graph_iri)
-        .map(|purpose| matches!(purpose, DocumentPurpose::Profile))
 }
 
 /// Classifies the validated create payload before projection. Imported crates
@@ -294,17 +272,14 @@ pub(crate) fn rocrate_is_profile(jsonld: &str, graph_iri: &str) -> Result<bool, 
             })
         })
         .ok_or_else(|| "RO-Crate has no root entity".to_string())?;
-    Ok(jsonld_value_contains_iri(
-        root.get("@type"),
-        PROFILE_TYPE_IRI,
-    ))
+    Ok(jsonld_contains_iri(root.get("@type"), PROFILE_TYPE_IRI))
 }
 
-fn collect_conforms_to_terms(value: Option<&Value>, terms: &mut HashSet<String>) {
+fn collect_conforms_terms(value: Option<&Value>, terms: &mut HashSet<String>) {
     match value {
         Some(Value::Array(values)) => {
             for value in values {
-                collect_conforms_to_terms(Some(value), terms);
+                collect_conforms_terms(Some(value), terms);
             }
         }
         Some(Value::Object(entries)) => {
@@ -323,12 +298,12 @@ fn collect_conforms_to_terms(value: Option<&Value>, terms: &mut HashSet<String>)
     }
 }
 
-fn jsonld_value_contains_iri(value: Option<&Value>, expected: &str) -> bool {
+fn jsonld_contains_iri(value: Option<&Value>, expected: &str) -> bool {
     match value {
         Some(Value::String(value)) => value == expected,
         Some(Value::Array(values)) => values
             .iter()
-            .any(|value| jsonld_value_contains_iri(Some(value), expected)),
+            .any(|value| jsonld_contains_iri(Some(value), expected)),
         Some(Value::Object(value)) => {
             value
                 .get("@id")
@@ -350,9 +325,7 @@ mod tests {
         MetadataApplyRoCrateRequest, MetadataEffect, MetadataEvent, MetadataGraphLifecycleRecord,
         MetadataGraphPolicy, MetadataRequestDurability,
     };
-    use aruna_core::storage_entries::{
-        metadata_graph_lifecycle_write_entry, metadata_registry_write_entries,
-    };
+    use aruna_core::storage_entries::{graph_lifecycle_entry, registry_write_entries};
     use aruna_core::structs::{Actor, Group, MetadataRegistryRecord, PlacementRef};
     use aruna_core::types::GroupId;
     use aruna_storage::{FjallStorage, StorageHandle};
@@ -461,7 +434,7 @@ mod tests {
     async fn write_record(fixture: &Fixture, record: &MetadataRegistryRecord) {
         write_entries(
             &fixture.storage,
-            metadata_registry_write_entries(record).expect("registry entries"),
+            registry_write_entries(record).expect("registry entries"),
         )
         .await;
     }
@@ -583,7 +556,7 @@ mod tests {
         );
         write_entries(
             &fixture.storage,
-            vec![metadata_graph_lifecycle_write_entry(&tombstone).expect("lifecycle entry")],
+            vec![graph_lifecycle_entry(&tombstone).expect("lifecycle entry")],
         )
         .await;
 
@@ -596,7 +569,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn counts_realm_groups_from_a_consistent_paged_scan() {
+    async fn counts_realm_groups() {
         let fixture = setup_fixture();
         let owner = aruna_core::UserId::nil(fixture.realm_id);
         let actor = Actor {
@@ -645,7 +618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_purpose_counts_classify_root_fixtures() {
+    async fn group_purpose_counts() {
         let fixture = setup_fixture();
         let group_id = Ulid::generate();
         // Deliberately misleading paths prove that classification does not use
@@ -681,7 +654,7 @@ mod tests {
         write_rocrate(&fixture, &dataset, serde_json::json!("Dataset"), None).await;
 
         assert_eq!(
-            count_group_documents_by_purpose(&fixture.context, fixture.realm_id, group_id)
+            count_group_purpose(&fixture.context, fixture.realm_id, group_id)
                 .await
                 .expect("purpose count succeeds"),
             Some(GroupDocumentPurposeCounts {
@@ -713,13 +686,9 @@ mod tests {
             None
         );
         assert_eq!(
-            count_group_documents_by_purpose(
-                &context,
-                RealmId::from_bytes(REALM_SEED),
-                Ulid::generate(),
-            )
-            .await
-            .expect("unconfigured purpose count succeeds"),
+            count_group_purpose(&context, RealmId::from_bytes(REALM_SEED), Ulid::generate(),)
+                .await
+                .expect("unconfigured purpose count succeeds"),
             None
         );
     }

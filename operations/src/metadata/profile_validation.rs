@@ -11,12 +11,10 @@ use aruna_core::metadata::{
     MetadataProfileValidationStatus, MetadataRawRevision, MetadataValidationViolation,
     is_rocrate_specification,
 };
-use aruna_core::storage_entries::{
-    metadata_profile_validation_status_key, metadata_profile_validation_status_write_entry,
-};
+use aruna_core::storage_entries::{profile_validation_entry, profile_validation_key};
 use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::time::unix_timestamp_millis as now_ms;
 use aruna_core::types::{GroupId, TxnId};
-use aruna_core::util::unix_timestamp_millis as now_ms;
 use craqle::{CrateViolation, ShaclValidationResult};
 use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxttl::NQuadsParser;
@@ -30,10 +28,8 @@ use crate::metadata::forward::export_profile_routed;
 use crate::metadata::profile_shacl::{
     ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
 };
-use crate::metadata::raw::load_raw_revision;
-use crate::metadata::repository::{
-    StorageReadError, parse_registry_read, read_registry_by_document_effect,
-};
+use crate::metadata::raw_revision::load_raw_revision;
+use crate::metadata::repository::{StorageReadError, parse_registry_read, read_document_registry};
 
 const SH: &str = "http://www.w3.org/ns/shacl#";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -50,12 +46,9 @@ const DX_PROFILE: &str = "http://www.w3.org/ns/dx/prof/Profile";
 const PROFILE_PUBLIC_PREFIX: &str = "https://w3id.org/aruna/profile/";
 const EVALUATOR_NAME: &str = "craqle-shacl-core/0.2";
 
-/// Authoritative backend SHACL support for Profile validation.
-///
-/// Shapes are compiled and executed by craqle's native SHACL Core Subset v1
-/// engine. Every construct outside this set, including SHACL-SPARQL, SHACL-JS,
-/// SHACL-AF, custom components and targets, recursive shapes, RDF-star, and
-/// remote `owl:imports`, fails closed with an `unsupported_constraint` finding.
+/// Authoritative backend SHACL support for Profile validation: craqle's native
+/// SHACL Core Subset v1 engine. Anything outside it (SHACL-SPARQL/JS/AF, custom
+/// targets, recursion, RDF-star, remote `owl:imports`) fails closed with `unsupported_constraint`.
 pub const SUPPORTED_PROFILE_CONSTRAINTS: &[&str] = &[
     "sh:targetClass",
     "sh:targetNode",
@@ -123,12 +116,8 @@ struct ResolvedProfile {
 }
 
 /// Which registered Profiles a validation may resolve.
-///
-/// Usability is a property of the registry row alone: a Profile serves the
-/// Datasets of its own group, and everyone once it is public. Whoever reaches
-/// validation already proved WRITE on the Dataset's path in that group, or READ
-/// on the group's metadata for a preview, so no caller identity takes part in
-/// the decision.
+/// Usability follows the registry row alone: group-mates, then everyone once
+/// public. The caller already proved WRITE or READ, so identity takes no part.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProfileScope {
     /// Datasets of this group, so its own Profiles resolve as well.
@@ -159,13 +148,13 @@ pub fn profile_public_iri(profile_id: Ulid) -> String {
 }
 
 pub fn equivalent_profile_iris(iri: &str) -> Vec<String> {
-    profile_id_from_iri(iri).map_or_else(
+    profile_from_iri(iri).map_or_else(
         || vec![iri.to_string()],
         |profile_id| vec![profile_public_iri(profile_id)],
     )
 }
 
-pub(crate) fn submission_has_profile_tag(jsonld: &str) -> bool {
+pub(crate) fn submission_profile_tag(jsonld: &str) -> bool {
     data_graph(jsonld)
         .map(|(data, root)| !profile_tags(&data, &root).is_empty())
         .unwrap_or(true)
@@ -195,7 +184,7 @@ fn untagged_without_evaluator(error: &MetadataError, jsonld: &str) -> bool {
             if findings
                 .iter()
                 .any(|finding| finding.code == "validator_unavailable")
-    ) && !submission_has_profile_tag(jsonld)
+    ) && !submission_profile_tag(jsonld)
 }
 
 /// A write refuses exactly what the preview reports: structural violations
@@ -565,7 +554,7 @@ pub async fn load_validation_status(
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_PROFILE_VALIDATION_STATUS_KEYSPACE.to_string(),
-            key: metadata_profile_validation_status_key(document_id),
+            key: profile_validation_key(document_id),
             txn_id,
         })
         .await
@@ -636,7 +625,7 @@ async fn validation_is_current(
     let Some(digest) = status.dataset_digest else {
         return Ok(status.dataset_revision == record.last_event_id);
     };
-    let current = crate::metadata::raw::load_raw_digest(context, record.document_id)
+    let current = crate::metadata::raw_revision::load_raw_digest(context, record.document_id)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     Ok(current == Some(digest))
@@ -681,10 +670,7 @@ pub async fn revalidate_current(
     let fenced = parse_registry_read(
         context
             .storage_handle
-            .send_effect(read_registry_by_document_effect(
-                record.document_id,
-                Some(txn_id),
-            ))
+            .send_effect(read_document_registry(record.document_id, Some(txn_id)))
             .await,
     )
     .map_err(map_registry_error)?;
@@ -703,7 +689,7 @@ pub async fn revalidate_current(
             "metadata revision changed during profile revalidation; retry".to_string(),
         ));
     }
-    let (key_space, key, value) = metadata_profile_validation_status_write_entry(&status)
+    let (key_space, key, value) = profile_validation_entry(&status)
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     match context
         .storage_handle
@@ -768,7 +754,7 @@ async fn resolve_registered_profile(
     requested_iri: &str,
     scope: ProfileScope,
 ) -> Result<ResolvedProfile, MetadataError> {
-    let Some(profile_id) = profile_id_from_iri(requested_iri) else {
+    let Some(profile_id) = profile_from_iri(requested_iri) else {
         return Err(profile_not_registered(requested_iri));
     };
     let record = match read_registry(context, profile_id).await {
@@ -876,7 +862,7 @@ async fn read_registry(
     parse_registry_read(
         context
             .storage_handle
-            .send_effect(read_registry_by_document_effect(document_id, None))
+            .send_effect(read_document_registry(document_id, None))
             .await,
     )
     .map_err(map_registry_error)
@@ -889,7 +875,7 @@ fn map_registry_error(error: StorageReadError) -> MetadataError {
     }
 }
 
-fn profile_id_from_iri(iri: &str) -> Option<Ulid> {
+fn profile_from_iri(iri: &str) -> Option<Ulid> {
     let value = iri.strip_prefix(PROFILE_PUBLIC_PREFIX)?;
     if value.is_empty() || value.contains('/') {
         return None;
@@ -1308,9 +1294,9 @@ mod tests {
         )
         .unwrap()
         .as_ulid();
-        assert_eq!(profile_id_from_iri(&profile_public_iri(id)), Some(id));
+        assert_eq!(profile_from_iri(&profile_public_iri(id)), Some(id));
         assert_eq!(
-            profile_id_from_iri(&MetadataRegistryRecord::graph_iri_for(id)),
+            profile_from_iri(&MetadataRegistryRecord::graph_iri_for(id)),
             None
         );
     }
@@ -1388,12 +1374,12 @@ mod tests {
                 .unwrap()
         );
 
-        let plan = crate::metadata::raw::prepare_merged_event(
+        let plan = crate::metadata::raw_revision::prepare_merged_event(
             &context,
             &event,
             render,
             0,
-            &mut crate::metadata::raw::RawStateCache::default(),
+            &mut crate::metadata::raw_revision::RawStateCache::default(),
         )
         .await
         .expect("merged raw state");

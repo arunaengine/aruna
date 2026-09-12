@@ -1,9 +1,6 @@
-//! Aruna Structured ULID codec (spec Appendix A.1, section 6.3.4).
-//!
-//! A `MetaResourceId`/`JobId` is a 26-character Crockford Base32 ULID whose
-//! 80-bit entropy field is partitioned into a 20-bit placement handle, a 12-bit
-//! bucket, and a 48-bit nonce. All raw bit knowledge lives in [`layout`]; this
-//! module exposes only typed fields so downstream code never touches raw bits.
+//! Aruna Structured ULID codec (spec Appendix A.1, section 6.3.4): a 26-character
+//! Crockford ULID whose entropy splits into a 20-bit placement handle, a 12-bit
+//! placement bucket and a 48-bit nonce. Raw bit knowledge stays in [`layout`].
 
 mod generator;
 mod layout;
@@ -21,12 +18,8 @@ use ulid::{DecodeError, Ulid};
 
 /// Highest allocatable placement handle; handle zero is reserved.
 pub const MAX_PLACEMENT_HANDLE: u32 = layout::MAX_HANDLE;
-/// Highest bucket value the 12-bit field can hold.
-pub const MAX_BUCKET_ID: u16 = layout::MAX_BUCKET;
 /// Maximum `bucket_count` a strategy may declare (the 12-bit field cap).
 pub const MAX_BUCKET_COUNT: u16 = layout::MAX_BUCKET_COUNT;
-/// Number of allocatable handles (20 bits, handle zero reserved).
-pub const ALLOCATABLE_HANDLES: u32 = layout::MAX_HANDLE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum FieldError {
@@ -94,7 +87,7 @@ impl<'de> Deserialize<'de> for PlacementHandle {
     }
 }
 
-/// A 12-bit bucket carried inside the id (REQ-META-ID-FORMAT-001).
+/// A 12-bit placement bucket carried inside the id (REQ-META-ID-FORMAT-001).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BucketId(u16);
 
@@ -493,9 +486,8 @@ mod tests {
 
     #[test]
     fn serde_matches_ulid() {
-        // The typed id must serialize to the exact same bytes a raw `Ulid` would,
-        // so migrating a `document_id` field never changes the on-the-wire or
-        // on-disk record layout (postcard is the record codec; JSON the API one).
+        // Match a raw `Ulid` byte-for-byte so the wire and on-disk record
+        // layout never changes (postcard is the record codec; JSON the API one).
         let id = MetaResourceId::parse(KAT_STRING).unwrap();
         let ulid = id.as_ulid();
         assert_eq!(
@@ -517,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn job_id_shares_codec() {
+    fn job_id_roundtrip() {
         let job = JobId::from_parts(
             0x0123456789ab,
             PlacementHandle::new(0x0beef).unwrap(),

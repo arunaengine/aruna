@@ -1,0 +1,1033 @@
+use super::sync::sync_graph_once;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use aruna_core::NodeId;
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::{METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE};
+use aruna_core::metadata::{
+    MetadataEffect, MetadataError, MetadataEvent, MetadataGraphLifecycleRecord,
+};
+use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::telemetry::record_elapsed_ms;
+use aruna_core::types::GroupId;
+use aruna_storage::StorageHandle;
+use craqle::{AllowAllAuthorizer, CraqleError, CraqleNode, GraphId};
+use tokio::time::sleep;
+use tracing::{Span, field, warn};
+use ulid::Ulid;
+
+use super::entity_convert::error_from_craqle;
+use super::{
+    LifecycleDeletedCacheEntry, METADATA_GRAPH_SYNC_ATTEMPTS, METADATA_GRAPH_SYNC_RETRY_AFTER,
+    METADATA_REGISTRY_CANDIDATE_LIMIT, METADATA_VISIBILITY_CACHE_TTL, MetadataHandle,
+    MetadataInner, MetadataVisibilityCache, RegistryCacheEntry, VisibilityFillResult,
+    metadata_graph_fence, summary_cache,
+};
+use crate::metadata::repository::{
+    StorageReadError, iter_registry_effect, parse_lifecycle_read, parse_registry_iter,
+    read_lifecycle_effect,
+};
+
+impl MetadataVisibilityCache {
+    pub(super) fn new() -> Self {
+        Self {
+            registry: Mutex::new(None),
+            registry_fill: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle_deleted: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    pub(super) fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub(super) fn advance_generation(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(super) fn registry_records(&self) -> Option<Arc<Vec<MetadataRegistryRecord>>> {
+        match self.registry_records_any() {
+            Some((records, true)) => Some(records),
+            _ => None,
+        }
+    }
+
+    // Expired entries are kept so readers can be served stale data while a
+    // background refill replaces the entry; the bool flags freshness.
+    pub(super) fn registry_records_any(&self) -> Option<(Arc<Vec<MetadataRegistryRecord>>, bool)> {
+        let now = Instant::now();
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        registry.as_mut().and_then(|entry| {
+            entry
+                .snapshot()
+                .map(|records| (records, entry.expires_at > now))
+        })
+    }
+
+    pub(super) fn records_group_any(
+        &self,
+        group_id: GroupId,
+    ) -> Option<(Arc<Vec<MetadataRegistryRecord>>, bool)> {
+        let now = Instant::now();
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        registry.as_mut().and_then(|entry| {
+            entry
+                .group_snapshot(group_id)
+                .map(|records| (records, entry.expires_at > now))
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn store_registry_records(&self, records: Arc<Vec<MetadataRegistryRecord>>) {
+        let map: BTreeMap<_, _> = records
+            .iter()
+            .map(|record| (record.document_id, record.clone()))
+            .collect();
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        *registry = Some(RegistryCacheEntry {
+            records: map,
+            snapshot: Some(records),
+            group_snapshots: HashMap::new(),
+            expires_at: Instant::now() + METADATA_VISIBILITY_CACHE_TTL,
+        });
+    }
+
+    pub(super) fn store_visibility_fill(
+        &self,
+        records: Arc<Vec<MetadataRegistryRecord>>,
+        lifecycle_entries: Vec<(String, bool)>,
+        fill_generation: u64,
+    ) -> bool {
+        if records.len() > METADATA_REGISTRY_CANDIDATE_LIMIT
+            || lifecycle_entries.len() > METADATA_REGISTRY_CANDIDATE_LIMIT
+        {
+            return false;
+        }
+        if self.current_generation() != fill_generation {
+            return false;
+        }
+        let map: BTreeMap<_, _> = records
+            .iter()
+            .map(|record| (record.document_id, record.clone()))
+            .collect();
+        let now = Instant::now();
+        let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let mut lifecycle = self
+            .lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        if self.current_generation() != fill_generation {
+            return false;
+        }
+        let protected = lifecycle_entries
+            .iter()
+            .map(|(graph_iri, _)| graph_iri.clone())
+            .collect::<HashSet<_>>();
+        Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
+        for (graph_iri, deleted) in lifecycle_entries {
+            lifecycle.insert(
+                graph_iri,
+                LifecycleDeletedCacheEntry {
+                    deleted,
+                    expires_at,
+                },
+            );
+        }
+        lifecycle.retain(|_, entry| entry.expires_at > now);
+        *registry = Some(RegistryCacheEntry {
+            records: map,
+            snapshot: Some(records),
+            group_snapshots: HashMap::new(),
+            expires_at,
+        });
+        true
+    }
+    #[cfg(test)]
+    pub(super) fn lifecycle_deleted(&self, graph_iri: &str) -> Option<bool> {
+        match self.lifecycle_deleted_any(graph_iri) {
+            Some((deleted, true)) => Some(deleted),
+            _ => None,
+        }
+    }
+
+    pub(super) fn lifecycle_deleted_any(&self, graph_iri: &str) -> Option<(bool, bool)> {
+        let now = Instant::now();
+        let lifecycle = self
+            .lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        lifecycle
+            .get(graph_iri)
+            .map(|entry| (entry.deleted, entry.expires_at > now))
+    }
+
+    pub(super) fn store_lifecycle_deleted(&self, graph_iri: String, deleted: bool) {
+        let mut lifecycle = self
+            .lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        self.advance_generation();
+        let now = Instant::now();
+        let protected = HashSet::from([graph_iri.clone()]);
+        Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
+        lifecycle.insert(
+            graph_iri,
+            LifecycleDeletedCacheEntry {
+                deleted,
+                expires_at: now + METADATA_VISIBILITY_CACHE_TTL,
+            },
+        );
+    }
+
+    // Bulk refresh after a registry fill: re-stamps every supplied graph and drops expired
+    // leftovers (graphs no longer in the registry) so the map stays bounded.
+    #[cfg(test)]
+    pub(super) fn refresh_lifecycle_deleted(
+        &self,
+        entries: impl IntoIterator<Item = (String, bool)>,
+    ) {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        if entries.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            return;
+        }
+        let now = Instant::now();
+        let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
+        let mut lifecycle = self
+            .lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let protected = entries
+            .iter()
+            .map(|(graph_iri, _)| graph_iri.clone())
+            .collect::<HashSet<_>>();
+        Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
+        for (graph_iri, deleted) in entries {
+            lifecycle.insert(
+                graph_iri,
+                LifecycleDeletedCacheEntry {
+                    deleted,
+                    expires_at,
+                },
+            );
+        }
+        lifecycle.retain(|_, entry| entry.expires_at > now);
+    }
+
+    pub(super) fn trim_lifecycle_deleted(
+        lifecycle: &mut HashMap<String, LifecycleDeletedCacheEntry>,
+        protected: &HashSet<String>,
+        now: Instant,
+    ) {
+        lifecycle.retain(|_, entry| entry.expires_at > now);
+        let protected_count = lifecycle
+            .keys()
+            .filter(|graph_iri| protected.contains(*graph_iri))
+            .count();
+        let available = METADATA_REGISTRY_CANDIDATE_LIMIT.saturating_sub(protected.len());
+        let remove_count = lifecycle
+            .len()
+            .saturating_sub(protected_count)
+            .saturating_sub(available);
+        let evicted = lifecycle
+            .keys()
+            .filter(|graph_iri| !protected.contains(*graph_iri))
+            .take(remove_count)
+            .cloned()
+            .collect::<Vec<_>>();
+        for graph_iri in evicted {
+            lifecycle.remove(&graph_iri);
+        }
+    }
+
+    pub(super) fn refresh_if_current(
+        &self,
+        entries: impl IntoIterator<Item = (String, bool)>,
+        fill_generation: u64,
+    ) -> bool {
+        if self.current_generation() != fill_generation {
+            return false;
+        }
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        if entries.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            return false;
+        }
+        let now = Instant::now();
+        let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
+        let mut lifecycle = self
+            .lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        if self.current_generation() != fill_generation {
+            return false;
+        }
+        let protected = entries
+            .iter()
+            .map(|(graph_iri, _)| graph_iri.clone())
+            .collect::<HashSet<_>>();
+        Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
+        for (graph_iri, deleted) in entries {
+            lifecycle.insert(
+                graph_iri,
+                LifecycleDeletedCacheEntry {
+                    deleted,
+                    expires_at,
+                },
+            );
+        }
+        lifecycle.retain(|_, entry| entry.expires_at > now);
+        true
+    }
+    // Incremental maintenance keeps the cached registry usable under writes;
+    pub(super) fn upsert_registry_records(&self, updates: &[MetadataRegistryRecord]) {
+        self.upsert_at(updates, None);
+    }
+
+    pub(super) fn upsert_at(
+        &self,
+        updates: &[MetadataRegistryRecord],
+        expected_generation: Option<u64>,
+    ) {
+        if updates.is_empty() {
+            return;
+        }
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        if expected_generation.is_some_and(|generation| self.current_generation() != generation) {
+            return;
+        }
+        self.advance_generation();
+        let Some(entry) = registry.as_mut() else {
+            return;
+        };
+        let new_records = updates
+            .iter()
+            .filter(|update| !entry.records.contains_key(&update.document_id))
+            .count();
+        if entry.records.len().saturating_add(new_records) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            *registry = None;
+            return;
+        }
+        let mut touched_groups = HashSet::new();
+        for update in updates {
+            entry.records.insert(update.document_id, update.clone());
+            touched_groups.insert(update.group_id);
+        }
+        for group_id in touched_groups {
+            entry.group_snapshots.remove(&group_id);
+        }
+        entry.snapshot = None;
+    }
+
+    pub(super) fn remove_registry_record(&self, document_id: Ulid) {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        self.advance_generation();
+        let Some(entry) = registry.as_mut() else {
+            return;
+        };
+        if let Some(removed) = entry.records.remove(&document_id) {
+            entry.group_snapshots.remove(&removed.group_id);
+            entry.snapshot = None;
+        }
+    }
+
+    pub(super) fn remove_graph_records(&self, graph_iri: &str) {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        self.advance_generation();
+        let Some(entry) = registry.as_mut() else {
+            return;
+        };
+        let removed_groups = entry
+            .records
+            .values()
+            .filter(|record| record.graph_iri == graph_iri)
+            .map(|record| record.group_id)
+            .collect::<HashSet<_>>();
+        if removed_groups.is_empty() {
+            return;
+        }
+        entry
+            .records
+            .retain(|_, record| record.graph_iri != graph_iri);
+        for group_id in removed_groups {
+            entry.group_snapshots.remove(&group_id);
+        }
+        entry.snapshot = None;
+    }
+
+    pub(super) fn remove_lifecycle_entry(&self, graph_iri: &str) {
+        let mut lifecycle = self
+            .lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        self.advance_generation();
+        lifecycle.remove(graph_iri);
+    }
+
+    pub(super) fn expire_now(&self) {
+        let expired = Instant::now() - Duration::from_secs(1);
+        if let Some(entry) = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .as_mut()
+        {
+            entry.expires_at = expired;
+        }
+        for entry in self
+            .lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .values_mut()
+        {
+            entry.expires_at = expired;
+        }
+    }
+}
+
+impl MetadataHandle {
+    pub async fn reconcile_document_sync(&self) -> Result<usize, MetadataError> {
+        let inner = self.inner.clone();
+        let applied = tokio::task::spawn_blocking(move || inner.node.reconcile_irokle())
+            .await
+            .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        // Peer sync invalidates summaries because their cursor may precede newly applied content.
+        if !applied.is_empty() {
+            self.inner.query_cache.bump_apply();
+            for graph in &applied {
+                summary_cache().remove(graph.as_str());
+            }
+        }
+        Ok(applied.len())
+    }
+
+    pub async fn prune_if_deleted(&self, graph_iri: String) -> Result<bool, MetadataError> {
+        let _graph_fence = metadata_graph_fence(&graph_iri)
+            .acquire()
+            .await
+            .map_err(|error| {
+                MetadataError::Backend(format!("metadata graph fence unavailable: {error}"))
+            })?;
+        if !graph_lifecycle_deleted(self.lifecycle_storage(), &graph_iri).await? {
+            return Ok(false);
+        }
+        self.inner.visibility_cache.remove_graph_records(&graph_iri);
+        self.inner
+            .visibility_cache
+            .store_lifecycle_deleted(graph_iri.clone(), true);
+        if !contains_local_graph(self.inner.node.clone(), graph_iri.clone()).await? {
+            return Ok(true);
+        }
+        delete_local_graph(self.inner.node.clone(), graph_iri).await?;
+        Ok(true)
+    }
+
+    pub async fn prune_deleted_graphs(&self) -> Result<usize, MetadataError> {
+        let inner = self.inner.clone();
+        let graphs = tokio::task::spawn_blocking(move || inner.node.graphs())
+            .await
+            .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        let mut pruned = 0usize;
+        for graph in graphs {
+            if self.prune_if_deleted(graph.as_str().to_string()).await? {
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
+
+    pub(super) async fn sync_best_effort(
+        &self,
+        graph_iri: String,
+        mut peers: Vec<NodeId>,
+    ) -> MetadataEvent {
+        if let Some(net_handle) = self.inner.net_handle.as_ref() {
+            peers.retain(|peer| *peer != net_handle.node_id());
+        }
+        peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        peers.dedup();
+        if peers.is_empty() {
+            return MetadataEvent::GraphSyncScheduled { graph_iri, peers };
+        }
+
+        let inner = self.inner.clone();
+        let task_graph_iri = graph_iri.clone();
+        let task_peers = peers.clone();
+        tokio::spawn(async move {
+            for attempt in 1..=METADATA_GRAPH_SYNC_ATTEMPTS {
+                match sync_graph_once(inner.clone(), task_graph_iri.clone(), task_peers.clone())
+                    .await
+                {
+                    Ok(()) => return,
+                    Err(error) => {
+                        warn!(
+                            graph_iri = %task_graph_iri,
+                            attempt,
+                            attempts = METADATA_GRAPH_SYNC_ATTEMPTS,
+                            error = ?error,
+                            "Metadata graph sync attempt failed"
+                        );
+                        if attempt < METADATA_GRAPH_SYNC_ATTEMPTS {
+                            sleep(METADATA_GRAPH_SYNC_RETRY_AFTER).await;
+                        }
+                    }
+                }
+            }
+
+            warn!(
+                graph_iri = %task_graph_iri,
+                peer_count = task_peers.len(),
+                "Metadata graph sync retries exhausted"
+            );
+        });
+
+        MetadataEvent::GraphSyncScheduled { graph_iri, peers }
+    }
+}
+
+async fn graph_lifecycle_record(
+    storage_handle: StorageHandle,
+    graph_iri: &str,
+) -> Result<Option<MetadataGraphLifecycleRecord>, MetadataError> {
+    let event = storage_handle
+        .send_effect(read_lifecycle_effect(graph_iri, None))
+        .await;
+    parse_lifecycle_read(event).map_err(|error| match error {
+        StorageReadError::Storage(error) => MetadataError::Storage(error),
+        StorageReadError::Conversion(error) => MetadataError::Backend(error.to_string()),
+    })
+}
+
+pub(super) async fn metadata_graph_deleted(
+    inner: Arc<MetadataInner>,
+    storage_handle: StorageHandle,
+    graph_iri: &str,
+) -> Result<bool, MetadataError> {
+    if let Some((true, _)) = inner.visibility_cache.lifecycle_deleted_any(graph_iri) {
+        return Ok(true);
+    }
+
+    let deleted = graph_lifecycle_deleted(storage_handle, graph_iri).await?;
+    inner
+        .visibility_cache
+        .store_lifecycle_deleted(graph_iri.to_string(), deleted);
+    Ok(deleted)
+}
+
+pub(super) async fn graph_lifecycle_deleted(
+    storage_handle: StorageHandle,
+    graph_iri: &str,
+) -> Result<bool, MetadataError> {
+    Ok(graph_lifecycle_record(storage_handle, graph_iri)
+        .await?
+        .map(|record| record.is_deleted())
+        .unwrap_or(false))
+}
+
+async fn delete_local_graph(node: Arc<CraqleNode>, graph_iri: String) -> Result<(), MetadataError> {
+    tokio::task::spawn_blocking(move || {
+        node.delete_graph(&AllowAllAuthorizer, &GraphId::new(&graph_iri))
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+    .map_err(error_from_craqle)
+}
+
+async fn contains_local_graph(
+    node: Arc<CraqleNode>,
+    graph_iri: String,
+) -> Result<bool, MetadataError> {
+    tokio::task::spawn_blocking(move || node.contains_graph(&GraphId::new(&graph_iri)))
+        .await
+        .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+        .map_err(error_from_craqle)
+}
+
+pub(super) fn effect_mutates_graph(effect: &MetadataEffect) -> bool {
+    matches!(
+        effect,
+        MetadataEffect::CreateCrate { .. }
+            | MetadataEffect::ApplyRoCrate { .. }
+            | MetadataEffect::UpsertDataEntity { .. }
+            | MetadataEffect::UpsertContextualEntity { .. }
+            | MetadataEffect::SetGraphPolicy { .. }
+            | MetadataEffect::AddGraphPeer { .. }
+            | MetadataEffect::DeleteGraph { .. }
+            | MetadataEffect::InstallSnapshot { .. }
+            | MetadataEffect::MergeBatch { .. }
+    )
+}
+
+pub(super) fn effect_rejects_deleted(effect: &MetadataEffect) -> bool {
+    matches!(
+        effect,
+        MetadataEffect::ValidateCreateCrate { .. }
+            | MetadataEffect::ValidateRoCrate { .. }
+            | MetadataEffect::CreateCrate { .. }
+            | MetadataEffect::ApplyRoCrate { .. }
+            | MetadataEffect::UpsertDataEntity { .. }
+            | MetadataEffect::UpsertContextualEntity { .. }
+            | MetadataEffect::SetGraphPolicy { .. }
+            | MetadataEffect::AddGraphPeer { .. }
+            | MetadataEffect::GetGraphPolicy { .. }
+            | MetadataEffect::ExportRoCrate { .. }
+            | MetadataEffect::ExportRoCrateSummary { .. }
+            | MetadataEffect::ExportRoCratePage { .. }
+            | MetadataEffect::PlanBatch { .. }
+            | MetadataEffect::MergeBatch { .. }
+    )
+}
+
+#[tracing::instrument(
+    name = "metadata.registry.list_local",
+    level = "debug",
+    skip(inner),
+    fields(
+        cache_hit = field::Empty,
+        stale = field::Empty,
+        record_count = field::Empty,
+        elapsed_ms = field::Empty,
+    )
+)]
+pub(super) async fn list_local_records(
+    inner: Arc<MetadataInner>,
+) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+    let started = Instant::now();
+    let span = Span::current();
+    match inner.visibility_cache.registry_records_any() {
+        Some((records, true)) => {
+            span.record("cache_hit", true);
+            span.record("stale", false);
+            span.record("record_count", records.len() as u64);
+            record_elapsed_ms(&span, "elapsed_ms", started);
+            Ok(records)
+        }
+        Some((records, false)) => {
+            // Serve the expired snapshot and refresh in the background so an
+            // expiry never blocks reads on a refill.
+            span.record("cache_hit", true);
+            span.record("stale", true);
+            span.record("record_count", records.len() as u64);
+            record_elapsed_ms(&span, "elapsed_ms", started);
+            spawn_visibility_refill(&inner);
+            Ok(records)
+        }
+        None => {
+            let _fill = inner
+                .visibility_cache
+                .registry_fill
+                .clone()
+                .lock_owned()
+                .await;
+            if let Some((records, true)) = inner.visibility_cache.registry_records_any() {
+                span.record("cache_hit", true);
+                span.record("stale", false);
+                span.record("record_count", records.len() as u64);
+                record_elapsed_ms(&span, "elapsed_ms", started);
+                return Ok(records);
+            }
+            span.record("cache_hit", false);
+            let fill = fill_visibility_caches(&inner).await?;
+            let records = fill.records;
+            span.record("record_count", records.len() as u64);
+            record_elapsed_ms(&span, "elapsed_ms", started);
+            Ok(records)
+        }
+    }
+}
+
+#[tracing::instrument(
+    name = "metadata.registry.list_local_group",
+    level = "debug",
+    skip(inner),
+    fields(
+        group_id = %group_id,
+        cache_hit = field::Empty,
+        stale = field::Empty,
+        record_count = field::Empty,
+        elapsed_ms = field::Empty,
+    )
+)]
+pub(super) async fn list_local_group(
+    inner: Arc<MetadataInner>,
+    group_id: GroupId,
+) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+    let started = Instant::now();
+    let span = Span::current();
+    match inner.visibility_cache.records_group_any(group_id) {
+        Some((records, true)) => {
+            span.record("cache_hit", true);
+            span.record("stale", false);
+            span.record("record_count", records.len() as u64);
+            record_elapsed_ms(&span, "elapsed_ms", started);
+            Ok(records)
+        }
+        Some((records, false)) => {
+            // Serve the expired snapshot and refresh in the background so an
+            // expiry never blocks reads on a refill.
+            span.record("cache_hit", true);
+            span.record("stale", true);
+            span.record("record_count", records.len() as u64);
+            record_elapsed_ms(&span, "elapsed_ms", started);
+            spawn_visibility_refill(&inner);
+            Ok(records)
+        }
+        None => {
+            let _fill = inner
+                .visibility_cache
+                .registry_fill
+                .clone()
+                .lock_owned()
+                .await;
+            if let Some((records, true)) = inner.visibility_cache.records_group_any(group_id) {
+                span.record("cache_hit", true);
+                span.record("stale", false);
+                span.record("record_count", records.len() as u64);
+                record_elapsed_ms(&span, "elapsed_ms", started);
+                return Ok(records);
+            }
+            span.record("cache_hit", false);
+            let fill = fill_visibility_caches(&inner).await?;
+            let records = if fill.store_accepted {
+                inner
+                    .visibility_cache
+                    .records_group_any(group_id)
+                    .map(|(records, _)| records)
+                    .unwrap_or_else(|| records_for_group(&fill.records, group_id))
+            } else {
+                records_for_group(&fill.records, group_id)
+            };
+            span.record("record_count", records.len() as u64);
+            record_elapsed_ms(&span, "elapsed_ms", started);
+            Ok(records)
+        }
+    }
+}
+
+fn spawn_visibility_refill(inner: &Arc<MetadataInner>) {
+    let fill_lock = inner.visibility_cache.registry_fill.clone();
+    let inner = inner.clone();
+    tokio::spawn(async move {
+        let Ok(_guard) = fill_lock.try_lock_owned() else {
+            return;
+        };
+        if let Some((_, true)) = inner.visibility_cache.registry_records_any() {
+            return;
+        }
+        if let Err(error) = fill_visibility_caches(&inner).await {
+            warn!(error = %error, "Background visibility refill failed");
+        }
+    });
+}
+
+pub(super) fn records_for_group(
+    records: &Arc<Vec<MetadataRegistryRecord>>,
+    group_id: GroupId,
+) -> Arc<Vec<MetadataRegistryRecord>> {
+    Arc::new(
+        records
+            .iter()
+            .filter(|record| record.group_id == group_id)
+            .cloned()
+            .collect(),
+    )
+}
+
+pub(super) async fn list_group_records(
+    inner: Arc<MetadataInner>,
+    group_id: GroupId,
+    limit: usize,
+) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+    let limit = limit.min(METADATA_REGISTRY_CANDIDATE_LIMIT);
+    if let Some((records, true)) = inner.visibility_cache.records_group_any(group_id)
+        && records.len() <= limit
+    {
+        return Ok(records);
+    }
+
+    let mut records = Vec::new();
+    let mut start_after = None;
+    loop {
+        let event = inner
+            .storage_handle
+            .send_effect(iter_registry_effect(group_id, start_after, None))
+            .await;
+        let (page, next_start_after) = parse_registry_iter(event).map_err(|error| {
+            MetadataError::Backend(format!("metadata group iteration failed: {error:?}"))
+        })?;
+        if records.len().saturating_add(page.len()) > limit {
+            return Err(MetadataError::Backend(
+                "metadata candidate limit exceeded".to_string(),
+            ));
+        }
+        records.extend(page);
+        match next_start_after {
+            Some(cursor) => start_after = Some(cursor),
+            None => break,
+        }
+    }
+
+    let (deleted_graphs, _) = list_deleted_iris(&inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
+    Ok(Arc::new(
+        records
+            .into_iter()
+            .filter(|record| !deleted_graphs.contains(&record.graph_iri))
+            .collect(),
+    ))
+}
+
+#[tracing::instrument(
+    name = "metadata.visibility.fill",
+    level = "debug",
+    skip(inner),
+    fields(
+        registry_pages = field::Empty,
+        lifecycle_pages = field::Empty,
+        record_count = field::Empty,
+        deleted_count = field::Empty,
+        store_accepted = field::Empty,
+        elapsed_ms = field::Empty,
+    )
+)]
+pub(super) async fn fill_visibility_caches(
+    inner: &Arc<MetadataInner>,
+) -> Result<VisibilityFillResult, MetadataError> {
+    let started = Instant::now();
+    let span = Span::current();
+    let fill_generation = inner.visibility_cache.current_generation();
+
+    let mut records = Vec::new();
+    let mut start_after = None;
+    let mut registry_pages = 0usize;
+    loop {
+        let event = inner
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Iter {
+                key_space: METADATA_INDEX_KEYSPACE.to_string(),
+                prefix: None,
+                start: start_after.map(IterStart::After),
+                limit: METADATA_REGISTRY_CANDIDATE_LIMIT
+                    .saturating_sub(records.len())
+                    .saturating_add(1),
+                txn_id: None,
+            }))
+            .await;
+        let (mut page, next_start_after) = parse_registry_iter(event).map_err(|error| {
+            MetadataError::Backend(format!("metadata registry iteration failed: {error:?}"))
+        })?;
+        registry_pages += 1;
+        if records.len().saturating_add(page.len()) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            return Err(MetadataError::Backend(
+                "metadata candidate limit exceeded".to_string(),
+            ));
+        }
+        records.append(&mut page);
+        match next_start_after {
+            Some(cursor) => start_after = Some(cursor),
+            None => break,
+        }
+    }
+    span.record("registry_pages", registry_pages as u64);
+    span.record("record_count", records.len() as u64);
+    // The registry keyspace iterates in (group, document) order; snapshot
+    // consumers binary-search by document id (record_for_graph).
+    records.sort_unstable_by_key(|record| record.document_id);
+
+    // Lifecycle records are deletion tombstones, so one keyspace sweep refreshes the
+    // deleted-state of every registry graph without per-graph point reads.
+    let (deleted_graphs, lifecycle_pages) =
+        list_deleted_iris(inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
+    span.record("lifecycle_pages", lifecycle_pages as u64);
+    span.record("deleted_count", deleted_graphs.len() as u64);
+
+    let lifecycle_entries = records
+        .iter()
+        .map(|record| {
+            (
+                record.graph_iri.clone(),
+                deleted_graphs.contains(&record.graph_iri),
+            )
+        })
+        .collect::<Vec<_>>();
+    records.retain(|record| !deleted_graphs.contains(&record.graph_iri));
+    let records = Arc::new(records);
+    warn_unprojected_graphs(inner.clone(), records.as_ref()).await;
+    let store_accepted = inner.visibility_cache.store_visibility_fill(
+        records.clone(),
+        lifecycle_entries,
+        fill_generation,
+    );
+    span.record("store_accepted", store_accepted);
+    record_elapsed_ms(&span, "elapsed_ms", started);
+    Ok(VisibilityFillResult {
+        records,
+        store_accepted,
+    })
+}
+
+pub(super) async fn list_deleted_iris(
+    inner: &Arc<MetadataInner>,
+    limit: usize,
+) -> Result<(HashSet<String>, usize), MetadataError> {
+    let mut deleted = HashSet::new();
+    let mut start_after = None;
+    let mut pages = 0usize;
+    loop {
+        let event = inner
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Iter {
+                key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+                prefix: None,
+                start: start_after.map(IterStart::After),
+                limit: limit.saturating_add(1),
+                txn_id: None,
+            }))
+            .await;
+        let (values, next_start_after) = match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(MetadataError::Storage(error));
+            }
+            other => {
+                return Err(MetadataError::Backend(format!(
+                    "unexpected metadata graph lifecycle iteration result: {other:?}"
+                )));
+            }
+        };
+        pages += 1;
+        if deleted.len().saturating_add(values.len()) > limit {
+            return Err(MetadataError::Backend(
+                "metadata lifecycle candidate limit exceeded".to_string(),
+            ));
+        }
+        for (_, value) in values {
+            let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&value)
+                .map_err(|error| MetadataError::Backend(error.to_string()))?;
+            if record.is_deleted() {
+                deleted.insert(record.graph_iri);
+            }
+        }
+        match next_start_after {
+            Some(cursor) => start_after = Some(cursor),
+            None => break,
+        }
+    }
+    Ok((deleted, pages))
+}
+
+pub(super) async fn list_read_records(
+    inner: Arc<MetadataInner>,
+    span: &Span,
+) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+    let registry_started = Instant::now();
+    let records = list_local_records(inner).await?;
+    record_elapsed_ms(span, "registry_ms", registry_started);
+    span.record("registry_records", records.len() as u64);
+    Ok(records)
+}
+
+async fn warn_unprojected_graphs(inner: Arc<MetadataInner>, records: &[MetadataRegistryRecord]) {
+    let projected = records
+        .iter()
+        .map(|record| record.graph_iri.clone())
+        .collect::<BTreeSet<_>>();
+    let node = inner.node.clone();
+    let policies = match tokio::task::spawn_blocking(move || {
+        node.graphs()?
+            .into_iter()
+            .map(|graph| {
+                let policy = node.graph_policy(&graph)?;
+                Ok((graph.as_str().to_string(), policy))
+            })
+            .collect::<Result<BTreeMap<_, _>, CraqleError>>()
+    })
+    .await
+    {
+        Ok(Ok(policies)) => policies,
+        Ok(Err(error)) => {
+            warn!(
+                event = "metadata.authorization.graph_scan_failed",
+                error = %error,
+                "Could not audit metadata graphs against the authorization projection"
+            );
+            return;
+        }
+        Err(error) => {
+            warn!(
+                event = "metadata.authorization.graph_scan_failed",
+                error = %error,
+                "Could not audit metadata graphs against the authorization projection"
+            );
+            return;
+        }
+    };
+    let graphs = policies.keys().cloned().collect::<BTreeSet<_>>();
+    let missing = graphs.difference(&projected).cloned().collect::<Vec<_>>();
+    if !missing.is_empty() {
+        warn!(
+            event = "metadata.authorization.projection_missing",
+            count = missing.len() as u64,
+            sample_graph_iris = ?missing.iter().take(8).collect::<Vec<_>>(),
+            "excluding metadata graphs missing from the authorization projection"
+        );
+    }
+    let unmaterialized = projected.difference(&graphs).cloned().collect::<Vec<_>>();
+    if !unmaterialized.is_empty() {
+        warn!(
+            event = "metadata.authorization.graph_missing",
+            count = unmaterialized.len() as u64,
+            sample_graph_iris = ?unmaterialized.iter().take(8).collect::<Vec<_>>(),
+            "metadata authorization projection references graphs missing from Craqle"
+        );
+    }
+    let stale = records
+        .iter()
+        .filter(|record| {
+            policies.get(&record.graph_iri).is_some_and(|policy| {
+                policy.public != record.public
+                    || policy.permission_paths != [record.permission_path.clone()]
+            })
+        })
+        .map(|record| record.graph_iri.as_str())
+        .collect::<Vec<_>>();
+    if !stale.is_empty() {
+        warn!(
+            event = "metadata.authorization.projection_stale",
+            count = stale.len() as u64,
+            sample_graph_iris = ?stale.iter().take(8).collect::<Vec<_>>(),
+            "metadata authorization projection disagrees with Craqle graph policy"
+        );
+    }
+}

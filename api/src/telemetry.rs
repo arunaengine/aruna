@@ -24,11 +24,11 @@ static HTTP_LATENCY: LazyLock<LatencyAggregator> = LazyLock::new(|| LatencyAggre
 fn slow_request_threshold() -> Duration {
     static THRESHOLD: OnceLock<Duration> = OnceLock::new();
     *THRESHOLD.get_or_init(|| {
-        parse_slow_request_threshold(std::env::var(SLOW_REQUEST_THRESHOLD_ENV).ok().as_deref())
+        parse_slow_threshold(std::env::var(SLOW_REQUEST_THRESHOLD_ENV).ok().as_deref())
     })
 }
 
-fn parse_slow_request_threshold(value: Option<&str>) -> Duration {
+fn parse_slow_threshold(value: Option<&str>) -> Duration {
     Duration::from_millis(
         value
             .and_then(|raw| raw.trim().parse::<u64>().ok())
@@ -275,36 +275,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slow_request_threshold_defaults_to_500ms() {
+    fn slow_threshold_defaults() {
+        assert_eq!(parse_slow_threshold(None), Duration::from_millis(500));
         assert_eq!(
-            parse_slow_request_threshold(None),
+            parse_slow_threshold(Some("garbage")),
             Duration::from_millis(500)
         );
-        assert_eq!(
-            parse_slow_request_threshold(Some("garbage")),
-            Duration::from_millis(500)
-        );
-        assert_eq!(
-            parse_slow_request_threshold(Some("")),
-            Duration::from_millis(500)
-        );
+        assert_eq!(parse_slow_threshold(Some("")), Duration::from_millis(500));
     }
 
     #[test]
-    fn slow_request_threshold_parses_override() {
+    fn slow_threshold_override() {
         assert_eq!(
-            parse_slow_request_threshold(Some("250")),
+            parse_slow_threshold(Some("250")),
             Duration::from_millis(250)
         );
         assert_eq!(
-            parse_slow_request_threshold(Some(" 1000 ")),
+            parse_slow_threshold(Some(" 1000 ")),
             Duration::from_millis(1000)
         );
     }
 
     #[test]
-    fn slow_request_gating_is_inclusive_at_threshold() {
-        let threshold = parse_slow_request_threshold(Some("500"));
+    fn slow_threshold_inclusive() {
+        let threshold = parse_slow_threshold(Some("500"));
         assert!(!is_slow_request(Duration::from_millis(499), threshold));
         assert!(is_slow_request(Duration::from_millis(500), threshold));
         assert!(is_slow_request(Duration::from_millis(750), threshold));

@@ -1,0 +1,1828 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+use aruna_core::effects::{IterStart, StorageEffect};
+use aruna_core::errors::{AuthorizationError, ConversionError};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::id::short_display_id;
+use aruna_core::keyspaces::{
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+    METADATA_PENDING_PROJECTION_KEYSPACE,
+};
+use aruna_core::metadata::{
+    MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataError,
+    MetadataGraphLifecycleRecord, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
+};
+use aruna_core::storage_entries::{
+    document_lifecycle_key, event_log_key, graph_lifecycle_key, pending_projection_target,
+};
+use aruna_core::structs::{
+    ARUNA_DATA_PREFIX, AuthContext, BlobHeadKey, BlobVersion, BlobVersionState,
+    CurrentVersionPointer, MetadataRegistryRecord, PathClaimRecord, Permission, PlacementRef,
+    RealmConfigDocument, RealmId, VersionKey, W3idDataIdentifier, bucket_permission_path,
+    object_permission_path,
+};
+use aruna_core::telemetry::record_elapsed_ms;
+use aruna_core::types::{GroupId, Key, TxnId, Value};
+use aruna_core::{MetaResourceId, NodeId, StructuredId};
+use aruna_storage::StorageHandle;
+use futures_util::StreamExt;
+use futures_util::future::{BoxFuture, FutureExt};
+use futures_util::stream;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracing::{Instrument, Span, debug_span, field, warn};
+use ulid::Ulid;
+
+pub use self::distributed::{aggregate_query_results, query_form, query_select_limit};
+use self::distributed::{object_search_fingerprint, record_object_result, record_preflight_node};
+use self::export::export_summary_jsonld;
+pub use self::export::{export_metadata_rocrate, get_visible_document};
+pub use self::fanout::forwarded_bearer;
+pub(crate) use self::fanout::pattern_contains_service;
+pub use self::fanout::search_buckets_distributed;
+use self::fanout::{
+    MetadataFanoutOperation, MetadataNodeCall, fanout_bearer, metadata_node_call, query_union_safe,
+    run_metadata_fanout,
+};
+pub(crate) use self::path::local_path_candidates;
+pub use self::path::{deduplicate_fanout_nodes, replica_query_nodes};
+use self::path::{
+    forward_path_resolution, load_path_holder, merge_path_views, reduce_path_candidates,
+    select_fanout_nodes, select_path_holders, validate_path_candidate,
+};
+pub(crate) use self::preflight::{discover_realm_nodes, references_preflight_local};
+pub use self::preflight::{load_realm_config, load_realm_nodes};
+use self::preflight::{
+    preflight_fingerprint, reference_document_title, resolve_graph_reference,
+    resolve_preflight_targets,
+};
+pub(crate) use self::read::{
+    can_read_record, ensure_record_readable, filter_live_records, load_live_record,
+    metadata_read_request,
+};
+use self::read::{
+    check_policy_limit, effective_list_limit, ensure_record_materialized, load_group_records,
+    load_pending_records, merge_pending_records, record_matches_filters,
+};
+pub use self::read::{
+    query_metadata, query_metadata_document, references_metadata, search_metadata,
+};
+use super::MetadataAuthToken;
+use super::forward::{AuthFailure, ReadDecision, reduce_holder_reads};
+use super::handle::{
+    METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS,
+    METADATA_REGISTRY_CANDIDATE_LIMIT,
+};
+use super::protocol::{
+    MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner, MetadataReadError,
+    MetadataTransportMessage,
+};
+use super::search_cursor::{
+    CursorEnvelopeError, METADATA_SEARCH_MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor,
+    SearchCursorError, SearchPageCursor, SearchWatermark, SignedCursor, merge_search_hits,
+    paginate, query_fingerprint, resume_fetch_limit,
+};
+use super::summary_cache::summary_cache;
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::permission_rules::GroupPermissionRules;
+use crate::blob::permission_paths::ResolveBlobPermissionPathsOperation;
+use crate::driver::{DriverContext, drive};
+use crate::groups::list_groups::ListGroupOperation;
+use crate::metadata::get_document::{load_document_record, record_materialized_read};
+use crate::metadata::repository::{
+    LIST_METADATA_PAGE_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
+    parse_registry_read, read_document_registry,
+};
+use crate::placement::selector::{
+    ROLE_NODE, neg_log2_q48, peer_rank, select_top_peers, selector_hash,
+};
+use crate::placement::{
+    holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
+    registry_strategy, resolve_holders_limit, resolve_shard_holders,
+};
+use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::get_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
+use crate::s3::search_objects::{
+    ObjectInventoryHit, ObjectKeyMatch, ObjectSearchNodePage, SearchObjectsInput,
+    search_local_objects,
+};
+
+mod distributed;
+mod export;
+mod fanout;
+mod path;
+mod preflight;
+mod read;
+
+const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
+const MAX_LIST_METADATA_LIMIT: usize = 1_000;
+/// Bounds the response payload and the number of RO-Crate summary exports an
+/// unauthenticated caller can force per request. The realm-wide registry scan
+/// is removed by the cached list path, not by this clamp.
+const ANONYMOUS_LIST_METADATA_LIMIT: usize = 100;
+/// Splits a targeted lookup from a browse page: the portal pages at 48, a
+/// run-crate or preview lookup at 1, and only a browse page pays the estimate.
+const METADATA_ESTIMATE_MIN_LIMIT: usize = 24;
+// Bounded so a single summary page cannot saturate the craqle read permits.
+const METADATA_SUMMARY_FANOUT_LIMIT: usize = 8;
+const METADATA_REFERENCES_DEFAULT_LIMIT: usize = 25;
+const METADATA_REFERENCES_MAX_LIMIT: usize = 100;
+const METADATA_PREFLIGHT_MAX_TARGET_VERSIONS: usize = 128;
+const METADATA_PREFLIGHT_SCAN_PAGE_SIZE: usize = 128;
+const METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT: usize = 8;
+const METADATA_DISTRIBUTED_QUERY_MAX_NODES: usize = 32;
+const METADATA_DISTRIBUTED_QUERY_DEADLINE: Duration = Duration::from_secs(12);
+const OBJECT_SEARCH_CURSOR_VERSION: u8 = 1;
+const OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT: &[u8] = b"aruna.object.search.cursor.v1";
+const OBJECT_SEARCH_CURSOR_MAX_BYTES: usize = 64 * 1024;
+const OBJECT_SEARCH_CURSOR_MAX_KEY_BYTES: usize = 2 * 1024;
+#[derive(Debug, Error)]
+pub enum MetadataApiError {
+    #[error("bad request")]
+    BadRequest,
+    #[error("unauthorized")]
+    Unauthorized,
+    #[error("forbidden")]
+    Forbidden,
+    #[error("not found")]
+    NotFound,
+    #[error("service unavailable")]
+    ServiceUnavailable,
+    /// The bucket has no usable activation, so the request cannot be routed.
+    /// Never absence: no holder was resolved to answer it.
+    #[error("placement unavailable: {0}")]
+    PlacementUnavailable(crate::placement::PlacementResolveError),
+    #[error("{0}")]
+    InvalidCursor(String),
+    #[error("{0}")]
+    Internal(String),
+}
+
+/// Order the visible metadata listing is paginated in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataListOrder {
+    /// Ascending document id, which is creation order for ULID ids.
+    #[default]
+    Created,
+    /// Descending `updated_at_ms`, tie-broken by descending document id.
+    Recent,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListVisibleMetadataDocumentsRequest {
+    pub group_id: Option<GroupId>,
+    pub path_prefix: Option<String>,
+    pub include_summary: bool,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub order: MetadataListOrder,
+    pub auth: Option<AuthContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedMetadataDocument {
+    pub record: MetadataRegistryRecord,
+    pub rocrate_summary_jsonld: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListVisibleMetadataDocumentsResult {
+    pub documents: Vec<ListedMetadataDocument>,
+    pub limit: usize,
+    pub offset: usize,
+    pub total_returned: usize,
+    /// Approximate number of matching documents across all pages; group-granular,
+    /// so it may over- or under-count glob read rules. `None` when not computed
+    /// for a request too small to be a browse page.
+    pub total_estimate: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataPathLookupRequest {
+    pub group_id: GroupId,
+    pub document_path: String,
+    pub auth: Option<AuthContext>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataPathLookupResult {
+    pub winner: MetadataPathWinner,
+    pub conflicts: Vec<Ulid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GetVisibleMetadataDocumentRequest {
+    pub document_id: Ulid,
+    pub auth: Option<AuthContext>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataRoCrateExportView {
+    Full,
+    Summary,
+    Page,
+    Raw,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportMetadataRoCrateRequest {
+    pub document_id: Ulid,
+    pub auth: Option<AuthContext>,
+    pub view: MetadataRoCrateExportView,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ExportMetadataRoCrateResult {
+    Full {
+        record: MetadataRegistryRecord,
+        jsonld: String,
+    },
+    Summary {
+        record: MetadataRegistryRecord,
+        jsonld: String,
+    },
+    Page {
+        record: MetadataRegistryRecord,
+        page: MetadataRoCratePage,
+    },
+    Raw {
+        record: MetadataRegistryRecord,
+        raw: crate::metadata::raw_revision::MetadataRawView,
+        dataset_digest: Option<[u8; 32]>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataApiQueryMode {
+    Local,
+    Distributed,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataDocumentQueryRequest {
+    pub document_id: Ulid,
+    pub auth: Option<AuthContext>,
+    pub bearer_token: Option<String>,
+    pub query: String,
+    pub mode: Option<MetadataApiQueryMode>,
+    pub allow_partial: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataQueryRequest {
+    pub auth: Option<AuthContext>,
+    pub bearer_token: Option<String>,
+    pub graph_iris: Option<Vec<String>>,
+    pub query: String,
+    pub mode: Option<MetadataApiQueryMode>,
+    pub target_nodes: Option<Vec<NodeId>>,
+    pub allow_partial: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataSearchRequest {
+    pub auth: Option<AuthContext>,
+    pub bearer_token: Option<String>,
+    pub graph_iris: Option<Vec<String>>,
+    pub query: String,
+    pub conforms_to: Option<String>,
+    pub group_id: Option<GroupId>,
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+    pub mode: Option<MetadataApiQueryMode>,
+    pub target_nodes: Option<Vec<NodeId>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataQueryExecution {
+    pub results: MetadataQueryResults,
+    pub fanout_stats: MetadataFanoutStats,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataSearchExecution {
+    pub hits: Vec<MetadataSearchHit>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+    pub fanout_stats: MetadataFanoutStats,
+}
+
+#[derive(Debug, Clone)]
+pub struct BucketSearchRequest {
+    pub auth: AuthContext,
+    pub bearer_token: Option<String>,
+    pub query: String,
+    pub limit: usize,
+    pub target_nodes: Option<Vec<NodeId>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BucketSearchExecution {
+    pub hits: Vec<BucketSearchHit>,
+    pub fanout_stats: MetadataFanoutStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectSearchQueryMode {
+    Local,
+    DistributedBestEffort,
+    DistributedStrict,
+}
+
+impl ObjectSearchQueryMode {
+    fn fanout_mode(self) -> MetadataApiQueryMode {
+        match self {
+            Self::Local => MetadataApiQueryMode::Local,
+            Self::DistributedBestEffort | Self::DistributedStrict => {
+                MetadataApiQueryMode::Distributed
+            }
+        }
+    }
+
+    fn allow_partial(self) -> bool {
+        !matches!(self, Self::DistributedStrict)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectSearchRequest {
+    pub auth: AuthContext,
+    pub bearer_token: Option<String>,
+    pub query: String,
+    pub key_match: ObjectKeyMatch,
+    pub bucket: Option<String>,
+    pub limit: usize,
+    pub cursor: Option<String>,
+    pub mode: ObjectSearchQueryMode,
+    pub target_nodes: Option<Vec<NodeId>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectSearchPartitionCoverage {
+    pub node_id: NodeId,
+    pub observed_at: SystemTime,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectSearchExecution {
+    pub hits: Vec<ObjectInventoryHit>,
+    pub next_cursor: Option<String>,
+    pub as_of: SystemTime,
+    pub partitions: Vec<ObjectSearchPartitionCoverage>,
+    pub fanout_stats: MetadataFanoutStats,
+    pub omitted_partitions: usize,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectSearchPartitionState {
+    node_id: NodeId,
+    start_after: Option<Vec<u8>>,
+    exhausted: bool,
+    observed_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ObjectSearchCursorPartition {
+    node_id: [u8; 32],
+    start_after: Option<Vec<u8>>,
+    exhausted: bool,
+    observed_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ObjectSearchCursorPayload {
+    as_of: SystemTime,
+    partitions: Vec<ObjectSearchCursorPartition>,
+    failed_partitions: Vec<[u8; 32]>,
+    discovery_failed: bool,
+    omitted_partitions: usize,
+}
+
+type ObjectSearchCursor = SignedCursor<ObjectSearchCursorPayload>;
+
+impl SignedCursor<ObjectSearchCursorPayload> {
+    fn decode(
+        raw: &str,
+        fingerprint: [u8; 32],
+        authorized_signers: &[NodeId],
+    ) -> Result<Self, MetadataApiError> {
+        if raw.len() > OBJECT_SEARCH_CURSOR_MAX_BYTES {
+            return Err(MetadataApiError::InvalidCursor(
+                "invalid object search cursor".to_string(),
+            ));
+        }
+        let cursor = Self::decode_verified(
+            raw,
+            OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT,
+            authorized_signers,
+            |cursor| {
+                if cursor.version != OBJECT_SEARCH_CURSOR_VERSION
+                    || cursor.fingerprint != fingerprint
+                {
+                    Err(CursorEnvelopeError::QueryMismatch)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .map_err(|error| match error {
+            CursorEnvelopeError::Invalid => {
+                MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+            }
+            CursorEnvelopeError::QueryMismatch => MetadataApiError::InvalidCursor(
+                "object search cursor does not match query".to_string(),
+            ),
+        })?;
+        if cursor.payload.partitions.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
+            || cursor.payload.failed_partitions.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
+        {
+            return Err(MetadataApiError::InvalidCursor(
+                "invalid object search cursor".to_string(),
+            ));
+        }
+        let mut nodes = HashSet::new();
+        for partition in &cursor.payload.partitions {
+            NodeId::from_bytes(&partition.node_id).map_err(|_| {
+                MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+            })?;
+            if !nodes.insert(partition.node_id)
+                || partition.start_after.as_ref().is_some_and(|key| {
+                    key.len() > OBJECT_SEARCH_CURSOR_MAX_KEY_BYTES
+                        || BlobHeadKey::from_bytes(key).is_err()
+                })
+            {
+                return Err(MetadataApiError::InvalidCursor(
+                    "invalid object search cursor".to_string(),
+                ));
+            }
+        }
+        for node_id in &cursor.payload.failed_partitions {
+            NodeId::from_bytes(node_id).map_err(|_| {
+                MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+            })?;
+            if !nodes.insert(*node_id) {
+                return Err(MetadataApiError::InvalidCursor(
+                    "invalid object search cursor".to_string(),
+                ));
+            }
+        }
+        if !cursor
+            .payload
+            .partitions
+            .iter()
+            .any(|partition| !partition.exhausted)
+        {
+            return Err(MetadataApiError::InvalidCursor(
+                "exhausted object search cursor".to_string(),
+            ));
+        }
+        Ok(cursor)
+    }
+
+    fn partition_states(&self) -> Result<Vec<ObjectSearchPartitionState>, MetadataApiError> {
+        self.payload
+            .partitions
+            .iter()
+            .map(|partition| {
+                Ok(ObjectSearchPartitionState {
+                    node_id: NodeId::from_bytes(&partition.node_id).map_err(|_| {
+                        MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+                    })?,
+                    start_after: partition.start_after.clone(),
+                    exhausted: partition.exhausted,
+                    observed_at: partition.observed_at,
+                })
+            })
+            .collect()
+    }
+
+    fn failed_nodes(&self) -> Result<Vec<NodeId>, MetadataApiError> {
+        self.payload
+            .failed_partitions
+            .iter()
+            .map(|node_id| {
+                NodeId::from_bytes(node_id).map_err(|_| {
+                    MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
+                })
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_signed(
+        fingerprint: [u8; 32],
+        as_of: SystemTime,
+        partitions: &[ObjectSearchPartitionState],
+        failed_partitions: &[NodeId],
+        discovery_failed: bool,
+        omitted_partitions: usize,
+        signer: NodeId,
+        sign: impl FnOnce(&[u8]) -> iroh::Signature,
+    ) -> Result<Self, postcard::Error> {
+        let partitions: Vec<ObjectSearchCursorPartition> = partitions
+            .iter()
+            .map(|partition| ObjectSearchCursorPartition {
+                node_id: *partition.node_id.as_bytes(),
+                start_after: partition.start_after.clone(),
+                exhausted: partition.exhausted,
+                observed_at: partition.observed_at,
+            })
+            .collect();
+        let failed_partitions: Vec<[u8; 32]> = failed_partitions
+            .iter()
+            .map(|node_id| *node_id.as_bytes())
+            .collect();
+        Self::build_signed(
+            OBJECT_SEARCH_CURSOR_VERSION,
+            OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT,
+            fingerprint,
+            ObjectSearchCursorPayload {
+                as_of,
+                partitions,
+                failed_partitions,
+                discovery_failed,
+                omitted_partitions,
+            },
+            signer,
+            sign,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataReferencesRequest {
+    pub auth: Option<AuthContext>,
+    pub iri: String,
+    pub predicate: Option<String>,
+    pub limit: Option<usize>,
+    pub resolve: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataReferenceEntry {
+    pub document_id: String,
+    pub group_id: String,
+    pub document_path: String,
+    pub graph_iri: String,
+    pub predicate: Option<String>,
+    pub subject_iris: Vec<String>,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataReferencesExecution {
+    pub references: Vec<MetadataReferenceEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MetadataReferencePreflightTarget {
+    ContentW3ids {
+        content_w3ids: Vec<String>,
+        remove_all_resolvable_locations: bool,
+    },
+    BucketPrefix {
+        bucket: String,
+        prefix: Option<String>,
+        operation: MetadataPreflightStorageOperation,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataPreflightStorageOperation {
+    #[default]
+    LatestVersionTombstone,
+    AllVersionsPurge,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataReferencePreflightRequest {
+    pub auth: AuthContext,
+    pub bearer_token: Option<String>,
+    pub target: MetadataReferencePreflightTarget,
+    pub s3_endpoint: Option<String>,
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+    pub mode: Option<MetadataApiQueryMode>,
+    pub target_nodes: Option<Vec<NodeId>>,
+    pub allow_partial: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataPreflightLocation {
+    pub node_id: NodeId,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Ulid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataPreflightResolvedTarget {
+    pub content_w3id: String,
+    pub content_hash: [u8; 32],
+    pub queried_iris: Vec<String>,
+    pub targeted_versions: Vec<MetadataPreflightLocation>,
+    pub removed_locations: Vec<MetadataPreflightLocation>,
+    pub remove_all_resolvable_locations: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataReferencePreflightNodeRequest {
+    pub targets: Vec<MetadataPreflightResolvedTarget>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataPreflightVisibleReference {
+    pub content_w3id: String,
+    pub document_id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataPreflightIndexState {
+    Current,
+    Pending,
+    Failed,
+    Mixed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataPreflightNodeFreshness {
+    pub node_id: NodeId,
+    pub index_state: MetadataPreflightIndexState,
+    pub oldest_status_updated_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataReferencePreflightNodeTarget {
+    pub content_w3id: String,
+    pub hidden_references_exist: bool,
+    pub resolvable_location_found: bool,
+    pub resolvable_location_after_operation: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataReferencePreflightNodeExecution {
+    pub visible_references: Vec<MetadataPreflightVisibleReference>,
+    pub targets: Vec<MetadataReferencePreflightNodeTarget>,
+    pub freshness: MetadataPreflightNodeFreshness,
+    pub path_style_endpoint_available: bool,
+    pub saturated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataReferencePreflightTargetExecution {
+    pub content_w3id: String,
+    pub targeted_versions: Vec<MetadataPreflightLocation>,
+    pub visible_references: Vec<MetadataPreflightVisibleReference>,
+    pub hidden_references_exist: bool,
+    pub would_remove_last_resolvable_aruna_location: bool,
+    pub location_impact_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataPreflightExcludedForm {
+    pub form: &'static str,
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataReferencePreflightCoverage {
+    pub queried_scope: &'static str,
+    pub queried_forms: Vec<&'static str>,
+    pub excluded_forms: Vec<MetadataPreflightExcludedForm>,
+    pub node_freshness: Vec<MetadataPreflightNodeFreshness>,
+    pub target_resolution_complete: bool,
+    pub path_style_endpoint_coverage_complete: bool,
+    pub realm_coverage_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataReferencePreflightExecution {
+    pub targets: Vec<MetadataReferencePreflightTargetExecution>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+    pub nodes_queried: usize,
+    pub nodes_failed: usize,
+    pub complete: bool,
+    pub failed_partitions: Vec<NodeId>,
+    pub coverage: MetadataReferencePreflightCoverage,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetadataFanoutStats {
+    pub nodes_queried: usize,
+    pub nodes_failed: usize,
+    pub failed_partitions: Vec<NodeId>,
+    pub discovery_failed: bool,
+}
+
+#[derive(Debug)]
+struct PathHolderSelection {
+    node_id: NodeId,
+    shards: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MetadataRealmNodeDiscovery {
+    pub(crate) nodes: Vec<NodeId>,
+    pub(crate) failed: bool,
+}
+
+#[derive(Debug)]
+struct MetadataFanoutScope {
+    mode: Option<MetadataApiQueryMode>,
+    target_nodes: Option<Vec<NodeId>>,
+    allow_partial: bool,
+    discovery_failed: bool,
+    subject: Option<[u8; 32]>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl MetadataFanoutScope {
+    fn new(
+        mode: Option<MetadataApiQueryMode>,
+        target_nodes: Option<Vec<NodeId>>,
+        allow_partial: bool,
+    ) -> Self {
+        Self {
+            mode,
+            target_nodes,
+            allow_partial,
+            discovery_failed: false,
+            subject: None,
+            deadline: None,
+        }
+    }
+
+    fn with_discovery_failed(mut self, discovery_failed: bool) -> Self {
+        self.discovery_failed = discovery_failed;
+        self
+    }
+
+    fn with_subject(mut self, subject: [u8; 32]) -> Self {
+        self.subject = Some(subject);
+        self
+    }
+
+    fn with_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataQueryForm {
+    Select,
+    Ask,
+}
+
+pub async fn list_visible_documents(
+    context: &DriverContext,
+    realm_id: RealmId,
+    request: ListVisibleMetadataDocumentsRequest,
+) -> Result<ListVisibleMetadataDocumentsResult, MetadataApiError> {
+    let limit = effective_list_limit(request.limit, request.auth.is_none());
+    let offset = request.offset.unwrap_or(0);
+
+    let group_ids = check_policy_limit(match request.group_id {
+        Some(group_id) => vec![group_id],
+        None => drive(
+            ListGroupOperation::with_pagination(METADATA_REGISTRY_CANDIDATE_LIMIT + 1, 0),
+            context,
+        )
+        .await
+        .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+        .into_iter()
+        .map(|group| group.group_id)
+        .collect(),
+    })?;
+    // Summary listings and recency listings must show documents whose projection has not landed
+    // yet; the pending keyspace is scanned once per request, never once per group.
+    let recent = request.order == MetadataListOrder::Recent;
+    let mut pending = if request.include_summary || recent {
+        load_pending_records(context, request.group_id, METADATA_REGISTRY_CANDIDATE_LIMIT).await?
+    } else {
+        HashMap::new()
+    };
+
+    let mut records = Vec::new();
+    for group_id in group_ids {
+        let remaining = METADATA_REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());
+        let mut group_records = load_group_records(context, group_id, remaining).await?;
+        if let Some(pending_records) = pending.remove(&group_id) {
+            merge_pending_records(&mut group_records, pending_records);
+            if group_records.len() > remaining {
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            group_records.sort_by_key(|record| record.document_id);
+        }
+        records.extend(group_records);
+    }
+    // Ordering precedes both the estimate scan and the offset window so that
+    // pagination and the early exit page the same sequence.
+    if recent {
+        records.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| right.document_id.cmp(&left.document_id))
+        });
+    }
+
+    // One rule collection per group keeps every later visibility check in memory.
+    let auth = request
+        .auth
+        .as_ref()
+        .filter(|auth| auth.realm_id == realm_id);
+    let permissions = GroupPermissionRules::collect(
+        context,
+        auth,
+        records
+            .iter()
+            .filter(|record| record.realm_id == realm_id)
+            .map(|record| record.group_id),
+    )
+    .await;
+    // RBAC/public visibility is additionally constrained by the metadata.read
+    // request policies, loaded once per distinct group (fail-closed on error).
+    let evaluators = crate::auth::request_policy::PolicyEvaluator::load_bulk(
+        context,
+        records
+            .iter()
+            .filter(|record| record.realm_id == realm_id)
+            .map(|record| (record.realm_id, record.group_id)),
+    )
+    .await
+    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let policy_auth = request.auth.as_ref();
+    let record_visible = |record: &MetadataRegistryRecord| {
+        permissions.record_visible(record)
+            && evaluators
+                .get(&(record.realm_id, record.group_id))
+                .is_some_and(|evaluator| {
+                    evaluator
+                        .evaluate(&metadata_read_request(&record.permission_path, policy_auth))
+                        .is_ok()
+                })
+    };
+
+    let mut total_estimate = None;
+    if limit >= METADATA_ESTIMATE_MIN_LIMIT {
+        let matching = records
+            .iter()
+            .filter(|record| record_matches_filters(record, request.path_prefix.as_deref()))
+            .filter(|record| record_visible(record))
+            .count();
+        total_estimate = Some(matching);
+    }
+
+    let needed = offset.saturating_add(limit);
+    let mut selected = Vec::with_capacity(limit.min(records.len()));
+    let mut visible_count = 0usize;
+    for record in records {
+        if !record_matches_filters(&record, request.path_prefix.as_deref()) {
+            continue;
+        }
+        if !record_visible(&record) {
+            continue;
+        }
+        visible_count += 1;
+        if visible_count > offset {
+            selected.push(record);
+            if visible_count >= needed {
+                break;
+            }
+        }
+    }
+
+    let mut documents = Vec::with_capacity(selected.len());
+    if request.include_summary {
+        let exports = selected
+            .iter()
+            .map(|record| async move {
+                // A pending graph cannot export content from before its accepted event.
+                ensure_record_materialized(context, record).await?;
+                export_summary_jsonld(context, &record.graph_iri, record.last_event_id).await
+            })
+            .collect::<Vec<_>>();
+        let summaries = stream::iter(exports)
+            .buffered(METADATA_SUMMARY_FANOUT_LIMIT)
+            .collect::<Vec<_>>()
+            .await;
+        for (record, summary) in selected.into_iter().zip(summaries) {
+            let rocrate_summary_jsonld = match summary {
+                Ok(summary) => Some(summary),
+                Err(MetadataApiError::ServiceUnavailable) => None,
+                Err(error) => return Err(error),
+            };
+            documents.push(ListedMetadataDocument {
+                record,
+                rocrate_summary_jsonld,
+            });
+        }
+    } else {
+        documents.extend(selected.into_iter().map(|record| ListedMetadataDocument {
+            record,
+            rocrate_summary_jsonld: None,
+        }));
+    }
+
+    let total_returned = documents.len();
+    Ok(ListVisibleMetadataDocumentsResult {
+        documents,
+        limit,
+        offset,
+        total_returned,
+        // Never report fewer than the page already discloses.
+        total_estimate: total_estimate.map(|estimate| estimate.max(total_returned)),
+    })
+}
+
+pub async fn lookup_metadata_path(
+    context: &DriverContext,
+    realm_id: RealmId,
+    request: MetadataPathLookupRequest,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<MetadataPathLookupResult, MetadataApiError> {
+    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let normalized = MetadataRegistryRecord::normalize_document_path(&request.document_path);
+    if normalized.is_empty() {
+        return Err(MetadataApiError::BadRequest);
+    }
+    if context.net_handle.is_none() {
+        return resolve_local_path(context, realm_id, request).await;
+    }
+    let config = tokio::time::timeout_at(deadline, load_realm_config(context, realm_id))
+        .await
+        .ok()
+        .flatten()
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let local_node = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let trusted_origin = config
+        .nodes
+        .iter()
+        .any(|node| node.node_id == local_node.to_string() && node.kind.is_sync_eligible());
+    if !trusted_origin {
+        let config_digest = config
+            .digest()
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+        return forward_path_resolution(
+            context,
+            realm_id,
+            &config,
+            request,
+            auth_token,
+            config_digest,
+            deadline,
+        )
+        .await;
+    }
+    let strategy = registry_strategy(&config).ok_or(MetadataApiError::ServiceUnavailable)?;
+    if strategy.shard_count == 0 {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let shard_count = strategy.shard_count;
+    let auth_token = auth_token.or_else(|| request.auth.clone().map(MetadataAuthToken::internal));
+    let group_id = request.group_id;
+    let auth = request.auth.as_ref();
+    let (holders, replica_counts) = select_path_holders(
+        &config,
+        realm_id,
+        group_id,
+        &normalized,
+        strategy.strategy_id,
+        shard_count,
+        strategy.replica_count,
+        local_node,
+        deadline,
+    )?;
+    let requests = stream::iter(holders.into_iter().map(|selection| {
+        let holder = selection.node_id;
+        let shards = selection.shards;
+        let auth_token = auth_token.clone();
+        let normalized = normalized.clone();
+        async move {
+            let result = if holder == local_node {
+                match tokio::time::timeout_at(
+                    deadline,
+                    local_path_candidates(context, realm_id, group_id, &normalized, auth),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(MetadataApiError::ServiceUnavailable),
+                }
+            } else {
+                load_path_holder(
+                    context,
+                    group_id,
+                    &normalized,
+                    holder,
+                    auth_token,
+                    config_digest,
+                    deadline,
+                )
+                .await
+            };
+            (holder, shards, result)
+        }
+    }))
+    .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT)
+    .collect::<Vec<_>>();
+    let responses = tokio::time::timeout_at(deadline, requests)
+        .await
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let mut views = Vec::new();
+    let mut auth_error = None;
+    let mut failed = false;
+    let mut only_auth = true;
+    let mut candidate_count = 0usize;
+    for (_holder, shards, response) in responses {
+        match response {
+            Ok(returned) => {
+                candidate_count = candidate_count.saturating_add(returned.len());
+                if candidate_count > METADATA_REGISTRY_CANDIDATE_LIMIT {
+                    return Err(MetadataApiError::ServiceUnavailable);
+                }
+                only_auth = false;
+                let mut partitions = shards.iter().map(|_| Vec::new()).collect::<Vec<_>>();
+                for candidate in returned {
+                    let placement = validate_path_candidate(
+                        &config,
+                        realm_id,
+                        group_id,
+                        &normalized,
+                        &candidate,
+                    )?;
+                    let index = shards
+                        .binary_search(&placement.shard)
+                        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+                    partitions[index].push(candidate);
+                }
+                views.extend(
+                    shards
+                        .into_iter()
+                        .zip(partitions)
+                        .map(|(shard, candidates)| PathShardView { shard, candidates }),
+                );
+            }
+            Err(error @ (MetadataApiError::Unauthorized | MetadataApiError::Forbidden)) => {
+                failed = true;
+                auth_error.get_or_insert(error);
+            }
+            Err(_) => {
+                failed = true;
+                only_auth = false;
+            }
+        }
+    }
+    if failed {
+        if only_auth && let Some(error) = auth_error {
+            return Err(error);
+        }
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let candidates = merge_path_views(&replica_counts, views)?;
+    reduce_path_candidates(candidates)
+}
+
+pub(crate) async fn resolve_local_path(
+    context: &DriverContext,
+    realm_id: RealmId,
+    request: MetadataPathLookupRequest,
+) -> Result<MetadataPathLookupResult, MetadataApiError> {
+    let normalized = MetadataRegistryRecord::normalize_document_path(&request.document_path);
+    if normalized.is_empty() {
+        return Err(MetadataApiError::BadRequest);
+    }
+    let candidates = local_path_candidates(
+        context,
+        realm_id,
+        request.group_id,
+        &normalized,
+        request.auth.as_ref(),
+    )
+    .await?;
+    reduce_path_candidates(candidates)
+}
+
+struct PathShardView {
+    shard: u32,
+    candidates: Vec<MetadataPathCandidate>,
+}
+
+struct ResolvedPreflightTargets {
+    targets: Vec<MetadataPreflightResolvedTarget>,
+    complete: bool,
+}
+
+pub async fn references_preflight(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    request: MetadataReferencePreflightRequest,
+) -> Result<MetadataReferencePreflightExecution, MetadataApiError> {
+    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let MetadataReferencePreflightRequest {
+        auth,
+        bearer_token,
+        target,
+        s3_endpoint,
+        limit,
+        cursor,
+        mode,
+        mut target_nodes,
+        allow_partial,
+    } = request;
+    if auth.realm_id != realm_id {
+        return Err(MetadataApiError::Forbidden);
+    }
+    let page_size = limit
+        .unwrap_or(METADATA_REFERENCES_DEFAULT_LIMIT)
+        .clamp(1, METADATA_REFERENCES_MAX_LIMIT);
+    let resolved = resolve_preflight_targets(
+        context,
+        realm_id,
+        local_node_id,
+        &auth,
+        target,
+        s3_endpoint.as_deref(),
+    )
+    .await?;
+    let fingerprint = preflight_fingerprint(&resolved.targets, mode);
+    let mut cursor_discovery = None;
+    let (watermark, resume) = match cursor.as_deref() {
+        Some(raw) => {
+            let signer_nodes = match mode.unwrap_or(MetadataApiQueryMode::Distributed) {
+                MetadataApiQueryMode::Local => vec![local_node_id],
+                MetadataApiQueryMode::Distributed => match target_nodes.as_ref() {
+                    Some(nodes) => {
+                        let mut signers = nodes.clone();
+                        signers.push(local_node_id);
+                        signers
+                    }
+                    None => {
+                        let discovery = tokio::time::timeout_at(
+                            deadline,
+                            discover_realm_nodes(context, realm_id, local_node_id),
+                        )
+                        .await
+                        .unwrap_or(MetadataRealmNodeDiscovery {
+                            nodes: vec![local_node_id],
+                            failed: true,
+                        });
+                        let mut signers = discovery.nodes.clone();
+                        signers.push(local_node_id);
+                        let nodes =
+                            select_fanout_nodes(&discovery.nodes, local_node_id, &fingerprint);
+                        let mut discovery = discovery;
+                        discovery.nodes = nodes;
+                        cursor_discovery = Some(discovery);
+                        signers
+                    }
+                },
+            };
+            let cursor = SearchCursor::decode(raw, &signer_nodes)
+                .map_err(|error| MetadataApiError::InvalidCursor(error.to_string()))?;
+            if cursor.fingerprint != fingerprint {
+                return Err(MetadataApiError::InvalidCursor(
+                    SearchCursorError::QueryMismatch.to_string(),
+                ));
+            }
+            (
+                Some(cursor.payload.watermark.clone()),
+                cursor.resume_positions(),
+            )
+        }
+        None => (None, HashMap::new()),
+    };
+    let discovery_failed = if cursor.is_some() {
+        let mut nodes = match target_nodes.as_ref() {
+            Some(nodes) => select_fanout_nodes(nodes, local_node_id, &fingerprint),
+            None => match mode.unwrap_or(MetadataApiQueryMode::Distributed) {
+                MetadataApiQueryMode::Local => vec![local_node_id],
+                MetadataApiQueryMode::Distributed => cursor_discovery
+                    .as_ref()
+                    .map(|discovery| discovery.nodes.clone())
+                    .unwrap_or_else(|| vec![local_node_id]),
+            },
+        };
+        for node_id in resume.keys() {
+            if !nodes.contains(node_id) {
+                nodes.push(*node_id);
+            }
+        }
+        target_nodes = Some(deduplicate_fanout_nodes(nodes));
+        cursor_discovery
+            .as_ref()
+            .is_some_and(|discovery| discovery.failed)
+    } else {
+        false
+    };
+
+    let resume = Arc::new(resume);
+    let remote_auth = forwarded_bearer(bearer_token.as_deref())?
+        .or_else(|| Some(MetadataAuthToken::internal(auth.clone())));
+    let handle = context
+        .metadata_handle
+        .clone()
+        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
+    let local_call: MetadataNodeCall<MetadataReferencePreflightNodeExecution> = metadata_node_call(
+        (
+            context.clone(),
+            realm_id,
+            auth.clone(),
+            resolved.targets.clone(),
+            s3_endpoint.clone(),
+            resume.clone(),
+            page_size,
+        ),
+        |(context, realm_id, auth, targets, endpoint, resume, page_size), node_id| async move {
+            let limit = resume_fetch_limit(
+                &resume,
+                node_id,
+                page_size,
+                METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+            );
+            references_preflight_local(
+                &context,
+                realm_id,
+                node_id,
+                Some(auth),
+                MetadataReferencePreflightNodeRequest { targets, limit },
+                endpoint,
+            )
+            .await
+            .map_err(super::forward::read_error)
+        },
+    );
+    let remote_call: MetadataNodeCall<MetadataReferencePreflightNodeExecution> = metadata_node_call(
+        (
+            handle,
+            remote_auth,
+            resolved.targets.clone(),
+            resume.clone(),
+            page_size,
+        ),
+        |(handle, auth_token, targets, resume, page_size), node_id| async move {
+            let limit = resume_fetch_limit(
+                &resume,
+                node_id,
+                page_size,
+                METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+            );
+            handle
+                .request_remote_preflight(
+                    node_id,
+                    auth_token,
+                    MetadataReferencePreflightNodeRequest { targets, limit },
+                )
+                .await
+        },
+    );
+    let (node_parts, fanout_stats) = run_metadata_fanout(
+        context,
+        realm_id,
+        local_node_id,
+        MetadataFanoutScope::new(mode, target_nodes, allow_partial)
+            .with_subject(fingerprint)
+            .with_discovery_failed(discovery_failed)
+            .with_deadline(deadline),
+        MetadataFanoutOperation::ReferencePreflight,
+        local_call,
+        remote_call,
+        record_preflight_node,
+        map_read_error,
+    )
+    .await?;
+
+    let mut node_results = Vec::new();
+    let mut node_freshness = Vec::new();
+    let mut hidden = BTreeSet::new();
+    let mut locations = BTreeMap::<String, (bool, bool)>::new();
+    let mut path_style_endpoint_coverage_complete = true;
+    for (node_id, part) in node_parts {
+        node_freshness.push(part.freshness.clone());
+        path_style_endpoint_coverage_complete &= part.path_style_endpoint_available;
+        for target in part.targets {
+            if target.hidden_references_exist {
+                hidden.insert(target.content_w3id.clone());
+            }
+            let entry = locations.entry(target.content_w3id).or_default();
+            entry.0 |= target.resolvable_location_found;
+            entry.1 |= target.resolvable_location_after_operation;
+        }
+        let hits = part
+            .visible_references
+            .into_iter()
+            .map(|reference| MetadataSearchHit {
+                document_id: reference.document_id.clone(),
+                group_id: String::new(),
+                document_path: String::new(),
+                graph_iri: reference.content_w3id,
+                subject_iri: reference.document_id,
+                score: 0.0,
+                title: reference.title,
+                snippet: None,
+                subject_types: Vec::new(),
+            })
+            .collect();
+        node_results.push(NodeSearchResult {
+            node_id,
+            hits,
+            saturated: part.saturated,
+        });
+    }
+    node_freshness.sort_by_key(|freshness| freshness.node_id.to_string());
+    let page = paginate(
+        node_results,
+        watermark,
+        page_size,
+        METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+    );
+    let mut visible_by_target = BTreeMap::<String, Vec<MetadataPreflightVisibleReference>>::new();
+    for hit in page.hits {
+        visible_by_target
+            .entry(hit.graph_iri.clone())
+            .or_default()
+            .push(MetadataPreflightVisibleReference {
+                content_w3id: hit.graph_iri,
+                document_id: hit.document_id,
+                title: hit.title,
+            });
+    }
+    let index_current = node_freshness
+        .iter()
+        .all(|freshness| freshness.index_state == MetadataPreflightIndexState::Current);
+    let complete = fanout_stats.nodes_failed == 0
+        && resolved.complete
+        && index_current
+        && path_style_endpoint_coverage_complete
+        && !page.truncated;
+    if !allow_partial && !complete {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let targets = resolved
+        .targets
+        .into_iter()
+        .map(|target| {
+            let (found, remaining) = locations
+                .remove(&target.content_w3id)
+                .unwrap_or((false, false));
+            let removes_location =
+                target.remove_all_resolvable_locations || !target.removed_locations.is_empty();
+            MetadataReferencePreflightTargetExecution {
+                visible_references: visible_by_target
+                    .remove(&target.content_w3id)
+                    .unwrap_or_default(),
+                hidden_references_exist: hidden.contains(&target.content_w3id),
+                would_remove_last_resolvable_aruna_location: complete
+                    && removes_location
+                    && found
+                    && !remaining,
+                location_impact_complete: complete,
+                content_w3id: target.content_w3id,
+                targeted_versions: target.targeted_versions,
+            }
+        })
+        .collect();
+    let next_cursor = match page.next {
+        Some(next) => {
+            let net = context.net_handle.as_ref().ok_or_else(|| {
+                MetadataApiError::Internal(
+                    "net handle unavailable for preflight cursor signing".to_string(),
+                )
+            })?;
+            Some(
+                SearchCursor::new_signed(
+                    fingerprint,
+                    next.watermark,
+                    next.resume,
+                    net.node_id(),
+                    |bytes| net.sign(bytes),
+                )
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+                .encode()
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?,
+            )
+        }
+        None => None,
+    };
+    let distributed =
+        mode.unwrap_or(MetadataApiQueryMode::Distributed) == MetadataApiQueryMode::Distributed;
+    Ok(MetadataReferencePreflightExecution {
+        targets,
+        next_cursor,
+        truncated: page.truncated,
+        nodes_queried: fanout_stats.nodes_queried,
+        nodes_failed: fanout_stats.nodes_failed,
+        complete,
+        failed_partitions: fanout_stats.failed_partitions,
+        coverage: MetadataReferencePreflightCoverage {
+            queried_scope: if distributed { "realm" } else { "local_node" },
+            queried_forms: vec![
+                "canonical_content_w3id",
+                "legacy_s3_iri",
+                "legacy_path_style_http_iri",
+            ],
+            excluded_forms: vec![
+                MetadataPreflightExcludedForm {
+                    form: "literal_content_url",
+                    reason: "literal objects are not materialized in the NamedNode IRI index",
+                },
+                MetadataPreflightExcludedForm {
+                    form: "imported_relative_identity",
+                    reason: "relative imported identities are outside exact absolute-IRI matching",
+                },
+                MetadataPreflightExcludedForm {
+                    form: "imported_external_identity",
+                    reason: "external identities without an Aruna content mapping are outside coverage",
+                },
+            ],
+            node_freshness,
+            target_resolution_complete: resolved.complete,
+            path_style_endpoint_coverage_complete,
+            realm_coverage_complete: distributed && complete,
+        },
+    })
+}
+
+fn authorized_realm_nodes(
+    config: &RealmConfigDocument,
+    nodes: HashSet<NodeId>,
+) -> Result<HashSet<NodeId>, ConversionError> {
+    let authorized = config
+        .sync_eligible_nodes()?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    Ok(nodes
+        .into_iter()
+        .filter(|node_id| authorized.contains(node_id))
+        .collect())
+}
+fn map_event_error(error: MetadataError) -> MetadataApiError {
+    match error {
+        MetadataError::GraphNotFound => MetadataApiError::ServiceUnavailable,
+        other => MetadataApiError::Internal(other.to_string()),
+    }
+}
+
+fn map_query_error(error: MetadataError) -> MetadataApiError {
+    match error {
+        MetadataError::InvalidInput(_) => MetadataApiError::BadRequest,
+        other => map_event_error(other),
+    }
+}
+
+fn map_read_error(error: MetadataReadError) -> MetadataApiError {
+    match error {
+        MetadataReadError::Unauthorized => MetadataApiError::Unauthorized,
+        MetadataReadError::Forbidden => MetadataApiError::Forbidden,
+        MetadataReadError::NotFound | MetadataReadError::Unavailable => {
+            MetadataApiError::ServiceUnavailable
+        }
+    }
+}
+
+fn map_internal_error(error: MetadataError) -> MetadataApiError {
+    MetadataApiError::Internal(error.to_string())
+}
+
+pub async fn search_objects(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    request: ObjectSearchRequest,
+) -> Result<ObjectSearchExecution, MetadataApiError> {
+    if request.query.is_empty() || request.auth.realm_id != realm_id {
+        return Err(if request.query.is_empty() {
+            MetadataApiError::BadRequest
+        } else {
+            MetadataApiError::Forbidden
+        });
+    }
+    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let limit = request
+        .limit
+        .clamp(1, crate::s3::search_objects::OBJECT_SEARCH_MAX_LIMIT);
+    let fingerprint = object_search_fingerprint(
+        realm_id,
+        &request.query,
+        request.key_match,
+        request.bucket.as_deref(),
+        request.mode,
+    );
+
+    let (as_of, mut partitions, mut failed_partitions, discovery_failed, omitted_partitions) =
+        match request.cursor.as_deref() {
+            Some(raw) => {
+                let authorized_signers = match request.mode {
+                    ObjectSearchQueryMode::Local => vec![local_node_id],
+                    ObjectSearchQueryMode::DistributedBestEffort
+                    | ObjectSearchQueryMode::DistributedStrict => {
+                        load_realm_config(context, realm_id)
+                            .await
+                            .ok_or(MetadataApiError::ServiceUnavailable)?
+                            .node_ids()
+                            .map_err(|_| MetadataApiError::ServiceUnavailable)?
+                    }
+                };
+                let cursor = ObjectSearchCursor::decode(raw, fingerprint, &authorized_signers)?;
+                let partitions = cursor.partition_states()?;
+                if request.mode == ObjectSearchQueryMode::Local
+                    && (partitions.len() != 1 || partitions[0].node_id != local_node_id)
+                {
+                    return Err(MetadataApiError::InvalidCursor(
+                        "invalid local object search cursor".to_string(),
+                    ));
+                }
+                (
+                    cursor.payload.as_of,
+                    partitions,
+                    cursor.failed_nodes()?,
+                    cursor.payload.discovery_failed,
+                    cursor.payload.omitted_partitions,
+                )
+            }
+            None => {
+                let as_of = SystemTime::now();
+                let (mut nodes, discovery_failed) =
+                    match request.mode {
+                        ObjectSearchQueryMode::Local => (vec![local_node_id], false),
+                        ObjectSearchQueryMode::DistributedBestEffort
+                        | ObjectSearchQueryMode::DistributedStrict => {
+                            match request.target_nodes.clone() {
+                                Some(nodes) => (deduplicate_fanout_nodes(nodes), false),
+                                None => {
+                                    let discovery = tokio::time::timeout_at(
+                                        deadline,
+                                        discover_realm_nodes(context, realm_id, local_node_id),
+                                    )
+                                    .await
+                                    .unwrap_or(MetadataRealmNodeDiscovery {
+                                        nodes: vec![local_node_id],
+                                        failed: true,
+                                    });
+                                    (discovery.nodes, discovery.failed)
+                                }
+                            }
+                        }
+                    };
+                if nodes.is_empty() {
+                    return Err(MetadataApiError::ServiceUnavailable);
+                }
+                let omitted_partitions = if nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+                    let selected = select_fanout_nodes(&nodes, local_node_id, &fingerprint);
+                    let omitted = nodes.len().saturating_sub(selected.len());
+                    nodes = selected;
+                    omitted
+                } else {
+                    0
+                };
+                if request.mode == ObjectSearchQueryMode::DistributedStrict
+                    && (discovery_failed || omitted_partitions > 0)
+                {
+                    return Err(MetadataApiError::ServiceUnavailable);
+                }
+                nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+                (
+                    as_of,
+                    nodes
+                        .into_iter()
+                        .map(|node_id| ObjectSearchPartitionState {
+                            node_id,
+                            start_after: None,
+                            exhausted: false,
+                            observed_at: None,
+                        })
+                        .collect(),
+                    Vec::new(),
+                    discovery_failed,
+                    omitted_partitions,
+                )
+            }
+        };
+
+    if request.mode == ObjectSearchQueryMode::DistributedStrict
+        && (discovery_failed || omitted_partitions > 0 || !failed_partitions.is_empty())
+    {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+
+    let active_nodes = partitions
+        .iter()
+        .filter(|partition| !partition.exhausted)
+        .map(|partition| partition.node_id)
+        .collect::<Vec<_>>();
+    if active_nodes.is_empty() {
+        return Err(MetadataApiError::InvalidCursor(
+            "exhausted object search cursor".to_string(),
+        ));
+    }
+    let start_positions = partitions
+        .iter()
+        .map(|partition| (partition.node_id, partition.start_after.clone()))
+        .collect::<HashMap<_, _>>();
+    let remote_auth_token = fanout_bearer(request.bearer_token.as_deref());
+    let handle = context.metadata_handle.clone();
+
+    let local_call: MetadataNodeCall<ObjectSearchNodePage> = metadata_node_call(
+        (
+            context.clone(),
+            request.auth,
+            realm_id,
+            request.query.clone(),
+            request.key_match,
+            request.bucket.clone(),
+            limit,
+            as_of,
+            start_positions.clone(),
+        ),
+        |(context, auth, realm_id, query, key_match, bucket, limit, as_of, starts), node_id| async move {
+            search_local_objects(
+                &context,
+                SearchObjectsInput {
+                    auth,
+                    realm_id,
+                    node_id,
+                    query,
+                    key_match,
+                    bucket,
+                    limit,
+                    start_after: starts.get(&node_id).cloned().flatten(),
+                    as_of,
+                },
+            )
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)
+        },
+    );
+    let remote_call: MetadataNodeCall<ObjectSearchNodePage> = metadata_node_call(
+        (
+            handle,
+            remote_auth_token,
+            request.query,
+            request.key_match,
+            request.bucket,
+            limit,
+            as_of,
+            start_positions,
+        ),
+        |(handle, auth_token, query, key_match, bucket, limit, as_of, starts), node_id| async move {
+            let Some(handle) = handle else {
+                return Err(MetadataReadError::Unavailable);
+            };
+            handle
+                .request_object_search(
+                    node_id,
+                    auth_token,
+                    query,
+                    key_match,
+                    bucket,
+                    limit,
+                    starts.get(&node_id).cloned().flatten(),
+                    as_of,
+                )
+                .await
+        },
+    );
+    let (parts, mut fanout_stats) = run_metadata_fanout(
+        context,
+        realm_id,
+        local_node_id,
+        MetadataFanoutScope::new(
+            Some(request.mode.fanout_mode()),
+            Some(active_nodes),
+            request.mode.allow_partial(),
+        )
+        .with_subject(fingerprint)
+        .with_discovery_failed(discovery_failed)
+        .with_deadline(deadline),
+        MetadataFanoutOperation::ObjectSearch,
+        local_call,
+        remote_call,
+        record_object_result,
+        map_read_error,
+    )
+    .await?;
+
+    let newly_failed = fanout_stats.failed_partitions.clone();
+    failed_partitions.extend(newly_failed.iter().copied());
+    failed_partitions.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    failed_partitions.dedup();
+    partitions.retain(|partition| !newly_failed.contains(&partition.node_id));
+    partitions
+        .sort_unstable_by(|left, right| left.node_id.as_bytes().cmp(right.node_id.as_bytes()));
+
+    let mut pages = parts.into_iter().collect::<HashMap<_, _>>();
+    let mut hits = Vec::with_capacity(limit);
+    let mut remaining = limit;
+    for partition in &mut partitions {
+        if partition.exhausted {
+            continue;
+        }
+        let Some(page) = pages.remove(&partition.node_id) else {
+            continue;
+        };
+        partition.observed_at = Some(page.observed_at);
+        if remaining == 0 {
+            if page.hits.is_empty() && page.next_start_after.is_none() {
+                partition.exhausted = true;
+            }
+            continue;
+        }
+
+        let consumed = remaining.min(page.hits.len());
+        hits.extend(
+            page.hits
+                .iter()
+                .take(consumed)
+                .map(|candidate| candidate.hit.clone()),
+        );
+        remaining = remaining.saturating_sub(consumed);
+        if consumed < page.hits.len() {
+            partition.start_after = page
+                .hits
+                .get(consumed.saturating_sub(1))
+                .map(|candidate| candidate.cursor_key.clone());
+            partition.exhausted = false;
+        } else if consumed > 0 || page.hits.is_empty() {
+            partition.start_after = page.next_start_after;
+            partition.exhausted = partition.start_after.is_none();
+        }
+    }
+
+    let next_cursor = if partitions.iter().any(|partition| !partition.exhausted) {
+        let net = context.net_handle.as_ref().ok_or_else(|| {
+            MetadataApiError::Internal(
+                "net handle unavailable for object search cursor signing".to_string(),
+            )
+        })?;
+        Some(
+            ObjectSearchCursor::new_signed(
+                fingerprint,
+                as_of,
+                &partitions,
+                &failed_partitions,
+                discovery_failed,
+                omitted_partitions,
+                net.node_id(),
+                |bytes| net.sign(bytes),
+            )
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+            .encode()
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let coverage = partitions
+        .iter()
+        .filter_map(|partition| {
+            partition
+                .observed_at
+                .map(|observed_at| ObjectSearchPartitionCoverage {
+                    node_id: partition.node_id,
+                    observed_at,
+                    truncated: !partition.exhausted,
+                })
+        })
+        .collect::<Vec<_>>();
+
+    fanout_stats.failed_partitions = failed_partitions;
+    fanout_stats.nodes_failed =
+        fanout_stats.failed_partitions.len() + omitted_partitions + usize::from(discovery_failed);
+    let complete = fanout_stats.nodes_failed == 0;
+    Ok(ObjectSearchExecution {
+        hits,
+        next_cursor,
+        as_of,
+        partitions: coverage,
+        fanout_stats,
+        omitted_partitions,
+        complete,
+    })
+}
+
+#[cfg(test)]
+mod tests;

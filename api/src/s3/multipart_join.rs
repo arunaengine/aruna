@@ -1,21 +1,15 @@
-//! Node-local join point for CompleteMultipartUpload.
-//!
-//! Completion is long and expensive, and the request future that starts it may
-//! be dropped by a client or an intermediary at any moment. The completion
-//! therefore runs detached under its upload key; a concurrent or later request
-//! joins the same run and receives the same answer.
+//! Node-local join point for detached CompleteMultipartUpload work.
+//! Concurrent requests for one upload join the same run and answer.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_operations::s3::complete_multipart_upload::CompleteMultipartUploadResult;
+use aruna_operations::s3::complete_upload::CompleteMultipartUploadResult;
 use aruna_tasks::join_registry::{JoinRegistry, JoinWatch, await_joined};
 use s3s::{S3Error, S3ErrorCode, s3_error};
 use ulid::Ulid;
 
-/// How long a finished completion stays joinable. A retry that arrives after
-/// the connection was cut still sees the ETag and version of the object that
-/// was created, instead of a `NoSuchUpload` for an upload that is already gone.
+/// Retention lets a retry recover the completed object's ETag and version.
 const COMPLETION_RETENTION: Duration = Duration::from_secs(600);
 
 /// Bucket, object key and upload id: an upload id alone would let a request

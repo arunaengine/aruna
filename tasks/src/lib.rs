@@ -82,11 +82,13 @@ pub struct TaskShutdownReport {
     pub in_flight: usize,
     /// Handlers aborted because they outlived the drain deadline.
     pub aborted: usize,
+    /// No command reached the scheduler, so the drain never ran.
+    pub scheduler_unavailable: bool,
 }
 
 impl TaskShutdownReport {
     pub fn drained(&self) -> bool {
-        self.aborted == 0
+        self.aborted == 0 && !self.scheduler_unavailable
     }
 }
 
@@ -211,7 +213,7 @@ impl SchedulerState {
         *self.in_flight_keys.entry(task.key.clone()).or_insert(0) += 1;
     }
 
-    fn spawn_handler_for_key(
+    fn spawn_handler(
         &mut self,
         key: TaskKey,
         started_at: Instant,
@@ -227,7 +229,7 @@ impl SchedulerState {
         }
     }
 
-    fn release_in_flight_key(&mut self, key: &TaskKey) -> bool {
+    fn release_key(&mut self, key: &TaskKey) -> bool {
         if let Some(count) = self.in_flight_keys.get_mut(key) {
             *count = count.saturating_sub(1);
             if *count > 0 {
@@ -274,13 +276,13 @@ impl SchedulerState {
                 if self.in_flight_keys.contains_key(&key) {
                     self.refire_requested.insert(key);
                 } else {
-                    self.spawn_handler_for_key(key, now, command_tx);
+                    self.spawn_handler(key, now, command_tx);
                 }
             }
         }
     }
 
-    fn warn_for_long_running_tasks(&mut self) {
+    fn warn_long_tasks(&mut self) {
         let now = Instant::now();
 
         while let Some(&(warn_at, run_id)) = self.running_warn_deadlines.first() {
@@ -363,7 +365,7 @@ impl SchedulerState {
         TaskEvent::TimerScheduled { key, after }
     }
 
-    fn schedule_timer_if_idle(&mut self, key: TaskKey, after: Duration) -> TaskEvent {
+    fn schedule_idle_timer(&mut self, key: TaskKey, after: Duration) -> TaskEvent {
         let now = Instant::now();
         if let Some(existing) = self.timers_by_key.get(&key) {
             return TaskEvent::TimerScheduled {
@@ -407,8 +409,8 @@ impl SchedulerState {
             );
         }
 
-        if self.release_in_flight_key(&entry.key) && self.refire_requested.remove(&entry.key) {
-            self.spawn_handler_for_key(entry.key, Instant::now(), command_tx);
+        if self.release_key(&entry.key) && self.refire_requested.remove(&entry.key) {
+            self.spawn_handler(entry.key, Instant::now(), command_tx);
         }
 
         self.notify_if_drained();
@@ -458,7 +460,7 @@ impl SchedulerState {
                 self.running_warn_deadlines
                     .remove(&(entry.warn_at, *run_id));
                 entry.task.abort();
-                self.release_in_flight_key(&entry.key);
+                self.release_key(&entry.key);
             }
         }
         self.refire_requested.remove(&key);
@@ -499,7 +501,7 @@ impl SchedulerState {
                 after,
                 response,
             } => {
-                let _ = response.send(self.schedule_timer_if_idle(key, after));
+                let _ = response.send(self.schedule_idle_timer(key, after));
             }
             TaskCommand::CancelTimer { key, response } => {
                 let _ = response.send(self.cancel_timer(key));
@@ -542,7 +544,7 @@ async fn run_scheduler(
 
     loop {
         state.dispatch_due_timers(&command_tx);
-        state.warn_for_long_running_tasks();
+        state.warn_long_tasks();
 
         match state.next_deadline() {
             Some(deadline) => {
@@ -646,101 +648,62 @@ impl TaskHandle {
         }
     }
 
-    async fn reset_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
+    async fn dispatch_command<F>(&self, key: TaskKey, build: F) -> TaskEvent
+    where
+        F: FnOnce(TaskKey, oneshot::Sender<TaskEvent>) -> TaskCommand,
+    {
         let command_key = key.clone();
         let (response, result) = oneshot::channel();
-        if self
-            .command_tx
-            .send(TaskCommand::ResetTimer {
-                key,
-                after,
-                response,
-            })
-            .await
-            .is_err()
-        {
+        if self.command_tx.send(build(key, response)).await.is_err() {
             return scheduler_unavailable(command_key);
         }
 
         result
             .await
             .unwrap_or_else(|_| scheduler_unavailable(command_key))
+    }
+
+    async fn reset_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
+        self.dispatch_command(key, |key, response| TaskCommand::ResetTimer {
+            key,
+            after,
+            response,
+        })
+        .await
     }
 
     async fn shorten_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
-        let command_key = key.clone();
-        let (response, result) = oneshot::channel();
-        if self
-            .command_tx
-            .send(TaskCommand::ShortenTimer {
-                key,
-                after,
-                response,
-            })
-            .await
-            .is_err()
-        {
-            return scheduler_unavailable(command_key);
-        }
-
-        result
-            .await
-            .unwrap_or_else(|_| scheduler_unavailable(command_key))
+        self.dispatch_command(key, |key, response| TaskCommand::ShortenTimer {
+            key,
+            after,
+            response,
+        })
+        .await
     }
 
-    pub async fn schedule_timer_if_idle(&self, key: TaskKey, after: Duration) -> TaskEvent {
-        let command_key = key.clone();
-        let (response, result) = oneshot::channel();
-        if self
-            .command_tx
-            .send(TaskCommand::ScheduleTimerIfIdle {
-                key,
-                after,
-                response,
-            })
-            .await
-            .is_err()
-        {
-            return scheduler_unavailable(command_key);
-        }
-
-        result
-            .await
-            .unwrap_or_else(|_| scheduler_unavailable(command_key))
+    pub async fn schedule_idle_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
+        self.dispatch_command(key, |key, response| TaskCommand::ScheduleTimerIfIdle {
+            key,
+            after,
+            response,
+        })
+        .await
     }
 
     async fn cancel_timer(&self, key: TaskKey) -> TaskEvent {
-        let command_key = key.clone();
-        let (response, result) = oneshot::channel();
-        if self
-            .command_tx
-            .send(TaskCommand::CancelTimer { key, response })
-            .await
-            .is_err()
-        {
-            return scheduler_unavailable(command_key);
-        }
-
-        result
-            .await
-            .unwrap_or_else(|_| scheduler_unavailable(command_key))
+        self.dispatch_command(key, |key, response| TaskCommand::CancelTimer {
+            key,
+            response,
+        })
+        .await
     }
 
     pub async fn abort_running_handlers(&self, key: TaskKey) -> TaskEvent {
-        let command_key = key.clone();
-        let (response, result) = oneshot::channel();
-        if self
-            .command_tx
-            .send(TaskCommand::AbortRunningHandlers { key, response })
-            .await
-            .is_err()
-        {
-            return scheduler_unavailable(command_key);
-        }
-
-        result
-            .await
-            .unwrap_or_else(|_| scheduler_unavailable(command_key))
+        self.dispatch_command(key, |key, response| TaskCommand::AbortRunningHandlers {
+            key,
+            response,
+        })
+        .await
     }
 
     /// Permanently stops new timer handlers without waiting for the scheduler.
@@ -770,12 +733,14 @@ impl TaskHandle {
             return TaskShutdownReport {
                 in_flight: 0,
                 aborted: 0,
+                scheduler_unavailable: true,
             };
         };
         if in_flight == 0 {
             return TaskShutdownReport {
                 in_flight: 0,
                 aborted: 0,
+                scheduler_unavailable: false,
             };
         }
 
@@ -790,6 +755,7 @@ impl TaskHandle {
             return TaskShutdownReport {
                 in_flight,
                 aborted: 0,
+                scheduler_unavailable: false,
             };
         }
 
@@ -817,7 +783,11 @@ impl TaskHandle {
             );
         }
 
-        TaskShutdownReport { in_flight, aborted }
+        TaskShutdownReport {
+            in_flight,
+            aborted,
+            scheduler_unavailable: false,
+        }
     }
 }
 
@@ -991,7 +961,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_timer_keeps_newly_rescheduled_entry() {
+    async fn reset_keeps_reschedule() {
         let handle = TaskHandle::new();
         let count = Arc::new(AtomicUsize::new(0));
         let notify = Arc::new(Notify::new());
@@ -1022,7 +992,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_timer_from_handler_does_not_cancel_running_handler() {
+    async fn handler_reset_survives() {
         let handle = TaskHandle::new();
         let started = Arc::new(Notify::new());
         let finished = Arc::new(Notify::new());
@@ -1052,7 +1022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abort_running_handlers_aborts_matching_handler_task() {
+    async fn abort_stops_handler() {
         let handle = TaskHandle::new();
         let started = Arc::new(Notify::new());
         let dropped = Arc::new(Notify::new());
@@ -1090,7 +1060,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overlapping_fires_coalesce_into_one_follow_up_run() {
+    async fn overlap_coalesces_refire() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
@@ -1123,7 +1093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fire_during_running_handler_triggers_follow_up_run() {
+    async fn running_fire_refires() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
@@ -1154,7 +1124,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequential_fires_run_once_each() {
+    async fn fires_run_once() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
@@ -1180,7 +1150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shorten_timer_does_not_lengthen_existing_entry() {
+    async fn shorten_preserves_earlier() {
         let handle = TaskHandle::new();
         let key = test_key();
 
@@ -1208,7 +1178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schedule_timer_if_idle_keeps_existing_timer() {
+    async fn idle_keeps_timer() {
         let handle = TaskHandle::new();
         let key = test_key();
 
@@ -1224,7 +1194,7 @@ mod tests {
         assert_eq!(after, Duration::from_secs(3600));
 
         let TaskEvent::TimerScheduled { after, .. } =
-            handle.schedule_timer_if_idle(key, Duration::ZERO).await
+            handle.schedule_idle_timer(key, Duration::ZERO).await
         else {
             panic!("expected timer scheduled event");
         };
@@ -1286,6 +1256,18 @@ mod tests {
         tokio::time::timeout(Duration::ZERO, dropped.notified())
             .await
             .expect("handler future must drop before shutdown returns");
+    }
+
+    #[test]
+    fn shutdown_reports_unavailable() {
+        let handle = TaskHandle::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime should build");
+        let report = runtime.block_on(handle.shutdown(Duration::ZERO));
+
+        assert!(report.scheduler_unavailable);
+        assert!(!report.drained());
     }
 
     // Admission stops first: timers that fire after shutdown find no handler.
@@ -1350,7 +1332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schedule_timer_if_idle_ignores_running_handler() {
+    async fn idle_ignores_running() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
@@ -1371,7 +1353,7 @@ mod tests {
             .expect("first handler run should start");
 
         let TaskEvent::TimerScheduled { .. } =
-            handle.schedule_timer_if_idle(key, Duration::ZERO).await
+            handle.schedule_idle_timer(key, Duration::ZERO).await
         else {
             panic!("expected timer scheduled event");
         };

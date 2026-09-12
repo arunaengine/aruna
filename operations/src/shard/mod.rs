@@ -7,10 +7,10 @@ use aruna_core::document::{ShardManifest, ShardManifestEntry, shard_topic_id};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SHARD_MANIFEST_KEYSPACE;
-use aruna_core::storage_entries::{document_sync_revision_key, shard_manifest_prefix};
+use aruna_core::storage_entries::{shard_manifest_prefix, sync_revision_key};
 use aruna_core::structs::{PlacementRef, RealmId};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
-use aruna_core::util::unix_timestamp_millis;
 use aruna_net::NetHandle;
 use byteview::ByteView;
 use irokle::Storage as _;
@@ -21,9 +21,7 @@ const SHARD_MANIFEST_SCAN_PAGE: usize = 512;
 
 /// Builds the local node's [`ShardManifest`] for one shard on demand: a prefix
 /// scan of the manifest keyspace for the entry set, plus the shard topic's
-/// irokle `sync_fingerprint` (digest) and persisted `ActorClock` (cursor). Never
-/// persisted — a new holder fetches a co-holder's over the shard ALPN and
-/// compares digests. A digest match against a co-holder means convergence.
+/// irokle fingerprint (digest) and persisted clock (cursor). Never persisted.
 pub async fn assemble_shard_manifest(
     context: &DriverContext,
     realm_id: RealmId,
@@ -33,9 +31,9 @@ pub async fn assemble_shard_manifest(
         .net_handle
         .as_ref()
         .ok_or_else(|| "cannot assemble shard manifest without a net handle".to_string())?;
-    let entries = scan_shard_manifest_entries(context, &placement).await?;
+    let entries = scan_manifest_entries(context, &placement).await?;
     let topic = shard_topic_id(realm_id, &placement);
-    let (digest, cursor) = topic_digest_and_cursor(net_handle, topic);
+    let (digest, cursor) = topic_digest_cursor(net_handle, topic);
     Ok(ShardManifest {
         placement,
         holder: net_handle.node_id(),
@@ -60,7 +58,7 @@ pub(crate) fn manifest_entry_digest(entries: &[ShardManifestEntry]) -> [u8; 32] 
 }
 
 fn canonical_entry_bytes(entry: &ShardManifestEntry) -> Vec<u8> {
-    let target_key = document_sync_revision_key(&entry.target);
+    let target_key = sync_revision_key(&entry.target);
     let target_key = target_key.as_ref();
     let mut bytes = Vec::with_capacity(4 + target_key.len() + 8 + 16 + 32 + 8);
     bytes.extend_from_slice(&(target_key.len() as u32).to_be_bytes());
@@ -72,7 +70,7 @@ fn canonical_entry_bytes(entry: &ShardManifestEntry) -> Vec<u8> {
     bytes
 }
 
-async fn scan_shard_manifest_entries(
+async fn scan_manifest_entries(
     context: &DriverContext,
     placement: &PlacementRef,
 ) -> Result<Vec<ShardManifestEntry>, String> {
@@ -117,12 +115,9 @@ async fn scan_shard_manifest_entries(
     Ok(entries)
 }
 
-// Digest and cursor come straight from irokle. A topic with no local genesis is
-// not special-cased here: it reports the (non-zero) empty fingerprint and an
-// empty cursor, and only a storage error falls back to the zero digest.
-// Verification therefore gates on the topic actually existing (see
-// `shard::verify`), never on the digest value.
-fn topic_digest_and_cursor(net_handle: &NetHandle, topic: irokle::TopicId) -> ([u8; 32], Vec<u8>) {
+// Irokle returns empty facts for a genesis-less topic and a zero digest on storage errors.
+// Verification therefore checks topic existence separately.
+fn topic_digest_cursor(net_handle: &NetHandle, topic: irokle::TopicId) -> ([u8; 32], Vec<u8>) {
     let node = net_handle.document_sync_node();
     let digest = node
         .sync_fingerprint(topic)
@@ -174,7 +169,7 @@ pub(crate) fn frontier_root(
 mod tests {
     use super::*;
     use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision};
-    use aruna_core::storage_entries::shard_manifest_write_entry;
+    use aruna_core::storage_entries::shard_manifest_entry;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
     use std::sync::Arc;
@@ -207,7 +202,7 @@ mod tests {
             document_id: Ulid::from_bytes([doc; 16]),
         };
         let (key_space, key, value) =
-            shard_manifest_write_entry(&target, &lifecycle_change(placement(shard), doc))
+            shard_manifest_entry(&target, &lifecycle_change(placement(shard), doc))
                 .unwrap()
                 .unwrap();
         match storage
@@ -252,16 +247,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_isolates_entries_by_shard() {
+    async fn scan_isolates_shard() {
         let (_dir, context) = spawn_context().await;
         write_manifest_row(&context.storage_handle, 3, 1).await;
         write_manifest_row(&context.storage_handle, 3, 2).await;
         write_manifest_row(&context.storage_handle, 4, 3).await;
 
-        let shard3 = scan_shard_manifest_entries(&context, &placement(3))
+        let shard3 = scan_manifest_entries(&context, &placement(3))
             .await
             .expect("scan shard 3");
-        let shard4 = scan_shard_manifest_entries(&context, &placement(4))
+        let shard4 = scan_manifest_entries(&context, &placement(4))
             .await
             .expect("scan shard 4");
 
@@ -274,7 +269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assembled_digest_and_cursor_track_the_live_shard_topic() {
+    async fn digest_tracks_topic() {
         let (_dir, context) = spawn_context().await;
         let realm_id = RealmId::from_bytes([5u8; 32]);
         let placement = placement(7);
@@ -284,7 +279,7 @@ mod tests {
         // fingerprint and clock to read back.
         let net = context.net_handle.as_ref().unwrap();
         let topic = shard_topic_id(realm_id, &placement);
-        net.ensure_document_sync_topics(&[topic], Vec::new())
+        net.ensure_sync_topics(&[topic], Vec::new())
             .expect("ensure topic");
 
         let manifest = assemble_shard_manifest(&context, realm_id, placement)
@@ -353,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_entry_digest_is_order_independent_and_revision_sensitive() {
+    fn digest_order_independent() {
         let actor = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let first = ShardManifestEntry {
             target: aruna_core::document::DocumentSyncTarget::MetadataDocumentLifecycle {

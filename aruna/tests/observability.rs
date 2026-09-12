@@ -4,8 +4,8 @@ mod shared;
 
 use reqwest::StatusCode;
 use shared::{
-    TestResult, create_bearer_token, create_group_via_http, create_s3_credentials_via_http,
-    s3_client, spawn_full_seed_node, spawn_seed_node, wait_for_group_via_http,
+    TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
+    spawn_complete_seed, spawn_seed_node, wait_group_http,
 };
 
 async fn scrape(ops_url: &str) -> TestResult<String> {
@@ -22,7 +22,7 @@ fn gauge_value(body: &str, series: &str) -> Option<f64> {
 }
 
 #[tokio::test]
-async fn readyz_reflects_startup_gate() -> TestResult<()> {
+async fn readyz_reflects_gate() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let result = async {
         let client = reqwest::Client::new();
@@ -74,7 +74,7 @@ async fn readyz_reflects_startup_gate() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn metrics_expose_rest_storage_and_queue_series() -> TestResult<()> {
+async fn metrics_expose_series() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let result = async {
         let client = reqwest::Client::new();
@@ -151,8 +151,8 @@ async fn metrics_absent_public() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn metrics_expose_s3_operation_label() -> TestResult<()> {
-    let seed = spawn_full_seed_node().await?;
+async fn metrics_s3_label() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
     let result = async {
         let bearer_token = create_bearer_token(
             seed.context.as_ref(),
@@ -161,11 +161,10 @@ async fn metrics_expose_s3_operation_label() -> TestResult<()> {
             seed.capabilities.clone(),
         )
         .await?;
-        let group =
-            create_group_via_http(&seed.base_url, &bearer_token, "obs-metrics-group").await?;
-        wait_for_group_via_http(&seed.base_url, &bearer_token, &group.group_id).await?;
+        let group = create_group_http(&seed.base_url, &bearer_token, "obs-metrics-group").await?;
+        wait_group_http(&seed.base_url, &bearer_token, &group.group_id).await?;
         let credentials =
-            create_s3_credentials_via_http(&seed.base_url, &bearer_token, &group.group_id).await?;
+            create_s3_credentials(&seed.base_url, &bearer_token, &group.group_id).await?;
 
         let endpoint = seed
             .s3
@@ -923,7 +922,7 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
     use aruna_core::structs::PlacementRef;
-    use aruna_operations::document_sync_outbox::{new_outbox_record, outbox_write_entry};
+    use aruna_operations::sync::document_outbox::{new_outbox_record, outbox_write_entry};
 
     let storage = env.open_storage().await;
     clear_space(&storage, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await?;

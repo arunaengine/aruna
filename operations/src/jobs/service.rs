@@ -12,8 +12,8 @@ use aruna_core::structs::{
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{NodeId, UserId, Value};
-use aruna_core::util::unix_timestamp_millis;
 use bytes::Bytes;
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
@@ -27,20 +27,20 @@ use super::protocol::{JobRequest, JobResponse, JobRouteError, WireRange, send_jo
 use super::runtime::JobsRuntime;
 use super::staging::read_staging_checkpoint;
 use super::store::{
-    CancelRequestOutcome, JobMutationError, find_dedup_plan, list_job_entries, list_jobs_for_user,
-    read_artifact_tombstone, read_job_record, read_run_crate_status, set_cancel_requested,
+    CancelRequestOutcome, JobMutationError, find_dedup_plan, list_job_entries, list_user_jobs,
+    read_artifact_tombstone, read_crate_status, read_job_record, set_cancel_requested,
 };
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
-    schedule_job_drain_effect,
+    schedule_drain_effect,
 };
 use super::workflow::finalize_followups;
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::api::load_realm_config;
+use crate::metadata::get_document::load_document_record;
 use crate::metadata::repository::StorageReadError;
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::PolicyRequestExtras;
 
 use super::lifecycle::cancel::cancel_family;
 use super::lifecycle::ids::session_of;
@@ -76,13 +76,13 @@ pub(crate) async fn mint_local_job(
     let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
         SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
     })?;
-    mint_local_job_from_config(&config, owner_node_id, subject)
+    mint_configured_job(&config, owner_node_id, subject)
 }
 
 /// Synchronous form used by producer transactions that already fenced and read
 /// the realm config. The resulting job id and dedup shard can therefore be
 /// written atomically with the producer's own records.
-pub(crate) fn mint_local_job_from_config(
+pub(crate) fn mint_configured_job(
     config: &aruna_core::structs::RealmConfigDocument,
     owner_node_id: NodeId,
     subject: &[u8],
@@ -125,8 +125,7 @@ pub(crate) async fn submit_local_job(
 
 /// Normalizes one execution request and enforces every bound that holds
 /// regardless of where the job runs: composition, the shared output bound, and
-/// the workspace rules. It is the single gate both the local and the
-/// distributed submission path pass through.
+/// the workspace rules. The single gate both submission paths pass through.
 pub(crate) fn validate_execution(
     spec: &mut ExecutionSpec,
     workspace_mode: WorkspaceMode,
@@ -203,11 +202,9 @@ pub(crate) fn validate_execution(
     Ok(())
 }
 
-/// Submit a container execution job on behalf of `created_by`. The drain claims it
+/// Submit a container execution job on behalf of `created_by`; the drain claims it
 /// and drives the fenced external attempt lifecycle. The idempotency key is
-/// namespaced per user, disjoint from internal obligation keys. `active_cap`
-/// bounds the user's unfinished execution jobs on this node inside the
-/// admitting transaction.
+/// user-namespaced, and `active_cap` is enforced inside the admitting transaction.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_execution_job(
     context: &DriverContext,
@@ -273,7 +270,7 @@ pub async fn submit_staging_job(
     .await
 }
 
-pub async fn submit_storage_purge_job(
+pub async fn submit_purge_job(
     context: &DriverContext,
     spec: StoragePurgeSpec,
     owner_node_id: NodeId,
@@ -308,10 +305,8 @@ pub async fn submit_storage_purge_job(
 }
 
 /// Register a w3id PID for a document as a fenced job on the document's PID
-/// authority. The dedup key names the document and is indexed without the
-/// submitting user, so a concurrent re-mint by another authorized user joins the
-/// same job; routing it to the one authority is what makes that hold across
-/// ingress nodes. The job record still carries the real requester.
+/// authority. The dedup key names the document without the submitting user, so a
+/// concurrent re-mint by another user joins the same job across ingress nodes.
 pub async fn submit_mint_pid(
     context: &Arc<DriverContext>,
     spec: MintPersistentIdSpec,
@@ -479,11 +474,11 @@ pub async fn submit_export_job(
 }
 
 /// Read the run-crate obligation status surfaced alongside an execution job.
-pub async fn read_job_run_crate_status(
+pub async fn read_crate_obligation(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<RunCrateStatus>, String> {
-    read_run_crate_status(&context.storage_handle, job_id).await
+    read_crate_status(&context.storage_handle, job_id).await
 }
 
 /// Node-local listing: returns only jobs owned by the serving node (every job
@@ -496,7 +491,7 @@ pub async fn list_owned_jobs(
     limit: usize,
     filter: impl Fn(&JobRecord) -> bool,
 ) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
-    list_jobs_for_user(&context.storage_handle, user_id, cursor, limit, filter).await
+    list_user_jobs(&context.storage_handle, user_id, cursor, limit, filter).await
 }
 
 pub async fn read_owned_job(
@@ -592,9 +587,8 @@ async fn route_record(
     }
 }
 
-/// Derives the immutable owner from the JobId alone: replicated placement
-/// state is the only input, so resolution never asks another node and can
-/// never be stranded by a placement rebalance. A missing or unsynced binding is
+/// Derives the immutable owner from the JobId alone using replicated placement
+/// state, so resolution never asks another node. A missing or unsynced binding is
 /// `Unavailable` (503); only a provably invalid id maps to `NotFound`.
 pub(crate) async fn resolve_job_owner(
     context: &DriverContext,
@@ -638,7 +632,7 @@ pub(crate) async fn local_status(
         .await
         .map_err(JobRouteError::Internal)?
         .ok_or(JobRouteError::NotFound)?;
-    let run_crate = read_job_run_crate_status(context, job_id)
+    let run_crate = read_crate_obligation(context, job_id)
         .await
         .map_err(JobRouteError::Internal)?
         .map(|status| status.to_public_json());
@@ -649,7 +643,7 @@ pub(crate) async fn local_status(
 }
 
 /// The caller's own job, or the PID mint job it joined. A joined job is served as
-/// the caller's own — the record is rewritten onto the caller — so the handle the
+/// the caller's own (its record is rewritten onto the caller), so the handle the
 /// mint route returned is inspectable without disclosing the first submitter.
 async fn readable_job(
     context: &DriverContext,
@@ -676,7 +670,7 @@ async fn joined_pid_job(
     let JobPayload::MintPersistentId(spec) = &record.payload else {
         return Ok(None);
     };
-    let Some(document) = load_metadata_record_by_document(context, spec.document_id)
+    let Some(document) = load_document_record(context, spec.document_id)
         .await
         .map_err(|error| format!("{error:?}"))?
     else {
@@ -976,7 +970,7 @@ pub async fn read_owned_artifact(
         return Err("artifact record does not match its blob location".to_string());
     }
     let document_path =
-        crate::get_metadata_document::load_metadata_record_by_document(context, spec.document_id)
+        crate::metadata::get_document::load_document_record(context, spec.document_id)
             .await
             .map_err(|error| match error {
                 StorageReadError::Storage(error) => error.to_string(),
@@ -1320,7 +1314,7 @@ fn artifact_job_matches(artifact: &OwnedArtifact, user_id: UserId, job_id: JobId
 pub(crate) async fn kick_drain(context: &DriverContext) {
     if let Some(task_handle) = context.task_handle.as_ref()
         && let Event::Task(TaskEvent::Error { message, .. }) =
-            task_handle.send_effect(schedule_job_drain_effect()).await
+            task_handle.send_effect(schedule_drain_effect()).await
     {
         warn!(message = %message, "Failed to kick job drain");
     }

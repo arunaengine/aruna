@@ -1,8 +1,6 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::connectors::resolver::{
-    ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
-};
+use crate::connectors::resolver::{ResolveVersionSourceBindingInput, resolve_binding_effect};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
@@ -13,11 +11,12 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
     BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
     GroupAuthorizationDocument, HashPathIndexKey, ManagedCopyKey, NodePlacementEntry, Permission,
     PlacementPolicyRef, PlacementSubject, RealmConfigDocument, RealmId, ResolvedSourceAccess,
-    VersionKey, VersionedObjectArn, blob_object_permission_path, storage_subject,
+    VersionKey, VersionedObjectArn, object_permission_path, storage_subject,
 };
 use aruna_core::types::{Effects, GroupId, TxnId, UserId};
 use bytes::Bytes;
@@ -30,27 +29,31 @@ use crate::blob::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
 use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
-use crate::placement_policy::{
+use crate::placement::policy::{
     GateContext, PolicyGateError, PolicyGateOperation, gate_decision, union_refs, write_gate,
 };
 
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
-use crate::blob::blob_keyspace_helper::blob_location_read;
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::mutate_realm_placement::node_kind;
-use crate::realm_peer::ensure_realm_peer;
-use crate::request_policy::{PolicyRequestExtras, policy_request_with};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use crate::blob::records::blob_location_read;
+use crate::realm::mutate_placement::node_kind;
+use crate::realm::peer_trust::ensure_realm_peer;
 
 #[derive(Debug, PartialEq)]
 pub enum BaoReadOutput {
     Metadata {
         size: u64,
         blake3: [u8; 32],
+        etag: Option<String>,
+        hashes: HashMap<String, Vec<u8>>,
     },
     Stream {
         blob: BackendStream<Result<Bytes, StreamError>>,
         size: u64,
         blake3: [u8; 32],
+        etag: Option<String>,
+        hashes: HashMap<String, Vec<u8>>,
     },
 }
 
@@ -107,6 +110,8 @@ pub struct BaoReadOperation {
     output: Option<Result<BaoReadOutput, BaoReadError>>,
     close_error: Option<BaoReadError>,
     accepted_blake3: Option<[u8; 32]>,
+    accepted_etag: Option<String>,
+    accepted_hashes: HashMap<String, Vec<u8>>,
 }
 
 impl BaoReadOperation {
@@ -119,6 +124,8 @@ impl BaoReadOperation {
             output: None,
             close_error: None,
             accepted_blake3: None,
+            accepted_etag: None,
+            accepted_hashes: HashMap::new(),
         }
     }
 
@@ -199,7 +206,12 @@ impl Operation for BaoReadOperation {
                     return self.unexpected(event);
                 };
                 match VersionReplicationMessage::from_bytes(&payload) {
-                    Ok(VersionReplicationMessage::BaoReadAccepted { size, blake3 }) => {
+                    Ok(VersionReplicationMessage::BaoReadAccepted {
+                        size,
+                        blake3,
+                        etag,
+                        hashes,
+                    }) => {
                         if self
                             .request
                             .expected_blake3
@@ -208,13 +220,20 @@ impl Operation for BaoReadOperation {
                             return self.fail(BaoReadError::Refused(BaoReadRefusal::HashMismatch));
                         }
                         if self.request.metadata_only {
-                            self.output = Some(Ok(BaoReadOutput::Metadata { size, blake3 }));
+                            self.output = Some(Ok(BaoReadOutput::Metadata {
+                                size,
+                                blake3,
+                                etag,
+                                hashes: hashes.into_iter().collect(),
+                            }));
                             self.state = BaoReadState::CloseMetadata;
                             return smallvec![Effect::Blob(BlobEffect::CloseConnection {
                                 stream_id,
                             })];
                         }
                         self.accepted_blake3 = Some(blake3);
+                        self.accepted_etag = etag;
+                        self.accepted_hashes = hashes.into_iter().collect();
                         self.state = BaoReadState::Receive;
                         smallvec![Effect::Blob(BlobEffect::ReceiveRead {
                             stream_id,
@@ -251,6 +270,8 @@ impl Operation for BaoReadOperation {
                     blob,
                     size: stream_size,
                     blake3,
+                    etag: self.accepted_etag.take(),
+                    hashes: std::mem::take(&mut self.accepted_hashes),
                 }));
                 self.state = BaoReadState::Finish;
                 smallvec![]
@@ -306,13 +327,9 @@ impl Operation for BaoReadOperation {
 /// so a second `Required` for the same set is a protocol dead end, not a loop.
 const CHALLENGE_ATTEMPTS: usize = 2;
 
-/// A governed remote read with the plan's destination challenge (5.6/10).
-///
-/// The request carries this node's advertised subject, so the source can
-/// evaluate it independently. On `PlacementPolicyRequired` the refs are
-/// resolved through the ordinary policy resolver, which verifies publication
-/// authority and caches the result, then evaluated locally; the read is retried
-/// only when the local subject complies. Echoed refs are never authority.
+/// A governed remote read with the plan's destination challenge (5.6/10): the
+/// request carries this node's subject, refs resolve and cache locally, retries
+/// need local compliance, and echoed refs are never authority.
 pub async fn managed_read(
     context: &DriverContext,
     node_id: NodeId,
@@ -338,10 +355,8 @@ pub async fn managed_read(
         if refs.is_empty() || refs == taught {
             return Err(BaoReadError::PolicyRequired { refs });
         }
-        // The refs are only a hint: this node decides on its own resolution,
-        // which also caches the verified publication for every later read.
-        // No bucket names the destination of a read, so the owning group is
-        // checked by the write that registers the copy these bytes become.
+        // The refs are only a hint; this node resolves its own view and caches the
+        // verified publication. The write checks the owning group, not the read.
         let Some(gate) = write_gate(destination.as_ref(), &refs, None)? else {
             return Err(BaoReadError::NoDestination);
         };
@@ -646,8 +661,7 @@ impl IncomingBaoReadOperation {
         if !allowed {
             return match next {
                 // A device never receives the group's policy documents, so this
-                // check cannot pass there. Its own observations are served under
-                // the owner binding instead, and to nobody else.
+                // check cannot pass there: its own observations are owner-bound.
                 PolicyNext::Exact if self.serves_own_data() => self.read_exact_version(),
                 PolicyNext::Exact => self.send_refusal(BaoReadRefusal::ReadDenied),
                 PolicyNext::Hash => {
@@ -773,6 +787,8 @@ impl IncomingBaoReadOperation {
         let payload = match (VersionReplicationMessage::BaoReadAccepted {
             size: location.blob_size,
             blake3,
+            etag: location.hashes.get(HASH_MD5).map(hex::encode),
+            hashes: location.hashes.clone().into_iter().collect(),
         })
         .to_bytes()
         {
@@ -887,10 +903,9 @@ impl IncomingBaoReadOperation {
         }
     }
 
-    /// Who this serve runs as. A User peer is owner-bound: it is admitted as a
-    /// realm member without internal trust, and the auth context is forced to
-    /// the owner its realm config names, so a device cannot read as anyone else
-    /// (D12). Every other kind keeps the internal-trust gate unchanged.
+    /// Who this serve runs as. A User peer is owner-bound: admitted as a realm member
+    /// without internal trust and forced to its config-named owner, so a device cannot
+    /// read as anyone else (D12). Other kinds keep the internal-trust gate.
     fn admit_peer(&mut self, document: &RealmConfigDocument) -> Option<BaoReadRefusal> {
         let owner = node_kind(document, self.peer).and_then(|kind| kind.owner());
         let internal_trust = owner.is_none();
@@ -922,7 +937,7 @@ impl IncomingBaoReadOperation {
         }
         self.local_owner = node_kind(&document, self.local_node).and_then(|kind| kind.owner());
         self.peer_is_infra = document
-            .sync_eligible_node_ids()
+            .sync_eligible_nodes()
             .is_ok_and(|ids| ids.contains(&self.peer));
         self.peer_placement = document.placement_entry(self.peer).cloned();
         match &self.request.target {
@@ -1018,9 +1033,8 @@ impl IncomingBaoReadOperation {
         if self.request.metadata_only {
             return self.send_refusal(BaoReadRefusal::ReadDenied);
         }
-        // The requester names the bytes it expects. Serving refuses anything
-        // that does not hash to them, so this node never streams a file under
-        // an identity it has not verified itself.
+        // The requester names the expected bytes; serving refuses anything that
+        // does not hash to them, so an unverified identity is never streamed.
         let Some(expected) = self.request.expected_blake3 else {
             return self.send_refusal(BaoReadRefusal::HashMismatch);
         };
@@ -1035,9 +1049,9 @@ impl IncomingBaoReadOperation {
             .exact_target()
             .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
         self.state = IncomingBaoReadState::ResolveSource;
-        smallvec![resolve_version_source_binding_suboperation(
-            ResolveVersionSourceBindingInput { source },
-        )]
+        smallvec![resolve_binding_effect(ResolveVersionSourceBindingInput {
+            source
+        },)]
     }
 
     /// Announces an observation the same way a materialized copy is announced,
@@ -1046,7 +1060,13 @@ impl IncomingBaoReadOperation {
         let (Some(blake3), Some(size)) = (self.blob_hash, self.source_size) else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
-        let payload = match (VersionReplicationMessage::BaoReadAccepted { size, blake3 }).to_bytes()
+        let payload = match (VersionReplicationMessage::BaoReadAccepted {
+            size,
+            blake3,
+            etag: self.source_fingerprint.clone(),
+            hashes: Default::default(),
+        })
+        .to_bytes()
         {
             Ok(payload) => payload,
             Err(error) => return self.fail(error.into()),
@@ -1072,7 +1092,7 @@ impl IncomingBaoReadOperation {
         let target = self
             .exact_target()
             .expect("exact target required after exact bucket read");
-        let path = blob_object_permission_path(
+        let path = object_permission_path(
             self.request.realm_id,
             bucket.group_id,
             self.local_node,
@@ -1190,10 +1210,9 @@ impl IncomingBaoReadOperation {
         (*claimed == expected).then_some(expected)
     }
 
-    /// Teaches the requester every rule it has not resolved, then evaluates the
-    /// authenticated destination independently. Authorization has already
-    /// passed here, so the refs may be disclosed; echoing one is never
-    /// authority.
+    /// Teaches the requester every unresolved rule, then evaluates the authenticated
+    /// destination independently. Authorization already passed, so refs may be
+    /// disclosed; echoing one is never authority.
     fn challenge_destination(&mut self, location: BackendLocation) -> Effects {
         let missing: Vec<PlacementPolicyRef> = self
             .version_refs
@@ -1456,7 +1475,7 @@ mod tests {
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::checksum::HASH_BLAKE3;
+    use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
     use aruna_core::structs::{
         AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, PlacementPolicyRef,
         RealmConfigDocument, RealmId, RealmNodeKind, VersionedObjectArn,
@@ -1508,7 +1527,7 @@ mod tests {
     }
 
     fn read_path(local_node: aruna_core::NodeId) -> String {
-        aruna_core::structs::blob_object_permission_path(
+        aruna_core::structs::object_permission_path(
             test_realm(),
             Ulid::from(5u128),
             local_node,
@@ -1752,6 +1771,8 @@ mod tests {
         let payload = VersionReplicationMessage::BaoReadAccepted {
             size: 42,
             blake3: hash,
+            etag: Some("etag-1".to_string()),
+            hashes: [("md5".to_string(), vec![3u8; 16])].into_iter().collect(),
         }
         .to_bytes()
         .unwrap();
@@ -1770,6 +1791,8 @@ mod tests {
             BaoReadOutput::Metadata {
                 size: 42,
                 blake3: hash,
+                etag: Some("etag-1".to_string()),
+                hashes: HashMap::from([("md5".to_string(), vec![3u8; 16])]),
             }
         );
     }
@@ -1824,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    fn echoed_refs_never_grant() {
+    fn echoed_refs_denied() {
         // The requester claims to know the rule, but the source still evaluates
         // the destination itself and refuses it.
         let local_node = node_from_seed(1);
@@ -2146,6 +2169,8 @@ mod tests {
             VersionReplicationMessage::BaoReadAccepted {
                 size: 42,
                 blake3: hash,
+                etag: location.hashes.get(HASH_MD5).map(hex::encode),
+                hashes: location.hashes.clone().into_iter().collect(),
             }
         );
 

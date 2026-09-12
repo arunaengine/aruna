@@ -4,26 +4,24 @@ mod shared;
 
 use aruna_api::routes::groups::AddGroupMemberRequest;
 use aruna_core::UserId;
-use aruna_core::structs::blob_bucket_permission_path;
+use aruna_core::structs::bucket_permission_path;
 use aws_sdk_s3::primitives::ByteStream;
 use reqwest::StatusCode;
 use serde_json::json;
 use shared::{
-    TestResult, create_bearer_token, create_group_via_http, create_s3_credentials_via_http,
-    s3_client, spawn_full_seed_node,
+    TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
+    spawn_complete_seed,
 };
 use ulid::Ulid;
 
 const PUBLIC_BODY: &[u8] = b"public profile artifact bytes";
 const PRIVATE_BODY: &[u8] = b"private bytes";
 
-/// A public role (assigned to the Everyone principal via `public: true`)
-/// grants anonymous READ on exactly the paths it names — S3 GETs and DRS
-/// lookups/downloads succeed without credentials, while writes and everything
-/// outside the granted path stay denied.
+/// A public role grants anonymous reads on its exact paths through S3 and DRS.
+/// Writes and access outside those paths remain denied.
 #[tokio::test]
-async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> {
-    let seed = spawn_full_seed_node().await?;
+async fn public_grants_read() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
 
     let result = async {
         let bearer_token = create_bearer_token(
@@ -34,11 +32,9 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
         )
         .await?;
 
-        let group =
-            create_group_via_http(&seed.base_url, &bearer_token, "public-access-e2e").await?;
+        let group = create_group_http(&seed.base_url, &bearer_token, "public-access-e2e").await?;
         let credential_group =
-            create_group_via_http(&seed.base_url, &bearer_token, "public-access-credentials")
-                .await?;
+            create_group_http(&seed.base_url, &bearer_token, "public-access-credentials").await?;
         let member_id = UserId::local(Ulid::generate(), seed.realm_id);
         let member_token = create_bearer_token(
             seed.context.as_ref(),
@@ -66,14 +62,11 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
             .as_ref()
             .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
         let credentials =
-            create_s3_credentials_via_http(&seed.base_url, &bearer_token, &group.group_id).await?;
+            create_s3_credentials(&seed.base_url, &bearer_token, &group.group_id).await?;
         let s3 = s3_client(s3_endpoint, &credentials);
-        let cross_group_credentials = create_s3_credentials_via_http(
-            &seed.base_url,
-            &member_token,
-            &credential_group.group_id,
-        )
-        .await?;
+        let cross_group_credentials =
+            create_s3_credentials(&seed.base_url, &member_token, &credential_group.group_id)
+                .await?;
         let cross_group_s3 = s3_client(s3_endpoint, &cross_group_credentials);
 
         let bucket = "public-profiles";
@@ -141,7 +134,7 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
         let group_ulid = Ulid::from_string(&group.group_id)?;
         let public_path = format!(
             "{}/**",
-            blob_bucket_permission_path(seed.realm_id, group_ulid, seed.net.node_id(), bucket)
+            bucket_permission_path(seed.realm_id, group_ulid, seed.net.node_id(), bucket)
         );
         let permissions = std::collections::HashMap::from([(public_path.clone(), "read")]);
         let created = http
@@ -192,7 +185,7 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
             "anonymous bucket listing must stay denied even when object GET is public"
         );
 
-        // Anonymous writes stay denied — public roles never grant more than
+        // Anonymous writes stay denied; public roles never grant more than
         // the anonymous read path allows.
         let put = http
             .put(&object_url)
@@ -241,9 +234,7 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
             "absent bucket should match private anonymous denial: {absent_body}"
         );
 
-        // Authenticated requests inherit public grants even when the signing
-        // key belongs to another group; signed access is never weaker than
-        // unsigned access.
+        // Authenticated requests inherit public grants even with another group's key.
         let signed = cross_group_s3
             .get_object()
             .bucket(bucket)

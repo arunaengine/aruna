@@ -2,7 +2,7 @@
 
 use crate::driver::DriverContext;
 use crate::jobs::records::rows::from_bytes;
-use crate::node_info::group_demand;
+use crate::node::node_info::group_demand;
 use aruna_core::NodeId;
 use aruna_core::compute_quota::{
     ComputeQuota, QuotaDenied, ResourceTotals, admits, understated_denial,
@@ -18,14 +18,9 @@ use tracing::{info, warn};
 /// group whose revision keeps moving under it.
 const QUOTA_ATTEMPTS: usize = 3;
 
-/// Standing-quota decision before one submission is logically admitted.
-/// `Ok((Some(reason), _))` is a denial applied only to a FRESH claim;
-/// `Err` means the quota or demand view is unavailable and admission fails
-/// closed. An overshoot observed after convergence cancels nothing.
-///
-/// A group whose merged view is understated is denied rather than admitted: the
-/// cap cannot be shown to hold, and a refusal is a quota decision about that
-/// group, never an availability failure of the node.
+/// Standing-quota decision before one submission is admitted. A denial applies
+/// only to a FRESH claim and an overshoot after convergence cancels nothing;
+/// `Err` (view unavailable) fails admission closed; understated views are denied.
 pub async fn quota_refusal(
     context: &DriverContext,
     config: &RealmConfigDocument,

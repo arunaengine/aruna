@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aruna_core::structs::{AuthContext, Permission, blob_bucket_permission_path};
+use aruna_core::structs::{AuthContext, Permission, bucket_permission_path};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket_usage::{
     BucketUsageInput, BucketUsageOperation, BucketUsageOutput,
@@ -126,7 +126,7 @@ pub async fn get_bucket_usage(
     ensure_permission(
         &state,
         &auth,
-        blob_bucket_permission_path(
+        bucket_permission_path(
             state.get_realm_id(),
             info.group_id,
             state.get_node_id(),

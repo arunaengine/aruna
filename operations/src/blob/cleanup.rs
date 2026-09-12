@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::replication::util::dht_registration_effect;
+use crate::replication::dht_registration::dht_registration_effect;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
@@ -20,9 +20,9 @@ use tracing::{error, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::group_backends::{backend_key, parse_read};
+use crate::groups::backends::{backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
-use crate::s3::abort_multipart_upload::{AbortMultipartUploadInput, AbortMultipartUploadOperation};
+use crate::s3::abort_upload::{AbortMultipartUploadInput, AbortMultipartUploadOperation};
 
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
@@ -115,7 +115,7 @@ fn cleanup_row_write(work: &BlobCleanupWork, key: &Key) -> Option<Effect> {
     }
 }
 
-pub fn schedule_blob_cleanup_effect() -> Effect {
+pub fn schedule_cleanup_effect() -> Effect {
     Effect::Task(TaskEffect::ShortenTimer {
         key: TaskKey::DrainBlobCleanupQueue,
         after: Duration::ZERO,
@@ -681,9 +681,8 @@ mod tests {
 
     #[tokio::test]
     async fn unowned_write_deletes() {
-        // Without a location row naming this copy the commit never landed, so
-        // the bytes have to go; this context has no blob handle, so the delete
-        // fails and the row stays for the next drain.
+        // Without a location row the commit never landed, so the bytes must
+        // go; no blob handle here, so the delete fails and the row waits.
         let (_dir, storage, context) = setup_context();
         let BlobCleanupWork::DeleteBlob { location } =
             BlobCleanupWork::from_bytes(&delete_work()).unwrap()

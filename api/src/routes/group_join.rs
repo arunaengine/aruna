@@ -1,19 +1,19 @@
-use crate::auth::{ensure_permission, require_unrestricted_realm_auth};
+use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::join_request::{JoinDecisionKind, JoinRequestState};
 use aruna_core::structs::{Actor, AuthContext, Permission};
-use aruna_operations::driver::drive;
-use aruna_operations::group_join::{
-    GroupJoinError, GroupJoinInput, GroupJoinOperation, JoinAction,
-};
-use aruna_operations::list_join_requests::{
-    ListJoinRequestsError, ListJoinRequestsInput, ListJoinRequestsOperation,
-};
-use aruna_operations::request_policy::{
+use aruna_operations::auth::request_policy::{
     PolicyEnforcementError, PolicyRequestExtras, enforce_policies, policy_request_with,
 };
-use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
+use aruna_operations::driver::drive;
+use aruna_operations::groups::join_request::{
+    GroupJoinError, GroupJoinInput, GroupJoinOperation, JoinAction,
+};
+use aruna_operations::groups::list_requests::{
+    ListJoinRequestsError, ListJoinRequestsInput, ListJoinRequestsOperation,
+};
+use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use http::StatusCode;
@@ -174,7 +174,7 @@ async fn mutate(
                 auth,
                 group_id,
                 action,
-                now_ms: aruna_core::util::unix_timestamp_millis(),
+                now_ms: aruna_core::time::unix_timestamp_millis(),
             }),
             &state.get_ctx(),
         )
@@ -285,7 +285,7 @@ async fn submit_join(
     Path(group_id): Path<Ulid>,
     Json(input): Json<CreateJoinRequest>,
 ) -> ServerResult<(StatusCode, Json<JoinResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     authorize_join(&state, &auth, Some(group_id), Permission::WRITE).await?;
     Ok((
         StatusCode::CREATED,
@@ -323,7 +323,7 @@ async fn list_joins(
     Path(group_id): Path<Ulid>,
     Query(query): Query<JoinQuery>,
 ) -> ServerResult<Json<JoinPage>> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     ensure_permission(
         &state,
         &auth,
@@ -353,7 +353,7 @@ async fn own_joins(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(query): Query<JoinQuery>,
 ) -> ServerResult<Json<JoinPage>> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     authorize_join(&state, &auth, None, Permission::READ).await?;
     Ok(Json(list(&state, auth, None, query).await?))
 }
@@ -376,7 +376,7 @@ async fn withdraw_join(
     Extension(auth): Extension<Option<AuthContext>>,
     Path((group_id, request_id)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     authorize_join(&state, &auth, Some(group_id), Permission::WRITE).await?;
     mutate(&state, auth, group_id, JoinAction::Withdraw { request_id }).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -404,7 +404,7 @@ async fn decide_join(
     Path((group_id, request_id)): Path<(Ulid, Ulid)>,
     Json(input): Json<DecideJoinRequest>,
 ) -> ServerResult<Json<JoinDecisionResponse>> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     ensure_permission(
         &state,
         &auth,

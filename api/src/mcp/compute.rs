@@ -8,7 +8,7 @@ use aruna_core::compute::runtimes::{
     SessionRuntime, quick_runtime,
 };
 use aruna_core::structs::{
-    JobPayload, OBJECT_CONTENT_TYPE_KEY, Permission, blob_group_permission_path, key_content_type,
+    JobPayload, OBJECT_CONTENT_TYPE_KEY, Permission, group_permission_path, key_content_type,
 };
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::lifecycle::family_report;
@@ -123,10 +123,8 @@ pub struct RunScriptInput {
     /// Longer note about what the run does and why. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Name of an existing bucket in that group, for example `project-data`.
-    /// It is the run's workspace: the script is staged under
-    /// `.aruna/scripts/<run id>/` and outputs are written back into it. Call
-    /// `list_buckets` for readable names.
+    /// Existing workspace bucket. Scripts use `.aruna/scripts/<run id>/` and write outputs here.
+    /// Call `list_buckets` for readable names.
     pub bucket: String,
     /// Runtime id from `list_runtimes`: `python-uv`, `deno`, or `bash`.
     pub runtime: String,
@@ -764,7 +762,7 @@ impl McpServer {
                 authorize_tool(
                     &self.state,
                     &auth,
-                    blob_group_permission_path(
+                    group_permission_path(
                         self.state.get_realm_id(),
                         group_id,
                         self.state.get_node_id(),
@@ -999,7 +997,7 @@ async fn compute_probe(
     server: &McpServer,
     auth: &aruna_core::structs::AuthContext,
     permission: Permission,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(&server.state, auth, permission, extras)
         .await

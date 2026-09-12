@@ -7,16 +7,16 @@ use crate::rate_limit::LocalKey;
 use crate::server_state::ServerState;
 use aruna_core::structs::{
     ArunaArn, ArunaArnType, AuthContext, BackendLocation, Permission, SourceMetadata,
-    VersionedObjectArn, W3idDataIdentifier, blob_object_permission_path,
+    VersionedObjectArn, W3idDataIdentifier, object_permission_path,
 };
-use aruna_operations::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
+use aruna_operations::blob::permission_paths::ResolveBlobPermissionPathsOperation;
 use aruna_operations::driver::{drive, drive_until};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::replication::location_summary::{
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::replication::locations::{
     LocationSummaryError, RemoteLocationSummaryOperation,
 };
 use aruna_operations::replication::protocol::LocationSummaryRequest;
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::body::Body;
@@ -417,7 +417,7 @@ pub async fn get_object(
 ) -> Response {
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let anonymous = auth.is_none();
-    let auth = match drs_auth_or_anonymous(state.as_ref(), auth) {
+    let auth = match drs_auth(state.as_ref(), auth) {
         Ok(auth) => auth,
         Err(error) => return error.into_response(),
     };
@@ -529,7 +529,7 @@ pub async fn post_objects(
     }
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let anonymous = auth.is_none();
-    let auth = match drs_auth_or_anonymous(state.as_ref(), auth) {
+    let auth = match drs_auth(state.as_ref(), auth) {
         Ok(auth) => auth,
         Err(error) => return error.into_response(),
     };
@@ -640,7 +640,7 @@ pub async fn download_object(
     Query(query): Query<DownloadQuery>,
 ) -> Response {
     let anonymous = auth.is_none();
-    let Ok(auth) = drs_auth_or_anonymous(state.as_ref(), auth) else {
+    let Ok(auth) = drs_auth(state.as_ref(), auth) else {
         return drs_error(StatusCode::NOT_FOUND, "DRS object not found");
     };
     let resolved =
@@ -777,10 +777,7 @@ fn require_drs_auth(
 /// Requests without a bearer token resolve as the Everyone principal. Public
 /// roles are then the only grants that can make an object readable; denied
 /// anonymous lookups are mapped to 404 at the route layer.
-fn drs_auth_or_anonymous(
-    state: &ServerState,
-    auth: Option<AuthContext>,
-) -> Result<AuthContext, DrsError> {
+fn drs_auth(state: &ServerState, auth: Option<AuthContext>) -> Result<AuthContext, DrsError> {
     match auth {
         Some(_) => require_drs_auth(state, auth),
         None => Ok(AuthContext::anonymous(state.get_realm_id())),
@@ -807,7 +804,7 @@ async fn resolve_object(
     object_id: &str,
     deadline: Instant,
 ) -> Result<ResolveOutcome, DrsError> {
-    match parse_requested_object_id(object_id)? {
+    match parse_object_id(object_id)? {
         RequestedObjectId::CanonicalW3id(hash) => {
             resolve_content_hash(state, auth, object_id, None, &hash).await
         }
@@ -941,14 +938,14 @@ async fn resolve_versioned(
         return Ok(ResolveOutcome::NotFound);
     };
 
-    let path = blob_object_permission_path(
+    let path = object_permission_path(
         arn.realm_id,
         bucket_info.group_id,
         arn.node_id,
         &arn.bucket,
         &arn.key,
     );
-    if !can_read_permission_path(state, auth, &path).await? {
+    if !can_read_path(state, auth, &path).await? {
         return Ok(ResolveOutcome::Denied);
     }
 
@@ -1000,7 +997,7 @@ async fn resolve_content_hash(
         let allowed = match &last_permission_check {
             Some((cached_path, allowed)) if cached_path == &path => *allowed,
             _ => {
-                let allowed = can_read_permission_path(state, auth, &path).await?;
+                let allowed = can_read_path(state, auth, &path).await?;
                 last_permission_check = Some((path.clone(), allowed));
                 allowed
             }
@@ -1065,7 +1062,7 @@ async fn resolve_content_hash(
     }
 }
 
-async fn can_read_permission_path(
+async fn can_read_path(
     state: &ServerState,
     auth: &AuthContext,
     path: &str,
@@ -1077,7 +1074,7 @@ async fn can_read_permission_path(
     }
 }
 
-fn parse_requested_object_id(object_id: &str) -> Result<RequestedObjectId, DrsError> {
+fn parse_object_id(object_id: &str) -> Result<RequestedObjectId, DrsError> {
     if object_id.starts_with(W3ID_DATA_PREFIX) {
         return match W3idDataIdentifier::parse(object_id)
             .map_err(|error| DrsError::bad_request(error.to_string()))?
@@ -1192,25 +1189,25 @@ mod tests {
     use super::{
         DrsBulkObjectsRequestBody, GetObjectError, MAX_BULK_OBJECT_IDS, RequestedObjectId,
         ResolveOutcome, ResolvedObject, W3ID_DATA_PREFIX, build_object_response, download_error,
-        drs_denied_error, encode_component, get_authorizations, get_object,
-        parse_requested_object_id, post_objects, resolve_object, routed_deadline,
+        drs_denied_error, encode_component, get_authorizations, get_object, parse_object_id,
+        post_objects, resolve_object, routed_deadline,
     };
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
+    use crate::tests::fixtures::routes::{
+        seed_group_docs, seed_realm_auth, seed_realm_config, test_context,
+        test_state as build_state, test_storage,
+    };
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
-        REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+        BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
         Actor, AuthContext, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BucketInfo,
-        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmId, SourceMetadata, VersionKey, VersionedObjectArn,
+        NodeCapabilities, RealmId, SourceMetadata, VersionKey, VersionedObjectArn,
     };
     use aruna_core::{NodeId, UserId};
-    use aruna_operations::driver::DriverContext;
-    use aruna_storage::storage::FjallStorage;
     use axum::Extension;
     use axum::body::to_bytes;
     use axum::extract::{ConnectInfo, Path, State};
@@ -1258,25 +1255,12 @@ mod tests {
     }
 
     async fn test_state() -> (TempDir, Arc<ServerState>) {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        let ctx = Arc::new(DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
-        let state = ServerState::new(
-            ctx,
+        let (dir, storage) = test_storage();
+        let state = build_state(
+            Arc::new(test_context(storage)),
             test_realm_id(),
             test_node_id(),
             NodeCapabilities::user_node(test_realm_id()).expect("capabilities"),
-            false,
-            None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
         (dir, Arc::new(state))
@@ -1327,48 +1311,19 @@ mod tests {
             user_id: owner,
             realm_id,
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
-        let group = Group {
-            display_name: "drs-group".to_string(),
-            group_id,
-            realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner,
-        };
         // Request-policy loading fails closed without the realm config, the group
         // record, and the group auth document.
-        write_fixture(
-            state,
-            REALM_CONFIG_KEYSPACE,
-            realm_id.as_bytes().to_vec(),
-            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
-                .to_bytes(&actor)
-                .expect("realm config serializes"),
+        seed_realm_config(&state.get_ctx(), realm_id, &actor).await;
+        seed_group_docs(
+            &state.get_ctx(),
+            realm_id,
+            &actor,
+            group_id,
+            "drs-group",
+            owner,
         )
         .await;
-        write_fixture(
-            state,
-            GROUP_KEYSPACE,
-            group_id.to_bytes().to_vec(),
-            group.to_bytes(&actor).expect("group serializes"),
-        )
-        .await;
-        write_fixture(
-            state,
-            AUTH_KEYSPACE,
-            realm_id.as_bytes().to_vec(),
-            realm_auth.to_bytes(&actor).expect("realm auth serializes"),
-        )
-        .await;
-        write_fixture(
-            state,
-            AUTH_KEYSPACE,
-            group_id.to_bytes().to_vec(),
-            group_auth.to_bytes(&actor).expect("group auth serializes"),
-        )
-        .await;
+        seed_realm_auth(&state.get_ctx(), realm_id, &actor).await;
 
         let bucket = "mybucket";
         let key = "path/file @ 1.txt";
@@ -1435,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_drs_denied_error_matches_unknown_object() {
+    fn anonymous_denial_concealed() {
         let anonymous = drs_denied_error(true);
         assert_eq!(anonymous.status, axum::http::StatusCode::NOT_FOUND);
         assert_eq!(anonymous.message, "DRS object not found");
@@ -1446,13 +1401,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_canonical_w3id_object_id() {
+    fn parses_canonical_w3id() {
         let expected_hash = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
             0x1c, 0x1d, 0x1e, 0x1f,
         ];
-        let parsed = parse_requested_object_id(
+        let parsed = parse_object_id(
             "https://w3id.org/aruna/data/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
         )
         .unwrap();
@@ -1465,14 +1420,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_content_hash_arn_preserving_realm_node_and_hash() {
+    fn parses_content_arn() {
         let realm_id = test_realm_id();
         let node_id = test_node_id();
         let arn = format!(
             "arn:aruna:{realm_id}:{node_id}:ch/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
         );
 
-        let parsed = parse_requested_object_id(&arn).unwrap();
+        let parsed = parse_object_id(&arn).unwrap();
 
         match parsed {
             RequestedObjectId::ContentHashArn {
@@ -1503,7 +1458,7 @@ mod tests {
         let bare = format!("arn:aruna:{realm_id}:{node_id}:s3/mybucket/path/file.txt@invalid");
 
         for object_id in [bare.clone(), format!("{W3ID_DATA_PREFIX}{bare}")] {
-            let error = parse_requested_object_id(&object_id)
+            let error = parse_object_id(&object_id)
                 .err()
                 .expect("malformed version should be rejected");
             assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -1656,7 +1611,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_canonical_w3id_response_omits_aliases_and_keeps_download_method() {
+    fn canonical_response_complete() {
         let blake3 = [0x11u8; 32];
         let canonical_w3id = format!("{W3ID_DATA_PREFIX}{}", hex::encode(blake3));
         let resolved = ResolvedObject {
@@ -1708,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_content_hash_arn_response_exposes_canonical_alias() {
+    fn content_response_aliases() {
         let realm_id = test_realm_id();
         let node_id = test_node_id();
         let blake3 = [0x22u8; 32];
@@ -1796,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn drs_openapi_includes_service_and_object_paths() {
+    fn openapi_has_drs() {
         let openapi = ApiDoc::openapi();
         assert!(
             openapi

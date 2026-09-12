@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use ulid::Ulid;
 
-pub(super) fn control_plane_timeout_event(
+pub(super) fn timeout_event(
     kind: ControlPlaneTimeoutKind,
     action: &'static str,
     timeout: Duration,
@@ -24,7 +24,7 @@ pub(super) fn control_plane_timeout_event(
     BlobEvent::Error(error)
 }
 
-pub(super) async fn with_control_plane_timeout<F, T>(
+pub(super) async fn with_timeout<F, T>(
     future: F,
     timeout_duration: Duration,
     kind: ControlPlaneTimeoutKind,
@@ -35,16 +35,16 @@ where
 {
     timeout(timeout_duration, future)
         .await
-        .map_err(|_| control_plane_timeout_event(kind, action, timeout_duration))
+        .map_err(|_| timeout_event(kind, action, timeout_duration))
 }
 
-pub(super) async fn send_replication_message_with_timeout(
+pub(super) async fn send_replication_message(
     sender: &mut SendStream,
     message: ReplicationMessage,
     timeout_duration: Duration,
     action: &'static str,
 ) -> Result<(), BlobEvent> {
-    match with_control_plane_timeout(
+    match with_timeout(
         message.send(sender),
         timeout_duration,
         ControlPlaneTimeoutKind::Write,
@@ -58,12 +58,12 @@ pub(super) async fn send_replication_message_with_timeout(
     }
 }
 
-pub(super) async fn read_replication_message_with_timeout(
+pub(super) async fn read_replication_message(
     receiver: &mut RecvStream,
     timeout_duration: Duration,
     action: &'static str,
 ) -> Result<ReplicationMessage, BlobEvent> {
-    match with_control_plane_timeout(
+    match with_timeout(
         ReplicationMessage::read(receiver),
         timeout_duration,
         ControlPlaneTimeoutKind::Read,
@@ -77,13 +77,13 @@ pub(super) async fn read_replication_message_with_timeout(
     }
 }
 
-pub(super) async fn send_framed_message_with_timeout(
+pub(super) async fn send_framed_message(
     sender: &mut SendStream,
     payload: &[u8],
     timeout_duration: Duration,
     action: &'static str,
 ) -> Result<(), BlobEvent> {
-    match with_control_plane_timeout(
+    match with_timeout(
         write_frame(sender, payload, MAX_CONTROL_PLANE_FRAME),
         timeout_duration,
         ControlPlaneTimeoutKind::Write,
@@ -97,12 +97,12 @@ pub(super) async fn send_framed_message_with_timeout(
     }
 }
 
-pub(super) async fn read_framed_message_with_timeout(
+pub(super) async fn read_framed_message(
     receiver: &mut RecvStream,
     timeout_duration: Duration,
     action: &'static str,
 ) -> Result<Vec<u8>, BlobEvent> {
-    match with_control_plane_timeout(
+    match with_timeout(
         read_frame(receiver, MAX_CONTROL_PLANE_FRAME),
         timeout_duration,
         ControlPlaneTimeoutKind::Read,
@@ -116,7 +116,7 @@ pub(super) async fn read_framed_message_with_timeout(
     }
 }
 
-pub(super) fn validate_replication_init_ack(
+pub(super) fn validate_init_ack(
     message: ReplicationMessage,
     replication_id: Ulid,
 ) -> Result<(), BlobError> {
@@ -158,11 +158,11 @@ pub(super) fn parse_replication_init(
 }
 
 impl BlobHandler {
-    pub(super) fn control_plane_connect_timeout(&self) -> Duration {
+    pub(super) fn connect_timeout(&self) -> Duration {
         self.registry.timeouts().control_plane_connect_timeout
     }
 
-    pub(super) fn control_plane_io_timeout(&self) -> Duration {
+    pub(super) fn io_timeout(&self) -> Duration {
         self.registry.timeouts().control_plane_io_timeout
     }
 

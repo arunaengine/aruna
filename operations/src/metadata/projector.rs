@@ -12,17 +12,16 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-    METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
+    METADATA_PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataError,
     MetadataGraphLifecycleRecord, MetadataMaterializationStatusRecord,
 };
 use aruna_core::storage_entries::{
-    metadata_document_lifecycle_revision_change, metadata_document_lifecycle_write_entry,
-    metadata_event_log_key, metadata_graph_lifecycle_key, metadata_materialization_status_key,
-    metadata_pending_projection_delete_entry, metadata_pending_projection_key,
-    metadata_pending_projection_target, metadata_registry_delete_entries,
+    delete_projection_entry, document_lifecycle_entry, event_log_key, graph_lifecycle_key,
+    lifecycle_revision_change, pending_projection_key, pending_projection_target,
+    registry_delete_entries,
 };
 use aruna_core::structs::{
     MetadataAuditRecord, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId,
@@ -39,19 +38,18 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::document_sync_outbox::schedule_outbox_drain_effect;
 use crate::driver::DriverContext;
 use crate::metadata::materialization_queue::{
-    new_materialization_job, new_pending_materialization_status,
-    schedule_metadata_materialization_drain_effect,
+    new_materialization_job, new_pending_status, schedule_materialization,
 };
 use crate::metadata::repository::{
-    create_records_and_outbox_write_entries,
-    create_records_outbox_and_materialization_write_entries, read_registry_by_document_effect,
+    StorageReadError, create_materialization_entries, create_outbox_entries, parse_lifecycle_read,
+    parse_status_read, read_document_registry, read_lifecycle_effect, read_status_effect,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
-use crate::sync_placement::sort_node_ids;
-use crate::task_persistence::persist_task_effect;
+use crate::sync::document_outbox::schedule_drain_effect;
+use crate::sync::shard_placement::sort_node_ids;
+use crate::tasks::task_persistence::persist_task_effect;
 
 const REPLAY_PAGE_SIZE: usize = 1_024;
 const PENDING_PROJECTION_PAGE_SIZE: usize = 256;
@@ -65,14 +63,13 @@ pub struct PendingMetadataProjectionDrainResult {
 }
 
 /// Conflict resolution is last-writer-wins on wall-clock time, so an event
-/// stamped far in the future would win every conflict forever. Inbound
-/// events beyond the configured skew are deferred until retry; operators must
-/// run NTP.
+/// stamped far ahead would win forever. Events beyond the configured skew are
+/// deferred until retry; operators must run NTP.
 const DEFAULT_MAX_CLOCK_SKEW_SECS: u64 = 300;
 
 static CLOCK_SKEW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 
-fn max_clock_skew_ms() -> u64 {
+fn max_clock_skew() -> u64 {
     static SKEW_MS: OnceLock<u64> = OnceLock::new();
     *SKEW_MS.get_or_init(|| {
         std::env::var("MAX_CLOCK_SKEW_SECS")
@@ -81,10 +78,6 @@ fn max_clock_skew_ms() -> u64 {
             .unwrap_or(DEFAULT_MAX_CLOCK_SKEW_SECS)
             .saturating_mul(1000)
     })
-}
-
-pub fn clock_skew_rejection_count() -> u64 {
-    CLOCK_SKEW_REJECTIONS.load(Ordering::Relaxed)
 }
 
 fn exceeds_clock_skew(event: &MetadataCreateEventRecord, now_ms: u64, max_skew_ms: u64) -> bool {
@@ -112,18 +105,18 @@ pub enum MetadataProjectionError {
     UnexpectedEvent(String),
 }
 
-fn pending_metadata_projection_drain_task_effect(after: Duration) -> TaskEffect {
+fn pending_drain_effect(after: Duration) -> TaskEffect {
     TaskEffect::ResetTimer {
         key: TaskKey::DrainMetadataProjectionQueue,
         after,
     }
 }
 
-pub async fn schedule_pending_metadata_projection_drain(
+pub async fn schedule_projection_drain(
     context: &DriverContext,
     after: Duration,
 ) -> Result<(), MetadataProjectionError> {
-    let effect = pending_metadata_projection_drain_task_effect(after);
+    let effect = pending_drain_effect(after);
     persist_task_effect(&context.storage_handle, &effect)
         .await
         .map_err(MetadataProjectionError::UnexpectedEvent)?;
@@ -142,10 +135,7 @@ pub async fn schedule_pending_metadata_projection_drain(
     }
 }
 
-pub async fn restore_pending_metadata_projection_timer(
-    storage: &StorageHandle,
-    task_handle: &TaskHandle,
-) {
+pub async fn restore_projection_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     let event = storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
@@ -159,9 +149,7 @@ pub async fn restore_pending_metadata_projection_timer(
         Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty() => {}
         Event::Storage(StorageEvent::IterResult { .. }) => {
             let event = task_handle
-                .send_effect(Effect::Task(pending_metadata_projection_drain_task_effect(
-                    Duration::ZERO,
-                )))
+                .send_effect(Effect::Task(pending_drain_effect(Duration::ZERO)))
                 .await;
             if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = event {
                 warn!(message = %message, "Failed to restore metadata projection timer");
@@ -176,9 +164,7 @@ pub async fn restore_pending_metadata_projection_timer(
     }
 }
 
-pub async fn replay_metadata_event_log(
-    context: &DriverContext,
-) -> Result<usize, MetadataProjectionError> {
+pub async fn replay_event_log(context: &DriverContext) -> Result<usize, MetadataProjectionError> {
     let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
     let mut start_after: Option<Key> = None;
     let mut projected = 0usize;
@@ -211,8 +197,8 @@ pub async fn replay_metadata_event_log(
         for (_, value) in values {
             events.push(postcard::from_bytes(&value).map_err(ConversionError::from)?);
         }
-        projected = projected
-            .saturating_add(project_metadata_create_events(context, events, local_node_id).await?);
+        projected =
+            projected.saturating_add(project_create_events(context, events, local_node_id).await?);
 
         match next_start_after {
             Some(next) => start_after = Some(next),
@@ -221,7 +207,7 @@ pub async fn replay_metadata_event_log(
     }
 }
 
-pub async fn drain_pending_metadata_projection_queue(
+pub async fn drain_projection_queue(
     context: &DriverContext,
 ) -> Result<PendingMetadataProjectionDrainResult, MetadataProjectionError> {
     let page = context
@@ -249,16 +235,15 @@ pub async fn drain_pending_metadata_projection_queue(
 
     let mut targets = Vec::with_capacity(values.len());
     for (key, _) in &values {
-        let Some(target) = metadata_pending_projection_target(key.as_ref()) else {
+        let Some(target) = pending_projection_target(key.as_ref()) else {
             let key = key.to_vec();
             warn!(key = ?key, "Deleting malformed metadata pending projection marker");
-            delete_pending_projection_marker_keys(context, vec![key]).await?;
+            delete_marker_keys(context, vec![key]).await?;
             continue;
         };
         targets.push(target);
     }
-    let projected_from_log =
-        project_metadata_create_events_from_log_inner(context, targets, true).await?;
+    let projected_from_log = project_logged_batch(context, targets, true).await?;
     Ok(PendingMetadataProjectionDrainResult {
         markers_examined: projected_from_log.existing_events,
         projected: projected_from_log.projected,
@@ -266,25 +251,23 @@ pub async fn drain_pending_metadata_projection_queue(
     })
 }
 
-pub async fn project_metadata_create_event_from_log(
+pub async fn project_logged_event(
     context: &DriverContext,
     document_id: Ulid,
     event_id: Ulid,
 ) -> Result<(), MetadataProjectionError> {
-    project_metadata_create_events_from_log(context, [(document_id, event_id)])
+    project_logged_events(context, [(document_id, event_id)])
         .await
         .map(|_| ())
 }
 
-pub async fn project_metadata_create_events_from_log(
+pub async fn project_logged_events(
     context: &DriverContext,
     targets: impl IntoIterator<Item = (Ulid, Ulid)>,
 ) -> Result<usize, MetadataProjectionError> {
-    Ok(
-        project_metadata_create_events_from_log_inner(context, targets, false)
-            .await?
-            .projected,
-    )
+    Ok(project_logged_batch(context, targets, false)
+        .await?
+        .projected)
 }
 
 struct MetadataProjectionFromLogResult {
@@ -292,7 +275,7 @@ struct MetadataProjectionFromLogResult {
     existing_events: usize,
 }
 
-async fn project_metadata_create_events_from_log_inner(
+async fn project_logged_batch(
     context: &DriverContext,
     targets: impl IntoIterator<Item = (Ulid, Ulid)>,
     delete_orphan_markers: bool,
@@ -305,7 +288,7 @@ async fn project_metadata_create_events_from_log_inner(
         if !seen.insert((document_id, event_id)) {
             continue;
         }
-        match read_create_event_from_log(context, document_id, event_id).await {
+        match read_create_event(context, document_id, event_id).await {
             Ok(event) => events.push(event),
             Err(MetadataProjectionError::MetadataCreateEventMissing {
                 document_id,
@@ -326,16 +309,16 @@ async fn project_metadata_create_events_from_log_inner(
             Err(error) => return Err(error),
         }
     }
-    delete_pending_projection_markers(context, missing_event_markers).await?;
+    delete_pending_markers(context, missing_event_markers).await?;
     let existing_events = events.len();
-    let projected = project_metadata_create_events(context, events, local_node_id).await?;
+    let projected = project_create_events(context, events, local_node_id).await?;
     Ok(MetadataProjectionFromLogResult {
         projected,
         existing_events,
     })
 }
 
-async fn read_create_event_from_log(
+async fn read_create_event(
     context: &DriverContext,
     document_id: Ulid,
     event_id: Ulid,
@@ -344,7 +327,7 @@ async fn read_create_event_from_log(
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
-            key: metadata_event_log_key(document_id, event_id),
+            key: event_log_key(document_id, event_id),
             txn_id: None,
         })
         .await
@@ -374,17 +357,17 @@ async fn read_create_event_from_log(
     Ok(event)
 }
 
-pub async fn project_metadata_create_event(
+pub async fn project_create_event(
     context: &DriverContext,
     event: MetadataCreateEventRecord,
     local_node_id: Option<NodeId>,
 ) -> Result<(), MetadataProjectionError> {
-    project_metadata_create_events(context, vec![event], local_node_id)
+    project_create_events(context, vec![event], local_node_id)
         .await
         .map(|_| ())
 }
 
-pub async fn project_metadata_create_events(
+pub async fn project_create_events(
     context: &DriverContext,
     events: Vec<MetadataCreateEventRecord>,
     local_node_id: Option<NodeId>,
@@ -416,8 +399,8 @@ pub async fn project_metadata_create_events(
 
     for event in events {
         let document_id = event.record.document_id;
-        let now_ms = aruna_core::util::unix_timestamp_millis();
-        if exceeds_clock_skew(&event, now_ms, max_clock_skew_ms()) {
+        let now_ms = aruna_core::time::unix_timestamp_millis();
+        if exceeds_clock_skew(&event, now_ms, max_clock_skew()) {
             let rejected_total = CLOCK_SKEW_REJECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             warn!(
                 event = "metadata.event.rejected",
@@ -435,9 +418,7 @@ pub async fn project_metadata_create_events(
             continue;
         }
         pending_projection_delete_targets.insert((document_id, event.event_id));
-        if metadata_graph_deleted_cached(context, &event.record.graph_iri, &mut lifecycle_cache)
-            .await?
-        {
+        if graph_deleted_cached(context, &event.record.graph_iri, &mut lifecycle_cache).await? {
             let existing_registry = match registry_cache.get(&document_id) {
                 Some(record) => record.clone(),
                 None => {
@@ -447,7 +428,7 @@ pub async fn project_metadata_create_events(
                 }
             };
             let stale_record = existing_registry.as_ref().unwrap_or(&event.record);
-            repair_deletes.extend(metadata_registry_delete_entries(stale_record));
+            repair_deletes.extend(registry_delete_entries(stale_record));
             repaired_records.push(stale_record.clone());
             registry_cache.insert(document_id, None);
             status_cache.insert(document_id, None);
@@ -455,8 +436,7 @@ pub async fn project_metadata_create_events(
         }
 
         let event =
-            expand_create_event_holders_cached(context, event, local_node_id, &mut realm_configs)
-                .await?;
+            expand_cached_holders(context, event, local_node_id, &mut realm_configs).await?;
         let existing_registry = match registry_cache.get(&document_id) {
             Some(record) => record.clone(),
             None => {
@@ -477,9 +457,8 @@ pub async fn project_metadata_create_events(
             .map(|record| record.holder_node_ids != event.record.holder_node_ids)
             .unwrap_or(false);
         let registry_exists = existing_registry.is_some();
-        // The materialization status record tracks the newest event whose
-        // materialization was enqueued or finished, so re-deliveries decide
-        // the skip path from storage alone without a craqle round trip.
+        // The materialization status record tracks the newest event whose materialization
+        // was enqueued or finished, so re-deliveries decide the skip path from storage.
         let needs_materialization = if registry_exists {
             let status = match status_cache.get(&document_id) {
                 Some(status) => status.clone(),
@@ -532,7 +511,7 @@ pub async fn project_metadata_create_events(
             // The local node authored this create event, so it originates the
             // document's lifecycle sync topic and may mint its genesis.
             Some(
-                create_event_outbox_record(&event, realm_config, true)
+                create_outbox_record(&event, realm_config, true)
                     .fenced_at(fence.generation(&realm_id, &event.record.placement)),
             )
         } else {
@@ -554,10 +533,10 @@ pub async fn project_metadata_create_events(
         });
         let audit = audit_record(&event);
         if needs_materialization {
-            let now = aruna_core::util::unix_timestamp_millis();
-            let status = new_pending_materialization_status(&event, now);
+            let now = aruna_core::time::unix_timestamp_millis();
+            let status = new_pending_status(&event, now);
             let job = new_materialization_job(&event, now);
-            writes.extend(create_records_outbox_and_materialization_write_entries(
+            writes.extend(create_materialization_entries(
                 &event.record,
                 &audit,
                 event.event_id,
@@ -568,7 +547,7 @@ pub async fn project_metadata_create_events(
             needs_materialization_drain = true;
             status_cache.insert(document_id, Some(status));
         } else {
-            writes.extend(create_records_and_outbox_write_entries(
+            writes.extend(create_outbox_entries(
                 &event.record,
                 &audit,
                 event.event_id,
@@ -580,13 +559,13 @@ pub async fn project_metadata_create_events(
         }
         if let Some(registry_outbox) = registry_outbox.flatten() {
             writes.push(
-                crate::document_sync_outbox::outbox_write_entry(&registry_outbox)
+                crate::sync::document_outbox::outbox_write_entry(&registry_outbox)
                     .map_err(ConversionError::from)?,
             );
             outboxes.push(registry_outbox);
         }
         if local_node_id == Some(event.node_id) {
-            writes.push(metadata_document_lifecycle_write_entry(
+            writes.push(document_lifecycle_entry(
                 &MetadataDocumentLifecycleRecord::Upsert {
                     event: Box::new(event.clone()),
                 },
@@ -616,7 +595,7 @@ pub async fn project_metadata_create_events(
         }
         if let Some(metadata_handle) = context.metadata_handle.as_ref() {
             for record in &repaired_records {
-                metadata_handle.remove_cached_registry_record(record.document_id);
+                metadata_handle.remove_cached_record(record.document_id);
             }
         }
     }
@@ -633,7 +612,7 @@ pub async fn project_metadata_create_events(
                     metadata_handle.upsert_cached_at(record, cache_generation);
                 }
             } else {
-                metadata_handle.upsert_cached_registry_records(&projected_records);
+                metadata_handle.cache_registry_records(&projected_records);
             }
         }
     }
@@ -643,12 +622,11 @@ pub async fn project_metadata_create_events(
     if needs_materialization_drain {
         schedule_materialization_drain(context).await?;
     }
-    write_pending_projection_markers(context, &pending_projection_retry_targets).await?;
-    write_pending_projection_markers(context, &mint_retry_targets).await?;
-    delete_pending_projection_markers(context, pending_projection_delete_targets).await?;
+    write_pending_markers(context, &pending_projection_retry_targets).await?;
+    write_pending_markers(context, &mint_retry_targets).await?;
+    delete_pending_markers(context, pending_projection_delete_targets).await?;
     if !mint_retry_targets.is_empty() {
-        schedule_pending_metadata_projection_drain(context, METADATA_PROJECTION_RETRY_AFTER)
-            .await?;
+        schedule_projection_drain(context, METADATA_PROJECTION_RETRY_AFTER).await?;
     }
 
     if !pending_projection_retry_targets.is_empty() {
@@ -669,7 +647,7 @@ async fn pending_projection_marker(
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
-            key: metadata_pending_projection_key(document_id, event_id),
+            key: pending_projection_key(document_id, event_id),
             txn_id: None,
         })
         .await;
@@ -724,7 +702,7 @@ async fn transactional_projection_write(
         .map(|graph_iri| {
             (
                 METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-                metadata_graph_lifecycle_key(graph_iri),
+                graph_lifecycle_key(graph_iri),
             )
         })
         .collect::<Vec<_>>();
@@ -819,7 +797,7 @@ async fn transactional_projection_write(
     }
 }
 
-async fn write_pending_projection_markers(
+async fn write_pending_markers(
     context: &DriverContext,
     targets: &BTreeSet<(Ulid, Ulid)>,
 ) -> Result<(), MetadataProjectionError> {
@@ -831,7 +809,7 @@ async fn write_pending_projection_markers(
         .map(|(document_id, event_id)| {
             (
                 METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
-                metadata_pending_projection_key(*document_id, *event_id),
+                pending_projection_key(*document_id, *event_id),
                 ByteView::from(Vec::new()),
             )
         })
@@ -852,7 +830,7 @@ async fn write_pending_projection_markers(
     }
 }
 
-async fn delete_pending_projection_markers(
+async fn delete_pending_markers(
     context: &DriverContext,
     targets: BTreeSet<(Ulid, Ulid)>,
 ) -> Result<(), MetadataProjectionError> {
@@ -861,9 +839,7 @@ async fn delete_pending_projection_markers(
     }
     let deletes = targets
         .into_iter()
-        .map(|(document_id, event_id)| {
-            metadata_pending_projection_delete_entry(document_id, event_id)
-        })
+        .map(|(document_id, event_id)| delete_projection_entry(document_id, event_id))
         .collect();
     match context
         .storage_handle
@@ -881,7 +857,7 @@ async fn delete_pending_projection_markers(
     }
 }
 
-async fn delete_pending_projection_marker_keys(
+async fn delete_marker_keys(
     context: &DriverContext,
     keys: Vec<Vec<u8>>,
 ) -> Result<(), MetadataProjectionError> {
@@ -913,7 +889,7 @@ async fn delete_pending_projection_marker_keys(
     }
 }
 
-async fn expand_create_event_holders_cached(
+async fn expand_cached_holders(
     context: &DriverContext,
     event: MetadataCreateEventRecord,
     local_node_id: Option<NodeId>,
@@ -933,10 +909,10 @@ async fn expand_create_event_holders_cached(
         None
     };
 
-    expand_create_event_holders(event, local_node_id, realm_config.as_ref())
+    expand_event_holders(event, local_node_id, realm_config.as_ref())
 }
 
-fn expand_create_event_holders(
+fn expand_event_holders(
     mut event: MetadataCreateEventRecord,
     _local_node_id: Option<NodeId>,
     _realm_config: Option<&RealmConfigDocument>,
@@ -970,22 +946,9 @@ async fn read_realm_config(
     }
 }
 
-/// The document's registry row, published on the registry class's own topic
-/// rather than the document's bucket topic.
-///
-/// The bucket is replica-capped, so on a realm larger than the replication factor
-/// most nodes never see the document's bucket topic at all — and every registry
-/// row a node has today arrives as a side effect of that topic's lifecycle
-/// events. Those nodes would therefore never learn the document exists: a GET
-/// through them 404s forever, and update/delete could not even load the record
-/// they need in order to decide to forward it to a holder. The registry class is
-/// bound "everywhere", so this row reaches every node and gives each one the
-/// `document_id -> placement -> holders` mapping the routing layer runs on.
-///
-/// `None` without a readable realm config (no strategy to resolve, and a
-/// NIL-placed shard record would derive a NIL topic) and `None` when the registry
-/// bucket has no holder at all: the realm has no eligible node, so there is nobody
-/// to publish to, and replay re-plans the row once there is.
+/// The document's registry row, published on the registry class's own
+/// everywhere-bound topic rather than the replica-capped bucket topic, so every
+/// node learns the routing mapping. `None` without config or a holder; replay re-plans.
 pub fn registry_outbox_record(
     event: &MetadataCreateEventRecord,
     realm_config: Option<&RealmConfigDocument>,
@@ -1032,7 +995,7 @@ pub fn registry_outbox_record(
     })
 }
 
-pub fn create_event_outbox_record(
+pub fn create_outbox_record(
     event: &MetadataCreateEventRecord,
     realm_config: Option<&RealmConfigDocument>,
     allow_genesis: bool,
@@ -1043,14 +1006,13 @@ pub fn create_event_outbox_record(
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: event.record.document_id,
     };
-    // The bucket is the one the create stamped; peers are its live holders, so a
-    // publish after a rebalance targets the current holder set and not the
-    // event-time one.
+    // The bucket is the one the create stamped; peers are its live holders, so a publish after
+    // a rebalance targets the current holder set and not the event-time one.
     let placement = event.record.placement;
     let peers = realm_config
         .map(|config| resolve_shard_holders(config, &placement))
         .unwrap_or_default();
-    let change = metadata_document_lifecycle_revision_change(&lifecycle, event.node_id, placement);
+    let change = lifecycle_revision_change(&lifecycle, event.node_id, placement);
     DocumentSyncOutboxRecord {
         outbox_id: event.event_id,
         node_id: event.node_id,
@@ -1068,7 +1030,7 @@ pub fn create_event_outbox_record(
     }
 }
 
-async fn metadata_graph_deleted_cached(
+async fn graph_deleted_cached(
     context: &DriverContext,
     graph_iri: &str,
     lifecycle_cache: &mut BTreeMap<String, bool>,
@@ -1085,28 +1047,16 @@ async fn metadata_graph_deleted(
     context: &DriverContext,
     graph_iri: &str,
 ) -> Result<bool, MetadataProjectionError> {
-    match context
+    let event = context
         .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_graph_lifecycle_key(graph_iri),
-            txn_id: None,
+        .send_effect(read_lifecycle_effect(graph_iri, None))
+        .await;
+    parse_lifecycle_read(event)
+        .map(|record| record.is_some_and(|record| record.is_deleted()))
+        .map_err(|error| match error {
+            StorageReadError::Storage(error) => error.into(),
+            StorageReadError::Conversion(error) => error.into(),
         })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => {
-            let record: MetadataGraphLifecycleRecord =
-                postcard::from_bytes(&value).map_err(ConversionError::from)?;
-            Ok(record.is_deleted())
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
 }
 
 fn audit_record(event: &MetadataCreateEventRecord) -> MetadataAuditRecord {
@@ -1133,7 +1083,7 @@ async fn read_existing_registry(
 ) -> Result<Option<MetadataRegistryRecord>, MetadataProjectionError> {
     match context
         .storage_handle
-        .send_effect(read_registry_by_document_effect(document_id, None))
+        .send_effect(read_document_registry(document_id, None))
         .await
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value
@@ -1151,34 +1101,21 @@ async fn read_materialization_status(
     context: &DriverContext,
     document_id: Ulid,
 ) -> Result<Option<MetadataMaterializationStatusRecord>, MetadataProjectionError> {
-    match context
+    let event = context
         .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
-            key: metadata_materialization_status_key(document_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| postcard::from_bytes(&value).map_err(ConversionError::from))
-            .transpose()
-            .map_err(Into::into),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
+        .send_effect(read_status_effect(document_id, None))
+        .await;
+    parse_status_read(event).map_err(|error| match error {
+        StorageReadError::Storage(error) => error.into(),
+        StorageReadError::Conversion(error) => error.into(),
+    })
 }
 
 async fn schedule_outbox_drain(context: &DriverContext) -> Result<(), MetadataProjectionError> {
     let Some(task_handle) = context.task_handle.as_ref() else {
         return Ok(());
     };
-    match task_handle
-        .send_effect(schedule_outbox_drain_effect())
-        .await
-    {
+    match task_handle.send_effect(schedule_drain_effect()).await {
         Event::Task(aruna_core::task::TaskEvent::TimerScheduled { .. }) => Ok(()),
         Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) => {
             Err(MetadataProjectionError::UnexpectedEvent(message))
@@ -1195,10 +1132,7 @@ async fn schedule_materialization_drain(
     let Some(task_handle) = context.task_handle.as_ref() else {
         return Ok(());
     };
-    match task_handle
-        .send_effect(schedule_metadata_materialization_drain_effect())
-        .await
-    {
+    match task_handle.send_effect(schedule_materialization()).await {
         Event::Task(aruna_core::task::TaskEvent::TimerScheduled { .. }) => Ok(()),
         Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) => {
             Err(MetadataProjectionError::UnexpectedEvent(message))
@@ -1213,9 +1147,7 @@ async fn schedule_materialization_drain(
 mod tests {
     use super::*;
     use aruna_core::metadata::{MetadataCreateEventPayload, MetadataDocumentLifecycleRecord};
-    use aruna_core::storage_entries::{
-        metadata_create_event_write_entry, metadata_pending_projection_key,
-    };
+    use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
     use aruna_core::structs::{
         PlacementRef, PlacementStrategy, RealmConfigDocument, RealmId, RealmNodeKind,
     };
@@ -1394,7 +1326,7 @@ mod tests {
             compute_handle: None,
         };
 
-        project_metadata_create_events(&context, vec![event.clone()], Some(event.node_id))
+        project_create_events(&context, vec![event.clone()], Some(event.node_id))
             .await
             .expect("projection succeeds");
         let rows = outbox_rows(&storage).await;
@@ -1433,10 +1365,9 @@ mod tests {
             compute_handle: None,
         };
 
-        let error =
-            project_metadata_create_events(&context, vec![event.clone()], Some(event.node_id))
-                .await
-                .expect_err("the fenced projection is rejected");
+        let error = project_create_events(&context, vec![event.clone()], Some(event.node_id))
+            .await
+            .expect_err("the fenced projection is rejected");
         assert!(
             matches!(error, MetadataProjectionError::PlacementFenced),
             "unexpected error: {error:?}"
@@ -1469,26 +1400,24 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
-        let marker_key = metadata_pending_projection_key(event.record.document_id, event.event_id);
+        let marker_key = pending_projection_key(event.record.document_id, event.event_id);
 
-        let projected =
-            project_metadata_create_events(&context, vec![event.clone()], Some(event.node_id))
-                .await
-                .expect("projection succeeds");
+        let projected = project_create_events(&context, vec![event.clone()], Some(event.node_id))
+            .await
+            .expect("projection succeeds");
         assert_eq!(projected, 1);
-        assert!(pending_projection_marker_exists(&storage, marker_key.to_vec()).await);
+        assert!(pending_marker_exists(&storage, marker_key.to_vec()).await);
 
         store_realm_config(&storage, &live).await;
-        let projected =
-            project_metadata_create_events(&context, vec![event.clone()], Some(event.node_id))
-                .await
-                .expect("retry projection succeeds");
+        let projected = project_create_events(&context, vec![event.clone()], Some(event.node_id))
+            .await
+            .expect("retry projection succeeds");
 
         assert_eq!(projected, 1);
-        assert!(!pending_projection_marker_exists(&storage, marker_key.to_vec()).await);
+        assert!(!pending_marker_exists(&storage, marker_key.to_vec()).await);
     }
 
-    async fn pending_projection_marker_exists(storage: &StorageHandle, key: Vec<u8>) -> bool {
+    async fn pending_marker_exists(storage: &StorageHandle, key: Vec<u8>) -> bool {
         match storage
             .send_storage_effect(StorageEffect::Read {
                 key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
@@ -1518,7 +1447,7 @@ mod tests {
         write_entries(
             &storage,
             vec![
-                aruna_core::storage_entries::metadata_graph_lifecycle_write_entry(&tombstone)
+                aruna_core::storage_entries::graph_lifecycle_entry(&tombstone)
                     .expect("tombstone serializes"),
             ],
         )
@@ -1534,7 +1463,7 @@ mod tests {
 
         let result = transactional_projection_write(
             &context,
-            aruna_core::storage_entries::metadata_registry_write_entries(&event.record)
+            aruna_core::storage_entries::registry_write_entries(&event.record)
                 .expect("registry writes serialize"),
             BTreeSet::from([event.record.graph_iri.clone()]),
             &Default::default(),
@@ -1562,7 +1491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_pending_projection_marker_is_deleted() {
+    async fn malformed_marker_deleted() {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
@@ -1585,24 +1514,24 @@ mod tests {
             compute_handle: None,
         };
 
-        let result = drain_pending_metadata_projection_queue(&context)
+        let result = drain_projection_queue(&context)
             .await
             .expect("projection drain succeeds");
 
         assert_eq!(result.markers_examined, 0);
         assert_eq!(result.projected, 0);
         assert!(!result.has_more);
-        assert!(!pending_projection_marker_exists(&storage, corrupt_key).await);
+        assert!(!pending_marker_exists(&storage, corrupt_key).await);
     }
 
     #[tokio::test]
-    async fn malformed_pending_projection_marker_before_valid_is_deleted() {
+    async fn malformed_before_valid() {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let corrupt_key = b"short".to_vec();
         let event = create_event();
-        let valid_key = metadata_pending_projection_key(event.record.document_id, event.event_id);
+        let valid_key = pending_projection_key(event.record.document_id, event.event_id);
         write_entries(
             &storage,
             vec![
@@ -1611,7 +1540,7 @@ mod tests {
                     ByteView::from(corrupt_key.clone()),
                     ByteView::from(Vec::new()),
                 ),
-                metadata_create_event_write_entry(&event).expect("event log entry"),
+                create_event_entry(&event).expect("event log entry"),
                 (
                     METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
                     valid_key.clone(),
@@ -1629,24 +1558,24 @@ mod tests {
             compute_handle: None,
         };
 
-        let result = drain_pending_metadata_projection_queue(&context)
+        let result = drain_projection_queue(&context)
             .await
             .expect("projection drain succeeds");
 
         assert_eq!(result.markers_examined, 1);
         assert_eq!(result.projected, 1);
-        assert!(!pending_projection_marker_exists(&storage, corrupt_key).await);
-        assert!(!pending_projection_marker_exists(&storage, valid_key.to_vec()).await);
+        assert!(!pending_marker_exists(&storage, corrupt_key).await);
+        assert!(!pending_marker_exists(&storage, valid_key.to_vec()).await);
     }
 
     #[tokio::test]
-    async fn orphan_pending_projection_marker_is_deleted() {
+    async fn orphan_pending_marker() {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let document_id = Ulid::from_bytes([21u8; 16]);
         let event_id = Ulid::from_parts(21, 1);
-        let marker_key = metadata_pending_projection_key(document_id, event_id);
+        let marker_key = pending_projection_key(document_id, event_id);
         write_entries(
             &storage,
             vec![(
@@ -1665,17 +1594,17 @@ mod tests {
             compute_handle: None,
         };
 
-        let result = drain_pending_metadata_projection_queue(&context)
+        let result = drain_projection_queue(&context)
             .await
             .expect("projection drain succeeds");
 
         assert_eq!(result.markers_examined, 0);
         assert_eq!(result.projected, 0);
-        assert!(!pending_projection_marker_exists(&storage, marker_key.to_vec()).await);
+        assert!(!pending_marker_exists(&storage, marker_key.to_vec()).await);
     }
 
     #[tokio::test]
-    async fn restore_pending_projection_timer_schedules_when_marker_exists() {
+    async fn timer_for_marker() {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
@@ -1683,10 +1612,10 @@ mod tests {
         write_entries(
             &storage,
             vec![
-                metadata_create_event_write_entry(&event).expect("event log entry"),
+                create_event_entry(&event).expect("event log entry"),
                 (
                     METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
-                    metadata_pending_projection_key(event.record.document_id, event.event_id),
+                    pending_projection_key(event.record.document_id, event.event_id),
                     ByteView::from(Vec::new()),
                 ),
             ],
@@ -1698,7 +1627,7 @@ mod tests {
             .set_inbound_handler(Arc::new(RecordingTaskHandler { seen: seen_tx }))
             .await;
 
-        restore_pending_metadata_projection_timer(&storage, &task_handle).await;
+        restore_projection_timer(&storage, &task_handle).await;
 
         let restored_key = tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
             .await
@@ -1715,9 +1644,8 @@ mod tests {
         let config = realm_config(event.record.realm_id, &[node(1), node(2), node(3), node(4)]);
         let event = stamped(event, &config);
 
-        let expanded =
-            expand_create_event_holders(event.clone(), Some(event.node_id), Some(&config))
-                .expect("holders expand");
+        let expanded = expand_event_holders(event.clone(), Some(event.node_id), Some(&config))
+            .expect("holders expand");
 
         assert_eq!(expanded.record.holder_node_ids, vec![node(1)]);
         assert!(expanded.record.holder_node_ids.contains(&event.node_id));
@@ -1727,7 +1655,7 @@ mod tests {
     // The origin's outbox record rides the bucket stored on the record, and its
     // peers are that bucket's live holders.
     #[tokio::test]
-    async fn outbox_rides_stored_bucket() {
+    async fn outbox_rides_stored() {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
@@ -1752,15 +1680,14 @@ mod tests {
             compute_handle: None,
         };
 
-        project_metadata_create_event(&context, event.clone(), Some(event.node_id))
+        project_create_event(&context, event.clone(), Some(event.node_id))
             .await
             .expect("projection succeeds");
 
         let expected_holders = resolve_shard_holders(&config, &event.record.placement);
 
-        // Two publishes, on two topics: the lifecycle event onto the document's
-        // own capped bucket, the registry row onto the everywhere-bound registry
-        // class. They share the event id, so they must not share an outbox key.
+        // Two publishes, on two topics: the lifecycle event onto the document's own capped
+        // bucket, the registry row onto the everywhere-bound registry class.
         let records = match storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
@@ -1834,7 +1761,7 @@ mod tests {
             compute_handle: None,
         };
 
-        project_metadata_create_event(&context, event.clone(), Some(event.node_id))
+        project_create_event(&context, event.clone(), Some(event.node_id))
             .await
             .expect("projection succeeds");
 
@@ -1896,9 +1823,8 @@ mod tests {
         }
 
         let event = stamped(event, &config);
-        let expanded =
-            expand_create_event_holders(event.clone(), Some(event.node_id), Some(&config))
-                .expect("holders resolve");
+        let expanded = expand_event_holders(event.clone(), Some(event.node_id), Some(&config))
+            .expect("holders resolve");
         let expected = vec![node(1), node(4)];
 
         assert_eq!(config.metadata_replication.default_replication_factor, 4);
@@ -1919,7 +1845,7 @@ mod tests {
         config.ensure_node(node(4), RealmNodeKind::Server);
         // A user node holds no bucket, so its create fell back to the hashed
         // one (stage 1); it still never becomes a holder of it.
-        event.record.placement = crate::placement::placement_ref_for_target(
+        event.record.placement = crate::placement::target_placement_ref(
             &config,
             &DocumentSyncTarget::MetadataDocumentLifecycle {
                 document_id: event.record.document_id,
@@ -1927,42 +1853,42 @@ mod tests {
             Default::default(),
         );
 
-        let expanded = expand_create_event_holders(event, Some(node(1)), Some(&config))
-            .expect("holders expand");
+        let expanded =
+            expand_event_holders(event, Some(node(1)), Some(&config)).expect("holders expand");
 
         assert_eq!(expanded.record.holder_node_ids, vec![node(1)]);
     }
 
     #[test]
-    fn metadata_recipient_preserves_authoritative_holders() {
+    fn recipient_preserves_authoritative() {
         let mut event = create_event();
         event.node_id = node(1);
         event.record.holder_node_ids = vec![node(3), node(1), node(3)];
         let config = realm_config(event.record.realm_id, &[node(1), node(2), node(3), node(4)]);
 
-        let expanded = expand_create_event_holders(event, Some(node(2)), Some(&config))
-            .expect("holders normalize");
+        let expanded =
+            expand_event_holders(event, Some(node(2)), Some(&config)).expect("holders normalize");
 
         assert_eq!(expanded.record.holder_node_ids, vec![node(1), node(3)]);
     }
 
     #[test]
-    fn metadata_recipient_does_not_synthesize_origin_holder() {
+    fn recipient_not_synthesize() {
         let mut event = create_event();
         event.node_id = node(1);
         event.record.holder_node_ids.clear();
         let config = realm_config(event.record.realm_id, &[node(1), node(2), node(3), node(4)]);
 
-        let expanded = expand_create_event_holders(event, Some(node(2)), Some(&config))
-            .expect("holders normalize");
+        let expanded =
+            expand_event_holders(event, Some(node(2)), Some(&config)).expect("holders normalize");
 
         assert!(expanded.record.holder_node_ids.is_empty());
     }
 
     #[test]
-    fn create_event_outbox_record_uses_document_lifecycle_stream() {
+    fn outbox_uses_lifecycle() {
         let event = create_event();
-        let outbox = create_event_outbox_record(&event, None, true);
+        let outbox = create_outbox_record(&event, None, true);
 
         assert!(outbox.allow_genesis);
         assert_eq!(outbox.outbox_id, event.event_id);
@@ -1994,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn create_and_update_stamp_equal_placement_refs() {
+    fn create_update_stamp() {
         let create = create_event();
         let config = realm_config(create.record.realm_id, &[node(1), node(2)]);
         let create = stamped(create, &config);
@@ -2009,7 +1935,7 @@ mod tests {
 
         let placement_of = |event: &MetadataCreateEventRecord| {
             let DocumentSyncOutboxEvent::Upsert { change, .. } =
-                create_event_outbox_record(event, Some(&config), true).event
+                create_outbox_record(event, Some(&config), true).event
             else {
                 panic!("expected upsert outbox event");
             };
@@ -2052,16 +1978,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skewed_direct_projection_writes_pending_marker_for_retry() {
+    async fn skewed_direct_writes() {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        let now_ms = aruna_core::util::unix_timestamp_millis();
-        let event = skew_event(now_ms + max_clock_skew_ms() + 60_000, now_ms);
-        let marker_key = metadata_pending_projection_key(event.record.document_id, event.event_id);
+        let now_ms = aruna_core::time::unix_timestamp_millis();
+        let event = skew_event(now_ms + max_clock_skew() + 60_000, now_ms);
+        let marker_key = pending_projection_key(event.record.document_id, event.event_id);
         write_entries(
             &storage,
-            vec![metadata_create_event_write_entry(&event).expect("event log entry")],
+            vec![create_event_entry(&event).expect("event log entry")],
         )
         .await;
         let context = DriverContext {
@@ -2073,7 +1999,7 @@ mod tests {
             compute_handle: None,
         };
 
-        let error = project_metadata_create_events(&context, vec![event], None)
+        let error = project_create_events(&context, vec![event], None)
             .await
             .expect_err("skewed event should be deferred");
 
@@ -2081,21 +2007,21 @@ mod tests {
             error,
             MetadataProjectionError::ClockSkewDeferred { deferred: 1 }
         ));
-        assert!(pending_projection_marker_exists(&storage, marker_key.to_vec()).await);
+        assert!(pending_marker_exists(&storage, marker_key.to_vec()).await);
     }
 
     #[tokio::test]
-    async fn skewed_queue_projection_keeps_pending_marker_for_retry() {
+    async fn skewed_queue_keeps() {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        let now_ms = aruna_core::util::unix_timestamp_millis();
-        let event = skew_event(now_ms + max_clock_skew_ms() + 60_000, now_ms);
-        let marker_key = metadata_pending_projection_key(event.record.document_id, event.event_id);
+        let now_ms = aruna_core::time::unix_timestamp_millis();
+        let event = skew_event(now_ms + max_clock_skew() + 60_000, now_ms);
+        let marker_key = pending_projection_key(event.record.document_id, event.event_id);
         write_entries(
             &storage,
             vec![
-                metadata_create_event_write_entry(&event).expect("event log entry"),
+                create_event_entry(&event).expect("event log entry"),
                 (
                     METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
                     marker_key.clone(),
@@ -2113,7 +2039,7 @@ mod tests {
             compute_handle: None,
         };
 
-        let error = drain_pending_metadata_projection_queue(&context)
+        let error = drain_projection_queue(&context)
             .await
             .expect_err("skewed queued event should be deferred");
 
@@ -2121,11 +2047,11 @@ mod tests {
             error,
             MetadataProjectionError::ClockSkewDeferred { deferred: 1 }
         ));
-        assert!(pending_projection_marker_exists(&storage, marker_key.to_vec()).await);
+        assert!(pending_marker_exists(&storage, marker_key.to_vec()).await);
     }
 
     #[test]
-    fn skew_guard_accepts_events_at_the_threshold() {
+    fn skew_guard_accepts() {
         let now_ms = 1_000_000;
         let max_skew_ms = 300_000;
         assert!(!exceeds_clock_skew(
@@ -2142,7 +2068,7 @@ mod tests {
     }
 
     #[test]
-    fn skew_guard_rejects_events_past_the_threshold() {
+    fn skew_guard_rejects() {
         let now_ms = 1_000_000;
         let max_skew_ms = 300_000;
         assert!(exceeds_clock_skew(

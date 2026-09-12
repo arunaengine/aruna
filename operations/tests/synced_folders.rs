@@ -28,7 +28,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
-use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
+use aruna_operations::s3::get_bucket::GetBucketInfoOperation;
 use aruna_operations::s3::get_object::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::staging::offered_directory::{OfferDirectoryInput, offer_directory};
@@ -46,10 +46,6 @@ fn body(bytes: &'static [u8]) -> BackendStream<Result<bytes::Bytes, StreamError>
 }
 
 /// Waits until the realm has pulled every queued upload.
-///
-/// The drain is a timer task the reconciliation arms, so it runs concurrently
-/// with an explicit pass and may hold the row this one wanted. Publishing is
-/// therefore complete when the outbox is empty, never after one call.
 async fn await_uploads(realm: &Topology) -> TestResult<()> {
     let device = realm.user_node();
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(

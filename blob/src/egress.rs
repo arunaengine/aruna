@@ -94,9 +94,8 @@ impl HttpFetch for ScreenedFetch {
         &self,
         request: http::Request<Buffer>,
     ) -> opendal::Result<http::Response<HttpBody>> {
-        // The client re-parses this exact string with `reqwest::Url`, whose host
-        // parser reads `2852039166` and `127.1` as addresses the raw substring
-        // never shows, so the screen must run on what that parse produces.
+        // reqwest's URL parser reads `2852039166` and `127.1` as addresses the
+        // raw substring never shows, so the screen runs on the parsed host.
         let uri = request.uri().to_string();
         let Some(host) = Url::parse(&uri)
             .ok()

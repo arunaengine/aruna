@@ -1,19 +1,19 @@
 use std::collections::BTreeSet;
 
 use aruna_core::metadata::MetadataError;
-use aruna_core::structs::{AuthContext, Permission, RealmId, blob_object_permission_path};
+use aruna_core::structs::{AuthContext, Permission, RealmId, object_permission_path};
 use aruna_core::types::{GroupId, NodeId};
 use serde_json::Value as JsonValue;
 
-use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
-use crate::blob_holders::GetBlobHoldersOperation;
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::blob::holders::GetBlobHoldersOperation;
+use crate::blob::permission_paths::ResolveBlobPermissionPathsOperation;
 use crate::driver::{DriverContext, drive, drive_until};
-use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::export::{EntityIdentity, entity_identity};
-use crate::replication::location_summary::LocationSummaryOperation;
+use crate::realm::get_config::GetRealmConfigOperation;
+use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::LocationSummaryRequest;
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 
 const FILE_TYPES: [&str; 4] = [
     "File",
@@ -57,9 +57,8 @@ struct ResolvedPaths {
 }
 
 /// Lists the draft's Aruna data entities that anonymous READ would not reach,
-/// so a dataset about to be published as public can warn about them. Resolution
-/// only follows paths the caller may read; nothing about a foreign object other
-/// than "not publicly readable" is disclosed.
+/// so a public publish can warn about them. Only paths the caller may read are
+/// resolved; nothing beyond "not publicly readable" about a foreign object leaks.
 pub async fn restricted_files(
     context: &DriverContext,
     realm_id: RealmId,
@@ -192,13 +191,8 @@ async fn entity_paths(
                 && summary.summary.blob_size.is_some()
                 && let Some(group_id) = summary.summary.group_id
             {
-                let path = blob_object_permission_path(
-                    realm_id,
-                    group_id,
-                    node_id,
-                    &exact.bucket,
-                    &exact.key,
-                );
+                let path =
+                    object_permission_path(realm_id, group_id, node_id, &exact.bucket, &exact.key);
                 seen.insert(path.clone());
                 paths.push(ObjectPath {
                     group_id,
@@ -355,7 +349,7 @@ mod tests {
     }
 
     async fn fixture(anonymous_read: bool) -> Fixture {
-        let staging = crate::staging::test_utils::setup_driver_context().await;
+        let staging = crate::tests::fixtures::staging::setup_driver_context().await;
         let context = staging.driver_context;
         let realm_id = RealmId::from_bytes([61; 32]);
         let owner = UserId::local(Ulid::from_bytes([62; 16]), realm_id);
@@ -370,7 +364,7 @@ mod tests {
         };
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.ensure_node(node_id, RealmNodeKind::Server);
-        let mut realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let mut realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
         if anonymous_read {
             let role_id = Ulid::from_bytes([67; 16]);
             realm_auth.roles.insert(
@@ -386,8 +380,7 @@ mod tests {
                 },
             );
         }
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
         let group = Group {
             display_name: "preview".to_string(),
             group_id,
@@ -459,7 +452,7 @@ mod tests {
                 session: None,
             },
             hash,
-            permission_path: blob_object_permission_path(realm_id, group_id, node_id, BUCKET, KEY),
+            permission_path: object_permission_path(realm_id, group_id, node_id, BUCKET, KEY),
             _tempdir: staging._tempdir,
         }
     }

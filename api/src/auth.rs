@@ -3,12 +3,12 @@ use crate::server_state::ServerState;
 use crate::telemetry::record_auth_context;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::structs::{
-    AuthContext, OidcProviderConfig, Permission, TokenClaims, blob_object_permission_path,
+    AuthContext, OidcProviderConfig, Permission, TokenClaims, object_permission_path,
 };
-use aruna_operations::auth::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_aruna_bearer_token,
+use aruna_operations::auth::bearer_token::{
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_bearer_token,
 };
-use aruna_operations::request_authorization::AuthorizeError;
+use aruna_operations::auth::request_authorization::AuthorizeError;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -223,7 +223,7 @@ impl OidcValidator {
         let header = decode_header(token)?;
         let kid = header.kid.ok_or(OidcError::MissingKeyId)?;
         let algorithm = header.alg;
-        if !is_supported_oidc_algorithm(algorithm) {
+        if !oidc_algorithm_supported(algorithm) {
             return Err(OidcError::UnsupportedAlgorithm);
         }
         let decoding_key = self.decoding_key_for(provider, &kid).await?;
@@ -319,7 +319,7 @@ fn oidc_display_name(claims: &OidcClaims) -> Option<String> {
         })
 }
 
-fn is_supported_oidc_algorithm(algorithm: Algorithm) -> bool {
+fn oidc_algorithm_supported(algorithm: Algorithm) -> bool {
     matches!(
         algorithm,
         Algorithm::RS256
@@ -383,12 +383,10 @@ pub enum AuthorizationError {
 
 #[cfg(test)]
 async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Option<AuthContext> {
-    extract_auth_context_and_bearer_token(state, headers)
-        .await
-        .0
+    extract_auth_parts(state, headers).await.0
 }
 
-async fn extract_auth_context_and_bearer_token(
+async fn extract_auth_parts(
     state: &ServerState,
     headers: &HeaderMap,
 ) -> (
@@ -425,9 +423,7 @@ async fn extract_auth_context_and_bearer_token(
 }
 
 pub async fn handle_token(state: &ServerState, token: &str) -> Result<TokenClaims, TokenError> {
-    decode_aruna_bearer_token(state, token)
-        .await
-        .map_err(Into::into)
+    decode_bearer_token(state, token).await.map_err(Into::into)
 }
 
 /// Fully verified claims of a token that may already be revoked, so revoking it
@@ -436,7 +432,7 @@ pub(crate) async fn claims_for_revocation(
     state: &ServerState,
     token: &str,
 ) -> Result<TokenClaims, TokenError> {
-    decode_aruna_bearer_token(&RevocationBlindState(state), token)
+    decode_bearer_token(&RevocationBlindState(state), token)
         .await
         .map_err(Into::into)
 }
@@ -474,11 +470,8 @@ pub async fn auth_middleware(
     // Extract and validate token, get Option<AuthContext>
     // We clone headers to avoid borrowing issues with the async function
     let headers = request.headers().clone();
-    let (auth_ctx, bearer_token) = aruna_core::telemetry::time_stage(
-        "auth",
-        extract_auth_context_and_bearer_token(&state, &headers),
-    )
-    .await;
+    let (auth_ctx, bearer_token) =
+        aruna_core::telemetry::time_stage("auth", extract_auth_parts(&state, &headers)).await;
     record_auth_context(auth_ctx.as_ref());
 
     // Always insert (Some or None) - handlers decide if auth is required
@@ -493,7 +486,7 @@ pub(crate) fn parse_group_id(group_id: &str) -> ServerResult<Ulid> {
     Ulid::from_str(group_id).map_err(|_| ServerError::BadRequest)
 }
 
-pub(crate) fn parse_source_connector_id(connector_id: &str) -> ServerResult<Ulid> {
+pub(crate) fn parse_connector_id(connector_id: &str) -> ServerResult<Ulid> {
     Ulid::from_str(connector_id).map_err(|_| ServerError::BadRequest)
 }
 
@@ -511,7 +504,7 @@ pub(crate) fn require_realm_auth(
 /// Realm auth that additionally rejects path-restricted (delegated) tokens. User-scoped
 /// surfaces cannot honour a token's path confinement, so a delegated token must not reach
 /// them even when a per-resource permission check would otherwise pass.
-pub(crate) fn require_unrestricted_realm_auth(
+pub(crate) fn require_unrestricted_auth(
     state: &ServerState,
     auth: Option<AuthContext>,
 ) -> ServerResult<AuthContext> {
@@ -533,7 +526,7 @@ pub(crate) async fn ensure_permission(
         auth,
         path,
         required_permission,
-        aruna_operations::request_policy::PolicyRequestExtras::rest(),
+        aruna_operations::auth::request_policy::PolicyRequestExtras::rest(),
     )
     .await
 }
@@ -546,11 +539,11 @@ pub(crate) async fn ensure_permission_with(
     auth: &AuthContext,
     path: String,
     required_permission: Permission,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> ServerResult<()> {
     aruna_core::telemetry::time_stage(
         "permission",
-        aruna_operations::request_authorization::authorize(
+        aruna_operations::auth::request_authorization::authorize(
             &state.get_ctx(),
             state.get_realm_id(),
             auth,
@@ -566,7 +559,7 @@ pub(crate) async fn ensure_permission_with(
 /// An infrastructure fault inside the permission check is not a verdict:
 /// exhausted transaction-cleanup capacity stays retryable, every other storage
 /// fault stays internal, and only real denials become `Forbidden`.
-fn map_authorize_error(error: AuthorizeError) -> ServerError {
+pub(crate) fn map_authorize_error(error: AuthorizeError) -> ServerError {
     match error {
         AuthorizeError::Storage(StorageError::CleanupCapacity) => {
             ServerError::ServiceUnavailableReason(
@@ -595,13 +588,13 @@ pub(crate) async fn permission_granted(
     }
 }
 
-pub(crate) fn bucket_blob_permission_path(
+pub(crate) fn blob_permission_path(
     state: &ServerState,
     group_id: Ulid,
     bucket: &str,
     key: &str,
 ) -> String {
-    blob_object_permission_path(
+    object_permission_path(
         state.get_realm_id(),
         group_id,
         state.get_node_id(),
@@ -613,9 +606,8 @@ pub(crate) fn bucket_blob_permission_path(
 #[cfg(test)]
 mod test {
     use crate::auth::{
-        OIDC_PROVIDER_METADATA_CACHE_TTL_SECS, OidcValidator, bucket_blob_permission_path,
-        extract_auth_context, extract_auth_context_and_bearer_token, handle_token,
-        map_authorize_error,
+        OIDC_PROVIDER_METADATA_CACHE_TTL_SECS, OidcValidator, blob_permission_path,
+        extract_auth_context, extract_auth_parts, handle_token, map_authorize_error,
     };
     use crate::error::{ServerError, TokenError};
     use crate::server::ServerState;
@@ -632,15 +624,15 @@ mod test {
         Actor, NodeCapabilities, RealmAuthorizationDocument, RealmId, TokenClaims,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
-    use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::register_or_get_oidc_user::{
-        RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
-    };
-    use aruna_operations::request_authorization::AuthorizeError;
-    use aruna_operations::revoke_token::{
+    use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+    use aruna_operations::auth::request_authorization::AuthorizeError;
+    use aruna_operations::auth::revoke_token::{
         RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
+    };
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::users::oidc_user::{
+        RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
     };
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -682,7 +674,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn bucket_blob_permission_path_matches_canonical_blob_object_path() {
+    async fn canonical_blob_path() {
         let storage_dir = tempfile::tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
@@ -712,8 +704,8 @@ mod test {
 
         let group_id = Ulid::from_bytes([9u8; 16]);
         assert_eq!(
-            bucket_blob_permission_path(&state, group_id, "bucket", "nested/file.txt"),
-            aruna_core::structs::blob_object_permission_path(
+            blob_permission_path(&state, group_id, "bucket", "nested/file.txt"),
+            aruna_core::structs::object_permission_path(
                 realm_id,
                 group_id,
                 node_id,
@@ -859,7 +851,7 @@ mod test {
         .unwrap()
     }
 
-    fn sign_multi_audience_oidc_token(
+    fn sign_audience_token(
         issuer: &str,
         audiences: &[&str],
         azp: Option<&str>,
@@ -912,7 +904,7 @@ mod test {
     }
 
     async fn revoke(driver_ctx: &Arc<DriverContext>, actor: Actor, token: &str) {
-        let now = aruna_core::util::unix_timestamp_secs();
+        let now = aruna_core::time::unix_timestamp_secs();
         let token_owner = actor.user_id;
         drive(
             RevokeTokenOperation::new(RevokeTokenConfig {
@@ -930,7 +922,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn bearer_token_carrier_requires_valid_aruna_token() {
+    async fn valid_token_required() {
         let storage_dir = tempfile::tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
@@ -998,8 +990,7 @@ mod test {
             headers
         };
 
-        let (auth, carrier) =
-            extract_auth_context_and_bearer_token(&state, &headers_for(&token)).await;
+        let (auth, carrier) = extract_auth_parts(&state, &headers_for(&token)).await;
         assert_eq!(auth.unwrap().user_id, user_id);
         assert_eq!(carrier.unwrap().as_str(), token);
 
@@ -1013,8 +1004,7 @@ mod test {
             &token,
         )
         .await;
-        let (auth, carrier) =
-            extract_auth_context_and_bearer_token(&state, &headers_for(&token)).await;
+        let (auth, carrier) = extract_auth_parts(&state, &headers_for(&token)).await;
         assert!(auth.is_none());
         assert!(carrier.is_none());
 
@@ -1028,19 +1018,17 @@ mod test {
             Algorithm::EdDSA,
             None,
         );
-        let (auth, carrier) =
-            extract_auth_context_and_bearer_token(&state, &headers_for(&oidc_token)).await;
+        let (auth, carrier) = extract_auth_parts(&state, &headers_for(&oidc_token)).await;
         assert!(auth.is_none());
         assert!(carrier.is_none());
 
-        let (auth, carrier) =
-            extract_auth_context_and_bearer_token(&state, &headers_for("not-a-jwt")).await;
+        let (auth, carrier) = extract_auth_parts(&state, &headers_for("not-a-jwt")).await;
         assert!(auth.is_none());
         assert!(carrier.is_none());
     }
 
     #[tokio::test]
-    async fn oidc_validator_accepts_valid_eddsa_token() {
+    async fn validator_accepts_eddsa() {
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
         let kid = "main-key";
@@ -1074,7 +1062,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn oidc_validator_rejects_hs256_tokens() {
+    async fn validator_rejects_hs256() {
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
         let kid = "symm-key";
@@ -1111,7 +1099,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn oidc_validator_rejects_wrong_audience() {
+    async fn validator_rejects_audience() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
         let signing_key = generate_signing_key();
@@ -1141,7 +1129,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn oidc_validator_caches_provider_metadata_between_requests() {
+    async fn validator_caches_metadata() {
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
         let kid = "main-key";
@@ -1176,7 +1164,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn oidc_validator_refreshes_expired_provider_metadata() {
+    async fn validator_refreshes_metadata() {
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
         let kid = "main-key";
@@ -1223,7 +1211,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn oidc_validator_requires_azp_for_multi_audience_token() {
+    async fn validator_requires_azp() {
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
         let kid = "main-key";
@@ -1239,7 +1227,7 @@ mod test {
         };
         let validator = OidcValidator::new().unwrap();
 
-        let missing_azp = sign_multi_audience_oidc_token(
+        let missing_azp = sign_audience_token(
             issuer,
             &[audience, "other-client"],
             None,
@@ -1249,7 +1237,7 @@ mod test {
         );
         assert!(validator.validate(&provider, &missing_azp).await.is_err());
 
-        let wrong_azp = sign_multi_audience_oidc_token(
+        let wrong_azp = sign_audience_token(
             issuer,
             &[audience, "other-client"],
             Some("other-client"),
@@ -1259,7 +1247,7 @@ mod test {
         );
         assert!(validator.validate(&provider, &wrong_azp).await.is_err());
 
-        let valid = sign_multi_audience_oidc_token(
+        let valid = sign_audience_token(
             issuer,
             &[audience, "other-client"],
             Some(audience),
@@ -1274,7 +1262,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn oidc_validator_refreshes_jwks_when_kid_is_rotated() {
+    async fn validator_refreshes_jwks() {
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
         let old_kid = "old-key";
@@ -1324,7 +1312,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn oidc_validator_rejects_discovery_issuer_mismatch() {
+    async fn validator_rejects_issuer() {
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
         let kid = "main-key";
@@ -1419,9 +1407,6 @@ mod test {
         .await
         .unwrap();
 
-        //
-        // Test Management Nodes
-        //
         let capabilities = NodeCapabilities::management_node(realm_signing_key.clone()).unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
@@ -1455,9 +1440,6 @@ mod test {
         assert_eq!(ctx.realm_id, realm_id);
         assert_eq!(ctx.user_id, token_config.user_id);
 
-        //
-        // Test Server Nodes
-        //
         let issuer_key = generate_signing_key();
 
         let message = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -1498,9 +1480,6 @@ mod test {
         assert_eq!(ctx.realm_id, realm_id);
         assert_eq!(ctx.user_id, token_config.user_id);
 
-        //
-        // Test Local Nodes
-        //
         let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
@@ -1535,7 +1514,7 @@ mod test {
     }
 
     #[tokio::test]
-    pub async fn test_unknown_token_user_is_rejected() {
+    pub async fn unknown_user_rejected() {
         let mut tempdir = temp_dir();
         tempdir.push(Ulid::generate().to_string());
         let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
@@ -1728,9 +1707,6 @@ mod test {
         )
         .await;
 
-        //
-        // Valid management token with expiry
-        //
         let token_config = CreateTokenConfig {
             time,
             expiry,
@@ -1773,9 +1749,6 @@ mod test {
             .timestamp() as u64;
         let expired = Some(chrono::Utc::now().timestamp() as u64 - 1);
 
-        //
-        // Expired management token
-        //
         let token_config = CreateTokenConfig {
             time: old_time,
             expiry: expired,
@@ -1795,9 +1768,6 @@ mod test {
         );
         assert!(extract_auth_context(&state, &headers).await.is_none());
 
-        //
-        // Expired server token
-        //
         let issuer_key = generate_signing_key();
 
         let message = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -1847,9 +1817,6 @@ mod test {
 
         assert!(extract_auth_context(&state, &headers).await.is_none());
 
-        //
-        // Invalid delegation signature
-        //
         let invalid_signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32]);
         let capabilities =
             NodeCapabilities::server_node(issuer_key.clone(), realm_id, invalid_signature).unwrap();
@@ -1882,9 +1849,6 @@ mod test {
         );
         assert!(extract_auth_context(&state, &headers).await.is_none());
 
-        //
-        // Invalid realm key
-        //
         let capabilities =
             NodeCapabilities::server_node(issuer_key, realm_id, delegation_signature.clone())
                 .unwrap();
@@ -1918,7 +1882,7 @@ mod test {
         assert!(extract_auth_context(&state, &headers).await.is_none());
     }
 
-    fn sign_untrusted_direct_token(issuer_key: &SigningKey, now: u64) -> String {
+    fn sign_untrusted_token(issuer_key: &SigningKey, now: u64) -> String {
         let issuer_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(issuer_key.verifying_key().to_bytes());
         let claims = TokenClaims {
@@ -1945,7 +1909,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn rejected_token_flood_keeps_issuer_cache_bounded() {
+    async fn issuer_cache_bounded() {
         let mut tempdir = temp_dir();
         tempdir.push(Ulid::generate().to_string());
         let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
@@ -1995,15 +1959,15 @@ mod test {
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         for _ in 0..2048 {
             let issuer_key = generate_signing_key();
-            let token = sign_untrusted_direct_token(&issuer_key, now);
+            let token = sign_untrusted_token(&issuer_key, now);
             assert!(handle_token(&state, &token).await.is_err());
         }
 
-        assert_eq!(state.issuer_key_cache_len().await, 0);
+        assert_eq!(state.issuer_cache_len().await, 0);
     }
 
     #[tokio::test]
-    async fn valid_delegated_token_caches_single_issuer_key() {
+    async fn delegated_token_cached() {
         let mut tempdir = temp_dir();
         tempdir.push(Ulid::generate().to_string());
         let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
@@ -2074,6 +2038,6 @@ mod test {
         handle_token(&state, &token).await.unwrap();
         handle_token(&state, &token).await.unwrap();
 
-        assert_eq!(state.issuer_key_cache_len().await, 1);
+        assert_eq!(state.issuer_cache_len().await, 1);
     }
 }

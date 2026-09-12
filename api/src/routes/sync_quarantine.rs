@@ -1,8 +1,5 @@
 //! Realm-admin surface over this node's sync-quarantine store (#338).
-//!
-//! Quarantine evidence is node-local: every node keeps the events its own
-//! replication path rejected, so these routes are served by the node that holds
-//! them rather than being restricted to the management node.
+//! Each node serves the events rejected by its own replication path.
 
 use std::sync::Arc;
 
@@ -10,7 +7,7 @@ use aruna_core::document::DocumentSyncEvent;
 use aruna_core::structs::{
     AuthContext, Permission, SyncQuarantineCapacity, SyncQuarantineRecord, SyncQuarantineUsage,
 };
-use aruna_operations::sync_quarantine::{
+use aruna_operations::sync::sync_quarantine::{
     QuarantineAdminError, QuarantinePageRequest, acknowledge_quarantine_row,
     list_quarantine_records, prune_quarantine_records, read_quarantine_record,
 };
@@ -22,7 +19,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_unrestricted_realm_auth};
+use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 
@@ -110,7 +107,7 @@ async fn authorize_quarantine_admin(
     state: &Arc<ServerState>,
     auth: Option<AuthContext>,
 ) -> ServerResult<AuthContext> {
-    let auth = require_unrestricted_realm_auth(state, auth)?;
+    let auth = require_unrestricted_auth(state, auth)?;
     ensure_permission(
         state,
         &auth,
@@ -468,11 +465,11 @@ mod tests {
         quarantine_usage_entry,
     };
     use aruna_core::types::UserId;
-    use aruna_operations::claim_initial_realm_admin::{
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::realm::claim_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use ulid::Ulid;

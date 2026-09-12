@@ -260,7 +260,7 @@ pub fn notification_inbox_cursor(created_at_ms: u64, notification_id: Ulid) -> V
     bytes
 }
 
-pub fn parse_notification_inbox_key(key: &[u8]) -> Result<(UserId, u64, Ulid), ConversionError> {
+pub fn parse_inbox_key(key: &[u8]) -> Result<(UserId, u64, Ulid), ConversionError> {
     if key.len() != 72 {
         return Err(ConversionError::InvalidLength(format!(
             "expected 72-byte notification inbox key, got {} bytes",
@@ -273,7 +273,7 @@ pub fn parse_notification_inbox_key(key: &[u8]) -> Result<(UserId, u64, Ulid), C
     Ok((recipient, created_at_ms, notification_id))
 }
 
-pub fn notification_prune_index_key(record: &NotificationRecord) -> Key {
+pub fn notification_prune_key(record: &NotificationRecord) -> Key {
     let mut bytes = Vec::with_capacity(72);
     bytes.extend_from_slice(&record.expires_at_ms().to_be_bytes());
     bytes.extend_from_slice(&record.recipient.to_storage_key());
@@ -281,9 +281,7 @@ pub fn notification_prune_index_key(record: &NotificationRecord) -> Key {
     ByteView::from(bytes)
 }
 
-pub fn parse_notification_prune_index_key(
-    key: &[u8],
-) -> Result<(u64, UserId, Ulid), ConversionError> {
+pub fn parse_prune_key(key: &[u8]) -> Result<(u64, UserId, Ulid), ConversionError> {
     if key.len() != 72 {
         return Err(ConversionError::InvalidLength(format!(
             "expected 72-byte notification prune index key, got {} bytes",
@@ -304,10 +302,7 @@ pub fn notification_outbox_key(outbox_id: Ulid) -> Key {
 mod tests {
     use super::*;
     use crate::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE};
-    use crate::storage_entries::{
-        notification_inbox_delete_entries, notification_inbox_update_entry,
-        notification_inbox_write_entries,
-    };
+    use crate::storage_entries::{inbox_delete_entries, inbox_update_entry, inbox_write_entries};
 
     fn make_node_id(seed: u8) -> NodeId {
         let mut seed_bytes = [0u8; 32];
@@ -327,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn notification_record_decodes_legacy_schema() {
+    fn notification_record_schema() {
         let recipient = user(1, 2);
         let notification_id = Ulid::generate();
         let legacy = (
@@ -356,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn notification_record_roundtrips_through_postcard() {
+    fn notification_record_postcard() {
         let recipient = user(1, 2);
         let metadata_group_id = Ulid::generate();
         let data_group_id = Ulid::generate();
@@ -391,7 +386,7 @@ mod tests {
                 actor_user_id: user(1, 5),
             },
             NotificationKind::DataUploaded {
-                path: crate::structs::data_watch_resource_path(
+                path: crate::structs::watch_resource_path(
                     data_group_id,
                     data_node_id,
                     "bucket",
@@ -405,7 +400,7 @@ mod tests {
                 actor_user_id: user(1, 6),
             },
             NotificationKind::SyncCompleted {
-                path: crate::structs::data_watch_resource_path(
+                path: crate::structs::watch_resource_path(
                     data_group_id,
                     data_node_id,
                     "bucket",
@@ -419,7 +414,7 @@ mod tests {
                 actor_user_id: user(1, 6),
             },
             NotificationKind::SyncFailed {
-                path: crate::structs::data_watch_resource_path(
+                path: crate::structs::watch_resource_path(
                     data_group_id,
                     data_node_id,
                     "bucket",
@@ -440,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn inbox_keys_order_newest_first_within_recipient() {
+    fn inbox_keys_recipient() {
         let r = user(1, 2);
         let id = Ulid::generate();
         assert!(notification_inbox_key(r, 2000, id) < notification_inbox_key(r, 1000, id));
@@ -454,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn inbox_key_is_recipient_prefixed() {
+    fn inbox_key_prefixed() {
         let a = user(1, 2);
         let b = user(1, 3);
         let id = Ulid::generate();
@@ -466,41 +461,41 @@ mod tests {
     }
 
     #[test]
-    fn inbox_key_roundtrips_through_parser() {
+    fn inbox_key_parser() {
         let r = user(5, 9);
         let ts = 1_700_000_000_000u64;
         let id = Ulid::generate();
         let key = notification_inbox_key(r, ts, id);
-        assert_eq!(parse_notification_inbox_key(&key).unwrap(), (r, ts, id));
+        assert_eq!(parse_inbox_key(&key).unwrap(), (r, ts, id));
         assert!(matches!(
-            parse_notification_inbox_key(&key[..71]),
+            parse_inbox_key(&key[..71]),
             Err(ConversionError::InvalidLength(_))
         ));
         let mut long = key.to_vec();
         long.push(0);
         assert!(matches!(
-            parse_notification_inbox_key(&long),
+            parse_inbox_key(&long),
             Err(ConversionError::InvalidLength(_))
         ));
     }
 
     #[test]
-    fn prune_index_key_orders_by_expiry() {
+    fn prune_index_expiry() {
         let r = user(1, 2);
         let t = 1_000_000u64;
         let transient = NotificationRecord::new(r, NotificationClass::Transient, added(3), t);
         let direct = NotificationRecord::new(r, NotificationClass::Direct, added(3), t);
-        let kt = notification_prune_index_key(&transient);
-        let kd = notification_prune_index_key(&direct);
+        let kt = notification_prune_key(&transient);
+        let kd = notification_prune_key(&direct);
         assert!(kt < kd);
         assert_eq!(
-            parse_notification_prune_index_key(&kt).unwrap(),
+            parse_prune_key(&kt).unwrap(),
             (transient.expires_at_ms(), r, transient.notification_id)
         );
     }
 
     #[test]
-    fn outbox_keys_are_fifo_by_ulid() {
+    fn outbox_keys_ulid() {
         assert!(
             notification_outbox_key(Ulid::from_parts(1, 0))
                 < notification_outbox_key(Ulid::from_parts(2, 0))
@@ -508,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_is_key_suffix() {
+    fn cursor_is_suffix() {
         let r = user(1, 2);
         let ts = 42u64;
         let id = Ulid::generate();
@@ -521,11 +516,11 @@ mod tests {
     }
 
     #[test]
-    fn write_entries_pair_primary_and_index() {
+    fn write_entries_index() {
         let r = user(1, 2);
         let record = NotificationRecord::new(r, NotificationClass::Direct, added(3), 1000);
 
-        let writes = notification_inbox_write_entries(&record).unwrap();
+        let writes = inbox_write_entries(&record).unwrap();
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].0, NOTIFICATION_INBOX_KEYSPACE);
         assert_eq!(
@@ -533,10 +528,10 @@ mod tests {
             notification_inbox_key(r, record.created_at_ms, record.notification_id)
         );
         assert_eq!(writes[1].0, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE);
-        assert_eq!(writes[1].1, notification_prune_index_key(&record));
+        assert_eq!(writes[1].1, notification_prune_key(&record));
         assert!(writes[1].2.is_empty());
 
-        let deletes = notification_inbox_delete_entries(&record);
+        let deletes = inbox_delete_entries(&record);
         assert_eq!(deletes.len(), 2);
         assert_eq!(deletes[0].0, NOTIFICATION_INBOX_KEYSPACE);
         assert_eq!(
@@ -544,9 +539,9 @@ mod tests {
             notification_inbox_key(r, record.created_at_ms, record.notification_id)
         );
         assert_eq!(deletes[1].0, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE);
-        assert_eq!(deletes[1].1, notification_prune_index_key(&record));
+        assert_eq!(deletes[1].1, notification_prune_key(&record));
 
-        let update = notification_inbox_update_entry(&record).unwrap();
+        let update = inbox_update_entry(&record).unwrap();
         assert_eq!(update.0, NOTIFICATION_INBOX_KEYSPACE);
         assert_eq!(
             update.1,
@@ -569,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn kind_categories_are_stable() {
+    fn kind_categories_stable() {
         let added = NotificationKind::AddedToGroup {
             group_id: Ulid::generate(),
             actor_user_id: user(1, 3),
@@ -597,12 +592,7 @@ mod tests {
         let data_group_id = Ulid::generate();
         let data_node_id = make_node_id(2);
         let data_uploaded = NotificationKind::DataUploaded {
-            path: crate::structs::data_watch_resource_path(
-                data_group_id,
-                data_node_id,
-                "bucket",
-                "key",
-            ),
+            path: crate::structs::watch_resource_path(data_group_id, data_node_id, "bucket", "key"),
             group_id: data_group_id,
             node_id: data_node_id,
             bucket: "bucket".to_string(),
@@ -611,12 +601,7 @@ mod tests {
             actor_user_id: user(1, 6),
         };
         let sync_completed = NotificationKind::SyncCompleted {
-            path: crate::structs::data_watch_resource_path(
-                data_group_id,
-                data_node_id,
-                "bucket",
-                "",
-            ),
+            path: crate::structs::watch_resource_path(data_group_id, data_node_id, "bucket", ""),
             group_id: data_group_id,
             node_id: data_node_id,
             bucket: "bucket".to_string(),
@@ -625,12 +610,7 @@ mod tests {
             actor_user_id: user(1, 6),
         };
         let sync_failed = NotificationKind::SyncFailed {
-            path: crate::structs::data_watch_resource_path(
-                data_group_id,
-                data_node_id,
-                "bucket",
-                "",
-            ),
+            path: crate::structs::watch_resource_path(data_group_id, data_node_id, "bucket", ""),
             group_id: data_group_id,
             node_id: data_node_id,
             bucket: "bucket".to_string(),

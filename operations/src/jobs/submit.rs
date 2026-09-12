@@ -8,7 +8,7 @@ use aruna_core::keyspaces::{JOB_ACTIVE_USER_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE, 
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     ActiveJobKind, JobId, JobPayload, JobRecord, WorkspaceMode, job_active_prefix, job_record_key,
-    parse_job_dedup_value,
+    parse_dedup_value,
 };
 use aruna_core::structured_id::{
     BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredIdGenerator,
@@ -20,10 +20,10 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use super::store::{decode_job_record, job_dedup_index_key, job_insert_entries};
+use super::store::{decode_job_record, dedup_index_key, job_insert_entries};
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
-pub fn schedule_job_drain_effect() -> Effect {
+pub fn schedule_drain_effect() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainJobQueue,
         after: Duration::ZERO,
@@ -127,13 +127,7 @@ enum SubmitState {
 
 /// Effect-driven submit; a live `job_dedup_index` entry short-circuits to the
 /// existing id (matching plan digest) or raises `JobPlanConflict` (differing
-/// digest), in both cases only after verifying that job's record still exists
-/// and decodes. A dangling entry (record quarantined or gone) falls through to a
-/// fresh create whose transactional batch write repoints the dedup row, so a ghost
-/// row can neither poison its key nor conflict against a dead job. Concurrent
-/// creates are serialized by the storage transaction.
-/// Execution is at-least-once: consumers must be idempotent (`Probe`'s marker file is
-/// the example).
+/// digest), a dangling entry creates fresh; at-least-once, so consumers must be idempotent.
 #[derive(Debug, PartialEq)]
 pub struct SubmitJobOperation {
     record: JobRecord,
@@ -215,12 +209,11 @@ impl SubmitJobOperation {
             return self.check_active(txn_id);
         };
         self.state = SubmitState::ReadDedup { txn_id };
-        // Must go through the same index-key builder `job_insert_entries` uses, which
-        // decides per key whether the owner prefixes it, or the reservation read never
-        // finds the row it is meant to be reserving against.
+        // Must use the same index-key builder `job_insert_entries` uses, which decides
+        // owner prefixing per key, or the reservation read misses its own row.
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: JOB_DEDUP_INDEX_KEYSPACE.to_string(),
-            key: job_dedup_index_key(self.record.created_by, &dedup_key),
+            key: dedup_index_key(self.record.created_by, &dedup_key),
             txn_id: Some(txn_id),
         })]
     }
@@ -273,7 +266,7 @@ impl SubmitJobOperation {
 
     fn schedule_drain(&mut self) -> Effects {
         self.state = SubmitState::ScheduleDrain;
-        smallvec![schedule_job_drain_effect()]
+        smallvec![schedule_drain_effect()]
     }
 
     fn after_write(&mut self) -> Effects {
@@ -341,10 +334,9 @@ impl Operation for SubmitJobOperation {
             SubmitState::ReadDedup { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
-                }) => match parse_job_dedup_value(value.as_ref()) {
-                    // Same key + same plan is idempotent; a different plan is a
-                    // conflict. Either way the target record is verified first so
-                    // a ghost row never answers for a dead job.
+                }) => match parse_dedup_value(value.as_ref()) {
+                    // Same key and plan is idempotent; a different plan is a conflict. Either way
+                    // the target record is verified first so no ghost row answers for a dead job.
                     Ok((existing_job_id, existing_digest)) => {
                         let digest_matches =
                             self.record.plan_digest.unwrap_or_default() == existing_digest;
@@ -466,7 +458,7 @@ mod tests {
     use aruna_core::structs::{
         AuthContext, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, ImportMetadataTarget,
         ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobState, RealmId,
-        RoCrateLimits, encode_job_dedup_value,
+        RoCrateLimits, encode_dedup_value,
     };
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
@@ -876,8 +868,8 @@ mod tests {
         write_raw(
             &storage,
             JOB_DEDUP_INDEX_KEYSPACE,
-            job_dedup_index_key(created_by, b"k"),
-            ByteView::from(encode_job_dedup_value(ghost, digest)),
+            dedup_index_key(created_by, b"k"),
+            ByteView::from(encode_dedup_value(ghost, digest)),
         )
         .await;
 
@@ -905,8 +897,8 @@ mod tests {
         write_raw(
             &storage,
             JOB_DEDUP_INDEX_KEYSPACE,
-            job_dedup_index_key(created_by, b"k"),
-            ByteView::from(encode_job_dedup_value(ghost, [0xAB; 32])),
+            dedup_index_key(created_by, b"k"),
+            ByteView::from(encode_dedup_value(ghost, [0xAB; 32])),
         )
         .await;
 
@@ -943,8 +935,8 @@ mod tests {
         write_raw(
             &storage,
             JOB_DEDUP_INDEX_KEYSPACE,
-            job_dedup_index_key(created_by, b"k"),
-            ByteView::from(encode_job_dedup_value(ghost, digest)),
+            dedup_index_key(created_by, b"k"),
+            ByteView::from(encode_dedup_value(ghost, digest)),
         )
         .await;
 

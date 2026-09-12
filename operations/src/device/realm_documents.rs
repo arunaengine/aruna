@@ -1,17 +1,6 @@
-//! A device's copy of the realm-wide documents.
-//!
-//! A device runs no document sync, so nothing pushes the realm configuration to
-//! it. It fetches the documents from a realm node as an ordinary routed read
-//! and installs the copies into the same keyspaces a realm node uses, so every
-//! local read and permission check runs unchanged. The copies are never
-//! published on: a device originates no realm administration.
-//!
-//! What it installs never regresses. A copy is refused unless its realm-config
-//! clock covers the installed one, and every revocation the device already
-//! holds survives whatever the answer says, so neither a lagging node nor one
-//! the realm evicted can hand a device back a revoked token. Only the realm's
-//! own nodes count in that clock, and a marker every peer disagrees with is
-//! re-based rather than left to lock the device out of its realm.
+//! A device's copy of the realm-wide documents, fetched by routed read into the
+//! realm keyspaces. Installs never regress, so revocations survive, and a marker
+//! every peer disagrees with is re-based.
 
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -32,8 +21,8 @@ use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, NodeInfoDocument, RealmConfigDocument,
     RealmId, SyncRefusal,
 };
+use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::{Key, UserId, Value};
-use aruna_core::util::unix_timestamp_secs;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -43,13 +32,12 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
 };
-use crate::mutate_realm_placement::node_kind;
-use crate::node_info::{read_node_info_document, write_node_info_document};
+use crate::node::node_info::{read_info_document, write_info_document};
+use crate::realm::mutate_placement::node_kind;
 
 /// Attempts in which every answering peer served a copy the marker does not
-/// cover before the marker itself is treated as the wrong one. A marker can
-/// only be too high through a peer that lied, and the realm agreeing against it
-/// is the evidence that it did.
+/// cover before the marker is treated as wrong. The realm agreeing against a
+/// too-high marker is evidence a peer lied.
 const REBASE_ATTEMPTS: u32 = 3;
 
 /// How many cached groups one reconciliation looks at. Above
@@ -128,10 +116,9 @@ pub async fn fetch_realm_documents(context: &Arc<DriverContext>, budget: Duratio
     fetch_with_plan(context, plan, budget).await
 }
 
-/// The same fetch for a device that holds no realm configuration yet: the owner
-/// and the peers to ask are given instead of read back from a stored copy. This
-/// is the onboarding path, where the realm documents are what the device is
-/// still missing.
+/// The same fetch for a device that holds no realm configuration yet: owner and
+/// peers are supplied instead of read from a stored copy. This is the onboarding
+/// path, where the realm documents are what the device is missing.
 pub async fn fetch_from_peers(
     context: &Arc<DriverContext>,
     owner: UserId,
@@ -405,9 +392,8 @@ async fn install_documents(
         && stored_groups == accepted.documents.groups
         && stored_urls == accepted.documents.management_urls;
     if unchanged {
-        // Nothing but the marker moves: writing the documents again would
-        // re-register every realm peer on every beat for a copy this device
-        // already holds.
+        // Nothing but the marker moves: writing the documents again would re-register
+        // every realm peer on every beat for a copy this device already holds.
         if marker == plan.marker {
             return true;
         }
@@ -470,7 +456,7 @@ async fn install_documents(
     // The peer set and the node kinds this device enforces follow the copy it
     // just installed, exactly as they follow a synced one on a realm node.
     if let Some(net_handle) = context.net_handle.as_ref()
-        && let Err(error) = net_handle.refresh_realm_peers_from_document(&config).await
+        && let Err(error) = net_handle.refresh_document_peers(&config).await
     {
         warn!(error = %error, "Failed to apply the fetched realm configuration");
     }
@@ -582,7 +568,7 @@ pub async fn install_group_docs(
 
 async fn install_node_infos(context: &Arc<DriverContext>, documents: &[NodeInfoDocument]) -> bool {
     for document in documents {
-        match read_node_info_document(&context.storage_handle, document.node_id).await {
+        match read_info_document(&context.storage_handle, document.node_id).await {
             Ok(Some(stored)) if stored == *document => continue,
             Ok(_) => {}
             Err(error) => {
@@ -594,7 +580,7 @@ async fn install_node_infos(context: &Arc<DriverContext>, documents: &[NodeInfoD
                 return false;
             }
         }
-        if let Err(error) = write_node_info_document(&context.storage_handle, document).await {
+        if let Err(error) = write_info_document(&context.storage_handle, document).await {
             warn!(
                 node_id = %document.node_id,
                 %error,
@@ -777,9 +763,8 @@ mod tests {
         ));
     }
 
-    // Only the realm's own nodes may appear in a marker: a peer that invents an
-    // origin, or one the realm has since evicted, must not be able to lock this
-    // device out of every legitimate copy.
+    // Only the realm's own nodes may appear in a marker: a peer that invents an origin,
+    // or one the realm has since evicted, must not lock this device out of every copy.
     #[test]
     fn ignores_forged_origins() {
         let realm_nodes = config(&[1, 2]);
@@ -809,7 +794,7 @@ mod tests {
     // One lagging node among fresh ones is not the realm disagreeing: the fresh
     // copy is taken and nothing is ever re-based on the lagging one.
     #[test]
-    fn keeps_fresh_over_lagging() {
+    fn prefers_fresh_copy() {
         let installed = clock(&[(1, 5)]);
         let mut selection = Selection::default();
 
@@ -926,11 +911,7 @@ mod tests {
                 roles: Default::default(),
                 owner,
             },
-            authorization: GroupAuthorizationDocument::new_default_group_doc(
-                owner,
-                realm(),
-                group_id,
-            ),
+            authorization: GroupAuthorizationDocument::default_group_doc(owner, realm(), group_id),
         }
     }
 

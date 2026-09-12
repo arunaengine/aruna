@@ -1,9 +1,6 @@
-//! The realm-admin mutation that attaches an exact policy set to one object.
-//!
-//! Authorization and ref authentication run here, before the transactional mint
-//! is started: a caller who may not administer the realm, or a ref that cannot
-//! be authenticated, never reaches a write. The successor VersionId is owned by
-//! this operation and collision-checked inside the mint transaction.
+//! Realm-admin mutation attaching an exact policy set to one object. It
+//! authorizes and authenticates refs before the mint transaction, and mints a
+//! collision-checked successor VersionId inside it.
 
 use aruna_core::effects::Effect;
 use aruna_core::errors::ConversionError;
@@ -21,11 +18,11 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::blob::blob_keyspace_helper::HeadAliasContext;
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement_policy::foreign_owner;
-use crate::placement_policy::read::ReadPolicyError;
-use crate::placement_policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::blob::records::HeadAliasContext;
+use crate::placement::policy::foreign_owner;
+use crate::placement::policy::read::ReadPolicyError;
+use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 use crate::s3::policy_successor::{
     MintPolicySuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
@@ -317,6 +314,7 @@ impl Operation for PolicyMutationOperation {
 mod tests {
     use super::{PolicyMutationConfig, PolicyMutationError, PolicyMutationOperation};
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
@@ -328,9 +326,10 @@ mod tests {
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
 
-    use crate::blob::blob_keyspace_helper::HeadAliasContext;
-    use crate::placement_policy::cache::PolicyCacheEntry;
-    use crate::placement_policy::fixtures::signed_document;
+    use crate::blob::records::HeadAliasContext;
+    use crate::placement::policy::cache::PolicyCacheEntry;
+    use crate::s3::policy_successor::SuccessorError;
+    use crate::tests::fixtures::policy::signed_document;
 
     fn realm_id() -> RealmId {
         RealmId::from_bytes([1u8; 32])
@@ -451,7 +450,7 @@ mod tests {
         operation.step(authorized(false));
         operation.step(authorized(true));
         operation.step(cached(&policy));
-        let effects = operation.step(crate::placement_policy::fixtures::group_authority(
+        let effects = operation.step(crate::tests::fixtures::policy::group_authority(
             realm_id(),
             group_id(),
         ));
@@ -471,7 +470,7 @@ mod tests {
         operation.start();
         operation.step(authorized(true));
         operation.step(cached(&policy));
-        let effects = operation.step(crate::placement_policy::fixtures::group_authority(
+        let effects = operation.step(crate::tests::fixtures::policy::group_authority(
             realm_id(),
             foreign,
         ));
@@ -516,12 +515,45 @@ mod tests {
         operation.start();
         operation.step(authorized(true));
         operation.step(cached(&policy));
-        let effects = operation.step(crate::placement_policy::fixtures::authority(realm_id()));
+        let effects = operation.step(crate::tests::fixtures::policy::authority(realm_id()));
 
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::StartTransaction { .. })]
         ));
         assert!(!operation.successor_version_id().is_nil());
+    }
+
+    #[test]
+    fn mint_failure_aborts() {
+        // The child mint's typed error must surface while its begun transaction
+        // is still aborted exactly once through the child cleanup.
+        let policy = policy(1);
+        let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
+        operation.start();
+        operation.step(authorized(true));
+        operation.step(cached(&policy));
+        operation.step(crate::tests::fixtures::policy::authority(realm_id()));
+        let txn_id = Ulid::from_bytes([5u8; 16]);
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }));
+
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::CommitFailed,
+        }));
+
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        );
+        assert_eq!(
+            operation.finalize(),
+            Err(PolicyMutationError::Successor(SuccessorError::Storage(
+                StorageError::CommitFailed
+            )))
+        );
     }
 }

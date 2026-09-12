@@ -54,7 +54,7 @@ services:
     volumes:
       - ${ARUNA_PROMETHEUS_CONFIG:-./observability/prometheus.yml}:/etc/prometheus/prometheus.yml:ro
       # prometheus.yml loads this rule file relative to its own directory.
-      - ./observability/aruna-alerts.yml:/etc/prometheus/aruna-alerts.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
     restart: unless-stopped
   grafana:

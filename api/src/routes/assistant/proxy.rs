@@ -2,7 +2,7 @@ use super::{
     PROXY_BODY_LIMIT, ProviderModel, ensure_enabled, forbidden_header, load_provider,
     validate_base_url,
 };
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{AssistantProvider, AssistantProviderKind, AuthContext};
@@ -104,7 +104,7 @@ async fn send_upstream(
     let custom_headers = provider
         .open_headers(state.credential_encryption_key())
         .map_err(|_| ServerError::InternalError("provider headers unavailable".to_string()))?;
-    let body = if provider.kind == AssistantProviderKind::Chatgpt {
+    let body = if provider.kind == AssistantProviderKind::Chatgpt && method == Method::POST {
         force_chatgpt(&body)?
     } else {
         body
@@ -189,7 +189,7 @@ async fn proxy_request(
     request: Request,
 ) -> ServerResult<Response> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let mut provider = load_provider(&state, auth.user_id, provider_id).await?;
     if !allowed_path(provider.kind, request.method(), &path) {
         return Err(ServerError::NotFound);
@@ -423,13 +423,13 @@ pub(super) async fn fetch_models(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{setup_state, spawn_mock};
     use super::*;
     use crate::server_state::ServerState;
+    use crate::tests::fixtures::assistant::{setup_state, spawn_mock};
     use aruna_core::compute::Secret;
     use aruna_core::credential_encryption::EncryptedS3Secret;
     use aruna_core::structs::{AssistantHeaders, AssistantProviderSecret, AssistantProviderStatus};
-    use aruna_operations::assistant_provider::CreateProviderOperation;
+    use aruna_operations::assistant::provider::CreateProviderOperation;
     use aruna_operations::driver::drive;
     use axum::body::Bytes;
     use axum::response::IntoResponse;
@@ -464,9 +464,9 @@ mod tests {
             secret: EncryptedS3Secret::empty(),
             models: Vec::new(),
             default_model: None,
-            created_at: aruna_core::util::unix_timestamp_secs(),
+            created_at: aruna_core::time::unix_timestamp_secs(),
             status: AssistantProviderStatus::Ready,
-            token_obtained_at: Some(aruna_core::util::unix_timestamp_secs()),
+            token_obtained_at: Some(aruna_core::time::unix_timestamp_secs()),
             login_expires_at: None,
             login_interval_seconds: None,
         };
@@ -562,6 +562,47 @@ mod tests {
             error,
             ServerError::BadGatewayReason(message) if message.contains("exceeds")
         ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn chatgpt_models_get() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let router = Router::new().route(
+            "/models",
+            get(move |method: Method, headers: HeaderMap, body: Bytes| {
+                let sender = sender.clone();
+                async move {
+                    sender.send((method, Observed { headers, body })).unwrap();
+                    "{}"
+                }
+            }),
+        );
+        let (base_url, handle) = spawn_mock(router).await;
+        let (_dir, state, auth) = setup_state().await;
+        let mut provider = make_provider(
+            &state,
+            &auth,
+            AssistantProviderKind::Chatgpt,
+            base_url,
+            None,
+        );
+        let mut secret = provider
+            .open_secret(state.credential_encryption_key())
+            .unwrap();
+        secret.access_token = Some(Secret::new("access"));
+        secret.account_id = Some(Secret::new("account"));
+        provider
+            .encrypt_secret(state.credential_encryption_key(), &secret)
+            .unwrap();
+
+        let models = fetch_models(&state, &provider).await.unwrap();
+        assert!(models.is_empty());
+        let (method, observed) = receiver.recv().await.unwrap();
+        assert_eq!(method, Method::GET);
+        assert!(observed.body.is_empty());
+        assert_eq!(observed.headers["authorization"], "Bearer access");
+        assert_eq!(observed.headers["chatgpt-account-id"], "account");
         handle.abort();
     }
 

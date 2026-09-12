@@ -10,8 +10,8 @@ use crate::NodeId;
 use crate::structs::{FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange};
 use crate::structured_id::PlacementHandle;
 
-/// The derived view over the replicated handle-range set. Overlapping grants —
-/// or two distinct values re-using one `range_id` — are retained as conflicted
+/// The derived view over the replicated handle-range set. Overlapping grants,
+/// or two distinct values re-using one `range_id`, are retained as conflicted
 /// and excluded from allocation, mirroring [`crate::structs::BindingDirectory`].
 #[derive(Debug, Default, Clone)]
 pub struct HandleRangeDirectory {
@@ -129,10 +129,8 @@ impl HandleAllocationCursor {
         Self::default()
     }
 
-    /// Draws the lowest unused handle at or after `next` that falls inside one of
-    /// `ranges` (this node's disjoint granted slices, any order), advancing the
-    /// cursor past it. The first handle of every range is the owner's reserved
-    /// JobControl handle and is never drawn. `None` ⇒ every granted handle is spent.
+    /// Draws the lowest unused granted handle at or after `next` and advances the cursor.
+    /// Each range starts with its reserved JobControl handle; `None` means all grants are spent.
     pub fn allocate(&mut self, ranges: &[HandleRange]) -> Option<(PlacementHandle, Ulid)> {
         let mut sorted: Vec<&HandleRange> =
             ranges.iter().filter(|range| !range.is_empty()).collect();

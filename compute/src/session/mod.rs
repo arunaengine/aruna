@@ -705,13 +705,16 @@ impl SessionRegistry {
         backend: Arc<dyn ExecutorBackend>,
         fence: FenceContext,
     ) -> Arc<Session> {
-        if let Some(existing) = self.get(&config.job_id) {
-            return existing;
-        }
         let (session, requests) = build_session(config);
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.insert(session.config.job_id.clone(), session.clone());
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = sessions.get(&session.config.job_id) {
+            return existing.clone();
         }
+        sessions.insert(session.config.job_id.clone(), session.clone());
+        drop(sessions);
         tokio::spawn(pump(session.clone(), backend, fence, requests));
         tokio::spawn(idle_watch(session.clone()));
         tokio::spawn(forget(self.clone(), session.clone()));

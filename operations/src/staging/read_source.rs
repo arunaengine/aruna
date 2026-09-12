@@ -1,4 +1,4 @@
-use crate::connectors::{ResolveSourceConnectorInput, resolve_source_connector_suboperation};
+use crate::connectors::{ResolveSourceConnectorInput, resolve_connector_effect};
 use crate::staging::describe_event;
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
@@ -87,14 +87,12 @@ impl ReadStagingSourceOperation {
 
     fn handle_init(&mut self) -> Effects {
         self.state = ReadStagingSourceState::ResolveConnector;
-        smallvec![resolve_source_connector_suboperation(
-            ResolveSourceConnectorInput {
-                group_id: self.input.group_id,
-                connector_id: self.input.connector_id,
-                source_path: self.input.source_path.clone(),
-                allow_root: false,
-            }
-        )]
+        smallvec![resolve_connector_effect(ResolveSourceConnectorInput {
+            group_id: self.input.group_id,
+            connector_id: self.input.connector_id,
+            source_path: self.input.source_path.clone(),
+            allow_root: false,
+        })]
     }
 
     fn handle_resolved_connector(&mut self, event: Event) -> Effects {
@@ -191,7 +189,7 @@ impl Operation for ReadStagingSourceOperation {
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use crate::staging::test_utils::{create_http_connector, setup_driver_context};
+    use crate::tests::fixtures::staging::{create_http_connector, setup_driver_context};
     use aruna_core::structs::{ResolvedSourceAccess, ResolvedSourceConnector, SourceConnectorKind};
     use futures_util::{StreamExt, stream};
     use std::collections::HashMap;
@@ -250,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn start_emits_resolve_connector_suboperation() {
+    fn start_emits_resolve() {
         let mut operation = ReadStagingSourceOperation::new(sample_input());
 
         let effects = operation.start();
@@ -260,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_connector_emits_read_effect_with_range() {
+    fn resolved_emits_read() {
         let mut operation = ReadStagingSourceOperation::new(sample_input());
         operation.start();
         let resolved = sample_resolved_connector();
@@ -281,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_error_is_exposed() {
+    fn exposes_resolve_error() {
         let mut operation = ReadStagingSourceOperation::new(sample_input());
         operation.start();
 
@@ -301,7 +299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_result_finishes_operation_and_exposes_stream() {
+    async fn read_finishes_operation() {
         let mut operation = ReadStagingSourceOperation::new(sample_input());
         operation.start();
         operation.step(Event::SubOperation(
@@ -328,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn staging_error_is_exposed() {
+    fn exposes_staging_error() {
         let mut operation = ReadStagingSourceOperation::new(sample_input());
         operation.start();
         operation.step(Event::SubOperation(
@@ -351,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn unexpected_event_uses_event_description() {
+    fn unexpected_describes_event() {
         let mut operation = ReadStagingSourceOperation::new(sample_input());
         operation.start();
 
@@ -372,7 +370,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_operation_resolves_connector_and_hits_runtime() {
+    async fn read_hits_runtime() {
         let test_context = setup_driver_context().await;
         let group_id = Ulid::generate();
         let connector =

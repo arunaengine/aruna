@@ -1,26 +1,19 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! A late node joins and onboarding hands it the buckets with an expansion
-//! transition it issues itself.
-//!
-//! Expansion is the superset case: every bucket's target set contains its old
-//! set, so nothing moves off any node and the old holders stay write authority
-//! throughout. It still runs the full machinery - barrier from every old
-//! holder, a pulled and verified copy on every target, a signed proof each, and
-//! only then the reduced cutover - which is what makes a multi-node bootstrap
-//! exercise the same path a rebalance does.
+//! A late node joins and onboarding hands it the buckets with an expansion transition it issues
+//! itself.
 
 mod topology;
 
 use aruna_core::StructuredId;
 use aruna_core::structs::{PlacementRef, RealmNodeKind};
-use aruna_operations::create_metadata_document::{
+use aruna_operations::driver::drive;
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     create_metadata_document, mint_local_document,
 };
-use aruna_operations::driver::drive;
-use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
-use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
+use aruna_operations::metadata::projector::replay_event_log;
 use ulid::Ulid;
 
 use topology::{TestNode, TestResult, Topology, wait_until};
@@ -105,10 +98,7 @@ async fn expansion_hands_buckets() -> TestResult<()> {
             assert!(bucket.target_holders.contains(&joiner));
         }
     }
-    // The joiner is a member from the moment the record exists, which is what
-    // lets it pull. (Whether it is already a holder is a race: the reconciler
-    // may have completed the whole handoff by now, so authority during the
-    // transition is asserted by the reducer tests instead.)
+    // The joiner is a member from the moment the record exists, which is what lets it pull.
     assert!(realm.members(&probe).contains(&joiner));
 
     for transition_id in &started {
@@ -211,7 +201,7 @@ async fn create_document(
         node.context.clone(),
     )
     .await?;
-    replay_metadata_event_log(node.context.as_ref()).await?;
+    replay_event_log(node.context.as_ref()).await?;
     Ok(created.record.placement)
 }
 

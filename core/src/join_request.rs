@@ -1,5 +1,5 @@
-use crate::admin_document_reducer::AdminDocumentReducerState;
 use crate::admin_documents::AdminDocumentTarget;
+use crate::reducer::AdminDocumentReducerState;
 use crate::types::{GroupId, RoleId, UserId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -205,13 +205,8 @@ mod tests {
             approved.join_requests()[0].decision.as_ref().unwrap().kind,
             JoinDecisionKind::Approved
         );
-        assert!(
-            approved.materialized_group_role_user_assignments()[&role_id]
-                .contains(&request.user_id)
-        );
-        assert!(
-            denied.materialized_group_role_user_assignments()[&role_id].contains(&request.user_id)
-        );
+        assert!(approved.materialized_group_assignments()[&role_id].contains(&request.user_id));
+        assert!(denied.materialized_group_assignments()[&role_id].contains(&request.user_id));
         let before = approved.clone();
         approved.apply(&approval).unwrap();
         assert_eq!(approved, before);

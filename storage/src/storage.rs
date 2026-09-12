@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
@@ -9,8 +9,8 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::keyspaces::prefix_upper_bound;
 use aruna_core::telemetry::{LatencyAggregator, duration_ms, record_stage};
-use aruna_core::util::prefix_upper_bound;
 use async_trait::async_trait;
 use byteview::ByteView;
 use crossfire::select::Select;
@@ -19,10 +19,15 @@ use fjall::{
     KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode, Readable,
 };
 use tokio::sync::{Notify, oneshot};
-use tracing::{Span, debug, debug_span, field, warn};
+use tracing::{Span, debug_span, field, warn};
 use ulid::Ulid;
 
-use crate::errors::StorageLibError;
+use crate::compaction::Compactor;
+
+mod lifecycle;
+mod persistence;
+mod records;
+mod transactions;
 pub type EffectHandle = (StorageEffect, ResponseSender, Span, Instant, InFlightGuard);
 pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
 type AsyncEffectSender = crossfire::MAsyncTx<mpsc::Array<EffectHandle>>;
@@ -90,7 +95,7 @@ fn record_storage_call(
     }
 }
 
-fn storage_effect_key_space(effect: &StorageEffect) -> Option<&str> {
+fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
     match effect {
         StorageEffect::Read { key_space, .. }
         | StorageEffect::Write { key_space, .. }
@@ -112,19 +117,10 @@ fn storage_effect_key_space(effect: &StorageEffect) -> Option<&str> {
         | StorageEffect::SyncAll => None,
     }
 }
-// Deletes leave tombstones that every later read walks. Small keyspaces never
-// fill a memtable, so compaction has to be triggered by the delete count.
-const COMPACT_AFTER_DELETES: u64 = 5_000;
-// A major compaction rewrites the whole keyspace and rotates its memtable under
-// the database-wide journal lock, so only a small keyspace is compacted here.
-const COMPACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_GROUP_COMMIT: usize = 256;
 const READ_POOL_THREADS: usize = 4;
 const BULK_READ_POOL_THREADS: usize = 2;
-// Foreground effects served per admitted bulk effect. Counting effects rather
-// than batches keeps the bulk share constant under load: a batch may carry up to
-// MAX_GROUP_COMMIT effects, so per-batch credit would shrink the share to
-// nothing exactly when the queue is deepest.
+// Count foreground effects so large batches cannot starve the bulk lane under load.
 const FOREGROUND_PER_BULK: usize = 8;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -199,132 +195,6 @@ impl Store {
             }
             Err(error) => Err(StorageError::KeyspaceError(error.to_string())),
         }
-    }
-}
-
-struct CompactionJob {
-    key_space: String,
-    deletes: u64,
-    run: Box<dyn FnOnce() -> fjall::Result<()> + Send>,
-}
-
-/// Runs keyspace compactions on one background thread, so compaction never
-/// blocks the write worker and never holds a lock the read pool needs.
-struct Compactor {
-    sender: Option<std::sync::mpsc::Sender<CompactionJob>>,
-    thread: Option<thread::JoinHandle<()>>,
-    active: Arc<Mutex<HashSet<String>>>,
-    stopping: Arc<AtomicBool>,
-}
-
-impl Compactor {
-    fn spawn() -> Self {
-        let (sender, receiver) = std::sync::mpsc::channel::<CompactionJob>();
-        let active: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let stopping = Arc::new(AtomicBool::new(false));
-        let running = active.clone();
-        let stop = stopping.clone();
-        let thread = thread::spawn(move || {
-            // A queued job holds a keyspace handle, so the backlog is dropped
-            // on shutdown instead of keeping the database open job by job.
-            while let Ok(job) = receiver.recv() {
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
-                run_compaction(job, &running);
-            }
-        });
-        Self {
-            sender: Some(sender),
-            thread: Some(thread),
-            active,
-            stopping,
-        }
-    }
-
-    /// Keeps at most one queued compaction per keyspace, including while one runs.
-    fn submit(&self, key_space: &str, deletes: u64, keyspace: OptimisticTxKeyspace) {
-        let Some(sender) = self.sender.as_ref() else {
-            return;
-        };
-        if !self
-            .active
-            .lock()
-            .expect("storage compaction mutex poisoned")
-            .insert(key_space.to_string())
-        {
-            return;
-        }
-        let job = CompactionJob {
-            key_space: key_space.to_string(),
-            deletes,
-            run: Box::new(move || {
-                // fjall 3.1.10 hides both calls from its docs; a version bump
-                // has to recheck that they still exist and still block here.
-                let keyspace: &fjall::Keyspace = keyspace.as_ref();
-                keyspace.rotate_memtable_and_wait()?;
-                keyspace.major_compact()
-            }),
-        };
-        if sender.send(job).is_err() {
-            self.release(key_space);
-        }
-    }
-
-    fn release(&self, key_space: &str) {
-        self.active
-            .lock()
-            .expect("storage compaction mutex poisoned")
-            .remove(key_space);
-    }
-
-    /// Waits for a running compaction so no keyspace handle outlives the store.
-    fn shutdown(&mut self) {
-        self.stopping.store(true, Ordering::Release);
-        self.sender = None;
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl Drop for Compactor {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-/// Whether a keyspace is small enough for a delete-triggered major compaction.
-fn compactable(disk_space: u64) -> bool {
-    disk_space <= COMPACT_MAX_BYTES
-}
-
-fn run_compaction(job: CompactionJob, active: &Arc<Mutex<HashSet<String>>>) {
-    let CompactionJob {
-        key_space,
-        deletes,
-        run,
-    } = job;
-    active
-        .lock()
-        .expect("storage compaction mutex poisoned")
-        .remove(&key_space);
-    let started = Instant::now();
-    match run() {
-        Ok(()) => debug!(
-            event = "storage.keyspace.compacted",
-            key_space = %key_space,
-            deletes,
-            elapsed_ms = duration_ms(started.elapsed()),
-            "Compacted a delete-heavy keyspace"
-        ),
-        Err(error) => warn!(
-            event = "storage.keyspace.compact_failed",
-            key_space = %key_space,
-            deletes,
-            error = %error,
-            "Keyspace compaction failed"
-        ),
     }
 }
 
@@ -772,15 +642,15 @@ impl StorageHandle {
     async fn dispatch_storage_effect(&self, effect: StorageEffect) -> StorageEvent {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
-        let event = self.dispatch_queued_storage_effect(effect).await;
+        let event = self.dispatch_queued(effect).await;
         record_stage("storage", started.elapsed());
         event
     }
 
-    async fn dispatch_queued_storage_effect(&self, effect: StorageEffect) -> StorageEvent {
+    async fn dispatch_queued(&self, effect: StorageEffect) -> StorageEvent {
         let (sender, response_rx) = oneshot::channel();
         let operation = storage_effect_kind(&effect);
-        let active_txn_id = active_txn_id_for_effect(&effect);
+        let active_txn_id = effect_txn_id(&effect);
         let cleanup = cleanup_effect(&effect);
         let cleanup_write = is_cleanup_write(&effect);
         if let StorageEffect::CommitTransaction { txn_id } = &effect
@@ -863,9 +733,7 @@ impl StorageHandle {
                 match self.channel_for(&item.0).try_send(item) {
                     Ok(()) => Ok(()),
                     Err(TrySendError::Full(item)) if cleanup_write => {
-                        // Awaiting a slot needs the close guard released first, so a
-                        // slot won after the close enqueues; the worker mutation
-                        // fence still rejects it before it can execute.
+                        // Release the close guard before waiting; the worker fence rejects a late write.
                         deferred = Some(item);
                         Ok(())
                     }
@@ -1073,7 +941,7 @@ fn storage_effect_mutates(effect: &StorageEffect) -> bool {
     }
 }
 
-fn active_txn_id_for_effect(effect: &StorageEffect) -> Option<Ulid> {
+fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
     match effect {
         StorageEffect::Read {
             txn_id: Some(txn_id),
@@ -1277,9 +1145,8 @@ fn observe_cleanup(
                 CleanupKind::CommitQueued | CleanupKind::CommitUnknown
             )
         {
-            // A repeat on an already unknown commit re-ran nothing that could
-            // progress: the transaction is gone from the worker. It counts
-            // against the bound so the entry retires and frees its slot.
+            // An unknown commit cannot progress after the worker forgets its transaction.
+            // Count retries so the cleanup slot is eventually freed.
             if matches!(entry.kind, CleanupKind::CommitUnknown) {
                 entry.attempts = entry.attempts.saturating_add(1);
                 return entry.attempts >= MAX_CLEANUP_ATTEMPTS;
@@ -1333,9 +1200,7 @@ impl ResponseToken {
             StorageEffect::AbortTransaction { txn_id } => {
                 Some(ResponseCleanup::Abort(*txn_id, true))
             }
-            _ => {
-                active_txn_id_for_effect(effect).map(|txn_id| ResponseCleanup::Abort(txn_id, false))
-            }
+            _ => effect_txn_id(effect).map(|txn_id| ResponseCleanup::Abort(txn_id, false)),
         };
         Self {
             handle: cleanup.as_ref().map(|_| handle.clone()),
@@ -1481,98 +1346,6 @@ impl Handle for StorageHandle {
 }
 
 impl FjallStorage {
-    #[tracing::instrument(name = "storage.open", level = "debug", fields(path = %path))]
-    pub fn open(path: &str) -> Result<StorageHandle, StorageLibError> {
-        Self::open_with_persist_policy(path, FjallPersistPolicy::default())
-    }
-
-    #[doc(hidden)]
-    pub fn open_test(path: &str) -> Result<StorageHandle, StorageLibError> {
-        Self::open_pools(path, FjallPersistPolicy::default(), 1, 1)
-    }
-
-    #[tracing::instrument(
-        name = "storage.open",
-        level = "debug",
-        fields(path = %path, persist_policy = policy.label())
-    )]
-    pub fn open_with_persist_policy(
-        path: &str,
-        policy: FjallPersistPolicy,
-    ) -> Result<StorageHandle, StorageLibError> {
-        Self::open_pools(path, policy, READ_POOL_THREADS, BULK_READ_POOL_THREADS)
-    }
-
-    fn open_pools(
-        path: &str,
-        policy: FjallPersistPolicy,
-        read_threads: usize,
-        bulk_threads: usize,
-    ) -> Result<StorageHandle, StorageLibError> {
-        let db = OptimisticTxDatabase::builder(path)
-            .manual_journal_persist(true)
-            .open()?;
-
-        let (sender, receivers) = StorageHandle::new();
-        let mut storage = Self::new(Store::new(db), policy, &sender, read_threads, bulk_threads);
-        let channel_closed = sender.metrics.channel_closed.clone();
-
-        let worker = thread::spawn(move || {
-            let _lifecycle = WorkerLifecycleGuard(channel_closed);
-            storage.receive_loop(receivers);
-            storage.close();
-        });
-        sender
-            .worker
-            .lock()
-            .expect("storage worker mutex poisoned")
-            .replace(worker);
-
-        Ok(sender)
-    }
-
-    /// Joins the read pools so every store clone is gone when this returns;
-    /// the fjall lock is released by the final store drop right after.
-    fn close(mut self) {
-        self.compactor.shutdown();
-        self.read_pool.clear();
-        self.bulk_read_pool.clear();
-        for reader in std::mem::take(&mut self.pool_threads) {
-            let _ = reader.join();
-        }
-    }
-
-    /// Worker sharing the handle's cleanup map and metrics, including the
-    /// mutation fence it reads before starting any mutation.
-    fn new(
-        store: Store,
-        policy: FjallPersistPolicy,
-        handle: &StorageHandle,
-        read_threads: usize,
-        bulk_threads: usize,
-    ) -> Self {
-        let (read_pool, mut pool_threads) =
-            spawn_read_pool(store.clone(), read_threads, STORAGE_EFFECT_QUEUE_CAPACITY);
-        let (bulk_read_pool, bulk_threads) =
-            spawn_read_pool(store.clone(), bulk_threads, BULK_EFFECT_QUEUE_CAPACITY);
-        pool_threads.extend(bulk_threads);
-        Self {
-            store,
-            persist_policy: policy,
-            txns: HashMap::new(),
-            transaction_cleanup: handle.transaction_cleanup.clone(),
-            metrics: handle.metrics.clone(),
-            read_pool,
-            next_reader: 0,
-            bulk_read_pool,
-            next_bulk_reader: 0,
-            pool_threads,
-            compactor: Compactor::spawn(),
-            deletes: HashMap::new(),
-            txn_deletes: HashMap::new(),
-        }
-    }
-
     /// True when the drain fence is up and this effect would start a mutation
     /// that has not begun executing yet.
     fn fenced_mutation(&self, effect: &StorageEffect) -> bool {
@@ -1582,7 +1355,7 @@ impl FjallStorage {
     /// Rejects a mutation the fence caught before it started, leaving no open
     /// transaction and no cleanup entry behind it.
     fn reject_fenced(&mut self, effect: &StorageEffect) -> StorageEvent {
-        if let Some(txn_id) = active_txn_id_for_effect(effect) {
+        if let Some(txn_id) = effect_txn_id(effect) {
             self.retire_fenced_txn(txn_id);
         }
         self.metrics.rejected_writes.fetch_add(1, Ordering::Relaxed);
@@ -1667,10 +1440,8 @@ impl FjallStorage {
             .expect("transaction cleanup mutex poisoned")
             .iter()
             .filter_map(|(txn_id, entry)| {
-                // CommitUnknown probes with an abort: a still-open transaction
-                // aborts, a resolved one reports NotFound; both are terminal.
-                // Queued entries are owned by an in-flight effect; racing it
-                // would surface a spurious TransactionNotFound to the caller.
+                // Probe unknown commits with abort: open transactions abort, resolved ones return NotFound.
+                // Do not race queued entries owned by an in-flight effect.
                 (matches!(entry.kind, CleanupKind::Abort | CleanupKind::CommitUnknown)
                     && entry.attempts < MAX_CLEANUP_ATTEMPTS
                     && !entry.queued)
@@ -1719,7 +1490,7 @@ impl FjallStorage {
                 }
                 StoragePriority::Bulk => {
                     if is_poolable_read(&first.0) {
-                        self.forward_to_read_pool(first, StoragePriority::Bulk, &mut slow_queue);
+                        self.forward_read(first, StoragePriority::Bulk, &mut slow_queue);
                     } else {
                         self.process_single(first, &mut slow_queue);
                     }
@@ -1765,7 +1536,7 @@ impl FjallStorage {
                     self.flush_write_group(&mut group, slow_queue);
                     group_index = None;
                 }
-                self.forward_to_read_pool(item, StoragePriority::Foreground, slow_queue);
+                self.forward_read(item, StoragePriority::Foreground, slow_queue);
                 continue;
             }
             self.flush_write_group(&mut group, slow_queue);
@@ -1777,7 +1548,7 @@ impl FjallStorage {
         served
     }
 
-    fn forward_to_read_pool(
+    fn forward_read(
         &mut self,
         item: EffectHandle,
         priority: StoragePriority,
@@ -1812,7 +1583,7 @@ impl FjallStorage {
         let (effect, mut response_tx, span, enqueued_at, in_flight) = item;
         let _guard = span.enter();
         let operation = storage_effect_kind(&effect);
-        let key_space = storage_effect_key_space(&effect).map(str::to_string);
+        let key_space = effect_keyspace(&effect).map(str::to_string);
         let cleanup = cleanup_effect(&effect);
         let queue_wait = enqueued_at.elapsed();
         span.record("queue_wait_ms", duration_ms(queue_wait));
@@ -1935,7 +1706,7 @@ impl FjallStorage {
             }
         }
 
-        let group_error = match self.commit_buffered_write_tx(tx) {
+        let group_error = match self.commit_buffered(tx) {
             Ok(()) => self.persist_journal().err(),
             Err(StorageError::TransactionConflict) => {
                 for (item, _) in prepared {
@@ -1974,7 +1745,7 @@ impl FjallStorage {
             span.record("path", "group_commit");
             slow_queue.observe(
                 storage_effect_kind(&effect),
-                storage_effect_key_space(&effect),
+                effect_keyspace(&effect),
                 queue_wait,
                 service_elapsed,
                 result,
@@ -2043,604 +1814,6 @@ impl FjallStorage {
             }
             _ => Err(StorageError::InvalidEffect),
         }
-    }
-
-    fn sync_all(&self) -> StorageEvent {
-        match self.persist_with_mode(PersistMode::SyncAll) {
-            Ok(()) => StorageEvent::SyncAllFinished,
-            Err(error) => StorageEvent::Error { error },
-        }
-    }
-
-    fn persist_journal(&self) -> Result<(), StorageError> {
-        self.persist_with_mode(self.persist_policy.as_fjall())
-    }
-
-    fn persist_with_mode(&self, mode: PersistMode) -> Result<(), StorageError> {
-        let persist_started = Instant::now();
-        self.store
-            .db
-            .persist(mode)
-            .map_err(|error| StorageError::PersistError(error.to_string()))?;
-        Span::current().record("persist_ms", duration_ms(persist_started.elapsed()));
-        Ok(())
-    }
-
-    fn buffered_write_tx(&self) -> Result<fjall::OptimisticWriteTx, StorageError> {
-        self.store
-            .db
-            .write_tx()
-            .map(|tx| tx.durability(Some(self.persist_policy.as_fjall())))
-            .map_err(|error| StorageError::WriteError(error.to_string()))
-    }
-
-    fn commit_buffered_write_tx(&self, tx: fjall::OptimisticWriteTx) -> Result<(), StorageError> {
-        let commit_started = Instant::now();
-        match tx.commit() {
-            Ok(Ok(())) => {
-                Span::current().record("commit_ms", duration_ms(commit_started.elapsed()));
-                Ok(())
-            }
-            Ok(Err(_)) => {
-                Span::current().record("commit_ms", duration_ms(commit_started.elapsed()));
-                Err(StorageError::TransactionConflict)
-            }
-            Err(error) => {
-                Span::current().record("commit_ms", duration_ms(commit_started.elapsed()));
-                Err(StorageError::WriteError(error.to_string()))
-            }
-        }
-    }
-
-    #[tracing::instrument(
-        name = "storage.start_transaction",
-        level = "debug",
-        skip(self),
-        fields(read)
-    )]
-    fn start_transaction(&mut self, read: bool) -> StorageEvent {
-        let txn_id = loop {
-            let candidate = Ulid::generate();
-            let mut pending = self
-                .transaction_cleanup
-                .lock()
-                .expect("transaction cleanup mutex poisoned");
-            if pending.len() >= MAX_TRANSACTION_CLEANUP {
-                return StorageEvent::Error {
-                    error: StorageError::CleanupCapacity,
-                };
-            }
-            if pending.contains_key(&candidate) {
-                continue;
-            }
-            pending.insert(
-                candidate,
-                CleanupEntry {
-                    kind: CleanupKind::Open,
-                    attempts: 0,
-                    queued: false,
-                },
-            );
-            break candidate;
-        };
-
-        let txn = if read {
-            let txn = self.store.db.read_tx();
-            Txn::Read(txn)
-        } else {
-            match self.store.db.write_tx() {
-                Ok(txn) => {
-                    let txn = txn.durability(Some(self.persist_policy.as_fjall()));
-                    Txn::Write(Box::new(txn))
-                }
-                Err(_e) => {
-                    self.transaction_cleanup
-                        .lock()
-                        .expect("transaction cleanup mutex poisoned")
-                        .remove(&txn_id);
-                    return StorageEvent::Error {
-                        error: StorageError::TransactionConflict,
-                    };
-                }
-            }
-        };
-
-        self.txns.insert(txn_id, txn);
-        StorageEvent::TransactionStarted { txn_id }
-    }
-
-    #[tracing::instrument(name = "storage.abort_transaction", level = "debug", skip(self), fields(txn_id = %txn_id))]
-    fn abort_transaction(&mut self, txn_id: Ulid) -> StorageEvent {
-        if self
-            .transaction_cleanup
-            .lock()
-            .expect("transaction cleanup mutex poisoned")
-            .get(&txn_id)
-            .is_some_and(|entry| {
-                matches!(
-                    entry.kind,
-                    CleanupKind::CommitQueued
-                        | CleanupKind::CommitUnknown
-                        | CleanupKind::Committed
-                        | CleanupKind::Aborted
-                )
-            })
-        {
-            return StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            };
-        }
-        self.take_txn_deletes(txn_id, false);
-        match self.txns.remove(&txn_id) {
-            Some(Txn::Write(txn)) => {
-                txn.rollback();
-                StorageEvent::TransactionAborted { txn_id }
-            }
-            Some(Txn::Read(_txn)) => StorageEvent::TransactionAborted { txn_id },
-            None => StorageEvent::Error {
-                error: StorageError::TransactionNotFound,
-            },
-        }
-    }
-
-    #[tracing::instrument(
-        name = "storage.read",
-        level = "debug",
-        skip(self, key),
-        fields(key_space = %key_space, key_len = key.as_ref().len(), txn_id = ?txn_id)
-    )]
-    fn read(&mut self, key_space: String, key: ByteView, txn_id: Option<Ulid>) -> StorageEvent {
-        let keyspace = match self.store.resolve_keyspace(&key_space) {
-            Ok(ks) => ks,
-            Err(e) => return StorageEvent::Error { error: e },
-        };
-
-        if let Some(txn_id) = txn_id {
-            match self.txns.get(&txn_id) {
-                Some(Txn::Read(txn)) => match txn.get(keyspace, &key) {
-                    Ok(value_opt) => StorageEvent::ReadResult {
-                        key,
-                        value: value_opt.map(|v| v.into()),
-                    },
-                    Err(error) => StorageEvent::Error {
-                        error: StorageError::ReadError(error.to_string()),
-                    },
-                },
-                Some(Txn::Write(txn)) => match txn.get(keyspace, &key) {
-                    Ok(value_opt) => StorageEvent::ReadResult {
-                        key,
-                        value: value_opt.map(|v| v.into()),
-                    },
-                    Err(error) => StorageEvent::Error {
-                        error: StorageError::ReadError(error.to_string()),
-                    },
-                },
-                None => StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
-                },
-            }
-        } else {
-            store_read(&self.store, keyspace, key)
-        }
-    }
-
-    fn batch_read(&mut self, reads: Vec<(String, ByteView)>, txn_id: Option<Ulid>) -> StorageEvent {
-        if let Some(txn_id) = txn_id {
-            match self.txns.get(&txn_id) {
-                Some(Txn::Read(txn)) => batch_read_with(&self.store, txn, reads),
-                Some(Txn::Write(txn)) => batch_read_with(&self.store, txn.as_ref(), reads),
-                None => StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
-                },
-            }
-        } else {
-            store_batch_read(&self.store, reads)
-        }
-    }
-
-    #[tracing::instrument(
-        name = "storage.write",
-        level = "debug",
-        skip(self, key, value),
-        fields(key_space = %key_space, key_len = key.as_ref().len(), value_len = value.as_ref().len(), txn_id = ?txn_id)
-    )]
-    fn write(
-        &mut self,
-        key_space: String,
-        key: ByteView,
-        value: ByteView,
-        txn_id: Option<Ulid>,
-    ) -> StorageEvent {
-        let keyspace = match self.store.resolve_keyspace(&key_space) {
-            Ok(ks) => ks,
-            Err(e) => return StorageEvent::Error { error: e },
-        };
-
-        if let Some(txn_id) = txn_id {
-            if let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) {
-                txn.insert(keyspace, key.clone(), value);
-                StorageEvent::WriteResult { key }
-            } else {
-                StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
-                }
-            }
-        } else {
-            let result = self.buffered_write_tx().and_then(|mut tx| {
-                tx.insert(keyspace, key.clone(), value);
-                self.commit_buffered_write_tx(tx)?;
-                self.persist_journal()
-            });
-            if let Err(error) = result {
-                return StorageEvent::Error { error };
-            }
-            StorageEvent::WriteResult { key }
-        }
-    }
-
-    #[tracing::instrument(
-        name = "storage.batch_write",
-        level = "debug",
-        skip(self, writes),
-        fields(write_count = writes.len(), txn_id = ?txn_id)
-    )]
-    fn batch_write(
-        &mut self,
-        writes: Vec<(String, ByteView, ByteView)>,
-        txn_id: Option<Ulid>,
-    ) -> StorageEvent {
-        let mut entries = Vec::with_capacity(writes.len());
-        let mut resolved = Vec::with_capacity(writes.len());
-        for (key_space, key, value) in writes {
-            let keyspace = match self.store.resolve_keyspace(&key_space) {
-                Ok(ks) => ks,
-                Err(error) => return StorageEvent::Error { error },
-            };
-            resolved.push((keyspace, key_space, key, value));
-        }
-
-        if let Some(txn_id) = txn_id {
-            let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) else {
-                return StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
-                };
-            };
-
-            for (keyspace, key_space, key, value) in resolved {
-                txn.insert(keyspace, key.clone(), value);
-                entries.push((key_space, key));
-            }
-        } else {
-            let mut tx = match self.buffered_write_tx() {
-                Ok(tx) => tx,
-                Err(error) => return StorageEvent::Error { error },
-            };
-            for (keyspace, key_space, key, value) in resolved {
-                tx.insert(keyspace, key.clone(), value);
-                entries.push((key_space, key));
-            }
-            if let Err(error) = self
-                .commit_buffered_write_tx(tx)
-                .and_then(|()| self.persist_journal())
-            {
-                return StorageEvent::Error { error };
-            }
-        }
-
-        StorageEvent::BatchWriteResult { entries }
-    }
-
-    #[tracing::instrument(name = "storage.commit_transaction", level = "debug", skip(self), fields(txn_id = %txn_id))]
-    fn commit_transaction(&mut self, txn_id: Ulid) -> StorageEvent {
-        let state = self
-            .transaction_cleanup
-            .lock()
-            .expect("transaction cleanup mutex poisoned")
-            .get(&txn_id)
-            .map(|entry| entry.kind);
-        match state {
-            Some(CleanupKind::Abort | CleanupKind::Aborted) => {
-                return StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                };
-            }
-            Some(CleanupKind::CommitQueued) => {}
-            Some(CleanupKind::CommitUnknown) if self.txns.contains_key(&txn_id) => {}
-            Some(CleanupKind::CommitUnknown) => {
-                return StorageEvent::Error {
-                    error: StorageError::CommitFailed,
-                };
-            }
-            Some(CleanupKind::Open) => {
-                if let Some(entry) = self
-                    .transaction_cleanup
-                    .lock()
-                    .expect("transaction cleanup mutex poisoned")
-                    .get_mut(&txn_id)
-                {
-                    entry.kind = CleanupKind::CommitQueued;
-                }
-            }
-            Some(CleanupKind::Committed) => {
-                return StorageEvent::TransactionCommitted { txn_id };
-            }
-            None => {}
-        }
-
-        match self.txns.remove(&txn_id) {
-            Some(Txn::Read(_txn)) => StorageEvent::TransactionCommitted { txn_id },
-            Some(Txn::Write(txn)) => {
-                let committed = txn.commit();
-                self.take_txn_deletes(txn_id, matches!(committed, Ok(Ok(()))));
-                match committed {
-                    Ok(Ok(())) => StorageEvent::TransactionCommitted { txn_id },
-                    Ok(Err(_)) => StorageEvent::Error {
-                        error: StorageError::TransactionConflict,
-                    },
-                    // Fjall writes the journal before applying memtables, so an
-                    // outer error may still leave the user batch durable.
-                    Err(error) => {
-                        warn!(
-                            event = "storage.transaction.commit_failed",
-                            txn_id = %txn_id,
-                            error = %error,
-                            "Storage transaction commit failed with an unknown outcome"
-                        );
-                        StorageEvent::Error {
-                            error: StorageError::CommitFailed,
-                        }
-                    }
-                }
-            }
-            None => StorageEvent::Error {
-                error: StorageError::TransactionNotFound,
-            },
-        }
-    }
-
-    /// Counts committed deletes and compacts the keyspace once they cross
-    /// `COMPACT_AFTER_DELETES`, because its tombstones slow every later read.
-    /// A keyspace past `COMPACT_MAX_BYTES` only resets its counter.
-    fn note_deletes(&mut self, key_space: &str, count: u64) {
-        let total = match self.deletes.get_mut(key_space) {
-            Some(total) => total,
-            None => self.deletes.entry(key_space.to_string()).or_default(),
-        };
-        *total += count;
-        if *total < COMPACT_AFTER_DELETES {
-            return;
-        }
-        let deletes = std::mem::take(total);
-        match self.store.resolve_keyspace(key_space) {
-            Ok(keyspace) => {
-                let disk_space = AsRef::<fjall::Keyspace>::as_ref(&keyspace).disk_space();
-                if !compactable(disk_space) {
-                    debug!(
-                        event = "storage.keyspace.compact_skipped",
-                        key_space,
-                        disk_space,
-                        deletes,
-                        "Keyspace is too large for a delete-triggered compaction"
-                    );
-                    return;
-                }
-                self.compactor.submit(key_space, deletes, keyspace)
-            }
-            Err(error) => warn!(
-                event = "storage.keyspace.compact_failed",
-                key_space, error = %error, "Keyspace compaction could not resolve the keyspace"
-            ),
-        }
-    }
-
-    fn note_effect_deletes(&mut self, effect: &StorageEffect) {
-        match effect {
-            StorageEffect::Delete { key_space, .. } => self.note_deletes(key_space, 1),
-            StorageEffect::BatchDelete { deletes, .. } => {
-                for (key_space, _) in deletes {
-                    self.note_deletes(key_space, 1);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn hold_txn_delete(&mut self, txn_id: Ulid, key_space: &str) {
-        *self
-            .txn_deletes
-            .entry(txn_id)
-            .or_default()
-            .entry(key_space.to_string())
-            .or_default() += 1;
-    }
-
-    /// Counts the deletes a transaction made durable; other outcomes drop them.
-    fn take_txn_deletes(&mut self, txn_id: Ulid, committed: bool) {
-        let Some(deletes) = self.txn_deletes.remove(&txn_id) else {
-            return;
-        };
-        if !committed {
-            return;
-        }
-        for (key_space, count) in deletes {
-            self.note_deletes(&key_space, count);
-        }
-    }
-
-    #[tracing::instrument(
-        name = "storage.delete",
-        level = "debug",
-        skip(self, key),
-        fields(key_space = %key_space, key_len = key.as_ref().len(), txn_id = ?txn_id)
-    )]
-    fn delete(&mut self, key_space: String, key: ByteView, txn_id: Option<Ulid>) -> StorageEvent {
-        let keyspace = match self.store.resolve_keyspace(&key_space) {
-            Ok(ks) => ks,
-            Err(e) => return StorageEvent::Error { error: e },
-        };
-
-        if let Some(txn_id) = txn_id {
-            if let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) {
-                txn.remove(keyspace, key.clone());
-                self.hold_txn_delete(txn_id, &key_space);
-                StorageEvent::DeleteResult { key }
-            } else {
-                StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
-                }
-            }
-        } else {
-            let mut tx = match self.buffered_write_tx() {
-                Ok(tx) => tx,
-                Err(error) => return StorageEvent::Error { error },
-            };
-            tx.remove(keyspace, key.clone());
-            if let Err(error) = self.commit_buffered_write_tx(tx) {
-                return StorageEvent::Error { error };
-            }
-            if let Err(error) = self.persist_journal() {
-                return StorageEvent::Error { error };
-            }
-            self.note_deletes(&key_space, 1);
-            StorageEvent::DeleteResult { key }
-        }
-    }
-
-    #[tracing::instrument(
-        name = "storage.batch_delete",
-        level = "debug",
-        skip(self, deletes),
-        fields(delete_count = deletes.len(), txn_id = ?txn_id)
-    )]
-    fn batch_delete(
-        &mut self,
-        deletes: Vec<(String, ByteView)>,
-        txn_id: Option<Ulid>,
-    ) -> StorageEvent {
-        let mut entries = Vec::with_capacity(deletes.len());
-        let mut resolved = Vec::with_capacity(deletes.len());
-        for (key_space, key) in deletes {
-            let keyspace = match self.store.resolve_keyspace(&key_space) {
-                Ok(ks) => ks,
-                Err(error) => return StorageEvent::Error { error },
-            };
-            resolved.push((keyspace, key_space, key));
-        }
-
-        if let Some(txn_id) = txn_id {
-            let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) else {
-                return StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
-                };
-            };
-
-            for (keyspace, key_space, key) in resolved {
-                txn.remove(keyspace, key.clone());
-                entries.push((key_space, key));
-            }
-            for (key_space, _) in &entries {
-                self.hold_txn_delete(txn_id, key_space);
-            }
-        } else {
-            let mut tx = match self.buffered_write_tx() {
-                Ok(tx) => tx,
-                Err(error) => return StorageEvent::Error { error },
-            };
-            for (keyspace, key_space, key) in resolved {
-                tx.remove(keyspace, key.clone());
-                entries.push((key_space, key));
-            }
-            if let Err(error) = self
-                .commit_buffered_write_tx(tx)
-                .and_then(|()| self.persist_journal())
-            {
-                return StorageEvent::Error { error };
-            }
-            for (key_space, _) in &entries {
-                self.note_deletes(key_space, 1);
-            }
-        }
-
-        StorageEvent::BatchDeleteResult { entries }
-    }
-
-    #[tracing::instrument(
-        name = "storage.iterate",
-        level = "debug",
-        skip(self, prefix, start),
-        fields(key_space = %key_space, has_prefix = prefix.is_some(), has_cursor = start.is_some(), limit, txn_id = ?txn_id)
-    )]
-    fn iterate(
-        &mut self,
-        key_space: String,
-        prefix: Option<ByteView>,
-        start: Option<IterStart>,
-        limit: usize,
-        txn_id: Option<Ulid>,
-    ) -> StorageEvent {
-        let keyspace = match self.store.resolve_keyspace(&key_space) {
-            Ok(ks) => ks,
-            Err(e) => return StorageEvent::Error { error: e },
-        };
-
-        if limit == 0 {
-            return StorageEvent::IterResult {
-                values: Vec::new(),
-                next_start_after: None,
-            };
-        }
-
-        let result = if let Some(txn_id) = txn_id {
-            match self.txns.get(&txn_id) {
-                Some(Txn::Read(txn)) => {
-                    iterate_page(txn, &keyspace, prefix.as_ref(), start.as_ref(), limit)
-                }
-                Some(Txn::Write(txn)) => iterate_page(
-                    txn.as_ref(),
-                    &keyspace,
-                    prefix.as_ref(),
-                    start.as_ref(),
-                    limit,
-                ),
-                None => {
-                    return StorageEvent::Error {
-                        error: StorageError::TransactionNotFound,
-                    };
-                }
-            }
-        } else {
-            return store_iterate(&self.store, keyspace, prefix, start, limit);
-        };
-
-        match result {
-            Ok((values, next_start_after)) => StorageEvent::IterResult {
-                values,
-                next_start_after,
-            },
-            Err(error) => StorageEvent::Error { error },
-        }
-    }
-
-    fn last(
-        &mut self,
-        key_space: String,
-        prefix: Option<ByteView>,
-        txn_id: Option<Ulid>,
-    ) -> StorageEvent {
-        let keyspace = match self.store.resolve_keyspace(&key_space) {
-            Ok(keyspace) => keyspace,
-            Err(error) => return StorageEvent::Error { error },
-        };
-        if let Some(txn_id) = txn_id {
-            return match self.txns.get(&txn_id) {
-                Some(Txn::Read(txn)) => read_last_with(txn, &keyspace, prefix.as_ref()),
-                Some(Txn::Write(txn)) => read_last_with(txn.as_ref(), &keyspace, prefix.as_ref()),
-                None => StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
-                },
-            };
-        }
-        store_last(&self.store, keyspace, prefix)
     }
 }
 
@@ -2822,7 +1995,7 @@ impl PendingWriteIndex {
     }
 
     fn insert_key(&mut self, key_space: &str, key: &ByteView) {
-        let key_space = self.key_space_index_or_insert(key_space);
+        let key_space = self.keyspace_slot(key_space);
         self.keys.push(PendingWriteKey {
             key_space,
             key: key.clone(),
@@ -2887,7 +2060,7 @@ impl PendingWriteIndex {
             .partition_point(|pending| pending.key_space <= key_space);
         self.keys[start_index..end_index]
             .iter()
-            .any(|pending| iter_may_include_key(prefix, start, &pending.key))
+            .any(|pending| iter_matches_key(prefix, start, &pending.key))
     }
 
     fn key_space_index(&self, key_space: &str) -> Option<usize> {
@@ -2896,7 +2069,7 @@ impl PendingWriteIndex {
             .position(|existing| existing.as_str() == key_space)
     }
 
-    fn key_space_index_or_insert(&mut self, key_space: &str) -> usize {
+    fn keyspace_slot(&mut self, key_space: &str) -> usize {
         match self.key_space_index(key_space) {
             Some(index) => index,
             None => {
@@ -2933,11 +2106,7 @@ fn compare_pending_key(
         .then_with(|| pending.key.as_ref().cmp(key))
 }
 
-fn iter_may_include_key(
-    prefix: Option<&ByteView>,
-    start: Option<&IterStart>,
-    key: &ByteView,
-) -> bool {
+fn iter_matches_key(prefix: Option<&ByteView>, start: Option<&IterStart>, key: &ByteView) -> bool {
     let key = key.as_ref();
     if let Some(prefix) = prefix
         && !key.starts_with(prefix.as_ref())
@@ -3065,7 +2234,7 @@ fn read_pool_loop(store: Store, receiver: EffectReceiver) {
             continue;
         }
         let operation = storage_effect_kind(&effect);
-        let key_space = storage_effect_key_space(&effect).map(str::to_string);
+        let key_space = effect_keyspace(&effect).map(str::to_string);
         let queue_wait = enqueued_at.elapsed();
         let service_started = Instant::now();
         let event = match effect {
@@ -3206,11 +2375,11 @@ fn storage_effect_span(effect: &StorageEffect) -> Span {
         persist_ms = field::Empty,
         result = field::Empty,
     );
-    record_storage_effect_fields(&span, effect);
+    record_effect_fields(&span, effect);
     span
 }
 
-fn record_storage_effect_fields(span: &Span, effect: &StorageEffect) {
+fn record_effect_fields(span: &Span, effect: &StorageEffect) {
     match effect {
         StorageEffect::StartTransaction { read } => {
             span.record("read", *read);
@@ -3428,7 +2597,7 @@ mod tests {
 
     const RESTART_CHILD_PATH_ENV: &str = "ARUNA_STORAGE_RESTART_CHILD_PATH";
     const RESTART_CHILD_MODE_ENV: &str = "ARUNA_STORAGE_RESTART_CHILD_MODE";
-    const RESTART_CHILD_TEST: &str = "storage::tests::buffered_persistence_restart_child_process";
+    const RESTART_CHILD_TEST: &str = "storage::tests::persistence_restart_child";
 
     fn small_handle(capacity: usize) -> (StorageHandle, super::StorageReceivers) {
         let (sender, foreground) = crossfire::mpsc::bounded_blocking(capacity);
@@ -3498,7 +2667,7 @@ mod tests {
         let mut lanes = super::LaneScheduler::default();
         let (first, priority) = lanes.next(&receivers).expect("first item");
         assert_eq!(priority, StoragePriority::Foreground);
-        assert_eq!(super::storage_effect_key_space(&first.0), Some("fg"));
+        assert_eq!(super::effect_keyspace(&first.0), Some("fg"));
         for _ in 0..3 {
             let (_, priority) = lanes.next(&receivers).expect("bulk item");
             assert_eq!(priority, StoragePriority::Bulk);
@@ -3508,9 +2677,7 @@ mod tests {
 
     #[test]
     fn bulk_keeps_share() {
-        // Credit is earned per foreground effect, not per batch: one batch may
-        // swallow the whole foreground queue, and it must still buy the bulk
-        // lane its proportional slots or a deep queue starves the drain.
+        // Credit each foreground effect so a large batch cannot starve the bulk drain.
         let (handle, receivers) = StorageHandle::new();
         let read = |key_space: &str| StorageEffect::Read {
             key_space: key_space.to_string(),
@@ -3742,7 +2909,7 @@ mod tests {
             bulk_read_pool: vec![bulk_sender],
             next_bulk_reader: 0,
             pool_threads: Vec::new(),
-            compactor: idle_compactor(),
+            compactor: crate::compaction::Compactor::idle(),
             deletes: std::collections::HashMap::new(),
             txn_deletes: std::collections::HashMap::new(),
         };
@@ -3769,7 +2936,7 @@ mod tests {
         let guard = super::InFlightGuard::acquire(&metrics);
         let (target_tx, mut target_rx) = super::response_channel(super::ResponseToken::empty());
         let mut slow = super::SlowQueueAggregator::default();
-        storage.forward_to_read_pool(
+        storage.forward_read(
             (target, target_tx, span, Instant::now(), guard),
             StoragePriority::Bulk,
             &mut slow,
@@ -3795,7 +2962,7 @@ mod tests {
         }
     }
 
-    fn assert_batch_write_result(event: Event, expected: &[(&str, &[u8])]) {
+    fn assert_batch_write(event: Event, expected: &[(&str, &[u8])]) {
         match event {
             Event::Storage(StorageEvent::BatchWriteResult { entries }) => {
                 let actual = entries
@@ -3808,7 +2975,7 @@ mod tests {
         }
     }
 
-    fn assert_batch_delete_result(event: Event, expected: &[(&str, &[u8])]) {
+    fn assert_batch_delete(event: Event, expected: &[(&str, &[u8])]) {
         match event {
             Event::Storage(StorageEvent::BatchDeleteResult { entries }) => {
                 let actual = entries
@@ -3835,13 +3002,13 @@ mod tests {
     }
 
     #[test]
-    fn persist_policy_defaults_to_buffer() {
+    fn policy_defaults_buffer() {
         assert_eq!(FjallPersistPolicy::default(), FjallPersistPolicy::Buffer);
         assert_eq!(FjallPersistPolicy::default().label(), "buffer");
     }
 
     #[test]
-    fn persist_policy_accepts_canonical_values() {
+    fn policy_accepts_values() {
         assert_eq!(
             "sync_all".parse::<FjallPersistPolicy>().unwrap(),
             FjallPersistPolicy::SyncAll
@@ -3853,7 +3020,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_policy_rejects_invalid_values() {
+    fn policy_rejects_invalid() {
         assert!("always".parse::<FjallPersistPolicy>().is_err());
         assert!("sync".parse::<FjallPersistPolicy>().is_err());
         assert!("sync-all".parse::<FjallPersistPolicy>().is_err());
@@ -3862,9 +3029,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_with_persist_policy_accepts_sync_all() {
+    async fn open_accepts_sync() {
         let dir = tempdir().expect("temp dir");
-        let handle = FjallStorage::open_with_persist_policy(
+        let handle = FjallStorage::open_with_policy(
             dir.path().to_str().expect("utf-8 path"),
             FjallPersistPolicy::SyncAll,
         )
@@ -3884,7 +3051,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_all_effect_returns_success() {
+    async fn sync_effect_succeeds() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
 
@@ -4084,17 +3251,6 @@ mod tests {
             read_txn,
             Event::Storage(StorageEvent::TransactionStarted { .. })
         ));
-    }
-
-    /// Compactor that accepts no job, for workers built without a background
-    /// thread.
-    fn idle_compactor() -> super::Compactor {
-        super::Compactor {
-            sender: None,
-            thread: None,
-            active: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            stopping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
     }
 
     /// Worker sharing the handle's channels, cleanup map and fence, driven by
@@ -4339,7 +3495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_all_handle_surfaces_persist_errors() {
+    async fn sync_surfaces_errors() {
         let (handle, receivers) = StorageHandle::new();
         let receiver = receivers.foreground;
         thread::spawn(move || {
@@ -4668,7 +3824,7 @@ mod tests {
             bulk_read_pool: Vec::new(),
             next_bulk_reader: 0,
             pool_threads: Vec::new(),
-            compactor: idle_compactor(),
+            compactor: crate::compaction::Compactor::idle(),
             deletes: std::collections::HashMap::new(),
             txn_deletes: std::collections::HashMap::new(),
         };
@@ -4715,7 +3871,7 @@ mod tests {
             bulk_read_pool: Vec::new(),
             next_bulk_reader: 0,
             pool_threads: Vec::new(),
-            compactor: idle_compactor(),
+            compactor: crate::compaction::Compactor::idle(),
             deletes: std::collections::HashMap::new(),
             txn_deletes: std::collections::HashMap::new(),
         };
@@ -4759,7 +3915,7 @@ mod tests {
             bulk_read_pool: Vec::new(),
             next_bulk_reader: 0,
             pool_threads: Vec::new(),
-            compactor: idle_compactor(),
+            compactor: crate::compaction::Compactor::idle(),
             deletes: std::collections::HashMap::new(),
             txn_deletes: std::collections::HashMap::new(),
         };
@@ -4964,7 +4120,7 @@ mod tests {
         }
     }
 
-    fn run_buffered_persistence_restart_child(mode: &str, path: &str) {
+    fn run_restart_child(mode: &str, path: &str) {
         let status = Command::new(env::current_exe().expect("test binary path"))
             .arg(RESTART_CHILD_TEST)
             .arg("--exact")
@@ -4978,7 +4134,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_persistence_restart_child_process() {
+    fn persistence_restart_child() {
         let Ok(mode) = env::var(RESTART_CHILD_MODE_ENV) else {
             return;
         };
@@ -4986,7 +4142,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
 
         runtime.block_on(async {
-            let handle = FjallStorage::open_with_persist_policy(&path, FjallPersistPolicy::Buffer)
+            let handle = FjallStorage::open_with_policy(&path, FjallPersistPolicy::Buffer)
                 .expect("storage opens in restart child");
 
             match mode.as_str() {
@@ -5027,12 +4183,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buffered_write_survives_process_restart() {
+    async fn buffered_write_survives() {
         let dir = tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
 
-        run_buffered_persistence_restart_child("write", path);
-        let handle = FjallStorage::open_with_persist_policy(path, FjallPersistPolicy::Buffer)
+        run_restart_child("write", path);
+        let handle = FjallStorage::open_with_policy(path, FjallPersistPolicy::Buffer)
             .expect("storage reopens after restart");
 
         assert_read_result(
@@ -5049,12 +4205,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buffered_committed_transaction_survives_process_restart() {
+    async fn buffered_commit_survives() {
         let dir = tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
 
-        run_buffered_persistence_restart_child("transaction", path);
-        let handle = FjallStorage::open_with_persist_policy(path, FjallPersistPolicy::Buffer)
+        run_restart_child("transaction", path);
+        let handle = FjallStorage::open_with_policy(path, FjallPersistPolicy::Buffer)
             .expect("storage reopens after restart");
 
         assert_read_result(
@@ -5071,7 +4227,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_transactional_raw_write_round_trips() {
+    async fn raw_write_roundtrip() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
 
@@ -5101,11 +4257,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_transactional_raw_batch_write_round_trips_in_order() {
+    async fn raw_batch_ordered() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
 
-        assert_batch_write_result(
+        assert_batch_write(
             handle
                 .send_storage_effect(StorageEffect::BatchWrite {
                     writes: vec![
@@ -5150,7 +4306,7 @@ mod tests {
         );
     }
 
-    fn assert_batch_read_result(event: Event, expected: &[(&[u8], Option<&[u8]>)]) {
+    fn assert_batch_read(event: Event, expected: &[(&[u8], Option<&[u8]>)]) {
         match event {
             Event::Storage(StorageEvent::BatchReadResult { values }) => {
                 let actual = values
@@ -5164,7 +4320,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_transactional_batch_read_returns_values_in_request_order() {
+    async fn batch_read_ordered() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
 
@@ -5182,7 +4338,7 @@ mod tests {
             );
         }
 
-        assert_batch_read_result(
+        assert_batch_read(
             handle
                 .send_storage_effect(StorageEffect::BatchRead {
                     reads: vec![
@@ -5198,7 +4354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transactional_batch_read_sees_uncommitted_writes() {
+    async fn transaction_reads_pending() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
 
@@ -5215,7 +4371,7 @@ mod tests {
             b"key",
         );
 
-        assert_batch_read_result(
+        assert_batch_read(
             handle
                 .send_storage_effect(StorageEffect::BatchRead {
                     reads: vec![("batch_read_txn".to_string(), b"key".to_vec().into())],
@@ -5225,7 +4381,7 @@ mod tests {
             &[(b"key", Some(b"txn"))],
         );
 
-        assert_batch_read_result(
+        assert_batch_read(
             handle
                 .send_storage_effect(StorageEffect::BatchRead {
                     reads: vec![("batch_read_txn".to_string(), b"key".to_vec().into())],
@@ -5237,7 +4393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transactional_batch_write_and_batch_delete_commit_atomically() {
+    async fn batch_commit_atomic() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
 
@@ -5254,7 +4410,7 @@ mod tests {
         );
 
         let txn_id = start_write_transaction(&handle).await;
-        assert_batch_write_result(
+        assert_batch_write(
             handle
                 .send_storage_effect(StorageEffect::BatchWrite {
                     writes: vec![(
@@ -5267,7 +4423,7 @@ mod tests {
                 .await,
             &[("batch_write_delete_commit", b"write")],
         );
-        assert_batch_delete_result(
+        assert_batch_delete(
             handle
                 .send_storage_effect(StorageEffect::BatchDelete {
                     deletes: vec![(
@@ -5280,7 +4436,7 @@ mod tests {
             &[("batch_write_delete_commit", b"delete")],
         );
 
-        assert_batch_read_result(
+        assert_batch_read(
             handle
                 .send_storage_effect(StorageEffect::BatchRead {
                     reads: vec![
@@ -5301,7 +4457,7 @@ mod tests {
 
         commit_transaction(&handle, txn_id).await;
 
-        assert_batch_read_result(
+        assert_batch_read(
             handle
                 .send_storage_effect(StorageEffect::BatchRead {
                     reads: vec![
@@ -5322,7 +4478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transactional_batch_write_and_batch_delete_abort_discards_all_changes() {
+    async fn batch_abort_discards() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
 
@@ -5339,7 +4495,7 @@ mod tests {
         );
 
         let txn_id = start_write_transaction(&handle).await;
-        assert_batch_write_result(
+        assert_batch_write(
             handle
                 .send_storage_effect(StorageEffect::BatchWrite {
                     writes: vec![(
@@ -5352,7 +4508,7 @@ mod tests {
                 .await,
             &[("batch_write_delete_abort", b"write")],
         );
-        assert_batch_delete_result(
+        assert_batch_delete(
             handle
                 .send_storage_effect(StorageEffect::BatchDelete {
                     deletes: vec![(
@@ -5367,7 +4523,7 @@ mod tests {
 
         abort_transaction(&handle, txn_id).await;
 
-        assert_batch_read_result(
+        assert_batch_read(
             handle
                 .send_storage_effect(StorageEffect::BatchRead {
                     reads: vec![
@@ -5411,7 +4567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn iter_start_bound_controls_inclusivity() {
+    async fn iter_bound_inclusive() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
 
@@ -5508,7 +4664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_transactional_write_works_while_write_transaction_is_active() {
+    async fn write_during_transaction() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
 
@@ -5573,7 +4729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_storage_effect_counts_requests_and_errors() {
+    async fn request_metrics_count() {
         let dir = tempdir().unwrap();
         let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
 
@@ -5602,7 +4758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_effect_counts_conflicts_separately_from_errors() {
+    async fn conflict_metrics_separate() {
         let (handle, receivers) = StorageHandle::new();
         let receiver = receivers.foreground;
         thread::spawn(move || {
@@ -5669,14 +4825,9 @@ mod tests {
     /// compactions are observable without running one.
     fn stub_compactor(
         storage: &mut FjallStorage,
-    ) -> std::sync::mpsc::Receiver<super::CompactionJob> {
+    ) -> std::sync::mpsc::Receiver<crate::compaction::CompactionJob> {
         let (sender, receiver) = std::sync::mpsc::channel();
-        storage.compactor = super::Compactor {
-            sender: Some(sender),
-            thread: None,
-            active: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            stopping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
+        storage.compactor = crate::compaction::Compactor::stub(sender);
         receiver
     }
 
@@ -5701,7 +4852,7 @@ mod tests {
         let mut storage = worker(&dir, &handle);
         let jobs = stub_compactor(&mut storage);
 
-        let below = super::COMPACT_AFTER_DELETES - 1;
+        let below = crate::compaction::DELETE_THRESHOLD - 1;
         storage.process_effect(delete_batch(below));
 
         assert!(jobs.try_recv().is_err());
@@ -5715,25 +4866,24 @@ mod tests {
         let mut storage = worker(&dir, &handle);
         let jobs = stub_compactor(&mut storage);
 
-        storage.process_effect(delete_batch(super::COMPACT_AFTER_DELETES));
+        storage.process_effect(delete_batch(crate::compaction::DELETE_THRESHOLD));
 
         let job = jobs.try_recv().expect("compaction is queued");
         assert_eq!(job.key_space, "dht_meta_v2");
-        assert_eq!(job.deletes, super::COMPACT_AFTER_DELETES);
+        assert_eq!(job.deletes, crate::compaction::DELETE_THRESHOLD);
         assert_eq!(storage.deletes.get("dht_meta_v2").copied(), Some(0));
         let active = storage.compactor.active.clone();
-        super::run_compaction(
-            super::CompactionJob {
+        crate::compaction::run_job(
+            crate::compaction::CompactionJob {
                 key_space: job.key_space,
                 deletes: job.deletes,
                 run: Box::new(move || {
                     (job.run)().expect("keyspace compacts");
-                    // Deletes after rotation need a successor before this job returns.
-                    storage.process_effect(delete_batch(super::COMPACT_AFTER_DELETES));
+                    storage.process_effect(delete_batch(crate::compaction::DELETE_THRESHOLD));
                     let successor = jobs.try_recv().expect("successor is queued");
-                    storage.process_effect(delete_batch(super::COMPACT_AFTER_DELETES));
+                    storage.process_effect(delete_batch(crate::compaction::DELETE_THRESHOLD));
                     assert!(jobs.try_recv().is_err(), "only one successor is queued");
-                    super::run_compaction(successor, &storage.compactor.active);
+                    crate::compaction::run_job(successor, &storage.compactor.active);
                     assert!(
                         storage
                             .compactor
@@ -5747,112 +4897,6 @@ mod tests {
             },
             &active,
         );
-    }
-
-    #[test]
-    fn gate_limits_compaction() {
-        // Only a keyspace small enough to rewrite quickly is compacted on
-        // deletes; a larger one keeps its tombstones for now.
-        assert!(super::compactable(0));
-        assert!(super::compactable(super::COMPACT_MAX_BYTES));
-        assert!(!super::compactable(super::COMPACT_MAX_BYTES + 1));
-    }
-
-    #[test]
-    fn delete_survives_compactor() {
-        let dir = tempdir().unwrap();
-        let (handle, _receivers) = StorageHandle::new();
-        let mut storage = worker(&dir, &handle);
-        drop(stub_compactor(&mut storage));
-
-        let event = storage.process_effect(delete_batch(super::COMPACT_AFTER_DELETES));
-
-        assert!(matches!(event, StorageEvent::BatchDeleteResult { .. }));
-        assert!(
-            storage
-                .compactor
-                .active
-                .lock()
-                .expect("compaction mutex")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn compaction_failure_continues() {
-        let mut compactor = super::Compactor::spawn();
-        let (done, finished) = std::sync::mpsc::channel();
-        let sender = compactor.sender.clone().expect("compactor accepts jobs");
-        compactor
-            .active
-            .lock()
-            .expect("compaction mutex")
-            .insert("failing".to_string());
-        sender
-            .send(super::CompactionJob {
-                key_space: "failing".to_string(),
-                deletes: super::COMPACT_AFTER_DELETES,
-                run: Box::new(|| Err(fjall::Error::Poisoned)),
-            })
-            .expect("failing job is queued");
-        sender
-            .send(super::CompactionJob {
-                key_space: "next".to_string(),
-                deletes: 1,
-                run: Box::new(move || {
-                    done.send(()).expect("test receives the signal");
-                    Ok(())
-                }),
-            })
-            .expect("next job is queued");
-        drop(sender);
-
-        finished
-            .recv_timeout(std::time::Duration::from_secs(300))
-            .expect("the thread ran the next job");
-        compactor.shutdown();
-        assert!(
-            compactor
-                .active
-                .lock()
-                .expect("compaction mutex")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn shutdown_drops_backlog() {
-        // A job queued behind a running one must not keep the database open.
-        let mut compactor = super::Compactor::spawn();
-        let (release, blocked) = std::sync::mpsc::channel::<()>();
-        let (ran, second) = std::sync::mpsc::channel::<()>();
-        let sender = compactor.sender.clone().expect("compactor accepts jobs");
-        sender
-            .send(super::CompactionJob {
-                key_space: "first".to_string(),
-                deletes: 1,
-                run: Box::new(move || {
-                    blocked.recv().expect("test releases the first job");
-                    Ok(())
-                }),
-            })
-            .expect("first job is queued");
-        sender
-            .send(super::CompactionJob {
-                key_space: "second".to_string(),
-                deletes: 1,
-                run: Box::new(move || {
-                    ran.send(()).expect("test observes the second job");
-                    Ok(())
-                }),
-            })
-            .expect("second job is queued");
-        drop(sender);
-
-        compactor.stopping.store(true, Ordering::Release);
-        release.send(()).expect("first job is released");
-        compactor.shutdown();
-        assert!(second.try_recv().is_err(), "the backlog ran after shutdown");
     }
 
     #[test]
@@ -5876,5 +4920,27 @@ mod tests {
 
         storage.process_effect(StorageEffect::CommitTransaction { txn_id });
         assert_eq!(storage.deletes.get("dht_meta_v2").copied(), Some(1));
+    }
+
+    #[test]
+    fn abort_drops_deletes() {
+        let dir = tempdir().unwrap();
+        let (handle, _receivers) = StorageHandle::new();
+        let mut storage = worker(&dir, &handle);
+        let StorageEvent::TransactionStarted { txn_id } =
+            storage.process_effect(StorageEffect::StartTransaction { read: false })
+        else {
+            panic!("transaction starts");
+        };
+        storage.process_effect(StorageEffect::Delete {
+            key_space: "dht_meta_v2".to_string(),
+            key: b"deadline".to_vec().into(),
+            txn_id: Some(txn_id),
+        });
+
+        storage.process_effect(StorageEffect::AbortTransaction { txn_id });
+
+        assert!(!storage.deletes.contains_key("dht_meta_v2"));
+        assert!(!storage.txn_deletes.contains_key(&txn_id));
     }
 }

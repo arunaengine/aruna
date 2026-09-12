@@ -143,6 +143,21 @@ mod tests {
     }
 
     #[test]
+    fn check_rejects_event() {
+        let mut operation = CheckStagingSourceOperation::new(sample_access());
+        operation.start();
+
+        let effects = operation.step(Event::Search());
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(CheckStagingSourceError::UnexpectedEvent { .. })
+        ));
+    }
+
+    #[test]
     fn check_exposes_error() {
         let mut operation = CheckStagingSourceOperation::new(sample_access());
         operation.start();

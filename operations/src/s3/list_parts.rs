@@ -367,7 +367,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_parts_sorts_numerically_across_varint_boundary() {
+    async fn varint_parts_sorted() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -407,7 +407,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_parts_paginates_with_marker() {
+    async fn marker_paginates() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -455,7 +455,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_parts_zero_max_returns_resume_marker() {
+    async fn zero_limit_resumes() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -510,7 +510,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_parts_missing_upload_returns_no_such_upload() {
+    async fn missing_upload_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -532,7 +532,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_parts_target_mismatch_returns_error() {
+    async fn target_mismatch_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -561,7 +561,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_parts_non_open_upload_returns_error() {
+    async fn closed_upload_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();

@@ -27,10 +27,10 @@ use ulid::Ulid;
 
 use super::api::load_realm_config;
 use super::protocol::{MetadataReadError, MetadataTransportMessage};
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive_until};
-use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::PolicyRequestExtras;
+use crate::placement::selector::select_top_peers;
 
 pub const MAX_AUDIT_PAGE_SIZE: usize = MAX_AUDIT_RECORDS;
 pub const DEFAULT_AUDIT_PAGE_SIZE: usize = 50;
@@ -339,36 +339,14 @@ fn select_peers<I>(peers: I, limit: usize, scope: &[u8]) -> PeerSelection
 where
     I: IntoIterator<Item = NodeId>,
 {
-    let limit = limit.min(MAX_AUDIT_PEERS);
-    let mut selected = BTreeSet::new();
     let mut omitted = BTreeSet::new();
     let mut missing_count = 0usize;
-    for node in peers {
-        if selected.iter().any(|(_, candidate)| *candidate == node) {
-            continue;
-        }
-        let score = neg_log2_q48(selector_hash(ROLE_NODE, scope, node.as_bytes()));
-        if selected.len() < limit {
-            selected.insert((score, node));
-            continue;
-        }
-        let Some(worst) = selected.last().copied() else {
-            remember_peer(&mut omitted, node);
-            missing_count = missing_count.saturating_add(1);
-            continue;
-        };
-        if (score, node) < worst {
-            selected.remove(&worst);
-            remember_peer(&mut omitted, worst.1);
-            missing_count = missing_count.saturating_add(1);
-            selected.insert((score, node));
-        } else {
-            remember_peer(&mut omitted, node);
-            missing_count = missing_count.saturating_add(1);
-        }
-    }
+    let selected = select_top_peers(peers, scope, limit.min(MAX_AUDIT_PEERS), |node| {
+        remember_peer(&mut omitted, node);
+        missing_count = missing_count.saturating_add(1);
+    });
     PeerSelection {
-        selected: selected.into_iter().map(|(_, node)| node).collect(),
+        selected,
         omitted,
         missing_count,
     }
@@ -1715,9 +1693,9 @@ mod tests {
             user_id,
             realm_id,
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let mut group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+            GroupAuthorizationDocument::default_group_doc(user_id, realm_id, group_id);
         group_auth.policies.push(RequestPolicy {
             policy_id: Ulid::from_bytes([12u8; 16]),
             name: "deny-audit".to_string(),

@@ -15,6 +15,8 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::device::backlog::RetryView;
+
 /// Folders one device may bind. A device serves one person's machine, so this
 /// is a human-sized list rather than an inventory.
 pub const MAX_SYNCED_FOLDERS: usize = 64;
@@ -70,17 +72,11 @@ impl SyncUpload {
     }
 
     pub fn is_due(&self, now_ms: u64) -> bool {
-        match &self.state {
-            UploadState::Pending { due_at_ms, .. } => *due_at_ms <= now_ms,
-            UploadState::Failed { .. } => false,
-        }
+        self.state.is_due(now_ms)
     }
 
     pub fn attempts(&self) -> u32 {
-        match &self.state {
-            UploadState::Pending { attempts, .. } => *attempts,
-            UploadState::Failed { .. } => 0,
-        }
+        self.state.attempts()
     }
 }
 
@@ -146,14 +142,6 @@ pub fn action_entry(record: &SyncActionRecord) -> Result<(String, Key, Value), C
         ByteView::from(key),
         ByteView::from(record.to_bytes()?),
     ))
-}
-
-pub fn read_folder(folder_id: Ulid, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: SYNCED_FOLDER_KEYSPACE.to_string(),
-        key: folder_key(folder_id),
-        txn_id,
-    })
 }
 
 pub fn scan_folders(start_after: Option<Key>, txn_id: Option<TxnId>) -> Effect {

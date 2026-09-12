@@ -11,20 +11,20 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::announce_realm_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-};
-use aruna_operations::create_metadata_document::{
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::placement::resolve_shard_holders;
+use aruna_operations::realm::announce_presence::{
+    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+};
+use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
 use aruna_operations::shard::assemble_shard_manifest;
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::tasks::incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -39,12 +39,10 @@ struct TestNode {
     context: Arc<DriverContext>,
 }
 
-// A metadata document created on node A must leave a manifest row on the origin
-// AND on the receiver that syncs it, and both holders' assembled shard manifests
-// must agree on the entry set and the topic digest.
+// A metadata document created on node A must leave a manifest row on the origin AND on the
+// receiver that syncs it.
 #[tokio::test]
-async fn document_manifest_row_lands_on_origin_and_receiver_with_matching_digest()
--> Result<(), Box<dyn std::error::Error>> {
+async fn manifest_rows_match() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([120u8; 32]);
     let (nodes, config) = build_realm_nodes(&realm_id, 2).await?;
     let group_id = Ulid::generate();
@@ -167,7 +165,7 @@ async fn build_realm_nodes(
         )
         .await?;
     }
-    wait_for_realm_node_convergence(&nodes, realm_id).await?;
+    wait_node_convergence(&nodes, realm_id).await?;
     let config = install_realm_config(&nodes, realm_id).await?;
     Ok((nodes, config))
 }
@@ -248,10 +246,10 @@ async fn install_realm_config(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
     for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
+        aruna_operations::placement::process_placements::process_shard_placements(
             &node.context,
             *realm_id,
             node.net.node_id(),
@@ -261,7 +259,7 @@ async fn install_realm_config(
     Ok(config)
 }
 
-async fn wait_for_realm_node_convergence(
+async fn wait_node_convergence(
     nodes: &[TestNode],
     realm_id: &RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {

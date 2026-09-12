@@ -6,23 +6,25 @@ use super::{
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    AuthContext, BucketInfo, OBJECT_CONTENT_TYPE_KEY, Permission, blob_bucket_permission_path,
-    blob_object_permission_path, key_content_type,
+    AuthContext, BucketInfo, OBJECT_CONTENT_TYPE_KEY, Permission, bucket_permission_path,
+    key_content_type, object_permission_path,
 };
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::replication::queue::complete_put;
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::{
     GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
 };
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
-use aruna_operations::s3::list_objects_v2::{
+use aruna_operations::s3::list_objects::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Object, ListObjectsV2Operation,
 };
 use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
+use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
@@ -56,10 +58,8 @@ pub struct BucketsOutput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ListObjectsInput {
-    /// Bucket name as the S3 surface uses it, for example `project-data`. Three
-    /// to 63 characters of lowercase letters, digits, dots, and hyphens. Call
-    /// `list_buckets` for the readable names; this is not an `s3://` URL and
-    /// carries no key.
+    /// S3 bucket name, containing three to 63 lowercase letters, digits, dots, or hyphens.
+    /// Call `list_buckets` for names. Do not pass an `s3://` URL or key.
     pub bucket: String,
     /// Optional key prefix filter, for example `reads/2026/`. Matched literally
     /// from the start of the key, with no wildcards and no leading slash.
@@ -274,10 +274,8 @@ impl SearchKind {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SearchInput {
-    /// Search text, at least two characters after trimming. Matched as a
-    /// substring for buckets, groups, and users, and as a full-text query over
-    /// name, description, keywords, and identifier for documents. Plain terms
-    /// only: boolean operators, quotes, and wildcards are stripped.
+    /// Search text of at least two characters. Buckets, groups, and users use substring matching.
+    /// Documents search names, descriptions, keywords, and identifiers after removing operators.
     pub q: String,
     /// Restrict the answer to one section: `documents`, `buckets`, `groups`, or
     /// `users`. Omit to search all four. Each section returns at most ten hits,
@@ -329,7 +327,7 @@ impl McpServer {
                 authorize_tool(
                     &self.state,
                     &auth,
-                    blob_bucket_permission_path(
+                    bucket_permission_path(
                         self.state.get_realm_id(),
                         info.group_id,
                         self.state.get_node_id(),
@@ -370,7 +368,7 @@ impl McpServer {
         authorize_tool(
             &self.state,
             &auth,
-            blob_bucket_permission_path(
+            bucket_permission_path(
                 self.state.get_realm_id(),
                 bucket_info.group_id,
                 self.state.get_node_id(),
@@ -493,7 +491,7 @@ impl McpServer {
         authorize_tool(
             &self.state,
             &auth,
-            blob_object_permission_path(
+            object_permission_path(
                 self.state.get_realm_id(),
                 bucket_info.group_id,
                 self.state.get_node_id(),
@@ -606,7 +604,7 @@ impl McpServer {
         authorize_tool(
             &self.state,
             &auth,
-            blob_bucket_permission_path(
+            bucket_permission_path(
                 self.state.get_realm_id(),
                 bucket_info.group_id,
                 self.state.get_node_id(),
@@ -872,7 +870,7 @@ pub(crate) async fn read_text(
     server: &McpServer,
     auth: &AuthContext,
     input: ReadObjectInput,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<ReadObjectOutput, CallToolResult> {
     validate_key(&input.key)?;
     let max_bytes = bounded_bytes(input.max_bytes)?;
@@ -881,7 +879,7 @@ pub(crate) async fn read_text(
     authorize_tool(
         &server.state,
         auth,
-        blob_object_permission_path(
+        object_permission_path(
             server.state.get_realm_id(),
             bucket_info.group_id,
             server.state.get_node_id(),
@@ -963,7 +961,7 @@ pub(crate) async fn write_text(
     server: &McpServer,
     auth: &AuthContext,
     input: WriteObjectInput,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<WriteObjectOutput, CallToolResult> {
     validate_key(&input.key)?;
     let size = input.text.len();
@@ -975,11 +973,14 @@ pub(crate) async fn write_text(
             ),
         )));
     }
+    guard_bucket_write(server.state.get_ctx().as_ref(), &input.bucket)
+        .await
+        .map_err(map_offered_error)?;
     let bucket_info = server.bucket_info(&input.bucket).await?;
     authorize_tool(
         &server.state,
         auth,
-        blob_object_permission_path(
+        object_permission_path(
             server.state.get_realm_id(),
             bucket_info.group_id,
             server.state.get_node_id(),
@@ -1038,7 +1039,8 @@ pub(crate) async fn write_text(
     .with_metadata(HashMap::from([(
         OBJECT_CONTENT_TYPE_KEY.to_string(),
         content_type.clone(),
-    )]));
+    )]))
+    .with_restrictions(auth.path_restrictions.clone());
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
@@ -1047,13 +1049,10 @@ pub(crate) async fn write_text(
         .and_then(|result| result.transpose())
         .map_err(map_put_error)?
         .ok_or_else(|| internal_error("object write did not finish"))?;
-    crate::s3::s3_service::ArunaS3Service::new(
-        server.state.get_ctx(),
+    complete_put(
+        &server.state.get_ctx(),
         server.state.get_realm_id(),
         server.state.get_node_id(),
-    )
-    .await
-    .complete_put(
         auth.clone(),
         bucket_info.group_id,
         input.bucket.clone(),
@@ -1081,6 +1080,16 @@ fn object_error(error: crate::error::ServerError, action: &str) -> CallToolResul
             ),
         ),
         error => server_error(error),
+    }
+}
+
+fn map_offered_error(error: OfferedDirectoryError) -> CallToolResult {
+    match error {
+        OfferedDirectoryError::ReadOnly(bucket) => explained(
+            crate::error::ServerError::Forbidden,
+            format!("bucket {bucket} is an offered directory and is read-only"),
+        ),
+        error => internal_error(error),
     }
 }
 
@@ -1127,7 +1136,7 @@ fn encode_cursor(cursor: &ListObjectsV2ContinuationToken) -> Result<String, Call
 async fn authorize_search(
     server: &McpServer,
     auth: &AuthContext,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(server.state.as_ref(), auth, Permission::READ, extras)
         .await
@@ -1188,6 +1197,10 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
         GetObjectError::ManagedCopyError(error) => internal_error(error),
         GetObjectError::PolicyError(error) => internal_error(error),
         error @ GetObjectError::BlobNotLocal { .. } => internal_error(error),
+        GetObjectError::HolderAccessDenied => server_error(crate::error::ServerError::Forbidden),
+        error @ (GetObjectError::HoldersUnavailable | GetObjectError::HolderIntegrityFailure) => {
+            internal_error(error)
+        }
         GetObjectError::GetObjectFailed => internal_error("object read failed"),
     }
 }

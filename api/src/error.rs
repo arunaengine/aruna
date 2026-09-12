@@ -2,7 +2,7 @@ use std::array::TryFromSliceError;
 
 use aruna_core::errors::ConversionError;
 use aruna_core::metadata::{MetadataProfileValidationFinding, MetadataValidationViolation};
-use aruna_operations::auth::ArunaBearerTokenError;
+use aruna_operations::auth::bearer_token::ArunaBearerTokenError;
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -496,7 +496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_validation_is_structured_and_unavailability_is_retryable() {
+    async fn validation_error_structured() {
         let finding = |code: &str| MetadataProfileValidationFinding {
             code: code.to_string(),
             severity: MetadataProfileValidationSeverity::Violation,

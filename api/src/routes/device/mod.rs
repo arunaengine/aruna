@@ -15,12 +15,12 @@ use std::sync::Arc;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::require_unrestricted_auth;
 use crate::error::{ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, NodeCapabilities};
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
+use aruna_operations::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
 
 #[derive(OpenApi)]
 #[openapi(tags((
@@ -39,11 +39,9 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .merge(wipe::router())
 }
 
-/// The device's owner, read from the replicated realm configuration.
-///
-/// This is the device plane's authorization boundary: the surface exists only
-/// on a User-kind node, and only for the user that node is bound to. The read
-/// is node-local, so the plane keeps working while the realm is unreachable.
+/// Reads the device owner from local replicated realm configuration.
+/// This authorizes the device surface only for its bound user on a User-kind node.
+/// Local reads keep the device plane available while the realm is unreachable.
 pub(crate) async fn require_owner(
     state: &ServerState,
     auth: Option<AuthContext>,
@@ -51,7 +49,7 @@ pub(crate) async fn require_owner(
     if !matches!(state.node_capabilities(), NodeCapabilities::User { .. }) {
         return Err(ServerError::NotFound);
     }
-    let auth = require_unrestricted_realm_auth(state, auth)?;
+    let auth = require_unrestricted_auth(state, auth)?;
     let config = drive(
         GetRealmConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),

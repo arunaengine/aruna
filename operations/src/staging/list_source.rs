@@ -1,4 +1,4 @@
-use crate::connectors::{ResolveSourceConnectorInput, resolve_source_connector_suboperation};
+use crate::connectors::{ResolveSourceConnectorInput, resolve_connector_effect};
 use crate::staging::describe_event;
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
@@ -82,14 +82,12 @@ impl Operation for ListStagingSourceOperation {
 
     fn start(&mut self) -> Effects {
         self.state = ListStagingSourceState::Resolve;
-        smallvec![resolve_source_connector_suboperation(
-            ResolveSourceConnectorInput {
-                group_id: self.input.group_id,
-                connector_id: self.input.connector_id,
-                source_path: self.input.source_path.clone(),
-                allow_root: true,
-            }
-        )]
+        smallvec![resolve_connector_effect(ResolveSourceConnectorInput {
+            group_id: self.input.group_id,
+            connector_id: self.input.connector_id,
+            source_path: self.input.source_path.clone(),
+            allow_root: true,
+        })]
     }
 
     fn step(&mut self, event: Event) -> Effects {
@@ -223,6 +221,21 @@ mod tests {
                 files_only: true,
                 ..
             })]
+        ));
+    }
+
+    #[test]
+    fn list_rejects_event() {
+        let mut operation = ListStagingSourceOperation::new(sample_input());
+        operation.start();
+
+        let effects = operation.step(Event::Search());
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(ListStagingSourceError::UnexpectedEvent { .. })
         ));
     }
 

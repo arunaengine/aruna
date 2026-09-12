@@ -11,10 +11,10 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::TempDir;
 
-use super::fixture::{Family, REALM, secret, user};
 use crate::driver::DriverContext;
 use crate::jobs::records::transport::{serve_job_record, serve_launch_offer};
 use crate::metadata::protocol::MetadataTransportMessage;
+use crate::tests::fixtures::records::{Family, REALM, secret, user};
 
 async fn fixture() -> (TempDir, Arc<DriverContext>, NetHandle, Family) {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -102,7 +102,7 @@ async fn separates_peer_authority() {
             .expect("bounded record");
     let relayed = serve_job_record(
         &context,
-        super::fixture::node(2),
+        crate::tests::fixtures::records::node(2),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
             record: Box::new(forged),
@@ -118,7 +118,7 @@ async fn separates_peer_authority() {
 
     let accepted = serve_job_record(
         &context,
-        super::fixture::node(2),
+        crate::tests::fixtures::records::node(2),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
             record: Box::new(record),
@@ -134,9 +134,8 @@ async fn separates_peer_authority() {
 
 #[tokio::test]
 async fn refuses_unknown_offer() {
-    // A launch offer from a node outside the realm is declined before any
-    // admission work, and an offer naming another target is not this node's
-    // launch to accept.
+    // An offer from outside the realm is declined before admission, and one naming
+    // another target is not this node's launch to accept.
     let (_dir, context, net, family) = fixture().await;
     let spec = family.spec();
     let launch = family.launch(&spec, family.holder.public(), 0);
@@ -152,7 +151,7 @@ async fn refuses_unknown_offer() {
         }
     );
     assert_eq!(
-        serve_launch_offer(&context, super::fixture::node(2), offer).await,
+        serve_launch_offer(&context, crate::tests::fixtures::records::node(2), offer).await,
         MetadataTransportMessage::ForwardedLaunchOffer {
             result: Err(LaunchDecline::Unauthorized),
         }
@@ -170,7 +169,7 @@ async fn refuses_page_mismatch() {
     };
     let response = serve_job_record(
         &context,
-        super::fixture::node(2),
+        crate::tests::fixtures::records::node(2),
         MetadataTransportMessage::ForwardJobRecordPage {
             placement,
             submission_id: family.submission_id,

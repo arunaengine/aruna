@@ -297,13 +297,6 @@ impl BackendCatalog {
             .collect()
     }
 
-    /// Whether tenant-authored rules may target this backend's class.
-    pub fn allows_tenants(&self, name: &str) -> bool {
-        self.backends
-            .get(name)
-            .is_some_and(|entry| entry.allow_tenants)
-    }
-
     pub fn default_backend(&self) -> Result<ResolvedBackend, RoutingError> {
         self.resolve_node(&self.default_name)
     }

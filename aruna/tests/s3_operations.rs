@@ -3,7 +3,7 @@
 mod shared;
 
 use aruna_api::routes::credentials::CreateS3PathRestriction;
-use aruna_core::structs::{Permission, blob_group_permission_path};
+use aruna_core::structs::{Permission, group_permission_path};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -12,9 +12,8 @@ use aws_sdk_s3::types::{
     VersioningConfiguration,
 };
 use shared::{
-    SeedNode, TestResult, create_bearer_token, create_group_via_http,
-    create_s3_credentials_via_http, create_s3_credentials_with_restrictions_via_http, s3_client,
-    spawn_full_seed_node,
+    SeedNode, TestResult, create_bearer_token, create_group_http, create_restricted_credentials,
+    create_s3_credentials, s3_client, spawn_complete_seed,
 };
 use ulid::Ulid;
 
@@ -30,7 +29,7 @@ where
 }
 
 async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client)> {
-    let seed = spawn_full_seed_node().await?;
+    let seed = spawn_complete_seed().await?;
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -38,9 +37,8 @@ async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client)> {
         seed.capabilities.clone(),
     )
     .await?;
-    let group = create_group_via_http(&seed.base_url, &admin_token, group_name).await?;
-    let credentials =
-        create_s3_credentials_via_http(&seed.base_url, &admin_token, &group.group_id).await?;
+    let group = create_group_http(&seed.base_url, &admin_token, group_name).await?;
+    let credentials = create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
     let endpoint = seed
         .s3
         .as_ref()
@@ -50,7 +48,7 @@ async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client)> {
 }
 
 #[tokio::test]
-async fn head_bucket_reports_existing_and_missing_buckets() -> TestResult<()> {
+async fn head_bucket_state() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-ops-head-bucket").await?;
 
     let result = async {
@@ -77,7 +75,7 @@ async fn head_bucket_reports_existing_and_missing_buckets() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn bucket_versioning_reports_enabled_and_rejects_suspended() -> TestResult<()> {
+async fn versioning_rejects_suspend() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-ops-versioning").await?;
 
     let result = async {
@@ -121,7 +119,7 @@ async fn bucket_versioning_reports_enabled_and_rejects_suspended() -> TestResult
 }
 
 #[tokio::test]
-async fn delete_objects_marks_existing_and_missing_keys() -> TestResult<()> {
+async fn delete_marks_keys() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-ops-delete-batch").await?;
 
     let result = async {
@@ -179,7 +177,7 @@ async fn delete_objects_marks_existing_and_missing_keys() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn delete_objects_quiet_mode_omits_deleted_entries() -> TestResult<()> {
+async fn quiet_delete_omits() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-ops-delete-quiet").await?;
 
     let result = async {
@@ -215,8 +213,8 @@ async fn delete_objects_quiet_mode_omits_deleted_entries() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn delete_objects_authorizes_each_entry_for_prefix_scoped_token() -> TestResult<()> {
-    let seed = spawn_full_seed_node().await?;
+async fn delete_authorizes_entries() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -224,9 +222,9 @@ async fn delete_objects_authorizes_each_entry_for_prefix_scoped_token() -> TestR
         seed.capabilities.clone(),
     )
     .await?;
-    let group = create_group_via_http(&seed.base_url, &admin_token, "s3-ops-delete-scoped").await?;
+    let group = create_group_http(&seed.base_url, &admin_token, "s3-ops-delete-scoped").await?;
     let full_credentials =
-        create_s3_credentials_via_http(&seed.base_url, &admin_token, &group.group_id).await?;
+        create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
     let endpoint = seed
         .s3
         .as_ref()
@@ -248,8 +246,8 @@ async fn delete_objects_authorizes_each_entry_for_prefix_scoped_token() -> TestR
 
         // Mint a credential scoped to the "scoped/" prefix only.
         let group_root =
-            blob_group_permission_path(seed.realm_id, group.group_id.parse()?, seed.net.node_id());
-        let scoped_credentials = create_s3_credentials_with_restrictions_via_http(
+            group_permission_path(seed.realm_id, group.group_id.parse()?, seed.net.node_id());
+        let scoped_credentials = create_restricted_credentials(
             &seed.base_url,
             &admin_token,
             &group.group_id,
@@ -307,7 +305,7 @@ async fn delete_objects_authorizes_each_entry_for_prefix_scoped_token() -> TestR
 }
 
 #[tokio::test]
-async fn delete_objects_reports_invalid_version_id_per_key() -> TestResult<()> {
+async fn delete_bad_version() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-ops-delete-badversion").await?;
 
     let result = async {
@@ -354,7 +352,7 @@ async fn delete_objects_reports_invalid_version_id_per_key() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn list_object_versions_orders_versions_and_delete_marker() -> TestResult<()> {
+async fn versions_order_markers() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-ops-versions-order").await?;
 
     let result = async {
@@ -441,7 +439,7 @@ async fn list_object_versions_orders_versions_and_delete_marker() -> TestResult<
 }
 
 #[tokio::test]
-async fn list_object_versions_honors_prefix_and_delimiter() -> TestResult<()> {
+async fn versions_honor_prefix() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-ops-versions-prefix").await?;
 
     let result = async {
@@ -496,7 +494,7 @@ async fn list_object_versions_honors_prefix_and_delimiter() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn list_object_versions_paginates_with_max_keys() -> TestResult<()> {
+async fn versions_paginate_keys() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-ops-versions-page").await?;
 
     let result = async {
@@ -554,7 +552,7 @@ async fn list_object_versions_paginates_with_max_keys() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn multipart_listing_before_and_after_complete() -> TestResult<()> {
+async fn multipart_listing_updates() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-ops-multipart-listing").await?;
 
     let result = async {

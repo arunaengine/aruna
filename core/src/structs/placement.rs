@@ -26,11 +26,10 @@ pub enum NodePlacementInputError {
     LocationTooLong,
 }
 
-/// Normalizes onboarding/config-sourced placement inputs: trims the location
-/// (empty-after-trim ⇒ unset), rejects locations longer than
-/// [`MAX_NODE_LOCATION_LEN`], clamps a present weight into `1..=MAX_NODE_WEIGHT`,
-/// and defaults an absent weight to [`DEFAULT_NODE_WEIGHT`].
-pub fn normalize_node_placement_input(
+/// Normalizes onboarding/config-sourced placement inputs: trims the location (empty-after-trim ⇒
+/// unset), rejects locations longer than [`MAX_NODE_LOCATION_LEN`], clamps a present weight into
+/// `1..=MAX_NODE_WEIGHT`, and defaults an absent weight to [`DEFAULT_NODE_WEIGHT`].
+pub fn normalize_placement_input(
     location: Option<&str>,
     weight: Option<u32>,
 ) -> Result<(String, u32), NodePlacementInputError> {
@@ -164,10 +163,9 @@ impl PlacementRef {
     };
 }
 
-/// Shard a subject hashes into for `shard_count` shards. Blake3 of a domain
-/// tag concatenated with the subject, masked into `0..shard_count`. All
-/// records of one logical document share a subject (see `subject_bytes`) and so
-/// land in one shard.
+/// Shard a subject hashes into for `shard_count` shards. Blake3 of a domain tag concatenated with the
+/// subject, masked into `0..shard_count`. All records of one logical document share a subject (see
+/// `subject_bytes`) and so land in one shard.
 pub fn shard_for_subject(subject: &[u8], shard_count: u32) -> u32 {
     debug_assert!(shard_count.is_power_of_two());
     let mut input = b"aruna-shard-v1".to_vec();
@@ -504,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_location_falls_back_to_default() {
+    fn effective_location_default() {
         let mut entry = NodePlacementEntry {
             node_id: node(1),
             location: String::new(),
@@ -520,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_entry_round_trips() {
+    fn placement_entry_trips() {
         let entry = NodePlacementEntry {
             node_id: node(2),
             location: "eu-west".to_string(),
@@ -537,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_strategy_round_trips() {
+    fn placement_strategy_trips() {
         let strategy = PlacementStrategy {
             strategy_id: Ulid::from_bytes([3u8; 16]),
             name: "default".to_string(),
@@ -569,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_override_round_trips() {
+    fn placement_override_trips() {
         let over = PlacementOverride {
             subject: b"document-subject".to_vec(),
             pinned: vec![node(4)],
@@ -584,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn strategy_binding_round_trips() {
+    fn strategy_binding_trips() {
         for scope in [
             BindingScope::Realm,
             BindingScope::Group(Ulid::from_bytes([7u8; 16])),
@@ -604,43 +602,35 @@ mod tests {
     }
 
     #[test]
-    fn normalize_placement_input_clamps_and_validates() {
+    fn normalize_placement_validates() {
         assert_eq!(
-            normalize_node_placement_input(None, None).unwrap(),
+            normalize_placement_input(None, None).unwrap(),
             (String::new(), DEFAULT_NODE_WEIGHT)
         );
-        assert_eq!(normalize_node_placement_input(None, Some(0)).unwrap().1, 1);
+        assert_eq!(normalize_placement_input(None, Some(0)).unwrap().1, 1);
         assert_eq!(
-            normalize_node_placement_input(None, Some(50_000))
-                .unwrap()
-                .1,
+            normalize_placement_input(None, Some(50_000)).unwrap().1,
             MAX_NODE_WEIGHT
         );
+        assert_eq!(normalize_placement_input(None, Some(250)).unwrap().1, 250);
         assert_eq!(
-            normalize_node_placement_input(None, Some(250)).unwrap().1,
-            250
-        );
-        assert_eq!(
-            normalize_node_placement_input(Some("  eu-west  "), None)
+            normalize_placement_input(Some("  eu-west  "), None)
                 .unwrap()
                 .0,
             "eu-west"
         );
-        assert_eq!(
-            normalize_node_placement_input(Some("   "), None).unwrap().0,
-            ""
-        );
+        assert_eq!(normalize_placement_input(Some("   "), None).unwrap().0, "");
         let long = "x".repeat(MAX_NODE_LOCATION_LEN + 1);
         assert_eq!(
-            normalize_node_placement_input(Some(&long), None),
+            normalize_placement_input(Some(&long), None),
             Err(NodePlacementInputError::LocationTooLong)
         );
         let at_limit = "y".repeat(MAX_NODE_LOCATION_LEN);
-        assert!(normalize_node_placement_input(Some(&at_limit), None).is_ok());
+        assert!(normalize_placement_input(Some(&at_limit), None).is_ok());
     }
 
     #[test]
-    fn placement_ref_round_trips() {
+    fn placement_ref_trips() {
         let placement = PlacementRef {
             strategy_id: Ulid::from_bytes([9u8; 16]),
             shard: 7,
@@ -653,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_for_subject_matches_golden_vectors() {
+    fn shard_for_vectors() {
         // Fixed subjects → fixed shards. These are the stage-2 cross-node
         // canaries: a change here means a document would remap topics.
         assert_eq!(shard_for_subject(b"", 64), 30);
@@ -664,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_for_subject_stays_in_range() {
+    fn shard_for_range() {
         for count in [1u32, 2, 4, 64, 128, 1024] {
             for seed in 0u32..256 {
                 let shard = shard_for_subject(&seed.to_be_bytes(), count);
@@ -674,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_for_subject_distributes_evenly() {
+    fn shard_for_evenly() {
         let shard_count = 64u32;
         let samples = 10_000u32;
         let mut counts = vec![0u32; shard_count as usize];
@@ -728,9 +718,8 @@ mod tests {
 
     #[test]
     fn shard_cap_matches() {
-        // Single source of truth: raising the codec bucket cap raises the
-        // placement shard cap in lockstep, so a strategy can never declare more
-        // shards than the id's bucket field can encode.
+        // Single source of truth: raising the codec bucket cap raises the placement shard cap in lockstep, so
+        // a strategy can never declare more shards than the id's bucket field can encode.
         assert_eq!(
             MAX_PLACEMENT_SHARD_COUNT,
             crate::structured_id::MAX_BUCKET_COUNT as u32

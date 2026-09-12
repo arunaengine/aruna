@@ -20,10 +20,10 @@ use crate::jobs::lifecycle::admit::{
 use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, store_workspace};
 use crate::jobs::lifecycle::routing::{family_of_alias, family_status};
 use crate::jobs::lifecycle::{LifecycleError, submit_external_job};
-use crate::jobs::records::tests::fixture::{Family, REALM, context, node, payload, secret, user};
 use crate::jobs::store::iter_prefix_page;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::MetadataAuthToken;
+use crate::tests::fixtures::records::{Family, REALM, context, node, payload, secret, user};
 
 fn frame(record: JobFamilyRecord, family: &Family) -> JobRecordFrame {
     JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded record")
@@ -354,9 +354,8 @@ fn absent_input() -> InputSelection {
 
 #[tokio::test]
 async fn device_skips_materialization() {
-    // A device references its inputs instead of resolving them: an object absent
-    // here still reaches forwarding, and nothing is admitted locally. The same
-    // request on a realm node is refused because that node must hold the input.
+    // A device references inputs instead of resolving them: an absent object still
+    // reaches forwarding. A realm node refuses because it must hold the input.
     let mut spec = payload();
     spec.inputs.push(absent_input());
 
@@ -401,9 +400,8 @@ async fn device_skips_materialization() {
     .await
     .expect_err("the input is not materialized here");
 
-    // The realm node resolves the input against its own objects, so it stops at
-    // the absent one instead of reaching forwarding. A definitive miss is the
-    // submitter's error, not a retryable placement failure.
+    // The realm node resolves against its own objects and stops at the absent one;
+    // a definitive miss is the submitter's error, not a retryable placement one.
     let SubmitJobError::InvalidWorkspace(reason) = refused else {
         panic!("a realm node must refuse an input it does not hold");
     };

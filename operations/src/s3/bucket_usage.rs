@@ -1,8 +1,6 @@
-//! Per-bucket inventory for the portal's bucket overview.
-//!
-//! There is no per-bucket usage counter: the maintained counters are keyed
-//! globally, per group and per backend. This bounded scan reuses the version and
-//! multipart listings the deletion preflight already runs and adds the byte sum.
+//! Per-bucket inventory for the portal's bucket overview. No per-bucket usage
+//! counter exists (counters are global, per group and per backend), so this
+//! bounded scan reuses the deletion preflight listings and adds the byte sum.
 
 use aruna_core::events::Event;
 use aruna_core::operation::Operation;
@@ -10,10 +8,10 @@ use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::s3::list_multipart_uploads::{
+use crate::s3::list_uploads::{
     ListMultipartUploadsError, ListMultipartUploadsInput, ListMultipartUploadsOperation,
 };
-use crate::s3::list_object_versions::{
+use crate::s3::list_versions::{
     ListObjectVersionsError, ListObjectVersionsInput, ListObjectVersionsItem,
     ListObjectVersionsOperation,
 };
@@ -231,6 +229,7 @@ impl Operation for BucketUsageOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::errors::StorageError;
     use aruna_core::events::StorageEvent;
     use ulid::Ulid;
 
@@ -261,5 +260,32 @@ mod tests {
 
         let usage = operation.finalize().expect("the inventory settles");
         assert!(!usage.complete);
+    }
+
+    #[test]
+    fn child_storage_propagates() {
+        // The active list child sees the error; the parent must surface its
+        // typed error and not abort anything a second time.
+        let mut operation = BucketUsageOperation::new(BucketUsageInput {
+            bucket: "data".to_string(),
+            limit: 10,
+        });
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::generate(),
+        }));
+
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::CommitFailed,
+        }));
+
+        assert!(effects.is_empty());
+        assert!(operation.abort().is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(BucketUsageError::Versions(
+                ListObjectVersionsError::StorageError(StorageError::CommitFailed)
+            ))
+        );
     }
 }

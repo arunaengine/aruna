@@ -1,9 +1,6 @@
-//! Decides one page of a synced folder, without touching the network or the
-//! filesystem beyond the strong hashes the decision itself needs.
-//!
-//! The operation only ever writes device-local rows. Bytes reach the disk
-//! through the guarded local-file effects the plan it answers with names, and
-//! reach the realm through the upload rows it queues.
+//! Decides one page of a synced folder, touching no network and only the hashes
+//! the decision needs. It writes only device-local rows; bytes reach disk via
+//! guarded local-file effects and the realm via queued upload rows.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -586,9 +583,8 @@ impl Operation for ReconcileFolderOperation {
                     })
                     .collect();
                 let eligible = self.hash_batch();
-                // A page that cannot hash every moved file decides only what it
-                // read: the rest waits for the next pass, which is asked for
-                // promptly instead of after the idle wait.
+                // A page that cannot hash every moved file decides only what it read:
+                // the rest waits for the next pass, which is asked for promptly.
                 self.plan.truncated |= eligible.len() > MAX_HASH_BATCH;
                 self.deferred = eligible.iter().copied().skip(MAX_HASH_BATCH).collect();
                 self.hashing = eligible.into_iter().take(MAX_HASH_BATCH).collect();
@@ -991,9 +987,8 @@ mod tests {
 
     #[test]
     fn holds_queued_upload() {
-        // The owner kept their copy and the realm has not answered yet. Until it
-        // does, the entry must not be decided again: a second pass would write
-        // another conflicted copy of a file that is already on its way.
+        // The owner kept their copy and the realm has not answered: deciding again
+        // would write another conflicted copy of a file already on its way.
         let version = Ulid::from_bytes([3u8; 16]);
         let queued = SyncUpload {
             folder_id: folder().folder_id,
@@ -1096,9 +1091,8 @@ mod tests {
 
     #[test]
     fn hashes_young_file() {
-        // A rewrite can restore the size, the inode and the modification time,
-        // so a file that changed moments ago is read rather than trusted; one
-        // that has been still keeps the hash the base recorded for it.
+        // A rewrite can restore size, inode and modification time, so a file that
+        // changed moments ago is hashed rather than trusted; a still one keeps the base hash.
         let settled = base("5-1-1-1", Some(Ulid::from_bytes([4u8; 16])));
         assert!(hashes_first(
             observed_now("5-1-1-1", OBSERVED_AT_MS),

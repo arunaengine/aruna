@@ -7,16 +7,16 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     Actor, AuthContext, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
     ImportRoCrateTarget, JobPayload, MetadataRegistryRecord, Permission, RoCrateMediaType,
-    blob_bucket_permission_path, blob_object_permission_path, user_dedup_key,
+    bucket_permission_path, object_permission_path, user_dedup_key,
 };
-use aruna_operations::create_metadata_document::mint_job_document;
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::jobs::import::{
     CreateRoCrateUploadConfig, CreateRoCrateUploadError, CreateRoCrateUploadOperation,
     load_rocrate_upload,
 };
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::metadata::create_document::mint_job_document;
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::staging::head_source::{
     HeadStagingSourceError, HeadStagingSourceInput, HeadStagingSourceOperation,
@@ -38,7 +38,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::jobs::{job_urls, map_submit_error};
-use crate::auth::{ensure_permission, require_unrestricted_realm_auth};
+use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 
@@ -177,7 +177,7 @@ pub async fn upload_rocrate(
     body: Body,
 ) -> ServerResult<(StatusCode, Json<UploadRoCrateResponse>)> {
     let deadline = Instant::now() + UPLOAD_DEADLINE;
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let media_type = parse_media_type(&headers)?;
     let limit = state.rocrate_limits().direct_upload_bytes;
     if headers
@@ -195,7 +195,7 @@ pub async fn upload_rocrate(
             "RO-Crate upload capacity is temporarily exhausted".to_string(),
         ));
     };
-    let expires_at_ms = aruna_core::util::unix_timestamp_millis()
+    let expires_at_ms = aruna_core::time::unix_timestamp_millis()
         .checked_add(state.rocrate_limits().upload_retention_ms)
         .ok_or_else(|| ServerError::InternalError("upload expiry overflow".to_string()))?;
     let timestamp = i64::try_from(expires_at_ms)
@@ -309,7 +309,7 @@ pub async fn submit_import(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<SubmitImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let source = parse_import_source(request.source)?;
     let target = parse_import_target(request.target, state.rocrate_limits().key_bytes)?;
     let metadata = parse_import_metadata(request.metadata, state.rocrate_limits().key_bytes)?;
@@ -348,7 +348,7 @@ pub async fn submit_import(
             &spec.metadata.path,
         )
         .await
-        .map_err(super::metadata::map_create_error)?
+        .map_err(crate::metadata::map_create_error)?
         .as_ulid();
         spec.document_id = document_id;
         fast_source_check(
@@ -489,7 +489,7 @@ async fn fast_source_check(
             } else {
                 false
             };
-            if !reclaimed && record.expires_at_ms <= aruna_core::util::unix_timestamp_millis() {
+            if !reclaimed && record.expires_at_ms <= aruna_core::time::unix_timestamp_millis() {
                 return Err(ServerError::BadRequestReason("upload expired".to_string()));
             }
             if record.size > state.rocrate_limits().import_source_bytes {
@@ -508,7 +508,7 @@ async fn fast_source_check(
             ensure_permission(
                 state,
                 auth,
-                blob_object_permission_path(
+                object_permission_path(
                     state.get_realm_id(),
                     bucket_info.group_id,
                     state.get_node_id(),
@@ -591,7 +591,7 @@ async fn fast_target_check(
     ensure_permission(
         state,
         auth,
-        blob_bucket_permission_path(
+        bucket_permission_path(
             state.get_realm_id(),
             bucket_info.group_id,
             state.get_node_id(),
@@ -852,7 +852,7 @@ mod tests {
             user_id: user,
             realm_id: realm,
         };
-        let group_auth = GroupAuthorizationDocument::new_default_group_doc(user, realm, group);
+        let group_auth = GroupAuthorizationDocument::default_group_doc(user, realm, group);
         let group_doc = Group {
             display_name: "import-group".to_string(),
             group_id: group,
@@ -860,7 +860,7 @@ mod tests {
             roles: group_auth.roles.keys().copied().collect(),
             owner: user,
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm);
+        let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm);
         write_doc(
             state,
             AUTH_KEYSPACE,
@@ -1013,7 +1013,7 @@ mod tests {
         let group = Ulid::generate();
         grant(&state, user, group).await;
         state
-            .register_rest_interface_with_public_url(
+            .register_rest_public(
                 "127.0.0.1:3000".parse().unwrap(),
                 Some("https://owner.example/"),
             )
@@ -1078,7 +1078,7 @@ mod tests {
             .with_rocrate_limits(limits),
         );
         state
-            .register_rest_interface_with_public_url(
+            .register_rest_public(
                 "127.0.0.1:3000".parse().unwrap(),
                 Some("https://owner.example/"),
             )
@@ -1231,7 +1231,7 @@ mod tests {
     async fn submit_accepts_upload() {
         let (_dir, state, user, group) = submit_state().await;
         let upload_id = Ulid::generate();
-        let future = aruna_core::util::unix_timestamp_millis() + 60_000;
+        let future = aruna_core::time::unix_timestamp_millis() + 60_000;
         seed_upload(&state, upload_id, user, 1, future).await;
         seed_bucket(&state, "target", group, user).await;
         let (status, Json(response)) = submit_import(
@@ -1275,7 +1275,7 @@ mod tests {
             upload_id,
             other,
             1,
-            aruna_core::util::unix_timestamp_millis() + 60_000,
+            aruna_core::time::unix_timestamp_millis() + 60_000,
         )
         .await;
         let result = submit_import(
@@ -1308,7 +1308,7 @@ mod tests {
         // An upload larger than the import-source cap is rejected at submit time.
         let (_dir, state, user, group) = submit_state().await;
         let upload_id = Ulid::generate();
-        let future = aruna_core::util::unix_timestamp_millis() + 60_000;
+        let future = aruna_core::time::unix_timestamp_millis() + 60_000;
         seed_upload(&state, upload_id, user, 2048, future).await;
         seed_bucket(&state, "target", group, user).await;
         let result = submit_import(
@@ -1330,7 +1330,7 @@ mod tests {
             upload_id,
             user,
             1,
-            aruna_core::util::unix_timestamp_millis() + 60_000,
+            aruna_core::time::unix_timestamp_millis() + 60_000,
         )
         .await;
         let foreign = Ulid::generate();
@@ -1354,7 +1354,7 @@ mod tests {
             upload_id,
             user,
             1,
-            aruna_core::util::unix_timestamp_millis() + 60_000,
+            aruna_core::time::unix_timestamp_millis() + 60_000,
         )
         .await;
         seed_bucket(&state, "target", group, user).await;

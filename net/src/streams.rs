@@ -22,9 +22,7 @@ use crate::connection_pool::{ConnectionLease, ConnectionPool};
 use crate::device_limits::{DeviceLimiter, DeviceLimits, DevicePermit, DeviceRefusal};
 use crate::document_sync::DocumentSyncService;
 use crate::error::{NetError, Result};
-use crate::telemetry::{
-    duration_ms, record_duration_ms, warn_if_slow_iroh_phase, warn_if_slow_iroh_request,
-};
+use crate::telemetry::{duration_ms, record_duration_ms, warn_iroh_phase, warn_iroh_request};
 
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const INBOUND_CONNECTION_GLOBAL_LIMIT: usize = 256;
@@ -290,16 +288,11 @@ impl AsyncRead for LeasedRecvStream {
 
 pub struct StreamsService {
     connection_pool: ConnectionPool,
-    #[allow(dead_code)]
-    shutdown: CancellationToken,
 }
 
 impl StreamsService {
-    pub fn new(connection_pool: ConnectionPool, shutdown: CancellationToken) -> Self {
-        Self {
-            connection_pool,
-            shutdown,
-        }
+    pub fn new(connection_pool: ConnectionPool) -> Self {
+        Self { connection_pool }
     }
 
     #[tracing::instrument(
@@ -334,7 +327,7 @@ impl StreamsService {
                 Ok(conn) => {
                     let elapsed = connect_started.elapsed();
                     record_duration_ms(&span, "iroh.connect_ms", elapsed);
-                    warn_if_slow_iroh_phase("stream.open", "connect", elapsed);
+                    warn_iroh_phase("stream.open", "connect", elapsed);
                     trace!(
                         event = "iroh.stream.open_phase",
                         peer = %node_id,
@@ -369,7 +362,7 @@ impl StreamsService {
                 Ok(Ok(stream)) => {
                     let elapsed = open_started.elapsed();
                     record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
-                    warn_if_slow_iroh_phase("stream.open", "open_bi", elapsed);
+                    warn_iroh_phase("stream.open", "open_bi", elapsed);
                     trace!(
                         event = "iroh.stream.open_phase",
                         peer = %node_id,
@@ -415,7 +408,7 @@ impl StreamsService {
 
             let total_elapsed = total_started.elapsed();
             record_duration_ms(&span, "iroh.total_ms", total_elapsed);
-            warn_if_slow_iroh_request("stream.open", total_elapsed);
+            warn_iroh_request("stream.open", total_elapsed);
             span.record("otel.status_code", "OK");
             trace!(
                 event = "iroh.stream.open_completed",
@@ -533,8 +526,7 @@ pub async fn run_accept_loop(
                         return;
                     }
                     // A provisional session takes the same budget as an admitted
-                    // one, so one unknown identity cannot hold every handshake
-                    // permit and starve inbound admission for configured peers.
+                    // one so one unknown identity cannot starve inbound admission.
                     drop(handshake_permit);
                     let Some(mut permit) = inbound_budget.acquire() else {
                         warn!("Dropping inbound Iroh connection: connection limit reached");
@@ -610,9 +602,8 @@ pub async fn run_accept_loop(
                     };
                     drop(provisional);
                     if materialized_now {
-                        // The fresh config decides: an admitted peer keeps this
-                        // session instead of losing its in-flight requests, and
-                        // run_admitted closes the connection for everyone else.
+                        // The fresh config decides: an admitted peer keeps its
+                        // session; run_admitted closes the connection for others.
                         run_admitted(
                             admitted_conn,
                             alpn,
@@ -993,9 +984,8 @@ mod tests {
 
     #[test]
     fn device_sync_refused() {
-        // A device exchanges no documents with anybody: not with realm
-        // infrastructure, not with another device. It fetches what it needs as
-        // a routed metadata read instead.
+        // A device exchanges no documents: it fetches what it needs as a routed
+        // metadata read instead.
         let realm_peers = Arc::new(RwLock::new(vec![peer(1), peer(2)]));
         let admission = InboundAdmission::new(realm_peers, []);
         admission.mark_materialized();

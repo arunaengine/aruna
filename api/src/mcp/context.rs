@@ -3,13 +3,13 @@ use super::{
     server_error, tool_extras,
 };
 use aruna_core::structs::{AuthContext, Group, Permission, Role};
+use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
-use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::list_groups::ListGroupOperation;
-use aruna_operations::metadata::stats::count_group_documents_by_purpose;
-use aruna_operations::read_realm_authorization::ReadRealmAuthorizationOperation;
-use aruna_operations::read_user_document::{ReadUserDocumentError, ReadUserDocumentOperation};
-use aruna_operations::request_policy::PolicyRequestExtras;
+use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
+use aruna_operations::groups::list_groups::ListGroupOperation;
+use aruna_operations::metadata::stats::count_group_purpose;
+use aruna_operations::realm::read_authorization::ReadRealmAuthorizationOperation;
+use aruna_operations::users::read_document::{ReadUserDocumentError, ReadUserDocumentOperation};
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
@@ -69,10 +69,8 @@ pub struct DatasetCountsOutput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct GroupIdInput {
-    /// The group's bare 26-character ULID, for example
-    /// `01JZ8Y6T0K4W7M2N9Q5R3S8V1X`. Call `list_groups` or `whoami` for the ids
-    /// the caller belongs to, or read `group_id` from a `search` hit. This is
-    /// not the `<ulid>@<realm>` form a user id uses.
+    /// Bare group ULID. Use `list_groups`, `whoami`, or a search result to find it.
+    /// This is distinct from a user's `<ulid>@<realm>` identifier.
     pub group_id: String,
 }
 
@@ -173,17 +171,16 @@ impl McpServer {
         };
         let mut groups = Vec::new();
         for group in member_groups(self, &auth).await? {
-            let counts =
-                count_group_documents_by_purpose(&self.state.get_ctx(), realm_id, group.group_id)
-                    .await
-                    .map_err(internal_error)?
-                    .ok_or_else(|| {
-                        explained(
-                            crate::error::ServerError::ServiceUnavailable,
-                            "this node has no metadata subsystem, so dataset counts are \
+            let counts = count_group_purpose(&self.state.get_ctx(), realm_id, group.group_id)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    explained(
+                        crate::error::ServerError::ServiceUnavailable,
+                        "this node has no metadata subsystem, so dataset counts are \
                              unavailable here; call get_node_info",
-                        )
-                    })?;
+                    )
+                })?;
             total.dataset_count += counts.dataset_count;
             total.profile_count += counts.profile_count;
             total.process_run_count += counts.process_run_count;

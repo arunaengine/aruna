@@ -11,8 +11,8 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::report::{AuditPaging, AuditRange, family_audit, family_report};
-use crate::jobs::records::tests::fixture::{Family, REALM, context, user};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::tests::fixtures::records::{Family, REALM, context, user};
 
 async fn append(context: &DriverContext, family: &Family, envelope: JobRecordEnvelope) {
     let record = JobRecordFrame::new(envelope).expect("bounded record");

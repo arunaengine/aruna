@@ -6,11 +6,10 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{
     MetadataRegistryRecord, NotificationKind, NotificationRecord, RealmConfigDocument, RealmId,
-    WatchEvent, WatchEventDetail, WatchEventKind, data_watch_resource_path,
-    parse_data_watch_resource_path,
+    WatchEvent, WatchEventDetail, WatchEventKind, parse_watch_path, watch_resource_path,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::UserId;
-use aruna_core::util::unix_timestamp_millis;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use byteview::ByteView;
@@ -21,10 +20,8 @@ use crate::driver::DriverContext;
 use crate::notifications::client::{
     close_stream, drain_request_stream, read_message, write_message,
 };
-use crate::notifications::dispatch::{
-    list_notifications_on_holder, mark_read_on_holder, unread_count_on_holder,
-};
-use crate::notifications::inbox::upsert_inbox_records_reporting;
+use crate::notifications::dispatch::{list_on_holder, mark_on_holder, unread_on_holder};
+use crate::notifications::inbox::upsert_with_report;
 use crate::notifications::mark_read::MARK_READ_MAX_IDS;
 use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
@@ -32,15 +29,13 @@ use crate::notifications::protocol::{
     NOTIFICATION_WATCH_EVENT_BATCH_SIZE, NotificationTransportMessage, notification_message_kind,
 };
 use crate::notifications::watch::authorization::{
-    WatchAuthorization, authorize_forwarded_watch, list_authorized_watch_subscriptions,
+    WatchAuthorization, authorize_forwarded_watch, list_authorized_subscriptions,
 };
 use crate::notifications::watch::expand::expand_watch_events;
-use crate::notifications::watch::interest::{
-    mark_watch_interest_dirty, schedule_watch_interest_publish,
-};
+use crate::notifications::watch::interest::{mark_interest_dirty, schedule_interest_publish};
 use crate::notifications::watch::subscriptions::{
-    WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE,
-    create_replicated_watch_subscription, delete_replicated_watch_subscription,
+    WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE, create_holder_watch,
+    delete_holder_watch,
 };
 
 const NOTIFICATION_MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -105,10 +100,10 @@ async fn build_response(
             if let Err(reason) = validate_inbound_batch(&records, unix_timestamp_millis()) {
                 return NotificationTransportMessage::Reject(reason);
             }
-            if let Err(reason) = verify_batch_local_holder(&records, &realm_config, local_node_id) {
+            if let Err(reason) = verify_batch_holder(&records, &realm_config, local_node_id) {
                 return NotificationTransportMessage::Reject(reason);
             }
-            match upsert_inbox_records_reporting(&context.storage_handle, &records).await {
+            match upsert_with_report(&context.storage_handle, &records).await {
                 Ok(outcome) => {
                     wake_recipients(net_handle, &outcome.recipients);
                     NotificationTransportMessage::DeliverAck {
@@ -123,12 +118,10 @@ async fn build_response(
             cursor,
             limit,
         } => {
-            if let Err(reason) =
-                verify_recipient_local_holder(&recipient, &realm_config, local_node_id)
-            {
+            if let Err(reason) = verify_recipient_holder(&recipient, &realm_config, local_node_id) {
                 return NotificationTransportMessage::Reject(reason);
             }
-            match list_notifications_on_holder(context, recipient, cursor, limit as usize).await {
+            match list_on_holder(context, recipient, cursor, limit as usize).await {
                 Ok((records, next_cursor)) => NotificationTransportMessage::ListResult {
                     records,
                     next_cursor,
@@ -137,12 +130,10 @@ async fn build_response(
             }
         }
         NotificationTransportMessage::UnreadCount { recipient } => {
-            if let Err(reason) =
-                verify_recipient_local_holder(&recipient, &realm_config, local_node_id)
-            {
+            if let Err(reason) = verify_recipient_holder(&recipient, &realm_config, local_node_id) {
                 return NotificationTransportMessage::Reject(reason);
             }
-            match unread_count_on_holder(context, recipient).await {
+            match unread_on_holder(context, recipient).await {
                 Ok((count, capped)) => {
                     NotificationTransportMessage::UnreadCountResult { count, capped }
                 }
@@ -160,12 +151,10 @@ async fn build_response(
                     ids.len()
                 ));
             }
-            if let Err(reason) =
-                verify_recipient_local_holder(&recipient, &realm_config, local_node_id)
-            {
+            if let Err(reason) = verify_recipient_holder(&recipient, &realm_config, local_node_id) {
                 return NotificationTransportMessage::Reject(reason);
             }
-            match mark_read_on_holder(context, recipient, ids, up_to_ms).await {
+            match mark_on_holder(context, recipient, ids, up_to_ms).await {
                 Ok(marked) => {
                     if marked > 0 {
                         net_handle.notify_inbox_activity(recipient);
@@ -181,8 +170,7 @@ async fn build_response(
             event_mask,
             authorization,
         } => {
-            if let Err(reason) = verify_recipient_local_holder(&owner, &realm_config, local_node_id)
-            {
+            if let Err(reason) = verify_recipient_holder(&owner, &realm_config, local_node_id) {
                 return NotificationTransportMessage::Reject(reason);
             }
 
@@ -211,7 +199,7 @@ async fn build_response(
                 Err(error) => return NotificationTransportMessage::Reject(error),
             }
 
-            match create_replicated_watch_subscription(
+            match create_holder_watch(
                 context,
                 local_node_id,
                 owner,
@@ -223,19 +211,18 @@ async fn build_response(
             .await
             {
                 Ok(subscription) => {
-                    schedule_watch_interest_publish(context).await;
+                    schedule_interest_publish(context).await;
                     NotificationTransportMessage::WatchCreated { subscription }
                 }
                 Err(error) => NotificationTransportMessage::Reject(error.to_string()),
             }
         }
         NotificationTransportMessage::DeleteWatch { owner, watch_id } => {
-            if let Err(reason) = verify_recipient_local_holder(&owner, &realm_config, local_node_id)
-            {
+            if let Err(reason) = verify_recipient_holder(&owner, &realm_config, local_node_id) {
                 return NotificationTransportMessage::Reject(reason);
             }
 
-            match delete_replicated_watch_subscription(
+            match delete_holder_watch(
                 context,
                 local_node_id,
                 owner,
@@ -245,35 +232,31 @@ async fn build_response(
             .await
             {
                 Ok(()) => {
-                    schedule_watch_interest_publish(context).await;
+                    schedule_interest_publish(context).await;
                     NotificationTransportMessage::WatchDeleted
                 }
                 Err(error) => NotificationTransportMessage::Reject(error.to_string()),
             }
         }
         NotificationTransportMessage::ListWatches { owner } => {
-            if let Err(reason) = verify_recipient_local_holder(&owner, &realm_config, local_node_id)
-            {
+            if let Err(reason) = verify_recipient_holder(&owner, &realm_config, local_node_id) {
                 return NotificationTransportMessage::Reject(reason);
             }
 
-            match list_authorized_watch_subscriptions(context, owner).await {
+            match list_authorized_subscriptions(context, owner).await {
                 Ok(subscriptions) => NotificationTransportMessage::WatchList { subscriptions },
                 Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
         NotificationTransportMessage::DeliverWatchEvents { events } => {
-            if let Err(reason) =
-                validate_inbound_watch_events(&events, realm_id, unix_timestamp_millis())
-            {
+            if let Err(reason) = validate_watch_events(&events, realm_id, unix_timestamp_millis()) {
                 return NotificationTransportMessage::Reject(reason);
             }
             match expand_watch_events(context, realm_id, &realm_config, local_node_id, &events)
                 .await
             {
                 Ok((outcome, found_stale)) => {
-                    if found_stale
-                        && let Err(error) = mark_watch_interest_dirty(context, realm_id).await
+                    if found_stale && let Err(error) = mark_interest_dirty(context, realm_id).await
                     {
                         warn!(%error, "Failed to retract dropped watch interest after delivery");
                     }
@@ -315,7 +298,7 @@ fn validate_inbound_batch(records: &[NotificationRecord], now_ms: u64) -> Result
     Ok(())
 }
 
-fn validate_inbound_watch_events(
+fn validate_watch_events(
     events: &[WatchEvent],
     realm_id: RealmId,
     now_ms: u64,
@@ -328,16 +311,12 @@ fn validate_inbound_watch_events(
         ));
     }
     for event in events {
-        validate_inbound_watch_event(event, realm_id, now_ms)?;
+        validate_watch_event(event, realm_id, now_ms)?;
     }
     Ok(())
 }
 
-fn validate_inbound_watch_event(
-    event: &WatchEvent,
-    realm_id: RealmId,
-    now_ms: u64,
-) -> Result<(), String> {
+fn validate_watch_event(event: &WatchEvent, realm_id: RealmId, now_ms: u64) -> Result<(), String> {
     if event.realm_id != realm_id {
         return Err("watch event realm mismatch".to_string());
     }
@@ -402,7 +381,7 @@ fn validate_inbound_watch_event(
             if key.is_empty() {
                 return Err("watch event has empty key".to_string());
             }
-            let expected_path = data_watch_resource_path(*group_id, *node_id, bucket, key);
+            let expected_path = watch_resource_path(*group_id, *node_id, bucket, key);
             if event.path != expected_path {
                 return Err("watch event data path does not match detail".to_string());
             }
@@ -549,7 +528,7 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             if key.is_empty() {
                 return Err("notification record has empty key".to_string());
             }
-            if path != &data_watch_resource_path(*group_id, *node_id, bucket, key) {
+            if path != &watch_resource_path(*group_id, *node_id, bucket, key) {
                 return Err("notification record data path does not match detail".to_string());
             }
             validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
@@ -611,7 +590,7 @@ fn validate_sync_path(
     if relationship_id.is_nil() {
         return Err("notification record has empty relationship_id".to_string());
     }
-    let resource = parse_data_watch_resource_path(path)
+    let resource = parse_watch_path(path)
         .ok_or_else(|| "notification record sync path is not canonical".to_string())?;
     if resource.group_id != group_id || resource.node_id != node_id || resource.bucket != bucket {
         return Err("notification record sync path does not match detail".to_string());
@@ -635,18 +614,18 @@ fn validate_kind_user(
     Ok(())
 }
 
-fn verify_batch_local_holder(
+fn verify_batch_holder(
     records: &[NotificationRecord],
     realm_config: &RealmConfigDocument,
     local_node_id: NodeId,
 ) -> Result<(), String> {
     for record in records {
-        verify_recipient_local_holder(&record.recipient, realm_config, local_node_id)?;
+        verify_recipient_holder(&record.recipient, realm_config, local_node_id)?;
     }
     Ok(())
 }
 
-fn verify_recipient_local_holder(
+fn verify_recipient_holder(
     recipient: &UserId,
     realm_config: &RealmConfigDocument,
     local_node_id: NodeId,
@@ -741,7 +720,7 @@ async fn authorize_peer(
         return Err(format!("realm `{realm_id}` config unavailable"));
     };
     let eligible = config
-        .sync_eligible_node_ids()
+        .sync_eligible_nodes()
         .map_err(|error| error.to_string())?;
     if eligible.contains(&peer) {
         Ok(config)
@@ -784,16 +763,16 @@ async fn read_realm_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::incoming::initialize_net_incoming;
     use crate::notifications::client::{
-        create_watch_remote, delete_watch_remote, deliver_remote, deliver_watch_events_remote,
+        create_watch_remote, delete_watch_remote, deliver_events_remote, deliver_remote,
         list_remote, list_watches_remote, mark_read_remote, send_notification_request,
         unread_count_remote,
     };
     use crate::notifications::inbox::upsert_inbox_records;
     use crate::notifications::watch::subscriptions::{
-        WATCH_SUBSCRIPTION_UNAUTHORIZED, create_watch_subscription, list_watch_subscriptions,
+        WATCH_SUBSCRIPTION_UNAUTHORIZED, create_local_watch, list_watch_subscriptions,
     };
+    use crate::sync::incoming::initialize_net_incoming;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
         NOTIFICATION_WATCH_INTEREST_KEYSPACE,
@@ -803,8 +782,7 @@ mod tests {
         Actor, Group, GroupAuthorizationDocument, NotificationClass, NotificationKind,
         NotificationRecord, PathRestriction, Permission, RealmAuthorizationDocument, RealmNodeKind,
         TokenRevocation, WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind,
-        WatchEventMask, blob_object_permission_path, data_watch_resource_path,
-        watch_interest_dirty_key,
+        WatchEventMask, interest_dirty_key, object_permission_path, watch_resource_path,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
@@ -867,7 +845,7 @@ mod tests {
     }
 
     fn data_path(key: &str) -> String {
-        data_watch_resource_path(data_group_id(), data_node_id(), "bucket", key)
+        watch_resource_path(data_group_id(), data_node_id(), "bucket", key)
     }
 
     /// Adds the record's creating token to the holder's replicated revocation set.
@@ -884,7 +862,7 @@ mod tests {
                 .expect("watch binding")
                 .token_hash
                 .clone(),
-            expires_at: aruna_core::util::unix_timestamp_secs() + 600,
+            expires_at: aruna_core::time::unix_timestamp_secs() + 600,
         });
         write_config(node, config.realm_id, &config).await;
     }
@@ -929,7 +907,7 @@ mod tests {
     /// Without this, the first in-request reload closes provisional sessions.
     async fn admit_peers(node: &Node, config: &RealmConfigDocument) {
         node.net
-            .refresh_realm_peers_from_document(config)
+            .refresh_document_peers(config)
             .await
             .expect("refresh realm peers");
     }
@@ -945,9 +923,9 @@ mod tests {
             user_id: owner,
             realm_id,
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let mut group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, data_group_id());
+            GroupAuthorizationDocument::default_group_doc(owner, realm_id, data_group_id());
         group_auth
             .roles
             .values_mut()
@@ -1085,7 +1063,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_remote_upserts_on_holder() {
+    async fn remote_upserts_deliver() {
         let realm_id = RealmId::from_bytes([40u8; 32]);
         let a = spawn(realm_id, [40u8; 32]).await;
         let b = spawn(realm_id, [41u8; 32]).await;
@@ -1114,7 +1092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_remote_delivery_is_idempotent() {
+    async fn remote_delivery_idempotent() {
         let realm_id = RealmId::from_bytes([42u8; 32]);
         let a = spawn(realm_id, [42u8; 32]).await;
         let b = spawn(realm_id, [43u8; 32]).await;
@@ -1145,7 +1123,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_peer_is_rejected() {
+    async fn unknown_peer_rejected() {
         let realm_id = RealmId::from_bytes([44u8; 32]);
         let a = spawn(realm_id, [44u8; 32]).await;
         let b = spawn(realm_id, [45u8; 32]).await;
@@ -1173,7 +1151,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_realm_batch_is_rejected() {
+    async fn mixed_realm_rejected() {
         let realm_id = RealmId::from_bytes([47u8; 32]);
         let other_realm = RealmId::from_bytes([48u8; 32]);
         let a = spawn(realm_id, [47u8; 32]).await;
@@ -1204,7 +1182,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_for_non_holder_is_rejected_without_partial_write() {
+    async fn nonholder_batch_rejected() {
         let realm_id = RealmId::from_bytes([64u8; 32]);
         let a = spawn(realm_id, [64u8; 32]).await;
         let b = spawn(realm_id, [65u8; 32]).await;
@@ -1236,7 +1214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_with_read_record_is_rejected_without_partial_write() {
+    async fn read_batch_rejected() {
         let (a, b, recipient) = delivery_pair(70).await;
         let valid = record(recipient, 1);
         let mut read = record(recipient, 2);
@@ -1253,7 +1231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_with_future_created_at_is_rejected_without_partial_write() {
+    async fn future_batch_rejected() {
         let (a, b, recipient) = delivery_pair(72).await;
         let valid = record(recipient, 1);
         let mut future = record(recipient, 2);
@@ -1272,7 +1250,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_with_invalid_kind_user_is_rejected_without_partial_write() {
+    async fn invalid_user_rejected() {
         let (a, b, recipient) = delivery_pair(73).await;
         let valid = record(recipient, 1);
         let mut invalid = record(recipient, 2);
@@ -1292,14 +1270,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_batch_rejects_watch_records_without_partial_write() {
+    async fn watch_batch_rejected() {
         let (a, b, recipient) = delivery_pair(83).await;
         let valid = record(recipient, 1);
         let mut invalid = record(recipient, 2);
         let group_id = Ulid::from_bytes([3u8; 16]);
         let node_id = data_node_id();
         invalid.kind = NotificationKind::DataUploaded {
-            path: data_watch_resource_path(group_id, node_id, "bucket", "object"),
+            path: watch_resource_path(group_id, node_id, "bucket", "object"),
             group_id,
             node_id,
             bucket: "bucket".to_string(),
@@ -1319,7 +1297,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_cap_rejects_whole_batch_without_partial_write() {
+    async fn direct_cap_rejected() {
         let (a, b, recipient) = delivery_pair(74).await;
         let records: Vec<_> = (0..=NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE)
             .map(|index| record(recipient, (index % 255 + 1) as u8))
@@ -1375,7 +1353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_batch_is_rejected() {
+    async fn empty_batch_rejected() {
         let realm_id = RealmId::from_bytes([50u8; 32]);
         let a = spawn(realm_id, [50u8; 32]).await;
         let b = spawn(realm_id, [51u8; 32]).await;
@@ -1405,7 +1383,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_kind_peer_is_rejected() {
+    async fn user_peer_rejected() {
         let realm_id = RealmId::from_bytes([52u8; 32]);
         let b = spawn(realm_id, [53u8; 32]).await;
         let c = spawn(realm_id, [54u8; 32]).await;
@@ -1504,7 +1482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_list_skips_revoked_watch_records_without_consuming_page() {
+    async fn list_skips_revoked() {
         let realm_id = RealmId::from_bytes([83u8; 32]);
         let a = spawn(realm_id, [83u8; 32]).await;
         let b = spawn(realm_id, [84u8; 32]).await;
@@ -1663,7 +1641,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .path_restrictions = Some(vec![PathRestriction {
-            pattern: blob_object_permission_path(
+            pattern: object_permission_path(
                 recipient.realm_id,
                 data_group_id(),
                 data_node_id(),
@@ -1684,7 +1662,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_unread_and_mark_read_roundtrip() {
+    async fn unread_mark_roundtrip() {
         let realm_id = RealmId::from_bytes([59u8; 32]);
         let a = spawn(realm_id, [59u8; 32]).await;
         let b = spawn(realm_id, [60u8; 32]).await;
@@ -1739,7 +1717,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_mark_read_rejects_too_many_ids() {
+    async fn mark_limit_rejected() {
         let (a, b, recipient) = delivery_pair(75).await;
         let ids = (0..=MARK_READ_MAX_IDS).map(|_| Ulid::generate()).collect();
 
@@ -1753,7 +1731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_read_path_still_gated() {
+    async fn read_path_gated() {
         let realm_id = RealmId::from_bytes([61u8; 32]);
         let a = spawn(realm_id, [61u8; 32]).await;
         let b = spawn(realm_id, [62u8; 32]).await;
@@ -1780,7 +1758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_inbox_ops_reject_non_local_holder() {
+    async fn inbox_nonholder_rejected() {
         let realm_id = RealmId::from_bytes([66u8; 32]);
         let a = spawn(realm_id, [66u8; 32]).await;
         let b = spawn(realm_id, [67u8; 32]).await;
@@ -1828,7 +1806,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_message_is_refused() {
+    async fn oversized_message_refused() {
         let realm_id = RealmId::from_bytes([57u8; 32]);
         let a = spawn(realm_id, [57u8; 32]).await;
         let b = spawn(realm_id, [58u8; 32]).await;
@@ -1870,7 +1848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_watch_crud_roundtrip() {
+    async fn watch_operations_roundtrip() {
         let realm_id = RealmId::from_bytes([64u8; 32]);
         let a = spawn(realm_id, [64u8; 32]).await;
         let b = spawn(realm_id, [65u8; 32]).await;
@@ -1924,7 +1902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_watch_ops_reject_non_local_holder() {
+    async fn watch_nonholder_rejected() {
         let realm_id = RealmId::from_bytes([68u8; 32]);
         let a = spawn(realm_id, [68u8; 32]).await;
         let b = spawn(realm_id, [69u8; 32]).await;
@@ -1978,9 +1956,8 @@ mod tests {
         );
     }
 
-    // The holder persists and replicates the subscription, so a proxying peer's
-    // assertion is not authority to watch: an owner without READ is refused there
-    // too, and nothing durable is written.
+    // A proxy cannot authorize a watch: the holder rechecks READ before persisting.
+    // An unauthorized owner is refused without a durable write.
     #[tokio::test]
     async fn create_requires_read() {
         let realm_id = RealmId::from_bytes([86u8; 32]);
@@ -2242,7 +2219,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_metadata_watch_path_accepts_normalized_nested_document_path() {
+    fn metadata_path_accepted() {
         let realm_id = RealmId::from_bytes([79u8; 32]);
         let actor = UserId::new(Ulid::generate(), realm_id);
         let group_id = Ulid::generate();
@@ -2260,17 +2237,17 @@ mod tests {
             },
         };
 
-        assert!(validate_inbound_watch_event(&event, realm_id, 1_000).is_ok());
+        assert!(validate_watch_event(&event, realm_id, 1_000).is_ok());
 
         event.path = format!("meta/{group_id}/datasets/project/");
         assert_eq!(
-            validate_inbound_watch_event(&event, realm_id, 1_000),
+            validate_watch_event(&event, realm_id, 1_000),
             Err("watch event metadata path is not canonical".to_string())
         );
 
         event.path = format!("meta/{}/datasets/project", Ulid::generate());
         assert_eq!(
-            validate_inbound_watch_event(&event, realm_id, 1_000),
+            validate_watch_event(&event, realm_id, 1_000),
             Err("watch event metadata path does not match detail".to_string())
         );
     }
@@ -2285,20 +2262,20 @@ mod tests {
         ];
 
         assert!(
-            validate_inbound_watch_events(&events, realm_id, 1_700_000_000_000)
+            validate_watch_events(&events, realm_id, 1_700_000_000_000)
                 .expect_err("oversized watch batch must be rejected")
                 .contains("exceeds cap")
         );
     }
 
     #[test]
-    fn inbound_data_watch_path_requires_matching_group_and_node_identity() {
+    fn data_identity_required() {
         let realm_id = RealmId::from_bytes([78u8; 32]);
         let actor = UserId::new(Ulid::generate(), realm_id);
         let mut event = upload_event(realm_id, actor, "bucket/object");
 
         assert!(
-            validate_inbound_watch_event(&event, realm_id, event.occurred_at_ms).is_ok(),
+            validate_watch_event(&event, realm_id, event.occurred_at_ms).is_ok(),
             "canonical detail matches its path"
         );
 
@@ -2308,7 +2285,7 @@ mod tests {
             panic!("canonical data detail expected");
         }
         assert_eq!(
-            validate_inbound_watch_event(&event, realm_id, event.occurred_at_ms),
+            validate_watch_event(&event, realm_id, event.occurred_at_ms),
             Err("watch event data path does not match detail".to_string())
         );
     }
@@ -2323,7 +2300,7 @@ mod tests {
             event_id: Ulid::generate(),
             realm_id,
             kind: WatchEventKind::SyncCompleted,
-            path: data_watch_resource_path(group_id, node_id, "bucket", "prefix/"),
+            path: watch_resource_path(group_id, node_id, "bucket", "prefix/"),
             actor,
             occurred_at_ms: 1_000,
             detail: WatchEventDetail::SyncCompleted {
@@ -2335,18 +2312,18 @@ mod tests {
             },
         };
 
-        assert!(validate_inbound_watch_event(&event, realm_id, 1_000).is_ok());
+        assert!(validate_watch_event(&event, realm_id, 1_000).is_ok());
         if let WatchEventDetail::SyncCompleted {
             relationship_id, ..
         } = &mut event.detail
         {
             *relationship_id = Ulid::nil();
         }
-        assert!(validate_inbound_watch_event(&event, realm_id, 1_000).is_err());
+        assert!(validate_watch_event(&event, realm_id, 1_000).is_err());
     }
 
     #[tokio::test]
-    async fn deliver_watch_events_expands_idempotently_on_holder() {
+    async fn events_expand_idempotently() {
         let realm_id = RealmId::from_bytes([70u8; 32]);
         let a = spawn(realm_id, [70u8; 32]).await;
         let b = spawn(realm_id, [71u8; 32]).await;
@@ -2365,7 +2342,7 @@ mod tests {
         let actor = UserId::new(Ulid::generate(), realm_id);
         install_watch_authorization(&b, realm_id, owner, &[]).await;
         admit_peers(&b, &config).await;
-        create_watch_subscription(
+        create_local_watch(
             &b.context.storage_handle,
             owner,
             data_path(""),
@@ -2376,11 +2353,11 @@ mod tests {
         .expect("holder subscription");
 
         let events = vec![upload_event(realm_id, actor, "bucket/object")];
-        let first = deliver_watch_events_remote(&a.net, b.net.node_id(), events.clone())
+        let first = deliver_events_remote(&a.net, b.net.node_id(), events.clone())
             .await
             .expect("first delivery succeeds");
         assert_eq!(first, 1);
-        let second = deliver_watch_events_remote(&a.net, b.net.node_id(), events)
+        let second = deliver_events_remote(&a.net, b.net.node_id(), events)
             .await
             .expect("redelivery succeeds");
         assert_eq!(second, 0);
@@ -2395,7 +2372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_subscription_does_not_block_valid_local_subscription() {
+    async fn stale_subscription_skipped() {
         let realm_id = RealmId::from_bytes([71u8; 32]);
         let a = spawn(realm_id, [72u8; 32]).await;
         let b = spawn(realm_id, [73u8; 32]).await;
@@ -2415,7 +2392,7 @@ mod tests {
         install_watch_authorization(&b, realm_id, local_owner, &[stale_owner]).await;
         // Before the new member joined, both owners were held locally.
         install_config(&b, realm_id, &[(b.net.node_id(), RealmNodeKind::Server)]).await;
-        create_watch_subscription(
+        create_local_watch(
             &b.context.storage_handle,
             local_owner,
             data_path(""),
@@ -2424,7 +2401,7 @@ mod tests {
         )
         .await
         .expect("local subscription fixture");
-        create_watch_subscription(
+        create_local_watch(
             &b.context.storage_handle,
             stale_owner,
             data_path(""),
@@ -2433,7 +2410,7 @@ mod tests {
         )
         .await
         .expect("stale subscription fixture");
-        let dirty_key = watch_interest_dirty_key(realm_id);
+        let dirty_key = interest_dirty_key(realm_id);
         match b
             .context
             .storage_handle
@@ -2460,7 +2437,7 @@ mod tests {
         admit_peers(&b, &config).await;
 
         let actor = UserId::new(Ulid::generate(), realm_id);
-        let written = deliver_watch_events_remote(
+        let written = deliver_events_remote(
             &a.net,
             b.net.node_id(),
             vec![upload_event(realm_id, actor, "bucket/object")],
@@ -2487,7 +2464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_watch_events_rejects_kind_detail_mismatch() {
+    async fn kind_mismatch_rejected() {
         let realm_id = RealmId::from_bytes([73u8; 32]);
         let a = spawn(realm_id, [74u8; 32]).await;
         let b = spawn(realm_id, [75u8; 32]).await;
@@ -2503,7 +2480,7 @@ mod tests {
         .await;
 
         let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
-        create_watch_subscription(
+        create_local_watch(
             &b.context.storage_handle,
             owner,
             data_path(""),
@@ -2516,7 +2493,7 @@ mod tests {
         let actor = UserId::new(Ulid::generate(), realm_id);
         let mut event = upload_event(realm_id, actor, "bucket/object");
         event.kind = WatchEventKind::MetadataCreated;
-        let error = deliver_watch_events_remote(&a.net, b.net.node_id(), vec![event])
+        let error = deliver_events_remote(&a.net, b.net.node_id(), vec![event])
             .await
             .expect_err("kind/detail mismatch must be rejected");
         assert!(
@@ -2527,7 +2504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_watch_events_is_trust_gated() {
+    async fn delivery_trust_gated() {
         let realm_id = RealmId::from_bytes([72u8; 32]);
         let b = spawn(realm_id, [73u8; 32]).await;
         let c = spawn(realm_id, [74u8; 32]).await;
@@ -2548,7 +2525,7 @@ mod tests {
         .await;
 
         let owner = UserId::new(Ulid::generate(), realm_id);
-        create_watch_subscription(
+        create_local_watch(
             &b.context.storage_handle,
             owner,
             data_path(""),
@@ -2559,7 +2536,7 @@ mod tests {
         .expect("holder subscription");
 
         let actor = UserId::new(Ulid::generate(), realm_id);
-        let error = deliver_watch_events_remote(
+        let error = deliver_events_remote(
             &c.net,
             b.net.node_id(),
             vec![upload_event(realm_id, actor, "bucket/object")],
@@ -2574,7 +2551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_watch_events_rejects_empty_and_mixed_realm() {
+    async fn invalid_events_rejected() {
         let realm_id = RealmId::from_bytes([75u8; 32]);
         let other_realm = RealmId::from_bytes([76u8; 32]);
         let a = spawn(realm_id, [75u8; 32]).await;
@@ -2603,7 +2580,7 @@ mod tests {
         );
 
         let actor = UserId::new(Ulid::generate(), realm_id);
-        let mixed = deliver_watch_events_remote(
+        let mixed = deliver_events_remote(
             &a.net,
             b.net.node_id(),
             vec![
@@ -2620,7 +2597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_path_is_trust_gated() {
+    async fn path_trust_gated() {
         let realm_id = RealmId::from_bytes([66u8; 32]);
         let b = spawn(realm_id, [67u8; 32]).await;
         let c = spawn(realm_id, [68u8; 32]).await;
@@ -2664,7 +2641,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_batch_wakes_recipient_only_on_fresh_write() {
+    async fn fresh_delivery_wakes() {
         let realm_id = RealmId::from_bytes([80u8; 32]);
         let a = spawn(realm_id, [80u8; 32]).await;
         let b = spawn(realm_id, [81u8; 32]).await;
@@ -2695,16 +2672,13 @@ mod tests {
         deliver_remote(&a.net, b.net.node_id(), batch.clone())
             .await
             .expect("redelivery succeeds");
-        assert!(
-            timeout(Duration::from_millis(200), wakes.recv())
-                .await
-                .is_err(),
-            "redelivery must not wake"
-        );
+        // The holder wakes before writing the ack, so the awaited reply orders
+        // this emptiness check after any wake the redelivery could have sent.
+        assert!(wakes.is_empty(), "redelivery must not wake");
     }
 
     #[tokio::test]
-    async fn mark_read_rpc_wakes_recipient_only_when_count_changes() {
+    async fn changed_count_wakes() {
         let realm_id = RealmId::from_bytes([82u8; 32]);
         let a = spawn(realm_id, [82u8; 32]).await;
         let b = spawn(realm_id, [83u8; 32]).await;
@@ -2746,11 +2720,8 @@ mod tests {
                 .expect("mark read again"),
             0
         );
-        assert!(
-            timeout(Duration::from_millis(200), wakes.recv())
-                .await
-                .is_err(),
-            "no-op mark-read must not wake"
-        );
+        // The holder wakes before writing the ack, so the awaited reply orders
+        // this emptiness check after any wake the no-op mark-read could send.
+        assert!(wakes.is_empty(), "no-op mark-read must not wake");
     }
 }

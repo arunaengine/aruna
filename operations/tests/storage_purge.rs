@@ -18,24 +18,25 @@ use aruna_core::structs::{
     MultipartChecksumType, MultipartUpload, MultipartUploadStatus, PathRestriction, Permission,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, RoutingSnapshot,
     StoragePurgeCheckpoint, StoragePurgeScope, StoragePurgeSpec, VersionKey,
-    blob_bucket_permission_path,
+    bucket_permission_path,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, NodeId, UserId};
-use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::{
     ClaimOutcome, claim_job, complete_job, insert_job, put_purge_checkpoint, transition_to_running,
 };
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
-use aruna_operations::s3::complete_multipart_upload::{
+use aruna_operations::s3::complete_upload::{
     CompleteMultipartUploadError, CompleteMultipartUploadInput, CompleteMultipartUploadOperation,
 };
 use aruna_operations::s3::copy_object::{
     CopyObjectError, CopyObjectInput, CopySourceConditions, copy_object,
 };
+use aruna_operations::s3::copy_part::{UploadPartCopyError, UploadPartCopyInput, upload_part_copy};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::create_multipart_upload::{
+use aruna_operations::s3::create_upload::{
     CreateMultipartUploadError, CreateMultipartUploadInput, CreateMultipartUploadOperation,
 };
 use aruna_operations::s3::delete_object::{
@@ -49,9 +50,6 @@ use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::s3::upload_part::{UploadPartError, UploadPartInput, UploadPartOperation};
-use aruna_operations::s3::upload_part_copy::{
-    UploadPartCopyError, UploadPartCopyInput, upload_part_copy,
-};
 use aruna_storage::{StorageHandle, storage};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -90,8 +88,8 @@ async fn setup_context() -> TestContext {
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(node_id, RealmNodeKind::Server);
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(user_id, realm_id, group_id);
     let group = Group {
         display_name: "purge".to_string(),
         group_id,
@@ -195,7 +193,7 @@ fn put_operation(context: &TestContext, key: &str, bytes: &[u8]) -> PutObjectOpe
 }
 
 #[tokio::test]
-async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
+async fn scoped_fence_isolates() {
     let context = setup_context().await;
     let upload = seed_upload(
         &context.driver.storage_handle,
@@ -426,7 +424,7 @@ async fn purge_checks_objects() {
     .await;
     let mut auth_context = auth(&context);
     auth_context.path_restrictions = Some(vec![PathRestriction {
-        pattern: blob_bucket_permission_path(
+        pattern: bucket_permission_path(
             context.realm_id,
             context.group_id,
             context.node_id,
@@ -470,7 +468,7 @@ async fn purge_checks_objects() {
 }
 
 #[tokio::test]
-async fn purge_resumes_aborts_uploads_preserves_prefix_neighbors_and_deletes_bucket() {
+async fn purge_resumes_cleanly() {
     let context = setup_context().await;
     let target_old = Ulid::generate();
     let target_current = Ulid::generate();

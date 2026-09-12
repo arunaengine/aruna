@@ -147,10 +147,10 @@ pub fn verify_record(
 
 /// Serialize a request to bytes
 pub fn encode_request(req: &DhtRequest) -> Result<Vec<u8>, postcard::Error> {
-    encode_request_with_trace_context(req, None)
+    encode_traced_request(req, None)
 }
 
-pub fn encode_request_with_trace_context(
+pub fn encode_traced_request(
     req: &DhtRequest,
     trace_context: Option<DistributedTraceContext>,
 ) -> Result<Vec<u8>, postcard::Error> {
@@ -162,10 +162,10 @@ pub fn encode_request_with_trace_context(
 
 /// Deserialize a request from bytes
 pub fn decode_request(bytes: &[u8]) -> Result<DhtRequest, postcard::Error> {
-    decode_request_with_trace_context(bytes).map(|(_, request)| request)
+    decode_traced_request(bytes).map(|(_, request)| request)
 }
 
-pub fn decode_request_with_trace_context(
+pub fn decode_traced_request(
     bytes: &[u8],
 ) -> Result<(Option<DistributedTraceContext>, DhtRequest), postcard::Error> {
     decode_exact::<DhtRequestEnvelope>(bytes)
@@ -250,24 +250,24 @@ mod tests {
     }
 
     #[test]
-    fn test_request_roundtrip_with_trace_context() {
+    fn request_trace_roundtrip() {
         let trace_context = DistributedTraceContext::new(
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
             Some("congo=t61rcWkgMzE".to_string()),
         );
         let req = DhtRequest::Ping;
 
-        let bytes = encode_request_with_trace_context(&req, Some(trace_context.clone()))
-            .expect("encode request");
+        let bytes =
+            encode_traced_request(&req, Some(trace_context.clone())).expect("encode request");
         let (decoded_trace_context, decoded_request) =
-            decode_request_with_trace_context(&bytes).expect("decode request");
+            decode_traced_request(&bytes).expect("decode request");
 
         assert_eq!(decoded_trace_context, Some(trace_context));
         assert!(matches!(decoded_request, DhtRequest::Ping));
     }
 
     #[test]
-    fn test_get_value_request_roundtrip_with_realm_filter() {
+    fn get_filter_roundtrip() {
         let key = DhtKeyId::from_data(b"realm-filtered-get");
         let realm_id = RealmId::from_bytes([9u8; 32]);
 
@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn test_put_value_request_roundtrip_with_signature() {
+    fn put_signature_roundtrip() {
         let publisher_secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
         let publisher = publisher_secret.public();
 

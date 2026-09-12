@@ -1,9 +1,6 @@
-//! External reads answered from the family projection.
-//!
-//! An external job has no single owner: any node that reduced the family can
-//! answer for it, and the user-facing alias stays the stable handle. Reads of
-//! bytes one node produced still route to that node, but the responder is
-//! chosen from the projection rather than from the alias's origin.
+//! External reads answered from the family projection. An external job has no
+//! single owner: any node that reduced the family can answer, and the alias stays
+//! the stable handle. Byte reads still route to the node that produced them.
 
 use aruna_core::jobs::{JobKind, JobStatusView};
 use aruna_core::keyspaces::JOB_FAMILY_ALIAS_KEYSPACE;
@@ -12,8 +9,8 @@ use aruna_core::structs::{
     JobProgress, JobProjection, JobRecord, JobResultPayload, JobState, LogicalJobSpec,
     LogicalJobState, PhysicalExecutionState, ResultMessage, WorkspaceMode,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{NodeId, UserId};
-use aruna_core::util::unix_timestamp_millis;
 
 use std::time::Duration;
 

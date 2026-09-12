@@ -54,14 +54,13 @@ pub fn stamp_location(labels: &mut BTreeMap<String, String>, location: &str) {
 
 /// Storage key for a node's info document. One document per node, so the raw
 /// node id is unambiguous within the dedicated `NODE_INFO_KEYSPACE`.
-pub fn node_info_storage_key(node_id: NodeId) -> Vec<u8> {
+pub fn node_info_key(node_id: NodeId) -> Vec<u8> {
     node_id.as_bytes().to_vec()
 }
 
-/// Supersession tuple of one publisher's advertisement. `membership_generation`
-/// is the realm-membership state the publisher observed, so a node that rejoins
-/// under a newer membership is never shadowed by its own delayed older
-/// advertisement, whatever local counter that one carried.
+/// Supersession tuple of one publisher's advertisement. `membership_generation` is the realm-membership
+/// state the publisher observed, so a node that rejoins under a newer membership is never shadowed by
+/// its own delayed older advertisement, whatever local counter that one carried.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 pub struct AdvertisementEpoch {
     pub membership_generation: u64,

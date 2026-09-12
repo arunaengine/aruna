@@ -1,22 +1,22 @@
-use super::s3_server::S3OpLabel;
 use super::scope::resolve_scope;
-use super::util::{get_s3_operation_permission, is_anonymous_object_read_operation};
+use super::server::S3OpLabel;
+use super::util::{anonymous_read_allowed, operation_permission};
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, RealmId, S3Session, UserAccess,
-    blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
+    AuthContext, BucketInfo, Permission, RealmId, S3Session, UserAccess, bucket_permission_path,
+    group_permission_path, object_permission_path,
 };
 use aruna_core::{NodeId, UserId};
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::request_authorization::{AuthorizeError, authorize};
-use aruna_operations::request_policy::{
+use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
+use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
 };
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::s3::get_access::{GetUserAccessError, GetUserAccessOperation};
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::session::{
     GetS3SessionOperation, S3SessionError, TouchS3SessionConfig, TouchS3SessionOperation,
 };
@@ -82,9 +82,7 @@ impl S3Auth for AuthProvider {
             return Ok(SecretKey::from(secret));
         }
         let user_access = self.query_user_access(access_key_id).await?;
-        // Secrets are encrypted at rest with an issuer-local key, so only the issuing
-        // node can recover the plaintext s3s needs to verify a signature. A
-        // record copied to another node, or with a rebound field, never opens.
+        // Only the issuing node can decrypt this secret; copied or rebound records never open.
         if user_access.issued_by != *self.node_id.as_bytes() {
             return Err(s3_error!(
                 InvalidAccessKeyId,
@@ -111,7 +109,7 @@ impl S3Access for AuthProvider {
         }
 
         // Evaluate action from S3 operation name
-        let action = get_s3_operation_permission(&operation_name)
+        let action = operation_permission(&operation_name)
             .ok_or_else(|| s3_error!(InvalidRequest, "Unknown Operation"))?;
 
         // Unsigned requests are checked as the Everyone principal, but only for
@@ -144,9 +142,7 @@ impl S3Access for AuthProvider {
         lease.replace(permit);
         cx.extensions_mut().insert(lease);
 
-        // Credentials are issuer-local and encrypted at rest: s3s only had a secret
-        // to verify this signature because `get_secret_key` decrypted it on the
-        // issuing node. Confirm that node is still a member of this realm.
+        // Decryption proves this node issued the credential; it must still belong to the realm.
         if !self.issuer_in_realm(&user_access.issued_by).await? {
             return Err(s3_error!(
                 InvalidAccessKeyId,
@@ -173,14 +169,10 @@ impl S3Access for AuthProvider {
                 .map_err(map_offered_error)?;
         }
 
-        // The policy request context is built once: ordinary authorization uses a
-        // clone and the original is stashed so per-object and secondary-resource
-        // handlers evaluate against the real query and allowlisted headers.
+        // Reuse this request context for ordinary and per-object policy checks.
         let extras = request_extras(cx, &operation_name);
 
-        // DeleteObjects keys live in the body, so per-object RBAC/policy checks stay in
-        // the handler against one loaded policy set. Prior credential, issuer, expiry,
-        // revocation, and ownership checks keep anonymous/cross-group requests fail-closed.
+        // DeleteObjects checks its body keys in the handler after these credential checks.
         if cx.s3_op().name() != "DeleteObjects" {
             match authorize(
                 self.driver_ctx.as_ref(),
@@ -335,14 +327,10 @@ fn map_offered_error(error: OfferedDirectoryError) -> s3s::S3Error {
 }
 
 impl AuthProvider {
-    /// Anonymous access: object bytes only, addressed to a concrete object, and
-    /// allowed only when a public role — one assigned to the Everyone principal
-    /// — grants READ on the object permission path. The bucket's own group
-    /// scopes that path, so the authenticated flow's group-ownership check has
-    /// no analogue here.
+    /// Anonymous access permits only concrete object bytes granted to Everyone.
+    /// The bucket's group scopes the permission path.
     async fn check_anonymous(&self, cx: &mut S3AccessContext<'_>, action: Action) -> S3Result<()> {
-        if !matches!(action, Action::Read) || !is_anonymous_object_read_operation(cx.s3_op().name())
-        {
+        if !matches!(action, Action::Read) || !anonymous_read_allowed(cx.s3_op().name()) {
             return Err(s3_error!(
                 AccessDenied,
                 "Anonymous access is limited to object reads"
@@ -363,8 +351,7 @@ impl AuthProvider {
         };
         let group_id = bucket_info.group_id;
 
-        let path =
-            blob_object_permission_path(self.realm_id, group_id, self.node_id, &bucket, &key);
+        let path = object_permission_path(self.realm_id, group_id, self.node_id, &bucket, &key);
 
         let extras = request_extras(cx, cx.s3_op().name());
         authorize(
@@ -378,10 +365,8 @@ impl AuthProvider {
         .await
         .map_err(map_authorize_error)?;
 
-        // Handlers read UserAccess/BucketInfo from the request extensions;
-        // hand them the Everyone principal scoped to the bucket's group. The
-        // key/secret fields are blank — nothing downstream signs with them —
-        // and expiry is irrelevant because this access was just checked.
+        // Handlers receive an Everyone identity scoped to this bucket's group.
+        // Blank keys cannot sign downstream requests.
         cx.extensions_mut().insert(extras);
         cx.extensions_mut().insert(bucket_info);
         cx.extensions_mut().insert(UserAccess {
@@ -499,10 +484,7 @@ impl AuthProvider {
         }
     }
 
-    /// Whether `issued_by` is a node configured in this realm. Credentials are
-    /// issuer-local and encrypted with an issuer-local key, so a verified signature
-    /// already proves this serving node issued them; this only confirms the
-    /// issuing node is still a realm member.
+    /// Checks that the issuer proven by local decryption still belongs to this realm.
     async fn issuer_in_realm(&self, issued_by: &[u8; 32]) -> S3Result<bool> {
         let config = drive(
             GetRealmConfigOperation::new(self.realm_id),
@@ -551,7 +533,7 @@ impl AuthProvider {
             Some(bucket_info) => {
                 if bucket_info.group_id != user_access.group_id {
                     if !matches!(action, Action::Read)
-                        || !is_anonymous_object_read_operation(cx.s3_op().name())
+                        || !anonymous_read_allowed(cx.s3_op().name())
                         || key.is_none()
                     {
                         return Err(s3_error!(
@@ -575,14 +557,10 @@ impl AuthProvider {
 
         Ok((
             match key {
-                Some(key) => blob_object_permission_path(
-                    self.realm_id,
-                    group_id,
-                    self.node_id,
-                    &bucket,
-                    &key,
-                ),
-                None => blob_bucket_permission_path(self.realm_id, group_id, self.node_id, &bucket),
+                Some(key) => {
+                    object_permission_path(self.realm_id, group_id, self.node_id, &bucket, &key)
+                }
+                None => bucket_permission_path(self.realm_id, group_id, self.node_id, &bucket),
             },
             auth_context,
         ))
@@ -625,7 +603,7 @@ impl AuthProvider {
     }
 
     fn group_data_path(&self, group_id: ulid::Ulid) -> String {
-        blob_group_permission_path(self.realm_id, group_id, self.node_id)
+        group_permission_path(self.realm_id, group_id, self.node_id)
     }
 }
 
@@ -882,4 +860,18 @@ mod tests {
         };
         assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidAccessKeyId);
     }
+}
+#[test]
+fn subpath_operations_limited() {
+    for operation in [
+        "ListBuckets",
+        "HeadBucket",
+        "GetBucketLocation",
+        "ListObjects",
+        "ListObjectsV2",
+    ] {
+        assert!(is_listing_operation(operation));
+    }
+    assert!(!is_listing_operation("PutObject"));
+    assert!(!is_listing_operation("GetObject"));
 }

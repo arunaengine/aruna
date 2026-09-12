@@ -1,4 +1,4 @@
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
@@ -14,7 +14,7 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 pub use crate::connectors::repository::StorageReadError;
-use crate::connectors::repository::parse_storage_read;
+use crate::storage_read::parse_storage_read;
 
 pub const HARVEST_SCAN_PAGE_SIZE: usize = 128;
 
@@ -111,21 +111,6 @@ pub fn write_provenance_effect(
         value: record.to_bytes()?.into(),
         txn_id,
     }))
-}
-
-pub fn iter_provenance_effect(
-    group_id: GroupId,
-    namespace: &str,
-    start_after: Option<Key>,
-    txn_id: Option<TxnId>,
-) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: HARVEST_PROVENANCE_KEYSPACE.to_string(),
-        prefix: Some(provenance_prefix(group_id, namespace)),
-        start: start_after.map(IterStart::After),
-        limit: HARVEST_SCAN_PAGE_SIZE,
-        txn_id,
-    })
 }
 
 pub fn parse_connector_read(event: Event) -> Result<Option<RepositoryConnector>, StorageReadError> {

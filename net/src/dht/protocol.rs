@@ -317,3 +317,71 @@ impl From<postcard::Error> for DhtIoError {
         Self::invalid_response(error)
     }
 }
+
+pub(crate) fn dht_input_kind(input: &DhtInput) -> &'static str {
+    match input {
+        DhtInput::Cmd(cmd) => dht_cmd_kind(cmd),
+        DhtInput::Io(io) => dht_io_kind(io),
+        DhtInput::Clock { .. } => "clock",
+        DhtInput::Tick { .. } => "tick",
+    }
+}
+
+pub(crate) fn dht_cmd_kind(cmd: &DhtCmd) -> &'static str {
+    match cmd {
+        DhtCmd::Put { .. } => "put",
+        DhtCmd::Get { .. } => "get",
+        DhtCmd::Cancel { .. } => "cancel",
+        DhtCmd::Bootstrap { .. } => "bootstrap",
+        DhtCmd::RoutingTableSize { .. } => "routing_table_size",
+        DhtCmd::AddPeer { .. } => "add_peer",
+    }
+}
+
+pub(crate) fn dht_io_kind(io: &DhtIo) -> &'static str {
+    match io {
+        DhtIo::RpcResponse { .. } => "rpc_response",
+        DhtIo::RpcError { .. } => "rpc_error",
+        DhtIo::InboundRequest { .. } => "inbound_request",
+        DhtIo::InboundReadError { .. } => "inbound_read_error",
+        DhtIo::InboundDropped { .. } => "inbound_dropped",
+        DhtIo::StorageReadResult { .. } => "storage_read_result",
+        DhtIo::StorageRevisionResult { .. } => "storage_revision_result",
+        DhtIo::StorageWriteResult { .. } => "storage_write_result",
+        DhtIo::StorageIterResult { .. } => "storage_iter_result",
+        DhtIo::StorageError { .. } => "storage_error",
+        DhtIo::PeerSeen { .. } => "peer_seen",
+    }
+}
+
+pub(crate) fn io_op_id(io: &DhtIo) -> Option<OpId> {
+    match io {
+        DhtIo::RpcResponse { op_id, .. }
+        | DhtIo::RpcError { op_id, .. }
+        | DhtIo::StorageReadResult { op_id, .. }
+        | DhtIo::StorageRevisionResult { op_id, .. }
+        | DhtIo::StorageWriteResult { op_id, .. }
+        | DhtIo::StorageIterResult { op_id, .. }
+        | DhtIo::StorageError { op_id, .. } => Some(*op_id),
+        DhtIo::InboundRequest { .. }
+        | DhtIo::InboundReadError { .. }
+        | DhtIo::InboundDropped { .. }
+        | DhtIo::PeerSeen { .. } => None,
+    }
+}
+
+pub(crate) fn io_inbound_id(io: &DhtIo) -> Option<InboundId> {
+    match io {
+        DhtIo::InboundRequest { inbound_id, .. }
+        | DhtIo::InboundReadError { inbound_id, .. }
+        | DhtIo::InboundDropped { inbound_id } => Some(*inbound_id),
+        DhtIo::RpcResponse { .. }
+        | DhtIo::RpcError { .. }
+        | DhtIo::StorageReadResult { .. }
+        | DhtIo::StorageRevisionResult { .. }
+        | DhtIo::StorageWriteResult { .. }
+        | DhtIo::StorageIterResult { .. }
+        | DhtIo::StorageError { .. }
+        | DhtIo::PeerSeen { .. } => None,
+    }
+}

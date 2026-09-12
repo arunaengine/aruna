@@ -20,10 +20,10 @@ use crate::jobs::lifecycle::reservation::{
 use crate::jobs::lifecycle::stage::read_targets;
 use crate::jobs::lifecycle::target::{already_running, existing_receipt, pin_matches};
 use crate::jobs::lifecycle::updates::chain_for;
-use crate::jobs::records::tests::fixture::{Family, REALM, context, node};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::iter_prefix_page;
 use crate::replication::protocol::BaoReadTarget;
+use crate::tests::fixtures::records::{Family, REALM, context, node};
 
 fn envelope(max_concurrent: u32) -> ResourceEnvelope {
     ResourceEnvelope {
@@ -334,9 +334,8 @@ fn declines_after_failure() {
 
 #[test]
 fn accepts_copy_pin() {
-    // A registered copy on any node may be the pinned source, but the captured
-    // version, hash and size still bind the bytes, and a pin naming this target
-    // itself is never a remote read.
+    // Any node's registered copy may be the pinned source, but captured version,
+    // hash and size bind the bytes; a pin naming this target is never remote.
     let family = Family::new([3u8; 32]);
     let ingress = family.holder.public();
     let local = family.target.public();

@@ -572,9 +572,8 @@ pub fn evaluate_placement(
             }
         }
     }
-    // Every outcome below blocks the operation; the order only decides which
-    // reason is reported, and an incomplete evaluation must not be sold as a
-    // definitive denial.
+    // Every outcome below blocks the operation; the order only decides which reason is reported, and an
+    // incomplete evaluation must not be sold as a definitive denial.
     if !invalid.is_empty() {
         return PlacementDecision::Invalid {
             policy_ids: invalid,

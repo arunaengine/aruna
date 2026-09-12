@@ -31,11 +31,11 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
-use crate::group_backends::{RecordReadError, parse_read};
-use crate::group_routing::{GroupRoutingInputsError, GroupRoutingInputsOperation};
+use crate::groups::backends::{RecordReadError, parse_read};
+use crate::groups::storage_routing::{GroupRoutingInputsError, GroupRoutingInputsOperation};
 use crate::metadata::MetadataHandle;
-use crate::placement_policy::GateContext;
-use crate::task_persistence::persist_task_effect;
+use crate::placement::policy::GateContext;
+use crate::tasks::task_persistence::persist_task_effect;
 use aruna_core::events::NetError;
 use aruna_core::metadata::{MetadataError, MetadataEvent};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -119,12 +119,9 @@ pub fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-/// The destination this node evaluates governed writes and serves against.
-/// `None` means it has never advertised a subject, which fails every governed
-/// operation closed; an ungoverned one never consults it.
-///
-/// A node whose inventory is being revalidated reports `admitting: false`, so
-/// `write_gate` stops its governed writes while ungoverned ones keep working.
+/// The destination this node evaluates governed writes and serves against. `None`
+/// means no subject was ever advertised, failing governed operations closed; a node
+/// revalidating inventory reports `admitting: false` to stop governed writes.
 pub async fn gate_context(
     context: &DriverContext,
     realm_id: RealmId,
@@ -334,14 +331,14 @@ async fn dispatch_effect_until(
             }
         }
         Effect::StagingSource(staging_source_effect) => {
-            if crate::native_reference::is_native_effect(&staging_source_effect) {
-                Box::pin(crate::native_reference::send_native_effect(
+            if crate::staging::native_source::is_native_effect(&staging_source_effect) {
+                Box::pin(crate::staging::native_source::send_native_effect(
                     staging_source_effect,
                     context,
                 ))
                 .await
             } else if let Some(blob_handle) = &context.blob_handle {
-                Box::pin(blob_handle.send_staging_source_effect(staging_source_effect)).await
+                Box::pin(blob_handle.send_staging_effect(staging_source_effect)).await
             } else {
                 Event::StagingSource(aruna_core::events::StagingSourceEvent::Error {
                     error: aruna_core::errors::StagingSourceError::HandleMissing,
@@ -378,7 +375,7 @@ async fn dispatch_effect_until(
                     ) => {
                         match tokio::time::timeout(
                             REALM_PEER_REFRESH_TIMEOUT,
-                            net_handle.refresh_realm_peers_from_bytes(&bytes),
+                            net_handle.refresh_encoded_peers(&bytes),
                         )
                         .await
                         {
@@ -435,11 +432,11 @@ async fn dispatch_effect_until(
         // Policy fetch resolves its holders in the operation and runs only the
         // holder round-trips here.
         Effect::Net(NetEffect::PolicyFetch(fetch)) => Event::Net(NetEvent::PolicyFetch(
-            Box::pin(crate::placement_policy::fetch_policy(context, *fetch)).await,
+            Box::pin(crate::placement::policy::fetch_policy(context, *fetch)).await,
         )),
         // Publication signing needs this node's key, which only the handle holds.
         Effect::Net(NetEffect::PolicySign(claim)) => Event::Net(NetEvent::PolicySign(
-            crate::placement_policy::sign_publication(context, *claim),
+            crate::placement::policy::sign_publication(context, *claim),
         )),
         // Job-record replication and launch offers resolve their holders in the
         // operation and run only the holder round-trips here.
@@ -1071,9 +1068,7 @@ pub async fn drive_until<O: Operation>(
                 expired = true;
                 cleanup_deadline = Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
                 queue.clear();
-                // A committed transaction must not be rolled back, so its abort
-                // effects stay suppressed; backend reservations are released by
-                // dropping `holds`, never by this path.
+                // Suppress aborts after commit. Dropping `holds` releases backend reservations.
                 if !committed || operation.abort_after_commit() {
                     queue.extend(operation.abort().into_iter().filter(|effect| {
                         !matches!(
@@ -1171,9 +1166,8 @@ pub async fn drive_until<O: Operation>(
         }
     }
     if !operation.is_complete() {
-        // finalize() is only defined on a terminal operation, so the deadline
-        // path takes its abort here. The cleanup window is over, so the effects
-        // are dropped and the tracker below owns any transaction they name.
+        // Nonterminal operations cannot finalize. Drop late cleanup effects and let the
+        // tracker resolve any transaction they name.
         let _ = operation.abort();
     }
     abort_leaked_transaction(
@@ -2947,7 +2941,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_driver_preserves_effect_order_fifo() {
+    async fn driver_preserves_fifo() {
         let random_path = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
@@ -3020,7 +3014,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_driver_dispatches_staging_source_effect_via_blob_handle() {
+    async fn driver_dispatches_staging() {
         let temp_dir = tempdir().unwrap();
         let temp_root = temp_dir.path().to_str().unwrap().to_string();
         let blob_root = format!("{temp_root}/blobstore");
@@ -3107,7 +3101,7 @@ mod test {
     }
 
     #[test]
-    fn test_suboperation_depth_limit_is_enforced() {
+    fn suboperation_depth_enforced() {
         // Driving to the depth limit nests deep futures; the default test
         // thread stack overflows, so the drive runs on a dedicated big stack.
         std::thread::Builder::new()
@@ -3150,7 +3144,7 @@ mod test {
 #[cfg(test)]
 mod routing_tests {
     use super::{DriverContext, bucket_snapshot, routing_snapshot};
-    use crate::staging::test_utils::setup_driver_context;
+    use crate::tests::fixtures::staging::setup_driver_context;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::GROUP_STORAGE_ROUTING_KEYSPACE;
@@ -3191,7 +3185,7 @@ mod routing_tests {
             disabled: false,
             cleanup: aruna_core::structs::CleanupStrategy::Retain,
         };
-        for (key_space, key, value) in crate::group_backends::record_writes(&record).unwrap() {
+        for (key_space, key, value) in crate::groups::backends::record_writes(&record).unwrap() {
             write(context, &key_space, key.to_vec(), value.to_vec()).await;
         }
         record.backend_id

@@ -92,6 +92,9 @@ impl Operation for PutBucketCorsOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.fail(error.clone().into());
+        }
         match self.state {
             PutBucketCorsState::Init => self.start(),
             PutBucketCorsState::StartTransaction => {
@@ -270,6 +273,9 @@ impl Operation for GetBucketCorsOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.fail(error.clone().into());
+        }
         match self.state {
             GetBucketCorsState::Init => self.start(),
             GetBucketCorsState::ReadBucket => {
@@ -401,6 +407,9 @@ impl Operation for DeleteBucketCorsOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.fail(error.clone().into());
+        }
         match self.state {
             DeleteBucketCorsState::Init => self.start(),
             DeleteBucketCorsState::StartTransaction => {
@@ -610,7 +619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn roundtrips_bucket_cors_configuration() {
+    async fn configuration_roundtrips() {
         let context = make_context();
         let bucket = "my-bucket";
         let original = bucket_info(None);
@@ -667,7 +676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_missing_bucket_and_missing_config() {
+    async fn missing_config_rejected() {
         let bucket = "missing-bucket".to_string();
 
         let context = make_context();

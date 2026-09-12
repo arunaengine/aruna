@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::{
     Backend, BackendBucket, BackendLocation, BackendRef, BlobCleanupWork, HIDDEN_BLOB_PREFIX,
-    HiddenBlobKey, MULTIPART_PART_PREFIX, ensure_confined_relative_path,
+    HiddenBlobKey, MULTIPART_PART_PREFIX, ensure_confined_path,
 };
 use aruna_core::types::TxnId;
 use aruna_storage::storage::TransactionOwner;
@@ -20,6 +20,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use ulid::Ulid;
+
+impl From<BlobError> for BlobLibError {
+    fn from(error: BlobError) -> Self {
+        BlobLibError::IoError(std::io::Error::other(error.to_string()))
+    }
+}
 
 const BUCKET_STATS_RETRIES: u32 = 32;
 const BUCKET_STATS_BACKOFF: Duration = Duration::from_millis(1);
@@ -97,7 +103,7 @@ pub(super) fn intent_value(location: &BackendLocation) -> Result<ByteView, BlobE
 }
 
 impl BlobHandler {
-    pub(super) async fn ensure_multipart_bucket(&self) -> Result<(), BlobLibError> {
+    pub(super) async fn ensure_multipart_bucket(&self) -> Result<(), BlobError> {
         for (_, backend) in self.registry.entries() {
             if backend.config.backend_type != Backend::S3 {
                 continue;
@@ -105,9 +111,7 @@ impl BlobHandler {
             let Some(bucket) = backend.config.multipart_bucket.as_deref() else {
                 continue;
             };
-            make_bucket(bucket, &backend.config.service_config)
-                .await
-                .map_err(|err| BlobLibError::IoError(std::io::Error::other(err.to_string())))?;
+            make_bucket(bucket, &backend.config.service_config).await?;
         }
         Ok(())
     }
@@ -1184,7 +1188,7 @@ impl BlobHandler {
         let prefix = stats_prefix(backend, config.bucket_prefix.as_deref());
         let start = start_after.map(|bucket| IterStart::After(stats_key(backend, bucket).into()));
         let event = tokio::time::timeout(
-            self.control_plane_io_timeout(),
+            self.io_timeout(),
             self.storage
                 .send_effect(Effect::Storage(StorageEffect::Iter {
                     key_space: BUCKET_STATS_DB.to_string(),
@@ -1249,7 +1253,7 @@ pub(super) fn build_backend_path(
     ulid: Ulid,
 ) -> Result<String, ConversionError> {
     let path = PathBuf::from(bucket).join(format!("{}_{}", key, ulid));
-    ensure_confined_relative_path(&path)?;
+    ensure_confined_path(&path)?;
     let first = path.components().find_map(|component| match component {
         std::path::Component::Normal(part) => part.to_str(),
         _ => None,
@@ -1277,13 +1281,13 @@ pub(super) fn build_hidden_path(
     let path = PathBuf::from(HIDDEN_BLOB_PREFIX)
         .join(namespace.to_string())
         .join(format!("{name}_{ulid}"));
-    ensure_confined_relative_path(&path)?;
+    ensure_confined_path(&path)?;
     path.into_os_string()
         .into_string()
         .map_err(|_| ConversionError::OsStringError)
 }
 
-pub(super) fn build_multipart_part_path(upload_id: Ulid, part_number: u16, ulid: Ulid) -> String {
+pub(super) fn build_part_path(upload_id: Ulid, part_number: u16, ulid: Ulid) -> String {
     PathBuf::from(MULTIPART_PART_PREFIX)
         .join(upload_id.to_string())
         .join(format!("{:05}_{}", part_number, ulid))
@@ -1307,7 +1311,7 @@ pub(super) fn rebuild_backend_path(
         .map_or(file_name, |(base, _)| base);
 
     let path = parent.join(format!("{}_{}", base_name, ulid));
-    ensure_confined_relative_path(&path)?;
+    ensure_confined_path(&path)?;
     path.into_os_string()
         .into_string()
         .map_err(|_| ConversionError::OsStringError)

@@ -3,17 +3,16 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::{
     RealmConfigDocument, RealmId, WATCH_INTEREST_DIRTY_PREFIX, WatchEventKind, WatchEventMask,
-    WatchInterestDigest, WatchInterestEntry, WatchInterestTable, watch_interest_dirty_key,
-    watch_interest_dirty_realm_id, watch_interest_key_node_id, watch_interest_key_realm_id,
-    watch_interest_node_key, watch_interest_node_prefix, watch_interest_pending_key,
-    watch_interest_realm_prefix,
+    WatchInterestDigest, WatchInterestEntry, WatchInterestTable, dirty_interest_realm,
+    interest_dirty_key, interest_node_id, interest_node_key, interest_node_prefix,
+    interest_pending_key, interest_realm_id, interest_realm_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace, Value};
@@ -24,33 +23,33 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::get_realm_config::GetRealmConfigOperation;
 use crate::notifications::protocol::{
     NOTIFICATION_WATCH_DIRTY_REALM_CAP, NOTIFICATION_WATCH_INTEREST_BYTES_CAP,
     NOTIFICATION_WATCH_INTEREST_ENTRY_CAP,
 };
-use crate::notifications::watch::authorization::filter_authorized_watch_subscriptions;
+use crate::notifications::watch::authorization::filter_authorized_subscriptions;
 use crate::notifications::watch::expand::drain_watch_events;
 use crate::notifications::watch::subscriptions::{
-    WatchSubscriptionError, list_realm_watch_subscriptions,
+    WatchSubscriptionError, list_realm_subscriptions,
 };
-use crate::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
+use crate::realm::get_config::GetRealmConfigOperation;
+use crate::storage_read::scan_all;
+use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
-/// Debounce window for the coalesced watch-interest publisher. `ShortenTimer`
-/// makes the timer fire this long after the *first* dirty write of a burst and
-/// keeps every later write inside the same window, so a run of watch CRUD
-/// collapses into one publish with bounded latency.
+/// Debounce window for the coalesced watch-interest publisher: `ShortenTimer`
+/// fires this long after the first dirty write, collapsing a run of watch CRUD
+/// into one publish with bounded latency.
 pub const WATCH_INTEREST_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Ensures this node has a document to announce when joining the shared
 /// realm-scoped watch-interest topic. Existing digests may contain live watches
 /// and are therefore never overwritten. Returns whether one was created.
-pub async fn ensure_local_watch_interest_digest(
+pub async fn ensure_interest_digest(
     storage: &StorageHandle,
     realm_id: RealmId,
     node_id: NodeId,
 ) -> Result<bool, String> {
-    let key = Key::from(watch_interest_node_key(realm_id, node_id));
+    let key = Key::from(interest_node_key(realm_id, node_id));
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
@@ -89,23 +88,21 @@ pub async fn ensure_local_watch_interest_digest(
 }
 
 /// Schedules (or shortens toward) the debounced watch-interest publish task.
-pub fn schedule_watch_interest_publish_effect() -> Effect {
+pub fn schedule_publish_effect() -> Effect {
     Effect::Task(TaskEffect::ShortenTimer {
         key: TaskKey::PublishWatchInterest,
         after: WATCH_INTEREST_PUBLISH_DEBOUNCE,
     })
 }
 
-/// Dirty marker written, in the same transaction as a subscription row
-/// write/delete, so the debounced publisher knows which realm's digest to
-/// rebuild. The value is a fresh generation id: the publisher only clears a
-/// marker whose stored generation still matches the one it observed, so a CRUD
-/// that re-dirties a realm mid-publish keeps its retry signal.
-pub fn watch_interest_dirty_marker_write(realm_id: RealmId) -> (KeySpace, Key, Value) {
+/// Dirty marker written in the same transaction as a subscription row change,
+/// so the debounced publisher knows which realm's digest to rebuild. The value
+/// is a generation id; a marker is only cleared if its generation still matches.
+pub fn dirty_marker_write(realm_id: RealmId) -> (KeySpace, Key, Value) {
     let generation = ByteView::from(Ulid::generate().to_bytes().to_vec());
     (
         NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-        ByteView::from(watch_interest_dirty_key(realm_id)),
+        ByteView::from(interest_dirty_key(realm_id)),
         generation,
     )
 }
@@ -113,24 +110,20 @@ pub fn watch_interest_dirty_marker_write(realm_id: RealmId) -> (KeySpace, Key, V
 /// Sends the debounced publish schedule from a CRUD call site. Best-effort: when
 /// no task handle is wired the durable marker survives and the periodic re-arm
 /// loop picks it up.
-pub async fn schedule_watch_interest_publish(context: &DriverContext) {
+pub async fn schedule_interest_publish(context: &DriverContext) {
     let Some(task_handle) = context.task_handle.as_ref() else {
         return;
     };
-    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle
-        .send_effect(schedule_watch_interest_publish_effect())
-        .await
+    if let Event::Task(TaskEvent::Error { message, .. }) =
+        task_handle.send_effect(schedule_publish_effect()).await
     {
         warn!(message = %message, "Failed to schedule watch interest publish");
     }
 }
 
 /// Durably requests a digest rebuild after a stale subscription is observed.
-pub async fn mark_watch_interest_dirty(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Result<(), String> {
-    let (key_space, key, value) = watch_interest_dirty_marker_write(realm_id);
+pub async fn mark_interest_dirty(context: &DriverContext, realm_id: RealmId) -> Result<(), String> {
+    let (key_space, key, value) = dirty_marker_write(realm_id);
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
@@ -142,7 +135,7 @@ pub async fn mark_watch_interest_dirty(
         .await
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => {
-            schedule_watch_interest_publish(context).await;
+            schedule_interest_publish(context).await;
             Ok(())
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
@@ -152,52 +145,19 @@ pub async fn mark_watch_interest_dirty(
     }
 }
 
-/// Rebuilds this node's watch-interest digest for every realm with a pending
-/// dirty marker and distributes it over the sync layer. The digest is the union
-/// of the path prefixes covered by every subscription the node holds for that
-/// realm; an empty digest (the last watch was deleted) is still published so
-/// peers drop the node's stale interest.
-///
-/// The dirty markers are only cleared after replication has durably accepted the
-/// digests, and only for markers whose generation was not bumped by a concurrent
-/// CRUD, so a failed publish or a racing write always leaves a retry signal
-/// behind. Returns whether any digest was published.
+/// Rebuilds each dirty realm's digest (union of subscribed path prefixes) and syncs
+/// it, publishing empties so stale interest drops. Markers clear only after replication
+/// accepts with the generation unchanged, so failures and racing writes still retry.
 pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Result<bool, String> {
     let storage = &ctx.storage_handle;
-
-    let (marker_values, scan_more) = match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-            prefix: Some(Key::from(WATCH_INTEREST_DIRTY_PREFIX.to_vec())),
-            start: None,
-            limit: NOTIFICATION_WATCH_DIRTY_REALM_CAP.saturating_add(1),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => (values, next_start_after.is_some()),
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => {
-            return Err(format!(
-                "watch interest dirty marker scan failed: {other:?}"
-            ));
-        }
-    };
-    let more_markers = scan_more || marker_values.len() > NOTIFICATION_WATCH_DIRTY_REALM_CAP;
-    let observed_markers = marker_values
-        .into_iter()
-        .take(NOTIFICATION_WATCH_DIRTY_REALM_CAP)
-        .collect::<Vec<_>>();
+    let (observed_markers, more_markers) = read_dirty_markers(storage).await?;
     if observed_markers.is_empty() {
         return Ok(false);
     }
 
     let mut realms: BTreeSet<RealmId> = BTreeSet::new();
     for (key, _) in &observed_markers {
-        if let Some(realm_id) = watch_interest_dirty_realm_id(key.as_ref()) {
+        if let Some(realm_id) = dirty_interest_realm(key.as_ref()) {
             realms.insert(realm_id);
         }
     }
@@ -205,7 +165,7 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
         // Markers are malformed; drop them so they cannot loop forever.
         clear_consumed_markers(storage, observed_markers).await?;
         if more_markers {
-            schedule_watch_interest_publish(ctx).await;
+            schedule_interest_publish(ctx).await;
         }
         return Ok(false);
     }
@@ -225,8 +185,8 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
         if check_failed {
             authorization_retries.push(*realm_id);
         }
-        let digest_key = Key::from(watch_interest_node_key(*realm_id, node_id));
-        let pending_key = Key::from(watch_interest_pending_key(*realm_id));
+        let digest_key = Key::from(interest_node_key(*realm_id, node_id));
+        let pending_key = Key::from(interest_pending_key(*realm_id));
         let digest_value = Value::from(digest.to_bytes().map_err(|e| e.to_string())?);
         let current = match storage
             .send_storage_effect(StorageEffect::BatchRead {
@@ -300,7 +260,7 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
         match storage
             .send_storage_effect(StorageEffect::Delete {
                 key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-                key: Key::from(watch_interest_pending_key(realm_id)),
+                key: Key::from(interest_pending_key(realm_id)),
                 txn_id: None,
             })
             .await
@@ -318,17 +278,49 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
     // Preserve a retry generation when a permission lookup failed. The current
     // fail-closed digest still retracts stale positive interest immediately.
     for realm_id in authorization_retries {
-        mark_watch_interest_dirty(ctx, realm_id).await?;
+        mark_interest_dirty(ctx, realm_id).await?;
     }
 
     // Replication accepted the digests; only now consume the markers, and only
     // those a concurrent CRUD did not re-dirty in the meantime.
     clear_consumed_markers(storage, observed_markers).await?;
     if more_markers {
-        schedule_watch_interest_publish(ctx).await;
+        schedule_interest_publish(ctx).await;
     }
 
     Ok(published)
+}
+
+async fn read_dirty_markers(storage: &StorageHandle) -> Result<(Vec<(Key, Value)>, bool), String> {
+    let (values, scan_more) = match storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            prefix: Some(Key::from(WATCH_INTEREST_DIRTY_PREFIX.to_vec())),
+            start: None,
+            limit: NOTIFICATION_WATCH_DIRTY_REALM_CAP.saturating_add(1),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => (values, next_start_after.is_some()),
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+        other => {
+            return Err(format!(
+                "watch interest dirty marker scan failed: {other:?}"
+            ));
+        }
+    };
+    let more = scan_more || values.len() > NOTIFICATION_WATCH_DIRTY_REALM_CAP;
+    Ok((
+        values
+            .into_iter()
+            .take(NOTIFICATION_WATCH_DIRTY_REALM_CAP)
+            .collect(),
+        more,
+    ))
 }
 
 /// Builds one bounded digest from subscriptions still held and authorized here.
@@ -339,7 +331,7 @@ async fn build_realm_digest(
     realm_id: RealmId,
     realm_config: &RealmConfigDocument,
 ) -> Result<(WatchInterestDigest, bool), String> {
-    let subscriptions = match list_realm_watch_subscriptions(&ctx.storage_handle, realm_id).await {
+    let subscriptions = match list_realm_subscriptions(&ctx.storage_handle, realm_id).await {
         Ok(subscriptions) => subscriptions,
         Err(WatchSubscriptionError::Storage(error))
             if error.contains("subscription scan cap reached") =>
@@ -349,7 +341,7 @@ async fn build_realm_digest(
         Err(error) => return Err(error.to_string()),
     };
     let filtered =
-        filter_authorized_watch_subscriptions(ctx, realm_id, realm_config, node_id, subscriptions)
+        filter_authorized_subscriptions(ctx, realm_id, realm_config, node_id, subscriptions)
             .await?;
     let digest = WatchInterestDigest::from_subscriptions(
         node_id,
@@ -408,11 +400,9 @@ async fn write_documents(
     }
 }
 
-/// Deletes each observed dirty marker, but only if its stored generation still
-/// matches the one seen when the publish run started. Re-reading the markers
-/// inside the write transaction makes fjall abort the commit if a concurrent
-/// CRUD re-dirtied any of them after they were observed, so a racing write never
-/// loses its retry signal.
+/// Deletes each observed dirty marker only if its stored generation still matches
+/// the one seen when the publish run started. Re-reading inside the write
+/// transaction makes a concurrent re-dirty abort the commit, preserving retries.
 async fn clear_consumed_markers(
     storage: &StorageHandle,
     observed: Vec<(Key, Value)>,
@@ -503,10 +493,7 @@ async fn clear_consumed_markers(
 }
 
 /// Re-arms the debounced publish task when dirty markers survived a restart.
-pub async fn restore_watch_interest_publish_timer(
-    storage: &StorageHandle,
-    task_handle: &TaskHandle,
-) {
+pub async fn restore_publish_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     let has_markers = match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
@@ -528,9 +515,8 @@ pub async fn restore_watch_interest_publish_timer(
         }
     };
     if has_markers
-        && let Event::Task(TaskEvent::Error { message, .. }) = task_handle
-            .send_effect(schedule_watch_interest_publish_effect())
-            .await
+        && let Event::Task(TaskEvent::Error { message, .. }) =
+            task_handle.send_effect(schedule_publish_effect()).await
     {
         warn!(message = %message, "Failed to restore watch interest publish timer");
     }
@@ -539,13 +525,13 @@ pub async fn restore_watch_interest_publish_timer(
 /// Rebuilds the full in-memory watch-interest table from the replicated digests
 /// in local storage. Digests whose embedded node id disagrees with their key are
 /// skipped defensively, and empty digests contribute nothing.
-pub async fn rebuild_watch_interest_table(storage: &StorageHandle) -> WatchInterestTable {
+pub async fn rebuild_interest_table(storage: &StorageHandle) -> WatchInterestTable {
     let mut table = WatchInterestTable::default();
     let mut eligible_by_realm: HashMap<RealmId, Option<HashSet<NodeId>>> = HashMap::new();
-    let entries = match iter_all(
+    let entries = match scan_all(
         storage,
         NOTIFICATION_WATCH_INTEREST_KEYSPACE,
-        Some(Key::from(watch_interest_node_prefix())),
+        Some(Key::from(interest_node_prefix())),
     )
     .await
     {
@@ -556,10 +542,10 @@ pub async fn rebuild_watch_interest_table(storage: &StorageHandle) -> WatchInter
         }
     };
     for (key, value) in entries {
-        let Some(realm_id) = watch_interest_key_realm_id(key.as_ref()) else {
+        let Some(realm_id) = interest_realm_id(key.as_ref()) else {
             continue;
         };
-        let key_node_id = watch_interest_key_node_id(key.as_ref());
+        let key_node_id = interest_node_id(key.as_ref());
         let digest = match WatchInterestDigest::from_bytes(value.as_ref()) {
             Ok(digest) => digest,
             Err(error) => {
@@ -595,15 +581,9 @@ pub async fn rebuild_watch_interest_table(storage: &StorageHandle) -> WatchInter
 }
 
 /// Refreshes the in-memory watch-interest cache for realms whose interest or
-/// membership changed, and schedules local digest rebuilds when replicated
-/// subscriptions or placement membership changed. Mirrors
-/// `refresh_realm_usage_summary_for_targets`: shared by every reconcile handler
-/// (inbound apply, durable outbox drain, and the `SyncDocument` timer) so a
-/// digest that lands on any of those paths updates the origin-side table.
-pub async fn refresh_watch_interest_for_targets(
-    ctx: &DriverContext,
-    targets: &[DocumentSyncTarget],
-) {
+/// membership changed and schedules rebuilds when replicated subscriptions or
+/// placement changed; shared by every reconcile handler.
+pub async fn refresh_target_interest(ctx: &DriverContext, targets: &[DocumentSyncTarget]) {
     let Some(net_handle) = ctx.net_handle.as_ref() else {
         return;
     };
@@ -631,7 +611,7 @@ pub async fn refresh_watch_interest_for_targets(
         }
     }
     for realm_id in dirty_realms {
-        if let Err(error) = mark_watch_interest_dirty(ctx, realm_id).await {
+        if let Err(error) = mark_interest_dirty(ctx, realm_id).await {
             warn!(%realm_id, %error, "Failed to schedule watch interest rebuild after document reconciliation");
         }
     }
@@ -639,12 +619,12 @@ pub async fn refresh_watch_interest_for_targets(
         return;
     }
     for realm_id in realms {
-        match build_realm_node_map(&ctx.storage_handle, realm_id).await {
-            Ok(nodes) => net_handle.update_watch_interest_realm(realm_id, nodes),
+        match build_node_map(&ctx.storage_handle, realm_id).await {
+            Ok(nodes) => net_handle.update_realm_interest(realm_id, nodes),
             Err(error) => {
                 // Membership is a security boundary. Fail closed instead of
                 // retaining a previously cached removed node.
-                net_handle.update_watch_interest_realm(realm_id, HashMap::new());
+                net_handle.update_realm_interest(realm_id, HashMap::new());
                 warn!(%realm_id, error = %error, "Cleared watch interest after failed realm refresh")
             }
         }
@@ -653,20 +633,20 @@ pub async fn refresh_watch_interest_for_targets(
 
 /// Builds one realm's node -> entries map from the digests in the realm's scan
 /// range, dropping mismatched and empty digests.
-async fn build_realm_node_map(
+async fn build_node_map(
     storage: &StorageHandle,
     realm_id: RealmId,
 ) -> Result<HashMap<NodeId, Vec<WatchInterestEntry>>, String> {
     let eligible = sync_eligible_nodes(storage, realm_id).await?;
-    let entries = iter_all(
+    let entries = scan_all(
         storage,
         NOTIFICATION_WATCH_INTEREST_KEYSPACE,
-        Some(Key::from(watch_interest_realm_prefix(realm_id))),
+        Some(Key::from(interest_realm_prefix(realm_id))),
     )
     .await?;
     let mut nodes: HashMap<NodeId, Vec<WatchInterestEntry>> = HashMap::new();
     for (key, value) in entries {
-        let key_node_id = watch_interest_key_node_id(key.as_ref());
+        let key_node_id = interest_node_id(key.as_ref());
         let digest = match WatchInterestDigest::from_bytes(value.as_ref()) {
             Ok(digest) => digest,
             Err(error) => {
@@ -708,44 +688,9 @@ async fn sync_eligible_nodes(
     };
     RealmConfigDocument::from_bytes(value.as_ref())
         .map_err(|error| error.to_string())?
-        .sync_eligible_node_ids()
+        .sync_eligible_nodes()
         .map(|nodes| nodes.into_iter().collect())
         .map_err(|error| error.to_string())
-}
-
-async fn iter_all(
-    storage: &StorageHandle,
-    key_space: &str,
-    prefix: Option<Key>,
-) -> Result<Vec<(Key, Value)>, String> {
-    let mut collected = Vec::new();
-    let mut start = None;
-    loop {
-        match storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: key_space.to_string(),
-                prefix: prefix.clone(),
-                start: start.map(IterStart::After),
-                limit: 1_000,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => {
-                collected.extend(values);
-                match next_start_after {
-                    Some(next) => start = Some(next),
-                    None => break,
-                }
-            }
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected iter event: {other:?}")),
-        }
-    }
-    Ok(collected)
 }
 
 #[cfg(test)]
@@ -761,9 +706,7 @@ mod tests {
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};
 
-    use crate::notifications::watch::subscriptions::{
-        create_watch_subscription, delete_watch_subscription,
-    };
+    use crate::notifications::watch::subscriptions::{create_local_watch, delete_local_watch};
 
     fn test_ctx(root: &str) -> DriverContext {
         DriverContext {
@@ -811,7 +754,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-                key: Key::from(watch_interest_node_key(realm_id, digest.node_id)),
+                key: Key::from(interest_node_key(realm_id, digest.node_id)),
                 value: Value::from(digest.to_bytes().unwrap()),
                 txn_id: None,
             })
@@ -851,9 +794,9 @@ mod tests {
             user_id: owner,
             realm_id,
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let mut group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+            GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
         group_auth
             .roles
             .values_mut()
@@ -946,7 +889,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-                key: Key::from(watch_interest_dirty_key(realm_id)),
+                key: Key::from(interest_dirty_key(realm_id)),
                 txn_id: None,
             })
             .await
@@ -978,7 +921,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-                key: Key::from(watch_interest_pending_key(realm_id)),
+                key: Key::from(interest_pending_key(realm_id)),
                 txn_id: None,
             })
             .await
@@ -997,7 +940,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-                key: Key::from(watch_interest_node_key(realm_id, node_id)),
+                key: Key::from(interest_node_key(realm_id, node_id)),
                 txn_id: None,
             })
             .await
@@ -1057,13 +1000,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_sets_dirty_marker_for_owner_realm() {
+    async fn create_marks_dirty() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let owner = user(1, 2);
         let group_id = Ulid::generate();
 
-        create_watch_subscription(
+        create_local_watch(
             &ctx.storage_handle,
             owner,
             metadata_prefix(group_id, "a"),
@@ -1077,7 +1020,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_builds_digest_and_clears_markers() {
+    async fn publish_clears_markers() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let node_id = node(5);
@@ -1086,7 +1029,7 @@ mod tests {
         let group_id = Ulid::generate();
         install_authorization(&ctx, owner.realm_id, node_id, group_id, owner, &[]).await;
 
-        create_watch_subscription(
+        create_local_watch(
             &ctx.storage_handle,
             owner,
             metadata_prefix(group_id, "a"),
@@ -1095,7 +1038,7 @@ mod tests {
         )
         .await
         .expect("create a");
-        create_watch_subscription(
+        create_local_watch(
             &ctx.storage_handle,
             owner,
             metadata_prefix(group_id, "b"),
@@ -1150,7 +1093,7 @@ mod tests {
         let group_id = Ulid::generate();
         install_realm_config(&ctx, realm_id, &[node_id]).await;
         install_authorization(&ctx, realm_id, node_id, group_id, owner, &[]).await;
-        create_watch_subscription(
+        create_local_watch(
             &ctx.storage_handle,
             owner,
             metadata_prefix(group_id, "a"),
@@ -1172,7 +1115,7 @@ mod tests {
             .unwrap();
         assert!(read_pending(&ctx, realm_id).await.is_none());
 
-        mark_watch_interest_dirty(&ctx, realm_id)
+        mark_interest_dirty(&ctx, realm_id)
             .await
             .expect("mark dirty");
         assert!(
@@ -1202,7 +1145,7 @@ mod tests {
         let owner = user(8, 2);
         let group_id = Ulid::generate();
         install_realm_config(&ctx, realm_id, &[node_id]).await;
-        create_watch_subscription(
+        create_local_watch(
             &ctx.storage_handle,
             owner,
             metadata_prefix(group_id, "a"),
@@ -1239,7 +1182,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_last_watch_publishes_empty_digest() {
+    async fn delete_publishes_empty() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let node_id = node(5);
@@ -1248,7 +1191,7 @@ mod tests {
         let group_id = Ulid::generate();
         install_authorization(&ctx, owner.realm_id, node_id, group_id, owner, &[]).await;
 
-        let created = create_watch_subscription(
+        let created = create_local_watch(
             &ctx.storage_handle,
             owner,
             metadata_prefix(group_id, "a"),
@@ -1263,7 +1206,7 @@ mod tests {
                 .expect("publish")
         );
 
-        delete_watch_subscription(&ctx.storage_handle, owner, created.watch_id)
+        delete_local_watch(&ctx.storage_handle, owner, created.watch_id)
             .await
             .expect("delete");
         assert!(read_marker(&ctx, owner.realm_id).await.is_some());
@@ -1280,7 +1223,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn digest_omits_subscriptions_that_re_ranked_to_another_holder() {
+    async fn digest_omits_moved() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let realm_id = RealmId([2u8; 32]);
@@ -1300,7 +1243,7 @@ mod tests {
         )
         .await;
 
-        create_watch_subscription(
+        create_local_watch(
             &ctx.storage_handle,
             local_owner,
             metadata_prefix(group_id, "local"),
@@ -1309,7 +1252,7 @@ mod tests {
         )
         .await
         .unwrap();
-        create_watch_subscription(
+        create_local_watch(
             &ctx.storage_handle,
             stale_owner,
             metadata_prefix(group_id, "stale"),
@@ -1332,14 +1275,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn marker_clear_respects_generation_guard() {
+    async fn marker_respects_generation() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let realm_id = RealmId([1u8; 32]);
 
         // Two distinct generations for the same realm marker: only the observed
         // generation should be cleared.
-        let (space, key, first) = watch_interest_dirty_marker_write(realm_id);
+        let (space, key, first) = dirty_marker_write(realm_id);
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -1356,7 +1299,7 @@ mod tests {
 
         // A concurrent CRUD bumped the generation after we observed `first`.
         let observed = vec![(key.clone(), first)];
-        let (space2, key2, second) = watch_interest_dirty_marker_write(realm_id);
+        let (space2, key2, second) = dirty_marker_write(realm_id);
         assert_eq!(key2, key);
         match ctx
             .storage_handle
@@ -1381,7 +1324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_reads_digests_from_storage() {
+    async fn rebuild_reads_digests() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let realm_id = RealmId([3u8; 32]);
@@ -1415,7 +1358,7 @@ mod tests {
         )
         .await;
 
-        let table = rebuild_watch_interest_table(&ctx.storage_handle).await;
+        let table = rebuild_interest_table(&ctx.storage_handle).await;
         assert_eq!(
             table.matching_nodes(realm_id, "bucket/object", WatchEventKind::MetadataCreated),
             vec![holder]
@@ -1436,7 +1379,7 @@ mod tests {
         let watch_owner = user(6, 2);
         let prefix = metadata_prefix(group_id, "a");
         install_authorization(&ctx, realm_id, node_id, group_id, auth_owner, &[]).await;
-        create_watch_subscription(&ctx.storage_handle, watch_owner, prefix.clone(), mask(), 1)
+        create_local_watch(&ctx.storage_handle, watch_owner, prefix.clone(), mask(), 1)
             .await
             .expect("create");
 
@@ -1463,11 +1406,7 @@ mod tests {
             &[watch_owner],
         )
         .await;
-        refresh_watch_interest_for_targets(
-            &ctx,
-            &[DocumentSyncTarget::GroupAuthorization { group_id }],
-        )
-        .await;
+        refresh_target_interest(&ctx, &[DocumentSyncTarget::GroupAuthorization { group_id }]).await;
 
         assert!(read_marker(&ctx, realm_id).await.is_some());
         assert!(
@@ -1483,7 +1422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_updates_the_net_handle_table() {
+    async fn refresh_updates_network() {
         let realm_id = RealmId([4u8; 32]);
         let (_dir, ctx, net) = ctx_with_net(realm_id, [70u8; 32]).await;
         let holder = node(13);
@@ -1508,7 +1447,7 @@ mod tests {
             realm_id,
             node_id: holder,
         };
-        refresh_watch_interest_for_targets(&ctx, &[target]).await;
+        refresh_target_interest(&ctx, &[target]).await;
 
         let snapshot = net.watch_interest_snapshot();
         assert_eq!(
@@ -1518,7 +1457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_config_refresh_retracts_removed_digest_holder() {
+    async fn refresh_retracts_holder() {
         let realm_id = RealmId([5u8; 32]);
         let (_dir, ctx, net) = ctx_with_net(realm_id, [71u8; 32]).await;
         let retained = node(14);
@@ -1538,7 +1477,7 @@ mod tests {
             )
             .await;
         }
-        refresh_watch_interest_for_targets(
+        refresh_target_interest(
             &ctx,
             &[DocumentSyncTarget::WatchInterest {
                 realm_id,
@@ -1556,8 +1495,7 @@ mod tests {
         );
 
         install_realm_config(&ctx, realm_id, &[retained]).await;
-        refresh_watch_interest_for_targets(&ctx, &[DocumentSyncTarget::RealmConfig { realm_id }])
-            .await;
+        refresh_target_interest(&ctx, &[DocumentSyncTarget::RealmConfig { realm_id }]).await;
 
         assert_eq!(
             net.watch_interest_snapshot().matching_nodes(

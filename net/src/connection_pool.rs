@@ -687,34 +687,17 @@ impl ConnectionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn node(seed: u8) -> NodeId {
-        iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
+    use crate::test_support::{make_repeated_node, unseeded_endpoint};
 
     fn key(seed: u8, alpn: Alpn) -> ConnectionKey {
         ConnectionKey {
-            node_id: node(seed),
+            node_id: make_repeated_node(seed),
             alpn,
         }
     }
 
     fn cache(cooldown: Duration, capacity: usize) -> FailureCache {
         FailureCache::new(cooldown, capacity, Arc::new(PoolCounters::default()))
-    }
-
-    async fn test_endpoint() -> Endpoint {
-        Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .relay_mode(iroh::RelayMode::Disabled)
-            .bind_addr(
-                "127.0.0.1:0"
-                    .parse::<std::net::SocketAddr>()
-                    .expect("valid bind addr"),
-            )
-            .expect("valid bind addr")
-            .bind()
-            .await
-            .expect("endpoint binds")
     }
 
     async fn pending_endpoint(peer: NodeId) -> (Endpoint, tokio::net::UdpSocket) {
@@ -794,7 +777,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_request_times_out_when_actor_does_not_reply() {
+    async fn lease_actor_timeout() {
         let (tx, _rx) = mpsc::channel(1);
         let pool = ConnectionPool {
             tx,
@@ -802,7 +785,7 @@ mod tests {
             counters: Arc::new(PoolCounters::default()),
         };
 
-        let result = pool.get_or_connect(node(1), Alpn::Bao).await;
+        let result = pool.get_or_connect(make_repeated_node(1), Alpn::Bao).await;
 
         assert!(matches!(result, Err(PoolConnectError::Timeout)));
     }
@@ -897,7 +880,7 @@ mod tests {
         cache.record(key(1, Alpn::Metadata), PoolConnectError::Timeout, now);
         cache.record(key(2, Alpn::Bao), PoolConnectError::Timeout, now);
 
-        cache.clear_node(node(1));
+        cache.clear_node(make_repeated_node(1));
 
         assert!(cache.hit(&key(1, Alpn::Bao), now).is_none());
         assert!(cache.hit(&key(1, Alpn::Metadata), now).is_none());
@@ -909,13 +892,13 @@ mod tests {
         // An unreachable peer must cost one dial for the whole cooldown, and the
         // suppressed calls must return the same retryable error class.
         let pool = ConnectionPool::new(
-            test_endpoint().await,
+            unseeded_endpoint().await,
             ConnectionPoolOptions {
                 failure_cooldown: Duration::from_secs(30),
                 ..ConnectionPoolOptions::default()
             },
         );
-        let peer = node(9);
+        let peer = make_repeated_node(9);
 
         let first = pool.get_or_connect(peer, Alpn::Bao).await;
         assert!(first.is_err());
@@ -942,8 +925,8 @@ mod tests {
 
     #[tokio::test]
     async fn clear_after_pressure() {
-        let blocked = node(20);
-        let target = node(21);
+        let blocked = make_repeated_node(20);
+        let target = make_repeated_node(21);
         let (endpoint, _blackhole) = pending_endpoint(blocked).await;
         tokio::time::pause();
         let options = ConnectionPoolOptions {
@@ -1017,8 +1000,8 @@ mod tests {
     #[tokio::test]
     async fn clear_waits_capacity() {
         let (tx, mut rx) = mpsc::channel(1);
-        let first = node(1);
-        let second = node(2);
+        let first = make_repeated_node(1);
+        let second = make_repeated_node(2);
         tx.send(ActorMessage::ClearFailures { node_id: first })
             .await
             .unwrap();
@@ -1045,13 +1028,13 @@ mod tests {
     #[tokio::test]
     async fn coalesces_requests() {
         let pool = ConnectionPool::new(
-            test_endpoint().await,
+            unseeded_endpoint().await,
             ConnectionPoolOptions {
                 failure_cooldown: Duration::from_secs(30),
                 ..ConnectionPoolOptions::default()
             },
         );
-        let peer = node(10);
+        let peer = make_repeated_node(10);
 
         let mut requests = JoinSet::new();
         for _ in 0..8 {
@@ -1247,7 +1230,7 @@ impl Monitor {
                 let selected_path = paths.iter().find(|path| path.is_selected());
                 let selected_address = selected_path
                     .as_ref()
-                    .map(|path| transport_addr_to_string(path.remote_addr()));
+                    .map(|path| format_transport_addr(path.remote_addr()));
                 let rtt_ms = selected_path
                     .as_ref()
                     .map(|path| path.rtt())
@@ -1278,7 +1261,7 @@ impl Default for Monitor {
     }
 }
 
-fn transport_addr_to_string(addr: &TransportAddr) -> String {
+fn format_transport_addr(addr: &TransportAddr) -> String {
     match addr {
         TransportAddr::Ip(addr) => addr.to_string(),
         TransportAddr::Relay(url) => url.to_string(),

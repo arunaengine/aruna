@@ -10,10 +10,10 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::{
     JOB_LEASE_INDEX_PREFIX, JobError, JobErrorKind, JobExecutionClass, JobId, JobPayload,
-    JobRecord, JobState, parse_job_schedule_index_key,
+    JobRecord, JobState, parse_schedule_key,
 };
 use aruna_core::task::TaskEvent;
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use futures_util::future::FutureExt;
@@ -29,7 +29,7 @@ use super::store::{
     fail_job, flush_progress, handoff_external_attempt, iter_prefix_page, read_job_record,
     release_job, renew_lease, requeue_job, transition_to_running,
 };
-use super::submit::schedule_job_drain_effect;
+use super::submit::schedule_drain_effect;
 use super::{
     JOB_CONCURRENCY_CAP, JOB_DRAIN_BATCH_SIZE, JOB_EXTERNAL_CONCURRENCY_CAP, JOB_HEARTBEAT_MS,
     JOB_PROGRESS_FLUSH_INTERVAL_MS,
@@ -256,9 +256,8 @@ impl JobsRuntime {
         let runtime = self.clone();
         let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
-            // A panicking payload is turned into a job failure inside `supervise`; this
-            // guard still runs `finish` if anything else unwinds, so a panic can never
-            // leak the concurrency slot and wedge the runtime.
+            // A panicking payload is turned into a failure inside `supervise`; this guard
+            // still runs `finish` on other unwinds, so a panic cannot leak the slot.
             let _ = AssertUnwindSafe(run_job(
                 context.clone(),
                 record,
@@ -428,7 +427,7 @@ impl JobsRuntime {
         }
         if let Some(task_handle) = context.task_handle.as_ref()
             && let Event::Task(TaskEvent::Error { message, .. }) =
-                task_handle.send_effect(schedule_job_drain_effect()).await
+                task_handle.send_effect(schedule_drain_effect()).await
         {
             warn!(message = %message, "Failed to kick job drain after completion");
         }
@@ -484,10 +483,9 @@ impl JobsRuntime {
         }
     }
 
-    /// At startup every claimed/running holder is definitionally dead: re-queue the
-    /// in-process ones. External attempts route to the reconcile hook instead, since a
-    /// blind requeue would spawn a second container for a job that may still be running.
-    /// The restart itself costs them no attempt; only an adoption that fails does.
+    /// At startup every claimed/running holder is definitionally dead. Re-queue
+    /// the in-process ones and route external attempts to the reconcile hook,
+    /// since a blind requeue would double-run; a restart costs them no attempt.
     pub async fn recover_stale_jobs(&self, storage: &StorageHandle) -> Result<usize, String> {
         let now_ms = unix_timestamp_millis();
         let mut job_ids = Vec::new();
@@ -503,7 +501,7 @@ impl JobsRuntime {
             )
             .await?;
             for (key, _) in &values {
-                if let Ok((_, job_id)) = parse_job_schedule_index_key(key.as_ref()) {
+                if let Ok((_, job_id)) = parse_schedule_key(key.as_ref()) {
                     job_ids.push(job_id);
                 }
             }
@@ -572,9 +570,7 @@ async fn run_job(
     shutdown: CancellationToken,
 ) {
     // External attempts drive a container through the fenced lifecycle; a lost
-    // lease there reconciles rather than requeues (spec 16.7). A shutdown mid-supervise
-    // hands the lease back through `JobsRuntime::shutdown`, so the attempt is adopted
-    // rather than re-run.
+    // lease reconciles, and a mid-supervise shutdown hands it back for adoption.
     if record.execution_class == JobExecutionClass::ExternalAttempt {
         Box::pin(super::workflow::run_execution_job(context, record, cancel)).await;
         return;
@@ -744,10 +740,9 @@ fn terminal_or_none(result: Result<JobRecord, JobMutationError>, job_id: JobId) 
 
 const TERMINAL_WRITE_MAX_ATTEMPTS: u32 = 5;
 
-/// Retry a terminal write past transient storage failures. The execution already
-/// finished, so a bare storage error would otherwise leave the job `Running` until the
-/// sweep re-runs it and can flip a succeeded job to `Failed`; token/transition races are
-/// legitimate outcomes and are returned unretried.
+/// Retry a terminal write past transient storage failures: the execution already
+/// finished, so a storage error would otherwise leave it `Running` until the sweep
+/// re-runs it. Token/transition races are legitimate and returned unretried.
 async fn retry_terminal<F, Fut>(mut op: F) -> Result<JobRecord, JobMutationError>
 where
     F: FnMut() -> Fut,
@@ -773,9 +768,8 @@ async fn supervise(
     record: &JobRecord,
     ctx: &JobContext,
 ) -> SuperviseResult {
-    // Renew the lease and flush progress on a SEPARATE task so a payload stuck in a
-    // non-yielding section cannot starve its own renewals and be swept out from under
-    // itself into a second concurrent execution.
+    // Renew the lease and flush progress on a separate task so a non-yielding
+    // payload cannot starve its renewals and be swept into a second execution.
     let stop = CancellationToken::new();
     let heartbeat = tokio::spawn(heartbeat_loop(
         storage.clone(),
@@ -998,7 +992,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_runs_to_success() {
+    async fn probe_reaches_success() {
         let (_dir, storage) = temp_storage();
         let ctx = context(storage.clone());
         let runtime = JobsRuntime::new();

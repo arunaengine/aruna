@@ -3,7 +3,7 @@ use crate::driver::{
     routing_snapshot,
 };
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::staging::descriptor::build_version_source_binding;
+use crate::staging::descriptor::build_source_binding;
 use crate::staging::read_source::{
     ReadStagingSourceError, ReadStagingSourceInput, ReadStagingSourceOperation,
 };
@@ -77,7 +77,7 @@ pub async fn stage_snapshot_blob(
     )
     .await?;
 
-    let mut version_source = build_version_source_binding(
+    let mut version_source = build_source_binding(
         StagingStrategy::Snapshot,
         &read_result.connector,
         &read_result.metadata,
@@ -221,7 +221,7 @@ async fn read_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::staging::test_utils::{
+    use crate::tests::fixtures::staging::{
         create_http_connector, create_test_bucket, setup_driver_context,
     };
     use axum::Router;

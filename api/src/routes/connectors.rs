@@ -10,25 +10,25 @@ use aruna_core::structs::{
     AuthContext, Permission, ResolvedSourceAccess, SourceConnector, SourceConnectorKind,
     SourceEntryKind,
 };
-use aruna_operations::connectors::create_source_connector::{
+use aruna_operations::connectors::create_connector::{
     CreateSourceConnectorError, CreateSourceConnectorInput, CreateSourceConnectorOperation,
 };
-use aruna_operations::connectors::delete_source_connector::{
+use aruna_operations::connectors::delete_connector::{
     DeleteSourceConnectorError, DeleteSourceConnectorInput, DeleteSourceConnectorOperation,
 };
-use aruna_operations::connectors::get_source_connector::{
+use aruna_operations::connectors::get_connector::{
     GetSourceConnectorError, GetSourceConnectorInput, GetSourceConnectorOperation,
 };
-use aruna_operations::connectors::has_secret_config::{
-    ConnectorHasSecretConfigError, ConnectorHasSecretConfigOperation,
-};
-use aruna_operations::connectors::list_source_connectors::{
+use aruna_operations::connectors::list_connectors::{
     ListSourceConnectorsError, ListSourceConnectorsInput, ListSourceConnectorsOperation,
 };
-use aruna_operations::connectors::replace_source_connector::{
+use aruna_operations::connectors::replace_connector::{
     ReplaceSourceConnectorError, ReplaceSourceConnectorInput, ReplaceSourceConnectorOperation,
 };
 use aruna_operations::connectors::resolver::{resolve_inline_access, validate_source_path};
+use aruna_operations::connectors::secret_config::{
+    ConnectorHasSecretConfigError, ConnectorHasSecretConfigOperation,
+};
 use aruna_operations::connectors::validation::validate_connector_input;
 use aruna_operations::connectors::{ResolveSourceConnectorInput, ResolveSourceConnectorOperation};
 use aruna_operations::driver::drive;
@@ -293,7 +293,7 @@ pub async fn create_source_connector(
 ) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
     let result = drive(
         CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
@@ -307,7 +307,7 @@ pub async fn create_source_connector(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_connector_error)?;
+    .map_err(map_create_error)?;
 
     Ok((
         StatusCode::CREATED,
@@ -375,19 +375,19 @@ pub async fn list_source_connectors(
 ) -> ServerResult<(StatusCode, Json<ListSourceConnectorsResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::READ).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
 
     let result = drive(
         ListSourceConnectorsOperation::new(ListSourceConnectorsInput { group_id }),
         &state.get_ctx(),
     )
     .await
-    .map_err(map_list_connector_error)?;
+    .map_err(map_connector_list)?;
 
     let mut connectors = Vec::with_capacity(result.connectors.len());
     for connector in result.connectors {
         let has_secret_config =
-            connector_has_secret_config(state.as_ref(), connector.connector_id).await?;
+            connector_has_secret(state.as_ref(), connector.connector_id).await?;
         connectors.push(map_connector_response(connector, has_secret_config));
     }
 
@@ -464,7 +464,7 @@ pub async fn get_source_connector(
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::READ).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
 
     let result = drive(
         GetSourceConnectorOperation::new(GetSourceConnectorInput {
@@ -474,7 +474,7 @@ pub async fn get_source_connector(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_get_connector_error)?;
+    .map_err(map_get_error)?;
 
     Ok((
         StatusCode::OK,
@@ -581,7 +581,7 @@ pub async fn replace_source_connector(
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
     let result = drive(
         ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
@@ -595,7 +595,7 @@ pub async fn replace_source_connector(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_replace_connector_error)?;
+    .map_err(map_replace_error)?;
 
     Ok((
         StatusCode::OK,
@@ -662,7 +662,7 @@ pub async fn delete_source_connector(
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
     drive(
         DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
@@ -672,7 +672,7 @@ pub async fn delete_source_connector(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_delete_connector_error)?;
+    .map_err(map_delete_error)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -764,7 +764,7 @@ pub async fn check_source_connector(
 ) -> ServerResult<Json<ConnectorCheckResponse>> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
     let kind: SourceConnectorKind = request.kind.into();
     validate_connector_input(
@@ -854,7 +854,7 @@ pub async fn check_stored_connector(
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::READ).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
 
     let resolved = drive(
         ResolveSourceConnectorOperation::new(ResolveSourceConnectorInput {
@@ -963,7 +963,7 @@ pub async fn list_connector_entries(
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
-    ensure_group_data_permission(&state, &auth, group_id, Permission::READ).await?;
+    ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
     let source_path = normalize_browse_path(&query.path)?;
     let limit = query.limit.unwrap_or(DEFAULT_ENTRY_LIMIT);
     if limit == 0 {
@@ -1070,7 +1070,7 @@ fn parse_connector_id(connector_id: &str) -> ServerResult<Ulid> {
     Ulid::from_str(connector_id).map_err(|_| ServerError::BadRequest)
 }
 
-pub(crate) async fn ensure_group_data_permission(
+pub(crate) async fn ensure_data_permission(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,
@@ -1085,19 +1085,16 @@ pub(crate) async fn ensure_group_data_permission(
     .await
 }
 
-async fn connector_has_secret_config(
-    state: &ServerState,
-    connector_id: Ulid,
-) -> ServerResult<bool> {
+async fn connector_has_secret(state: &ServerState, connector_id: Ulid) -> ServerResult<bool> {
     drive(
         ConnectorHasSecretConfigOperation::new(connector_id),
         &state.get_ctx(),
     )
     .await
-    .map_err(map_connector_secret_config_error)
+    .map_err(map_secret_error)
 }
 
-fn map_connector_secret_config_error(error: ConnectorHasSecretConfigError) -> ServerError {
+fn map_secret_error(error: ConnectorHasSecretConfigError) -> ServerError {
     ServerError::InternalError(error.to_string())
 }
 
@@ -1122,19 +1119,19 @@ fn format_system_time(value: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(value).to_rfc3339()
 }
 
-fn map_create_connector_error(error: CreateSourceConnectorError) -> ServerError {
+fn map_create_error(error: CreateSourceConnectorError) -> ServerError {
     match error {
         CreateSourceConnectorError::ValidationError(_) => ServerError::BadRequest,
         _ => ServerError::InternalError(error.to_string()),
     }
 }
 
-fn map_list_connector_error(error: ListSourceConnectorsError) -> ServerError {
+fn map_connector_list(error: ListSourceConnectorsError) -> ServerError {
     ServerError::InternalError(error.to_string())
 }
 
-fn map_get_connector_error(
-    error: aruna_operations::connectors::get_source_connector::GetSourceConnectorError,
+fn map_get_error(
+    error: aruna_operations::connectors::get_connector::GetSourceConnectorError,
 ) -> ServerError {
     match error {
         GetSourceConnectorError::NotFound => ServerError::NotFound,
@@ -1146,7 +1143,7 @@ fn map_get_connector_error(
     }
 }
 
-fn map_replace_connector_error(error: ReplaceSourceConnectorError) -> ServerError {
+fn map_replace_error(error: ReplaceSourceConnectorError) -> ServerError {
     match error {
         ReplaceSourceConnectorError::ValidationError(_) => ServerError::BadRequest,
         ReplaceSourceConnectorError::NotFound => ServerError::NotFound,
@@ -1157,7 +1154,7 @@ fn map_replace_connector_error(error: ReplaceSourceConnectorError) -> ServerErro
     }
 }
 
-fn map_delete_connector_error(error: DeleteSourceConnectorError) -> ServerError {
+fn map_delete_error(error: DeleteSourceConnectorError) -> ServerError {
     match error {
         DeleteSourceConnectorError::NotFound => ServerError::NotFound,
         DeleteSourceConnectorError::ReferencedByObjectVersion => {
@@ -1191,16 +1188,11 @@ fn map_list_error(error: ListStagingSourceError) -> ServerError {
 mod tests {
     use super::*;
     use crate::openapi::ApiDoc;
-    use aruna_core::UserId;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-    use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
-        RealmConfigDocument,
+    use crate::tests::fixtures::routes::{
+        seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
     };
-    use aruna_operations::driver::DriverContext;
-    use aruna_storage::storage;
+    use aruna_core::UserId;
+    use aruna_core::structs::{Actor, NodeCapabilities};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -1213,7 +1205,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connector_routes_crud_and_redact_secret_config() {
+    async fn connector_crud_redacts() {
         let test = setup_state().await;
 
         let (_, Json(created)) = create_source_connector(
@@ -1302,7 +1294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connector_routes_require_group_data_permission() {
+    async fn connectors_require_permission() {
         let test = setup_state().await;
 
         let result = create_source_connector(
@@ -1495,17 +1487,17 @@ mod tests {
     fn referenced_connector_conflicts() {
         // A still-referenced credential is a policy refusal, not an internal error.
         assert!(matches!(
-            map_replace_connector_error(ReplaceSourceConnectorError::ReferencedByObjectVersion),
+            map_replace_error(ReplaceSourceConnectorError::ReferencedByObjectVersion),
             ServerError::Conflict(_)
         ));
         assert!(matches!(
-            map_delete_connector_error(DeleteSourceConnectorError::ReferencedByObjectVersion),
+            map_delete_error(DeleteSourceConnectorError::ReferencedByObjectVersion),
             ServerError::Conflict(_)
         ));
     }
 
     #[test]
-    fn openapi_includes_connector_paths() {
+    fn openapi_has_connectors() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
         assert!(
@@ -1540,9 +1532,7 @@ mod tests {
     }
 
     async fn setup_state() -> TestState {
-        let storage_dir = tempfile::tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let (storage_dir, storage_handle) = test_storage();
         let realm_id = aruna_core::structs::RealmId([3u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
         let user_id = UserId::local(Ulid::generate(), realm_id);
@@ -1552,68 +1542,28 @@ mod tests {
             user_id,
             realm_id,
         };
-        let driver_ctx = Arc::new(DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
+        let driver_ctx = Arc::new(test_context(storage_handle));
         let group_id = Ulid::generate();
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
-        let group = Group {
-            display_name: "connector-group".to_string(),
-            group_id,
-            realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner: user_id,
-        };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
 
         // Request-policy loading fails closed without the realm config document.
-        write_doc(
+        seed_realm_config(&driver_ctx, realm_id, &actor).await;
+        seed_realm_auth(&driver_ctx, realm_id, &actor).await;
+        seed_group_docs(
             &driver_ctx,
-            REALM_CONFIG_KEYSPACE,
-            (*realm_id.as_bytes()).into(),
-            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
-                .to_bytes(&actor)
-                .unwrap()
-                .into(),
-        )
-        .await;
-        write_doc(
-            &driver_ctx,
-            AUTH_KEYSPACE,
-            (*realm_id.as_bytes()).into(),
-            realm_auth.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
-        write_doc(
-            &driver_ctx,
-            AUTH_KEYSPACE,
-            group_id.to_bytes().into(),
-            group_auth.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
-        write_doc(
-            &driver_ctx,
-            GROUP_KEYSPACE,
-            group_id.to_bytes().into(),
-            group.to_bytes(&actor).unwrap().into(),
+            realm_id,
+            &actor,
+            group_id,
+            "connector-group",
+            user_id,
         )
         .await;
 
         let state = Arc::new(
-            ServerState::new(
+            test_state(
                 driver_ctx,
                 realm_id,
                 node_id,
                 NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
@@ -1635,26 +1585,5 @@ mod tests {
             group_id,
             state,
         }
-    }
-
-    async fn write_doc(
-        driver_ctx: &Arc<DriverContext>,
-        key_space: &str,
-        key: byteview::ByteView,
-        value: byteview::ByteView,
-    ) {
-        let event = driver_ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key,
-                value,
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ));
     }
 }

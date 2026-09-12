@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn formats_s3_arn_canonically() {
+    fn formats_s3_canonically() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = test_node_id();
         let arn = ArunaArn::s3_bucket(realm_id, node_id, "mybucket").unwrap();
@@ -382,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_canonical_s3_arn() {
+    fn parses_canonical_arn() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = test_node_id();
         let arn = format!("arn:aruna:{realm_id}:{node_id}:s3/mybucket");
@@ -469,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_w3id_suffix() {
+    fn rejects_pid_suffix() {
         assert!(W3idDataIdentifier::parse(&format!("{ARUNA_DATA_PREFIX}ABC")).is_err());
         assert!(
             W3idDataIdentifier::parse(&format!("{ARUNA_DATA_PREFIX}{}", "A".repeat(64))).is_err()

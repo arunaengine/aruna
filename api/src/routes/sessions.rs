@@ -1,8 +1,8 @@
-use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_realm_auth};
+use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{Actor, AuthContext, SessionKind, UserSession};
-use aruna_core::util::unix_timestamp_secs;
+use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::driver::drive;
 use aruna_operations::session::{
     CreateSessionConfig, CreateSessionError, CreateSessionOperation, ListSessionOperation,
@@ -165,7 +165,7 @@ pub async fn create_session(
     Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<CreateSessionRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateSessionResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let kind = parse_session_kind(&request.kind)?;
     if auth
@@ -242,7 +242,7 @@ pub async fn list_sessions(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<ListSessionsResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let current_sid = auth.session.as_ref().map(|session| session.sid.as_str());
     let sessions = drive(ListSessionOperation::new(auth.user_id), &state.get_ctx())
         .await
@@ -281,7 +281,7 @@ pub async fn delete_session(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(session_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     if Ulid::from_string(&session_id).is_err() {
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -307,27 +307,17 @@ mod tests {
     use super::*;
     use crate::auth::handle_token;
     use crate::error::TokenError;
+    use crate::tests::fixtures::routes::{test_context, test_state, test_storage};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{NodeCapabilities, RealmId, SessionRef};
     use aruna_core::types::UserId;
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::driver::DriverContext;
-    use aruna_operations::jobs::runtime::JobsRuntime;
-    use aruna_storage::storage::FjallStorage;
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use axum::response::IntoResponse;
     use tempfile::TempDir;
 
     async fn setup_state() -> (TempDir, Arc<ServerState>, AuthContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = Arc::new(DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
+        let (dir, storage) = test_storage();
+        let context = Arc::new(test_context(storage));
         let signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
         let user_id = UserId::local(Ulid::generate(), realm_id);
@@ -350,14 +340,11 @@ mod tests {
         .await
         .unwrap();
         let state = Arc::new(
-            ServerState::new(
+            test_state(
                 context,
                 realm_id,
                 node_id,
                 NodeCapabilities::management_node(signing_key).unwrap(),
-                false,
-                None,
-                JobsRuntime::new(),
             )
             .await,
         );

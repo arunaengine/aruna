@@ -2,9 +2,9 @@ use crate::s3::auth::Action;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::{
-    MultipartChecksumType, MultipartUploadChecksumHint, ensure_confined_relative_path,
+    MultipartChecksumType, MultipartUploadChecksumHint, ensure_confined_path,
 };
-use aruna_operations::s3::complete_multipart_upload::CompleteMultipartPart;
+use aruna_operations::s3::complete_upload::CompleteMultipartPart;
 use aruna_operations::s3::get_object::ObjectRangeRequest;
 use aruna_operations::s3::put_object::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;
@@ -17,7 +17,7 @@ use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::path::Path;
 use ulid::Ulid;
 
-pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
+pub fn operation_permission(operation_name: &str) -> Option<Action> {
     match operation_name {
         // Write operations (operations that modify state/data)
         "AbortMultipartUpload" => Some(Action::Write),
@@ -124,7 +124,7 @@ pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
     }
 }
 
-pub(crate) fn is_anonymous_object_read_operation(operation_name: &str) -> bool {
+pub(crate) fn anonymous_read_allowed(operation_name: &str) -> bool {
     matches!(operation_name, "GetObject")
 }
 
@@ -133,7 +133,7 @@ pub(crate) fn validate_object_key(key: &str) -> S3Result<()> {
         return Err(s3_error!(InvalidArgument, "Object key must not be empty"));
     }
 
-    ensure_confined_relative_path(Path::new(key))
+    ensure_confined_path(Path::new(key))
         .map_err(|err| s3_error!(InvalidArgument, "{}", err.to_string()))
 }
 
@@ -170,18 +170,18 @@ pub(crate) fn reject_sse(requested: bool) -> S3Result<()> {
     Ok(())
 }
 
-pub(crate) fn parse_multipart_checksum_hint(
+pub(crate) fn parse_checksum_hint(
     input: &CreateMultipartUploadInput,
 ) -> S3Result<Option<MultipartUploadChecksumHint>> {
     let algorithm = input
         .checksum_algorithm
         .as_ref()
-        .map(checksum_algorithm_from_s3)
+        .map(parse_checksum_algorithm)
         .transpose()?;
     let checksum_type = input
         .checksum_type
         .as_ref()
-        .map(multipart_checksum_type_from_s3)
+        .map(parse_checksum_type)
         .unwrap_or(MultipartChecksumType::FullObject);
 
     Ok(
@@ -198,7 +198,7 @@ pub(crate) fn parse_completed_part(part: &CompletedPart) -> S3Result<CompleteMul
     let Some(part_number) = part.part_number else {
         return Err(s3_error!(InvalidPart, "Missing part number"));
     };
-    let part_number = parse_multipart_part_number(part_number, S3ErrorCode::InvalidPart)?;
+    let part_number = parse_part_number(part_number, S3ErrorCode::InvalidPart)?;
 
     let mut expected_checksums = Vec::new();
     for (value, algorithm) in [
@@ -226,10 +226,7 @@ pub(crate) fn parse_completed_part(part: &CompletedPart) -> S3Result<CompleteMul
     })
 }
 
-pub(crate) fn parse_multipart_part_number(
-    part_number: PartNumber,
-    error_code: S3ErrorCode,
-) -> S3Result<u16> {
+pub(crate) fn parse_part_number(part_number: PartNumber, error_code: S3ErrorCode) -> S3Result<u16> {
     if !(1..=10_000).contains(&part_number) {
         return Err(S3Error::with_message(error_code, "Invalid part number"));
     }
@@ -280,7 +277,7 @@ pub(crate) fn parse_copy_source(
     }
 }
 
-pub(crate) fn parse_copy_source_range(range: Option<&str>) -> S3Result<Option<ObjectRangeRequest>> {
+pub(crate) fn parse_source_range(range: Option<&str>) -> S3Result<Option<ObjectRangeRequest>> {
     let Some(range) = range else {
         return Ok(None);
     };
@@ -304,18 +301,14 @@ pub(crate) fn parse_version_id(version_id: Option<String>) -> S3Result<Option<Ul
         .transpose()
 }
 
-pub(crate) fn multipart_checksum_type_from_s3(
-    checksum_type: &ChecksumType,
-) -> MultipartChecksumType {
+pub(crate) fn parse_checksum_type(checksum_type: &ChecksumType) -> MultipartChecksumType {
     match checksum_type.as_str() {
         ChecksumType::COMPOSITE => MultipartChecksumType::Composite,
         _ => MultipartChecksumType::FullObject,
     }
 }
 
-pub(crate) fn s3_checksum_type_from_multipart(
-    checksum_type: MultipartChecksumType,
-) -> ChecksumType {
+pub(crate) fn map_checksum_type(checksum_type: MultipartChecksumType) -> ChecksumType {
     match checksum_type {
         MultipartChecksumType::FullObject => ChecksumType::from_static(ChecksumType::FULL_OBJECT),
         MultipartChecksumType::Composite => ChecksumType::from_static(ChecksumType::COMPOSITE),
@@ -333,7 +326,7 @@ pub(crate) fn checksum_response_hashes<'a>(
     }
 }
 
-pub(crate) fn checksum_algorithm_from_s3(
+pub(crate) fn parse_checksum_algorithm(
     algorithm: &S3ChecksumAlgorithm,
 ) -> S3Result<ChecksumAlgorithm> {
     match algorithm.as_str() {
@@ -355,13 +348,11 @@ pub(crate) fn declared_trailer_algorithm(
 ) -> S3Result<Option<ChecksumAlgorithm>> {
     algorithm
         .filter(|_| has_handle && headers.contains_key("x-amz-trailer"))
-        .map(checksum_algorithm_from_s3)
+        .map(parse_checksum_algorithm)
         .transpose()
 }
 
-pub(crate) fn s3_checksum_algorithm_from_core(
-    algorithm: ChecksumAlgorithm,
-) -> Option<S3ChecksumAlgorithm> {
+pub(crate) fn map_checksum_algorithm(algorithm: ChecksumAlgorithm) -> Option<S3ChecksumAlgorithm> {
     match algorithm {
         ChecksumAlgorithm::Crc32 => {
             Some(S3ChecksumAlgorithm::from_static(S3ChecksumAlgorithm::CRC32))
@@ -417,13 +408,12 @@ pub(crate) fn bucket_name_reason(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        S3ChecksumAlgorithm, bucket_name_reason, checksum_response_hashes,
-        declared_trailer_algorithm, get_s3_operation_permission,
-        is_anonymous_object_read_operation, parse_copy_source, parse_copy_source_range,
-        parse_multipart_part_number, validate_object_key,
+        S3ChecksumAlgorithm, anonymous_read_allowed, bucket_name_reason, checksum_response_hashes,
+        declared_trailer_algorithm, operation_permission, parse_copy_source, parse_part_number,
+        parse_source_range, validate_object_key,
     };
     use crate::s3::auth::Action;
-    use crate::s3::checksum::parse_upload_checksum_request;
+    use crate::s3::checksum::parse_upload_checksum;
     use aruna_core::structs::MultipartChecksumType;
     use aruna_core::structs::checksum::ChecksumAlgorithm;
     use aruna_operations::s3::get_object::ObjectRangeRequest;
@@ -444,7 +434,7 @@ mod tests {
 
         let derived = declared_trailer_algorithm(&headers, true, Some(&algorithm)).unwrap();
         assert_eq!(derived, None);
-        let request = parse_upload_checksum_request(&headers, derived).unwrap();
+        let request = parse_upload_checksum(&headers, derived).unwrap();
         assert_eq!(request.expected.len(), 1);
 
         headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
@@ -457,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_uploads_surface_composite_hashes() {
+    fn composite_upload_hashes() {
         let location = HashMap::from([("md5".to_string(), vec![1u8; 16])]);
         let composite = HashMap::from([("md5".to_string(), vec![2u8; 16])]);
 
@@ -468,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn full_object_uploads_surface_location_hashes() {
+    fn full_upload_hashes() {
         let location = HashMap::from([("md5".to_string(), vec![1u8; 16])]);
         let composite = HashMap::from([("md5".to_string(), vec![2u8; 16])]);
 
@@ -479,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_composite_hashes_fall_back_to_location() {
+    fn composite_fallback_location() {
         let location = HashMap::from([("md5".to_string(), vec![1u8; 16])]);
         let composite = HashMap::new();
 
@@ -490,23 +480,23 @@ mod tests {
     }
 
     #[test]
-    fn parses_bounded_copy_source_range() {
+    fn parses_bounded_range() {
         assert_eq!(
-            parse_copy_source_range(Some("bytes=0-99")).unwrap(),
+            parse_source_range(Some("bytes=0-99")).unwrap(),
             Some(ObjectRangeRequest::StartEnd { start: 0, end: 99 })
         );
     }
 
     #[test]
-    fn parses_absent_copy_source_range() {
-        assert_eq!(parse_copy_source_range(None).unwrap(), None);
+    fn parses_absent_range() {
+        assert_eq!(parse_source_range(None).unwrap(), None);
     }
 
     #[test]
-    fn rejects_malformed_copy_source_ranges() {
+    fn malformed_ranges_rejected() {
         for value in ["0-99", "bytes=2-", "bytes=-5", "bytes=abc-def", "bytes=5-2"] {
             assert_eq!(
-                *parse_copy_source_range(Some(value)).unwrap_err().code(),
+                *parse_source_range(Some(value)).unwrap_err().code(),
                 S3ErrorCode::InvalidArgument,
                 "expected InvalidArgument for {value}"
             );
@@ -514,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_bucket_copy_source_without_version() {
+    fn parses_unversioned_source() {
         let source = CopySource::Bucket {
             bucket: "src-bucket".into(),
             key: "folder/object.txt".into(),
@@ -529,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_bucket_copy_source_with_version() {
+    fn parses_versioned_source() {
         let version = Ulid::generate();
         let source = CopySource::Bucket {
             bucket: "src-bucket".into(),
@@ -543,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_copy_source_version() {
+    fn invalid_version_rejected() {
         let source = CopySource::Bucket {
             bucket: "src-bucket".into(),
             key: "object.txt".into(),
@@ -557,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_bucket_copy_source() {
+    fn nonbucket_source_rejected() {
         let source = CopySource::AccessPoint {
             partition: "aws".into(),
             region: "eu-central-1".into(),
@@ -574,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_object_key_accepts_ordinary_keys() {
+    fn ordinary_keys_accepted() {
         for key in ["object.bin", "nested/path/object.bin", "a.b..c/keep..dots"] {
             assert!(
                 validate_object_key(key).is_ok(),
@@ -584,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_object_key_rejects_traversal_and_control_keys() {
+    fn unsafe_keys_rejected() {
         let cases = [
             "",
             "/absolute/key",
@@ -606,8 +596,8 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_public_access_only_allows_get_object() {
-        assert!(is_anonymous_object_read_operation("GetObject"));
+    fn anonymous_only_gets() {
+        assert!(anonymous_read_allowed("GetObject"));
 
         for operation in [
             "HeadObject",
@@ -622,23 +612,17 @@ mod tests {
             "ListParts",
         ] {
             assert!(
-                !is_anonymous_object_read_operation(operation),
+                !anonymous_read_allowed(operation),
                 "{operation} must not be allowed anonymously"
             );
         }
     }
 
     #[test]
-    fn authenticated_read_classification_still_includes_metadata_operations() {
-        assert_eq!(get_s3_operation_permission("GetObject"), Some(Action::Read));
-        assert_eq!(
-            get_s3_operation_permission("HeadObject"),
-            Some(Action::Read)
-        );
-        assert_eq!(
-            get_s3_operation_permission("ListObjectsV2"),
-            Some(Action::Read)
-        );
+    fn metadata_reads_classified() {
+        assert_eq!(operation_permission("GetObject"), Some(Action::Read));
+        assert_eq!(operation_permission("HeadObject"), Some(Action::Read));
+        assert_eq!(operation_permission("ListObjectsV2"), Some(Action::Read));
     }
 
     #[test]
@@ -652,9 +636,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_upload_part_number_zero() {
+    fn zero_part_rejected() {
         assert_eq!(
-            *parse_multipart_part_number(0, S3ErrorCode::InvalidArgument)
+            *parse_part_number(0, S3ErrorCode::InvalidArgument)
                 .unwrap_err()
                 .code(),
             S3ErrorCode::InvalidArgument
@@ -662,9 +646,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_upload_part_number_above_limit() {
+    fn large_part_rejected() {
         assert_eq!(
-            *parse_multipart_part_number(10_001, S3ErrorCode::InvalidArgument)
+            *parse_part_number(10_001, S3ErrorCode::InvalidArgument)
                 .unwrap_err()
                 .code(),
             S3ErrorCode::InvalidArgument
@@ -672,9 +656,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_negative_completed_part_number() {
+    fn negative_part_rejected() {
         assert_eq!(
-            *parse_multipart_part_number(-1, S3ErrorCode::InvalidPart)
+            *parse_part_number(-1, S3ErrorCode::InvalidPart)
                 .unwrap_err()
                 .code(),
             S3ErrorCode::InvalidPart
@@ -682,13 +666,13 @@ mod tests {
     }
 
     #[test]
-    fn accepts_multipart_part_number_bounds() {
+    fn part_bounds_accepted() {
         assert_eq!(
-            parse_multipart_part_number(1, S3ErrorCode::InvalidArgument).unwrap(),
+            parse_part_number(1, S3ErrorCode::InvalidArgument).unwrap(),
             1
         );
         assert_eq!(
-            parse_multipart_part_number(10_000, S3ErrorCode::InvalidPart).unwrap(),
+            parse_part_number(10_000, S3ErrorCode::InvalidPart).unwrap(),
             10_000
         );
     }

@@ -6,14 +6,14 @@ use aws_sdk_s3::types::{CorsConfiguration, CorsRule};
 use reqwest::StatusCode;
 use reqwest::header;
 use shared::{
-    TEST_CORS_ORIGIN, TestResult, create_bearer_token, create_group_via_http,
-    create_s3_credentials_via_http, s3_client, spawn_full_seed_node, spawn_seed_node,
+    TEST_CORS_ORIGIN, TestResult, create_bearer_token, create_group_http, create_s3_credentials,
+    s3_client, spawn_complete_seed, spawn_seed_node,
 };
 
 const DISALLOWED_ORIGIN: &str = "http://evil.test";
 
 #[tokio::test]
-async fn rest_preflight_and_actual_requests_carry_cors_headers() -> TestResult<()> {
+async fn rest_carries_cors() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let client = reqwest::Client::new();
 
@@ -74,8 +74,8 @@ async fn rest_preflight_and_actual_requests_carry_cors_headers() -> TestResult<(
 }
 
 #[tokio::test]
-async fn s3_preflight_succeeds_unsigned_and_responses_expose_headers() -> TestResult<()> {
-    let seed = spawn_full_seed_node().await?;
+async fn s3_unsigned_preflight() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
     let s3 = seed.s3.as_ref().expect("full seed node has S3");
     let client = reqwest::Client::new();
 
@@ -157,8 +157,8 @@ async fn s3_preflight_succeeds_unsigned_and_responses_expose_headers() -> TestRe
 }
 
 #[tokio::test]
-async fn s3_bucket_cors_rules_never_lock_out_allowlisted_origins() -> TestResult<()> {
-    let seed = spawn_full_seed_node().await?;
+async fn s3_preserves_origins() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
 
     let result = async {
         let bearer = create_bearer_token(
@@ -168,21 +168,19 @@ async fn s3_bucket_cors_rules_never_lock_out_allowlisted_origins() -> TestResult
             seed.capabilities.clone(),
         )
         .await?;
-        let group = create_group_via_http(&seed.base_url, &bearer, "cors-locked").await?;
+        let group = create_group_http(&seed.base_url, &bearer, "cors-locked").await?;
         let endpoint = seed
             .s3
             .as_ref()
             .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
-        let credentials =
-            create_s3_credentials_via_http(&seed.base_url, &bearer, &group.group_id).await?;
+        let credentials = create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
         let s3 = s3_client(endpoint, &credentials);
 
         let bucket = "cors-locked-bucket";
         let object_url = format!("{}/{}/profiles/shapes.ttl", endpoint.endpoint_url, bucket);
         s3.create_bucket().bucket(bucket).send().await?;
-        // A stored read-only rule: the shape older portal versions wrote,
-        // which used to block every browser write on the bucket - including
-        // the PutBucketCors call that would repair it.
+        // This stored read-only rule previously blocked every browser write,
+        // including the PutBucketCors request needed to repair it.
         s3.put_bucket_cors()
             .bucket(bucket)
             .cors_configuration(
@@ -219,9 +217,7 @@ async fn s3_bucket_cors_rules_never_lock_out_allowlisted_origins() -> TestResult
             Some("*")
         );
 
-        // A PUT preflight from the node's allowlisted origin is not covered
-        // by the stored rule; it must fall back to the node allowlist instead
-        // of answering 403.
+        // The stored rule omits PUT, so an allowlisted origin must fall back to the node rule.
         let portal_put = client
             .request(reqwest::Method::OPTIONS, &object_url)
             .header(header::ORIGIN, TEST_CORS_ORIGIN)
@@ -275,9 +271,8 @@ async fn s3_bucket_cors_rules_never_lock_out_allowlisted_origins() -> TestResult
             Some("*")
         );
 
-        // Actual responses the stored rule does NOT cover fall back too, so
-        // the allowlisted origin can read error bodies (here: the signature
-        // rejection of an unsigned PUT) instead of an opaque CORS failure.
+        // Uncovered responses also fall back, exposing the unsigned PUT error body
+        // to an allowlisted origin instead of replacing it with an opaque CORS failure.
         let uncovered_put = client
             .put(&object_url)
             .header(header::ORIGIN, TEST_CORS_ORIGIN)

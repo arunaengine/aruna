@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 use aruna_core::DistributedTraceContext;
 use aruna_core::effects::DhtCompletion;
 use aruna_core::events::DhtEntry;
+use aruna_core::id::xor_distance_32;
 use aruna_core::id::{DhtKeyId, NodeId, NodeIdExt};
 use aruna_core::structs::RealmId;
-use aruna_core::util::xor_distance_32;
 use smallvec::SmallVec;
 
 use super::constants::{
@@ -17,7 +17,8 @@ use super::kbucket::{InsertResult, K, PeerInfo, RoutingTable};
 use super::protocol::{
     CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtGetCompletedReason, DhtGetStats, DhtInput, DhtIo,
     DhtIoError, DhtIoRequest, DhtOutput, DhtOutputValue, DhtPeerError, DhtPutStats,
-    INTERNAL_OP_START, InboundId, OpId, RpcPhase, StorageStage,
+    INTERNAL_OP_START, InboundId, OpId, RpcPhase, StorageStage, dht_cmd_kind, dht_input_kind,
+    dht_io_kind, io_inbound_id, io_op_id,
 };
 use super::rpc::{
     DhtRequest, DhtResponse, ErrorCode, StoredValue, request_kind, response_kind,
@@ -580,7 +581,7 @@ impl DhtStateMachine {
         name = "dht.state.io",
         level = "debug",
         skip(self, io, out),
-        fields(io = dht_io_kind(&io), op_id = ?dht_io_op_id(&io), inbound_id = ?dht_io_inbound_id(&io))
+        fields(io = dht_io_kind(&io), op_id = ?io_op_id(&io), inbound_id = ?io_inbound_id(&io))
     )]
     fn handle_io(&mut self, io: DhtIo, out: &mut SmallVec<[DhtEffect; 4]>) {
         match io {
@@ -642,7 +643,7 @@ impl DhtStateMachine {
         self.current_tick = now_tick;
         self.update_clock(now_secs);
 
-        let mut timed_out = self.collect_timed_out_rpc();
+        let mut timed_out = self.collect_rpc_timeouts();
         timed_out.sort_unstable_by(|(op_a, phase_a, peer_a), (op_b, phase_b, peer_b)| {
             op_a.cmp(op_b)
                 .then_with(|| rpc_phase_order(*phase_a).cmp(&rpc_phase_order(*phase_b)))
@@ -683,7 +684,7 @@ impl DhtStateMachine {
             return;
         }
 
-        self.handle_rpc_response_state(op_id, phase, peer, response, op_state, out);
+        self.route_rpc_response(op_id, phase, peer, response, op_state, out);
     }
 
     #[tracing::instrument(
@@ -708,7 +709,7 @@ impl DhtStateMachine {
             return;
         }
 
-        self.handle_rpc_error_state(op_id, phase, peer, error, op_state, out);
+        self.route_rpc_error(op_id, phase, peer, error, op_state, out);
     }
 
     #[tracing::instrument(
@@ -717,7 +718,7 @@ impl DhtStateMachine {
         skip(self, response, op_state, out),
         fields(op_id, phase = ?phase, peer = %peer, response = response_kind(&response))
     )]
-    fn handle_rpc_response_state(
+    fn route_rpc_response(
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
@@ -727,16 +728,16 @@ impl DhtStateMachine {
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         match op_state {
-            OpState::Put(op) => self.handle_rpc_response_put(op_id, phase, peer, response, op, out),
-            OpState::Get(op) => self.handle_rpc_response_get(op_id, phase, peer, response, op, out),
+            OpState::Put(op) => self.handle_put_response(op_id, phase, peer, response, op, out),
+            OpState::Get(op) => self.handle_get_response(op_id, phase, peer, response, op, out),
             OpState::Bootstrap(op) => {
-                self.handle_rpc_response_bootstrap(op_id, phase, peer, response, op, out)
+                self.handle_bootstrap_response(op_id, phase, peer, response, op, out)
             }
             OpState::EvictionPing(op) => {
-                self.handle_rpc_response_eviction_ping(op_id, phase, response, op, out)
+                self.handle_eviction_response(op_id, phase, response, op, out)
             }
             OpState::MaintenancePing(op) => {
-                self.handle_rpc_response_maintenance_ping(op_id, phase, peer, response, op, out)
+                self.handle_maintenance_response(op_id, phase, peer, response, op, out)
             }
             OpState::InboundGet(op) => {
                 self.ops.insert(op_id, OpState::InboundGet(op));
@@ -747,7 +748,7 @@ impl DhtStateMachine {
         }
     }
 
-    fn handle_rpc_response_put(
+    fn handle_put_response(
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
@@ -771,7 +772,7 @@ impl DhtStateMachine {
                     | DhtResponse::Error { .. } => {}
                 }
 
-                self.dispatch_put_lookup_requests(op_id, &mut op, out);
+                self.dispatch_put_lookups(op_id, &mut op, out);
                 if self.put_lookup_exhausted(&op) {
                     self.begin_put_store(op_id, &mut op, out);
                 }
@@ -791,7 +792,7 @@ impl DhtStateMachine {
         self.maybe_complete_put(op_id, op, out);
     }
 
-    fn handle_rpc_response_get(
+    fn handle_get_response(
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
@@ -815,7 +816,7 @@ impl DhtStateMachine {
                     if !stored_value_bounded(&op.key, &entry, self.now_secs)
                         || !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id)
                     {
-                        record_get_peer_error(&mut op, peer, "invalid_record");
+                        record_peer_error(&mut op, peer, "invalid_record");
                         continue;
                     }
                     valid_response = true;
@@ -862,7 +863,7 @@ impl DhtStateMachine {
                             return;
                         }
                         Err(MergeError::Encoding | MergeError::Invalid) => {
-                            record_get_peer_error(&mut op, peer, "invalid_record");
+                            record_peer_error(&mut op, peer, "invalid_record");
                             continue;
                         }
                     };
@@ -892,10 +893,10 @@ impl DhtStateMachine {
                     .add_candidates(closer_nodes, self.local_id, op.key.as_bytes());
             }
             DhtResponse::Error { code, .. } => {
-                record_get_peer_error(&mut op, peer, format!("remote_error:{code:?}"));
+                record_peer_error(&mut op, peer, format!("remote_error:{code:?}"));
             }
             DhtResponse::Pong | DhtResponse::Nodes { .. } | DhtResponse::Stored => {
-                record_get_peer_error(&mut op, peer, "unexpected_response");
+                record_peer_error(&mut op, peer, "unexpected_response");
             }
         }
 
@@ -903,7 +904,7 @@ impl DhtStateMachine {
         self.maybe_complete_get(op_id, op, out);
     }
 
-    fn handle_rpc_response_bootstrap(
+    fn handle_bootstrap_response(
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
@@ -930,7 +931,7 @@ impl DhtStateMachine {
         );
     }
 
-    fn handle_rpc_response_eviction_ping(
+    fn handle_eviction_response(
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
@@ -960,7 +961,7 @@ impl DhtStateMachine {
         }
     }
 
-    fn handle_rpc_response_maintenance_ping(
+    fn handle_maintenance_response(
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
@@ -991,7 +992,7 @@ impl DhtStateMachine {
         skip(self, error, op_state, out),
         fields(op_id, phase = ?phase, error = %error)
     )]
-    fn handle_rpc_error_state(
+    fn route_rpc_error(
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
@@ -1001,13 +1002,11 @@ impl DhtStateMachine {
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         match op_state {
-            OpState::Put(op) => self.handle_rpc_error_put(op_id, phase, error, op, out),
-            OpState::Get(op) => self.handle_rpc_error_get(op_id, phase, peer, error, op, out),
-            OpState::Bootstrap(op) => self.handle_rpc_error_bootstrap(op_id, phase, error, op, out),
-            OpState::EvictionPing(op) => self.handle_rpc_error_eviction_ping(op_id, phase, op),
-            OpState::MaintenancePing(op) => {
-                self.handle_rpc_error_maintenance_ping(op_id, phase, op)
-            }
+            OpState::Put(op) => self.handle_put_error(op_id, phase, error, op, out),
+            OpState::Get(op) => self.handle_get_error(op_id, phase, peer, error, op, out),
+            OpState::Bootstrap(op) => self.handle_bootstrap_error(op_id, phase, error, op, out),
+            OpState::EvictionPing(op) => self.handle_eviction_error(op_id, phase, op),
+            OpState::MaintenancePing(op) => self.handle_maintenance_error(op_id, phase, op),
             OpState::InboundGet(op) => {
                 self.ops.insert(op_id, OpState::InboundGet(op));
             }
@@ -1017,7 +1016,7 @@ impl DhtStateMachine {
         }
     }
 
-    fn handle_rpc_error_put(
+    fn handle_put_error(
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
@@ -1027,7 +1026,7 @@ impl DhtStateMachine {
     ) {
         match phase {
             RpcPhase::PutLookup => {
-                self.dispatch_put_lookup_requests(op_id, &mut op, out);
+                self.dispatch_put_lookups(op_id, &mut op, out);
                 if self.put_lookup_exhausted(&op) {
                     self.begin_put_store(op_id, &mut op, out);
                 }
@@ -1042,7 +1041,7 @@ impl DhtStateMachine {
         self.maybe_complete_put(op_id, op, out);
     }
 
-    fn handle_rpc_error_get(
+    fn handle_get_error(
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
@@ -1056,12 +1055,12 @@ impl DhtStateMachine {
             return;
         }
 
-        record_get_peer_error(&mut op, peer, dht_io_error_label(&error));
+        record_peer_error(&mut op, peer, io_error_label(&error));
         self.dispatch_get_requests(op_id, &mut op, out);
         self.maybe_complete_get(op_id, op, out);
     }
 
-    fn handle_rpc_error_bootstrap(
+    fn handle_bootstrap_error(
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
@@ -1077,7 +1076,7 @@ impl DhtStateMachine {
         self.finish_bootstrap(op_id, op, error, out);
     }
 
-    fn handle_rpc_error_eviction_ping(&mut self, op_id: OpId, phase: RpcPhase, op: EvictionPingOp) {
+    fn handle_eviction_error(&mut self, op_id: OpId, phase: RpcPhase, op: EvictionPingOp) {
         if phase != RpcPhase::EvictionPing {
             self.ops.insert(op_id, OpState::EvictionPing(op));
             return;
@@ -1093,12 +1092,7 @@ impl DhtStateMachine {
         }
     }
 
-    fn handle_rpc_error_maintenance_ping(
-        &mut self,
-        op_id: OpId,
-        phase: RpcPhase,
-        op: MaintenancePingOp,
-    ) {
+    fn handle_maintenance_error(&mut self, op_id: OpId, phase: RpcPhase, op: MaintenancePingOp) {
         if phase != RpcPhase::MaintenancePing {
             self.ops.insert(op_id, OpState::MaintenancePing(op));
             return;
@@ -1335,7 +1329,7 @@ impl DhtStateMachine {
                     op.key.as_bytes(),
                 );
 
-                self.dispatch_put_lookup_requests(op_id, &mut op, out);
+                self.dispatch_put_lookups(op_id, &mut op, out);
                 if self.put_lookup_exhausted(&op) {
                     self.begin_put_store(op_id, &mut op, out);
                 }
@@ -1485,9 +1479,8 @@ impl DhtStateMachine {
                     self.maybe_complete_get(op_id, op, out);
                 }
                 StorageStage::GetRemoteMerge => {
-                    // Read-repair write-back is best-effort: the looked-up values are
-                    // already signature-validated, so a losing write-back (stale
-                    // revision, full store, retry exhaustion) still completes the get.
+                    // Read-repair write-back is best-effort: the values are already
+                    // signature-validated, so a losing write-back still completes the get.
                     tracing::debug!(op_id, %error, "DHT read-repair write-back failed; completing get");
                     self.maybe_complete_get(op_id, op, out);
                 }
@@ -1546,7 +1539,7 @@ impl DhtStateMachine {
                 })));
             }
             DhtRequest::GetValue { key, realm_filter } => {
-                let op_id = self.alloc_internal_op_id();
+                let op_id = self.allocate_internal_id();
                 let mut op = OpState::InboundGet(InboundGetOp {
                     inbound_id,
                     key,
@@ -1648,7 +1641,7 @@ impl DhtStateMachine {
                     retain_until: expires_at,
                 };
 
-                let op_id = self.alloc_internal_op_id();
+                let op_id = self.allocate_internal_id();
                 let mut op = OpState::InboundPut(InboundPutOp {
                     inbound_id,
                     pending: HashMap::new(),
@@ -1706,7 +1699,7 @@ impl DhtStateMachine {
         skip(self, op, out),
         fields(op_id, key = %op.key)
     )]
-    fn dispatch_put_lookup_requests(
+    fn dispatch_put_lookups(
         &mut self,
         op_id: OpId,
         op: &mut PutOp,
@@ -1920,7 +1913,7 @@ impl DhtStateMachine {
         let idx = (now_tick as usize) % peers.len();
         let peer = peers[idx].clone();
 
-        let op_id = self.alloc_internal_op_id();
+        let op_id = self.allocate_internal_id();
         let mut op = OpState::MaintenancePing(MaintenancePingOp {
             peer: peer.node_id,
             peer_seen: peer.last_seen,
@@ -1999,7 +1992,7 @@ impl DhtStateMachine {
             return;
         }
 
-        let op_id = self.alloc_internal_op_id();
+        let op_id = self.allocate_internal_id();
         let mut op = OpState::EvictionPing(EvictionPingOp {
             oldest_node: oldest_peer.node_id,
             oldest_seen: oldest_peer.last_seen,
@@ -2154,7 +2147,7 @@ impl DhtStateMachine {
     }
 
     #[tracing::instrument(name = "dht.state.collect_timeouts", level = "trace", skip(self))]
-    fn collect_timed_out_rpc(&self) -> Vec<(OpId, RpcPhase, NodeId)> {
+    fn collect_rpc_timeouts(&self) -> Vec<(OpId, RpcPhase, NodeId)> {
         let mut timed_out = Vec::new();
 
         for (op_id, op) in &self.ops {
@@ -2174,7 +2167,7 @@ impl DhtStateMachine {
     }
 
     #[tracing::instrument(name = "dht.state.alloc_internal_op", level = "trace", skip(self))]
-    fn alloc_internal_op_id(&mut self) -> OpId {
+    fn allocate_internal_id(&mut self) -> OpId {
         let op_id = self.next_internal_op_id;
         self.next_internal_op_id = self.next_internal_op_id.saturating_add(1);
         op_id
@@ -2360,7 +2353,7 @@ fn limited_sorted_peers(peers: &HashSet<NodeId>, limit: usize) -> Vec<NodeId> {
     peers
 }
 
-fn record_get_peer_error(op: &mut GetOp, peer: NodeId, error: impl Into<String>) {
+fn record_peer_error(op: &mut GetOp, peer: NodeId, error: impl Into<String>) {
     op.peer_error_count = op.peer_error_count.saturating_add(1);
     if op.peer_errors.len() >= LOOKUP_LOG_ERROR_LIMIT {
         return;
@@ -2372,7 +2365,7 @@ fn record_get_peer_error(op: &mut GetOp, peer: NodeId, error: impl Into<String>)
     });
 }
 
-fn dht_io_error_label(error: &DhtIoError) -> &'static str {
+fn io_error_label(error: &DhtIoError) -> &'static str {
     match error {
         DhtIoError::QueueFull => "queue_full",
         DhtIoError::Shutdown => "shutdown",
@@ -2426,85 +2419,14 @@ fn rpc_phase_order(phase: RpcPhase) -> u8 {
     }
 }
 
-fn dht_input_kind(input: &DhtInput) -> &'static str {
-    match input {
-        DhtInput::Cmd(cmd) => dht_cmd_kind(cmd),
-        DhtInput::Io(io) => dht_io_kind(io),
-        DhtInput::Clock { .. } => "clock",
-        DhtInput::Tick { .. } => "tick",
-    }
-}
-
-fn dht_cmd_kind(cmd: &DhtCmd) -> &'static str {
-    match cmd {
-        DhtCmd::Put { .. } => "put",
-        DhtCmd::Get { .. } => "get",
-        DhtCmd::Cancel { .. } => "cancel",
-        DhtCmd::Bootstrap { .. } => "bootstrap",
-        DhtCmd::RoutingTableSize { .. } => "routing_table_size",
-        DhtCmd::AddPeer { .. } => "add_peer",
-    }
-}
-
-fn dht_io_kind(io: &DhtIo) -> &'static str {
-    match io {
-        DhtIo::RpcResponse { .. } => "rpc_response",
-        DhtIo::RpcError { .. } => "rpc_error",
-        DhtIo::InboundRequest { .. } => "inbound_request",
-        DhtIo::InboundReadError { .. } => "inbound_read_error",
-        DhtIo::InboundDropped { .. } => "inbound_dropped",
-        DhtIo::StorageReadResult { .. } => "storage_read_result",
-        DhtIo::StorageRevisionResult { .. } => "storage_revision_result",
-        DhtIo::StorageWriteResult { .. } => "storage_write_result",
-        DhtIo::StorageIterResult { .. } => "storage_iter_result",
-        DhtIo::StorageError { .. } => "storage_error",
-        DhtIo::PeerSeen { .. } => "peer_seen",
-    }
-}
-
-fn dht_io_op_id(io: &DhtIo) -> Option<OpId> {
-    match io {
-        DhtIo::RpcResponse { op_id, .. }
-        | DhtIo::RpcError { op_id, .. }
-        | DhtIo::StorageReadResult { op_id, .. }
-        | DhtIo::StorageRevisionResult { op_id, .. }
-        | DhtIo::StorageWriteResult { op_id, .. }
-        | DhtIo::StorageIterResult { op_id, .. }
-        | DhtIo::StorageError { op_id, .. } => Some(*op_id),
-        DhtIo::InboundRequest { .. }
-        | DhtIo::InboundReadError { .. }
-        | DhtIo::InboundDropped { .. }
-        | DhtIo::PeerSeen { .. } => None,
-    }
-}
-
-fn dht_io_inbound_id(io: &DhtIo) -> Option<InboundId> {
-    match io {
-        DhtIo::InboundRequest { inbound_id, .. }
-        | DhtIo::InboundReadError { inbound_id, .. }
-        | DhtIo::InboundDropped { inbound_id } => Some(*inbound_id),
-        DhtIo::RpcResponse { .. }
-        | DhtIo::RpcError { .. }
-        | DhtIo::StorageReadResult { .. }
-        | DhtIo::StorageRevisionResult { .. }
-        | DhtIo::StorageWriteResult { .. }
-        | DhtIo::StorageIterResult { .. }
-        | DhtIo::StorageError { .. }
-        | DhtIo::PeerSeen { .. } => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{make_node, make_secret};
     use aruna_core::structs::RealmNodeKind;
     use aruna_core::types::UserId;
     use std::collections::BTreeMap;
     use std::sync::Arc;
-
-    fn make_node(seed: u8) -> NodeId {
-        make_secret(seed).public()
-    }
 
     fn user_kinds(peer: NodeId) -> PeerKinds {
         Arc::new(parking_lot::RwLock::new(BTreeMap::from([(
@@ -2513,12 +2435,6 @@ mod tests {
                 owner: UserId::nil(make_realm(1)),
             },
         )])))
-    }
-
-    fn make_secret(seed: u8) -> iroh::SecretKey {
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes[0] = seed;
-        iroh::SecretKey::from_bytes(&seed_bytes)
     }
 
     fn make_realm(seed: u8) -> RealmId {
@@ -3905,7 +3821,7 @@ mod tests {
     }
 
     #[test]
-    fn step_returns_smallvec_capacity_four() {
+    fn step_smallvec_four() {
         let local_secret = iroh::SecretKey::from_bytes(&[7u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -3922,7 +3838,7 @@ mod tests {
     }
 
     #[test]
-    fn add_peer_is_sync_and_emits_no_effect_when_not_full() {
+    fn add_peer_noop() {
         let local_secret = iroh::SecretKey::from_bytes(&[11u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -3933,7 +3849,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_replay_produces_identical_effects() {
+    fn deterministic_replay_effects() {
         let local_secret_a = iroh::SecretKey::from_bytes(&[21u8; 32]);
         let local_id_a = local_secret_a.public();
         let local_secret_b = iroh::SecretKey::from_bytes(&[21u8; 32]);
@@ -3976,7 +3892,7 @@ mod tests {
     }
 
     #[test]
-    fn late_rpc_response_is_ignored_after_timeout() {
+    fn late_response_ignored() {
         let local_secret = iroh::SecretKey::from_bytes(&[23u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -4027,7 +3943,7 @@ mod tests {
     }
 
     #[test]
-    fn get_lookup_continues_with_closer_nodes() {
+    fn get_uses_closer() {
         let local_secret = iroh::SecretKey::from_bytes(&[31u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -4095,7 +4011,7 @@ mod tests {
     }
 
     #[test]
-    fn get_trace_context_propagates_to_remote_lookup() {
+    fn get_propagates_trace() {
         let local_secret = iroh::SecretKey::from_bytes(&[32u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -4137,7 +4053,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_trace_context_propagates_to_ping() {
+    fn bootstrap_propagates_trace() {
         let local_secret = iroh::SecretKey::from_bytes(&[33u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -4659,7 +4575,7 @@ mod tests {
     }
 
     #[test]
-    fn get_forwards_realm_filter_to_remote_lookups() {
+    fn get_forwards_filter() {
         let local_secret = iroh::SecretKey::from_bytes(&[59u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
@@ -4789,7 +4705,7 @@ mod tests {
     }
 
     #[test]
-    fn get_stats_include_peer_errors_until_remote_value() {
+    fn get_reports_errors() {
         let local_secret = iroh::SecretKey::from_bytes(&[61u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
@@ -4893,7 +4809,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_partial_success_completes_when_other_peer_times_out() {
+    fn bootstrap_partial_success() {
         let local_secret = iroh::SecretKey::from_bytes(&[47u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -4936,7 +4852,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_rpc_phase_is_ignored_and_operation_continues() {
+    fn wrong_phase_ignored() {
         let local_secret = iroh::SecretKey::from_bytes(&[48u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -5009,7 +4925,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_put_missing_signature_returns_invalid_signature_error() {
+    fn unsigned_put_rejected() {
         let local_secret = iroh::SecretKey::from_bytes(&[50u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -5106,7 +5022,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_get_filters_response_entries_by_realm() {
+    fn inbound_realm_filter() {
         let local_secret = iroh::SecretKey::from_bytes(&[60u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
@@ -5444,7 +5360,7 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_ping_timeout_removes_peer_from_routing_table() {
+    fn maintenance_timeout_evicts() {
         let local_secret = iroh::SecretKey::from_bytes(&[54u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -5629,7 +5545,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_operation_io_is_ignored() {
+    fn unknown_io_ignored() {
         let local_secret = iroh::SecretKey::from_bytes(&[55u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);

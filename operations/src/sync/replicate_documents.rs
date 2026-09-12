@@ -1,0 +1,702 @@
+use aruna_core::NodeId;
+use aruna_core::document::{DocumentSyncTarget, PendingShardPlacement};
+use aruna_core::effects::Effect;
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::structs::{DocumentClass, PlacementRef, RealmConfigDocument, RealmId};
+use aruna_core::task::TaskEvent;
+use aruna_core::types::Effects;
+use smallvec::smallvec;
+use thiserror::Error;
+use tracing::warn;
+
+use crate::document_repository::read_effect;
+use crate::placement::{document_class, plan_target_placement};
+use crate::sync::announce::AnnounceTopicOperation;
+use crate::sync::shard_placement::{
+    delete_placement_effect, new_placement, placement_satisfied, schedule_retry_effect,
+    write_placement_effect,
+};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplicateDocumentsConfig {
+    pub realm_id: RealmId,
+    pub local_node_id: NodeId,
+    pub excluded_peers: Vec<NodeId>,
+    pub documents: Vec<DocumentSyncTarget>,
+    /// Whether announces this run may mint a missing topic genesis. True for a
+    /// document's origin; for shared node-usage only the realm-bootstrap node, so
+    /// joiners ride the TopicNotReady retry instead of forking.
+    pub allow_genesis: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ReplicateDocumentsOperation {
+    config: ReplicateDocumentsConfig,
+    state: ReplicateDocumentsState,
+    pending_documents: Vec<DocumentSyncTarget>,
+    realm_config: Option<RealmConfigDocument>,
+    placement_action: Option<PlacementAction>,
+    retry_needed: bool,
+    output: Option<Result<(), ReplicateDocumentsError>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ReplicateDocumentsState {
+    Init,
+    LoadRealmConfig,
+    Publish,
+    StorePlacement,
+    ScheduleRetry,
+    Finish,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PlacementAction {
+    Write(PendingShardPlacement),
+    Delete(PlacementRef),
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum ReplicateDocumentsError {
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error("realm config document not found")]
+    RealmConfigNotFound,
+    #[error("document sync failed: {0}")]
+    DocumentSync(String),
+    #[error("placement persistence failed: {0}")]
+    Placement(String),
+    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
+    UnexpectedEvent {
+        state: String,
+        expected: &'static str,
+        got: String,
+    },
+}
+
+pub fn replicate_documents_effect(
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    documents: Vec<DocumentSyncTarget>,
+) -> Effect {
+    Effect::SubOperation(boxed_suboperation(
+        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents,
+            // The node authoring the change originates every document it replicates
+            // here, so it may mint any missing topic genesis.
+            allow_genesis: true,
+        }),
+        |result| {
+            Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+                result: result.map_err(|error| error.to_string()),
+            })
+        },
+    ))
+}
+
+impl ReplicateDocumentsOperation {
+    pub fn new(config: ReplicateDocumentsConfig) -> Self {
+        Self {
+            pending_documents: config.documents.clone().into_iter().rev().collect(),
+            config,
+            state: ReplicateDocumentsState::Init,
+            realm_config: None,
+            placement_action: None,
+            retry_needed: false,
+            output: None,
+        }
+    }
+
+    fn fail(&mut self, error: ReplicateDocumentsError) -> Effects {
+        self.state = ReplicateDocumentsState::Error;
+        self.output = Some(Err(error));
+        smallvec![]
+    }
+
+    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+        self.fail(ReplicateDocumentsError::UnexpectedEvent {
+            state: format!("{:?}", self.state),
+            expected,
+            got,
+        })
+    }
+
+    fn finish_success(&mut self) -> Effects {
+        self.state = ReplicateDocumentsState::Finish;
+        self.output = Some(Ok(()));
+        smallvec![]
+    }
+
+    fn emit_next_publish(&mut self) -> Effects {
+        let Some(document) = self.pending_documents.pop() else {
+            return self.finish_success();
+        };
+
+        // Admin documents replicate as operations over their shared topic; they never
+        // take placements, so skip them without a placement write or publish attempt.
+        if document.is_admin_document() {
+            return self.emit_next_publish();
+        }
+
+        // Metadata uses its recorded bucket and its own outbox, never a rederived target bucket.
+        if matches!(
+            document_class(&document),
+            DocumentClass::Metadata | DocumentClass::MetadataRegistry
+        ) {
+            debug_assert!(
+                false,
+                "metadata target {document:?} must publish from its stored placement"
+            );
+            return self.emit_next_publish();
+        }
+
+        let Some(realm_config) = self.realm_config.as_ref() else {
+            return self.emit_next_publish();
+        };
+        // No bound strategy means this target has no placement work.
+        let plan = match plan_target_placement(realm_config, &document, Default::default()) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return self.emit_next_publish(),
+            Err(_) => {
+                // Unresolvable bucket: keep a durable pending record so the
+                // reconciler retries, and announce nothing to nonholders.
+                let placement = crate::placement::target_placement_ref(
+                    realm_config,
+                    &document,
+                    Default::default(),
+                );
+                self.placement_action = Some(PlacementAction::Write(new_placement(
+                    self.config.realm_id,
+                    placement,
+                    self.config.local_node_id,
+                    Vec::new(),
+                )));
+                return match self.emit_placement_update() {
+                    Ok(effects) => effects,
+                    Err(error) => self.fail(error),
+                };
+            }
+        };
+        let desired_count = plan.desired_count;
+        let placement = plan.placement;
+
+        // The origin is the authoritative holder; replicate to the remaining
+        // top-ranked holders (excluding self and any explicit exclusions).
+        let local_node_id = self.config.local_node_id;
+        let excluded_peers = &self.config.excluded_peers;
+        let selected_peers: Vec<NodeId> = plan
+            .holders
+            .into_iter()
+            .filter(|node_id| *node_id != local_node_id && !excluded_peers.contains(node_id))
+            .take(desired_count.saturating_sub(1))
+            .collect();
+
+        self.placement_action = if placement_satisfied(selected_peers.len(), desired_count) {
+            Some(PlacementAction::Delete(placement))
+        } else {
+            Some(PlacementAction::Write(new_placement(
+                self.config.realm_id,
+                placement,
+                local_node_id,
+                selected_peers.clone(),
+            )))
+        };
+
+        if selected_peers.is_empty()
+            && !matches!(
+                document,
+                DocumentSyncTarget::NodeUsage { .. }
+                    | DocumentSyncTarget::WatchInterest { .. }
+                    | DocumentSyncTarget::NodeInfo { .. }
+            )
+        {
+            return match self.emit_placement_update() {
+                Ok(effects) => effects,
+                Err(error) => self.fail(error),
+            };
+        }
+
+        self.state = ReplicateDocumentsState::Publish;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            AnnounceTopicOperation::new_with_placement(
+                document.topic_id(),
+                self.config.local_node_id,
+                Some(document),
+                selected_peers,
+                placement,
+                self.config.allow_genesis,
+            ),
+            |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+                result: result.map_err(|error| error.to_string()),
+            }),
+        ))]
+    }
+
+    fn emit_placement_update(&mut self) -> Result<Effects, ReplicateDocumentsError> {
+        let Some(action) = self.placement_action.take() else {
+            return Ok(self.emit_next_publish());
+        };
+        self.state = ReplicateDocumentsState::StorePlacement;
+        match action {
+            PlacementAction::Write(record) => {
+                self.retry_needed = true;
+                Ok(smallvec![write_placement_effect(&record).map_err(
+                    |error| ReplicateDocumentsError::Placement(error.to_string())
+                )?])
+            }
+            PlacementAction::Delete(placement) => {
+                self.retry_needed = false;
+                Ok(smallvec![delete_placement_effect(
+                    self.config.realm_id,
+                    &placement
+                )])
+            }
+        }
+    }
+
+    fn retry_failed_publish(&mut self, error: String) -> Effects {
+        let Some(action) = self.placement_action.take() else {
+            return self.fail(ReplicateDocumentsError::DocumentSync(error));
+        };
+        let placement = match action {
+            PlacementAction::Write(record) => record.placement,
+            PlacementAction::Delete(placement) => placement,
+        };
+        warn!(placement = ?placement, error = %error, "Document sync failed; queued shard placement retry");
+        // Re-queue the shard with no selected co-holders so the placement
+        // reconciler re-resolves and re-ensures topic membership.
+        self.placement_action = Some(PlacementAction::Write(new_placement(
+            self.config.realm_id,
+            placement,
+            self.config.local_node_id,
+            Vec::new(),
+        )));
+        match self.emit_placement_update() {
+            Ok(effects) => effects,
+            Err(error) => self.fail(error),
+        }
+    }
+}
+
+impl Operation for ReplicateDocumentsOperation {
+    type Output = ();
+    type Error = ReplicateDocumentsError;
+
+    fn start(&mut self) -> Effects {
+        self.state = ReplicateDocumentsState::LoadRealmConfig;
+        smallvec![read_effect(
+            &DocumentSyncTarget::RealmConfig {
+                realm_id: self.config.realm_id,
+            },
+            None,
+        )]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match self.state {
+            ReplicateDocumentsState::LoadRealmConfig => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let Some(value) = value else {
+                        self.realm_config = None;
+                        return self.emit_next_publish();
+                    };
+                    let config = match RealmConfigDocument::from_bytes(&value) {
+                        Ok(config) => config,
+                        Err(error) => return self.fail(error.into()),
+                    };
+                    self.realm_config = Some(config);
+                    self.emit_next_publish()
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("realm config read result", format!("{other:?}")),
+            },
+            ReplicateDocumentsState::Publish => match event {
+                Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
+                    match result {
+                        Ok(()) => match self.emit_placement_update() {
+                            Ok(effects) => effects,
+                            Err(error) => self.fail(error),
+                        },
+                        Err(error) => self.retry_failed_publish(error),
+                    }
+                }
+                other => self.unexpected_event("document sync result", format!("{other:?}")),
+            },
+            ReplicateDocumentsState::StorePlacement => match event {
+                Event::Storage(StorageEvent::WriteResult { .. })
+                | Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                    if self.retry_needed {
+                        self.state = ReplicateDocumentsState::ScheduleRetry;
+                        smallvec![schedule_retry_effect(
+                            self.config.realm_id,
+                            self.config.local_node_id,
+                        )]
+                    } else {
+                        self.emit_next_publish()
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("placement storage result", format!("{other:?}")),
+            },
+            ReplicateDocumentsState::ScheduleRetry => match event {
+                Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                    self.retry_needed = false;
+                    self.emit_next_publish()
+                }
+                Event::Task(TaskEvent::Error { message, .. }) => {
+                    warn!(message = %message, "Failed to schedule placement retry; pending placement remains durable");
+                    self.retry_needed = false;
+                    self.emit_next_publish()
+                }
+                other => self.unexpected_event("task timer schedule result", format!("{other:?}")),
+            },
+            ReplicateDocumentsState::Init
+            | ReplicateDocumentsState::Finish
+            | ReplicateDocumentsState::Error => smallvec![],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(
+            self.state,
+            ReplicateDocumentsState::Finish | ReplicateDocumentsState::Error
+        )
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Ok(()))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::{PlacementStrategy, RealmNodeKind};
+    use aruna_core::task::TaskEvent;
+    use ulid::Ulid;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn group_target(seed: u8) -> DocumentSyncTarget {
+        DocumentSyncTarget::Group {
+            group_id: Ulid::from_bytes([seed; 16]),
+        }
+    }
+
+    fn node_usage_target(realm_id: RealmId, node_id: NodeId) -> DocumentSyncTarget {
+        DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id,
+            group_id: None,
+        }
+    }
+
+    fn watch_interest_target(realm_id: RealmId, node_id: NodeId) -> DocumentSyncTarget {
+        DocumentSyncTarget::WatchInterest { realm_id, node_id }
+    }
+
+    fn node_info_target(realm_id: RealmId, node_id: NodeId) -> DocumentSyncTarget {
+        DocumentSyncTarget::NodeInfo { realm_id, node_id }
+    }
+
+    fn config_with(nodes: &[NodeId], replica: Option<u32>) -> RealmConfigDocument {
+        let mut config = RealmConfigDocument::new(RealmId::from_bytes([7u8; 32]), Vec::new(), 3);
+        let strategy = PlacementStrategy {
+            strategy_id: Ulid::from_bytes([9u8; 16]),
+            name: "default".to_string(),
+            replica_count: replica,
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 64,
+        };
+        config.default_strategy_id = Some(strategy.strategy_id);
+        config.strategies = vec![strategy];
+        for node_id in nodes {
+            config.ensure_node(*node_id, RealmNodeKind::Server);
+        }
+        config
+    }
+
+    #[test]
+    fn schedule_error_nonblocking() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: node(1),
+            excluded_peers: Vec::new(),
+            documents: Vec::new(),
+            allow_genesis: true,
+        });
+        operation.state = ReplicateDocumentsState::ScheduleRetry;
+        operation.retry_needed = true;
+
+        let effects = operation.step(Event::Task(TaskEvent::Error {
+            key: None,
+            message: "task handle unavailable".to_string(),
+        }));
+
+        assert!(effects.is_empty());
+        assert_eq!(operation.state, ReplicateDocumentsState::Finish);
+        assert_eq!(operation.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn unresolved_keeps_record() {
+        // A governed target whose bucket cannot resolve writes the durable
+        // pending record with no peers and announces nothing.
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let target = node_usage_target(realm_id, node(5));
+        let local_node_id = node(1);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![target],
+            allow_genesis: true,
+        });
+        let mut config = config_with(&[local_node_id, node(2)], Some(3));
+        // A published map without an activation makes the bucket unresolvable.
+        config.candidate_maps.push(config.freeze_map(1));
+        operation.realm_config = Some(config);
+
+        let effects = operation.emit_next_publish();
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::SubOperation(_))),
+            "an unresolvable bucket must not announce"
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::Storage(_)]),
+            "expected the durable pending placement write"
+        );
+        assert_eq!(operation.state, ReplicateDocumentsState::StorePlacement);
+        assert!(operation.retry_needed);
+    }
+
+    #[test]
+    fn peers_satisfy_placement() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let target = node_usage_target(realm_id, node(4));
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: node(1),
+            excluded_peers: Vec::new(),
+            documents: vec![target.clone()],
+            allow_genesis: true,
+        });
+        operation.realm_config = Some(config_with(&[node(1), node(2), node(3)], Some(3)));
+
+        let effects = operation.emit_next_publish();
+
+        assert!(matches!(
+            operation.placement_action,
+            Some(PlacementAction::Delete(_))
+        ));
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    }
+
+    #[test]
+    fn pending_records_origin() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let target = node_usage_target(realm_id, node(5));
+        let local_node_id = node(1);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![target],
+            allow_genesis: true,
+        });
+        // Replica target of three but only two eligible nodes ⇒ stays pending.
+        operation.realm_config = Some(config_with(&[local_node_id, node(2)], Some(3)));
+
+        let effects = operation.emit_next_publish();
+
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let Some(PlacementAction::Write(record)) = operation.placement_action else {
+            panic!("expected pending placement write");
+        };
+        assert_eq!(record.authoritative_node_id, local_node_id);
+        assert_eq!(record.selected_peers, vec![node(2)]);
+    }
+
+    #[test]
+    fn node_usage_peerless() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let local_node_id = node(1);
+        let target = node_usage_target(realm_id, local_node_id);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![target.clone()],
+            allow_genesis: true,
+        });
+        operation.realm_config = Some(config_with(&[local_node_id], Some(3)));
+
+        let effects = operation.emit_next_publish();
+
+        let Some(PlacementAction::Write(record)) = operation.placement_action else {
+            panic!("expected pending placement write");
+        };
+        assert_eq!(record.authoritative_node_id, local_node_id);
+        assert!(record.selected_peers.is_empty());
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    }
+
+    #[test]
+    fn watch_interest_peerless() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let local_node_id = node(1);
+        let target = watch_interest_target(realm_id, local_node_id);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![target.clone()],
+            allow_genesis: true,
+        });
+        operation.realm_config = Some(config_with(&[local_node_id], Some(3)));
+
+        let effects = operation.emit_next_publish();
+
+        let Some(PlacementAction::Write(record)) = operation.placement_action else {
+            panic!("expected pending placement write");
+        };
+        assert_eq!(record.authoritative_node_id, local_node_id);
+        assert!(record.selected_peers.is_empty());
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    }
+
+    // Node info rides the shared realm topic, so a single-node realm still
+    // publishes it instead of parking it behind a placement retry.
+    #[test]
+    fn node_info_peerless() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let local_node_id = node(1);
+        let target = node_info_target(realm_id, local_node_id);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![target.clone()],
+            allow_genesis: true,
+        });
+        operation.realm_config = Some(config_with(&[local_node_id], Some(3)));
+
+        let effects = operation.emit_next_publish();
+
+        let Some(PlacementAction::Write(record)) = operation.placement_action else {
+            panic!("expected pending placement write");
+        };
+        assert_eq!(record.authoritative_node_id, local_node_id);
+        assert!(record.selected_peers.is_empty());
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    }
+
+    #[test]
+    fn failure_keeps_origin() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let target = node_usage_target(realm_id, node(6));
+        let local_node_id = node(1);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![target.clone()],
+            allow_genesis: true,
+        });
+        operation.realm_config = Some(config_with(&[local_node_id, node(2)], Some(3)));
+        operation.state = ReplicateDocumentsState::Publish;
+        operation.placement_action = Some(PlacementAction::Delete(PlacementRef {
+            strategy_id: ulid::Ulid::from_bytes([9u8; 16]),
+            shard: 1,
+        }));
+
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+            result: Err("publish failed".to_string()),
+        }));
+
+        let [Effect::Storage(aruna_core::effects::StorageEffect::Write { value, .. })] =
+            effects.as_slice()
+        else {
+            panic!("expected placement write");
+        };
+        let record = crate::sync::shard_placement::decode_placement(value.as_ref())
+            .expect("placement decodes");
+        assert_eq!(record.authoritative_node_id, local_node_id);
+        assert!(record.selected_peers.is_empty());
+    }
+
+    #[test]
+    fn selection_uses_rendezvous() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let target = node_usage_target(realm_id, node(7));
+
+        let mut first = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: node(1),
+            excluded_peers: Vec::new(),
+            documents: vec![target.clone()],
+            allow_genesis: true,
+        });
+        first.realm_config = Some(config_with(&[node(1), node(2)], Some(3)));
+        let _ = first.emit_next_publish();
+
+        let mut second = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: node(9),
+            excluded_peers: Vec::new(),
+            documents: vec![target],
+            allow_genesis: true,
+        });
+        second.realm_config = Some(config_with(&[node(9), node(2)], Some(3)));
+        let _ = second.emit_next_publish();
+
+        let Some(PlacementAction::Write(first_record)) = first.placement_action else {
+            panic!("expected first placement");
+        };
+        let Some(PlacementAction::Write(second_record)) = second.placement_action else {
+            panic!("expected second placement");
+        };
+        assert_eq!(first_record.selected_peers, second_record.selected_peers);
+        assert_ne!(
+            first_record.authoritative_node_id,
+            second_record.authoritative_node_id
+        );
+    }
+
+    #[test]
+    fn admin_skips_placement() {
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id: RealmId::from_bytes([7u8; 32]),
+            local_node_id: node(1),
+            excluded_peers: Vec::new(),
+            documents: vec![group_target(4)],
+            allow_genesis: true,
+        });
+
+        let effects = operation.emit_next_publish();
+
+        assert!(effects.is_empty());
+        assert!(operation.placement_action.is_none());
+        assert_eq!(operation.state, ReplicateDocumentsState::Finish);
+        assert_eq!(operation.finalize(), Ok(()));
+    }
+}

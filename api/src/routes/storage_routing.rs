@@ -2,11 +2,11 @@ use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{
-    AuthContext, BackendRef, Permission, RoutingTarget, StorageRoutingRule,
-    blob_bucket_permission_path, target_warnings,
+    AuthContext, BackendRef, Permission, RoutingTarget, StorageRoutingRule, bucket_permission_path,
+    target_warnings,
 };
 use aruna_operations::driver::{drive, node_routing};
-use aruna_operations::group_routing::{
+use aruna_operations::groups::storage_routing::{
     GetGroupRoutingOperation, GroupRoutingInputsOperation, PutGroupRoutingError,
     PutGroupRoutingOperation,
 };
@@ -14,7 +14,7 @@ use aruna_operations::s3::bucket_routing::{
     GetBucketRoutingError, GetBucketRoutingOperation, PutBucketRoutingError,
     PutBucketRoutingOperation,
 };
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
@@ -206,7 +206,7 @@ async fn ensure_bucket_read(
     crate::auth::ensure_permission(
         state,
         auth,
-        blob_bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
+        bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
         Permission::READ,
     )
     .await
@@ -557,30 +557,10 @@ pub async fn put_group_routing(
 
 #[cfg(test)]
 pub(crate) mod tests {
+
     use super::*;
     use crate::openapi::ApiDoc;
-    use aruna_core::UserId;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
-    };
-    use aruna_core::structs::{
-        Actor, BucketInfo, Group, GroupAuthorizationDocument, NodeCapabilities,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    };
-    use aruna_operations::driver::DriverContext;
-    use aruna_storage::storage;
-    use tempfile::TempDir;
-
-    pub(crate) struct TestState {
-        _storage_dir: TempDir,
-        pub(crate) auth: AuthContext,
-        pub(crate) other_auth: AuthContext,
-        pub(crate) group_id: Ulid,
-        pub(crate) bucket: String,
-        pub(crate) state: Arc<ServerState>,
-    }
+    use crate::tests::fixtures::storage_routing::setup_state;
 
     fn class_rule(class: &str) -> StorageRoutingRuleRequest {
         StorageRoutingRuleRequest {
@@ -769,142 +749,5 @@ pub(crate) mod tests {
                 .get("warnings")
                 .is_some()
         );
-    }
-
-    pub(crate) async fn setup_state() -> TestState {
-        let storage_dir = tempfile::tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
-        let realm_id = RealmId([3u8; 32]);
-        let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
-        let user_id = UserId::local(Ulid::generate(), realm_id);
-        let other_user_id = UserId::local(Ulid::generate(), realm_id);
-        let actor = Actor {
-            node_id,
-            user_id,
-            realm_id,
-        };
-        let driver_ctx = Arc::new(DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
-        let group_id = Ulid::generate();
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
-        let group = Group {
-            display_name: "routing-group".to_string(),
-            group_id,
-            realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner: user_id,
-        };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let bucket = "routed".to_string();
-        let bucket_info = BucketInfo {
-            group_id,
-            created_at: SystemTime::UNIX_EPOCH,
-            created_by: user_id,
-            cors_configuration: None,
-            storage_routing: Vec::new(),
-            placement_policies: Vec::new(),
-            placement_policy_generation: 0,
-        };
-
-        // Request-policy loading fails closed without the realm config document.
-        write_doc(
-            &driver_ctx,
-            REALM_CONFIG_KEYSPACE,
-            (*realm_id.as_bytes()).into(),
-            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
-                .to_bytes(&actor)
-                .unwrap()
-                .into(),
-        )
-        .await;
-        write_doc(
-            &driver_ctx,
-            AUTH_KEYSPACE,
-            (*realm_id.as_bytes()).into(),
-            realm_auth.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
-        write_doc(
-            &driver_ctx,
-            AUTH_KEYSPACE,
-            group_id.to_bytes().into(),
-            group_auth.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
-        write_doc(
-            &driver_ctx,
-            GROUP_KEYSPACE,
-            group_id.to_bytes().into(),
-            group.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
-        write_doc(
-            &driver_ctx,
-            S3_BUCKET_KEYSPACE,
-            bucket.as_bytes().to_vec().into(),
-            bucket_info.to_bytes().unwrap().into(),
-        )
-        .await;
-
-        let state = Arc::new(
-            ServerState::new(
-                driver_ctx,
-                realm_id,
-                node_id,
-                NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
-            )
-            .await,
-        );
-
-        TestState {
-            _storage_dir: storage_dir,
-            auth: AuthContext {
-                user_id,
-                realm_id,
-                path_restrictions: None,
-                session: None,
-            },
-            other_auth: AuthContext {
-                user_id: other_user_id,
-                realm_id,
-                path_restrictions: None,
-                session: None,
-            },
-            group_id,
-            bucket,
-            state,
-        }
-    }
-
-    async fn write_doc(
-        driver_ctx: &Arc<DriverContext>,
-        key_space: &str,
-        key: byteview::ByteView,
-        value: byteview::ByteView,
-    ) {
-        let event = driver_ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key,
-                value,
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ));
     }
 }

@@ -7,14 +7,14 @@ use aruna_core::structs::{
 };
 use aruna_operations::blob::reclaim::backend_status;
 use aruna_operations::driver::drive;
-use aruna_operations::group_backends::create::{
+use aruna_operations::groups::backends::create::{
     CreateGroupBackendError, CreateGroupBackendInput, CreateGroupBackendOperation,
 };
-use aruna_operations::group_backends::disable::{SetDisabledError, SetDisabledOperation};
-use aruna_operations::group_backends::query::{
+use aruna_operations::groups::backends::disable::{SetDisabledError, SetDisabledOperation};
+use aruna_operations::groups::backends::query::{
     GetGroupBackendOperation, ListGroupBackendsOperation,
 };
-use aruna_operations::group_backends::replace::ReplaceGroupBackendOperation;
+use aruna_operations::groups::backends::replace::ReplaceGroupBackendOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -801,7 +801,7 @@ mod tests {
         create_group_backend, delete_group_backend, enable_group_backend, list_group_backends,
     };
     use crate::error::ServerError;
-    use crate::routes::storage_routing::tests::setup_state;
+    use crate::tests::fixtures::storage_routing::setup_state;
     use axum::extract::{Path, State};
     use axum::{Extension, Json};
     use std::collections::HashMap;

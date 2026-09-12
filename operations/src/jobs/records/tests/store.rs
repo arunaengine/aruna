@@ -7,14 +7,14 @@ use aruna_core::structs::{
     job_record_key,
 };
 
-use super::fixture::{Family, REALM};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use crate::jobs::records::project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::tests::fixtures::records::{Family, REALM};
 
-use super::fixture::context as fixture;
+use crate::tests::fixtures::records::context as fixture;
 
 async fn append(
     context: &DriverContext,
@@ -56,7 +56,7 @@ async fn project(context: &DriverContext, family: &Family, rebuild: bool) -> Log
 }
 
 #[tokio::test]
-async fn admits_out_of_order() {
+async fn admits_early() {
     // Records arriving before their evidence are retained and then admitted by
     // the append that supplies it, and the alias resolves to the family.
     let family = Family::new([1u8; 32]);
@@ -121,8 +121,8 @@ async fn keeps_attempt_state() {
     let (_dir, context) = fixture(&family.config, family.holder.public()).await;
     let mut logical = aruna_core::structs::JobRecord::new(
         family.job_id,
-        aruna_core::structs::JobPayload::Execution(super::fixture::payload()),
-        super::fixture::user(),
+        aruna_core::structs::JobPayload::Execution(crate::tests::fixtures::records::payload()),
+        crate::tests::fixtures::records::user(),
         family.holder.public(),
         1_000,
         1_000,

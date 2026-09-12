@@ -55,9 +55,8 @@ pub(super) fn group_entry(
     // service does not know it.
     service_config.insert("bucket".to_string(), container.clone());
 
-    // Invariant: the kind stays `Backend::Group` here. `Backend::S3` would build
-    // through the unguarded operator path and the raw AWS SDK client, both of
-    // which bypass the egress guard a tenant endpoint depends on.
+    // Invariant: the kind stays `Backend::Group`; `Backend::S3` would build
+    // through the unguarded operator and bypass the egress guard.
     Ok(NodeBackend::new(
         BackendConfig {
             backend_type: Backend::Group(record.kind),
@@ -117,11 +116,9 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
     ids
 }
 
-/// How a tenant backend is being used: how many holds it carries, whether
-/// removal has claimed it, and how many holds it has ever carried. Holds and
-/// claims are mutually exclusive, which is what keeps the credentials alive for
-/// as long as anything can still need them. Entries are never dropped, or the
-/// generation a removal compares against would restart at zero.
+/// Tenant backend use: hold count, claim flag and hold generation.
+/// Holds and claims are mutually exclusive, which keeps credentials alive
+/// while anything can still need them; entries are never dropped.
 #[derive(Debug, Default)]
 pub(super) struct GroupBackendUse {
     held: usize,
@@ -215,10 +212,9 @@ impl BlobHandler {
         }
     }
 
-    /// Granted only when the backend has been idle continuously since
-    /// `generation`, which is what keeps removal's scan result true, and
-    /// refusing every hold while it lives, which keeps it true until the record
-    /// is gone.
+    /// Granted only when the backend stayed idle since `generation`; it
+    /// refuses every hold while alive, keeping removal's scan result true
+    /// until the record is gone.
     pub(super) fn claim_backend(&self, backend_id: Ulid, generation: u64) -> Option<BackendClaim> {
         let mut counts = self.group_effects.lock().ok()?;
         let usage = counts.entry(backend_id).or_default();

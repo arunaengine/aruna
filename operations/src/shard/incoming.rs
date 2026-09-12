@@ -7,7 +7,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{RealmConfigDocument, RealmId};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use byteview::ByteView;
@@ -43,7 +43,7 @@ pub async fn handle_shard_stream(context: &DriverContext, mut stream: BiStream, 
         return;
     };
 
-    let message = match with_shard_io_timeout(
+    let message = match with_io_timeout(
         "reading shard manifest request",
         read_shard_request(&mut stream),
     )
@@ -57,7 +57,7 @@ pub async fn handle_shard_stream(context: &DriverContext, mut stream: BiStream, 
     };
 
     let response = build_response(context, net_handle, peer, message).await;
-    if let Err(error) = with_shard_io_timeout(
+    if let Err(error) = with_io_timeout(
         "writing shard manifest response",
         write_response(&mut stream, &response),
     )
@@ -80,14 +80,14 @@ async fn write_response(
     }
 }
 
-async fn with_shard_io_timeout<T>(
+async fn with_io_timeout<T>(
     operation: &'static str,
     future: impl Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
-    with_shard_io_timeout_after(SHARD_IO_TIMEOUT, operation, future).await
+    with_io_deadline(SHARD_IO_TIMEOUT, operation, future).await
 }
 
-async fn with_shard_io_timeout_after<T>(
+async fn with_io_deadline<T>(
     duration: Duration,
     operation: &'static str,
     future: impl Future<Output = Result<T, String>>,
@@ -127,7 +127,7 @@ async fn build_response(
 
     // Trust gate: only sync-eligible (server-class) realm nodes may fetch a
     // manifest, mirroring the notification/metadata peer checks.
-    match config.sync_eligible_node_ids() {
+    match config.sync_eligible_nodes() {
         Ok(eligible) if eligible.contains(&peer) => {}
         Ok(_) => {
             return PreparedShardResponse::Message(ShardTransportResponse::Reject(format!(
@@ -212,8 +212,8 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn shard_io_timeout_reports_timed_out_operation() {
-        let error = with_shard_io_timeout_after(
+    async fn timeout_reports_operation() {
+        let error = with_io_deadline(
             Duration::from_millis(1),
             "reading shard manifest request",
             std::future::pending::<Result<(), String>>(),

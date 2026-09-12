@@ -7,13 +7,13 @@ use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use super::repository::{IntakeEntry, MAX_INTAKE_ENTRIES, scan_intake};
+use super::publish_queue::{MAX_PUBLISH_ENTRIES, PublishEntry, scan_publish_queue};
 
 #[derive(Debug, PartialEq)]
 pub struct ListDraftsOperation {
-    entries: Vec<IntakeEntry>,
+    entries: Vec<PublishEntry>,
     state: ListDraftsState,
-    output: Option<Result<Vec<IntakeEntry>, ListDraftsError>>,
+    output: Option<Result<Vec<PublishEntry>, ListDraftsError>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -57,12 +57,12 @@ impl ListDraftsOperation {
 }
 
 impl Operation for ListDraftsOperation {
-    type Output = Vec<IntakeEntry>;
+    type Output = Vec<PublishEntry>;
     type Error = ListDraftsError;
 
     fn start(&mut self) -> Effects {
         self.state = ListDraftsState::Scan;
-        smallvec![scan_intake(None, None)]
+        smallvec![scan_publish_queue(None, None)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
@@ -91,14 +91,14 @@ impl Operation for ListDraftsOperation {
                     );
                 };
                 for (_, bytes) in values {
-                    match IntakeEntry::from_bytes(&bytes) {
+                    match PublishEntry::from_bytes(&bytes) {
                         Ok(entry) => self.entries.push(entry),
                         Err(error) => return fail(self, ListDraftsError::ConversionError(error)),
                     }
                 }
                 match next_start_after {
-                    Some(cursor) if self.entries.len() < MAX_INTAKE_ENTRIES => {
-                        smallvec![scan_intake(Some(cursor), None)]
+                    Some(cursor) if self.entries.len() < MAX_PUBLISH_ENTRIES => {
+                        smallvec![scan_publish_queue(Some(cursor), None)]
                     }
                     _ => {
                         self.state = ListDraftsState::Finish;
@@ -134,29 +134,12 @@ fn fail(operation: &mut ListDraftsOperation, error: ListDraftsError) -> Effects 
 mod tests {
     use super::ListDraftsOperation;
     use crate::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
-    use crate::device::repository::{INTAKE_PAGE_SIZE, IntakeEntry};
-    use crate::driver::{DriverContext, drive};
+    use crate::device::publish_queue::{PUBLISH_PAGE_SIZE, PublishEntry};
+    use crate::driver::drive;
+    use crate::tests::fixtures::device::context;
     use aruna_core::structs::RealmId;
     use aruna_core::types::UserId;
-    use aruna_storage::storage;
-    use tempfile::tempdir;
     use ulid::Ulid;
-
-    async fn context() -> (tempfile::TempDir, DriverContext) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        (
-            tempdir,
-            DriverContext {
-                storage_handle,
-                net_handle: None,
-                blob_handle: None,
-                metadata_handle: None,
-                task_handle: None,
-                compute_handle: None,
-            },
-        )
-    }
 
     #[tokio::test]
     async fn lists_queued_drafts() {
@@ -164,8 +147,8 @@ mod tests {
         let (_tempdir, context) = context().await;
         let owner = UserId::local(Ulid::generate(), RealmId::from_bytes([3u8; 32]));
         let mut queued = Vec::new();
-        for index in 0..INTAKE_PAGE_SIZE + 3 {
-            let entry = IntakeEntry::new(
+        for index in 0..PUBLISH_PAGE_SIZE + 3 {
+            let entry = PublishEntry::new(
                 Ulid::generate(),
                 owner,
                 Ulid::generate(),

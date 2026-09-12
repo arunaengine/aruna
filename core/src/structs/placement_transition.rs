@@ -111,13 +111,8 @@ pub enum TransitionStatus {
     Aborted,
 }
 
-/// One bucket of a transition with the two holder sets it moves between.
-///
-/// Both sets are pure functions of immutable inputs (the bucket's activated map
-/// and the target map), so naming them here is a restatement any node can
-/// re-derive - which is exactly what the admission guard does. Carrying them
-/// keeps completion a set-membership question the reducer can settle without a
-/// selector.
+/// One transition bucket and its deterministically derived old and target holder sets.
+/// Persisting both lets the reducer decide completion through set membership without a selector.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct BucketPlan {
     pub bucket: u32,
@@ -355,16 +350,8 @@ impl PlacementTransition {
                 .all(|plan| self.completion(plan.bucket).is_some())
     }
 
-    /// Whether the record has outlived its purpose: it is terminal, its last
-    /// cut-over is older than the grace window, and every departing old
-    /// holder of every completed bucket has a reduced drain report.
-    ///
-    /// The grace is what keeps a departing old holder in the topic while a
-    /// reader mid-cutover may still need it; the drain report is what proves
-    /// its accepted writes reached the topic. A permanently dead holder is
-    /// retained indefinitely: the plan names it, so removing the node from the
-    /// realm releases nothing either, and only its own report may. An aborted
-    /// record that cut nothing over releases at once - it moved nobody.
+    /// A terminal transition expires after grace only when every departed holder reports drained.
+    /// Grace protects readers and drains prove accepted writes published; dead holders retain the record.
     pub fn released(&self, now_ms: u64) -> bool {
         self.is_terminal()
             && self
@@ -389,10 +376,9 @@ impl PlacementTransition {
             .count()
     }
 
-    /// The one structural predicate a counted proof must pass: a planned
-    /// target attesting exactly this bucket's predecessor epoch, the plan's
-    /// target epoch, and the bucket's reduced barrier digest. Signatures are
-    /// verified at admission, not re-checked here.
+    /// The one structural predicate a counted proof must pass: a planned target attesting exactly this
+    /// bucket's predecessor epoch, the plan's target epoch, and the bucket's reduced barrier digest.
+    /// Signatures are verified at admission, not re-checked here.
     pub fn proof_valid(&self, bucket: u32, proof: &CompletionProof) -> bool {
         let Some(plan) = self.plan.bucket_plan(bucket) else {
             return false;
@@ -404,15 +390,8 @@ impl PlacementTransition {
             && proof.barrier_digest == self.barrier_digest(bucket)
     }
 
-    /// Whether the bucket may cut over: every old holder reported its barrier
-    /// and every target holder proved the full tuple against one shared
-    /// checkpoint root. A forced bucket needs one valid proof instead, so the
-    /// last verified copy is never the one being cut away.
-    ///
-    /// Deliberately independent of [`TransitionStatus`]: a bucket whose proofs
-    /// are all in has cut over, and an abort that arrives afterwards must not
-    /// un-cut it. An abort stops the executors, so an incomplete bucket simply
-    /// never completes.
+    /// Cutover requires every old-holder barrier and target proof against one checkpoint root; forced
+    /// cutover still requires one proof. Completed proofs remain effective if an abort arrives later.
     pub fn bucket_ready(&self, bucket: u32) -> bool {
         let Some(plan) = self.plan.bucket_plan(bucket) else {
             return false;
@@ -560,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn map_and_activation_round_trip() {
+    fn map_and_trip() {
         let map = CandidatePlacementMap {
             epoch: 2,
             nodes: vec![CandidateMapNode {
@@ -596,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_binds_its_claim() {
+    fn proof_binds_claim() {
         // A signature is valid only for the exact tuple it was made over.
         let holder = secret(2).public();
         let proof = claim(1, holder, [0; 32]).sign(&secret(2));
@@ -621,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn barrier_digest_ignores_order() {
+    fn barrier_digest_order() {
         let mut left = PlacementTransition::new(plan());
         left.barriers.push(BucketBarrier {
             bucket: 1,
@@ -652,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_names_its_buckets() {
+    fn plan_names_buckets() {
         assert_eq!(plan().bucket_list(), vec![1, 3]);
         assert!(plan().covers(1));
         assert!(!plan().covers(2));
@@ -660,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_needs_every_bucket() {
+    fn terminal_needs_bucket() {
         let mut transition = PlacementTransition::new(plan());
         assert!(!transition.is_terminal());
         transition.completed.push(BucketCompletion {
@@ -680,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_needs_barrier_and_every_proof() {
+    fn ready_needs_proof() {
         // Old holders 1 and 2 must fence; target holders 2 and 3 must prove
         // against the final barrier digest.
         let mut transition = PlacementTransition::new(plan());
@@ -845,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn force_needs_one_proof() {
+    fn force_needs_proof() {
         let mut transition = PlacementTransition::new(plan());
         transition.forced.push(BucketForceFinalize {
             bucket: 3,

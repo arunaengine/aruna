@@ -3,17 +3,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    METADATA_IRI_REFERENCE_INDEX_KEYSPACE, METADATA_MATERIALIZATION_STATUS_KEYSPACE,
-};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::METADATA_IRI_REFERENCE_INDEX_KEYSPACE;
 use aruna_core::metadata::{
     MetadataError, MetadataIriReferenceIndexRecord, MetadataMaterializationState,
     MetadataMaterializationStatusRecord,
 };
-use aruna_core::storage_entries::{
-    metadata_iri_reference_key_ids, metadata_iri_reference_prefix,
-    metadata_iri_reference_write_entry, metadata_materialization_status_key,
-};
+use aruna_core::storage_entries::{iri_reference_entry, iri_reference_ids, iri_reference_prefix};
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
@@ -23,6 +19,7 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 
 use super::handle::METADATA_REGISTRY_CANDIDATE_LIMIT;
+use super::repository::{StorageReadError, parse_status_read, read_status_effect};
 
 const IRI_INDEX_PAGE_SIZE: usize = 128;
 const IRI_INDEX_WRITE_BATCH_SIZE: usize = 128;
@@ -47,7 +44,7 @@ impl From<MetadataIriIndexError> for MetadataError {
     }
 }
 
-pub(crate) fn project_metadata_iri_references(
+pub(crate) fn project_iri_references(
     document_id: Ulid,
     document_cursor: Ulid,
     references: Vec<(String, String, String)>,
@@ -74,27 +71,24 @@ pub(crate) fn project_metadata_iri_references(
         .collect()
 }
 
-pub(crate) fn metadata_iri_reference_write_entries(
+pub(crate) fn iri_write_entries(
     records: &[MetadataIriReferenceIndexRecord],
 ) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
-    records
-        .iter()
-        .map(metadata_iri_reference_write_entry)
-        .collect()
+    records.iter().map(iri_reference_entry).collect()
 }
 
-pub(crate) async fn lookup_metadata_iri_references(
+pub(crate) async fn lookup_iri_references(
     storage: &StorageHandle,
     registry_records: &[MetadataRegistryRecord],
     predicate_iri: &str,
     object_iri: &str,
 ) -> Result<BTreeMap<Ulid, Vec<String>>, MetadataError> {
-    let prefix = metadata_iri_reference_prefix(predicate_iri, object_iri);
-    let records = scan_iri_reference_records(storage, Some(prefix)).await?;
+    let prefix = iri_reference_prefix(predicate_iri, object_iri);
+    let records = scan_records(storage, Some(prefix)).await?;
     let registry_records = super::api::filter_live_records(storage, registry_records)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    Ok(collect_matching_iri_references(
+    Ok(collect_iri_matches(
         records,
         &registry_records,
         predicate_iri,
@@ -133,9 +127,8 @@ pub(crate) async fn lookup_iri_backlinks(
     object_iri: &str,
     predicate_iri: Option<&str>,
 ) -> Result<Vec<IriBacklink>, MetadataError> {
-    let prefix =
-        predicate_iri.map(|predicate| metadata_iri_reference_prefix(predicate, object_iri));
-    let records = scan_iri_reference_records(storage, prefix).await?;
+    let prefix = predicate_iri.map(|predicate| iri_reference_prefix(predicate, object_iri));
+    let records = scan_records(storage, prefix).await?;
     Ok(collect_iri_backlinks(
         records,
         registry_records,
@@ -146,12 +139,12 @@ pub(crate) async fn lookup_iri_backlinks(
 
 /// Backlinks to a bounded set of exact object IRIs. The predicate-less index
 /// scan is shared across all targets and stale document cursors are fenced.
-pub(crate) async fn lookup_iri_backlinks_for_objects(
+pub(crate) async fn lookup_backlinks_objects(
     storage: &StorageHandle,
     registry_records: &[MetadataRegistryRecord],
     object_iris: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, Vec<IriBacklink>>, MetadataError> {
-    let records = scan_iri_reference_records(storage, None).await?;
+    let records = scan_records(storage, None).await?;
     let current_cursors = registry_records
         .iter()
         .map(|record| (record.document_id, record.last_event_id))
@@ -226,7 +219,7 @@ pub(crate) async fn iri_index_freshness(
     })
 }
 
-async fn scan_iri_reference_records(
+async fn scan_records(
     storage: &StorageHandle,
     prefix: Option<ByteView>,
 ) -> Result<Vec<MetadataIriReferenceIndexRecord>, MetadataIriIndexError> {
@@ -272,14 +265,12 @@ async fn scan_iri_reference_records(
     Ok(records)
 }
 
-pub(crate) async fn rebuild_metadata_iri_reference_index(
-    context: &DriverContext,
-) -> Result<usize, MetadataError> {
+pub(crate) async fn rebuild_index(context: &DriverContext) -> Result<usize, MetadataError> {
     let metadata_handle = context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataError::HandleMissing)?;
-    let registry_records = metadata_handle.list_cached_registry_records().await?;
+    let registry_records = metadata_handle.list_cached_records().await?;
     let registry_records =
         super::api::filter_live_records(&context.storage_handle, registry_records.as_ref())
             .await
@@ -304,17 +295,15 @@ pub(crate) async fn rebuild_metadata_iri_reference_index(
             .snapshot_iri_references(record.graph_iri.clone())
             .await?;
         let projected =
-            project_metadata_iri_references(record.document_id, record.last_event_id, references);
-        write_metadata_iri_references(&context.storage_handle, &projected).await?;
+            project_iri_references(record.document_id, record.last_event_id, references);
+        write_iri_references(&context.storage_handle, &projected).await?;
         reprojected.insert(record.document_id, record.last_event_id);
         written = written.saturating_add(projected.len());
     }
 
-    // Re-read the registry so cleanup keys deletion on the current cursor: a
-    // materialization that advanced a document mid-rebuild keeps its fresh rows,
-    // while rows for documents gone from the registry are pruned.
+    // Re-read the registry so cleanup cannot delete rows from a newer materialization.
     let registered = metadata_handle
-        .list_cached_registry_records()
+        .list_cached_records()
         .await?
         .as_ref()
         .to_vec();
@@ -324,17 +313,15 @@ pub(crate) async fn rebuild_metadata_iri_reference_index(
         .into_iter()
         .map(|record| (record.document_id, record.last_event_id))
         .collect::<HashMap<_, _>>();
-    let stale =
-        stale_rebuild_iri_reference_keys(&context.storage_handle, &reprojected, &registered)
-            .await?;
-    delete_iri_reference_keys(&context.storage_handle, stale).await?;
+    let stale = stale_rebuild_keys(&context.storage_handle, &reprojected, &registered).await?;
+    delete_keys(&context.storage_handle, stale).await?;
 
     Ok(written)
 }
 
 /// Scans the IRI reference index and returns the keyspace-qualified keys for
 /// which `select` accepts the row's document id and cursor.
-async fn select_iri_reference_keys<F>(
+async fn select_keys<F>(
     storage: &StorageHandle,
     txn_id: Option<Ulid>,
     mut select: F,
@@ -365,7 +352,7 @@ where
             }
         };
         for (key, _) in values {
-            if let Some((document_id, cursor)) = metadata_iri_reference_key_ids(key.as_ref())
+            if let Some((document_id, cursor)) = iri_reference_ids(key.as_ref())
                 && select(document_id, cursor)
             {
                 selected.push((METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(), key));
@@ -382,12 +369,12 @@ where
 /// Keys of index rows whose document is re-projected under a newer cursor.
 /// Superseded rows are already fenced from results but bloat storage and the
 /// predicate-less scan, so callers delete them alongside the current projection.
-pub(crate) async fn superseded_iri_reference_keys(
+pub(crate) async fn superseded_keys(
     storage: &StorageHandle,
     txn_id: Option<Ulid>,
     current_cursors: &HashMap<Ulid, Ulid>,
 ) -> Result<Vec<(String, ByteView)>, MetadataIriIndexError> {
-    select_iri_reference_keys(storage, txn_id, |document_id, cursor| {
+    select_keys(storage, txn_id, |document_id, cursor| {
         current_cursors
             .get(&document_id)
             .is_some_and(|current| *current != cursor)
@@ -395,16 +382,15 @@ pub(crate) async fn superseded_iri_reference_keys(
     .await
 }
 
-/// Keys the full rebuild must drop. A row survives only at the cursor the
-/// rebuild just projected or the document's current registry cursor, so a
-/// materialization that raced ahead keeps its rows; rows for documents in
-/// neither map (deleted or reverted) are pruned.
-async fn stale_rebuild_iri_reference_keys(
+/// Keys the full rebuild must drop: a row survives only at the cursor just
+/// projected or the document's current registry cursor, so a raced-ahead
+/// materialization keeps its rows; rows in neither map (deleted, reverted) are pruned.
+async fn stale_rebuild_keys(
     storage: &StorageHandle,
     reprojected: &HashMap<Ulid, Ulid>,
     registered: &HashMap<Ulid, Ulid>,
 ) -> Result<Vec<(String, ByteView)>, MetadataIriIndexError> {
-    select_iri_reference_keys(storage, None, |document_id, cursor| {
+    select_keys(storage, None, |document_id, cursor| {
         reprojected.get(&document_id) != Some(&cursor)
             && registered.get(&document_id) != Some(&cursor)
     })
@@ -413,17 +399,17 @@ async fn stale_rebuild_iri_reference_keys(
 
 /// Keys for the given documents at every cursor, so a deletion can prune the
 /// rows it would otherwise leak into the predicate-less backlink scan.
-pub(crate) async fn document_iri_reference_keys(
+pub(crate) async fn document_iri_keys(
     storage: &StorageHandle,
     document_ids: &BTreeSet<Ulid>,
 ) -> Result<Vec<(String, ByteView)>, MetadataError> {
-    Ok(select_iri_reference_keys(storage, None, |document_id, _| {
+    Ok(select_keys(storage, None, |document_id, _| {
         document_ids.contains(&document_id)
     })
     .await?)
 }
 
-pub(crate) async fn delete_iri_reference_keys(
+pub(crate) async fn delete_keys(
     storage: &StorageHandle,
     keys: Vec<(String, ByteView)>,
 ) -> Result<(), MetadataError> {
@@ -447,7 +433,7 @@ pub(crate) async fn delete_iri_reference_keys(
     Ok(())
 }
 
-fn collect_matching_iri_references(
+fn collect_iri_matches(
     records: Vec<MetadataIriReferenceIndexRecord>,
     registry_records: &[MetadataRegistryRecord],
     predicate_iri: &str,
@@ -513,29 +499,21 @@ async fn read_materialization_status(
     storage: &StorageHandle,
     document_id: Ulid,
 ) -> Result<Option<MetadataMaterializationStatusRecord>, MetadataIriIndexError> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
-            key: metadata_materialization_status_key(document_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| postcard::from_bytes(&bytes).map_err(ConversionError::from))
-            .transpose()
-            .map_err(MetadataIriIndexError::from),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataIriIndexError::UnexpectedEvent(format!("{other:?}"))),
-    }
+    let event = storage
+        .send_effect(read_status_effect(document_id, None))
+        .await;
+    parse_status_read(event).map_err(|error| match error {
+        StorageReadError::Storage(error) => error.into(),
+        StorageReadError::Conversion(error) => error.into(),
+    })
 }
 
-async fn write_metadata_iri_references(
+async fn write_iri_references(
     storage: &StorageHandle,
     records: &[MetadataIriReferenceIndexRecord],
 ) -> Result<(), MetadataIriIndexError> {
     for records in records.chunks(IRI_INDEX_WRITE_BATCH_SIZE) {
-        let writes = metadata_iri_reference_write_entries(records)?;
+        let writes = iri_write_entries(records)?;
         match storage
             .send_storage_effect(StorageEffect::BatchWrite {
                 writes,
@@ -556,12 +534,12 @@ async fn write_metadata_iri_references(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::storage_entries::metadata_iri_reference_key;
+    use aruna_core::storage_entries::iri_reference_key;
     use aruna_core::structs::{PlacementRef, RealmId};
     use aruna_storage::FjallStorage;
 
     fn index_key(document_id: Ulid, cursor: Ulid) -> ByteView {
-        metadata_iri_reference_key("p", "o", document_id, cursor)
+        iri_reference_key("p", "o", document_id, cursor)
     }
 
     async fn write_index_row(storage: &StorageHandle, document_id: Ulid, cursor: Ulid) {
@@ -607,10 +585,10 @@ mod tests {
     }
 
     #[test]
-    fn projection_groups_and_sorts_subjects() {
+    fn groups_sorts_subjects() {
         let document_id = Ulid::from_parts(1, 1);
         let cursor = Ulid::from_parts(2, 1);
-        let records = project_metadata_iri_references(
+        let records = project_iri_references(
             document_id,
             cursor,
             vec![
@@ -645,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_fences_exact_strings_and_document_cursor() {
+    fn lookup_fences_exact() {
         let current_document_id = Ulid::from_parts(1, 1);
         let stale_document_id = Ulid::from_parts(1, 2);
         let cursor = Ulid::from_parts(2, 1);
@@ -678,12 +656,8 @@ mod tests {
             registry_record(stale_document_id, cursor),
         ];
 
-        let matches = collect_matching_iri_references(
-            records,
-            &registry_records,
-            DCTERMS_CONFORMS_TO_IRI,
-            profile,
-        );
+        let matches =
+            collect_iri_matches(records, &registry_records, DCTERMS_CONFORMS_TO_IRI, profile);
 
         assert_eq!(matches.len(), 1);
         assert_eq!(
@@ -756,7 +730,7 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         write_index_row(&storage, Ulid::from_parts(1, 1), Ulid::from_parts(2, 1)).await;
 
-        let error = scan_iri_reference_records(&storage, None)
+        let error = scan_records(&storage, None)
             .await
             .expect_err("malformed row fails to decode");
         assert!(matches!(error, MetadataIriIndexError::Conversion(_)));
@@ -778,7 +752,7 @@ mod tests {
         let reprojected = HashMap::from([(doc, reprojected_cursor)]);
         let registered = HashMap::from([(doc, raced)]);
 
-        let stale = stale_rebuild_iri_reference_keys(&storage, &reprojected, &registered)
+        let stale = stale_rebuild_keys(&storage, &reprojected, &registered)
             .await
             .unwrap();
         let keys: Vec<ByteView> = stale.into_iter().map(|(_, key)| key).collect();
@@ -798,7 +772,7 @@ mod tests {
         let reprojected = HashMap::from([(live, cursor)]);
         let registered = HashMap::from([(live, cursor)]);
 
-        let stale = stale_rebuild_iri_reference_keys(&storage, &reprojected, &registered)
+        let stale = stale_rebuild_keys(&storage, &reprojected, &registered)
             .await
             .unwrap();
         let keys: Vec<ByteView> = stale.into_iter().map(|(_, key)| key).collect();
@@ -819,9 +793,7 @@ mod tests {
         write_index_row(&storage, kept, first).await;
         let targets = BTreeSet::from([deleted]);
 
-        let keys = document_iri_reference_keys(&storage, &targets)
-            .await
-            .unwrap();
+        let keys = document_iri_keys(&storage, &targets).await.unwrap();
         let keys: Vec<ByteView> = keys.into_iter().map(|(_, key)| key).collect();
         assert!(keys.contains(&index_key(deleted, first)));
         assert!(keys.contains(&index_key(deleted, second)));

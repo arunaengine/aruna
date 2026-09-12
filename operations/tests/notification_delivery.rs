@@ -10,21 +10,20 @@ use aruna_core::structs::{
     Actor, NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
     RealmConfigDocument, RealmId, RealmNodeKind,
 };
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::notifications::client::{mark_read_remote, unread_count_remote};
 use aruna_operations::notifications::dispatch::{
-    NotificationDispatchError, list_notifications_for_user, mark_read_for_user,
-    unread_count_for_user,
+    NotificationDispatchError, list_for_user, mark_for_user, unread_for_user,
 };
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
-use aruna_operations::task_incoming::{drain_notification_outbox, initialize_task_incoming};
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::tasks::incoming::{drain_notification_outbox, initialize_task_incoming};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -42,13 +41,13 @@ struct TestNode {
 }
 
 #[tokio::test]
-async fn notification_emitted_on_a_is_visible_via_b() -> Result<(), Box<dyn std::error::Error>> {
+async fn notification_crosses_nodes() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([12u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
-    let record = added_to_group_record(recipient, realm_id, unix_timestamp_millis());
+    let record = added_group_record(recipient, realm_id, unix_timestamp_millis());
     let target = record.notification_id;
 
     emit_on(&nodes[0], vec![record]).await?;
@@ -72,7 +71,7 @@ async fn notification_emitted_on_a_is_visible_via_b() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
-async fn delivery_retries_through_holder_outage() -> Result<(), Box<dyn std::error::Error>> {
+async fn delivery_retries_outage() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([22u8; 32]);
     let secrets: [[u8; 32]; 3] = [[11u8; 32], [22u8; 32], [33u8; 32]];
     // The holder's storage must outlive its node struct so the post-outage
@@ -81,16 +80,16 @@ async fn delivery_retries_through_holder_outage() -> Result<(), Box<dyn std::err
     let holder_storage =
         FjallStorage::open(holder_dir.path().to_str().ok_or("invalid temp path")?)?;
     let mut nodes = Vec::with_capacity(3);
-    nodes.push(spawn_node_with_secret(realm_id, secrets[0]).await?);
-    nodes.push(spawn_node_with_secret(realm_id, secrets[1]).await?);
-    nodes.push(spawn_node_reusing_storage(realm_id, secrets[2], holder_storage.clone()).await?);
+    nodes.push(spawn_with_secret(realm_id, secrets[0]).await?);
+    nodes.push(spawn_with_secret(realm_id, secrets[1]).await?);
+    nodes.push(respawn_with_storage(realm_id, secrets[2], holder_storage.clone()).await?);
     mesh_nodes(&nodes).await;
     install_realm_config(&nodes, realm_id).await?;
 
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
-    let record = added_to_group_record(recipient, realm_id, unix_timestamp_millis());
+    let record = added_group_record(recipient, realm_id, unix_timestamp_millis());
     let target = record.notification_id;
 
     nodes[0]
@@ -111,7 +110,7 @@ async fn delivery_retries_through_holder_outage() -> Result<(), Box<dyn std::err
         "outbox must retain an undeliverable record while its holder is offline"
     );
 
-    nodes[2] = spawn_node_reusing_storage(realm_id, secrets[2], holder_storage.clone()).await?;
+    nodes[2] = respawn_with_storage(realm_id, secrets[2], holder_storage.clone()).await?;
     mesh_nodes(&nodes).await;
     install_realm_config(&nodes, realm_id).await?;
     drain_notification_outbox(nodes[0].context.clone()).await;
@@ -133,13 +132,13 @@ async fn delivery_retries_through_holder_outage() -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test]
-async fn duplicate_delivery_is_idempotent_across_nodes() -> Result<(), Box<dyn std::error::Error>> {
+async fn duplicate_delivery_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([33u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
-    let record = added_to_group_record(recipient, realm_id, unix_timestamp_millis());
+    let record = added_group_record(recipient, realm_id, unix_timestamp_millis());
     let target = record.notification_id;
 
     emit_on(&nodes[0], vec![record.clone()]).await?;
@@ -184,7 +183,7 @@ async fn duplicate_delivery_is_idempotent_across_nodes() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
-async fn unread_and_mark_read_across_nodes() -> Result<(), Box<dyn std::error::Error>> {
+async fn unread_crosses_nodes() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([44u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
@@ -193,7 +192,7 @@ async fn unread_and_mark_read_across_nodes() -> Result<(), Box<dyn std::error::E
 
     let now = unix_timestamp_millis();
     let records: Vec<NotificationRecord> = (0..3)
-        .map(|offset| added_to_group_record(recipient, realm_id, now + offset))
+        .map(|offset| added_group_record(recipient, realm_id, now + offset))
         .collect();
     let ids: Vec<Ulid> = vec![records[0].notification_id, records[1].notification_id];
 
@@ -224,7 +223,7 @@ async fn unread_and_mark_read_across_nodes() -> Result<(), Box<dyn std::error::E
 }
 
 #[tokio::test]
-async fn placement_is_uniform_across_nodes() -> Result<(), Box<dyn std::error::Error>> {
+async fn placement_converges() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([55u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
 
@@ -245,7 +244,7 @@ async fn placement_is_uniform_across_nodes() -> Result<(), Box<dyn std::error::E
 }
 
 #[tokio::test]
-async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std::error::Error>> {
+async fn dispatch_proxies_nonholder() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([66u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
@@ -258,7 +257,7 @@ async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std:
 
     let now = unix_timestamp_millis();
     let records: Vec<NotificationRecord> = (0..3)
-        .map(|offset| added_to_group_record(recipient, realm_id, now + offset))
+        .map(|offset| added_group_record(recipient, realm_id, now + offset))
         .collect();
     let ids: Vec<Ulid> = vec![records[0].notification_id, records[1].notification_id];
 
@@ -266,7 +265,7 @@ async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std:
     wait_for(|| {
         let reader_ctx = reader_ctx.clone();
         async move {
-            list_notifications_for_user(
+            list_for_user(
                 reader_ctx.as_ref(),
                 reader_id,
                 recipient,
@@ -280,14 +279,14 @@ async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std:
     })
     .await?;
 
-    let (count, capped) = unread_count_for_user(reader_ctx.as_ref(), reader_id, recipient).await?;
+    let (count, capped) = unread_for_user(reader_ctx.as_ref(), reader_id, recipient).await?;
     assert_eq!((count, capped), (3, false));
 
     let marked =
-        mark_read_for_user(reader_ctx.as_ref(), reader_id, recipient, ids.clone(), None).await?;
+        mark_for_user(reader_ctx.as_ref(), reader_id, recipient, ids.clone(), None).await?;
     assert_eq!(marked, 2);
 
-    let (count, _) = unread_count_for_user(reader_ctx.as_ref(), reader_id, recipient).await?;
+    let (count, _) = unread_for_user(reader_ctx.as_ref(), reader_id, recipient).await?;
     assert_eq!(count, 1);
 
     // A resolvable remote holder with no net handle is Unavailable, not a 500.
@@ -299,7 +298,7 @@ async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std:
         task_handle: None,
         compute_handle: None,
     });
-    let unavailable = list_notifications_for_user(
+    let unavailable = list_for_user(
         no_net.as_ref(),
         reader_id,
         recipient,
@@ -315,7 +314,7 @@ async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std:
 
     // An unreachable holder surfaces as a Remote proxy error (mapped to 502).
     nodes[2].net.shutdown().await;
-    let remote = wait_for_dispatch_error(reader_ctx.as_ref(), reader_id, recipient).await;
+    let remote = wait_dispatch_error(reader_ctx.as_ref(), reader_id, recipient).await;
     assert!(matches!(remote, NotificationDispatchError::Remote(_)));
 
     nodes[0].net.shutdown().await;
@@ -323,35 +322,27 @@ async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-async fn wait_for_dispatch_error(
+async fn wait_dispatch_error(
     context: &DriverContext,
     local_node_id: NodeId,
     recipient: UserId,
 ) -> NotificationDispatchError {
     wait_for_convergence("holder never became unreachable", || async {
         Ok::<usize, Box<dyn std::error::Error>>(usize::from(
-            list_notifications_for_user(
-                context,
-                local_node_id,
-                recipient,
-                None,
-                LIST_LIMIT as usize,
-            )
-            .await
-            .is_ok(),
+            list_for_user(context, local_node_id, recipient, None, LIST_LIMIT as usize)
+                .await
+                .is_ok(),
         ))
     })
     .await
     .expect("holder never became unreachable");
-    match list_notifications_for_user(context, local_node_id, recipient, None, LIST_LIMIT as usize)
-        .await
-    {
+    match list_for_user(context, local_node_id, recipient, None, LIST_LIMIT as usize).await {
         Err(error) => error,
         Ok(_) => panic!("holder never became unreachable"),
     }
 }
 
-fn added_to_group_record(
+fn added_group_record(
     recipient: UserId,
     realm_id: RealmId,
     created_at_ms: u64,
@@ -404,7 +395,7 @@ async fn emit_on(
 }
 
 async fn list_via(node: &TestNode, recipient: UserId) -> Vec<NotificationRecord> {
-    list_notifications_for_user(
+    list_for_user(
         node.context.as_ref(),
         node.net.node_id(),
         recipient,
@@ -481,14 +472,14 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
     build_node(realm_id, None, None).await
 }
 
-async fn spawn_node_with_secret(
+async fn spawn_with_secret(
     realm_id: RealmId,
     secret: [u8; 32],
 ) -> Result<TestNode, Box<dyn std::error::Error>> {
     build_node(realm_id, Some(secret), None).await
 }
 
-async fn spawn_node_reusing_storage(
+async fn respawn_with_storage(
     realm_id: RealmId,
     secret: [u8; 32],
     storage: StorageHandle,
@@ -573,12 +564,12 @@ async fn install_realm_config(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
+        aruna_operations::placement::process_placements::process_shard_placements(
             &node.context,
             realm_id,
             node.net.node_id(),

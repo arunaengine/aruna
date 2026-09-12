@@ -1,16 +1,11 @@
-//! Bounded bulk application of a bucket default to current heads.
-//!
-//! A run captures one `(bucket identity, generation, target refs)` target in its
-//! own transaction. Each object is minted through the same per-version
-//! sub-operation the single-object mutation uses, which re-reads the captured
-//! default, the head and the intent inside its commit boundary. The application
-//! is additive: it unions the captured refs with the head re-read inside the mint
-//! transaction, so applying a default never removes an object's constraints.
+//! Bounded bulk application of a bucket default to current heads. Each run
+//! captures one target per transaction and mints via the single-object
+//! sub-operation, which re-reads default/head/intent and unions, never removes.
 
-use crate::blob::blob_keyspace_helper::HeadAliasContext;
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement_policy::foreign_owner;
-use crate::placement_policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::blob::records::HeadAliasContext;
+use crate::placement::policy::foreign_owner;
+use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 use crate::s3::policy_successor::{
     CapturedDefault, MintPolicySuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
@@ -629,9 +624,7 @@ impl PolicyBulkOperation {
                 self.config.bucket.clone(),
                 candidate.key.clone(),
             ),
-            // The preassigned successor is also the mutation identity, so a
-            // retried pass replays onto the same version instead of minting
-            // another.
+            // The successor id is the stable mutation identity across retries.
             mutation_id: intent.successor_version_id,
             expected_head: intent.observed_head.clone(),
             bucket_identity: run.bucket_identity,
@@ -676,9 +669,7 @@ impl PolicyBulkOperation {
             // This node is mid-transition, so every evaluation this pass made is
             // stale. The run stays active and a later pass resumes it.
             Err(SuccessorError::SubjectDrift) => return self.finish(),
-            // A head that moved, an id another mutation took, an intent a
-            // concurrent pass owns, and a lost commit race are all replanned by
-            // the next pass.
+            // Concurrent head, id, intent and commit races are replanned next pass.
             Err(
                 SuccessorError::HeadConflict { .. }
                 | SuccessorError::VersionCollision(_)
@@ -970,15 +961,13 @@ impl Operation for PolicyBulkOperation {
 #[cfg(test)]
 mod tests {
     use super::{BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, PolicyBulkOperation};
-    use crate::claim_initial_realm_admin::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    };
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive, gate_context};
-    use crate::placement_policy::cache::cache_key;
-    use crate::placement_policy::fixtures::{seed_gate, subject};
+    use crate::placement::policy::cache::cache_key;
+    use crate::realm::claim_admin::{ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation};
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::s3::bucket_placement::{PutBucketPlacementInput, PutBucketPlacementOperation};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use crate::tests::fixtures::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};

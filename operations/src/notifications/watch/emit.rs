@@ -6,22 +6,19 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::get_realm_config::GetRealmConfigOperation;
-use crate::notifications::client::deliver_watch_events_remote;
-use crate::notifications::placement::filter_locally_held_watch_subscriptions;
+use crate::notifications::client::deliver_events_remote;
+use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::watch::expand::expand_watch_events;
-use crate::notifications::watch::interest::mark_watch_interest_dirty;
+use crate::notifications::watch::interest::mark_interest_dirty;
 use crate::notifications::watch::subscriptions::{
-    WatchSubscriptionError, list_realm_watch_subscriptions,
+    WatchSubscriptionError, list_realm_subscriptions,
 };
+use crate::realm::get_config::GetRealmConfigOperation;
 
-/// Post-commit, best-effort emission of an origin watch event. Matches the event
-/// against the in-memory realm interest table plus local durable subscriptions
-/// that may not have published their digest yet, then immediately expands it for
-/// the local holder or forwards it once to each remote holder. Every failure
-/// warns; nothing propagates and nothing panics, so a lost watch event never
-/// affects the host operation. An unmatched event writes nothing.
-pub async fn emit_resource_watch_event(context: &DriverContext, event: WatchEvent) {
+/// Post-commit, best-effort emission of an origin watch event. Matches the
+/// in-memory interest table plus local durable subscriptions, then expands for
+/// the local holder or forwards once per remote holder; all failures only warn.
+pub async fn emit_watch_event(context: &DriverContext, event: WatchEvent) {
     // Watches are a user-plane feature; system/anonymous writes carry a nil actor
     // and are deliberately not emitted.
     if event.actor == UserId::nil(event.realm_id) {
@@ -36,20 +33,14 @@ pub async fn emit_resource_watch_event(context: &DriverContext, event: WatchEven
         &event.path,
         event.kind,
     );
-    let local_realm_config = match include_local_holder_from_subscriptions(
-        context,
-        &event,
-        net_handle.node_id(),
-        &mut holders,
-    )
-    .await
-    {
-        Ok(realm_config) => Some(realm_config),
-        Err(error) => {
-            warn!(%error, "Failed to scan local watch subscriptions while emitting event");
-            None
-        }
-    };
+    let local_realm_config =
+        match include_local_holder(context, &event, net_handle.node_id(), &mut holders).await {
+            Ok(realm_config) => Some(realm_config),
+            Err(error) => {
+                warn!(%error, "Failed to scan local watch subscriptions while emitting event");
+                None
+            }
+        };
     if holders.is_empty() {
         return;
     }
@@ -76,7 +67,7 @@ pub async fn emit_resource_watch_event(context: &DriverContext, event: WatchEven
                         net_handle.notify_inbox_activity(recipient);
                     }
                     if dropped
-                        && let Err(error) = mark_watch_interest_dirty(context, event.realm_id).await
+                        && let Err(error) = mark_interest_dirty(context, event.realm_id).await
                     {
                         warn!(%error, "Failed to retract dropped local watch interest");
                     }
@@ -86,7 +77,7 @@ pub async fn emit_resource_watch_event(context: &DriverContext, event: WatchEven
                 }
             }
         } else if let Err(error) =
-            deliver_watch_events_remote(net_handle, holder, vec![event.clone()]).await
+            deliver_events_remote(net_handle, holder, vec![event.clone()]).await
         {
             warn!(holder = %holder, %error, "Failed to forward watch event to remote holder");
         }
@@ -95,10 +86,7 @@ pub async fn emit_resource_watch_event(context: &DriverContext, event: WatchEven
 
 /// Post-commit, best-effort `metadata_created` emission shared by every dataset
 /// creation path, so an import or a job notifies exactly like `POST /metadata`.
-///
-/// `event_id` is the durable create event id, and its own timestamp dates the
-/// event, so a retried create that returns the same acceptance keeps the whole
-/// inbox key stable and notifies subscribers once.
+/// `event_id` dates the event, keeping a retried create's inbox key stable.
 pub async fn emit_metadata_created(
     context: &DriverContext,
     realm_id: RealmId,
@@ -108,7 +96,7 @@ pub async fn emit_metadata_created(
     document_path: &str,
     event_id: Ulid,
 ) {
-    emit_resource_watch_event(
+    emit_watch_event(
         context,
         WatchEvent {
             event_id,
@@ -126,7 +114,7 @@ pub async fn emit_metadata_created(
     .await;
 }
 
-async fn include_local_holder_from_subscriptions(
+async fn include_local_holder(
     context: &DriverContext,
     event: &WatchEvent,
     local_node_id: aruna_core::NodeId,
@@ -136,7 +124,7 @@ async fn include_local_holder_from_subscriptions(
         .await
         .map_err(|error| error.to_string())?;
     let subscriptions =
-        match list_realm_watch_subscriptions(&context.storage_handle, event.realm_id).await {
+        match list_realm_subscriptions(&context.storage_handle, event.realm_id).await {
             Ok(subscriptions) => subscriptions,
             Err(WatchSubscriptionError::Storage(error))
                 if error.contains("subscription scan cap reached") =>
@@ -149,7 +137,7 @@ async fn include_local_holder_from_subscriptions(
             Err(error) => return Err(error.to_string()),
         };
     let (subscriptions, found_stale) =
-        filter_locally_held_watch_subscriptions(subscriptions, &realm_config, local_node_id)
+        filter_local_subscriptions(subscriptions, &realm_config, local_node_id)
             .map_err(|error| error.to_string())?;
     holders.retain(|holder| *holder != local_node_id);
     if subscriptions.iter().any(|subscription| {
@@ -159,7 +147,7 @@ async fn include_local_holder_from_subscriptions(
     }) {
         holders.push(local_node_id);
     }
-    if found_stale && let Err(error) = mark_watch_interest_dirty(context, event.realm_id).await {
+    if found_stale && let Err(error) = mark_interest_dirty(context, event.realm_id).await {
         warn!(%error, "Failed to mark stale watch interest dirty while emitting event");
     }
     Ok(realm_config)
@@ -176,22 +164,22 @@ mod tests {
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, NotificationRecord, RealmAuthorizationDocument,
         RealmConfigDocument, RealmId, RealmNodeKind, WatchEventDetail, WatchEventKind,
-        WatchEventMask, WatchInterestEntry, WatchInterestTable, data_watch_resource_path,
-        parse_data_watch_resource_path,
+        WatchEventMask, WatchInterestEntry, WatchInterestTable, parse_watch_path,
+        watch_resource_path,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
-    use crate::notifications::watch::subscriptions::create_watch_subscription;
+    use crate::notifications::watch::subscriptions::create_local_watch;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
     fn upload_event(realm: RealmId, actor: UserId, path: &str) -> WatchEvent {
-        let resource = parse_data_watch_resource_path(path).expect("canonical data watch path");
+        let resource = parse_watch_path(path).expect("canonical data watch path");
         WatchEvent {
             event_id: Ulid::generate(),
             realm_id: realm,
@@ -221,8 +209,8 @@ mod tests {
             user_id: owner,
             realm_id: realm,
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm);
-        let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm, group_id);
+        let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm);
+        let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm, group_id);
         // Policy loading resolves the group record before group policies apply.
         let group = Group {
             display_name: "watch".to_string(),
@@ -339,26 +327,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_table_writes_nothing() {
+    async fn empty_table_noop() {
         let realm = RealmId([1u8; 32]);
         let (_dir, ctx, net) = ctx_with_net(realm, [80u8; 32]).await;
         let actor = UserId::new(Ulid::generate(), realm);
-        let path = data_watch_resource_path(Ulid::generate(), net.node_id(), "bucket", "object");
-        emit_resource_watch_event(&ctx, upload_event(realm, actor, &path)).await;
+        let path = watch_resource_path(Ulid::generate(), net.node_id(), "bucket", "object");
+        emit_watch_event(&ctx, upload_event(realm, actor, &path)).await;
         assert!(read_inbox_rows(&ctx).await.is_empty());
     }
 
     #[tokio::test]
-    async fn local_subscription_matches_before_interest_publish() {
+    async fn local_matches_early() {
         let realm = RealmId([1u8; 32]);
         let (_dir, ctx, net) = ctx_with_net(realm, [84u8; 32]).await;
         let metrics = NodeMetrics::new();
         net.notification_watch_metrics().register(&metrics).await;
         let owner = UserId::new(Ulid::generate(), realm);
         let group_id = Ulid::from_bytes([3u8; 16]);
-        let prefix = data_watch_resource_path(group_id, net.node_id(), "bucket", "");
+        let prefix = watch_resource_path(group_id, net.node_id(), "bucket", "");
         install_authorization(&ctx, realm, group_id, owner).await;
-        create_watch_subscription(
+        create_local_watch(
             &ctx.storage_handle,
             owner,
             prefix.clone(),
@@ -369,8 +357,8 @@ mod tests {
         .expect("subscription creates");
 
         let actor = UserId::new(Ulid::generate(), realm);
-        let event_path = data_watch_resource_path(group_id, net.node_id(), "bucket", "object");
-        emit_resource_watch_event(&ctx, upload_event(realm, actor, &event_path)).await;
+        let event_path = watch_resource_path(group_id, net.node_id(), "bucket", "object");
+        emit_watch_event(&ctx, upload_event(realm, actor, &event_path)).await;
 
         let rows = read_inbox_rows(&ctx).await;
         assert_eq!(rows.len(), 1);
@@ -387,7 +375,7 @@ mod tests {
         );
 
         install_authorization(&ctx, realm, group_id, UserId::new(Ulid::generate(), realm)).await;
-        emit_resource_watch_event(&ctx, upload_event(realm, actor, &event_path)).await;
+        emit_watch_event(&ctx, upload_event(realm, actor, &event_path)).await;
         assert_eq!(read_inbox_rows(&ctx).await.len(), 1);
         assert!(metrics.render().await.contains(
             "aruna_notification_watch_delivery_suppressions_total{reason=\"permission_denied\"} 1"
@@ -403,7 +391,7 @@ mod tests {
         let owner = UserId::new(Ulid::generate(), realm);
         let group_id = Ulid::from_bytes([5u8; 16]);
         install_authorization(&ctx, realm, group_id, owner).await;
-        create_watch_subscription(
+        create_local_watch(
             &ctx.storage_handle,
             owner,
             format!("meta/{group_id}/"),
@@ -435,25 +423,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nil_actor_is_skipped() {
+    async fn nil_actor_skipped() {
         let realm = RealmId([1u8; 32]);
         let (_dir, ctx, net) = ctx_with_net(realm, [82u8; 32]).await;
-        let path = data_watch_resource_path(Ulid::generate(), net.node_id(), "bucket", "object");
+        let path = watch_resource_path(Ulid::generate(), net.node_id(), "bucket", "object");
         net.replace_watch_interest(interest_table(realm, node(9), &path));
 
-        emit_resource_watch_event(&ctx, upload_event(realm, UserId::nil(realm), &path)).await;
+        emit_watch_event(&ctx, upload_event(realm, UserId::nil(realm), &path)).await;
         assert!(read_inbox_rows(&ctx).await.is_empty());
     }
 
     #[tokio::test]
-    async fn local_expansion_error_is_swallowed() {
+    async fn expansion_error_swallowed() {
         let realm = RealmId([1u8; 32]);
         let (dir, ctx, net) = ctx_with_net(realm, [83u8; 32]).await;
-        let path = data_watch_resource_path(Ulid::generate(), net.node_id(), "bucket", "object");
+        let path = watch_resource_path(Ulid::generate(), net.node_id(), "bucket", "object");
         net.replace_watch_interest(interest_table(realm, net.node_id(), &path));
         drop(dir);
 
         let actor = UserId::new(Ulid::generate(), realm);
-        emit_resource_watch_event(&ctx, upload_event(realm, actor, &path)).await;
+        emit_watch_event(&ctx, upload_event(realm, actor, &path)).await;
     }
 }

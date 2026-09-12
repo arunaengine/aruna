@@ -168,10 +168,10 @@ fn load_existing_status(
         return Ok(None);
     }
 
-    Ok(Some(installed_status_from_dir(config, &portal_dir)))
+    Ok(Some(installed_status(config, &portal_dir)))
 }
 
-fn installed_status_from_dir(config: &PortalArtifactConfig, dir: &Path) -> PortalStatus {
+fn installed_status(config: &PortalArtifactConfig, dir: &Path) -> PortalStatus {
     let manifest = read_manifest(dir).ok().flatten();
     let checksum = read_checksum_file(dir).or_else(|| config.artifact_sha256.clone());
     let version = manifest
@@ -272,7 +272,7 @@ fn validate_install_target(path: &Path) -> Result<(), PortalArtifactError> {
 fn replace_existing_path(path: &Path) -> Result<(), PortalArtifactError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => {
-            if can_replace_existing_dir(path)? {
+            if can_replace_dir(path)? {
                 fs::remove_dir_all(path)?;
                 Ok(())
             } else {
@@ -289,7 +289,7 @@ fn replace_existing_path(path: &Path) -> Result<(), PortalArtifactError> {
     }
 }
 
-fn can_replace_existing_dir(path: &Path) -> io::Result<bool> {
+fn can_replace_dir(path: &Path) -> io::Result<bool> {
     if fs::symlink_metadata(path.join(CHECKSUM_FILE))
         .map(|metadata| metadata.is_file())
         .unwrap_or(false)
@@ -534,7 +534,7 @@ pub enum PortalArtifactError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECKSUM_FILE, PortalArtifactError, install_parent, installed_status_from_dir, portal_dir,
+        CHECKSUM_FILE, PortalArtifactError, install_parent, installed_status, portal_dir,
         replace_existing_path, safe_archive_path, unpack_archive, verify_sha256,
     };
     use crate::config::PortalArtifactConfig;
@@ -558,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_path_safety_rejects_absolute_and_traversal_paths() {
+    fn path_rejects_traversal() {
         assert!(matches!(
             safe_archive_path(Path::new("/index.html")),
             Err(PortalArtifactError::UnsafeArchivePath { .. })
@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn unpack_rejects_archive_links() {
+    fn unpack_rejects_links() {
         let archive = archive_with_entry("index.html", b"ok", EntryType::Symlink);
         let tempdir = tempdir().unwrap();
 
@@ -586,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn unpack_skips_archive_root_directory() {
+    fn unpack_skips_root() {
         let archive = archive_with_entry("./", b"", EntryType::Directory);
         let tempdir = tempdir().unwrap();
 
@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn install_parent_rejects_unsafe_targets() {
+    fn parent_rejects_targets() {
         for path in ["", ".", "..", "../portal", "/", "/run", "/tmp"] {
             assert!(
                 matches!(
@@ -617,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_existing_path_rejects_existing_files() {
+    fn replace_rejects_files() {
         let tempdir = tempdir().unwrap();
         let target = tempdir.path().join("portal");
         fs::write(&target, "important data").unwrap();
@@ -630,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_existing_path_rejects_unowned_non_empty_dirs() {
+    fn replace_rejects_nonempty() {
         let tempdir = tempdir().unwrap();
         let target = tempdir.path().join("portal");
         fs::create_dir_all(&target).unwrap();
@@ -647,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_existing_path_allows_empty_or_installer_owned_dirs() {
+    fn replace_allows_owned() {
         let tempdir = tempdir().unwrap();
         let empty = tempdir.path().join("empty-portal");
         fs::create_dir_all(&empty).unwrap();
@@ -669,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_populates_status_without_trusting_manifest_checksum() {
+    fn manifest_status_safe() {
         let tempdir = tempdir().unwrap();
         let config = config(tempdir.path());
         let dir = portal_dir(&config);
@@ -691,7 +691,7 @@ mod tests {
         )
         .unwrap();
 
-        let status = installed_status_from_dir(&config, &dir);
+        let status = installed_status(&config, &dir);
 
         assert!(status.installed);
         assert_eq!(status.mode, "artifact");
@@ -705,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_sha256_requires_exact_checksum() {
+    fn checksum_requires_exact() {
         let bytes = b"portal artifact";
         let expected = hex::encode(sha2::Sha256::digest(bytes));
 

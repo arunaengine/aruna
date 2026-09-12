@@ -1,8 +1,6 @@
 //! The placement references one object's current head carries, with the head
-//! generation an exact-set mutation has to present.
-//!
-//! Read-only and node-local: it reports what this node stores, and the caller
-//! authorizes the object read before driving it.
+//! generation an exact-set mutation must present. Read-only and node-local: it
+//! reports what this node stores; the caller authorizes the read before driving it.
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -115,6 +113,9 @@ impl Operation for ObjectPlacementOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = &event {
+            return self.finish(Err(error.clone().into()));
+        }
         match self.state {
             ReadState::Init => self.start(),
             ReadState::ReadHead => {

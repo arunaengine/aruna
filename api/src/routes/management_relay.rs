@@ -1,16 +1,14 @@
-//! Transparent relay of management-only REST routes.
-//!
-//! A caller must not need to know which node kind serves their portal. A
-//! management-only route that reaches a node of another kind is re-issued
-//! against a management node and its answer is passed back verbatim.
+//! Transparent relay of management-only REST routes: a route that reaches the
+//! wrong node kind is re-issued against a management node and its answer is
+//! passed back verbatim, so a caller never needs to know the serving node kind.
 
 use crate::error::ServerError;
-use crate::routes::info::{load_node_info_documents_best_effort, management_node_urls};
+use crate::routes::info::{load_node_documents, management_node_urls};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
 use axum::body::Bytes;
 use axum::extract::{FromRequest, MatchedPath, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
@@ -255,7 +253,7 @@ async fn management_targets(state: &Arc<ServerState>) -> Vec<String> {
     .await
     {
         Ok(config) => {
-            let documents = load_node_info_documents_best_effort(state, &config).await;
+            let documents = load_node_documents(state, &config).await;
             let peers = peer_management_urls(state.get_node_id(), &config, &documents);
             let installed = installed_management_urls(&state.get_ctx(), state.get_realm_id()).await;
             cached.urls = relay_targets(peers, installed);
@@ -368,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn hop_header_stops_relay() {
+    fn hop_stops_relay() {
         assert_eq!(
             relay_route(
                 &Method::PUT,
@@ -381,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn management_node_answers_itself() {
+    fn management_answers_itself() {
         assert_eq!(
             relay_route(
                 &Method::PUT,

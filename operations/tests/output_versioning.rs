@@ -21,8 +21,8 @@ use aruna_core::structs::{
     RoutingSnapshot, WorkspaceMode, checksum::HASH_BLAKE3,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, NodeId};
-use aruna_core::util::unix_timestamp_millis;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::store::{insert_job, record_attempt_intent, reserve_output_commits};
@@ -31,7 +31,7 @@ use aruna_operations::jobs::workflow::workspace::{capture_outputs, load_direct_i
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation, HeadObjectResult};
 use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
-use aruna_operations::s3::list_object_versions::{
+use aruna_operations::s3::list_versions::{
     ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
 };
 use aruna_operations::s3::put_object::{
@@ -318,8 +318,8 @@ async fn seed_auth(harness: &Harness) {
         user_id: harness.created_by,
         realm_id: harness.realm_id,
     };
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(harness.realm_id);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(harness.realm_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(
         harness.created_by,
         harness.realm_id,
         harness.group_id,

@@ -2,7 +2,7 @@ use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission, parse_group_id, require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::metadata::map_metadata_api_error;
+use crate::metadata::map_api_error;
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, MetadataAuditOperation, Permission};
 use aruna_operations::metadata::api::forwarded_bearer;
@@ -188,7 +188,7 @@ pub async fn list_audit(
     )
     .await
     .map_err(|_| ServerError::ServiceUnavailable)?
-    .map_err(map_metadata_api_error)?;
+    .map_err(map_api_error)?;
     // A device holds no audit rows of its own, so this read is pure fan-out and
     // every peer re-checks the same group-admin authority on the caller's token.
     if !user_origin {
@@ -210,12 +210,12 @@ pub async fn list_audit(
         let carrier = bearer_token.as_ref().ok_or(ServerError::Unauthorized)?;
         Some(
             forwarded_bearer(Some(carrier.as_str()))
-                .map_err(map_metadata_api_error)?
+                .map_err(map_api_error)?
                 .ok_or(ServerError::Unauthorized)?,
         )
     } else {
         forwarded_bearer(bearer_token.as_ref().map(|carrier| carrier.as_str()))
-            .map_err(map_metadata_api_error)?
+            .map_err(map_api_error)?
     };
     let page = gather_audit(
         ctx.as_ref(),

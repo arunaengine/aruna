@@ -1,9 +1,6 @@
 //! Edits the owner makes on this device's own replicas.
 //!
-//! The edit is planned against the local graph, queued, and then merged, so a
-//! queue failure leaves the graph unchanged and the realm receives exactly the
-//! change set the device applies. Nothing here decides realm authority: the
-//! holder re-checks the owner's permission when the drain forwards the batch.
+//! Planned against the local graph, queued, then merged; the holder re-checks authority on forward.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,11 +19,11 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::device::enqueue_draft::{EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation};
+use crate::device::publish_queue::{PublishEntry, PublishKind, PublishState};
 use crate::device::replica::{ReplicaRecord, mark_edited, store_replica};
-use crate::device::repository::{IntakeEntry, IntakeKind, IntakeState};
-use crate::device::status::read_intake_entries;
+use crate::device::sync_status::read_publish_entries;
 use crate::driver::{DriverContext, drive};
-use crate::update_metadata_document::UpdateMetadataDocumentMutation;
+use crate::metadata::update_document::UpdateMetadataDocumentMutation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DeviceEditError {
@@ -52,10 +49,7 @@ pub fn device_edit_actor(node_id: NodeId, draft_id: Ulid) -> [u8; 32] {
 
 /// Applies one edit to the local replica and queues it for the realm.
 ///
-/// The batch craqle produced is the edit: the holder merges that same change
-/// set, so both sides converge whatever else happened while the device was
-/// away. Answers with the record this device holds, which the realm confirms
-/// when the drain forwards the batch.
+/// The holder merges the same craqle batch so both sides converge; the drain confirms the record.
 pub async fn apply_local_edit(
     context: &Arc<DriverContext>,
     owner: UserId,
@@ -74,7 +68,7 @@ pub async fn apply_local_edit(
     let draft_id = Ulid::generate();
     let actor = device_edit_actor(node_id, draft_id);
     let batch = plan_local(context, &record, &authored, actor).await?;
-    let entry = IntakeEntry::edit(draft_id, owner, &record, batch.clone(), authored);
+    let entry = PublishEntry::edit(draft_id, owner, &record, batch.clone(), authored);
     drive(
         EnqueueDraftOperation::new(EnqueueDraftInput { entry }),
         context.as_ref(),
@@ -195,16 +189,16 @@ async fn render(context: &Arc<DriverContext>, graph_iri: &str) -> Result<String,
         })
 }
 
-/// Wakes the intake drain so a reachable realm sees the edit at once.
+/// Wakes the publish drain so a reachable realm sees the edit at once.
 async fn arm_drain(context: &Arc<DriverContext>) {
     let Some(task_handle) = context.task_handle.as_ref() else {
         return;
     };
     if let TaskEvent::Error { message, .. } = task_handle
-        .schedule_timer_if_idle(TaskKey::DrainDeviceIntake, Duration::ZERO)
+        .schedule_idle_timer(TaskKey::DrainDeviceIntake, Duration::ZERO)
         .await
     {
-        warn!(message = %message, "Failed to arm the device intake drain");
+        warn!(message = %message, "Failed to arm the device publish drain");
     }
 }
 
@@ -219,31 +213,27 @@ async fn request_persist(context: &Arc<DriverContext>) {
     }
 }
 
-/// Whether one queued entry's batch has to go back into the local graph after a
-/// restart. An edit that is still on its way to the realm is the only local
-/// change nothing else would restore; a published one comes back with the next
-/// refresh, and a parked one is not this device's state to keep.
-pub fn replays_edit(entry: &IntakeEntry) -> bool {
-    matches!(entry.kind, IntakeKind::Edit { .. })
+/// Whether one queued entry's batch must be re-merged after a restart: only an
+/// edit still on its way to the realm, which nothing else restores. A published
+/// entry returns by refresh; a parked one is not this device's state.
+pub fn replays_edit(entry: &PublishEntry) -> bool {
+    matches!(entry.kind, PublishKind::Edit { .. })
         && matches!(
             entry.state,
-            IntakeState::Pending { .. } | IntakeState::Publishing { .. }
+            PublishState::Pending { .. } | PublishState::Publishing { .. }
         )
 }
 
-/// Re-merges every queued edit into this device's replicas, and answers how
-/// many were replayed.
+/// Re-merges every queued edit into this device's replicas, returning the count.
 ///
-/// Local edits are written to craqle's WAL and persisted afterwards, so a crash
-/// in between can leave the graph behind the queue. Merging is idempotent by
-/// dot, so a batch the graph already carries costs nothing.
+/// A crash between the WAL write and persist can leave the graph behind; merging is idempotent by dot.
 pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
     let Some(metadata) = context.metadata_handle.as_ref() else {
         return 0;
     };
     let mut replayed = 0usize;
-    for entry in read_intake_entries(context).await {
-        let IntakeKind::Edit { batch, .. } = &entry.kind else {
+    for entry in read_publish_entries(context).await {
+        let PublishKind::Edit { batch, .. } = &entry.kind else {
             continue;
         };
         if !replays_edit(&entry) {
@@ -279,10 +269,10 @@ pub fn accepts_edits(replica: &ReplicaRecord) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{DeviceEditError, apply_local_edit, device_edit_actor, replays_edit};
-    use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
-    use crate::device::repository::{
-        IntakeEntry, IntakeKind, IntakeState, MAX_INTAKE_ENTRIES, intake_entry,
+    use crate::device::publish_queue::{
+        MAX_PUBLISH_ENTRIES, PublishEntry, PublishKind, PublishState, publish_entry,
     };
+    use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
     use crate::driver::DriverContext;
     use crate::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
     use aruna_core::effects::StorageEffect;
@@ -339,8 +329,8 @@ mod tests {
         }
     }
 
-    fn edit(state: IntakeState) -> IntakeEntry {
-        let mut entry = IntakeEntry::edit(
+    fn edit(state: PublishState) -> PublishEntry {
+        let mut entry = PublishEntry::edit(
             Ulid::generate(),
             UserId::local(Ulid::generate(), RealmId::from_bytes([3u8; 32])),
             &record(),
@@ -411,8 +401,8 @@ mod tests {
             Event::Metadata(MetadataEvent::CreateCrateResult { .. })
         ));
         let owner = UserId::local(Ulid::generate(), record.realm_id);
-        for _ in 0..MAX_INTAKE_ENTRIES {
-            let entry = IntakeEntry::new(
+        for _ in 0..MAX_PUBLISH_ENTRIES {
+            let entry = PublishEntry::new(
                 Ulid::generate(),
                 owner,
                 record.group_id,
@@ -420,7 +410,7 @@ mod tests {
                 false,
                 "{}".to_string(),
             );
-            let (key_space, key, value) = intake_entry(&entry).unwrap();
+            let (key_space, key, value) = publish_entry(&entry).unwrap();
             assert!(matches!(
                 context
                     .storage_handle
@@ -453,13 +443,13 @@ mod tests {
                 owner,
                 node(1),
                 &replica,
-                crate::update_metadata_document::UpdateMetadataDocumentMutation::UpsertContextualEntity {
+                crate::metadata::update_document::UpdateMetadataDocumentMutation::UpsertContextualEntity {
                     jsonld: r##"{"@id":"#ada","@type":"Person","name":"Ada"}"##.to_string(),
                 },
             )
             .await,
             Err(DeviceEditError::QueueFull {
-                limit: MAX_INTAKE_ENTRIES
+                limit: MAX_PUBLISH_ENTRIES
             })
         );
         assert_eq!(
@@ -475,26 +465,26 @@ mod tests {
     fn replays_unpublished_edits() {
         // Only an edit still on its way to the realm is local state nothing
         // else restores; a create carries no batch to replay at all.
-        assert!(replays_edit(&edit(IntakeState::Pending {
+        assert!(replays_edit(&edit(PublishState::Pending {
             due_at_ms: 0,
             attempts: 0,
             last_error: None,
         })));
-        assert!(replays_edit(&edit(IntakeState::Publishing {
+        assert!(replays_edit(&edit(PublishState::Publishing {
             document_id: record().document_id,
             due_at_ms: 0,
             attempts: 1,
         })));
-        assert!(!replays_edit(&edit(IntakeState::Published {
+        assert!(!replays_edit(&edit(PublishState::Published {
             document_id: record().document_id,
         })));
-        assert!(!replays_edit(&edit(IntakeState::Failed {
+        assert!(!replays_edit(&edit(PublishState::Failed {
             reason: "denied".to_string(),
             retryable: false,
             document_id: Some(record().document_id),
         })));
 
-        let create = IntakeEntry::new(
+        let create = PublishEntry::new(
             Ulid::generate(),
             UserId::local(Ulid::generate(), RealmId::from_bytes([3u8; 32])),
             Ulid::from_bytes([1u8; 16]),
@@ -502,7 +492,7 @@ mod tests {
             false,
             "{}".to_string(),
         );
-        assert!(matches!(create.kind, IntakeKind::Create));
+        assert!(matches!(create.kind, PublishKind::Create));
         assert!(!replays_edit(&create));
     }
 }

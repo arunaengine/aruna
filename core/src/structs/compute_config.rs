@@ -1,8 +1,6 @@
-//! Realm-wide compute configuration the pure planner reads.
-//!
-//! It carries operator knowledge no node can measure for itself: the directed
-//! bandwidth between placement locations, the bandwidth to assume for an
-//! unconfigured link, and how long an availability sample stays meaningful.
+//! Realm-wide compute configuration the pure planner reads. It carries operator knowledge no node can
+//! measure for itself: the directed bandwidth between placement locations, the bandwidth to assume for
+//! an unconfigured link, and how long an availability sample stays meaningful.
 
 use crate::compute_quota::ComputeQuota;
 use crate::structs::MAX_NODE_LOCATION_LEN;
@@ -18,10 +16,8 @@ pub const MAX_LOCATION_LINKS: usize = 256;
 pub const DEFAULT_PESSIMISTIC_BANDWIDTH: u64 = 12_500_000;
 /// Age above which an availability sample only counts as unknown.
 pub const DEFAULT_AVAILABILITY_STALE_MS: u64 = 300_000;
-/// Delay one witness rank waits before it plans a submission itself. With
-/// replication factor `RF`, `witness_base_delay_ms * (RF - 1)` is the worst-case
-/// wait before any witness launches while higher ranks are down, so an operator
-/// tunes the leaderless failover latency here instead of in a hidden constant.
+/// Delay per witness rank. `base * (RF - 1)` bounds leaderless launch failover when higher ranks
+/// are down, making the operator setting the explicit failover control.
 pub const DEFAULT_WITNESS_BASE_DELAY_MS: u64 = 30_000;
 /// How long a witness waits for a launch to produce a receipt, and how long an
 /// executor node may stay silent, before the round plans again: 5 minutes.
@@ -290,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_quota_fails_closed() {
+    fn duplicate_quota_closed() {
         // An ambiguous quota section must not silently resolve to one of its
         // entries or to the realm default.
         let group = GroupId::from_bytes([1; 16]);

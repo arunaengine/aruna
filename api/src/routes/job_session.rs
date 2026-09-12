@@ -13,12 +13,12 @@ use aruna_compute::session::{
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{AuthContext, JobId, JobPayload, JobRecord, JobState, key_content_type};
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::jobs::lifecycle::ids::session_of;
 use aruna_operations::jobs::lifecycle::routing::session_job;
 use aruna_operations::jobs::service::read_session_reason;
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
 use aruna_operations::s3::copy_object::{CopyObjectInput, CopySourceConditions, copy_object};
-use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
+use aruna_operations::s3::get_bucket::GetBucketInfoOperation;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -35,7 +35,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::jobs::{
     JobStatusResponse, coded_response, job_status_response, map_job_route, parse_job_id,
@@ -191,7 +191,7 @@ pub struct PendingInputResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct FailedInputResponse {
     pub dest_key: String,
-    /// Why this item did not land, so the caller can retry or drop it.
+    /// Safe reason this item did not land, so the caller can retry or drop it.
     pub error: String,
 }
 
@@ -446,7 +446,7 @@ pub async fn get_session(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     match live_session(&state, &record, physical_job_id, true).await {
         Ok(session) => Ok(Json(session_response(&session, true)).into_response()),
@@ -492,7 +492,7 @@ pub async fn stream_session(
     Query(query): Query<EventsQuery>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, true).await {
         Ok(session) => session,
@@ -650,7 +650,7 @@ pub async fn submit_cell(
     Path(job_id): Path<String>,
     Json(request): Json<SubmitCellRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
@@ -697,7 +697,7 @@ pub async fn interrupt_session(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
@@ -745,7 +745,7 @@ pub async fn end_session(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
@@ -802,7 +802,7 @@ pub async fn stage_inputs(
     Path(job_id): Path<String>,
     Json(request): Json<SessionInputsRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
@@ -838,10 +838,7 @@ pub async fn stage_inputs(
                 staged.push(entry);
             }
             Err(error) => {
-                failed.push(FailedInputResponse {
-                    dest_key,
-                    error: error.public_message(),
-                });
+                failed.push(failed_input(dest_key, &error));
                 refusal = refusal.or(Some(error));
             }
         }
@@ -898,6 +895,13 @@ fn inputs_outcome(
         }),
     )
         .into_response())
+}
+
+fn failed_input(dest_key: String, error: &ServerError) -> FailedInputResponse {
+    FailedInputResponse {
+        dest_key,
+        error: error.public_message(),
+    }
 }
 
 /// The bucket a name resolves to here. Absence reads as 404 like every other
@@ -1010,7 +1014,7 @@ pub async fn list_scratch(
     Path(job_id): Path<String>,
     Query(query): Query<ScratchQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
@@ -1062,7 +1066,7 @@ pub async fn read_scratch(
     Path(job_id): Path<String>,
     Query(query): Query<ScratchReadQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
@@ -1654,6 +1658,15 @@ mod tests {
             body.ended.map(|ended| ended.reason),
             Some("idle".to_string())
         );
+    }
+
+    #[test]
+    fn failed_item_redacted() {
+        let failed = failed_input(
+            "data/b.txt".to_string(),
+            &ServerError::InternalError("private backend detail".to_string()),
+        );
+        assert!(!failed.error.contains("private backend detail"));
     }
 
     fn registry_session(state: &Arc<ServerState>, job_id: JobId) -> Option<Arc<Session>> {

@@ -1,8 +1,6 @@
 //! Asks each folder's realm node to pull the local versions that changed.
-//!
-//! The device never pushes: it forwards one request naming the exact local
-//! version, and the realm node reads that version back from this device and
-//! commits its own copy as the owner.
+//! The device never pushes: one request names the exact local version, which the
+//! node reads back and commits as the owner.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,20 +10,22 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE};
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::structs::{
-    AuthContext, EntrySide, EntryState, FolderState, SyncBase, SyncPullAck, SyncRefusal,
+    AuthContext, EntrySide, EntryState, FolderState, RealmId, SyncBase, SyncPullAck, SyncRefusal,
     SyncedBytes, SyncedFolder, VersionedObjectArn,
 };
-use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::task::TaskKey;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, TxnId};
-use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
 
+use crate::device::backlog::{
+    ForwardOutcome, QueueDrain, arm_timer, drain_queue, exhausted, retry_due_ms,
+};
 use crate::device::drain::DrainOutcome;
 use crate::driver::DriverContext;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::queue_backoff::queue_retry_after_ms;
 
 use super::repository::{
     MAX_UPLOAD_ATTEMPTS, SYNC_PAGE_SIZE, SyncUpload, UploadState, abort_txn, base_entry, base_key,
@@ -46,55 +46,62 @@ pub async fn drain_sync_outbox(context: &Arc<DriverContext>) -> DrainOutcome {
     let realm_id = *net_handle.realm_id();
     let node_id = net_handle.node_id();
     let now = unix_timestamp_millis();
-    let mut cursor: Option<Key> = None;
-    let mut due = false;
-    loop {
-        let Some((rows, next)) = read_page(context, cursor).await else {
-            return DrainOutcome::Deferred;
-        };
-        for upload in rows {
-            if !upload.is_due(now) {
-                continue;
-            }
-            let Some(folder) = load_folder(context, upload.folder_id).await else {
-                // The folder is unbound: this row is nobody's work any more, and
-                // leaving it would keep the drain awake for a folder that is gone.
-                drop_upload(context, &upload).await;
-                continue;
-            };
-            // An unbinding folder publishes nothing more; its rows are going.
-            if folder.state == FolderState::Deleting {
-                continue;
-            }
-            let attempts = upload.attempts().saturating_add(1);
-            if !claim_upload(context, &upload, attempts).await {
-                continue;
-            }
-            // Only a row this pass really forwards keeps the drain running.
-            due = true;
-            let source = match VersionedObjectArn::new(
-                realm_id,
-                node_id,
-                folder.local_bucket.clone(),
-                upload.relative.clone(),
-                upload.local_version.unwrap_or_default(),
-            ) {
-                Ok(source) => source,
-                Err(error) => {
-                    park(context, &upload, error.to_string(), false).await;
-                    continue;
-                }
-            };
-            forward_upload(context, &folder, &upload, source, attempts).await;
-        }
-        match next {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
+    drain_queue(
+        now,
+        UploadDrain {
+            context,
+            realm_id,
+            node_id,
+        },
+    )
+    .await
+}
+
+/// One upload drain queue handed to the shared page loop.
+struct UploadDrain<'a> {
+    context: &'a Arc<DriverContext>,
+    realm_id: RealmId,
+    node_id: aruna_core::NodeId,
+}
+
+impl QueueDrain for UploadDrain<'_> {
+    type Entry = SyncUpload;
+
+    async fn read(&mut self, cursor: Option<Key>) -> Option<(Vec<SyncUpload>, Option<Key>)> {
+        read_page(self.context, cursor).await
     }
-    match due {
-        true => DrainOutcome::More,
-        false => DrainOutcome::Idle,
+
+    async fn forward(&mut self, upload: SyncUpload) -> ForwardOutcome {
+        let Some(folder) = load_folder(self.context, upload.folder_id).await else {
+            // The folder is unbound: this entry is nobody's work any more, and
+            // leaving it would keep the drain awake for a folder that is gone.
+            drop_upload(self.context, &upload).await;
+            return ForwardOutcome::Settled;
+        };
+        // An unbinding folder publishes nothing more; its entries are going.
+        if folder.state == FolderState::Deleting {
+            return ForwardOutcome::Settled;
+        }
+        let attempts = upload.attempts().saturating_add(1);
+        if !claim_upload(self.context, &upload, attempts).await {
+            return ForwardOutcome::Settled;
+        }
+        // Only a claimed entry keeps the drain awake.
+        let source = match VersionedObjectArn::new(
+            self.realm_id,
+            self.node_id,
+            folder.local_bucket.clone(),
+            upload.relative.clone(),
+            upload.local_version.unwrap_or_default(),
+        ) {
+            Ok(source) => source,
+            Err(error) => {
+                park(self.context, &upload, error.to_string(), false).await;
+                return ForwardOutcome::Recheck;
+            }
+        };
+        forward_upload(self.context, &folder, &upload, source, attempts).await;
+        ForwardOutcome::Recheck
     }
 }
 
@@ -177,11 +184,9 @@ fn permanent(refusal: &SyncRefusal) -> bool {
     )
 }
 
-/// Records the realm version as the entry's new base and drops the outbox row
-/// in one transaction, so an acknowledged pull is never forwarded twice.
-///
-/// A row the owner still has to answer keeps its reported state: the pull only
-/// establishes which realm version these bytes now correspond to.
+/// Records the realm version as the entry's new base and drops the outbox row in
+/// one transaction, so an acknowledged pull is never forwarded twice; a row the
+/// owner must still answer keeps its reported state.
 async fn settle_upload(context: &Arc<DriverContext>, upload: &SyncUpload, ack: &SyncPullAck) {
     let current = read_value(
         context,
@@ -276,7 +281,7 @@ fn settled_base(upload: &SyncUpload, ack: &SyncPullAck, current: Option<SyncBase
 /// read, so a concurrent unbind or a newer version wins instead of coming back.
 async fn claim_upload(context: &Arc<DriverContext>, upload: &SyncUpload, attempts: u32) -> bool {
     let next = UploadState::Pending {
-        due_at_ms: unix_timestamp_millis().saturating_add(queue_retry_after_ms(attempts)),
+        due_at_ms: retry_due_ms(attempts),
         attempts,
         last_error: None,
     };
@@ -284,13 +289,13 @@ async fn claim_upload(context: &Arc<DriverContext>, upload: &SyncUpload, attempt
 }
 
 async fn retry(context: &Arc<DriverContext>, upload: &SyncUpload, reason: String, attempts: u32) {
-    let next = match attempts >= MAX_UPLOAD_ATTEMPTS {
+    let next = match exhausted(attempts, MAX_UPLOAD_ATTEMPTS) {
         true => UploadState::Failed {
             reason,
             retryable: true,
         },
         false => UploadState::Pending {
-            due_at_ms: unix_timestamp_millis().saturating_add(queue_retry_after_ms(attempts)),
+            due_at_ms: retry_due_ms(attempts),
             attempts,
             last_error: Some(reason),
         },
@@ -400,12 +405,12 @@ pub async fn restore_upload_timer(storage: &StorageHandle, task_handle: &TaskHan
     if !has_rows(storage, SYNC_UPLOAD_OUTBOX_KEYSPACE).await {
         return;
     }
-    if let TaskEvent::Error { message, .. } = task_handle
-        .schedule_timer_if_idle(TaskKey::DrainSyncUploadOutbox, Duration::ZERO)
-        .await
-    {
-        warn!(message = %message, "Failed to restore the synced-folder upload timer");
-    }
+    arm_timer(
+        task_handle,
+        TaskKey::DrainSyncUploadOutbox,
+        "Failed to restore the synced-folder upload timer",
+    )
+    .await;
 }
 
 /// Whether a keyspace holds at least one row.
@@ -422,4 +427,173 @@ pub(crate) async fn has_rows(storage: &StorageHandle, key_space: &str) -> bool {
             .await,
         Event::Storage(StorageEvent::IterResult { values, .. }) if !values.is_empty()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use aruna_core::structs::{FolderMode, RemoteBinding};
+    use aruna_core::types::UserId;
+    use ulid::Ulid;
+
+    use super::{
+        ForwardOutcome, QueueDrain, SyncUpload, UploadDrain, UploadState, drain_sync_outbox,
+    };
+    use crate::device::drain::DrainOutcome;
+    use crate::device::sync::folders::store_folder;
+    use crate::device::sync::repository::{base_key, read_value, upload_entry, write_rows};
+    use crate::driver::DriverContext;
+    use crate::tests::fixtures::device::context;
+    use aruna_core::keyspaces::SYNC_UPLOAD_OUTBOX_KEYSPACE;
+    use aruna_core::structs::{FolderState, RealmId, SyncedFolder};
+
+    fn node_id() -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[1u8; 32]).public()
+    }
+
+    fn folder(folder_id: Ulid) -> SyncedFolder {
+        SyncedFolder {
+            folder_id,
+            root: "/home/ada/lab".to_string(),
+            local_bucket: "folder-1".to_string(),
+            group_id: Ulid::from_bytes([1u8; 16]),
+            remote: RemoteBinding {
+                node_id: node_id(),
+                bucket: "lab".to_string(),
+                prefix: "ada/".to_string(),
+            },
+            mode: FolderMode::TwoWay,
+            propagate_deletes: false,
+            state: FolderState::Active,
+            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
+            created_at_ms: 1,
+            last_reconcile_ms: None,
+            last_error: None,
+            last_error_at_ms: None,
+            observed_files: 0,
+            list_cursor: None,
+        }
+    }
+
+    fn upload(folder_id: Ulid) -> SyncUpload {
+        SyncUpload {
+            folder_id,
+            relative: "notes.txt".to_string(),
+            deleted: false,
+            fingerprint: "1-1-1-1".to_string(),
+            blake3: Some([5u8; 32]),
+            size: 1,
+            local_version: Some(Ulid::generate()),
+            queued_at_ms: 0,
+            state: UploadState::Pending {
+                due_at_ms: 0,
+                attempts: 0,
+                last_error: None,
+            },
+        }
+    }
+
+    fn drain(context: &Arc<DriverContext>) -> UploadDrain<'_> {
+        UploadDrain {
+            context,
+            realm_id: RealmId::from_bytes([1u8; 32]),
+            node_id: node_id(),
+        }
+    }
+
+    async fn store(context: &Arc<DriverContext>, upload: &SyncUpload) {
+        assert!(write_rows(context, vec![upload_entry(upload).unwrap()], None).await);
+    }
+
+    async fn stored(context: &Arc<DriverContext>, upload: &SyncUpload) -> SyncUpload {
+        let bytes = read_value(
+            context,
+            SYNC_UPLOAD_OUTBOX_KEYSPACE,
+            base_key(upload.folder_id, &upload.relative),
+            None,
+        )
+        .await
+        .expect("the upload row is stored");
+        SyncUpload::from_bytes(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn defers_without_realm() {
+        let (_tempdir, context) = context().await;
+        let context = Arc::new(context);
+        assert_eq!(drain_sync_outbox(&context).await, DrainOutcome::Deferred);
+    }
+
+    #[tokio::test]
+    async fn drops_unbound_upload() {
+        // An unbound folder owns nothing: the entry is dropped instead of
+        // keeping the drain awake for a folder that is gone.
+        let (_tempdir, context) = context().await;
+        let context = Arc::new(context);
+        let entry = upload(Ulid::generate());
+        store(&context, &entry).await;
+
+        assert_eq!(
+            drain(&context).forward(entry.clone()).await,
+            ForwardOutcome::Settled
+        );
+        assert!(
+            read_value(
+                &context,
+                SYNC_UPLOAD_OUTBOX_KEYSPACE,
+                base_key(entry.folder_id, &entry.relative),
+                None,
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn claims_before_forward() {
+        // The claim is stored before the forward, so a crash mid-forward
+        // resumes from the claimed state rather than the old one.
+        let (_tempdir, context) = context().await;
+        let context = Arc::new(context);
+        let folder = folder(Ulid::generate());
+        store_folder(&context, &folder).await.unwrap();
+        let entry = upload(folder.folder_id);
+        store(&context, &entry).await;
+
+        assert_eq!(
+            drain(&context).forward(entry.clone()).await,
+            ForwardOutcome::Recheck
+        );
+        assert!(matches!(
+            stored(&context, &entry).await.state,
+            UploadState::Pending { attempts: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn keeps_newer_state() {
+        // The entry advanced while the page was in flight: the failed claim
+        // must let the newer state win instead of overwriting it.
+        let (_tempdir, context) = context().await;
+        let context = Arc::new(context);
+        let folder = folder(Ulid::generate());
+        store_folder(&context, &folder).await.unwrap();
+        let entry = upload(folder.folder_id);
+        store(&context, &entry).await;
+        let newer = SyncUpload {
+            state: UploadState::Failed {
+                reason: "gone".to_string(),
+                retryable: false,
+            },
+            ..entry.clone()
+        };
+        store(&context, &newer).await;
+
+        assert_eq!(
+            drain(&context).forward(entry).await,
+            ForwardOutcome::Settled
+        );
+        assert_eq!(stored(&context, &newer).await.state, newer.state);
+    }
 }

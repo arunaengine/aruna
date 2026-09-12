@@ -1,12 +1,12 @@
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::sessions::unix_rfc3339;
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{AuthContext, UserVault};
-use aruna_core::util::unix_timestamp_secs;
+use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::driver::drive;
-use aruna_operations::user_vault::{
+use aruna_operations::users::user_vault::{
     DeleteVaultOperation, ReadVaultOperation, VaultStoreError, WriteVaultOperation,
 };
 use axum::extract::State;
@@ -102,7 +102,7 @@ pub async fn get_vault(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<VaultResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let vault = drive(ReadVaultOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(map_vault_error)?;
@@ -157,7 +157,7 @@ pub async fn put_vault(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<SaveVaultRequest>,
 ) -> ServerResult<(StatusCode, Json<VaultResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let vault = drive(
         WriteVaultOperation::new(
             auth.user_id,
@@ -197,7 +197,7 @@ pub async fn delete_vault(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     drive(
         DeleteVaultOperation::new(auth.user_id, unix_timestamp_secs()),
         &state.get_ctx(),
@@ -210,7 +210,7 @@ pub async fn delete_vault(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routes::users::resolve_tests::{realm_auth, setup_state};
+    use crate::tests::fixtures::users::{realm_auth, setup_state};
     use aruna_core::structs::MAX_USER_VAULT_BYTES;
     use axum::response::IntoResponse;
 

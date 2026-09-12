@@ -230,7 +230,7 @@ mod tests {
     };
 
     #[test]
-    fn on_success_runs_after_stream_completion() {
+    fn on_success_completion() {
         futures::executor::block_on(async {
             let calls = Arc::new(AtomicUsize::new(0));
             let calls_for_callback = calls.clone();
@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn on_success_does_not_run_after_stream_error() {
+    fn on_success_error() {
         futures::executor::block_on(async {
             let calls = Arc::new(AtomicUsize::new(0));
             let calls_for_callback = calls.clone();
@@ -264,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn on_success_async_waits_for_callback_before_completion() {
+    fn on_async_completion() {
         futures::executor::block_on(async {
             let calls = Arc::new(AtomicUsize::new(0));
             let calls_for_callback = calls.clone();
@@ -281,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn on_success_async_surfaces_callback_error() {
+    fn on_async_error() {
         futures::executor::block_on(async {
             let mut stream = BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(1)]))
                 .on_success_async(move || async move {

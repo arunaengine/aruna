@@ -67,7 +67,7 @@ pub fn key_content_type(key: &str) -> &'static str {
     }
 }
 
-pub fn ensure_confined_relative_path(path: &Path) -> Result<(), ConversionError> {
+pub fn ensure_confined_path(path: &Path) -> Result<(), ConversionError> {
     for component in path.components() {
         match component {
             Component::Normal(part) => {
@@ -346,7 +346,7 @@ impl Display for BackendLocation {
 impl BackendLocation {
     fn confined_relative_path(&self) -> Result<PathBuf, ConversionError> {
         let path = PathBuf::from(&self.storage_bucket).join(&self.backend_path);
-        ensure_confined_relative_path(&path)?;
+        ensure_confined_path(&path)?;
         Ok(path)
     }
 
@@ -486,7 +486,7 @@ impl HiddenBlobKey {
 
     pub fn namespace(&self) -> Result<Ulid, ConversionError> {
         let path = Path::new(&self.backend_path);
-        ensure_confined_relative_path(path)?;
+        ensure_confined_path(path)?;
         let mut components = path.components().filter_map(|component| match component {
             Component::Normal(part) => part.to_str(),
             _ => None,
@@ -511,7 +511,7 @@ impl HiddenBlobKey {
 
     pub fn get_storage_path(&self) -> Result<String, ConversionError> {
         let path = PathBuf::from(&self.storage_bucket).join(&self.backend_path);
-        ensure_confined_relative_path(&path)?;
+        ensure_confined_path(&path)?;
         self.namespace()?;
         path.into_os_string()
             .into_string()
@@ -648,11 +648,11 @@ impl BlobHeadKey {
     }
 }
 
-pub fn blob_group_permission_path(realm_id: RealmId, group_id: GroupId, node_id: NodeId) -> String {
+pub fn group_permission_path(realm_id: RealmId, group_id: GroupId, node_id: NodeId) -> String {
     format!("/{realm_id}/g/{group_id}/data/{node_id}")
 }
 
-pub fn blob_bucket_permission_path(
+pub fn bucket_permission_path(
     realm_id: RealmId,
     group_id: GroupId,
     node_id: NodeId,
@@ -660,12 +660,12 @@ pub fn blob_bucket_permission_path(
 ) -> String {
     format!(
         "{}/{}",
-        blob_group_permission_path(realm_id, group_id, node_id),
+        group_permission_path(realm_id, group_id, node_id),
         bucket
     )
 }
 
-pub fn blob_object_permission_path(
+pub fn object_permission_path(
     realm_id: RealmId,
     group_id: GroupId,
     node_id: NodeId,
@@ -674,7 +674,7 @@ pub fn blob_object_permission_path(
 ) -> String {
     format!(
         "{}/{}",
-        blob_bucket_permission_path(realm_id, group_id, node_id, bucket),
+        bucket_permission_path(realm_id, group_id, node_id, bucket),
         key
     )
 }
@@ -716,26 +716,6 @@ impl HashPathIndexKey {
         }
     }
 
-    pub fn from_blake3_hash(
-        hash: &[u8],
-        version_id: Ulid,
-        realm_id: RealmId,
-        group_id: GroupId,
-        node_id: NodeId,
-        bucket: impl Into<String>,
-        key: impl Into<String>,
-    ) -> Result<Self, ConversionError> {
-        Ok(Self::new(
-            hash.try_into()?,
-            version_id,
-            realm_id,
-            group_id,
-            node_id,
-            bucket,
-            key,
-        ))
-    }
-
     pub fn hash_prefix(hash: &[u8]) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(&HashPathIndexKeyPrefix {
             blake3_hash: hash.try_into()?,
@@ -743,7 +723,7 @@ impl HashPathIndexKey {
     }
 
     pub fn permission_path(&self) -> String {
-        blob_object_permission_path(
+        object_permission_path(
             self.realm_id,
             self.group_id,
             self.node_id,
@@ -1287,8 +1267,8 @@ mod tests {
         Backend, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
         BucketCorsConfiguration, BucketCorsRule, BucketInfo, CurrentVersionPointer,
         HashPathIndexKey, HiddenBlobKey, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
-        ManagedCopyState, VersionKey, blob_bucket_permission_path, blob_group_permission_path,
-        blob_object_permission_path, key_content_type,
+        ManagedCopyState, VersionKey, bucket_permission_path, group_permission_path,
+        key_content_type, object_permission_path,
     };
     use crate::NodeId;
     use crate::errors::ConversionError;
@@ -1318,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn local_advance_is_checked() {
+    fn local_advance_checked() {
         assert_eq!(
             CurrentVersionPointer::next_for(None, Ulid::from_bytes([1u8; 16]))
                 .expect("first write starts at one")
@@ -1407,7 +1387,7 @@ mod tests {
     }
 
     #[test]
-    fn current_version_pointer_roundtrip_preserves_fields() {
+    fn current_version_fields() {
         let pointer = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([7u8; 16]), 42);
 
         let restored = CurrentVersionPointer::from_bytes(&pointer.to_bytes().unwrap()).unwrap();
@@ -1416,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn blob_head_key_roundtrip_preserves_fields_and_bucket_prefix() {
+    fn blob_head_prefix() {
         let key = BlobHeadKey::new("bucket", "nested/path.txt");
 
         let restored = BlobHeadKey::from_bytes(&key.to_bytes().unwrap()).unwrap();
@@ -1427,14 +1407,14 @@ mod tests {
     }
 
     #[test]
-    fn blob_head_key_object_prefix_roundtrip() {
+    fn blob_head_roundtrip() {
         let prefix = BlobHeadKey::object_prefix("bucket", "rare/").unwrap();
         let key = BlobHeadKey::new("bucket", "rare/").to_bytes().unwrap();
         assert_eq!(prefix, key);
     }
 
     #[test]
-    fn blob_head_key_object_prefix_rejects_wrong_bucket() {
+    fn blob_head_bucket() {
         let key = BlobHeadKey::new("bucket_b", "docs/file.txt")
             .to_bytes()
             .unwrap();
@@ -1443,14 +1423,14 @@ mod tests {
     }
 
     #[test]
-    fn blob_head_key_byte_order_matches_lexicographic_key_order() {
+    fn blob_head_order() {
         let short = BlobHeadKey::new("bucket", "b").to_bytes().unwrap();
         let long = BlobHeadKey::new("bucket", "aa").to_bytes().unwrap();
         assert!(long < short);
     }
 
     #[test]
-    fn blob_head_key_prefix_range_is_contiguous() {
+    fn blob_head_contiguous() {
         let prefix = BlobHeadKey::object_prefix("bucket", "rare/").unwrap();
         let inside = BlobHeadKey::new("bucket", "rare/1").to_bytes().unwrap();
         let outside = BlobHeadKey::new("bucket", "rare0").to_bytes().unwrap();
@@ -1485,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_path_index_key_roundtrip_preserves_fields_and_hash_prefix() {
+    fn hash_path_prefix() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let group_id = Ulid::from_bytes([3u8; 16]);
         let node_id =
@@ -1509,12 +1489,12 @@ mod tests {
         assert!(key.to_bytes().unwrap().starts_with(&prefix));
         assert_eq!(
             key.permission_path(),
-            blob_object_permission_path(realm_id, group_id, node_id, "bucket", "nested/path.txt")
+            object_permission_path(realm_id, group_id, node_id, "bucket", "nested/path.txt")
         );
     }
 
     #[test]
-    fn blob_permission_path_builders_use_canonical_format() {
+    fn blob_permission_format() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let group_id = Ulid::from_bytes([3u8; 16]);
         let node_id =
@@ -1522,21 +1502,21 @@ mod tests {
                 .unwrap();
 
         assert_eq!(
-            blob_group_permission_path(realm_id, group_id, node_id),
+            group_permission_path(realm_id, group_id, node_id),
             format!("/{realm_id}/g/{group_id}/data/{node_id}")
         );
         assert_eq!(
-            blob_bucket_permission_path(realm_id, group_id, node_id, "bucket"),
+            bucket_permission_path(realm_id, group_id, node_id, "bucket"),
             format!("/{realm_id}/g/{group_id}/data/{node_id}/bucket")
         );
         assert_eq!(
-            blob_object_permission_path(realm_id, group_id, node_id, "bucket", "nested/path.txt"),
+            object_permission_path(realm_id, group_id, node_id, "bucket", "nested/path.txt"),
             format!("/{realm_id}/g/{group_id}/data/{node_id}/bucket/nested/path.txt")
         );
     }
 
     #[test]
-    fn blob_version_roundtrip_preserves_all_states() {
+    fn blob_version_states() {
         let created_at = SystemTime::UNIX_EPOCH;
         let created_by = UserId::default();
         let binding = VersionSourceBinding {
@@ -1607,8 +1587,8 @@ mod tests {
     }
 
     #[test]
-    fn ensure_confined_relative_path_matrix() {
-        use super::ensure_confined_relative_path;
+    fn ensure_confined_matrix() {
+        use super::ensure_confined_path;
         use crate::errors::ConversionError;
         use std::path::Path;
 
@@ -1617,7 +1597,7 @@ mod tests {
             "bucket/nested/object.bin",
             "bucket/./object",
         ] {
-            assert!(ensure_confined_relative_path(Path::new(ok)).is_ok());
+            assert!(ensure_confined_path(Path::new(ok)).is_ok());
         }
         for bad in [
             "../escape",
@@ -1626,14 +1606,14 @@ mod tests {
             "bucket/../../../etc/passwd",
         ] {
             assert!(matches!(
-                ensure_confined_relative_path(Path::new(bad)),
+                ensure_confined_path(Path::new(bad)),
                 Err(ConversionError::UnsafePath(_))
             ));
         }
     }
 
     #[test]
-    fn get_storage_path_rejects_traversal_in_backend_path() {
+    fn get_path_path() {
         use crate::errors::{BlobError, ConversionError};
         use crate::structs::BackendLocation;
 
@@ -1948,7 +1928,7 @@ mod tests {
     }
 
     #[test]
-    fn bucket_cors_configuration_roundtrip_preserves_rules() {
+    fn bucket_cors_rules() {
         let config = BucketCorsConfiguration {
             rules: vec![BucketCorsRule {
                 id: Some("rule-1".to_string()),

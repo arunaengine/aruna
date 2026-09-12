@@ -7,8 +7,8 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SHARD_VERIFICATION_KEYSPACE;
 use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
-use aruna_core::util::unix_timestamp_millis;
 use aruna_net::NetHandle;
 use byteview::ByteView;
 use futures_util::{StreamExt, stream};
@@ -16,17 +16,17 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::driver::DriverContext;
+use crate::node::startup::apply_restored_reconcile;
 use crate::placement::resolve_shard_holders;
 use crate::shard::client::fetch_shard_manifest;
 use crate::shard::{assemble_shard_manifest, manifest_entry_digest};
-use crate::startup::apply_restored_reconcile;
-use crate::sync_placement::{placement_key, placement_prefix};
+use crate::sync::shard_placement::{placement_key, placement_prefix};
 
 /// Page size for scanning persisted shard verification markers.
 const VERIFIED_SHARD_SCAN_PAGE_SIZE: usize = 256;
 
 /// A new holder retries digest reconciliation this many times against the first
-/// reachable co-holder before leaving the shard unverified for the next pass.
+/// reachable co-holder before leaving it unverified for the next pass.
 pub const SHARD_VERIFICATION_MAX_ATTEMPTS: usize = 3;
 
 /// Limits startup verification work while allowing independent shards to make
@@ -34,10 +34,8 @@ pub const SHARD_VERIFICATION_MAX_ATTEMPTS: usize = 3;
 const SHARD_VERIFICATION_CONCURRENCY_LIMIT: usize = 8;
 
 /// Persisted proof that the local node reconciled a shard against a co-holder.
-/// Presence of the row (keyed like a pending placement) means verified; a
-/// restart resumes only shards without one. The marker is a one-shot join-time
-/// signal, not a continuous consistency guarantee: it is written once on the
-/// first successful reconcile and deleted when the node leaves the holder set.
+/// Presence of the row (keyed like a pending placement) means verified, so a
+/// restart resumes only shards without one. One-shot signal, not a guarantee.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardVerificationRecord {
     pub placement: PlacementRef,
@@ -54,13 +52,9 @@ pub struct ShardVerificationSummary {
     pub unverified: usize,
 }
 
-/// Reconciles every shard the local node newly holds against a co-holder with
-/// bounded concurrency: fetch the first reachable co-holder's manifest in rank
-/// order and compare the topic digest plus manifest entry digest. Equal ⇒ mark
-/// verified; differing ⇒ one anti-entropy pass against that co-holder and retry,
-/// bounded by [`SHARD_VERIFICATION_MAX_ATTEMPTS`]. Already verified shards (a
-/// persisted marker) are skipped, so this is idempotent and cheap in steady
-/// state and resumes unverified shards after a restart.
+/// Reconciles every newly held shard against the first reachable co-holder in
+/// rank order, comparing digest and entries, then retrying once via
+/// anti-entropy. Verified markers skip, so it is idempotent across restarts.
 pub async fn verify_held_shards(
     context: &Arc<DriverContext>,
     node_id: NodeId,
@@ -151,15 +145,10 @@ async fn verify_one_shard(
 ) -> bool {
     let topic = shard_topic_id(realm_id, &placement);
 
-    // A sole holder is trivially consistent with itself, but only once its
-    // genesis exists. A genesis-less topic still reports the (non-zero) empty
-    // fingerprint, so gate on the local topic actually existing — never on the
-    // digest value — or a rank-0 create still pending would be marked verified.
+    // A sole holder converges only after its genesis exists.
+    // A genesis-less topic has an empty fingerprint, so the digest alone is insufficient.
     if co_holders.is_empty() {
-        if !net_handle
-            .document_sync_topic_exists(topic)
-            .unwrap_or(false)
-        {
+        if !net_handle.sync_topic_exists(topic).unwrap_or(false) {
             debug!(
                 strategy = %placement.strategy_id,
                 shard = placement.shard,
@@ -202,12 +191,9 @@ async fn verify_one_shard(
     }
 }
 
-/// Reconciles the local shard copy against the first reachable co-holder and
-/// returns that co-holder with the digest both sides agree on.
-///
-/// The same machinery a joining holder verifies with, reused by the transition
-/// executor: the matched digest is the checkpoint root a completion proof
-/// commits to. `None` when no co-holder converged within the retry budget.
+/// Reconciles the local shard copy against the first reachable co-holder,
+/// returning it with the digest both sides agree on. The matched digest is the
+/// checkpoint root a completion proof commits to; `None` when none converged.
 pub async fn converge_shard_digest(
     context: &Arc<DriverContext>,
     net_handle: &NetHandle,
@@ -232,9 +218,8 @@ fn dominates_required(cursor: &[u8], required: Option<&irokle::ActorClock>) -> b
 }
 
 /// [`converge_shard_digest`] with an additionally required frontier: the local
-/// cursor must dominate `required` (the join of every old-holder barrier)
-/// before the digest counts, so a target can never prove while missing an
-/// unreachable divergent holder's writes. Every source is tried in turn.
+/// cursor must dominate the join of every old-holder barrier before the digest
+/// counts, so a target cannot prove while missing an unreachable holder's writes.
 pub async fn converge_with_barrier(
     context: &Arc<DriverContext>,
     net_handle: &NetHandle,
@@ -269,12 +254,9 @@ pub async fn converge_with_barrier(
                     return None;
                 }
             };
-            // Never certify convergence without a local genesis: two genesis-less
-            // holders share the (non-zero) empty fingerprint and would otherwise
-            // match, so require the local topic to exist before comparing.
-            if net_handle
-                .document_sync_topic_exists(topic)
-                .unwrap_or(false)
+            // Genesis-less holders share the empty fingerprint.
+            // Require a local genesis before comparing manifests.
+            if net_handle.sync_topic_exists(topic).unwrap_or(false)
                 && manifests_converged(&local, &remote)
                 && dominates_required(&local.cursor, required)
             {
@@ -326,11 +308,9 @@ pub async fn delete_shard_verification(
 }
 
 /// Topic ids of every shard the local node has durably verified in `realm_id`.
-///
-/// Reconciliation installs a former-holder history cutoff only for these topics:
-/// an unverified shard's local clock is not a trustworthy cutover boundary, so
-/// its history is left admissible until verification proves the transfer.
-pub async fn load_verified_shard_topics(
+/// Reconciliation installs a former-holder history cutoff only for these: an
+/// unverified shard's clock is not a trustworthy cutover boundary until proven.
+pub async fn load_verified_topics(
     context: &DriverContext,
     realm_id: RealmId,
 ) -> BTreeSet<::irokle::TopicId> {
@@ -496,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_topic_digest_with_different_entries_does_not_converge() {
+    fn equal_digest_diverges() {
         let local = manifest(vec![entry(1, 1)]);
         let remote = manifest(vec![entry(2, 1)]);
 

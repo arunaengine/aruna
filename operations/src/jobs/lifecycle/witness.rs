@@ -1,10 +1,6 @@
-//! Leaderless witness scheduling.
-//!
-//! Every current holder of a submission family is a witness. Each computes the
-//! same rank from the immutable identity, so the admitting node plans at once
-//! and later ranks only step in after their own persisted delay. No witness
-//! holds a lease, and a partition may therefore produce one execution per
-//! participating witness.
+//! Leaderless witness scheduling: every current holder of a submission family is
+//! a witness, and each computes the same rank from the immutable identity. No
+//! witness holds a lease, so a partition may produce one execution per witness.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -41,7 +37,7 @@ use crate::jobs::records::{
 };
 use crate::jobs::store::{batch_delete, iter_prefix_page};
 use crate::metadata::api::load_realm_config;
-use crate::node_info::read_node_info_document;
+use crate::node::node_info::read_info_document;
 
 /// Domain of the stable witness order.
 pub const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
@@ -85,9 +81,8 @@ pub fn schedule_witness_drain(after: Duration) -> Effect {
 }
 
 /// Position of `node` in the witness order. The admitting node ranks first,
-/// because it already holds the request and every input decision it made; the
-/// remaining witnesses follow the domain-separated digest of the immutable
-/// identity, which is identical on every node and unbiasable by any publisher.
+/// because it already holds the request; remaining witnesses follow the
+/// domain-separated digest of the immutable identity, identical on every node.
 pub fn witness_rank(
     holders: &[NodeId],
     family: &JobFamilyId,
@@ -267,7 +262,7 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::{Family, context, node};
+    use crate::tests::fixtures::records::{Family, context, node};
 
     #[tokio::test]
     async fn keeps_later_deadlines() {
@@ -451,9 +446,8 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     if !view.holds(local) {
         return RoundOutcome::Done;
     }
-    // An incomplete family read is undecided evidence: a suppression, a
-    // cancellation, or an earlier launch may be in the part that did not load,
-    // so this round stores no budget and offers no launch.
+    // An incomplete family read is undecided evidence: a suppression, cancel or
+    // earlier launch may be in the unloaded part, so no budget and no offer.
     let records = match load_family_complete(context, family).await {
         Ok(records) => records,
         Err(error) => {
@@ -704,10 +698,9 @@ async fn record_decline(
     let _ = write_row(context, JOB_PLAN_EXPLAIN_KEYSPACE, &key, &explain).await;
 }
 
-/// Whether a launch is suppressed by a success, cancellation, permanent
-/// failure, or an execution that may still finish. An unfinished execution on a
-/// node in `silent` no longer suppresses: that node stopped reporting, so its
-/// execution is no longer evidence that the work is still under way.
+/// Whether a launch is suppressed by a success, cancellation, permanent failure,
+/// or an execution that may still finish. An unfinished execution on a `silent`
+/// node no longer suppresses: that node stopped reporting.
 pub(crate) fn suppressed(
     family: JobFamilyId,
     records: &[JobRecordEnvelope],
@@ -746,7 +739,7 @@ async fn silent_nodes(
         .map(|execution| execution.executor_node_id)
         .collect();
     for node in running {
-        if let Ok(Some(document)) = read_node_info_document(&context.storage_handle, node).await
+        if let Ok(Some(document)) = read_info_document(&context.storage_handle, node).await
             && now_ms.saturating_sub(document.utilization.heartbeat_at_ms) > window_ms
         {
             silent.insert(node);

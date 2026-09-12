@@ -3,36 +3,36 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_core::admin_document_reducer::AdminDocumentReducerState;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncPublish, DocumentSyncTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::reducer::AdminDocumentReducerState;
 use aruna_core::structs::{
     Actor, AffinityEffect, AffinityRule, LabelMatch, MetadataRegistryRecord, NodePlacementEntry,
     NodeUrls, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent, StructuredId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::create_metadata_document::{
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::mutate_realm_placement::{
+use aruna_operations::node::node_info::{read_info_document, seed_info_document};
+use aruna_operations::placement::{build_view, resolve_holders, resolve_shard_holders};
+use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::mutate_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
 };
-use aruna_operations::node_info::{read_node_info_document, seed_node_info_document};
-use aruna_operations::placement::{build_view, resolve_holders, resolve_shard_holders};
-use aruna_operations::replicate_documents::{
+use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -47,12 +47,10 @@ struct TestNode {
     context: Arc<DriverContext>,
 }
 
-// #261 Definition of Done: placement policy converges over the real admin topic,
-// every node derives the same weighted multi-location holder sets, and a durable
-// completed inventory is revalidated when that policy changes.
+// #261 Definition of Done: placement policy converges over the real admin topic, every node
+// derives the same weighted multi-location holder sets.
 #[tokio::test]
-async fn placement_policy_converges_and_replans_completed_inventory()
--> Result<(), Box<dyn std::error::Error>> {
+async fn policy_converges_inventory() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([61u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 4).await?;
     let actor = test_actor(&nodes[0], realm_id);
@@ -63,7 +61,7 @@ async fn placement_policy_converges_and_replans_completed_inventory()
         nodes[0].context.as_ref(),
     )
     .await?;
-    assert_weighted_distinct_resolution(&nodes, &initial_config);
+    assert_distinct_resolution(&nodes, &initial_config);
     let document_id =
         mint_local_document(&initial_config, &actor, group_id, "datasets/issue-261")?.as_ulid();
 
@@ -80,7 +78,7 @@ async fn placement_policy_converges_and_replans_completed_inventory()
     sort_node_ids(&mut expected_initial);
     assert_eq!(expected_initial.len(), 2);
     assert!(expected_initial.contains(&nodes[0].net.node_id()));
-    wait_for_document_on_holders(&nodes, &expected_initial, &target).await?;
+    wait_holder_document(&nodes, &expected_initial, &target).await?;
 
     let obsolete = expected_initial[0];
     let old_entry = initial_config
@@ -116,9 +114,9 @@ async fn placement_policy_converges_and_replans_completed_inventory()
     )
     .await?;
 
-    let configs = wait_for_policy_convergence(&nodes, realm_id, obsolete, 3).await?;
-    assert_placement_state_identical(&configs);
-    assert_resolve_holders_identical(&configs);
+    let configs = wait_policy_convergence(&nodes, realm_id, obsolete, 3).await?;
+    assert_placement_equal(&configs);
+    assert_holders_equal(&configs);
     assert_eq!(placement.strategy_id, expanded_strategy.strategy_id);
     let mut expected_final = resolve_shard_holders(&configs[0], &placement);
     sort_node_ids(&mut expected_final);
@@ -130,15 +128,14 @@ async fn placement_policy_converges_and_replans_completed_inventory()
             .any(|holder| !expected_initial.contains(holder)),
         "policy change should add replacement/top-up holders"
     );
-    wait_for_document_on_holders(&nodes, &expected_final, &target).await?;
+    wait_holder_document(&nodes, &expected_final, &target).await?;
 
     shutdown_nodes(nodes).await;
     Ok(())
 }
 
 #[tokio::test]
-async fn shared_node_info_topic_propagates_placement_authoritative_document()
--> Result<(), Box<dyn std::error::Error>> {
+async fn node_info_propagates() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([67u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let publisher = &nodes[0];
@@ -149,7 +146,7 @@ async fn shared_node_info_topic_propagates_placement_authoritative_document()
         s3: Some("https://s3.node-a.example.test".to_string()),
     };
 
-    seed_node_info_document(
+    seed_info_document(
         publisher.context.as_ref(),
         publisher_id,
         realm_id,
@@ -188,7 +185,7 @@ async fn shared_node_info_topic_propagates_placement_authoritative_document()
         "node info document did not propagate over the shared topic",
         || async {
             Ok(usize::from(
-                read_node_info_document(&peer.context.storage_handle, publisher_id)
+                read_info_document(&peer.context.storage_handle, publisher_id)
                     .await
                     .map_err(std::io::Error::other)?
                     .is_none(),
@@ -196,7 +193,7 @@ async fn shared_node_info_topic_propagates_placement_authoritative_document()
         },
     )
     .await?;
-    let received = read_node_info_document(&peer.context.storage_handle, publisher_id)
+    let received = read_info_document(&peer.context.storage_handle, publisher_id)
         .await
         .map_err(std::io::Error::other)?
         .expect("node info document present after convergence");
@@ -254,7 +251,7 @@ async fn create_metadata_document(
     .record)
 }
 
-async fn wait_for_document_on_holders(
+async fn wait_holder_document(
     nodes: &[TestNode],
     holders: &[aruna_core::NodeId],
     target: &DocumentSyncTarget,
@@ -293,7 +290,7 @@ async fn wait_for_document(
     .await
 }
 
-async fn wait_for_policy_convergence(
+async fn wait_policy_convergence(
     nodes: &[TestNode],
     realm_id: RealmId,
     draining_node: aruna_core::NodeId,
@@ -338,7 +335,7 @@ async fn wait_for_policy_convergence(
     Ok(configs)
 }
 
-fn assert_weighted_distinct_resolution(nodes: &[TestNode], config: &RealmConfigDocument) {
+fn assert_distinct_resolution(nodes: &[TestNode], config: &RealmConfigDocument) {
     let strategy = config
         .default_strategy_id
         .and_then(|strategy_id| config.strategy(&strategy_id))
@@ -389,7 +386,7 @@ fn sort_node_ids(nodes: &mut [aruna_core::NodeId]) {
     nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
 }
 
-fn assert_placement_state_identical(configs: &[RealmConfigDocument]) {
+fn assert_placement_equal(configs: &[RealmConfigDocument]) {
     let first = &configs[0];
     let mut first_map = first.placement_map.clone();
     first_map.sort_by(|a, b| a.node_id.as_bytes().cmp(b.node_id.as_bytes()));
@@ -412,7 +409,7 @@ fn assert_placement_state_identical(configs: &[RealmConfigDocument]) {
     }
 }
 
-fn assert_resolve_holders_identical(configs: &[RealmConfigDocument]) {
+fn assert_holders_equal(configs: &[RealmConfigDocument]) {
     let strategy = configs[0]
         .default_strategy_id
         .and_then(|id| configs[0].strategy(&id))
@@ -583,14 +580,14 @@ async fn install_realm_config(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
-    seed_realm_config_sync_topic(nodes, realm_id, &config).await?;
+    seed_config_topic(nodes, realm_id, &config).await?;
     // Config apply hook: restore shared topics and converge shard membership
     // before the fixture starts publishing or changing placement.
     for _ in 0..5 {
         for node in nodes {
-            aruna_operations::startup::restore_shard_subscriptions(
+            aruna_operations::node::startup::restore_shard_subscriptions(
                 &node.context,
                 node.net.node_id(),
                 realm_id,
@@ -599,7 +596,7 @@ async fn install_realm_config(
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_operations::process_placements::process_shard_placements(
+            retry |= aruna_operations::placement::process_placements::process_shard_placements(
                 &node.context,
                 realm_id,
                 node.net.node_id(),
@@ -614,14 +611,14 @@ async fn install_realm_config(
     Ok(())
 }
 
-async fn seed_realm_config_sync_topic(
+async fn seed_config_topic(
     nodes: &[TestNode],
     realm_id: RealmId,
     config: &RealmConfigDocument,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let target = DocumentSyncTarget::RealmConfig { realm_id };
     let placement =
-        aruna_operations::placement::placement_ref_for_target(config, &target, Default::default());
+        aruna_operations::placement::target_placement_ref(config, &target, Default::default());
     let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: nodes[1].net.node_id(),

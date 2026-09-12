@@ -19,6 +19,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::jobs::JOB_MUTATE_MAX_ATTEMPTS;
+use crate::jobs::store::{CommitStep, commit_write};
 
 #[derive(Debug, PartialEq)]
 pub struct CreateRoCrateUploadConfig {
@@ -510,15 +511,17 @@ pub async fn claim_rocrate_upload(
                 return Err(error);
             }
         };
-        match commit_txn(storage, txn_id).await {
-            CommitResult::Committed => return Ok(record),
-            CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
-            CommitResult::Conflict => {
-                return Err(UploadClaimError::Storage(
-                    "upload claim exhausted conflict retries".to_string(),
-                ));
-            }
-            CommitResult::Failed(error) => return Err(UploadClaimError::Storage(error)),
+        match commit_write(
+            storage,
+            txn_id,
+            attempt,
+            "upload claim exhausted conflict retries",
+        )
+        .await
+        .map_err(|error| UploadClaimError::Storage(error.to_string()))?
+        {
+            CommitStep::Committed => return Ok(record),
+            CommitStep::Retry => continue,
         }
     }
     Err(UploadClaimError::Storage(
@@ -623,26 +626,6 @@ async fn start_txn(storage: &StorageHandle) -> Result<TxnId, String> {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected upload transaction event: {other:?}")),
-    }
-}
-
-enum CommitResult {
-    Committed,
-    Conflict,
-    Failed(String),
-}
-
-async fn commit_txn(storage: &StorageHandle, txn_id: TxnId) -> CommitResult {
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => CommitResult::Committed,
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }) => CommitResult::Conflict,
-        Event::Storage(StorageEvent::Error { error }) => CommitResult::Failed(error.to_string()),
-        other => CommitResult::Failed(format!("unexpected upload commit event: {other:?}")),
     }
 }
 

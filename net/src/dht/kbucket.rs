@@ -1,6 +1,6 @@
 // net/src/dht/kbucket.rs
+use aruna_core::id::xor_distance_32;
 use aruna_core::id::{NodeId, NodeIdExt};
-use aruna_core::util::xor_distance_32;
 use std::collections::VecDeque;
 
 /// Maximum entries per bucket (standard Kademlia k value)
@@ -232,14 +232,7 @@ impl RoutingTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_node(seed: u8) -> NodeId {
-        // Generate deterministic keys from seed
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes[0] = seed;
-        let secret = iroh::SecretKey::from_bytes(&seed_bytes);
-        secret.public()
-    }
+    use crate::test_support::make_node;
 
     #[test]
     fn test_kbucket_insert() {
@@ -291,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn test_routing_table_closest() {
+    fn routing_table_closest() {
         let local = make_node(0);
         let mut table = RoutingTable::new(local);
 

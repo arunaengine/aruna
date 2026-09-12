@@ -23,14 +23,14 @@ use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::cleanup::{process_cleanup_batch, sweep_stale_uploads};
 use aruna_operations::driver::{DriverContext, drive, now_ms};
-use aruna_operations::s3::abort_multipart_upload::{
+use aruna_operations::s3::abort_upload::{
     AbortMultipartUploadInput, AbortMultipartUploadOperation,
 };
-use aruna_operations::s3::complete_multipart_upload::{
+use aruna_operations::s3::complete_upload::{
     CompleteMultipartPart, CompleteMultipartUploadError, CompleteMultipartUploadInput,
     CompleteMultipartUploadOperation,
 };
-use aruna_operations::s3::create_multipart_upload::{
+use aruna_operations::s3::create_upload::{
     CreateMultipartUploadInput, CreateMultipartUploadOperation,
 };
 use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
@@ -206,7 +206,7 @@ async fn complete_upload(
     checksum_type: MultipartChecksumType,
     object_size: Option<u64>,
     created_by: UserId,
-) -> aruna_operations::s3::complete_multipart_upload::CompleteMultipartUploadResult {
+) -> aruna_operations::s3::complete_upload::CompleteMultipartUploadResult {
     drive(
         CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
             bucket: bucket.to_string(),
@@ -241,7 +241,7 @@ async fn complete_upload(
 }
 
 #[tokio::test]
-async fn completes_multipart_upload_and_persists_object_part_metadata() {
+async fn completion_persists_parts() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::generate(), realm_id);
@@ -602,7 +602,7 @@ async fn rejects_missing_checksum() {
 }
 
 #[tokio::test]
-async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
+async fn overwrite_cleans_blob() {
     let context = setup_context().await;
     let created_by = UserId::local(Ulid::generate(), RealmId::from_bytes([7u8; 32]));
     let upload_id = drive(
@@ -671,7 +671,7 @@ async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
 }
 
 #[tokio::test]
-async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
+async fn completion_retains_path() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::generate(), realm_id);
@@ -862,7 +862,7 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
 }
 
 #[tokio::test]
-async fn multipart_completion_deduplicates_against_existing_multipart_object() {
+async fn completion_deduplicates_multipart() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::generate(), realm_id);
@@ -972,7 +972,7 @@ async fn multipart_completion_deduplicates_against_existing_multipart_object() {
 }
 
 #[tokio::test]
-async fn multipart_completion_deduplicates_against_existing_put_object() {
+async fn completion_deduplicates_put() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::generate(), realm_id);
@@ -1069,7 +1069,7 @@ async fn multipart_completion_deduplicates_against_existing_put_object() {
 }
 
 #[tokio::test]
-async fn multipart_completion_same_key_same_content_bumps_generation_and_reuses_location() {
+async fn completion_reuses_location() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::generate(), realm_id);
@@ -1196,7 +1196,7 @@ async fn multipart_completion_same_key_same_content_bumps_generation_and_reuses_
 }
 
 #[tokio::test]
-async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
+async fn abort_removes_parts() {
     let context = setup_context().await;
     let created_by = UserId::local(Ulid::generate(), RealmId::from_bytes([7u8; 32]));
     let created = drive(
@@ -1274,7 +1274,7 @@ async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
 }
 
 #[tokio::test]
-async fn upload_part_checksum_mismatch_cleans_up_raw_part() {
+async fn checksum_mismatch_cleans() {
     let context = setup_context().await;
     let created_by = UserId::local(Ulid::generate(), RealmId::from_bytes([7u8; 32]));
     let upload_id = drive(
@@ -1340,7 +1340,7 @@ async fn upload_part_checksum_mismatch_cleans_up_raw_part() {
 }
 
 #[tokio::test]
-async fn delete_object_removes_completed_multipart_metadata() {
+async fn delete_removes_metadata() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::generate(), realm_id);
@@ -1711,7 +1711,7 @@ async fn abort_refuses_lease() {
 
     assert!(matches!(
         refused,
-        Err(aruna_operations::s3::abort_multipart_upload::AbortMultipartUploadError::CompletionInProgress)
+        Err(aruna_operations::s3::abort_upload::AbortMultipartUploadError::CompletionInProgress)
     ));
 
     // Once the lease lapses the same abort reclaims the record and its part.

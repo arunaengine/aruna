@@ -1,24 +1,21 @@
-use crate::blob::blob_keyspace_helper::blob_location_read;
-use crate::blob::managed_copy::{
-    CopyRequest, ManagedCopyError, serve_reads, split_serve_reads, validate_registration,
-};
-use crate::connectors::{
-    ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
+use crate::blob::managed_copy::ManagedCopyError;
+use crate::blob::records::blob_location_read;
+use crate::connectors::{ResolveVersionSourceBindingInput, resolve_binding_effect};
+use crate::s3::object_lookup::{
+    ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
+    multipart_summary_read, summary_from_read,
 };
 use aruna_core::effects::{Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
     ConversionError, SourceConnectorResolutionError, StagingSourceError, StorageError,
 };
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType, MultipartObjectMetadataKey,
-    MultipartObjectSummary, PlacementPolicyRef, SourceConnectorKind, SourceMetadata, VersionKey,
-    VersionSourceBinding,
+    CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType, PlacementPolicyRef,
+    SourceConnectorKind, SourceMetadata, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -154,6 +151,19 @@ impl HeadObjectOperation {
         smallvec![]
     }
 
+    fn lookup_error(&self, expected: &'static str, error: LookupError) -> HeadObjectError {
+        match error {
+            LookupError::Conversion(err) => HeadObjectError::ConversionError(err),
+            LookupError::Managed(err) => HeadObjectError::ManagedCopyError(err),
+            LookupError::InvalidEvent(received) => HeadObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected,
+                received,
+            },
+            LookupError::Missing => HeadObjectError::HeadObjectFailed,
+        }
+    }
+
     fn handle_init(&mut self) -> Effects {
         if self.state != HeadObjectState::Init {
             self.emit_error(HeadObjectError::InvalidState {
@@ -234,7 +244,7 @@ impl HeadObjectOperation {
         self.read_version(version_id, version, self.input.version_id.is_some())
     }
 
-    fn handle_received_current_version(&mut self, event: Event) -> Effects {
+    fn current_version_received(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(HeadObjectError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -336,67 +346,47 @@ impl HeadObjectOperation {
         blob_hash: [u8; 32],
         backend: BackendRef,
     ) -> Effects {
-        let key = ManagedCopyKey::new(
-            VersionKey::new(&self.input.bucket, &self.input.key, version_id),
-            backend.clone(),
-        );
-        let effect = match serve_reads(&key, self.txn_id) {
-            Ok(effect) => effect,
+        let check = match begin_copy_check(
+            &self.input.bucket,
+            &self.input.key,
+            version_id,
+            blob_hash,
+            backend,
+            self.txn_id,
+        ) {
+            Ok(check) => check,
             Err(err) => return self.emit_error(err.into()),
         };
-        self.pending_copy = Some(key);
-        self.pending_location = Some(BlobLocationKey::new(blob_hash, backend));
+        self.pending_copy = Some(check.copy_key);
+        self.pending_location = Some(check.location_key);
         self.state = HeadObjectState::CheckManagedCopy;
-        smallvec![effect]
+        smallvec![check.effect]
     }
 
     fn handle_managed_copy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(HeadObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
-            });
-        };
-        let (copy, subject) = match split_serve_reads(values) {
-            Ok(split) => split,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        let (Some(copy_key), Some(key)) = (self.pending_copy.take(), self.pending_location.take())
-        else {
-            return self.emit_error(HeadObjectError::HeadObjectFailed);
-        };
-        if let Err(err) = validate_registration(
-            copy.as_deref(),
-            &CopyRequest {
-                key: &copy_key,
-                node_id: Some(subject.subject.node_id),
-                blake3: Some(key.blake3_hash),
-                refs: &self.source_policies,
-                subject_generation: Some(subject.subject.generation),
-            },
+        let key = match finish_copy_check(
+            event,
+            &mut self.pending_copy,
+            &mut self.pending_location,
+            &self.source_policies,
+            ExpectedNode::Subject,
         ) {
-            return self.emit_error(err.into());
-        }
+            Ok(key) => key,
+            Err(err) => {
+                let error = self.lookup_error("Event::Storage(StorageEvent::BatchReadResult)", err);
+                return self.emit_error(error);
+            }
+        };
         self.read_blob_location(key)
     }
 
-    fn handle_blob_location_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(HeadObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
-        };
-
-        let Some(value) = value else {
-            return self.emit_error(HeadObjectError::HeadObjectFailed);
-        };
-
-        let location = match BackendLocation::from_bytes(value.as_ref()) {
+    fn location_read(&mut self, event: Event) -> Effects {
+        let location = match location_from_read(event) {
             Ok(location) => location,
-            Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
+            Err(err) => {
+                let error = self.lookup_error("Event::Storage(StorageEvent::ReadResult)", err);
+                return self.emit_error(error);
+            }
         };
 
         self.read_multipart_summary(location, self.resolved_version_id)
@@ -404,45 +394,39 @@ impl HeadObjectOperation {
 
     fn read_multipart_summary(
         &mut self,
-        location: BackendLocation,
+        location: Option<BackendLocation>,
         resolved_version_id: Option<Ulid>,
     ) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(HeadObjectError::NoTransactionFound);
         };
 
-        self.location = Some(location);
+        self.location = location;
         self.resolved_version_id = resolved_version_id;
 
         let Some(version_id) = resolved_version_id else {
             return self.finish_lookup();
         };
 
-        let key = match MultipartObjectMetadataKey::summary(version_id).to_bytes() {
-            Ok(key) => key.into(),
+        let effect = match multipart_summary_read(version_id, Some(txn_id)) {
+            Ok(effect) => effect,
             Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
         };
 
         self.state = HeadObjectState::ReadMultipartSummary;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
-            key,
-            txn_id: Some(txn_id),
-        })]
+        smallvec![effect]
     }
 
-    fn handle_multipart_summary_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(HeadObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
+    fn summary_read(&mut self, event: Event) -> Effects {
+        let summary = match summary_from_read(event) {
+            Ok(summary) => summary,
+            Err(err) => {
+                let error = self.lookup_error("Event::Storage(StorageEvent::ReadResult)", err);
+                return self.emit_error(error);
+            }
         };
 
-        if let Some(summary) =
-            value.and_then(|value| MultipartObjectSummary::from_bytes(value.as_ref()).ok())
-        {
+        if let Some(summary) = summary {
             self.checksum_type = summary.checksum_type;
             self.composite_hashes = summary.composite_hashes;
             self.part_count = Some(summary.part_count);
@@ -455,10 +439,6 @@ impl HeadObjectOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(HeadObjectError::NoTransactionFound);
         };
-        if self.location.is_none() && self.source_metadata.is_none() {
-            return self.emit_error(HeadObjectError::HeadObjectFailed);
-        }
-
         self.state = HeadObjectState::CommitTransaction;
         self.output = Some(Ok(HeadObjectResult {
             location: self.location.clone(),
@@ -482,9 +462,9 @@ impl HeadObjectOperation {
             self.txn_id = None;
             if let Some(source) = self.reference_source.take() {
                 self.state = HeadObjectState::ResolveReferenceAccess;
-                return smallvec![resolve_version_source_binding_suboperation(
-                    ResolveVersionSourceBindingInput { source },
-                )];
+                return smallvec![resolve_binding_effect(ResolveVersionSourceBindingInput {
+                    source
+                },)];
             }
             self.state = HeadObjectState::Finish;
             smallvec![]
@@ -567,9 +547,9 @@ impl Operation for HeadObjectOperation {
             HeadObjectState::StartTransaction => self.handle_transaction_started(event),
             HeadObjectState::GetVersion => self.handle_received_version(event),
             HeadObjectState::CheckManagedCopy => self.handle_managed_copy(event),
-            HeadObjectState::GetBlobLocation => self.handle_blob_location_read(event),
-            HeadObjectState::GetCurrentVersion => self.handle_received_current_version(event),
-            HeadObjectState::ReadMultipartSummary => self.handle_multipart_summary_read(event),
+            HeadObjectState::GetBlobLocation => self.location_read(event),
+            HeadObjectState::GetCurrentVersion => self.current_version_received(event),
+            HeadObjectState::ReadMultipartSummary => self.summary_read(event),
             HeadObjectState::CommitTransaction => self.handle_transaction_committed(event),
             HeadObjectState::ResolveReferenceAccess => self.handle_reference_access(event),
             HeadObjectState::HeadReferenceSource => self.handle_reference_head(event),
@@ -645,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn head_object_reads_current_version_pointer() {
+    async fn current_version_read() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
@@ -759,7 +739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn head_object_reads_specific_version() {
+    async fn specific_version_read() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
@@ -952,7 +932,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn head_object_returns_cached_reference_metadata() {
+    async fn cached_metadata_returned() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
