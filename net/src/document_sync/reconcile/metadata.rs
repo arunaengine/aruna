@@ -19,7 +19,7 @@ pub(super) enum MetadataOutcome {
         tombstone: Option<MetadataGraphLifecycleRecord>,
     },
     Deferred(DocumentSyncDependency),
-    Pending(PendingMetadataCreateApply),
+    Pending(Box<PendingMetadataCreateApply>),
     Rejected(SyncRejection),
     Skipped,
 }
@@ -38,7 +38,7 @@ pub(super) async fn apply_metadata_event(
         DocumentSyncTarget::MetadataCreateEvent { .. }
     ) {
         return Ok(match service.prepare_create(identity, event) {
-            Ok(pending) => MetadataOutcome::Pending(pending),
+            Ok(pending) => MetadataOutcome::Pending(Box::new(pending)),
             Err(rejection) => {
                 warn!(%topic_id, reason = %rejection.reason, "Rejecting malformed metadata create event");
                 MetadataOutcome::Rejected(*rejection)
@@ -227,19 +227,21 @@ async fn apply_lifecycle_event(
             let record = *record;
             let inner_bytes = postcard::to_allocvec(&record)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            Ok(MetadataOutcome::Pending(PendingMetadataCreateApply {
-                identity,
-                event: DocumentSyncEvent::Upsert {
-                    event_id,
-                    target: target.clone(),
-                    bytes,
-                    change,
+            Ok(MetadataOutcome::Pending(Box::new(
+                PendingMetadataCreateApply {
+                    identity,
+                    event: DocumentSyncEvent::Upsert {
+                        event_id,
+                        target: target.clone(),
+                        bytes,
+                        change,
+                    },
+                    target,
+                    lifecycle_revision: Some(change),
+                    record,
+                    bytes: inner_bytes,
                 },
-                target,
-                lifecycle_revision: Some(change),
-                record,
-                bytes: inner_bytes,
-            }))
+            )))
         }
         MetadataDocumentLifecycleRecord::Delete { event } => {
             let tombstone = event.tombstone.clone();
