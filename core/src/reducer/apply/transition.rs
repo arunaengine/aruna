@@ -50,8 +50,8 @@ impl AdminDocumentReducerState {
                 if proof.holder != event.origin_node_id {
                     return Err(AdminDocumentReducerError::TransitionOriginMismatch);
                 }
-            // A replicated plan wins; otherwise materialization rechecks the signed submitted
-            // strategy against the plan.
+                // A replicated plan wins; otherwise materialization rechecks the signed submitted
+                // strategy against the plan.
                 let strategy_id = self
                     .materialized_transition_plans()
                     .get(transition_id)

@@ -78,14 +78,16 @@ pub fn cfg_attr(attribute: &str) -> bool {
 }
 
 pub fn function_calls(source: &str) -> BTreeMap<String, Vec<String>> {
-    let file = syn::parse_file(source).unwrap_or_else(|error| panic!("invalid Rust source: {error}"));
+    let file =
+        syn::parse_file(source).unwrap_or_else(|error| panic!("invalid Rust source: {error}"));
     let mut functions = BTreeMap::new();
     collect_items(&file.items, &mut functions);
     functions
 }
 
 pub fn use_paths(source: &str) -> BTreeMap<String, String> {
-    let file = syn::parse_file(source).unwrap_or_else(|error| panic!("invalid Rust source: {error}"));
+    let file =
+        syn::parse_file(source).unwrap_or_else(|error| panic!("invalid Rust source: {error}"));
     let mut imports = BTreeMap::new();
     for item in file.items {
         if let syn::Item::Use(item_use) = item
@@ -165,9 +167,7 @@ fn requires_test(meta: &syn::Meta) -> bool {
         return false;
     };
     let nested = list
-        .parse_args_with(
-            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-        )
+        .parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
         .unwrap_or_else(|error| panic!("invalid cfg predicate: {error}"));
     if list.path.is_ident("all") {
         nested.iter().any(requires_test)
@@ -203,7 +203,11 @@ fn collect_items(items: &[syn::Item], functions: &mut BTreeMap<String, Vec<Strin
                         && !attrs_test(&function.attrs)
                         && has_attribute(&function.attrs, "tool")
                     {
-                        collect_function(&function.sig.ident.to_string(), &function.block, functions);
+                        collect_function(
+                            &function.sig.ident.to_string(),
+                            &function.block,
+                            functions,
+                        );
                     }
                 }
             }
@@ -244,7 +248,9 @@ fn collect_use(
 }
 
 fn has_attribute(attributes: &[syn::Attribute], name: &str) -> bool {
-    attributes.iter().any(|attribute| attribute.path().is_ident(name))
+    attributes
+        .iter()
+        .any(|attribute| attribute.path().is_ident(name))
 }
 
 fn attrs_test(attributes: &[syn::Attribute]) -> bool {
@@ -261,11 +267,7 @@ fn attrs_test(attributes: &[syn::Attribute]) -> bool {
     })
 }
 
-fn collect_function(
-    name: &str,
-    block: &syn::Block,
-    functions: &mut BTreeMap<String, Vec<String>>,
-) {
+fn collect_function(name: &str, block: &syn::Block, functions: &mut BTreeMap<String, Vec<String>>) {
     assert!(
         !functions.contains_key(name),
         "duplicate function name {name} requires scoped resolution"

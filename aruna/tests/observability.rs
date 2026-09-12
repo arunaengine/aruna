@@ -4,8 +4,8 @@ mod shared;
 
 use reqwest::StatusCode;
 use shared::{
-    TestResult, create_bearer_token, create_group_http, create_s3_credentials,
-    s3_client, spawn_complete_seed, spawn_seed_node, wait_group_http,
+    TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
+    spawn_complete_seed, spawn_seed_node, wait_group_http,
 };
 
 async fn scrape(ops_url: &str) -> TestResult<String> {
@@ -161,8 +161,7 @@ async fn metrics_s3_label() -> TestResult<()> {
             seed.capabilities.clone(),
         )
         .await?;
-        let group =
-            create_group_http(&seed.base_url, &bearer_token, "obs-metrics-group").await?;
+        let group = create_group_http(&seed.base_url, &bearer_token, "obs-metrics-group").await?;
         wait_group_http(&seed.base_url, &bearer_token, &group.group_id).await?;
         let credentials =
             create_s3_credentials(&seed.base_url, &bearer_token, &group.group_id).await?;

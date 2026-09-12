@@ -6,8 +6,8 @@ use aws_sdk_s3::types::{CorsConfiguration, CorsRule};
 use reqwest::StatusCode;
 use reqwest::header;
 use shared::{
-    TEST_CORS_ORIGIN, TestResult, create_bearer_token, create_group_http,
-    create_s3_credentials, s3_client, spawn_complete_seed, spawn_seed_node,
+    TEST_CORS_ORIGIN, TestResult, create_bearer_token, create_group_http, create_s3_credentials,
+    s3_client, spawn_complete_seed, spawn_seed_node,
 };
 
 const DISALLOWED_ORIGIN: &str = "http://evil.test";
@@ -173,8 +173,7 @@ async fn s3_preserves_origins() -> TestResult<()> {
             .s3
             .as_ref()
             .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
-        let credentials =
-            create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
+        let credentials = create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
         let s3 = s3_client(endpoint, &credentials);
 
         let bucket = "cors-locked-bucket";

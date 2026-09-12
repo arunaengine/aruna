@@ -7,7 +7,7 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
     AuthContext, BucketInfo, OBJECT_CONTENT_TYPE_KEY, Permission, bucket_permission_path,
-    object_permission_path, key_content_type,
+    key_content_type, object_permission_path,
 };
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
 use aruna_operations::realm::get_config::GetRealmConfigOperation;

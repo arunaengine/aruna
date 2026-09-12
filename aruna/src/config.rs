@@ -17,11 +17,9 @@ use aruna_core::structs::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy, RoCrateLimits,
     STORAGE_CLASS_LABEL_PREFIX, StaticRealmEndpoint,
 };
-use aruna_core::types::UserId;
 use aruna_core::time::unix_timestamp_secs;
-use aruna_net::{
-    DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_config,
-};
+use aruna_core::types::UserId;
+use aruna_net::{DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_config};
 use aruna_operations::metadata::MetadataSearchStorage;
 use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle, errors::StorageLibError};
 use base64::Engine;
@@ -677,8 +675,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
         node_weight,
     } = settings;
     let bootstrap_timeout = Duration::from_secs(onboarding_bootstrap_timeout_secs);
-    let storage_handle =
-        FjallStorage::open_with_policy(&storage_path, fjall_persist_policy)?;
+    let storage_handle = FjallStorage::open_with_policy(&storage_path, fjall_persist_policy)?;
     let mut temporary_bootstrap_endpoint = None;
     let mut enrollment_endpoints = Vec::new();
     let node_state = match load_node_state(&storage_handle).await? {
@@ -1835,8 +1832,8 @@ fn realm_network_config(
                             error,
                         )
                     })?;
-                let endpoint_addr = parse_endpoint_config(&endpoint.endpoint_addr)
-                    .map_err(|message| {
+                let endpoint_addr =
+                    parse_endpoint_config(&endpoint.endpoint_addr).map_err(|message| {
                         invalid_config_value(
                             "realm_static_endpoint",
                             endpoint.endpoint_addr.as_str(),
@@ -2000,9 +1997,9 @@ mod tests {
     use super::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
         S3ServerTimeouts, SetupError, assistant_proxy_env, load, load_oidc_providers,
-        normalize_root, outermost_roots, parse_node_labels, persist_policy_env,
-        persist_node_state, portal_config_env, read_settings, rocrate_limits_env,
-        validate_public_url, validate_s3_profile, validate_wipe_roots,
+        normalize_root, outermost_roots, parse_node_labels, persist_node_state, persist_policy_env,
+        portal_config_env, read_settings, rocrate_limits_env, validate_public_url,
+        validate_s3_profile, validate_wipe_roots,
     };
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{
@@ -2367,10 +2364,7 @@ mod tests {
         let previous = vec![(key.to_string(), std::env::var(key).ok())];
         unsafe { std::env::remove_var(key) };
 
-        assert_eq!(
-            persist_policy_env().unwrap(),
-            FjallPersistPolicy::Buffer
-        );
+        assert_eq!(persist_policy_env().unwrap(), FjallPersistPolicy::Buffer);
 
         restore_env(previous);
     }
@@ -2382,10 +2376,7 @@ mod tests {
         let previous = vec![(key.to_string(), std::env::var(key).ok())];
         unsafe { std::env::set_var(key, "sync_all") };
 
-        assert_eq!(
-            persist_policy_env().unwrap(),
-            FjallPersistPolicy::SyncAll
-        );
+        assert_eq!(persist_policy_env().unwrap(), FjallPersistPolicy::SyncAll);
 
         restore_env(previous);
     }

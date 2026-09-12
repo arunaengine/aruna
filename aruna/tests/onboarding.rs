@@ -18,8 +18,8 @@ use aruna_operations::users::oidc_user::{
 };
 use byteview::ByteView;
 use shared::{
-    TestResult, create_onboarding_secret, shutdown_pair, spawn_joiner_node,
-    spawn_seed_node, wait_realm_nodes,
+    TestResult, create_onboarding_secret, shutdown_pair, spawn_joiner_node, spawn_seed_node,
+    wait_realm_nodes,
 };
 
 async fn read_user(
@@ -61,8 +61,7 @@ async fn joiner_bootstraps_documents() -> TestResult<()> {
         seed.context.as_ref(),
     )
     .await?;
-    let onboarding_secret =
-        create_onboarding_secret(&seed, OnboardingMode::Server).await?;
+    let onboarding_secret = create_onboarding_secret(&seed, OnboardingMode::Server).await?;
     let expected_user = read_user(seed.context.as_ref(), seed.user_id)
         .await
         .expect("seed user should exist");
@@ -106,10 +105,9 @@ async fn joiner_bootstraps_documents() -> TestResult<()> {
         .find(|node| node.node_id == joiner.config.node_id)
         .expect("joiner should be in the placement view")
         .labels;
-    let joiner_info =
-        read_info_document(&joiner.context.storage_handle, joiner.config.node_id)
-            .await?
-            .expect("joiner startup should seed its node info after fetching realm config");
+    let joiner_info = read_info_document(&joiner.context.storage_handle, joiner.config.node_id)
+        .await?
+        .expect("joiner startup should seed its node info after fetching realm config");
     assert_eq!(joiner_info.node_id, joiner.config.node_id);
     assert_eq!(joiner_info.labels, selector_labels);
     assert_eq!(joiner_info.labels.get("fixture").unwrap(), "joiner");
@@ -179,8 +177,7 @@ async fn second_joiner_onboards() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn server_joiner_completes() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
-    let onboarding_secret =
-        create_onboarding_secret(&seed, OnboardingMode::Server).await?;
+    let onboarding_secret = create_onboarding_secret(&seed, OnboardingMode::Server).await?;
 
     let joiner = spawn_joiner_node(&seed, onboarding_secret).await?;
 

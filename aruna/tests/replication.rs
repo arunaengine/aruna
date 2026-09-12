@@ -36,9 +36,8 @@ use aws_sdk_s3::types::{
 use reqwest::StatusCode;
 use shared::{
     JoinerNode, SeedNode, TestResult, bucket_arn, create_bearer_token, create_group_http,
-    create_onboarding_secret, create_s3_credentials,
-    create_restricted_credentials, s3_client, shutdown_pair,
-    spawn_complete_joiner, spawn_complete_seed, wait_group_http, wait_realm_nodes,
+    create_onboarding_secret, create_restricted_credentials, create_s3_credentials, s3_client,
+    shutdown_pair, spawn_complete_joiner, spawn_complete_seed, wait_group_http, wait_realm_nodes,
     wait_until,
 };
 use std::time::Duration;
@@ -111,11 +110,8 @@ struct ReplicationHarness {
 impl ReplicationHarness {
     async fn new(group_name: &str) -> TestResult<Self> {
         let seed = spawn_complete_seed().await?;
-        let onboarding_secret = create_onboarding_secret(
-            &seed,
-            aruna_core::onboarding::OnboardingMode::Server,
-        )
-        .await?;
+        let onboarding_secret =
+            create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server).await?;
         let joiner = spawn_complete_joiner(&seed, onboarding_secret).await?;
 
         let seed_s3 = seed
@@ -583,12 +579,7 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
             .assert_object_absent(target_bucket, source_key, 10, Duration::from_millis(200))
             .await?;
         harness
-            .assert_object_absent(
-                target_bucket,
-                excluded_key,
-                10,
-                Duration::from_millis(200),
-            )
+            .assert_object_absent(target_bucket, excluded_key, 10, Duration::from_millis(200))
             .await?;
         harness
             .assert_object_absent(
@@ -722,12 +713,7 @@ async fn once_syncs_prefix() -> TestResult<()> {
             .assert_object_absent(target_bucket, source_key, 10, Duration::from_millis(200))
             .await?;
         harness
-            .assert_object_absent(
-                target_bucket,
-                excluded_key,
-                10,
-                Duration::from_millis(200),
-            )
+            .assert_object_absent(target_bucket, excluded_key, 10, Duration::from_millis(200))
             .await?;
         harness
             .assert_object_absent(

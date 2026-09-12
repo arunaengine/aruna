@@ -21,8 +21,8 @@ use crate::document_sync::storage::{
     replace_batch_in, start_storage_transaction, transaction_read,
 };
 use crate::document_sync::{
-    DOCUMENT_SYNC_FRAME_LEN_LIMIT, DeferredTopicRegistrationOutcome,
-    DocumentSyncDependency, DocumentSyncService, MetadataPlacementFence, MetadataPlacementOutcome,
+    DOCUMENT_SYNC_FRAME_LEN_LIMIT, DeferredTopicRegistrationOutcome, DocumentSyncDependency,
+    DocumentSyncService, MetadataPlacementFence, MetadataPlacementOutcome,
     PendingMetadataCreateApply, SyncRejection,
 };
 use crate::error::{NetError, Result};
