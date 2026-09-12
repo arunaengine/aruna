@@ -5,7 +5,7 @@
 mod topology;
 
 use aruna_core::StructuredId;
-use aruna_core::structs::{PlacementRef, TransitionLimits};
+use aruna_core::structs::TransitionLimits;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::mint_local_document;
 use aruna_operations::metadata::forward::route_metadata_update;

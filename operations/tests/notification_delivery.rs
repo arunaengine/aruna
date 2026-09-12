@@ -16,8 +16,7 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::client::{mark_read_remote, unread_count_remote};
 use aruna_operations::notifications::dispatch::{
-    NotificationDispatchError, list_notifications_for_user, mark_read_for_user,
-    unread_count_for_user,
+    NotificationDispatchError, list_for_user, mark_for_user, unread_for_user,
 };
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
@@ -266,7 +265,7 @@ async fn dispatch_proxies_nonholder() -> Result<(), Box<dyn std::error::Error>> 
     wait_for(|| {
         let reader_ctx = reader_ctx.clone();
         async move {
-            list_notifications_for_user(
+            list_for_user(
                 reader_ctx.as_ref(),
                 reader_id,
                 recipient,
@@ -280,14 +279,14 @@ async fn dispatch_proxies_nonholder() -> Result<(), Box<dyn std::error::Error>> 
     })
     .await?;
 
-    let (count, capped) = unread_count_for_user(reader_ctx.as_ref(), reader_id, recipient).await?;
+    let (count, capped) = unread_for_user(reader_ctx.as_ref(), reader_id, recipient).await?;
     assert_eq!((count, capped), (3, false));
 
     let marked =
-        mark_read_for_user(reader_ctx.as_ref(), reader_id, recipient, ids.clone(), None).await?;
+        mark_for_user(reader_ctx.as_ref(), reader_id, recipient, ids.clone(), None).await?;
     assert_eq!(marked, 2);
 
-    let (count, _) = unread_count_for_user(reader_ctx.as_ref(), reader_id, recipient).await?;
+    let (count, _) = unread_for_user(reader_ctx.as_ref(), reader_id, recipient).await?;
     assert_eq!(count, 1);
 
     // A resolvable remote holder with no net handle is Unavailable, not a 500.
@@ -299,7 +298,7 @@ async fn dispatch_proxies_nonholder() -> Result<(), Box<dyn std::error::Error>> 
         task_handle: None,
         compute_handle: None,
     });
-    let unavailable = list_notifications_for_user(
+    let unavailable = list_for_user(
         no_net.as_ref(),
         reader_id,
         recipient,
@@ -330,22 +329,14 @@ async fn wait_dispatch_error(
 ) -> NotificationDispatchError {
     wait_for_convergence("holder never became unreachable", || async {
         Ok::<usize, Box<dyn std::error::Error>>(usize::from(
-            list_notifications_for_user(
-                context,
-                local_node_id,
-                recipient,
-                None,
-                LIST_LIMIT as usize,
-            )
-            .await
-            .is_ok(),
+            list_for_user(context, local_node_id, recipient, None, LIST_LIMIT as usize)
+                .await
+                .is_ok(),
         ))
     })
     .await
     .expect("holder never became unreachable");
-    match list_notifications_for_user(context, local_node_id, recipient, None, LIST_LIMIT as usize)
-        .await
-    {
+    match list_for_user(context, local_node_id, recipient, None, LIST_LIMIT as usize).await {
         Err(error) => error,
         Ok(_) => panic!("holder never became unreachable"),
     }
@@ -404,7 +395,7 @@ async fn emit_on(
 }
 
 async fn list_via(node: &TestNode, recipient: UserId) -> Vec<NotificationRecord> {
-    list_notifications_for_user(
+    list_for_user(
         node.context.as_ref(),
         node.net.node_id(),
         recipient,

@@ -569,7 +569,7 @@ async fn create_replay_rejects() -> Result<(), Box<dyn std::error::Error>> {
     let holders = resolve_shard_holders(&config, &created.placement);
     wait_holder_records(&nodes, &holders, document_id).await?;
 
-    let group_error = drive_forwarded_create(
+    let group_error = drive_create_at(
         &realm,
         user_node,
         other_group,
@@ -583,7 +583,7 @@ async fn create_replay_rejects() -> Result<(), Box<dyn std::error::Error>> {
         Some(MetadataWriteError::Undeliverable(_))
     ));
 
-    let path_error = drive_forwarded_create(
+    let path_error = drive_create_at(
         &realm,
         user_node,
         first_group,
@@ -998,10 +998,10 @@ async fn drive_forwarded_create(
     group_id: Ulid,
     document_id: Ulid,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
-    drive_forwarded_create(realm, node, group_id, document_id, "datasets/forwarded").await
+    drive_create_at(realm, node, group_id, document_id, "datasets/forwarded").await
 }
 
-async fn drive_forwarded_create(
+async fn drive_create_at(
     realm: &Realm,
     node: &TestNode,
     group_id: Ulid,

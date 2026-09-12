@@ -23,9 +23,7 @@ use aruna_core::structs::{
     VersionKey, group_permission_path, sync_relationship_key,
 };
 use aruna_operations::driver::DriverContext;
-use aruna_operations::replication::queue::{
-    LiveReplicationObligationRecord, live_replication_obligation_key,
-};
+use aruna_operations::replication::queue::{LiveReplicationObligationRecord, live_obligation_key};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -1661,7 +1659,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
             version_id,
             false,
         );
-        let obligation_key = live_replication_obligation_key(&record)?;
+        let obligation_key = live_obligation_key(&record)?;
         let Event::Storage(StorageEvent::WriteResult { .. }) = harness
             .seed
             .context
