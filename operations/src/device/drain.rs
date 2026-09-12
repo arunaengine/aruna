@@ -509,9 +509,9 @@ mod tests {
     use crate::device::publish_queue::{
         MAX_PUBLISH_ATTEMPTS, PublishEntry, PublishState, publish_entry,
     };
-    use crate::device::tests::fixtures::context;
     use crate::driver::{DriverContext, drive};
     use crate::metadata::forward::MetadataWriteError;
+    use crate::tests::fixtures::device::context;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::RealmId;
     use aruna_core::types::UserId;

@@ -468,7 +468,7 @@ fn log_tails(result: Option<&JobResultPayload>) -> (Option<ResultMessage>, Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixtures::{Family, node, payload, user};
+    use crate::tests::fixtures::records::{Family, node, payload, user};
     use aruna_core::structs::{JobError, JobPayload};
 
     fn receipt(family: &Family) -> ExecutionReceipt {

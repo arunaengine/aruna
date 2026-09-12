@@ -2276,9 +2276,7 @@ mod tests {
     use tokio::sync::Notify;
     use ulid::Ulid;
 
-    pub(crate) mod fixtures;
-
-    use self::fixtures::{execution_spec, node_id};
+    use crate::tests::fixtures::workflow::{execution_spec, node_id};
 
     fn job_id() -> JobId {
         crate::jobs::submit::mint_job_id(

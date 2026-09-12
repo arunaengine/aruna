@@ -5,8 +5,8 @@ use aruna_core::structs::{
     LogicalJobState, PhysicalExecutionState, canonical_execution_key,
 };
 
-use super::fixtures::Family;
 use crate::jobs::records::reduce::{canonical_binding, reduce_family, submission_families};
+use crate::tests::fixtures::records::Family;
 
 /// Deterministic shuffle: an index rotation plus every record duplicated once,
 /// so replay and batching are covered without unseeded randomness.

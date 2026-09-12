@@ -159,9 +159,9 @@ impl Operation for QueuedReplicaNodesOperation {
 #[cfg(test)]
 mod tests {
     use super::QueuedReplicaNodesOperation;
-    use crate::replication::locations::tests::fixtures::{auth, node_id};
     use crate::replication::queue::BlobReplicationJobRecord;
     use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
+    use crate::tests::fixtures::locations::{auth, node_id};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::types::NodeId;

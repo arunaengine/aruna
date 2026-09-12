@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) use super::fixtures::*;
+pub(super) use crate::tests::fixtures::incoming::*;
 
 #[test]
 fn blocked_batch_waits() {

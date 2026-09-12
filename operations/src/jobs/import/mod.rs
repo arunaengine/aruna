@@ -1,8 +1,8 @@
-mod archive;
+pub(crate) mod archive;
 #[cfg(test)]
 mod consortium;
 mod reader;
-mod rewrite;
+pub(crate) mod rewrite;
 mod upload;
 
 pub use upload::{
@@ -1856,7 +1856,6 @@ fn classify_gate(error: GateContextError) -> ImportFailure {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    pub(crate) mod fixtures;
 
     use super::*;
     use aruna_core::structs::{
@@ -1868,7 +1867,7 @@ pub(crate) mod tests {
 
     use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::insert_job;
-    use crate::staging::tests::fixtures::setup_driver_context;
+    use crate::tests::fixtures::staging::setup_driver_context;
 
     #[test]
     fn target_checks_limits() {

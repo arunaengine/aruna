@@ -522,7 +522,7 @@ fn logical_record(spec: &LogicalJobSpec) -> JobRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixtures::{Family, REALM};
+    use crate::tests::fixtures::records::{Family, REALM};
 
     // A state that expects no event must reject one instead of ignoring it.
     #[test]

@@ -465,7 +465,7 @@ pub(crate) fn network_access(spec: &LogicalJobSpec) -> NetworkAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixtures::{Family, REALM, context, node};
+    use crate::tests::fixtures::records::{Family, REALM, context, node};
     use aruna_core::compute::{ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};

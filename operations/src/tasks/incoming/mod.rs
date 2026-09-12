@@ -181,7 +181,7 @@ type DrainRecord = (
     irokle::TopicId,
 );
 
-struct OperationsTaskHandler {
+pub(crate) struct OperationsTaskHandler {
     context: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
@@ -319,7 +319,7 @@ enum DeferOutcome {
 }
 
 impl OperationsTaskHandler {
-    fn new(context: Arc<DriverContext>, jobs_runtime: Arc<JobsRuntime>) -> Self {
+    pub(crate) fn new(context: Arc<DriverContext>, jobs_runtime: Arc<JobsRuntime>) -> Self {
         Self {
             context,
             jobs_runtime,
@@ -339,7 +339,7 @@ impl OperationsTaskHandler {
     }
 
     #[cfg(test)]
-    fn with_outbox_limits(
+    pub(crate) fn with_outbox_limits(
         mut self,
         pages: usize,
         records: usize,

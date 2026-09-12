@@ -14,9 +14,9 @@ use aruna_core::types::{GroupId, Key, NodeId, UserId, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use ulid::Ulid;
 
-use super::super::cache::{PolicyCacheEntry, cache_key};
-use super::{node, realm_authorization};
 use crate::driver::DriverContext;
+use crate::placement::policy::cache::{PolicyCacheEntry, cache_key};
+use crate::placement::policy::tests::{node, realm_authorization};
 
 /// The authorizing user every policy fixture publishes under.
 pub(crate) fn admin_user(realm_id: RealmId) -> UserId {

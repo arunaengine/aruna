@@ -31,6 +31,9 @@ pub mod sync;
 pub mod tasks;
 pub mod users;
 
+#[cfg(test)]
+mod tests;
+
 /// Deterministic member order for records that several nodes must byte-match.
 pub(crate) fn sorted_user_ids(
     user_ids: &std::collections::HashSet<aruna_core::types::UserId>,

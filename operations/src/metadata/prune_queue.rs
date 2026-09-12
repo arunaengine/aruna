@@ -807,7 +807,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::metadata::MetadataHandle;
-    use crate::metadata::tests::fixtures::{storage_key_exists, write_entries};
+    use crate::tests::fixtures::metadata::{storage_key_exists, write_entries};
 
     fn lifecycle(graph_iri: &str) -> MetadataGraphLifecycleRecord {
         MetadataGraphLifecycleRecord::deleted(

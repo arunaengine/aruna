@@ -440,7 +440,7 @@ mod tests {
     }
 
     fn document(policy: &VerifiedPolicy) -> PlacementPolicyDocument {
-        super::super::tests::fixtures::signed_document(realm(), policy, 1)
+        crate::tests::fixtures::policy::signed_document(realm(), policy, 1)
     }
 
     fn encoded(policy: &VerifiedPolicy) -> Value {
@@ -453,9 +453,9 @@ mod tests {
         for seed in 1..=4u8 {
             config.ensure_node(node(seed), RealmNodeKind::Server);
         }
-        super::super::tests::fixtures::realm_view(
+        crate::tests::fixtures::policy::realm_view(
             &config,
-            super::super::tests::fixtures::admin_user(realm()),
+            crate::tests::fixtures::policy::admin_user(realm()),
         )
     }
 

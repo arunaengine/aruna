@@ -507,7 +507,7 @@ pub async fn serve_launch_offer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixtures::Family;
+    use crate::tests::fixtures::records::Family;
     use aruna_core::structs::JobRecordBody;
 
     #[test]

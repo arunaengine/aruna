@@ -189,7 +189,7 @@ impl Operation for ReadStagingSourceOperation {
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use crate::staging::tests::fixtures::{create_http_connector, setup_driver_context};
+    use crate::tests::fixtures::staging::{create_http_connector, setup_driver_context};
     use aruna_core::structs::{ResolvedSourceAccess, ResolvedSourceConnector, SourceConnectorKind};
     use futures_util::{StreamExt, stream};
     use std::collections::HashMap;

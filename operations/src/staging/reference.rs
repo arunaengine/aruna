@@ -489,7 +489,7 @@ mod tests {
     use super::*;
     use crate::driver::drive;
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-    use crate::staging::tests::fixtures::{
+    use crate::tests::fixtures::staging::{
         create_http_connector, create_test_bucket, setup_driver_context,
     };
     use aruna_core::effects::StorageEffect;
