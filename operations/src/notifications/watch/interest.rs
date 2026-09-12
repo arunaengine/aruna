@@ -620,11 +620,11 @@ pub async fn refresh_target_interest(ctx: &DriverContext, targets: &[DocumentSyn
     }
     for realm_id in realms {
         match build_node_map(&ctx.storage_handle, realm_id).await {
-            Ok(nodes) => net_handle.update_watch_interest_realm(realm_id, nodes),
+            Ok(nodes) => net_handle.update_realm_interest(realm_id, nodes),
             Err(error) => {
                 // Membership is a security boundary. Fail closed instead of
                 // retaining a previously cached removed node.
-                net_handle.update_watch_interest_realm(realm_id, HashMap::new());
+                net_handle.update_realm_interest(realm_id, HashMap::new());
                 warn!(%realm_id, error = %error, "Cleared watch interest after failed realm refresh")
             }
         }

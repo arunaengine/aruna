@@ -571,7 +571,9 @@ impl OperationsTaskHandler {
             .await;
         invocation.undeliverable += undeliverable.len().saturating_sub(relayed.len());
         if !relayed.is_empty()
-            && let Err(error) = delete_outbox_records(&self.context.storage_handle, relayed).await
+            && let Err(error) =
+                crate::sync::document_outbox::delete_outbox_records(&self.context.storage_handle, relayed)
+                    .await
         {
             warn!(%error, "Failed to delete relayed admin outbox records");
         }
@@ -1045,7 +1047,7 @@ impl OperationsTaskHandler {
         if !metadata_create_events.is_empty() {
             let local_node_id = self.context.net_handle.as_ref().map(|net| net.node_id());
             if let Err(error) =
-                project_metadata_create_events(&self.context, metadata_create_events, local_node_id)
+                project_create_events(&self.context, metadata_create_events, local_node_id)
                     .await
             {
                 warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch after document sync");
@@ -1067,7 +1069,7 @@ impl OperationsTaskHandler {
             create_event_targets.push((document_id, event_id));
         }
         if let Err(error) =
-            project_metadata_create_events_from_log(&self.context, create_event_targets).await
+            project_logged_events(&self.context, create_event_targets).await
         {
             warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch from log after document sync");
             return Err(());
@@ -1092,7 +1094,7 @@ impl OperationsTaskHandler {
                 metadata_graph_tombstones,
                 ..
             })) => {
-                process_metadata_graph_tombstones(self.context.as_ref(), metadata_graph_tombstones)
+                process_graph_tombstones(self.context.as_ref(), metadata_graph_tombstones)
                     .await;
                 let mut refresh_targets = targets.clone();
                 refresh_targets.extend(requested_targets);
@@ -1104,7 +1106,7 @@ impl OperationsTaskHandler {
                     )
                     .await;
                 }
-                refresh_watch_interest_for_targets(self.context.as_ref(), &refresh_targets).await;
+                refresh_target_interest(self.context.as_ref(), &refresh_targets).await;
                 let project_started = Instant::now();
                 let projected = self
                     .project_create_events(retry_key, targets, metadata_create_events)
@@ -1116,8 +1118,11 @@ impl OperationsTaskHandler {
                 }
                 let delete_started = Instant::now();
                 let delete_count = record_keys.len();
-                let deleted =
-                    delete_outbox_records(&self.context.storage_handle, record_keys).await;
+                let deleted = crate::sync::document_outbox::delete_outbox_records(
+                    &self.context.storage_handle,
+                    record_keys,
+                )
+                .await;
                 outcome.delete_elapsed = delete_started.elapsed();
                 if deleted.is_ok() {
                     outcome.deleted += delete_count;

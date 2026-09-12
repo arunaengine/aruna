@@ -965,7 +965,7 @@ mod tests {
         let driver_ctx = context(&storage);
         let authorized_prefix = watch_resource_path(group_id, node_id, "bucket", "reports/");
         assert_eq!(
-            create_local_watch(
+            create_holder_watch(
                 &driver_ctx,
                 node_id,
                 owner,

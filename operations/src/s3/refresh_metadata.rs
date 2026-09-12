@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::tasks::queue_backoff::{due_after, min_due_at, retry_after_ms};
+use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 
 const REFRESH_SCAN_PAGE_SIZE: usize = 512;
 const REFRESH_BATCH_SIZE: usize = 64;
@@ -830,7 +830,7 @@ async fn reschedule_job(
     error: String,
 ) -> Result<u64, ReferenceMetadataRefreshQueueError> {
     let attempts = job.attempts.saturating_add(1);
-    let due_at_ms = unix_timestamp_millis().saturating_add(retry_after_ms(attempts));
+    let due_at_ms = unix_timestamp_millis().saturating_add(retry_delay_ms(attempts));
     let next_job = ReferenceMetadataRefreshJobRecord {
         refresh: job.refresh.clone(),
         due_at_ms,

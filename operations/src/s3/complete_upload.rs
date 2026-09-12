@@ -13,7 +13,7 @@ use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
-use crate::replication::queue::write_live_replication_obligation_effect;
+use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::upload_target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup, delete_records_effect};
@@ -1416,7 +1416,7 @@ impl CompleteMultipartUploadOperation {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
-        let effect = match write_live_replication_obligation_effect(
+        let effect = match build_live_obligation(
             self.input.node_id,
             AuthContext {
                 user_id: self.input.created_by,

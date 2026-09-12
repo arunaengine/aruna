@@ -26,13 +26,17 @@ async fn durable_rearm_loop(
             return;
         };
         ticks = ticks.saturating_add(1);
-        restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
-        restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
+        restore_blob_timer(&context.storage_handle, &task_handle).await;
+        crate::s3::refresh_metadata::restore_timer(&context.storage_handle, &task_handle).await;
         restore_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_publish_timer(&context.storage_handle, &task_handle).await;
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
-        restore_publish_timer(&context.storage_handle, &task_handle).await;
+        crate::notifications::watch::interest::restore_publish_timer(
+            &context.storage_handle,
+            &task_handle,
+        )
+        .await;
         crate::node::node_info::restore_info_timer(&context.storage_handle, &task_handle).await;
         restore_idle_timer(
             &context.storage_handle,
@@ -40,15 +44,17 @@ async fn durable_rearm_loop(
             NOTIFICATION_DELIVERY_RETRY_AFTER,
         )
         .await;
-        restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
+        restore_projection_timer(&context.storage_handle, &task_handle).await;
         // Dead letters retry on a minute-scale backoff, so sweeping every rearm
         // tick would scan the keyspace far more often than it can yield work.
         if ticks.is_multiple_of(DEAD_LETTER_SWEEP_TICKS) {
             sweep_dead_letters(&context.storage_handle).await;
         }
-        restore_metadata_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
-        restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
-        restore_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
+        crate::metadata::prune_queue::restore_prune_timer(&context.storage_handle, &task_handle)
+            .await;
+        crate::notifications::prune::restore_prune_timer(&context.storage_handle, &task_handle)
+            .await;
         restore_drain_timer(&context.storage_handle, &task_handle).await;
         restore_prune_timer(&context.storage_handle, &task_handle).await;
         restore_mirror_timer(&context.storage_handle, &task_handle).await;
@@ -154,16 +160,22 @@ impl TaskQueues {
         crate::device::edit::replay_queued_edits(&context).await;
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
-        restore_publish_timer(&context.storage_handle, &task_handle).await;
+        crate::notifications::watch::interest::restore_publish_timer(
+            &context.storage_handle,
+            &task_handle,
+        )
+        .await;
         crate::node::node_info::restore_info_timer(&context.storage_handle, &task_handle).await;
         restore_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
-        restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
+        restore_projection_timer(&context.storage_handle, &task_handle).await;
         sweep_dead_letters(&context.storage_handle).await;
-        restore_metadata_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
-        restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
-        restore_prune_timer(&context.storage_handle, &task_handle).await;
-        restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
-        restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
+        restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
+        crate::metadata::prune_queue::restore_prune_timer(&context.storage_handle, &task_handle)
+            .await;
+        crate::notifications::prune::restore_prune_timer(&context.storage_handle, &task_handle)
+            .await;
+        restore_blob_timer(&context.storage_handle, &task_handle).await;
+        crate::s3::refresh_metadata::restore_timer(&context.storage_handle, &task_handle).await;
         restore_prune_timer(&context.storage_handle, &task_handle).await;
         restore_mirror_timer(&context.storage_handle, &task_handle).await;
         if context.blob_handle.is_some() {
@@ -275,7 +287,7 @@ impl OperationsTaskHandler {
 
     pub(super) async fn drain_materialization_queue(&self) {
         let bulk = self.bulk_context();
-        match process_metadata_materialization_batch(&bulk).await {
+        match process_materialization_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(
                     TaskKey::DrainMetadataMaterializationQueue,
@@ -292,7 +304,7 @@ impl OperationsTaskHandler {
                 )
                 .await;
             }
-            Ok(_) => match metadata_materialization_jobs_exist(&bulk.storage_handle).await {
+            Ok(_) => match materialization_jobs_exist(&bulk.storage_handle).await {
                 Ok(false) => {}
                 Ok(true) => {
                     self.reschedule_timer(
@@ -323,7 +335,7 @@ impl OperationsTaskHandler {
 
     pub(super) async fn drain_graph_queue(&self) {
         let bulk = self.bulk_context();
-        match process_metadata_graph_prune_batch(&bulk).await {
+        match crate::metadata::prune_queue::process_prune_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(
                     TaskKey::DrainMetadataGraphPruneQueue,
@@ -340,7 +352,7 @@ impl OperationsTaskHandler {
                 )
                 .await;
             }
-            Ok(_) => match metadata_graph_prune_jobs_exist(&bulk.storage_handle).await {
+            Ok(_) => match prune_jobs_exist(&bulk.storage_handle).await {
                 Ok(false) => {}
                 Ok(true) => {
                     self.reschedule_timer(
@@ -372,7 +384,7 @@ impl OperationsTaskHandler {
 
 impl OperationsTaskHandler {
     pub(super) async fn drain_projection_queue(&self) {
-        match drain_pending_metadata_projection_queue(&self.context).await {
+        match drain_projection_queue(&self.context).await {
             Ok(result) if result.has_more => {
                 self.reschedule_timer(
                     TaskKey::DrainMetadataProjectionQueue,
@@ -381,7 +393,7 @@ impl OperationsTaskHandler {
                 .await;
             }
             Ok(result) if result.markers_examined == 0 => {
-                if let Err(error) = replay_metadata_event_log(&self.context).await {
+                if let Err(error) = replay_event_log(&self.context).await {
                     warn!(task_id = ?TaskKey::DrainMetadataProjectionQueue, error = ?error, "Failed to replay metadata event log fallback");
                     self.reschedule_timer(
                         TaskKey::DrainMetadataProjectionQueue,
@@ -403,7 +415,7 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_replication_queue(&self) {
-        match process_blob_replication_batch(&self.context).await {
+        match process_blob_batch(&self.context).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainBlobReplicationQueue, Duration::ZERO)
                     .await;
@@ -451,7 +463,7 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_refresh_queue(&self) {
-        match process_reference_metadata_refresh_batch(&self.context).await {
+        match crate::s3::refresh_metadata::process_batch(&self.context).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainReferenceMetadataRefreshQueue, Duration::ZERO)
                     .await;
@@ -692,7 +704,7 @@ impl OperationsTaskHandler {
             }
 
             if !local_records.is_empty() {
-                match upsert_inbox_records_reporting(&self.context.storage_handle, &local_records)
+                match upsert_with_report(&self.context.storage_handle, &local_records)
                     .await
                 {
                     Ok(outcome) => {

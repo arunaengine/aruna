@@ -62,7 +62,7 @@ use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 mod archive;
-use archive::*;
+pub(crate) use archive::*;
 
 const METADATA_PATH: &str = "ro-crate-metadata.json";
 const REPORT_PATH: &str = "aruna-export-report.json";

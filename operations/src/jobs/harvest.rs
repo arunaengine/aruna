@@ -37,10 +37,10 @@ use crate::metadata::create_document::{
     CreateMetadataDocumentPayload, mint_job_document,
 };
 use crate::metadata::forward::{
-    MetadataWriteError, create_metadata_document_routed, delete_metadata_document_routed,
-    update_metadata_document_routed,
+    MetadataWriteError, route_metadata_create, route_metadata_delete,
+    route_metadata_update,
 };
-use crate::metadata::get_document::load_metadata_record_by_document;
+use crate::metadata::get_document::load_document_record;
 use crate::metadata::update_document::UpdateMetadataDocumentMutation;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
@@ -368,7 +368,7 @@ async fn confirm_withdrawn(
     if stored.is_none() {
         confirm_absent(ctx, document_id).await?;
     }
-    match delete_metadata_document_routed(
+    match route_metadata_delete(
         &ctx.driver,
         actor.clone(),
         stored.as_ref(),
@@ -388,7 +388,7 @@ async fn read_stored(
     ctx: &JobContext,
     document_id: Ulid,
 ) -> Result<Option<MetadataRegistryRecord>, HarvestFailure> {
-    load_metadata_record_by_document(&ctx.driver, document_id)
+    load_document_record(&ctx.driver, document_id)
         .await
         .map_err(|error| retryable(format!("harvest record read: {error:?}")))
 }
@@ -462,8 +462,8 @@ async fn create_document(
     record: &OaiRecord,
 ) -> Result<(), HarvestFailure> {
     let document_path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
-    let created = create_metadata_document_routed(
-        CreateMetadataDocumentOperation::new_for_generated_document_id(
+    let created = route_metadata_create(
+        CreateMetadataDocumentOperation::new_generated_id(
             CreateMetadataDocumentConfig {
                 actor: actor.clone(),
                 group_id: source.group_id,
@@ -510,7 +510,7 @@ async fn update_document(
     stored: Option<&MetadataRegistryRecord>,
     record: &OaiRecord,
 ) -> Result<(), MetadataWriteError> {
-    update_metadata_document_routed(
+    route_metadata_update(
         &ctx.driver,
         actor.clone(),
         stored,

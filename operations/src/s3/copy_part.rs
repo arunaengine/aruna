@@ -86,6 +86,7 @@ pub async fn upload_part_copy(
 
     let source_version_id = source.version_id;
     let source_last_modified = source
+        .info
         .version_created_at
         .or_else(|| source.location.as_ref().map(|location| location.created_at))
         .or_else(|| {

@@ -1135,10 +1135,10 @@ impl IncomingVersionReplicationOperation {
             return self.write_object_lookup();
         }
 
-        self.write_blob_location()
+        self.begin_blob_location()
     }
 
-    fn write_blob_location(&mut self) -> Effects {
+    fn begin_blob_location(&mut self) -> Effects {
         let Ok(location) = self.effective_materialized_location() else {
             return self.write_object_lookup();
         };
@@ -4740,7 +4740,7 @@ mod tests {
         op.destination_group_id = Some(test_group_id());
         op.existing_blob_location = Some(make_location());
 
-        let effects = op.write_blob_location();
+        let effects = op.begin_blob_location();
         assert_eq!(
             op.state,
             IncomingVersionReplicationState::VerifyExistingBlob
