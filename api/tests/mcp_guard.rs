@@ -247,7 +247,7 @@ fn is_guarded(
         }
 
         body.iter().any(|call| {
-            let Some((called_file, called_name)) = resolve_call(module, file, &call) else {
+            let Some((called_file, called_name)) = resolve_call(module, file, call) else {
                 return false;
             };
             is_guarded(modules, &called_file, &called_name, seen)
