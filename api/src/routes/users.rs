@@ -1781,7 +1781,6 @@ async fn delete_enrollment(state: &Arc<ServerState>, enrollment_id: Ulid) -> Ser
 
 #[cfg(test)]
 mod tests {
-    pub(crate) mod fixtures;
 
     use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse, enrollment_status};
     use crate::auth::{OidcValidator, handle_token};
@@ -3306,7 +3305,7 @@ mod tests {
 mod resolve_tests {
     use super::{ResolveUsersRequest, resolve_users};
     use crate::error::ServerError;
-    use crate::routes::users::tests::fixtures::{realm_auth, setup_state};
+    use crate::tests::fixtures::users::{realm_auth, setup_state};
     use aruna_core::UserId;
     use aruna_core::structs::RealmId;
     use axum::extract::State;

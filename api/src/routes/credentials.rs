@@ -787,7 +787,7 @@ fn parse_permission(permission: &str) -> ServerResult<Permission> {
 mod tests {
     use super::*;
     use crate::error::ServerError;
-    use crate::routes::tests::fixtures::{
+    use crate::tests::fixtures::routes::{
         seed_group_docs, seed_realm_auth, seed_realm_config, test_context,
         test_state as build_state, test_storage,
     };

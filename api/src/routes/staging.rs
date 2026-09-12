@@ -1556,7 +1556,7 @@ fn format_system_time(value: std::time::SystemTime) -> String {
 mod tests {
     use super::*;
     use crate::openapi::ApiDoc;
-    use crate::routes::tests::fixtures::{
+    use crate::tests::fixtures::routes::{
         seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
     };
     use aruna_core::UserId;

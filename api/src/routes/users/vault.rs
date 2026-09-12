@@ -210,7 +210,7 @@ pub async fn delete_vault(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routes::users::tests::fixtures::{realm_auth, setup_state};
+    use crate::tests::fixtures::users::{realm_auth, setup_state};
     use aruna_core::structs::MAX_USER_VAULT_BYTES;
     use axum::response::IntoResponse;
 

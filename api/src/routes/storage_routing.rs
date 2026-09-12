@@ -557,11 +557,10 @@ pub async fn put_group_routing(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    pub(crate) mod fixtures;
 
     use super::*;
     use crate::openapi::ApiDoc;
-    use fixtures::setup_state;
+    use crate::tests::fixtures::storage_routing::setup_state;
 
     fn class_rule(class: &str) -> StorageRoutingRuleRequest {
         StorageRoutingRuleRequest {

@@ -307,7 +307,7 @@ mod tests {
     use super::*;
     use crate::auth::handle_token;
     use crate::error::TokenError;
-    use crate::routes::tests::fixtures::{test_context, test_state, test_storage};
+    use crate::tests::fixtures::routes::{test_context, test_state, test_storage};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{NodeCapabilities, RealmId, SessionRef};
     use aruna_core::types::UserId;

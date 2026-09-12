@@ -468,7 +468,7 @@ pub async fn delete_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routes::tests::fixtures::{test_context, test_state, test_storage};
+    use crate::tests::fixtures::routes::{test_context, test_state, test_storage};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{
         Actor, MAX_ASSISTANT_CHAT_BYTES, MAX_ASSISTANT_CHAT_TURNS, MAX_ASSISTANT_CHATS,

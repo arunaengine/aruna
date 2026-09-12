@@ -1193,11 +1193,11 @@ mod tests {
         post_objects, resolve_object, routed_deadline,
     };
     use crate::openapi::ApiDoc;
-    use crate::routes::tests::fixtures::{
+    use crate::server_state::ServerState;
+    use crate::tests::fixtures::routes::{
         seed_group_docs, seed_realm_auth, seed_realm_config, test_context,
         test_state as build_state, test_storage,
     };
-    use crate::server_state::ServerState;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{

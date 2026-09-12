@@ -19,3 +19,6 @@ pub mod s3;
 pub mod server;
 pub mod server_state;
 pub mod telemetry;
+
+#[cfg(test)]
+mod tests;
