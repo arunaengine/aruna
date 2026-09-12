@@ -1,3 +1,15 @@
+//! Local, read-only inspection of a stopped node's persisted state.
+//!
+//! Three responsibilities, in order: persisted decoding (one decoder per
+//! keyspace record), the doctor commands that read and summarize them, and
+//! presentation (table/JSON output).
+//!
+//! Output policy: the doctor is a local operator tool. `node-state` prints the
+//! persisted identity record including its network secret by design, because
+//! recovering a node may require it. Fixtures use synthetic values only. Any
+//! redaction or reveal-flag change is a CLI contract decision, not an
+//! incidental extraction change.
+
 use crate::error::CliError;
 use aruna::config::PersistedNodeState;
 use aruna_api::server_state::INITIAL_REALM_ADMIN_CLAIMED_KEY;
@@ -1939,10 +1951,10 @@ mod tests {
         CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_BATCH_PREFIX, CRAQLE_LOG_KEYSPACE,
         CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, ComputeDepartureReport, ConflictRecord,
         CraqleStoredBatch, CraqleStoredGraphMeta, CraqleStoredQuadOp, DecodedField, DecodedValue,
-        JobFamilyId, JobRecordEnvelope, JobReservationRecord, JsonPlacementPolicyDocument,
-        JsonPolicyCacheEntry, OutboxEntry, PendingNeed, PendingRecord, ProjectionCache,
-        WitnessDeadline, WitnessExplain, decode_entry, list_entries, list_keyspaces, location_scan,
-        raw_field,
+        JobFamilyId, JobRecordEnvelope, JobReservationRecord, JsonPersistedNodeState,
+        JsonPlacementPolicyDocument, JsonPolicyCacheEntry, OutboxEntry, PendingNeed, PendingRecord,
+        ProjectionCache, WitnessDeadline, WitnessExplain, decode_entry, list_entries,
+        list_keyspaces, location_scan, raw_field,
     };
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -3295,6 +3307,27 @@ mod tests {
                 "/{realm_id}/g/{group_id}/data/{}/bucket/path/file.txt",
                 node_id
             )
+        );
+    }
+    // The local operator output intentionally includes the persisted network
+    // secret; a redaction change would be a CLI contract decision.
+    #[test]
+    fn node_state_output_keeps_the_network_secret() {
+        let state = PersistedNodeState {
+            boot_origin: aruna::config::BootOrigin::InitializedRealm,
+            status: aruna::config::PersistedNodeStatus::Complete,
+            realm_id: aruna_core::structs::RealmId([3u8; 32]),
+            net_secret_key: [7u8; 32],
+            onboarding_phase: None,
+            onboarding_sync_ticket: None,
+            identity: aruna::config::PersistedNodeIdentity::Management {
+                realm_private_key_pem: "synthetic-pem".to_string(),
+            },
+        };
+        let json = serde_json::to_value(JsonPersistedNodeState(state)).unwrap();
+        assert_eq!(
+            json["net_secret_key"].as_str(),
+            Some("0707070707070707070707070707070707070707070707070707070707070707")
         );
     }
 }

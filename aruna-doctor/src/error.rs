@@ -71,10 +71,4 @@ pub enum CliError {
     },
     #[error("OIDC provider '{0}' is not configured")]
     OidcProviderNotFound(String),
-    #[error("invalid {key} value {value:?}: {message}")]
-    InvalidConfigValue {
-        key: &'static str,
-        value: String,
-        message: String,
-    },
 }
