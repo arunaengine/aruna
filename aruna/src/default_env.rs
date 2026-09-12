@@ -5,8 +5,9 @@
 use std::io::Cursor;
 use thiserror::Error;
 
-/// The demonstration environment as tracked in the repository.
-const SHIPPED_ENV: &str = include_str!("../../.env");
+// The demonstration environment as tracked in the repository, embedded by the
+// build script. Empty when the build context carries no `.env`.
+include!(concat!(env!("OUT_DIR"), "/shipped_env.rs"));
 
 /// Opt-in that downgrades the refusal to a warning.
 pub const OVERRIDE_FLAG: &str = "--dangerously-use-default-env";
