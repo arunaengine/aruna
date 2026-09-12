@@ -39,8 +39,8 @@ use crate::jobs::lifecycle::target::{
 use crate::jobs::records::keys::record_key;
 use crate::jobs::records::load_kind_complete;
 use crate::jobs::records::rows::to_bytes;
-use crate::jobs::records::tests::fixtures::{Family, REALM, context};
 use crate::node::node_info::set_operator_drain;
+use crate::tests::fixtures::records::{Family, REALM, context};
 
 /// Detects a wakeup that never arrives, not a slow machine.
 const WAKEUP_LIMIT: Duration = Duration::from_secs(30);

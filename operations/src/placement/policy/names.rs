@@ -189,8 +189,7 @@ mod tests {
             PolicyNamesOperation::new(realm(), &[held.policy_ref(), unknown.policy_ref()]);
         operation.start();
 
-        let document =
-            crate::placement::policy::tests::fixtures::signed_document(realm(), &held, 1);
+        let document = crate::tests::fixtures::policy::signed_document(realm(), &held, 1);
         operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (
@@ -226,7 +225,7 @@ mod tests {
         let mut operation = PolicyNamesOperation::new(realm(), &[held.policy_ref()]);
         operation.start();
 
-        let document = crate::placement::policy::tests::fixtures::signed_document(
+        let document = crate::tests::fixtures::policy::signed_document(
             RealmId::from_bytes([9u8; 32]),
             &held,
             1,

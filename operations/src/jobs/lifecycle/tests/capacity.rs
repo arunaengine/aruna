@@ -20,10 +20,10 @@ use crate::jobs::lifecycle::reservation::{
 use crate::jobs::lifecycle::stage::read_targets;
 use crate::jobs::lifecycle::target::{already_running, existing_receipt, pin_matches};
 use crate::jobs::lifecycle::updates::chain_for;
-use crate::jobs::records::tests::fixtures::{Family, REALM, context, node};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::iter_prefix_page;
 use crate::replication::protocol::BaoReadTarget;
+use crate::tests::fixtures::records::{Family, REALM, context, node};
 
 fn envelope(max_concurrent: u32) -> ResourceEnvelope {
     ResourceEnvelope {

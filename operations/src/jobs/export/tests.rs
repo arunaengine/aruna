@@ -1,12 +1,12 @@
 use super::*;
 
 use crate::jobs::executor::ProgressReporter;
-use crate::jobs::import::tests::fixtures::{
+use crate::sync::incoming::initialize_net_incoming;
+use crate::tests::fixtures::import::{
     RewriteTarget, file_id_candidates, inspect_archive, open_archive, payload_entries,
     read_metadata, rewrite_document, signature_entry, validate_document,
 };
-use crate::staging::tests::fixtures::setup_driver_context;
-use crate::sync::incoming::initialize_net_incoming;
+use crate::tests::fixtures::staging::setup_driver_context;
 use aruna_blob::blob::{BlobHandle, BlobHandler};
 use aruna_core::UserId;
 use aruna_core::keyspaces::{

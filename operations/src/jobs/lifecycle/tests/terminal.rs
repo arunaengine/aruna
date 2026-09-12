@@ -19,11 +19,11 @@ use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecuti
 use crate::jobs::lifecycle::updates::{execution_chain, publish_state, publish_terminal};
 use crate::jobs::output_record::store_outputs;
 use crate::jobs::records::reduce::reduce_family;
-use crate::jobs::records::tests::fixtures::{Family, REALM, context};
 use crate::jobs::records::{
     AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
 };
 use crate::jobs::store::{iter_prefix_page, record_attempt_intent, reserve_output_commits};
+use crate::tests::fixtures::records::{Family, REALM, context};
 
 const TOKEN: Ulid = Ulid(0x7E12);
 

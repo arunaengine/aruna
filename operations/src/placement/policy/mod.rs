@@ -84,8 +84,6 @@ pub(crate) mod tests {
 
     use crate::placement::resolve_shard_holders;
 
-    pub(crate) mod fixtures;
-
     /// Realm authorization granting `user` the realm-configuration write every
     /// policy publication is verified against.
     pub(crate) fn realm_authorization(
@@ -105,7 +103,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn node(seed: u8) -> NodeId {
+    pub(crate) fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 

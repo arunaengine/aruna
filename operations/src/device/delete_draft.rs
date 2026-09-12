@@ -217,8 +217,8 @@ fn fail(operation: &mut DeleteDraftOperation, error: DeleteDraftError) -> Effect
 mod tests {
     use super::{DeleteDraftError, DeleteDraftOperation};
     use crate::device::publish_queue::{PublishEntry, PublishState, publish_entry};
-    use crate::device::tests::fixtures::context;
     use crate::driver::{DriverContext, drive};
+    use crate::tests::fixtures::device::context;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::RealmId;
     use aruna_core::types::UserId;

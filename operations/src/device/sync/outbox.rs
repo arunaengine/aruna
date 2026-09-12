@@ -443,8 +443,8 @@ mod tests {
     use crate::device::drain::DrainOutcome;
     use crate::device::sync::folders::store_folder;
     use crate::device::sync::repository::{base_key, read_value, upload_entry, write_rows};
-    use crate::device::tests::fixtures::context;
     use crate::driver::DriverContext;
+    use crate::tests::fixtures::device::context;
     use aruna_core::keyspaces::SYNC_UPLOAD_OUTBOX_KEYSPACE;
     use aruna_core::structs::{FolderState, RealmId, SyncedFolder};
 

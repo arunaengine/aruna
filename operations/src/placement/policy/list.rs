@@ -211,7 +211,7 @@ mod tests {
     use aruna_core::types::{Key, NodeId, UserId};
     use ulid::Ulid;
 
-    use crate::placement::policy::tests::fixtures::signed_document;
+    use crate::tests::fixtures::policy::signed_document;
 
     fn realm_id() -> RealmId {
         RealmId::from_bytes([1u8; 32])
