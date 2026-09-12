@@ -90,7 +90,7 @@ pub async fn restore_task_timers(storage: &StorageHandle, task_handle: &TaskHand
                 Ok(record) => record,
                 Err(error) => {
                     warn!(error = %error, "Failed to decode persisted task timer");
-                    delete_timer(storage, key_bytes).await;
+                    delete_timer_key(storage, key_bytes).await;
                     continue;
                 }
             };
@@ -190,11 +190,11 @@ async fn write_record(storage: &StorageHandle, record: &PersistedTaskTimer) -> R
 }
 
 async fn delete_timer(storage: &StorageHandle, key: &TaskKey) -> Result<(), String> {
-    delete_timer(storage, task_storage_key(key)?).await;
+    delete_timer_key(storage, task_storage_key(key)?).await;
     Ok(())
 }
 
-async fn delete_timer(storage: &StorageHandle, key: ByteView) {
+async fn delete_timer_key(storage: &StorageHandle, key: ByteView) {
     if let Event::Storage(StorageEvent::Error { error }) = storage
         .send_storage_effect(StorageEffect::Delete {
             key_space: TASK_TIMER_KEYSPACE.to_string(),

@@ -23,9 +23,9 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::placement_ref_for_target;
+use crate::placement::target_placement_ref;
 use crate::sync::document_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -223,7 +223,7 @@ impl SetGroupPoliciesOperation {
             .transpose()?;
         let placement = realm_config
             .as_ref()
-            .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
+            .map(|config| target_placement_ref(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
         let realm_id = self.config.actor.realm_id;
         if let Some(config) = realm_config.as_ref() {
@@ -237,7 +237,7 @@ impl SetGroupPoliciesOperation {
             ),
             reducer_state_entry(&reducer_state)?,
         ];
-        let record = new_outbox_record_with_id(
+        let record = new_identified_record(
             admin_event.event_id,
             self.config.actor.node_id,
             document_target,
@@ -422,7 +422,7 @@ impl Operation for SetGroupPoliciesOperation {
                     self.txn_id = None;
                     self.state =
                         SetGroupPoliciesState::ScheduleDocumentSyncOutboxDrain { document };
-                    smallvec![schedule_outbox_drain_effect()]
+                    smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;

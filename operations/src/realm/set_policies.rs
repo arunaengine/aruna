@@ -20,10 +20,10 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::placement_ref_for_target;
+use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::document_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -200,7 +200,7 @@ impl SetRealmPoliciesOperation {
         let stale_conflict_deletes =
             stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let document_target = self.document_ref();
-        let placement = placement_ref_for_target(&document, &document_target, Default::default());
+        let placement = target_placement_ref(&document, &document_target, Default::default());
         let mut writes = vec![
             (
                 document_target.storage_keyspace().to_string(),
@@ -209,7 +209,7 @@ impl SetRealmPoliciesOperation {
             ),
             reducer_state_entry(&reducer_state)?,
         ];
-        let record = new_outbox_record_with_id(
+        let record = new_identified_record(
             admin_event.event_id,
             self.config.actor.node_id,
             document_target,
@@ -358,7 +358,7 @@ impl Operation for SetRealmPoliciesOperation {
                     self.txn_id = None;
                     self.state =
                         SetRealmPoliciesState::ScheduleDocumentSyncOutboxDrain { document };
-                    smallvec![schedule_outbox_drain_effect()]
+                    smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;

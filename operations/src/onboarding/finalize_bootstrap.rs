@@ -149,7 +149,7 @@ pub async fn bootstrap_onboarding_finalize(
         let mut all_topics = onboarding_topics.shared;
         all_topics.extend(onboarding_topics.shard);
         net_handle
-            .allow_sync_peers(&all_topics, vec![input.node_id])
+            .allow_topic_peers(&all_topics, vec![input.node_id])
             .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
     }
 

@@ -23,9 +23,9 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::placement::placement_ref_for_target;
+use crate::placement::target_placement_ref;
 use crate::sync::document_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -269,10 +269,10 @@ impl CreateRealmOperation {
         let realm_auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
         let realm_config_target = DocumentSyncTarget::RealmConfig { realm_id };
         let realm_auth_placement =
-            placement_ref_for_target(config_doc, &realm_auth_target, Default::default());
+            target_placement_ref(config_doc, &realm_auth_target, Default::default());
         let realm_config_placement =
-            placement_ref_for_target(config_doc, &realm_config_target, Default::default());
-        let realm_auth_record = new_outbox_record_with_id(
+            target_placement_ref(config_doc, &realm_config_target, Default::default());
+        let realm_auth_record = new_identified_record(
             realm_role_event.event_id,
             self.config.actor.node_id,
             realm_auth_target,
@@ -287,7 +287,7 @@ impl CreateRealmOperation {
             outbox_write_entry(&realm_auth_record).map_err(ConversionError::from)?,
         ];
         for event in config_events {
-            let record = new_outbox_record_with_id(
+            let record = new_identified_record(
                 event.event_id,
                 self.config.actor.node_id,
                 realm_config_target.clone(),
@@ -416,7 +416,7 @@ impl CreateRealmOperation {
 
         if self.auth_doc.is_some() && self.config_doc.is_some() {
             self.state = CreateRealmState::ScheduleDocumentSyncOutboxDrain;
-            smallvec![schedule_outbox_drain_effect()]
+            smallvec![schedule_drain_effect()]
         } else {
             self.fail(CreateRealmError::RealmConfigDocNotFound)
         }

@@ -1405,7 +1405,7 @@ async fn process_blob_job(
         operation = operation.with_gate(gate);
     }
     let mut watch_group_id = None;
-    let mut relationship = if let Some(relationship_id) = job.relationship_id {
+    let relationship = if let Some(relationship_id) = job.relationship_id {
         let Some(relationship) = stored_relationship else {
             info!(
                 relationship_id = %relationship_id,

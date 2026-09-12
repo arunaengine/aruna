@@ -1,6 +1,5 @@
 use super::*;
 
-use super::*;
 use crate::jobs::executor::ProgressReporter;
 use crate::jobs::import::tests::fixtures::{
     RewriteTarget, file_id_candidates, inspect_archive, open_archive, payload_entries,

@@ -17,11 +17,11 @@ use crate::metadata::projector::{
     METADATA_PROJECTION_RETRY_AFTER, project_create_events, project_logged_events,
     schedule_projection_drain,
 };
-use crate::metadata::prune_queue::process_metadata_graph_tombstones;
+use crate::metadata::prune_queue::process_graph_tombstones;
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::node::usage_stats::refresh_usage_targets;
-use crate::notifications::watch::emit::emit_resource_watch_event;
-use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
+use crate::notifications::watch::emit::emit_watch_event;
+use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::process_placements::reconcile_shard_topics;
 use crate::realm::get_config::GetRealmConfigOperation;
 use crate::realm::mutate_placement::node_kind;
@@ -35,7 +35,7 @@ use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::sync::document_outbox::{
     new_identified_record, schedule_drain_effect, write_outbox_effect,
 };
-use crate::tasks::queue_backoff::retry_after_ms;
+use crate::tasks::queue_backoff::retry_delay_ms;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
     DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
@@ -154,7 +154,7 @@ async fn emit_replication_watch(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    emit_resource_watch_event(
+    emit_watch_event(
         context,
         WatchEvent {
             event_id: Ulid::generate(),
@@ -437,7 +437,7 @@ impl DocumentSyncReconcileCoalescer {
                     failures = 0;
                 } else {
                     coalescer.trigger(context.clone(), batch);
-                    let retry_after = Duration::from_millis(retry_after_ms(failures));
+                    let retry_after = Duration::from_millis(retry_delay_ms(failures));
                     failures = failures.saturating_add(1);
                     sleep(retry_after).await;
                 }
@@ -536,12 +536,12 @@ async fn reconcile_inbound_topics(
         reconcile_shard_topics(context, *net_handle.realm_id(), net_handle.node_id()).await;
     }
     refresh_usage_targets(context, net_handle.node_id(), &targets.targets).await;
-    refresh_watch_interest_for_targets(context, &targets.targets).await;
+    refresh_target_interest(context, &targets.targets).await;
     let project_started = Instant::now();
     project_inbound_events(context, targets).await;
     let project_elapsed = project_started.elapsed();
     let prune_started = Instant::now();
-    process_metadata_graph_tombstones(context, metadata_graph_tombstones).await;
+    process_graph_tombstones(context, metadata_graph_tombstones).await;
     info!(
         event = "pipeline.reconcile.summary",
         topics = topic_count,

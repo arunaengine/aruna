@@ -55,7 +55,7 @@ use crate::metadata::MetadataAuthToken;
 use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
-use crate::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
+use crate::metadata::forward::{MetadataWriteError, route_metadata_create};
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetRealmConfigOperation;
 use crate::replication::queue::{
@@ -1008,8 +1008,8 @@ async fn create_document(
         user_id: spec.auth_context.user_id,
         realm_id: spec.auth_context.realm_id,
     };
-    match create_metadata_document_routed(
-        CreateMetadataDocumentOperation::new_for_generated_document_id(
+    match route_metadata_create(
+        CreateMetadataDocumentOperation::new_generated_id(
             CreateMetadataDocumentConfig {
                 actor,
                 group_id: spec.metadata.group_id,

@@ -1430,7 +1430,7 @@ async fn restore_rank0(
 ) -> RestoreUnitOutcome {
     let mut outcome = RestoreUnitOutcome::default();
     // An unreachable co-holder might hold the genesis; never fork a second one.
-    let group_withheld = crate::placement::process_placements::ensure_rank0_shard_group(
+    let group_withheld = crate::placement::process_placements::ensure_genesis_group(
         context,
         net_handle,
         node_id,

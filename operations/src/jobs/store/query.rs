@@ -240,13 +240,13 @@ pub(super) async fn commit_txn(storage: &StorageHandle, txn_id: TxnId) -> Commit
     }
 }
 
-pub(super) enum CommitStep {
+pub(crate) enum CommitStep {
     Committed,
     Retry,
 }
 
 /// Commits one write transaction, sleeping between bounded conflict retries.
-pub(super) async fn commit_write(
+pub(crate) async fn commit_write(
     storage: &StorageHandle,
     txn_id: TxnId,
     attempt: u32,

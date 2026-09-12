@@ -24,7 +24,7 @@ use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_job_document,
 };
-use crate::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
+use crate::metadata::forward::{MetadataWriteError, route_metadata_create};
 use crate::notifications::watch::emit::emit_metadata_created;
 
 /// Run the follow-on run-crate obligation for a finished execution job. A failure
@@ -153,8 +153,8 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
 
     let jsonld = build_crate_jsonld(&parent, spec, document_id);
 
-    let (status, resource) = match create_metadata_document_routed(
-        CreateMetadataDocumentOperation::new_for_generated_document_id(
+    let (status, resource) = match route_metadata_create(
+        CreateMetadataDocumentOperation::new_generated_id(
             CreateMetadataDocumentConfig {
                 actor,
                 group_id: spec.group_id,

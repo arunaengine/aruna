@@ -22,7 +22,7 @@ use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::sync::document_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
 
@@ -307,7 +307,7 @@ impl AddRealmRoleOperation {
             realm_id: self.input.realm_id,
         };
         for event in &admin_events {
-            let record = new_outbox_record_with_id(
+            let record = new_identified_record(
                 event.event_id,
                 self.input.actor.node_id,
                 document_target.clone(),
@@ -420,7 +420,7 @@ impl AddRealmRoleOperation {
         };
         if admin_outbox_written {
             self.state = AddRealmRoleState::ScheduleAdminDocumentOutboxDrain { auth_doc };
-            return smallvec![schedule_outbox_drain_effect()];
+            return smallvec![schedule_drain_effect()];
         }
 
         self.emit_auth_announce(auth_doc)

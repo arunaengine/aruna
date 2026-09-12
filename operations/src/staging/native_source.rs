@@ -512,7 +512,7 @@ fn result_metadata(
             content_length: location.blob_size,
             content_type: None,
             etag: None,
-            last_modified: result.version_created_at,
+            last_modified: result.info.version_created_at,
             source_version: None,
         }
     } else {
