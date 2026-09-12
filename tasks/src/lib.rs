@@ -603,24 +603,53 @@ fn spawn_timer_handler(
     })
 }
 
+/// The task scheduler could not start because no Tokio runtime is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskSchedulerUnavailable;
+
+impl std::fmt::Display for TaskSchedulerUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("task scheduler requires an active Tokio runtime")
+    }
+}
+
+impl std::error::Error for TaskSchedulerUnavailable {}
+
 impl TaskHandle {
-    pub fn new() -> Self {
+    /// Starts the scheduler on the current Tokio runtime. Production startup
+    /// uses this so a missing runtime is a concrete error instead of a handle
+    /// that only looks like it is running.
+    pub fn try_new() -> Result<Self, TaskSchedulerUnavailable> {
         let (command_tx, command_rx) = mpsc::channel(TASK_COMMAND_BUFFER);
         let admission_closed = Arc::new(AtomicBool::new(false));
-
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(run_scheduler(
-                command_rx,
-                command_tx.downgrade(),
-                admission_closed.clone(),
-            ));
-        } else {
-            warn!("TaskHandle created without an active Tokio runtime; task scheduler unavailable");
-        }
-
-        Self {
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| TaskSchedulerUnavailable)?;
+        handle.spawn(run_scheduler(
+            command_rx,
+            command_tx.downgrade(),
+            admission_closed.clone(),
+        ));
+        Ok(Self {
             command_tx,
             admission_closed,
+        })
+    }
+
+    /// Convenience constructor for tests and deliberate inactive handles:
+    /// starts the scheduler when a runtime is active, else returns an unstarted
+    /// handle and logs why. Production paths use [`TaskHandle::try_new`].
+    pub fn new() -> Self {
+        match Self::try_new() {
+            Ok(handle) => handle,
+            Err(unavailable) => {
+                warn!(
+                    "TaskHandle created without an active Tokio runtime; task scheduler unavailable: {unavailable}"
+                );
+                let (command_tx, _command_rx) = mpsc::channel(TASK_COMMAND_BUFFER);
+                Self {
+                    command_tx,
+                    admission_closed: Arc::new(AtomicBool::new(false)),
+                }
+            }
         }
     }
 
@@ -958,6 +987,18 @@ mod tests {
             realm_id: aruna_core::structs::RealmId([7u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
         }
+    }
+
+    // Production construction must not return a scheduler-less handle as if it
+    // were running; outside a runtime the failure is concrete.
+    #[test]
+    fn try_new_requires_a_runtime() {
+        assert_eq!(TaskHandle::try_new().unwrap_err(), TaskSchedulerUnavailable);
+    }
+
+    #[tokio::test]
+    async fn try_new_starts_with_a_runtime() {
+        assert!(TaskHandle::try_new().is_ok());
     }
 
     #[tokio::test]
