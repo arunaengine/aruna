@@ -10,15 +10,15 @@ use aruna_core::metadata::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
-    graph_revision_change, metadata_document_lifecycle_revision_change, updated_index_delete,
+    graph_revision_change, lifecycle_revision_change, updated_index_delete,
 };
 use aruna_core::structs::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, PlacementRef,
     RealmConfigDocument,
 };
 use aruna_core::task::TaskEvent;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Effects;
-use aruna_core::util::unix_timestamp_millis;
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -29,13 +29,11 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::persistent_id::{
     MappingRoute, mapping_route_for, parse_mapping_read, read_mapping_effect, tombstone_transition,
 };
-use crate::metadata::prune_queue::{
-    new_graph_prune_job, schedule_metadata_graph_prune_drain_effect, write_graph_prune_job_effect,
-};
+use crate::metadata::prune_queue::{new_prune_job, schedule_prune_drain, write_prune_effect};
 use crate::metadata::repository::{
-    StorageReadError, delete_document_index_effect, delete_holders_effect, delete_registry_effect,
-    parse_registry_read, read_registry_effect, write_audit_effect,
-    write_document_lifecycle_with_revision_effect, write_graph_lifecycle_effect,
+    StorageReadError, delete_holders_effect, delete_index_effect, delete_registry_effect,
+    parse_registry_read, read_registry_effect, write_audit_effect, write_graph_lifecycle,
+    write_lifecycle_revision,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
 use crate::sync::document_outbox::{
@@ -178,7 +176,7 @@ impl DeleteMetadataDocumentOperation {
         let Some(lifecycle_record) = self.lifecycle_record.as_ref() else {
             return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
         };
-        match write_graph_lifecycle_effect(lifecycle_record, Some(txn_id)) {
+        match write_graph_lifecycle(lifecycle_record, Some(txn_id)) {
             Ok(effect) => {
                 self.state = DeleteMetadataDocumentState::WriteGraphLifecycle;
                 smallvec![effect]
@@ -211,7 +209,7 @@ impl DeleteMetadataDocumentOperation {
         }
     }
 
-    fn document_lifecycle_outbox_record(
+    fn lifecycle_outbox_record(
         &self,
         record: &MetadataRegistryRecord,
     ) -> Result<DocumentSyncOutboxRecord, DeleteMetadataDocumentError> {
@@ -220,14 +218,12 @@ impl DeleteMetadataDocumentOperation {
         };
         let bytes = postcard::to_allocvec(lifecycle_record)
             .map_err(|error| DeleteMetadataDocumentError::ConversionError(error.into()))?;
-        let change = metadata_document_lifecycle_revision_change(
+        let change = lifecycle_revision_change(
             lifecycle_record,
             self.actor.node_id,
             self.document_lifecycle_placement_ref,
         );
-        // Delete tombstones publish on the holder's per-document sync topics and
-        // must mint their genesis (the graph-lifecycle topic is first written
-        // here) or the delete batch stalls. Single-origin, so no fork risk.
+        // A delete mints the graph-lifecycle topic genesis before publishing its tombstone.
         Ok(new_outbox_record_with_id(
             lifecycle_record.event_id(),
             self.actor.node_id,
@@ -245,19 +241,19 @@ impl DeleteMetadataDocumentOperation {
         ))
     }
 
-    fn document_lifecycle_outbox_effect(
+    fn document_lifecycle_effect(
         &self,
         record: &MetadataRegistryRecord,
         txn_id: Ulid,
     ) -> Result<Effects, DeleteMetadataDocumentError> {
-        let outbox = self.document_lifecycle_outbox_record(record)?;
+        let outbox = self.lifecycle_outbox_record(record)?;
         Ok(smallvec![
             write_outbox_effect_with_txn(&outbox, Some(txn_id))
                 .map_err(|error| { DeleteMetadataDocumentError::ConversionError(error.into()) })?
         ])
     }
 
-    fn graph_lifecycle_outbox_effect(
+    fn graph_lifecycle_effect(
         &self,
         record: &MetadataRegistryRecord,
         txn_id: Ulid,
@@ -297,14 +293,14 @@ impl DeleteMetadataDocumentOperation {
         ])
     }
 
-    fn graph_lifecycle_schedule_effect(&self) -> Result<Effects, DeleteMetadataDocumentError> {
+    fn lifecycle_schedule_effect(&self) -> Result<Effects, DeleteMetadataDocumentError> {
         if self.lifecycle_record.is_none() {
             return Err(DeleteMetadataDocumentError::DocumentNotFound);
         }
         Ok(smallvec![schedule_outbox_drain_effect()])
     }
 
-    fn registry_delete_outbox_effect(
+    fn delete_outbox_effect(
         &self,
         record: &MetadataRegistryRecord,
         txn_id: Ulid,
@@ -312,7 +308,7 @@ impl DeleteMetadataDocumentOperation {
         let Some(lifecycle_record) = self.document_lifecycle_record.as_ref() else {
             return Err(DeleteMetadataDocumentError::DocumentNotFound);
         };
-        let change = metadata_document_lifecycle_revision_change(
+        let change = lifecycle_revision_change(
             lifecycle_record,
             self.actor.node_id,
             self.registry_placement_ref,
@@ -339,7 +335,7 @@ impl DeleteMetadataDocumentOperation {
         ])
     }
 
-    fn registry_delete_schedule_effect(&self) -> Effects {
+    fn delete_schedule_effect(&self) -> Effects {
         smallvec![schedule_outbox_drain_effect()]
     }
 
@@ -392,7 +388,7 @@ pub async fn delete_metadata_document(
         }
     }
     if let Some(metadata_handle) = context.metadata_handle.as_ref() {
-        metadata_handle.remove_cached_registry_record(document_id);
+        metadata_handle.remove_cached_record(document_id);
     }
     Ok(())
 }
@@ -436,21 +432,16 @@ impl Operation for DeleteMetadataDocumentOperation {
                                     .fail(DeleteMetadataDocumentError::ConversionError(error));
                             }
                         };
-                        // Every record rides the bucket its create stamped, so a
-                        // tombstone lands on the document's own topic. Peers are
-                        // that bucket's live holders, not the event-time stamp.
+                        // Every record rides the bucket its create stamped, so a tombstone
+                        // lands on the document's own topic.
                         self.holder_peers = resolve_shard_holders(&config, &record.placement);
                         self.document_lifecycle_placement_ref = record.placement;
                         self.graph_lifecycle_placement_ref = record.placement;
-                        // The registry row rides the registry class's own topic,
-                        // not the document's capped bucket, so its tombstone must
-                        // go where the row went: to every node that has one.
+                        // The registry tombstone follows its everywhere-bound registry topic.
                         self.registry_placement_ref = registry_placement(&config, record);
                         self.registry_peers =
                             resolve_shard_holders(&config, &self.registry_placement_ref);
-                        // The PID mapping rides the placement derived from the
-                        // structured id, not the deletable registry row, so its
-                        // tombstone keeps routing after this delete commits.
+                        // The PID tombstone keeps the structured id's placement after deletion.
                         self.mapping_route = mapping_route_for(
                             &config,
                             record.realm_id,
@@ -493,7 +484,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let lifecycle_record = self.lifecycle_record(&record);
                     self.document_lifecycle_record =
                         Some(self.document_lifecycle_record(&record, lifecycle_record.clone()));
-                    self.prune_job_record = Some(new_graph_prune_job(
+                    self.prune_job_record = Some(new_prune_job(
                         lifecycle_record.graph_iri.clone(),
                         unix_timestamp_millis(),
                     ));
@@ -536,7 +527,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
                     self.state = DeleteMetadataDocumentState::WriteGraphPruneJob;
-                    match write_graph_prune_job_effect(prune_job_record, Some(txn_id)) {
+                    match write_prune_effect(prune_job_record, Some(txn_id)) {
                         Ok(effect) => smallvec![effect],
                         Err(error) => {
                             self.fail(DeleteMetadataDocumentError::ConversionError(error))
@@ -558,7 +549,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
                     self.state = DeleteMetadataDocumentState::WriteDocumentLifecycle;
-                    match write_document_lifecycle_with_revision_effect(
+                    match write_lifecycle_revision(
                         document_lifecycle_record,
                         self.actor.node_id,
                         self.document_lifecycle_placement_ref,
@@ -598,7 +589,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                         return self.fail(DeleteMetadataDocumentError::MissingTransaction);
                     };
                     self.state = DeleteMetadataDocumentState::DeleteDocumentIndex;
-                    smallvec![delete_document_index_effect(self.document_id, Some(txn_id))]
+                    smallvec![delete_index_effect(self.document_id, Some(txn_id))]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("registry delete result", format!("{other:?}")),
@@ -666,7 +657,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
                     self.state = DeleteMetadataDocumentState::WriteDocumentLifecycleOutbox;
-                    match self.document_lifecycle_outbox_effect(record, txn_id) {
+                    match self.document_lifecycle_effect(record, txn_id) {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }
@@ -683,7 +674,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
                     self.state = DeleteMetadataDocumentState::WriteGraphLifecycleOutbox;
-                    match self.graph_lifecycle_outbox_effect(record, txn_id) {
+                    match self.graph_lifecycle_effect(record, txn_id) {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }
@@ -707,7 +698,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
                     self.state = DeleteMetadataDocumentState::WriteDeleteOutbox;
-                    match self.registry_delete_outbox_effect(record, txn_id) {
+                    match self.delete_outbox_effect(record, txn_id) {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }
@@ -736,9 +727,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                 other => self
                     .unexpected_event("document delete outbox write result", format!("{other:?}")),
             },
-            // The PID tombstone commits with the registry row it retires: a
-            // best-effort write afterwards can be lost to a crash and leave a
-            // deleted document's PID Active forever.
+            // Commit the PID tombstone with the registry row to prevent a crash leaving it active.
             DeleteMetadataDocumentState::ReadPidMapping => {
                 let Some(txn_id) = self.txn_id else {
                     return self.fail(DeleteMetadataDocumentError::MissingTransaction);
@@ -797,7 +786,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.state = DeleteMetadataDocumentState::ScheduleGraphPruneQueue;
-                    smallvec![schedule_metadata_graph_prune_drain_effect()]
+                    smallvec![schedule_prune_drain()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
@@ -834,7 +823,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     }
                     self.state = DeleteMetadataDocumentState::ScheduleGraphLifecycleSync;
-                    match self.graph_lifecycle_schedule_effect() {
+                    match self.lifecycle_schedule_effect() {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }
@@ -845,7 +834,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     }
                     self.state = DeleteMetadataDocumentState::ScheduleGraphLifecycleSync;
-                    match self.graph_lifecycle_schedule_effect() {
+                    match self.lifecycle_schedule_effect() {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }
@@ -858,7 +847,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     }
                     self.state = DeleteMetadataDocumentState::ScheduleDeleteSync;
-                    self.registry_delete_schedule_effect()
+                    self.delete_schedule_effect()
                 }
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
@@ -915,7 +904,7 @@ mod tests {
         DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
         METADATA_GRAPH_PRUNE_JOB_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE,
     };
-    use aruna_core::storage_entries::document_sync_revision_key;
+    use aruna_core::storage_entries::sync_revision_key;
     use aruna_core::structs::{
         JobId, PersistentIdMapping, PersistentIdStatus, PlacementStrategy, RealmId, RealmNodeKind,
         persistent_id_key,
@@ -965,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_writes_document_lifecycle_tombstone_outbox_with_fence() {
+    fn delete_writes_lifecycle() {
         let actor = actor();
         let record = record(&actor);
         let mut operation = DeleteMetadataDocumentOperation::new(
@@ -978,7 +967,7 @@ mod tests {
             Some(operation.document_lifecycle_record(&record, tombstone.clone()));
 
         let outbox = operation
-            .document_lifecycle_outbox_record(&record)
+            .lifecycle_outbox_record(&record)
             .expect("outbox record builds");
 
         assert_eq!(
@@ -1046,7 +1035,7 @@ mod tests {
     // Every record of a document rides the bucket its create stamped, so all
     // three tombstones land on the topic the document itself lives on.
     #[test]
-    fn delete_rides_stored_bucket() {
+    fn delete_rides_stored() {
         let actor = actor();
         let mut record = record(&actor);
         // Deterministic identity so the placement collision check cannot flake on
@@ -1123,16 +1112,16 @@ mod tests {
         assert_ne!(registry_ref, record.placement);
 
         let document_outbox = operation
-            .document_lifecycle_outbox_record(&record)
+            .lifecycle_outbox_record(&record)
             .expect("document lifecycle outbox builds");
         let graph_outbox = outbox_from_effects(
             operation
-                .graph_lifecycle_outbox_effect(&record, Ulid::generate())
+                .graph_lifecycle_effect(&record, Ulid::generate())
                 .expect("graph lifecycle outbox builds"),
         );
         let registry_outbox = outbox_from_effects(
             operation
-                .registry_delete_outbox_effect(&record, Ulid::generate())
+                .delete_outbox_effect(&record, Ulid::generate())
                 .expect("registry delete outbox builds"),
         );
         let DocumentSyncOutboxEvent::Upsert {
@@ -1260,16 +1249,16 @@ mod tests {
             "an admitted delete writes the graph lifecycle tombstone, got {effects:?}"
         );
         let document_outbox = operation
-            .document_lifecycle_outbox_record(&record)
+            .lifecycle_outbox_record(&record)
             .expect("document lifecycle outbox builds");
         let graph_outbox = outbox_from_effects(
             operation
-                .graph_lifecycle_outbox_effect(&record, Ulid::generate())
+                .graph_lifecycle_effect(&record, Ulid::generate())
                 .expect("graph lifecycle outbox builds"),
         );
         let registry_outbox = outbox_from_effects(
             operation
-                .registry_delete_outbox_effect(&record, Ulid::generate())
+                .delete_outbox_effect(&record, Ulid::generate())
                 .expect("registry delete outbox builds"),
         );
         assert_eq!(document_outbox.generation, 1);
@@ -1306,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_writes_prune_job_in_same_transaction_before_commit() {
+    fn delete_writes_prune() {
         let actor = actor();
         let record = record(&actor);
         let mut fenced = record.clone();
@@ -1366,7 +1355,7 @@ mod tests {
         ));
 
         let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: crate::metadata::repository::metadata_graph_lifecycle_key(&record.graph_iri),
+            key: crate::metadata::repository::graph_lifecycle_key(&record.graph_iri),
         }));
         let [
             Effect::Storage(StorageEffect::Write {
@@ -1426,7 +1415,7 @@ mod tests {
                 )
             })
             .expect("revision sidecar write exists");
-        assert_eq!(revision_key, &document_sync_revision_key(&target));
+        assert_eq!(revision_key, &sync_revision_key(&target));
         assert_eq!(revision.current.event_id, event.event_id);
         assert_eq!(revision.current.actor, actor.node_id);
         assert_eq!(revision.current.generation, event.tombstone.updated_at_ms);
@@ -1582,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_ignores_prune_timer_schedule_error_after_job_commit() {
+    fn delete_ignores_prune() {
         let actor = actor();
         let record = record(&actor);
         let mut operation =

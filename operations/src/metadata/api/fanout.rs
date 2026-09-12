@@ -1,13 +1,13 @@
 use super::distributed::record_bucket_result;
 use super::*;
 
-pub(super) fn ensure_supported_query_mode(mode: &Option<MetadataApiQueryMode>) {
+pub(super) fn ensure_query_mode(mode: &Option<MetadataApiQueryMode>) {
     match mode {
         None | Some(MetadataApiQueryMode::Local) | Some(MetadataApiQueryMode::Distributed) => {}
     }
 }
 
-pub(super) fn ensure_supported_query_form(query: &str) -> Result<(), MetadataApiError> {
+pub(super) fn ensure_query_form(query: &str) -> Result<(), MetadataApiError> {
     if query.len() > METADATA_QUERY_MAX_BYTES {
         return Err(MetadataApiError::BadRequest);
     }
@@ -18,7 +18,7 @@ pub(super) fn ensure_supported_query_form(query: &str) -> Result<(), MetadataApi
         spargebra::Query::Select { pattern, .. } | spargebra::Query::Ask { pattern, .. } => pattern,
         _ => return Err(MetadataApiError::BadRequest),
     };
-    if graph_pattern_contains_service(pattern) {
+    if pattern_contains_service(pattern) {
         return Err(MetadataApiError::BadRequest);
     }
     if matches!(
@@ -33,7 +33,7 @@ pub(super) fn ensure_supported_query_form(query: &str) -> Result<(), MetadataApi
     Ok(())
 }
 
-pub(crate) fn graph_pattern_contains_service(pattern: &spargebra::algebra::GraphPattern) -> bool {
+pub(crate) fn pattern_contains_service(pattern: &spargebra::algebra::GraphPattern) -> bool {
     use spargebra::algebra::GraphPattern;
 
     match pattern {
@@ -43,30 +43,30 @@ pub(crate) fn graph_pattern_contains_service(pattern: &spargebra::algebra::Graph
         | GraphPattern::Lateral { left, right }
         | GraphPattern::Union { left, right }
         | GraphPattern::Minus { left, right } => {
-            graph_pattern_contains_service(left) || graph_pattern_contains_service(right)
+            pattern_contains_service(left) || pattern_contains_service(right)
         }
         GraphPattern::LeftJoin {
             left,
             right,
             expression,
         } => {
-            graph_pattern_contains_service(left)
-                || graph_pattern_contains_service(right)
+            pattern_contains_service(left)
+                || pattern_contains_service(right)
                 || expression.as_ref().is_some_and(expression_contains_service)
         }
         GraphPattern::Filter { expr, inner } => {
-            expression_contains_service(expr) || graph_pattern_contains_service(inner)
+            expression_contains_service(expr) || pattern_contains_service(inner)
         }
         GraphPattern::Graph { inner, .. }
         | GraphPattern::Project { inner, .. }
         | GraphPattern::Distinct { inner }
         | GraphPattern::Reduced { inner }
-        | GraphPattern::Slice { inner, .. } => graph_pattern_contains_service(inner),
+        | GraphPattern::Slice { inner, .. } => pattern_contains_service(inner),
         GraphPattern::Extend {
             inner, expression, ..
-        } => expression_contains_service(expression) || graph_pattern_contains_service(inner),
+        } => expression_contains_service(expression) || pattern_contains_service(inner),
         GraphPattern::OrderBy { inner, expression } => {
-            graph_pattern_contains_service(inner)
+            pattern_contains_service(inner)
                 || expression.iter().any(|expression| match expression {
                     spargebra::algebra::OrderExpression::Asc(expression)
                     | spargebra::algebra::OrderExpression::Desc(expression) => {
@@ -77,7 +77,7 @@ pub(crate) fn graph_pattern_contains_service(pattern: &spargebra::algebra::Graph
         GraphPattern::Group {
             inner, aggregates, ..
         } => {
-            graph_pattern_contains_service(inner)
+            pattern_contains_service(inner)
                 || aggregates.iter().any(|(_, aggregate)| match aggregate {
                     spargebra::algebra::AggregateExpression::CountSolutions { .. } => false,
                     spargebra::algebra::AggregateExpression::FunctionCall { expr, .. } => {
@@ -92,7 +92,7 @@ fn expression_contains_service(expression: &spargebra::algebra::Expression) -> b
     use spargebra::algebra::Expression;
 
     match expression {
-        Expression::Exists(pattern) => graph_pattern_contains_service(pattern),
+        Expression::Exists(pattern) => pattern_contains_service(pattern),
         Expression::NamedNode(_)
         | Expression::Literal(_)
         | Expression::Variable(_)
@@ -131,7 +131,7 @@ fn expression_contains_service(expression: &spargebra::algebra::Expression) -> b
 /// DEFERRED (#259): this local guard bounds distributed union queries to a safe
 /// subset. The spec-correct single-evaluation captured-generation union awaits
 /// one-holder-per-bucket selection from feat/routing-placement; not built here.
-pub(super) fn distributed_query_is_union_safe(query: &str) -> bool {
+pub(super) fn query_union_safe(query: &str) -> bool {
     let Ok(parsed) = spargebra::SparqlParser::new().parse_query(query) else {
         return false;
     };
@@ -150,27 +150,25 @@ pub(super) fn distributed_query_is_union_safe(query: &str) -> bool {
             let spargebra::algebra::GraphPattern::Project { inner, .. } = *inner else {
                 return false;
             };
-            distributed_union_pattern_is_safe(&inner)
+            union_pattern_safe(&inner)
         }
         spargebra::Query::Ask { pattern, .. } => {
             let spargebra::algebra::GraphPattern::Project { inner, .. } = pattern else {
                 return false;
             };
-            distributed_union_pattern_is_safe(&inner)
+            union_pattern_safe(&inner)
         }
         _ => false,
     }
 }
 
-fn distributed_union_pattern_is_safe(pattern: &spargebra::algebra::GraphPattern) -> bool {
+fn union_pattern_safe(pattern: &spargebra::algebra::GraphPattern) -> bool {
     match pattern {
         spargebra::algebra::GraphPattern::Bgp { patterns } => patterns.len() <= 1,
         spargebra::algebra::GraphPattern::Union { left, right } => {
-            distributed_union_pattern_is_safe(left) && distributed_union_pattern_is_safe(right)
+            union_pattern_safe(left) && union_pattern_safe(right)
         }
-        spargebra::algebra::GraphPattern::Graph { inner, .. } => {
-            distributed_union_pattern_is_safe(inner)
-        }
+        spargebra::algebra::GraphPattern::Graph { inner, .. } => union_pattern_safe(inner),
         _ => false,
     }
 }
@@ -225,7 +223,7 @@ impl MetadataFanoutOperation {
     }
 }
 
-pub(super) fn metadata_fanout_node_span(
+pub(super) fn fanout_node_span(
     operation: MetadataFanoutOperation,
     node_id: NodeId,
     local: bool,
@@ -274,7 +272,7 @@ pub(super) fn metadata_fanout_node_span(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_metadata_fanout_node<T>(
+pub(super) async fn run_fanout_node<T>(
     operation: MetadataFanoutOperation,
     node_id: NodeId,
     local: bool,
@@ -284,7 +282,7 @@ pub(super) async fn run_metadata_fanout_node<T>(
     record_result: fn(&Span, &Result<T, MetadataReadError>),
     record_stage_detail: bool,
 ) -> Result<T, MetadataReadError> {
-    let node_span = metadata_fanout_node_span(operation, node_id, local);
+    let node_span = fanout_node_span(operation, node_id, local);
     let node_started = Instant::now();
     let result = if local {
         match tokio::time::timeout_at(deadline, local_call(node_id).instrument(node_span.clone()))
@@ -375,10 +373,10 @@ where
     } = scope;
     let deadline = scope_deadline
         .unwrap_or_else(|| tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE);
-    ensure_supported_query_mode(&mode);
+    ensure_query_mode(&mode);
     match mode.unwrap_or(MetadataApiQueryMode::Distributed) {
         MetadataApiQueryMode::Local => {
-            let result = run_metadata_fanout_node(
+            let result = run_fanout_node(
                 operation,
                 local_node_id,
                 true,
@@ -444,15 +442,14 @@ where
             let mut not_found = false;
             let node_order = nodes.clone();
             let mut outstanding = nodes.iter().copied().collect::<HashSet<_>>();
-            // Every interactive fanout gets the overall deadline; offline
-            // partitions land in failed_partitions and partial-tolerant
-            // callers (search) still answer from the reachable nodes.
+            // Offline partitions become failures while partial-tolerant callers still use
+            // reachable results within the shared deadline.
             let pending =
                 stream::iter(nodes.into_iter().enumerate().map(|(node_index, node_id)| {
                     let local_call = local_call.clone();
                     let remote_call = remote_call.clone();
                     async move {
-                        let result = run_metadata_fanout_node(
+                        let result = run_fanout_node(
                             operation,
                             node_id,
                             node_id == local_node_id,

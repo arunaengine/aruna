@@ -103,10 +103,8 @@ mod tests {
     use aws_sdk_s3::error::SdkError;
     use tokio::net::TcpListener;
 
-    // The AWS SDK ships no HTTPS connector unless `default-https-client` is on, and
-    // its absence only shows up at runtime. A TLS handshake against a socket that
-    // hangs up must fail while dispatching, not while constructing the request:
-    // a ConstructionFailure here means the connector was dropped from the build.
+    // The AWS SDK only ships an HTTPS connector with `default-https-client`;
+    // a ConstructionFailure here means it was dropped from the build.
     #[tokio::test]
     async fn https_connector_present() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

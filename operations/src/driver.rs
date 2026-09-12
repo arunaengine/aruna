@@ -338,7 +338,7 @@ async fn dispatch_effect_until(
                 ))
                 .await
             } else if let Some(blob_handle) = &context.blob_handle {
-                Box::pin(blob_handle.send_staging_source_effect(staging_source_effect)).await
+                Box::pin(blob_handle.send_staging_effect(staging_source_effect)).await
             } else {
                 Event::StagingSource(aruna_core::events::StagingSourceEvent::Error {
                     error: aruna_core::errors::StagingSourceError::HandleMissing,
@@ -375,7 +375,7 @@ async fn dispatch_effect_until(
                     ) => {
                         match tokio::time::timeout(
                             REALM_PEER_REFRESH_TIMEOUT,
-                            net_handle.refresh_realm_peers_from_bytes(&bytes),
+                            net_handle.refresh_encoded_peers(&bytes),
                         )
                         .await
                         {
@@ -1068,9 +1068,7 @@ pub async fn drive_until<O: Operation>(
                 expired = true;
                 cleanup_deadline = Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
                 queue.clear();
-                // A committed transaction must not be rolled back, so its abort
-                // effects stay suppressed; backend reservations are released by
-                // dropping `holds`, never by this path.
+                // Suppress aborts after commit. Dropping `holds` releases backend reservations.
                 if !committed || operation.abort_after_commit() {
                     queue.extend(operation.abort().into_iter().filter(|effect| {
                         !matches!(
@@ -1168,9 +1166,8 @@ pub async fn drive_until<O: Operation>(
         }
     }
     if !operation.is_complete() {
-        // finalize() is only defined on a terminal operation, so the deadline
-        // path takes its abort here. The cleanup window is over, so the effects
-        // are dropped and the tracker below owns any transaction they name.
+        // Nonterminal operations cannot finalize. Drop late cleanup effects and let the
+        // tracker resolve any transaction they name.
         let _ = operation.abort();
     }
     abort_leaked_transaction(
@@ -2944,7 +2941,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_driver_preserves_effect_order_fifo() {
+    async fn driver_preserves_fifo() {
         let random_path = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
@@ -3017,7 +3014,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_driver_dispatches_staging_source_effect_via_blob_handle() {
+    async fn driver_dispatches_staging() {
         let temp_dir = tempdir().unwrap();
         let temp_root = temp_dir.path().to_str().unwrap().to_string();
         let blob_root = format!("{temp_root}/blobstore");
@@ -3104,7 +3101,7 @@ mod test {
     }
 
     #[test]
-    fn test_suboperation_depth_limit_is_enforced() {
+    fn suboperation_depth_enforced() {
         // Driving to the depth limit nests deep futures; the default test
         // thread stack overflows, so the drive runs on a dedicated big stack.
         std::thread::Builder::new()

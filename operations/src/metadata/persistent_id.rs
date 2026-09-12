@@ -8,7 +8,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{METADATA_AUDIT_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE};
-use aruna_core::storage_entries::{document_sync_revision_write_entry, shard_manifest_write_entry};
+use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, PersistentIdFailure,
     PersistentIdMapping, PersistentIdRevision, PlacementRef, RealmConfigDocument, RealmId,
@@ -22,7 +22,7 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::repository::{metadata_audit_key, read_registry_by_document_effect};
+use crate::metadata::repository::{metadata_audit_key, read_document_registry};
 use crate::placement::resolve_shard_holders;
 use crate::sync::document_outbox::{
     new_outbox_record, outbox_write_entry, schedule_outbox_drain_effect,
@@ -194,7 +194,7 @@ pub async fn fail_persistent_id(
 /// Exceptional administrator-only withdrawal. Authorization is enforced at
 /// both routing hops; the transition stores the actor and required reason and
 /// writes the generic metadata audit row in the same transaction.
-pub async fn admin_withdraw_persistent_id(
+pub async fn admin_withdraw_pid(
     ctx: &DriverContext,
     realm_id: RealmId,
     document_id: Ulid,
@@ -205,7 +205,7 @@ pub async fn admin_withdraw_persistent_id(
     let route = mapping_route(ctx, realm_id, document_id).await?;
     for attempt in 0..TRANSITION_ATTEMPTS {
         let txn_id = start_transaction(ctx).await?;
-        let outcome = admin_withdraw_in_txn(
+        let outcome = admin_withdraw_txn(
             ctx,
             &route,
             document_id,
@@ -360,7 +360,7 @@ async fn mint_in_txn(
 }
 
 /// `Ok(None)` means the mapping is already terminal and the caller must abort.
-async fn admin_withdraw_in_txn(
+async fn admin_withdraw_txn(
     ctx: &DriverContext,
     route: &Option<MappingRoute>,
     document_id: Ulid,
@@ -442,12 +442,9 @@ pub fn transition_entries(
     )];
     if let Some(route) = route {
         let change = persistent_id_change(mapping, route.placement);
-        writes.push(
-            document_sync_revision_write_entry(&target, &change)
-                .map_err(PersistentIdError::Conversion)?,
-        );
+        writes.push(sync_revision_entry(&target, &change).map_err(PersistentIdError::Conversion)?);
         if let Some(entry) =
-            shard_manifest_write_entry(&target, &change).map_err(PersistentIdError::Conversion)?
+            shard_manifest_entry(&target, &change).map_err(PersistentIdError::Conversion)?
         {
             writes.push(entry);
         }
@@ -510,7 +507,7 @@ async fn registry_missing_txn(
 ) -> Result<bool, PersistentIdError> {
     match ctx
         .storage_handle
-        .send_effect(read_registry_by_document_effect(document_id, Some(txn_id)))
+        .send_effect(read_document_registry(document_id, Some(txn_id)))
         .await
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_none()),
@@ -528,7 +525,7 @@ async fn registry_in_txn(
 ) -> Result<Option<MetadataRegistryRecord>, PersistentIdError> {
     match ctx
         .storage_handle
-        .send_effect(read_registry_by_document_effect(document_id, Some(txn_id)))
+        .send_effect(read_document_registry(document_id, Some(txn_id)))
         .await
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value
@@ -648,7 +645,7 @@ async fn schedule_drain(ctx: &DriverContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::storage_entries::metadata_registry_write_entries;
+    use aruna_core::storage_entries::registry_write_entries;
     use aruna_core::structs::{
         JobId, MetadataAuditRecord, MetadataRegistryRecord, PersistentIdStatus, RealmId,
     };
@@ -705,7 +702,7 @@ mod tests {
     }
 
     async fn seed_record(ctx: &DriverContext, document_id: Ulid) {
-        let writes = metadata_registry_write_entries(&record(document_id)).unwrap();
+        let writes = registry_write_entries(&record(document_id)).unwrap();
         match ctx
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::BatchWrite {
@@ -761,7 +758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projection_absence_stays_processing() {
+    async fn absence_stays_processing() {
         let (ctx, _dir) = context();
         let id = Ulid::from_bytes([6; 16]);
         seed_intent(&ctx, id, false).await;
@@ -780,12 +777,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_withdraw_needs_record() {
+    async fn admin_withdraw_needs() {
         let (ctx, _dir) = context();
         let id = Ulid::from_bytes([12; 16]);
         seed_intent(&ctx, id, false).await;
         assert_eq!(
-            admin_withdraw_persistent_id(&ctx, realm(), id, user(), "reason".into(), 10)
+            admin_withdraw_pid(&ctx, realm(), id, user(), "reason".into(), 10)
                 .await
                 .unwrap_err(),
             PersistentIdError::DocumentMissing
@@ -797,13 +794,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_withdraw_records_reason() {
+    async fn admin_withdraw_records() {
         let (ctx, _dir) = context();
         let id = Ulid::from_bytes([7; 16]);
         seed_record(&ctx, id).await;
         seed_intent(&ctx, id, false).await;
         let (mapping, changed) =
-            admin_withdraw_persistent_id(&ctx, realm(), id, user(), "operator reason".into(), 10)
+            admin_withdraw_pid(&ctx, realm(), id, user(), "operator reason".into(), 10)
                 .await
                 .unwrap();
         assert!(changed);
@@ -839,7 +836,7 @@ mod tests {
         );
 
         let (again, changed_again) =
-            admin_withdraw_persistent_id(&ctx, realm(), id, user(), "another reason".into(), 20)
+            admin_withdraw_pid(&ctx, realm(), id, user(), "another reason".into(), 20)
                 .await
                 .unwrap();
         assert!(!changed_again);
@@ -852,7 +849,7 @@ mod tests {
         let id = Ulid::from_bytes([8; 16]);
         seed_record(&ctx, id).await;
         seed_intent(&ctx, id, false).await;
-        admin_withdraw_persistent_id(&ctx, realm(), id, user(), "reason".into(), 5)
+        admin_withdraw_pid(&ctx, realm(), id, user(), "reason".into(), 5)
             .await
             .unwrap();
 
@@ -878,7 +875,7 @@ mod tests {
             mint_persistent_id(&ctx, realm(), id, user(), 1)
                 .await
                 .unwrap();
-            admin_withdraw_persistent_id(&ctx, realm(), id, user(), "reason".into(), 4)
+            admin_withdraw_pid(&ctx, realm(), id, user(), "reason".into(), 4)
                 .await
                 .unwrap();
         }
@@ -904,10 +901,9 @@ mod tests {
             .await
             .unwrap();
 
-        let (mapping, changed) =
-            admin_withdraw_persistent_id(&ctx, realm(), id, user(), "reason".into(), 10)
-                .await
-                .unwrap();
+        let (mapping, changed) = admin_withdraw_pid(&ctx, realm(), id, user(), "reason".into(), 10)
+            .await
+            .unwrap();
         assert!(changed);
         assert_eq!(mapping.status, PersistentIdStatus::AdminWithdrawn);
         assert_eq!(mapping.minted_at_ms, Some(1));
@@ -948,9 +944,9 @@ mod tests {
         use aruna_core::StructuredId;
         let document_id = aruna_core::MetaResourceId::from_parts(
             13,
-            aruna_core::identifiers::PlacementHandle::new(aruna_core::structs::METADATA_HANDLE)
+            aruna_core::structured_id::PlacementHandle::new(aruna_core::structs::METADATA_HANDLE)
                 .unwrap(),
-            aruna_core::identifiers::BucketId::new(3).unwrap(),
+            aruna_core::structured_id::BucketId::new(3).unwrap(),
             13,
         )
         .expect("the structured id builds")

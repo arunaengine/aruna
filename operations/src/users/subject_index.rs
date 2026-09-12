@@ -2,7 +2,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::storage_entries::{stale_subject_index_deletes, subject_index_writes};
+use aruna_core::storage_entries::{stale_subject_deletes, subject_index_writes};
 use aruna_core::structs::{Actor, User};
 use aruna_core::types::{Effects, TxnId, UserId};
 use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
@@ -102,7 +102,7 @@ impl ResolveUserSubjectConflictsOperation {
         smallvec![]
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn fail_storage(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -135,10 +135,10 @@ impl ResolveUserSubjectConflictsOperation {
             .collect();
         self.current_user = Some(current_user);
         self.previous_user = previous_user;
-        self.emit_next_read_or_resolution()
+        self.advance_resolution()
     }
 
-    fn emit_next_read_or_resolution(
+    fn advance_resolution(
         &mut self,
     ) -> Result<Effects, ResolveUserSubjectConflictsError> {
         if let Some(subject) = self.subject_queue.pop_front() {
@@ -161,17 +161,17 @@ impl ResolveUserSubjectConflictsOperation {
             })]);
         }
 
-        self.emit_write_canonical_user()
+        self.write_canonical()
     }
 
-    fn handle_read_subject_index(&mut self, event: Event) -> Effects {
+    fn accept_subject(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::ReadResult)", got);
         };
 
         if let Some(value) = value {
-            let indexed_user_id = match parse_index_user_id(&value) {
+            let indexed_user_id = match parse_index_user(&value) {
                 Ok(user_id) => user_id,
                 Err(error) => return self.fail(error.into()),
             };
@@ -187,13 +187,13 @@ impl ResolveUserSubjectConflictsOperation {
             }
         }
 
-        match self.emit_next_read_or_resolution() {
+        match self.advance_resolution() {
             Ok(effects) => effects,
             Err(error) => self.fail(error),
         }
     }
 
-    fn handle_read_conflicting_user(&mut self, event: Event, user_id: UserId) -> Effects {
+    fn accept_conflict(&mut self, event: Event, user_id: UserId) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::ReadResult)", got);
@@ -210,13 +210,13 @@ impl ResolveUserSubjectConflictsOperation {
             }
         }
 
-        match self.emit_next_read_or_resolution() {
+        match self.advance_resolution() {
             Ok(effects) => effects,
             Err(error) => self.fail(error),
         }
     }
 
-    fn emit_write_canonical_user(&mut self) -> Result<Effects, ResolveUserSubjectConflictsError> {
+    fn write_canonical(&mut self) -> Result<Effects, ResolveUserSubjectConflictsError> {
         let plan = self.build_resolution()?;
         self.pending_deletes = plan.deletes;
         self.pending_writes = plan.writes;
@@ -284,7 +284,7 @@ impl ResolveUserSubjectConflictsOperation {
                 ByteView::from(loser_user_id.to_bytes()),
             ));
         }
-        deletes.extend(stale_subject_index_deletes(
+        deletes.extend(stale_subject_deletes(
             self.previous_user.as_ref(),
             Some(&canonical_user),
         ));
@@ -299,15 +299,15 @@ impl ResolveUserSubjectConflictsOperation {
         })
     }
 
-    fn handle_write_canonical_user(&mut self, event: Event) -> Effects {
+    fn accept_canonical_write(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::WriteResult)", got);
         };
-        self.emit_delete_or_write_subject_indexes()
+        self.sync_subjects()
     }
 
-    fn emit_delete_or_write_subject_indexes(&mut self) -> Effects {
+    fn sync_subjects(&mut self) -> Effects {
         if !self.pending_deletes.is_empty() {
             self.state = ResolveUserSubjectConflictsState::DeleteStaleEntries;
             return smallvec![Effect::Storage(StorageEffect::BatchDelete {
@@ -315,18 +315,18 @@ impl ResolveUserSubjectConflictsOperation {
                 txn_id: Some(self.input.txn_id),
             })];
         }
-        self.emit_write_subject_indexes()
+        self.write_subjects()
     }
 
-    fn handle_delete_stale_entries(&mut self, event: Event) -> Effects {
+    fn accept_stale_delete(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchDeleteResult)", got);
         };
-        self.emit_write_subject_indexes()
+        self.write_subjects()
     }
 
-    fn emit_write_subject_indexes(&mut self) -> Effects {
+    fn write_subjects(&mut self) -> Effects {
         if self.pending_writes.is_empty() {
             self.state = ResolveUserSubjectConflictsState::Finish;
             self.output = Some(Ok(()));
@@ -340,7 +340,7 @@ impl ResolveUserSubjectConflictsOperation {
         })]
     }
 
-    fn handle_write_subject_indexes(&mut self, event: Event) -> Effects {
+    fn accept_subject_write(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchWriteResult)", got);
@@ -363,26 +363,26 @@ impl Operation for ResolveUserSubjectConflictsOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.fail_storage(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
 
         match self.state.clone() {
             ResolveUserSubjectConflictsState::ReadSubjectIndex { .. } => {
-                self.handle_read_subject_index(event)
+                self.accept_subject(event)
             }
             ResolveUserSubjectConflictsState::ReadConflictingUser { user_id } => {
-                self.handle_read_conflicting_user(event, user_id)
+                self.accept_conflict(event, user_id)
             }
             ResolveUserSubjectConflictsState::WriteCanonicalUser => {
-                self.handle_write_canonical_user(event)
+                self.accept_canonical_write(event)
             }
             ResolveUserSubjectConflictsState::DeleteStaleEntries => {
-                self.handle_delete_stale_entries(event)
+                self.accept_stale_delete(event)
             }
             ResolveUserSubjectConflictsState::WriteSubjectIndexes => {
-                self.handle_write_subject_indexes(event)
+                self.accept_subject_write(event)
             }
             ResolveUserSubjectConflictsState::Init
             | ResolveUserSubjectConflictsState::Finish
@@ -407,16 +407,16 @@ impl Operation for ResolveUserSubjectConflictsOperation {
     }
 }
 
-fn parse_index_user_id(value: &[u8]) -> Result<UserId, ConversionError> {
+fn parse_index_user(value: &[u8]) -> Result<UserId, ConversionError> {
     UserId::from_storage_key(value)
 }
 
-pub fn rewrite_subject_index_effects(
+pub fn rewrite_subjects(
     previous: Option<&User>,
     current: &User,
     txn_id: TxnId,
 ) -> Result<Effects, ConversionError> {
-    let deletes = stale_subject_index_deletes(previous, Some(current));
+    let deletes = stale_subject_deletes(previous, Some(current));
     let writes = subject_index_writes(current);
 
     let mut effects = smallvec![];
@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_writes_user_and_subject_index_without_conflict() {
+    fn resolves_without_conflict() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
         let subject = oidc_subject_key("https://issuer.example", "subject-1").unwrap();
@@ -528,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_merges_conflicting_subject_into_lowest_user_id() {
+    fn merges_subject_conflict() {
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let winner_id = UserId::local(Ulid::from_bytes([1u8; 16]), realm_id);
         let loser_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);

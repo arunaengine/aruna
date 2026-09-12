@@ -136,7 +136,7 @@ async fn resolves_session_alias() {
     assert_eq!(record.job_id, spec.job_id);
     assert_eq!(record.owner_node_id, family.target.public());
     assert_eq!(physical, Some(receipt.physical_job_id));
-    let now = aruna_core::util::unix_timestamp_millis();
+    let now = aruna_core::time::unix_timestamp_millis();
     let mut physical = aruna_core::structs::JobRecord::new(
         receipt.physical_job_id,
         aruna_core::structs::JobPayload::Execution(spec.payload.clone()),

@@ -120,10 +120,9 @@ pub struct HarvestSelector {
     pub metadata_prefix: Option<String>,
 }
 
-/// Datestamp precision an OAI-PMH repository advertises through `Identify`.
-/// A day-granularity repository answers `badArgument` to a second-granularity
-/// `from`, so a discovered value is persisted and every later window is
-/// formatted at exactly that precision.
+/// Datestamp precision an OAI-PMH repository advertises through `Identify`. A day-granularity
+/// repository answers `badArgument` to a second-granularity `from`, so a discovered value is persisted
+/// and every later window is formatted at exactly that precision.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum HarvestGranularity {
     /// `YYYY-MM-DD`, the OAI-PMH baseline every repository must support.
@@ -224,10 +223,9 @@ impl HarvestSource {
     }
 }
 
-/// How far the current identity of a harvested source record has progressed.
-/// The mapping row is retained in every state so an id is never reused for a
-/// different source record. Variants are independent, so a policy state such as
-/// a permanent absence marker composes as a sibling.
+/// How far the current identity of a harvested source record has progressed. The mapping row is
+/// retained in every state so an id is never reused for a different source record. Variants are
+/// independent, so a policy state such as a permanent absence marker composes as a sibling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum HarvestRecordState {
     /// Identity allocated and durably recorded, create not yet confirmed. A
@@ -237,13 +235,8 @@ pub enum HarvestRecordState {
     Tombstoned,
 }
 
-/// Binds one upstream source record to the metadata document currently minted
-/// for it.
-///
-/// `(group_id, namespace, source_record_id) -> meta_resource_id` is fixed for
-/// the lifetime of one identity. A tombstoned document can never be recreated
-/// under its old id, so a revival allocates a new identity and pushes the old
-/// one onto `predecessors`; ids are retired, never reused.
+/// Permanently binds one upstream record identity to its current metadata document.
+/// Revival allocates a new ID and records the tombstoned predecessor; IDs are never reused.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HarvestProvenance {
     pub group_id: GroupId,
@@ -268,10 +261,9 @@ impl HarvestProvenance {
     }
 }
 
-/// The provenance keyspace key is
-/// `group_id || len(namespace) || namespace || record_id`, so a group's records
-/// scan together, two groups naming the same source never share a row, and the
-/// two string fields cannot be confused across a boundary.
+/// The provenance keyspace key is `group_id || len(namespace) || namespace || record_id`, so a group's
+/// records scan together, two groups naming the same source never share a row, and the two string
+/// fields cannot be confused across a boundary.
 pub fn harvest_provenance_prefix(group_id: GroupId, namespace: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(20 + namespace.len());
     key.extend_from_slice(&group_id.to_bytes());
@@ -317,12 +309,8 @@ pub enum ProvenanceDecision {
     Skip,
 }
 
-/// Idempotent, wall-clock-free decision for one harvested record. A deletion at
-/// or below the applied datestamp is skipped, so replays and out-of-order old
-/// deletions never withdraw a newer document.
-///
-/// An unresolved `PendingCreate` outranks the staleness test: a replay of the
-/// exact record that crashed mid-create must converge on the persisted id.
+/// Wall-clock-free harvest decision: stale deletions cannot withdraw newer documents.
+/// An unresolved `PendingCreate` wins so replay after a mid-create crash reuses its persisted ID.
 pub fn provenance_decision(
     existing: Option<&HarvestProvenance>,
     incoming: &IncomingRecord,

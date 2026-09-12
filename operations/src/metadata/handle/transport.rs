@@ -1,4 +1,32 @@
-use super::*;
+use std::sync::Arc;
+use std::time::{Instant, SystemTime};
+
+use aruna_core::NodeId;
+use aruna_core::alpn::Alpn;
+use aruna_core::metadata::{MetadataError, MetadataQueryResults, MetadataSearchHit};
+use aruna_core::structs::SyncRelationship;
+use aruna_core::telemetry::record_elapsed_ms;
+use aruna_core::types::GroupId;
+use aruna_net::NetHandle;
+use aruna_net::streams::{BiStream, RecvStream};
+use tokio::io::AsyncRead;
+use tokio::time::{timeout, timeout_at};
+use tracing::{Span, field};
+use ulid::Ulid;
+
+use super::effects::{record_error, record_query_counts};
+use super::{
+    METADATA_CHUNK_SIZE, METADATA_ENVELOPE_BYTES, METADATA_IO_TIMEOUT, MetadataHandle,
+    MetadataInner, SYNC_MIRROR_REQUEST_TIMEOUT,
+};
+use crate::auth::request_policy::PolicyRequestExtras;
+use crate::metadata::protocol::{
+    MetadataAuthToken, MetadataReadError, MetadataTransportMessage, encode_message, frame_class,
+    read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
+    write_message,
+};
+use crate::s3::search_buckets::BucketSearchHit;
+use crate::s3::search_objects::{ObjectKeyMatch, ObjectSearchNodePage};
 
 #[tracing::instrument(
     name = "metadata.remote.request",
@@ -41,7 +69,7 @@ pub(super) async fn send_request(
     record_elapsed_ms(&span, "open_stream_ms", open_started);
 
     let write_started = Instant::now();
-    write_encoded_transport_message(&mut stream, frame_class(&message), &bytes)
+    write_framed_message(&mut stream, frame_class(&message), &bytes)
         .await
         .map_err(MetadataRequestError::possibly_sent)?;
     record_elapsed_ms(&span, "write_ms", write_started);
@@ -101,7 +129,7 @@ pub(super) async fn send_export_request(
     .map_err(|_| MetadataError::Backend("timed out opening metadata stream".to_string()))
     .and_then(|result| result.map_err(|error| MetadataError::Backend(error.to_string())))
     .map_err(MetadataRequestError::definitely_not_sent)?;
-    write_encoded_transport_message(&mut stream, frame_class(&message), &bytes)
+    write_framed_message(&mut stream, frame_class(&message), &bytes)
         .await
         .map_err(MetadataRequestError::possibly_sent)?;
     stream
@@ -152,7 +180,7 @@ pub(super) async fn write_transport_message(
         .map_err(MetadataError::Backend)
 }
 
-async fn write_encoded_transport_message(
+async fn write_framed_message(
     stream: &mut BiStream,
     class: u8,
     bytes: &[u8],
@@ -315,4 +343,536 @@ pub(super) async fn drain_request_stream(stream: &mut BiStream) -> Result<(), Me
         })?
         .map(|_| ())
         .map_err(|error| MetadataError::Backend(error.to_string()))
+}
+
+impl MetadataHandle {
+    #[tracing::instrument(
+        name = "metadata.forward.remote",
+        level = "debug",
+        skip(self, message),
+        fields(
+            peer = ?node_id,
+            request = transport_message_kind(&message),
+            elapsed_ms = field::Empty,
+        )
+    )]
+    pub(crate) async fn request_forwarded_write(
+        &self,
+        node_id: NodeId,
+        message: MetadataTransportMessage,
+    ) -> Result<MetadataTransportMessage, MetadataRequestError> {
+        let started = Instant::now();
+        let span = Span::current();
+        let result = send_remote_request(&self.inner, &span, node_id, message).await;
+        record_elapsed_ms(&span, "elapsed_ms", started);
+        if let Err(error) = &result {
+            record_error(&span, &error.to_string());
+        }
+        result
+    }
+}
+
+async fn send_remote_request(
+    inner: &MetadataInner,
+    span: &Span,
+    node_id: NodeId,
+    message: MetadataTransportMessage,
+) -> Result<MetadataTransportMessage, MetadataRequestError> {
+    let Some(net_handle) = inner.net_handle.clone() else {
+        record_error(span, "metadata net handle missing");
+        return Err(MetadataRequestError::definitely_not_sent(
+            MetadataError::HandleMissing,
+        ));
+    };
+
+    send_request(&net_handle, node_id, message).await
+}
+
+pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'static str {
+    match message {
+        MetadataTransportMessage::QueryGraphs { .. } => "query_graphs",
+        MetadataTransportMessage::QueryResults { .. } => "query_results",
+        MetadataTransportMessage::SearchGraphs { .. } => "search_graphs",
+        MetadataTransportMessage::FilteredSearchGraphs { .. } => "filtered_search_graphs",
+        MetadataTransportMessage::SearchResults { .. } => "search_results",
+        MetadataTransportMessage::SearchBuckets { .. } => "search_buckets",
+        MetadataTransportMessage::BucketSearchResults { .. } => "bucket_search_results",
+        MetadataTransportMessage::SearchObjects { .. } => "search_objects",
+        MetadataTransportMessage::ObjectSearchResults { .. } => "object_search_results",
+        MetadataTransportMessage::CreateSyncMirror { .. } => "create_sync_mirror",
+        MetadataTransportMessage::DeleteSyncMirror { .. } => "delete_sync_mirror",
+        MetadataTransportMessage::SyncMirrorCreated => "sync_mirror_created",
+        MetadataTransportMessage::SyncMirrorDeleted => "sync_mirror_deleted",
+        MetadataTransportMessage::ForwardCreateDocument { .. } => "forward_create_document",
+        MetadataTransportMessage::ForwardUpdateDocument { .. } => "forward_update_document",
+        MetadataTransportMessage::ForwardDeleteDocument { .. } => "forward_delete_document",
+        MetadataTransportMessage::ForwardReadDocument { .. } => "forward_read_document",
+        MetadataTransportMessage::ForwardedRecord { .. } => "forwarded_record",
+        MetadataTransportMessage::ForwardedRead { .. } => "forwarded_read",
+        MetadataTransportMessage::ForwardPathLookup { .. } => "forward_path_lookup",
+        MetadataTransportMessage::ForwardedPathLookup { .. } => "forwarded_path_lookup",
+        MetadataTransportMessage::ForwardPathResolution { .. } => "forward_path_resolution",
+        MetadataTransportMessage::ForwardedPathResolution { .. } => "forwarded_path_resolution",
+        MetadataTransportMessage::ForwardedWriteDenied { .. } => "forwarded_write_denied",
+        MetadataTransportMessage::ForwardedWriteNotFound => "forwarded_write_not_found",
+        MetadataTransportMessage::ForwardedWriteUnavailable => "forwarded_write_unavailable",
+        MetadataTransportMessage::ForwardedDelete => "forwarded_delete",
+        MetadataTransportMessage::ForwardExportDocument { .. } => "forward_export_document",
+        MetadataTransportMessage::ForwardExportProfile { .. } => "forward_export_profile",
+        MetadataTransportMessage::ForwardedExport { .. } => "forwarded_export",
+        MetadataTransportMessage::QueryDocument { .. } => "query_document",
+        MetadataTransportMessage::DocumentQueryResults { .. } => "document_query_results",
+        MetadataTransportMessage::Reject(_) => "reject",
+        MetadataTransportMessage::ForwardedUpdateInvalidInput { .. } => {
+            "forwarded_update_invalid_input"
+        }
+        MetadataTransportMessage::ForwardAuditPage { .. } => "forward_audit_page",
+        MetadataTransportMessage::ForwardedAuditPage { .. } => "forwarded_audit_page",
+        MetadataTransportMessage::ForwardTokenRevocation { .. } => "forward_token_revocation",
+        MetadataTransportMessage::ForwardedTokenRevoked => "forwarded_token_revoked",
+        MetadataTransportMessage::ForwardedTokenRevocationCapacity => {
+            "forwarded_token_revocation_capacity"
+        }
+        MetadataTransportMessage::ForwardedMetadataHistoryCapacity => {
+            "forwarded_metadata_history_capacity"
+        }
+        MetadataTransportMessage::ForwardPersistentId { .. } => "forward_persistent_id",
+        MetadataTransportMessage::ForwardedPersistentId { .. } => "forwarded_persistent_id",
+        MetadataTransportMessage::ForwardPlacementPolicy { .. } => "forward_placement_policy",
+        MetadataTransportMessage::ForwardedPlacementPolicy { .. } => "forwarded_placement_policy",
+        MetadataTransportMessage::ForwardCreatePlacementPolicy { .. } => {
+            "forward_create_placement_policy"
+        }
+        MetadataTransportMessage::ForwardedPlacementPolicyCreated { .. } => {
+            "forwarded_placement_policy_created"
+        }
+        MetadataTransportMessage::ForwardJobRecord { .. } => "forward_job_record",
+        MetadataTransportMessage::ForwardedJobRecord { .. } => "forwarded_job_record",
+        MetadataTransportMessage::ForwardJobRecordPage { .. } => "forward_job_record_page",
+        MetadataTransportMessage::ForwardedJobRecordPage { .. } => "forwarded_job_record_page",
+        MetadataTransportMessage::ForwardLaunchOffer { .. } => "forward_launch_offer",
+        MetadataTransportMessage::ForwardedLaunchOffer { .. } => "forwarded_launch_offer",
+        MetadataTransportMessage::ForwardJobSubmission { .. } => "forward_job_submission",
+        MetadataTransportMessage::ForwardedJobSubmission { .. } => "forwarded_job_submission",
+        MetadataTransportMessage::ForwardedProfileValidation { .. } => {
+            "forwarded_profile_validation"
+        }
+        MetadataTransportMessage::ForwardProfileValidationStatus { .. } => {
+            "forward_profile_validation_status"
+        }
+        MetadataTransportMessage::ForwardedProfileValidationStatus { .. } => {
+            "forwarded_profile_validation_status"
+        }
+        MetadataTransportMessage::ReferencePreflight { .. } => "reference_preflight",
+        MetadataTransportMessage::ReferencePreflightResults { .. } => "reference_preflight_results",
+        MetadataTransportMessage::ForwardAdminEvent { .. } => "forward_admin_event",
+        MetadataTransportMessage::ForwardedAdminEventQueued => "forwarded_admin_event_queued",
+        MetadataTransportMessage::ForwardGroupCreate { .. } => "forward_group_create",
+        MetadataTransportMessage::ForwardedGroupCreated { .. } => "forwarded_group_created",
+        MetadataTransportMessage::ForwardSyncPull { .. } => "forward_sync_pull",
+        MetadataTransportMessage::ForwardedSyncPull { .. } => "forwarded_sync_pull",
+        MetadataTransportMessage::ForwardListVersions { .. } => "forward_list_versions",
+        MetadataTransportMessage::ForwardedVersions { .. } => "forwarded_versions",
+        MetadataTransportMessage::ForwardCreateBucket { .. } => "forward_create_bucket",
+        MetadataTransportMessage::ForwardedBucketCreated { .. } => "forwarded_bucket_created",
+        MetadataTransportMessage::FetchRealmDocuments { .. } => "fetch_realm_documents",
+        MetadataTransportMessage::FetchedRealmDocuments { .. } => "fetched_realm_documents",
+        MetadataTransportMessage::FetchGraphState { .. } => "fetch_graph_state",
+        MetadataTransportMessage::FetchedGraphState { .. } => "fetched_graph_state",
+        MetadataTransportMessage::ForwardApplyBatch { .. } => "forward_apply_batch",
+        MetadataTransportMessage::ForwardedApplyBatch { .. } => "forwarded_apply_batch",
+        MetadataTransportMessage::ForwardedGroupCreateConflict { .. } => {
+            "forwarded_group_create_conflict"
+        }
+    }
+}
+
+impl MetadataHandle {
+    pub(crate) async fn request_export(
+        &self,
+        node_id: NodeId,
+        message: MetadataTransportMessage,
+    ) -> Result<
+        Result<super::super::api::ExportMetadataRoCrateResult, MetadataReadError>,
+        MetadataRequestError,
+    > {
+        send_export_request(&self.inner, node_id, message).await
+    }
+
+    #[tracing::instrument(
+        name = "metadata.query.remote",
+        level = "debug",
+        skip(self, auth_token, sparql),
+        fields(
+            peer = ?node_id,
+            query_len = sparql.len() as u64,
+            graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
+            elapsed_ms = field::Empty,
+            result = field::Empty,
+            row_count = field::Empty,
+            triple_count = field::Empty,
+        )
+        )]
+    pub async fn query_remote_graphs(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        graph_iris: Option<Vec<String>>,
+        sparql: String,
+    ) -> Result<MetadataQueryResults, MetadataReadError> {
+        let started = Instant::now();
+        let span = Span::current();
+        let result = match send_remote_request(
+            &self.inner,
+            &span,
+            node_id,
+            MetadataTransportMessage::QueryGraphs {
+                auth_token,
+                graph_iris,
+                sparql,
+            },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::QueryResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        };
+        record_elapsed_ms(&span, "elapsed_ms", started);
+        match &result {
+            Ok(results) => {
+                span.record("result", results.kind());
+                record_query_counts(&span, results);
+            }
+            Err(error) => record_error(&span, &format!("{error:?}")),
+        }
+        result
+    }
+
+    pub(crate) async fn request_document_query(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        config_digest: [u8; 32],
+        document_id: Ulid,
+        sparql: String,
+    ) -> Result<MetadataQueryResults, MetadataReadError> {
+        match send_remote_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::QueryDocument {
+                auth_token,
+                config_digest,
+                document_id,
+                sparql,
+            },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::DocumentQueryResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    #[tracing::instrument(
+        name = "metadata.search.remote",
+        level = "debug",
+        skip(self, auth_token, query),
+        fields(
+            peer = ?node_id,
+            query_len = query.len() as u64,
+            limit = limit as u64,
+            graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
+            elapsed_ms = field::Empty,
+            result = field::Empty,
+            hit_count = field::Empty,
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_remote_graphs(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        graph_iris: Option<Vec<String>>,
+        query: String,
+        limit: usize,
+        group_id: Option<GroupId>,
+    ) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
+        self.search_remote(
+            node_id, auth_token, graph_iris, query, limit, group_id, None,
+        )
+        .await
+    }
+
+    #[tracing::instrument(
+        name = "metadata.bucket_search.remote",
+        level = "debug",
+        skip(self, auth_token, query),
+        fields(
+            peer = ?node_id,
+            query_len = query.len() as u64,
+            limit = limit as u64,
+            elapsed_ms = field::Empty,
+            result = field::Empty,
+            hit_count = field::Empty,
+        )
+    )]
+    pub async fn request_bucket_search(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        query: String,
+        limit: usize,
+    ) -> Result<Vec<BucketSearchHit>, MetadataReadError> {
+        let started = Instant::now();
+        let span = Span::current();
+        let result = match send_remote_request(
+            &self.inner,
+            &span,
+            node_id,
+            MetadataTransportMessage::SearchBuckets {
+                auth_token,
+                query,
+                limit,
+            },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::BucketSearchResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        };
+        record_elapsed_ms(&span, "elapsed_ms", started);
+        match &result {
+            Ok(hits) => {
+                span.record("result", "ok");
+                span.record("hit_count", hits.len() as u64);
+            }
+            Err(error) => record_error(&span, &format!("{error:?}")),
+        }
+        result
+    }
+
+    #[tracing::instrument(
+        name = "metadata.object_search.remote",
+        level = "debug",
+        skip(self, auth_token, query, start_after),
+        fields(
+            peer = ?node_id,
+            query_len = query.len() as u64,
+            limit = limit as u64,
+            elapsed_ms = field::Empty,
+            result = field::Empty,
+            hit_count = field::Empty,
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_object_search(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        query: String,
+        key_match: ObjectKeyMatch,
+        bucket: Option<String>,
+        limit: usize,
+        start_after: Option<Vec<u8>>,
+        as_of: SystemTime,
+    ) -> Result<ObjectSearchNodePage, MetadataReadError> {
+        let started = Instant::now();
+        let span = Span::current();
+        let result = match send_remote_request(
+            &self.inner,
+            &span,
+            node_id,
+            MetadataTransportMessage::SearchObjects {
+                auth_token,
+                query,
+                key_match,
+                bucket,
+                limit,
+                start_after,
+                as_of,
+            },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::ObjectSearchResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        };
+        record_elapsed_ms(&span, "elapsed_ms", started);
+        match &result {
+            Ok(page) => {
+                span.record("result", "ok");
+                span.record("hit_count", page.hits.len() as u64);
+            }
+            Err(error) => record_error(&span, &format!("{error:?}")),
+        }
+        result
+    }
+
+    pub async fn request_sync_create(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        source_group_id: GroupId,
+        relationship: SyncRelationship,
+        extras: PolicyRequestExtras,
+    ) -> Result<(), MetadataError> {
+        match with_sync_timeout(send_remote_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::CreateSyncMirror {
+                auth_token,
+                source_group_id,
+                relationship: Box::new(relationship),
+                extras,
+            },
+        ))
+        .await?
+        {
+            MetadataTransportMessage::SyncMirrorCreated => Ok(()),
+            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
+            other => Err(MetadataError::Backend(format!(
+                "unexpected sync mirror response: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn request_sync_delete(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        relationship: SyncRelationship,
+        extras: PolicyRequestExtras,
+    ) -> Result<(), MetadataError> {
+        match with_sync_timeout(send_remote_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::DeleteSyncMirror {
+                auth_token,
+                relationship: Box::new(relationship),
+                extras,
+            },
+        ))
+        .await?
+        {
+            MetadataTransportMessage::SyncMirrorDeleted => Ok(()),
+            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
+            other => Err(MetadataError::Backend(format!(
+                "unexpected sync mirror response: {other:?}"
+            ))),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_remote_filtered(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        graph_iris: Option<Vec<String>>,
+        query: String,
+        limit: usize,
+        predicate_iri: String,
+        object_iri: String,
+        group_id: Option<GroupId>,
+    ) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
+        self.search_remote(
+            node_id,
+            auth_token,
+            graph_iris,
+            query,
+            limit,
+            group_id,
+            Some((predicate_iri, object_iri)),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn search_remote(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        graph_iris: Option<Vec<String>>,
+        query: String,
+        limit: usize,
+        group_id: Option<GroupId>,
+        iri_filter: Option<(String, String)>,
+    ) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
+        let started = Instant::now();
+        let span = Span::current();
+        let message = match iri_filter {
+            Some((predicate_iri, object_iri)) => MetadataTransportMessage::FilteredSearchGraphs {
+                auth_token,
+                graph_iris,
+                query,
+                limit,
+                predicate_iri,
+                object_iri,
+                group_id,
+            },
+            None => MetadataTransportMessage::SearchGraphs {
+                auth_token,
+                graph_iris,
+                query,
+                limit,
+                group_id,
+            },
+        };
+        let result = match send_remote_request(&self.inner, &span, node_id, message)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::SearchResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        };
+        record_elapsed_ms(&span, "elapsed_ms", started);
+        match &result {
+            Ok(hits) => {
+                span.record("result", "ok");
+                span.record("hit_count", hits.len() as u64);
+            }
+            Err(error) => record_error(&span, &format!("{error:?}")),
+        }
+        result
+    }
+
+    pub async fn request_remote_preflight(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        request: super::super::api::MetadataReferencePreflightNodeRequest,
+    ) -> Result<super::super::api::MetadataReferencePreflightNodeExecution, MetadataReadError> {
+        match send_remote_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::ReferencePreflight {
+                auth_token,
+                request: Box::new(request),
+            },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::ReferencePreflightResults { result } => {
+                result.map(|result| *result)
+            }
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+}
+
+pub(super) async fn with_sync_timeout<T>(
+    request: impl std::future::Future<Output = Result<T, MetadataRequestError>>,
+) -> Result<T, MetadataError> {
+    timeout(SYNC_MIRROR_REQUEST_TIMEOUT, request)
+        .await
+        .map_err(|_| MetadataError::Backend("sync mirror request timed out".to_string()))?
+        .map_err(MetadataRequestError::into_metadata_error)
 }

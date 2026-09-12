@@ -88,8 +88,8 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
     for index in 0..CONCURRENT_CREATES {
         let context = context.clone();
         handles.push(tokio::spawn(async move {
-            let operation = CreateMetadataDocumentOperation::new_for_generated_document_id(
-                CreateMetadataDocumentConfig {
+            let operation =
+                CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
                     actor: Actor {
                         node_id,
                         user_id: UserId::local(Ulid::generate(), realm_id),
@@ -101,8 +101,7 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
                     document_path: format!("datasets/concurrent-{index}"),
                     public: true,
                     payload: scaffold(index),
-                },
-            );
+                });
             create_metadata_document(operation, context).await
         }));
     }

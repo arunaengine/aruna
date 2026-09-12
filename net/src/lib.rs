@@ -5,9 +5,9 @@
 mod connection_pool;
 pub mod device_limits;
 pub mod dht;
+pub mod document_sync;
 mod effect_handlers;
 pub mod error;
-pub mod irokle;
 pub mod streams;
 mod telemetry;
 #[cfg(test)]
@@ -36,10 +36,10 @@ use aruna_core::structs::{
     ConnectionAddressState, ConnectionAddressStatus, ConnectionMonitorState, NetState,
     NetworkDiagnosticsState, PeerConnectionState, PeerConnectionStatus, PlacementRef,
     ProtocolConnectionState, RealmConfigDocument, RealmEndpointAnnouncement, RealmId,
-    WatchInterestEntry, WatchInterestTable, realm_endpoint_announcement_signing_bytes,
+    WatchInterestEntry, WatchInterestTable, endpoint_signing_bytes,
 };
+use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::UserId;
-use aruna_core::util::unix_timestamp_secs;
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use async_trait::async_trait;
 use crossfire::TrySendError;
@@ -58,8 +58,8 @@ use ulid::Ulid;
 pub use ::irokle::net::IrohRuntimeConfig;
 pub use connection_pool::{Monitor, PoolCounts};
 pub use dht::DhtHandle;
+pub use document_sync::{DocumentSyncService, PendingEviction, ShardGenesisProbe};
 pub use error::{NetError, Result};
-pub use irokle::{DocumentSyncService, PendingEviction, ShardGenesisProbe};
 
 const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
 const MAX_INBOUND_APP_STREAM_HANDLERS: usize = 1024;
@@ -217,7 +217,7 @@ fn unique_relay_urls(relays: Vec<String>) -> Vec<String> {
     unique
 }
 
-pub fn endpoint_addr_to_config_string(endpoint_addr: &EndpointAddr) -> String {
+pub fn format_endpoint_config(endpoint_addr: &EndpointAddr) -> String {
     let mut parts = Vec::with_capacity(endpoint_addr.addrs.len() + 1);
     parts.push(endpoint_addr.id.to_string());
     parts.extend(endpoint_addr.addrs.iter().map(|addr| match addr {
@@ -228,7 +228,7 @@ pub fn endpoint_addr_to_config_string(endpoint_addr: &EndpointAddr) -> String {
     parts.join(";")
 }
 
-pub fn endpoint_addr_from_config_string(value: &str) -> std::result::Result<EndpointAddr, String> {
+pub fn parse_endpoint_config(value: &str) -> std::result::Result<EndpointAddr, String> {
     let mut parts = value
         .split(';')
         .map(str::trim)
@@ -363,11 +363,9 @@ enum PeerConnectivityEvent {
 pub trait InboundEventHandler: Send + Sync {
     async fn handle_incoming_stream(&self, alpn: Alpn, stream: streams::BiStream, node_id: NodeId);
 
-    /// Re-emits the documents recovered from a genesis tie-break eviction: the
-    /// loser's own payloads, decoded from the reset chain, to be replayed onto
-    /// the winning genesis via durable operations outbox records. Returns
-    /// whether every replacement record is committed; anything else keeps the
-    /// journal entry for a later attempt.
+    /// Re-emits documents recovered from a genesis tie-break eviction: the loser's
+    /// payloads replayed onto the winning genesis via durable outbox records.
+    /// Returns whether every replacement committed; otherwise the journal stays.
     async fn handle_evicted_documents(&self, _documents: Vec<DocumentSyncEvictedDocument>) -> bool {
         false
     }
@@ -376,7 +374,7 @@ pub trait InboundEventHandler: Send + Sync {
 /// Hands journalled evictions to the registered handler and releases only the
 /// entries whose replacement records are durable. Everything else stays pending,
 /// so a missing handler, a failed write, or a shutdown loses nothing.
-async fn flush_pending_evicted_documents(
+async fn flush_evicted_documents(
     inbound_handler: &Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
     document_sync: &Arc<DocumentSyncService>,
     pending: &mut Vec<PendingEviction>,
@@ -558,7 +556,7 @@ impl NetHandle {
         peer_hints.extend(peer_endpoints.iter().map(|endpoint| endpoint.id));
         let peer_hints = unique_peer_nodes(peer_hints, node_id);
         let persisted_realm_peers =
-            read_persisted_realm_peer_nodes(&storage, config.realm_id, node_id).await?;
+            read_persisted_peers(&storage, config.realm_id, node_id).await?;
         let realm_peer_nodes = persisted_realm_peers.clone().unwrap_or_default();
         let realm_peers = Arc::new(RwLock::new(realm_peer_nodes.clone()));
         let inbound_admission = streams::InboundAdmission::new(
@@ -580,7 +578,7 @@ impl NetHandle {
         let network_diagnostics = Arc::new(Mutex::new(NetworkDiagnosticsState::default()));
         let (peer_connectivity_tx, peer_connectivity_rx) = mpsc::channel(256);
         for node_id in &peer_hints {
-            send_peer_connectivity_event(
+            send_connectivity_event(
                 &peer_connectivity_tx,
                 PeerConnectivityEvent::ManagePeer {
                     node_id: *node_id,
@@ -626,7 +624,7 @@ impl NetHandle {
         // joiner admits its seed's pushes before the first realm config applies.
         let mut document_sync_peers = realm_peer_nodes.clone();
         document_sync_peers.extend(peer_hints.iter().copied());
-        let mut document_sync = DocumentSyncService::open_with_persist_policy(
+        let mut document_sync = DocumentSyncService::open_with_policy(
             endpoint.clone(),
             storage.clone(),
             document_sync_path,
@@ -645,8 +643,7 @@ impl NetHandle {
         let (effect_tx, mut effect_rx) = mpsc::channel::<EffectHandle>(256);
 
         // Inbound handlers and presence refreshes write to storage, so shutdown
-        // has to be able to join them instead of leaving them detached behind
-        // the final sync.
+        // joins them instead of leaving them detached behind the final sync.
         let inbound_tasks = TaskTracker::new();
         let effect_context = Arc::new(effect_handlers::NetEffectContext {
             dht: dht.clone(),
@@ -715,8 +712,7 @@ impl NetHandle {
                         continue;
                     };
                     // A user device is bounded by the realm's published limits
-                    // rather than by responsibilities it does not carry; the
-                    // slot it takes is held for the whole handler.
+                    // rather than responsibilities it does not carry.
                     let device_permit = match admission_for_streams.admit_stream(peer_id) {
                         Ok(permit) => permit,
                         Err(refusal) => {
@@ -785,7 +781,7 @@ impl NetHandle {
                         while let Ok(eviction) = eviction_rx.try_recv() {
                             pending.extend(eviction_document_sync.consume_eviction(eviction).await);
                         }
-                        if !flush_pending_evicted_documents(
+                        if !flush_evicted_documents(
                             &eviction_inbound_handler,
                             &eviction_document_sync,
                             &mut pending,
@@ -801,7 +797,7 @@ impl NetHandle {
                         break;
                     },
                     _ = eviction_inbound_handler_registered.notified(), if !pending.is_empty() => {
-                        let _ = flush_pending_evicted_documents(
+                        let _ = flush_evicted_documents(
                             &eviction_inbound_handler,
                             &eviction_document_sync,
                             &mut pending,
@@ -809,7 +805,7 @@ impl NetHandle {
                         .await;
                     },
                     _ = retry.tick(), if !pending.is_empty() => {
-                        let _ = flush_pending_evicted_documents(
+                        let _ = flush_evicted_documents(
                             &eviction_inbound_handler,
                             &eviction_document_sync,
                             &mut pending,
@@ -822,7 +818,7 @@ impl NetHandle {
                         if pending.is_empty() {
                             continue;
                         }
-                        if !flush_pending_evicted_documents(
+                        if !flush_evicted_documents(
                             &eviction_inbound_handler,
                             &eviction_document_sync,
                             &mut pending,
@@ -839,7 +835,7 @@ impl NetHandle {
             }
         });
 
-        let peer_connectivity_task = tokio::spawn(run_peer_connectivity_manager(
+        let peer_connectivity_task = tokio::spawn(run_connectivity_manager(
             dht.clone(),
             address_lookup.clone(),
             connection_pool.clone(),
@@ -854,7 +850,7 @@ impl NetHandle {
 
         let mut tasks = dht_resources.tasks;
         if let Some((ttl, refresh_after)) = discovery_method.dht_signed_config() {
-            tasks.push(spawn_dht_signed_publisher(
+            tasks.push(spawn_signed_publisher(
                 dht.clone(),
                 endpoint.clone(),
                 config.realm_id,
@@ -971,25 +967,23 @@ impl NetHandle {
         self.inner.document_sync.database()
     }
 
-    pub async fn sync_document_topic_with_peers(
+    pub async fn sync_topic_peers(
         &self,
         topic_id: ::irokle::TopicId,
         peers: Vec<NodeId>,
     ) -> Result<()> {
         self.inner
             .document_sync
-            .sync_topic_with_peers(topic_id, peers)
+            .sync_with_peers(topic_id, peers)
             .await
     }
 
-    pub fn allow_document_sync_peers(
+    pub fn allow_topic_peers(
         &self,
         topics: &[::irokle::TopicId],
         peers: Vec<NodeId>,
     ) -> Result<()> {
-        self.inner
-            .document_sync
-            .allow_document_sync_peers(topics, peers)
+        self.inner.document_sync.allow_topic_peers(topics, peers)
     }
 
     /// Reconciles shard-only topics to their exact sync membership (delivery)
@@ -1009,14 +1003,12 @@ impl NetHandle {
             .await
     }
 
-    pub fn ensure_document_sync_topics(
+    pub fn ensure_sync_topics(
         &self,
         topics: &[::irokle::TopicId],
         peers: Vec<NodeId>,
     ) -> Result<()> {
-        self.inner
-            .document_sync
-            .ensure_document_sync_topics(topics, peers)
+        self.inner.document_sync.ensure_sync_topics(topics, peers)
     }
 
     /// Ensures topics this node is the only holder of. No peer is added to
@@ -1026,21 +1018,21 @@ impl NetHandle {
     }
 
     /// Whether a document sync topic's genesis is known locally.
-    pub fn document_sync_topic_exists(&self, topic: ::irokle::TopicId) -> Result<bool> {
+    pub fn sync_topic_exists(&self, topic: ::irokle::TopicId) -> Result<bool> {
         self.inner.document_sync.topic_exists(topic)
     }
 
     /// Probes a shard's co-holders for an existing genesis of `topics` (see
     /// [`ShardGenesisProbe`]). A rank-0 holder uses the result to create a fresh
     /// genesis only when every co-holder was reached and none had the topic.
-    pub async fn probe_shard_topic_geneses(
+    pub async fn probe_shard_geneses(
         &self,
         topics: Vec<::irokle::TopicId>,
         co_holders: Vec<NodeId>,
     ) -> ShardGenesisProbe {
         self.inner
             .document_sync
-            .probe_shard_topic_geneses(topics, co_holders)
+            .probe_shard_geneses(topics, co_holders)
             .await
     }
 
@@ -1058,7 +1050,7 @@ impl NetHandle {
             .await
     }
 
-    pub async fn handle_document_sync_stream(
+    pub async fn handle_sync_stream(
         &self,
         stream: streams::BiStream,
         peer: NodeId,
@@ -1069,14 +1061,14 @@ impl NetHandle {
             .await
     }
 
-    pub async fn reconcile_document_sync_topics(
+    pub async fn reconcile_sync_topics(
         &self,
         topic_ids: Vec<::irokle::TopicId>,
     ) -> Result<DocumentSyncReconcileResult> {
         let applied = self
             .inner
             .document_sync
-            .reconcile_document_sync_topics(topic_ids)
+            .reconcile_sync_topics(topic_ids)
             .await?;
         if applied
             .targets
@@ -1118,7 +1110,7 @@ impl NetHandle {
         {
             debug!(node_id = %endpoint_addr.id, %error, "Connection pool stopped during address installation");
         }
-        send_peer_connectivity_event(
+        send_connectivity_event(
             &self.inner.peer_connectivity_tx,
             PeerConnectivityEvent::ManagePeer {
                 node_id: endpoint_addr.id,
@@ -1135,7 +1127,7 @@ impl NetHandle {
         }
     }
 
-    pub async fn refresh_realm_peers_from_document(
+    pub async fn refresh_document_peers(
         &self,
         document: &RealmConfigDocument,
     ) -> Result<Vec<NodeId>> {
@@ -1145,10 +1137,8 @@ impl NetHandle {
                 document.realm_id, self.inner.realm_id
             )));
         }
-        // Node kind decides which protocols each side of a connection may
-        // speak; the accept loop and the DHT read the same table. Kinds are
-        // published first: a peer admitted before its kind is known would pass
-        // the ALPN matrix as an unconfigured node.
+        // Node kind decides which protocols each side may speak and is published
+        // first: a peer admitted before its kind is known would pass as unconfigured.
         let mut peer_kinds = BTreeMap::new();
         let mut local_kind = None;
         for node in &document.nodes {
@@ -1184,7 +1174,7 @@ impl NetHandle {
         // Sync fan-out and DHT trust stay restricted to sync-eligible nodes.
         let peers = unique_peer_nodes(
             document
-                .sync_eligible_node_ids()
+                .sync_eligible_nodes()
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?,
             self.inner.node_id,
         );
@@ -1192,10 +1182,10 @@ impl NetHandle {
         Ok(peers)
     }
 
-    pub async fn refresh_realm_peers_from_bytes(&self, bytes: &[u8]) -> Result<Vec<NodeId>> {
+    pub async fn refresh_encoded_peers(&self, bytes: &[u8]) -> Result<Vec<NodeId>> {
         let document = RealmConfigDocument::from_bytes(bytes)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        self.refresh_realm_peers_from_document(&document).await
+        self.refresh_document_peers(&document).await
     }
 
     pub async fn reload_realm_peers(&self) -> Result<Option<Vec<NodeId>>> {
@@ -1208,7 +1198,7 @@ impl NetHandle {
         else {
             return Ok(None);
         };
-        self.refresh_realm_peers_from_bytes(&bytes).await.map(Some)
+        self.refresh_encoded_peers(&bytes).await.map(Some)
     }
 
     pub async fn realm_peers(&self) -> Vec<NodeId> {
@@ -1262,7 +1252,7 @@ impl NetHandle {
 
     /// Replaces one realm's node map after a reconcile touched its digests,
     /// leaving every other realm's cached interest untouched.
-    pub fn update_watch_interest_realm(
+    pub fn update_realm_interest(
         &self,
         realm_id: RealmId,
         nodes: HashMap<NodeId, Vec<WatchInterestEntry>>,
@@ -1270,11 +1260,10 @@ impl NetHandle {
         self.inner.watch_interest.write().set_realm(realm_id, nodes);
     }
 
-    /// Records a locally-known holder for a freshly created watch so the node
-    /// that handled the create routes matching events to the holder before the
-    /// holder's digest replicates back. Retracted by
-    /// [`Self::retract_local_watch_interest`].
-    pub fn register_local_watch_interest(
+    /// Records a locally-known holder for a freshly created watch so matching
+    /// events route to it before its digest replicates back. Retracted by
+    /// [`Self::retract_local_interest`].
+    pub fn register_local_interest(
         &self,
         watch_id: Ulid,
         realm_id: RealmId,
@@ -1288,14 +1277,14 @@ impl NetHandle {
     }
 
     /// Drops the local watch-interest registration for a deleted watch.
-    pub fn retract_local_watch_interest(&self, watch_id: Ulid) {
+    pub fn retract_local_interest(&self, watch_id: Ulid) {
         self.inner.watch_interest.write().retract_local(watch_id);
     }
 
     async fn refresh_realm_peers(&self, peers: Vec<NodeId>) {
         *self.inner.realm_peers.write() = peers.clone();
         self.inner.inbound_admission.mark_materialized();
-        replace_dht_signed_authorized_nodes(
+        replace_authorized_nodes(
             &self.inner.dht_signed_authorized_nodes,
             &peers,
             self.inner.node_id,
@@ -1303,7 +1292,7 @@ impl NetHandle {
         if let Err(err) = self
             .inner
             .document_sync
-            .refresh_potential_peer_nodes(peers.clone())
+            .refresh_peer_candidates(peers.clone())
         {
             warn!(
                 error = %err,
@@ -1320,12 +1309,12 @@ impl NetHandle {
             return;
         }
 
-        authorize_dht_signed_node(
+        authorize_signed_node(
             &self.inner.dht_signed_authorized_nodes,
             node_id,
             self.inner.node_id,
         );
-        send_peer_connectivity_event(
+        send_connectivity_event(
             &self.inner.peer_connectivity_tx,
             PeerConnectivityEvent::ManagePeer {
                 node_id,
@@ -1386,7 +1375,7 @@ impl NetHandle {
             Ok(result) => result,
             Err(_) => {
                 if node_id != self.inner.node_id {
-                    send_peer_connectivity_event(
+                    send_connectivity_event(
                         &self.inner.peer_connectivity_tx,
                         PeerConnectivityEvent::ConnectionFailure {
                             node_id,
@@ -1412,7 +1401,7 @@ impl NetHandle {
                     "Failed to add stream target peer to DHT"
                 );
             }
-            send_peer_connectivity_event(
+            send_connectivity_event(
                 &self.inner.peer_connectivity_tx,
                 PeerConnectivityEvent::ManagePeer {
                     node_id,
@@ -1425,7 +1414,7 @@ impl NetHandle {
         match self.inner.streams.open(node_id, alpn).await {
             Ok(stream) => {
                 if node_id != self.inner.node_id {
-                    send_peer_connectivity_event(
+                    send_connectivity_event(
                         &self.inner.peer_connectivity_tx,
                         PeerConnectivityEvent::ConnectionSuccess {
                             node_id,
@@ -1438,7 +1427,7 @@ impl NetHandle {
             Err(mut err) => {
                 if node_id != self.inner.node_id {
                     let authorized_nodes = self.inner.dht_signed_authorized_nodes.read().clone();
-                    match resolve_dht_signed_endpoint(
+                    match resolve_signed_endpoint(
                         &self.inner.dht,
                         self.inner.realm_id,
                         &authorized_nodes,
@@ -1462,7 +1451,7 @@ impl NetHandle {
                             );
                             match self.inner.streams.open(node_id, alpn).await {
                                 Ok(stream) => {
-                                    send_peer_connectivity_event(
+                                    send_connectivity_event(
                                         &self.inner.peer_connectivity_tx,
                                         PeerConnectivityEvent::ConnectionSuccess {
                                             node_id,
@@ -1488,7 +1477,7 @@ impl NetHandle {
                 }
 
                 if node_id != self.inner.node_id {
-                    send_peer_connectivity_event(
+                    send_connectivity_event(
                         &self.inner.peer_connectivity_tx,
                         PeerConnectivityEvent::ConnectionFailure {
                             node_id,
@@ -1609,7 +1598,7 @@ impl NetHandle {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_dht_signed_publisher(
+fn spawn_signed_publisher(
     dht: Arc<DhtHandle>,
     endpoint: Endpoint,
     realm_id: RealmId,
@@ -1620,12 +1609,12 @@ fn spawn_dht_signed_publisher(
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let (ttl, refresh_after) = normalized_dht_signed_timing(ttl, refresh_after);
+        let (ttl, refresh_after) = normalize_signed_timing(ttl, refresh_after);
         let mut sequence = 0u64;
 
         loop {
             sequence = sequence.saturating_add(1);
-            match publish_realm_endpoint_announcement(
+            match publish_endpoint_announcement(
                 &dht,
                 &endpoint,
                 realm_id,
@@ -1668,7 +1657,7 @@ fn spawn_dht_signed_publisher(
     })
 }
 
-fn normalized_dht_signed_timing(ttl: Duration, refresh_after: Duration) -> (Duration, Duration) {
+fn normalize_signed_timing(ttl: Duration, refresh_after: Duration) -> (Duration, Duration) {
     let ttl_secs = ttl.as_secs().clamp(1, dht::constants::MAX_TTL_SECS);
     let mut refresh_secs = refresh_after.as_secs().max(1);
     if refresh_secs >= ttl_secs && ttl_secs > 1 {
@@ -1681,7 +1670,7 @@ fn normalized_dht_signed_timing(ttl: Duration, refresh_after: Duration) -> (Dura
     )
 }
 
-async fn publish_realm_endpoint_announcement(
+async fn publish_endpoint_announcement(
     dht: &DhtHandle,
     endpoint: &Endpoint,
     realm_id: RealmId,
@@ -1700,7 +1689,7 @@ async fn publish_realm_endpoint_announcement(
                 .to_string(),
         ));
     }
-    let signing_bytes = realm_endpoint_announcement_signing_bytes(
+    let signing_bytes = endpoint_signing_bytes(
         &realm_id,
         &node_id,
         &endpoint_addr,
@@ -1734,7 +1723,7 @@ async fn publish_realm_endpoint_announcement(
     Ok(())
 }
 
-async fn lookup_dht_signed_endpoint(
+async fn lookup_signed_endpoint(
     dht: &DhtHandle,
     realm_id: RealmId,
     authorized_nodes: &[NodeId],
@@ -1749,9 +1738,8 @@ async fn lookup_dht_signed_endpoint(
     }
 
     let key = realm_endpoint_key(&realm_id, &peer);
-    // The announcement is only usable when `peer` published it in this realm, so
-    // the driver may stop at the first valid record from that publisher. The
-    // sub-budget keeps the whole resolve inside OPEN_STREAM_TIMEOUT.
+    // An announcement is usable only from the publisher in this realm, so the
+    // driver stops at the first valid record; the sub-budget keeps the resolve bounded.
     let entries = dht
         .get(
             &key,
@@ -1761,7 +1749,7 @@ async fn lookup_dht_signed_endpoint(
         .await?;
     let now = unix_timestamp_secs();
 
-    Ok(select_dht_signed_endpoint(
+    Ok(select_signed_endpoint(
         entries,
         peer,
         realm_id,
@@ -1771,7 +1759,7 @@ async fn lookup_dht_signed_endpoint(
     ))
 }
 
-fn select_dht_signed_endpoint(
+fn select_signed_endpoint(
     entries: Vec<DhtEntry>,
     peer: NodeId,
     realm_id: RealmId,
@@ -1786,7 +1774,7 @@ fn select_dht_signed_endpoint(
         else {
             continue;
         };
-        if validate_realm_endpoint_announcement(
+        if validate_endpoint_announcement(
             &announcement,
             entry.node_id,
             peer,
@@ -1816,7 +1804,7 @@ fn select_dht_signed_endpoint(
     best.map(|announcement| announcement.endpoint_addr)
 }
 
-async fn resolve_dht_signed_endpoint(
+async fn resolve_signed_endpoint(
     dht: &DhtHandle,
     realm_id: RealmId,
     authorized_nodes: &[NodeId],
@@ -1824,11 +1812,11 @@ async fn resolve_dht_signed_endpoint(
     config: Option<(Duration, Duration)>,
     diagnostics: &Arc<Mutex<NetworkDiagnosticsState>>,
 ) -> Result<Option<EndpointAddr>> {
-    if !dht_signed_lookup_enabled(config, authorized_nodes, peer) {
+    if !signed_lookup_enabled(config, authorized_nodes, peer) {
         return Ok(None);
     }
 
-    let result = lookup_dht_signed_endpoint(dht, realm_id, authorized_nodes, peer, config).await;
+    let result = lookup_signed_endpoint(dht, realm_id, authorized_nodes, peer, config).await;
     match &result {
         Ok(_) => diagnostics.lock().await.requests.record_success(),
         Err(err) => {
@@ -1843,7 +1831,7 @@ async fn resolve_dht_signed_endpoint(
     result
 }
 
-fn dht_signed_lookup_enabled(
+fn signed_lookup_enabled(
     config: Option<(Duration, Duration)>,
     authorized_nodes: &[NodeId],
     peer: NodeId,
@@ -1851,7 +1839,7 @@ fn dht_signed_lookup_enabled(
     config.is_some() && authorized_nodes.contains(&peer)
 }
 
-fn validate_realm_endpoint_announcement(
+fn validate_endpoint_announcement(
     announcement: &RealmEndpointAnnouncement,
     entry_publisher: NodeId,
     requested_peer: NodeId,
@@ -1892,7 +1880,7 @@ fn validate_realm_endpoint_announcement(
         return Err("announcement ttl exceeds configured maximum".to_string());
     }
 
-    let signing_bytes = realm_endpoint_announcement_signing_bytes(
+    let signing_bytes = endpoint_signing_bytes(
         &announcement.realm_id,
         &announcement.node_id,
         &announcement.endpoint_addr,
@@ -1959,7 +1947,7 @@ fn push_transport_addr(addrs: &mut Vec<TransportAddr>, addr: TransportAddr) {
     }
 }
 
-async fn read_persisted_realm_peer_nodes(
+async fn read_persisted_peers(
     storage: &StorageHandle,
     realm_id: RealmId,
     local_id: NodeId,
@@ -1998,7 +1986,7 @@ async fn read_persisted_realm_peer_nodes(
     }
 }
 
-fn authorize_dht_signed_node(
+fn authorize_signed_node(
     authorized_nodes: &Arc<RwLock<Vec<NodeId>>>,
     node_id: NodeId,
     local_id: NodeId,
@@ -2015,7 +2003,7 @@ fn authorize_dht_signed_node(
     nodes.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 }
 
-fn replace_dht_signed_authorized_nodes(
+fn replace_authorized_nodes(
     authorized_nodes: &Arc<RwLock<Vec<NodeId>>>,
     nodes: &[NodeId],
     local_id: NodeId,
@@ -2196,10 +2184,7 @@ fn peer_jitter_seed(node_id: NodeId, attempt: u64) -> u64 {
     u64::from_le_bytes(bytes) ^ attempt.rotate_left(17)
 }
 
-fn send_peer_connectivity_event(
-    tx: &mpsc::Sender<PeerConnectivityEvent>,
-    event: PeerConnectivityEvent,
-) {
+fn send_connectivity_event(tx: &mpsc::Sender<PeerConnectivityEvent>, event: PeerConnectivityEvent) {
     if let Err(err) = tx.try_send(event) {
         match err {
             mpsc::error::TrySendError::Full(_) => debug!("peer connectivity event queue full"),
@@ -2215,7 +2200,7 @@ async fn peer_connectivity_status(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_peer_connectivity_manager(
+async fn run_connectivity_manager(
     dht: Arc<DhtHandle>,
     address_lookup: MemoryLookup,
     connection_pool: ConnectionPool,
@@ -2228,7 +2213,7 @@ async fn run_peer_connectivity_manager(
     shutdown: CancellationToken,
 ) {
     loop {
-        drain_peer_connectivity_events(&state, &mut event_rx).await;
+        drain_connectivity_events(&state, &mut event_rx).await;
 
         let now = Instant::now();
         let due_peers = state.lock().await.due_peers(now);
@@ -2240,7 +2225,7 @@ async fn run_peer_connectivity_manager(
                 let authorized_nodes = dht_signed_authorized_nodes.read().clone();
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
-                    _ = run_peer_connectivity_attempt(
+                    _ = run_connectivity_attempt(
                         &dht,
                         &address_lookup,
                         &connection_pool,
@@ -2262,9 +2247,9 @@ async fn run_peer_connectivity_manager(
             _ = shutdown.cancelled() => break,
             maybe_event = event_rx.recv() => {
                 let Some(event) = maybe_event else { break };
-                apply_peer_connectivity_event(&state, event).await;
+                apply_connectivity_event(&state, event).await;
                 while let Ok(event) = event_rx.try_recv() {
-                    apply_peer_connectivity_event(&state, event).await;
+                    apply_connectivity_event(&state, event).await;
                 }
             }
             _ = tokio::time::sleep(wait) => {}
@@ -2272,16 +2257,16 @@ async fn run_peer_connectivity_manager(
     }
 }
 
-async fn drain_peer_connectivity_events(
+async fn drain_connectivity_events(
     state: &Arc<Mutex<PeerConnectivityManagerState>>,
     event_rx: &mut mpsc::Receiver<PeerConnectivityEvent>,
 ) {
     while let Ok(event) = event_rx.try_recv() {
-        apply_peer_connectivity_event(state, event).await;
+        apply_connectivity_event(state, event).await;
     }
 }
 
-async fn apply_peer_connectivity_event(
+async fn apply_connectivity_event(
     state: &Arc<Mutex<PeerConnectivityManagerState>>,
     event: PeerConnectivityEvent,
 ) {
@@ -2309,7 +2294,7 @@ async fn apply_peer_connectivity_event(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_peer_connectivity_attempt(
+async fn run_connectivity_attempt(
     dht: &DhtHandle,
     address_lookup: &MemoryLookup,
     connection_pool: &ConnectionPool,
@@ -2324,7 +2309,7 @@ async fn run_peer_connectivity_attempt(
 
     let mut result = dht.bootstrap_nodes(&[peer]).await;
     if result.is_err() {
-        match resolve_dht_signed_endpoint(
+        match resolve_signed_endpoint(
             dht,
             realm_id,
             dht_signed_authorized_nodes,
@@ -2466,7 +2451,7 @@ async fn active_address_rows(endpoint: &Endpoint, peer: NodeId) -> Vec<Connectio
             if matches!(addr.usage(), TransportAddrUsage::Active) {
                 upsert_address_row(
                     &mut rows,
-                    transport_addr_to_string(addr.addr()),
+                    format_transport_addr(addr.addr()),
                     ConnectionAddressStatus::Active,
                 );
             }
@@ -2503,7 +2488,7 @@ fn merge_rtt(existing: &mut Option<u64>, candidate: Option<u64>) {
     *existing = Some(existing.map_or(candidate, |current| current.min(candidate)));
 }
 
-fn transport_addr_to_string(addr: &TransportAddr) -> String {
+fn format_transport_addr(addr: &TransportAddr) -> String {
     match addr {
         TransportAddr::Ip(addr) => addr.to_string(),
         TransportAddr::Relay(url) => url.to_string(),
@@ -2573,7 +2558,7 @@ impl Handle for NetHandle {
         name = "net.handle.send_effect",
         level = "debug",
         skip(self, effect),
-        fields(effect = net_handle_effect_kind(&effect))
+        fields(effect = effect_kind(&effect))
     )]
     async fn send_effect(&self, effect: Effect) -> Event {
         match effect {
@@ -2599,7 +2584,7 @@ impl Handle for NetHandle {
     }
 }
 
-fn net_handle_effect_kind(effect: &Effect) -> &'static str {
+fn effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::Net(NetEffect::Dht(_)) => "dht",
         Effect::Net(NetEffect::DocumentSync(_)) => "document_sync",
@@ -2639,7 +2624,7 @@ mod tests {
         sequence: u64,
     ) -> RealmEndpointAnnouncement {
         let node_id = secret.public();
-        let signing_bytes = realm_endpoint_announcement_signing_bytes(
+        let signing_bytes = endpoint_signing_bytes(
             &realm_id,
             &node_id,
             &endpoint_addr,
@@ -2739,7 +2724,7 @@ mod tests {
             .bind()
             .await
             .expect("endpoint binds");
-        let service = DocumentSyncService::open_with_persist_policy(
+        let service = DocumentSyncService::open_with_policy(
             endpoint,
             storage,
             dir.path().join("document-sync"),
@@ -2754,7 +2739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evicted_documents_wait_for_registered_inbound_handler() {
+    async fn eviction_waits_handler() {
         // A journal entry survives a missing handler and a handler that cannot
         // commit; only a durable conversion releases it.
         let (_dir, service) = eviction_test_service().await;
@@ -2767,7 +2752,7 @@ mod tests {
         let mut pending = vec![entry.clone()];
 
         assert!(
-            !flush_pending_evicted_documents(&inbound_handler, &service, &mut pending).await,
+            !flush_evicted_documents(&inbound_handler, &service, &mut pending).await,
             "payloads must stay journalled without a handler"
         );
         assert_eq!(pending, vec![entry.clone()]);
@@ -2775,7 +2760,7 @@ mod tests {
         let failing = Arc::new(RecordingEvictedHandler::new(false));
         *inbound_handler.write() = Some(failing.clone() as Arc<dyn InboundEventHandler>);
         assert!(
-            !flush_pending_evicted_documents(&inbound_handler, &service, &mut pending).await,
+            !flush_evicted_documents(&inbound_handler, &service, &mut pending).await,
             "a handler that cannot commit must not release the entry"
         );
         assert_eq!(pending, vec![entry.clone()]);
@@ -2783,7 +2768,7 @@ mod tests {
 
         let handler = Arc::new(RecordingEvictedHandler::new(true));
         *inbound_handler.write() = Some(handler.clone() as Arc<dyn InboundEventHandler>);
-        assert!(flush_pending_evicted_documents(&inbound_handler, &service, &mut pending).await);
+        assert!(flush_evicted_documents(&inbound_handler, &service, &mut pending).await);
         assert!(pending.is_empty());
         assert_eq!(*handler.documents.lock().await, entry.documents);
 
@@ -2836,7 +2821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eviction_registers_its_buckets() {
+    async fn eviction_registers_buckets() {
         // The entry outlives the hand-off: it is released only once the
         // replacement rows are durable, and it never stalls another bucket.
         let (_dir, service) = eviction_test_service().await;
@@ -2861,7 +2846,7 @@ mod tests {
         let failing = Arc::new(RecordingEvictedHandler::new(false));
         *inbound_handler.write() = Some(failing as Arc<dyn InboundEventHandler>);
         let mut pending = vec![entry];
-        assert!(!flush_pending_evicted_documents(&inbound_handler, &service, &mut pending).await);
+        assert!(!flush_evicted_documents(&inbound_handler, &service, &mut pending).await);
         assert!(
             service.eviction_pending(&placement),
             "an unconverted entry must keep blocking its bucket"
@@ -2869,14 +2854,14 @@ mod tests {
 
         let handler = Arc::new(RecordingEvictedHandler::new(true));
         *inbound_handler.write() = Some(handler as Arc<dyn InboundEventHandler>);
-        assert!(flush_pending_evicted_documents(&inbound_handler, &service, &mut pending).await);
+        assert!(flush_evicted_documents(&inbound_handler, &service, &mut pending).await);
         assert!(!service.eviction_pending(&placement));
 
         service.shutdown().await;
     }
 
     #[tokio::test]
-    async fn empty_eviction_stays_unpending() {
+    async fn empty_eviction_unpending() {
         // Irokle writes no record for an eviction with no payloads, so treating
         // one as pending would arm the retry timer against a phantom forever.
         let (_dir, service) = eviction_test_service().await;
@@ -2943,7 +2928,7 @@ mod tests {
         let announcement = make_announcement(&secret, realm_id, endpoint_addr, now, now + 300, 1);
 
         assert!(
-            validate_realm_endpoint_announcement(
+            validate_endpoint_announcement(
                 &announcement,
                 node_id,
                 node_id,
@@ -2955,7 +2940,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            validate_realm_endpoint_announcement(
+            validate_endpoint_announcement(
                 &announcement,
                 node_id,
                 node_id,
@@ -2968,7 +2953,7 @@ mod tests {
         );
 
         let forged_secret = make_secret(52);
-        let signing_bytes = realm_endpoint_announcement_signing_bytes(
+        let signing_bytes = endpoint_signing_bytes(
             &announcement.realm_id,
             &announcement.node_id,
             &announcement.endpoint_addr,
@@ -2981,7 +2966,7 @@ mod tests {
         forged.signature = forged_secret.sign(&signing_bytes);
 
         assert!(
-            validate_realm_endpoint_announcement(
+            validate_endpoint_announcement(
                 &forged,
                 node_id,
                 node_id,
@@ -3021,14 +3006,14 @@ mod tests {
             },
         ];
 
-        let endpoint = select_dht_signed_endpoint(entries, node_id, realm_id, &[node_id], now, 300)
+        let endpoint = select_signed_endpoint(entries, node_id, realm_id, &[node_id], now, 300)
             .expect("valid announcement");
 
         assert_eq!(endpoint.addrs, newer.endpoint_addr.addrs);
     }
 
     #[test]
-    fn newer_issued_announcement_wins_after_sequence_reset() {
+    fn new_announcement_wins() {
         let secret = make_secret(55);
         let node_id = secret.public();
         let realm_id = RealmId::from_bytes([12u8; 32]);
@@ -3055,7 +3040,7 @@ mod tests {
         ];
 
         let endpoint =
-            select_dht_signed_endpoint(entries, node_id, realm_id, &[node_id], now + 10, 300)
+            select_signed_endpoint(entries, node_id, realm_id, &[node_id], now + 10, 300)
                 .expect("valid announcement");
 
         assert_eq!(endpoint.addrs, fresh.endpoint_addr.addrs);
@@ -3077,13 +3062,12 @@ mod tests {
         }];
 
         assert!(
-            select_dht_signed_endpoint(entries, node_id, realm_id, &[node_id], 1_000, 300)
-                .is_none()
+            select_signed_endpoint(entries, node_id, realm_id, &[node_id], 1_000, 300).is_none()
         );
     }
 
     #[test]
-    fn rejects_future_and_excessive_ttl_announcements() {
+    fn invalid_announcement_timing() {
         let secret = make_secret(56);
         let node_id = secret.public();
         let realm_id = RealmId::from_bytes([13u8; 32]);
@@ -3101,7 +3085,7 @@ mod tests {
         let excessive_ttl = make_announcement(&secret, realm_id, endpoint_addr, now, now + 301, 1);
 
         assert!(
-            validate_realm_endpoint_announcement(
+            validate_endpoint_announcement(
                 &future,
                 node_id,
                 node_id,
@@ -3113,7 +3097,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            validate_realm_endpoint_announcement(
+            validate_endpoint_announcement(
                 &excessive_ttl,
                 node_id,
                 node_id,
@@ -3127,7 +3111,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_net_handle_creates() -> Result<()> {
+    async fn net_handle_creates() -> Result<()> {
         let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
         let storage = aruna_storage::FjallStorage::open(
             temp_dir
@@ -3185,7 +3169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notification_wake_without_subscriber_is_noop() -> Result<()> {
+    async fn wake_without_subscriber() -> Result<()> {
         let (_dir, handle) = notification_wake_handle().await?;
         // No subscribers: the send must not panic or error.
         handle.notify_inbox_activity(wake_user(1));
@@ -3194,7 +3178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notification_wake_reaches_subscriber() -> Result<()> {
+    async fn wake_reaches_subscriber() -> Result<()> {
         let (_dir, handle) = notification_wake_handle().await?;
         let mut rx = handle.subscribe_notification_wakes();
         let recipient = wake_user(7);
@@ -3220,7 +3204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_endpoint_only_nodes_are_not_dht_signed_authorized() -> Result<()> {
+    async fn endpoint_only_unauthorized() -> Result<()> {
         let temp_a = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
         let temp_b = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
         let storage_a = aruna_storage::FjallStorage::open(
@@ -3331,18 +3315,18 @@ mod tests {
         }
     }
 
-    async fn wait_for_open_connections(handle: &NetHandle, expected: usize) -> NetState {
+    async fn await_open_connections(handle: &NetHandle, expected: usize) -> NetState {
         wait_for_status(handle, |status| {
             protocol_connection_count(status) >= expected
         })
         .await
     }
 
-    async fn wait_for_bootstrap_failure(handle: &NetHandle) -> NetState {
+    async fn await_bootstrap_failure(handle: &NetHandle) -> NetState {
         wait_for_status(handle, |status| status.requests.failures > 0).await
     }
 
-    async fn wait_for_peer_failure(handle: &NetHandle, peer: NodeId) -> NetState {
+    async fn await_peer_failure(handle: &NetHandle, peer: NodeId) -> NetState {
         wait_for_status(handle, |status| {
             status.connections.iter().any(|state| {
                 state.node_id == peer && state.status == PeerConnectionStatus::Unreachable
@@ -3360,7 +3344,7 @@ mod tests {
             .sum()
     }
 
-    fn protocol_connection_count_for(
+    fn connection_count_for(
         status: &NetState,
         node_id: NodeId,
         alpn: Alpn,
@@ -3376,7 +3360,7 @@ mod tests {
             .count()
     }
 
-    async fn wait_for_protocol_connection_count(
+    async fn await_protocol_count(
         handle: &NetHandle,
         node_id: NodeId,
         alpn: Alpn,
@@ -3384,13 +3368,13 @@ mod tests {
         expected: usize,
     ) -> NetState {
         wait_for_status(handle, |status| {
-            protocol_connection_count_for(status, node_id, alpn, side) == expected
+            connection_count_for(status, node_id, alpn, side) == expected
         })
         .await
     }
 
     #[tokio::test]
-    async fn refresh_realm_peers_uses_realm_config_nodes_as_source_of_truth() -> Result<()> {
+    async fn config_replaces_peers() -> Result<()> {
         let (handle, _dir) = test_net_handle().await?;
         let peer_a = make_secret(11).public();
         let peer_b = make_secret(12).public();
@@ -3411,7 +3395,7 @@ mod tests {
         );
         let expected = unique_peer_nodes(vec![peer_a, peer_b], handle.node_id());
 
-        let peers = handle.refresh_realm_peers_from_document(&document).await?;
+        let peers = handle.refresh_document_peers(&document).await?;
         assert_eq!(peers, expected);
         assert_eq!(handle.realm_peers().await, expected);
         assert_eq!(*handle.inner.dht_signed_authorized_nodes.read(), expected);
@@ -3430,9 +3414,7 @@ mod tests {
             RealmConfigDocument::default_for_realm(*handle.realm_id(), Vec::new());
         replacement.ensure_node(peer_b, aruna_core::structs::RealmNodeKind::Server);
 
-        let peers = handle
-            .refresh_realm_peers_from_document(&replacement)
-            .await?;
+        let peers = handle.refresh_document_peers(&replacement).await?;
         assert_eq!(peers, vec![peer_b]);
         assert_eq!(handle.realm_peers().await, vec![peer_b]);
         assert_eq!(
@@ -3476,7 +3458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_streams_reuse_pooled_connection() -> Result<()> {
+    async fn outbound_reuses_connection() -> Result<()> {
         let (a, _a_dir) = test_net_handle().await?;
         let (b, _b_dir) = test_net_handle().await?;
         a.add_peer_addr(b.endpoint_addr()).await;
@@ -3485,17 +3467,11 @@ mod tests {
         let _first = a.open_stream(b.node_id(), Alpn::Bao).await?;
         let _second = a.open_stream(b.node_id(), Alpn::Bao).await?;
 
-        let status = wait_for_protocol_connection_count(
-            &a,
-            b.node_id(),
-            Alpn::Bao,
-            iroh::endpoint::Side::Client,
-            1,
-        )
-        .await;
+        let status =
+            await_protocol_count(&a, b.node_id(), Alpn::Bao, iroh::endpoint::Side::Client, 1).await;
 
         assert_eq!(
-            protocol_connection_count_for(
+            connection_count_for(
                 &status,
                 b.node_id(),
                 Alpn::Bao,
@@ -3510,7 +3486,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn monitor_tracks_multiple_open_connections() -> Result<()> {
+    async fn monitor_tracks_connections() -> Result<()> {
         let (a, _a_dir) = test_net_handle().await?;
         let (b, _b_dir) = test_net_handle().await?;
         a.add_peer_addr(b.endpoint_addr()).await;
@@ -3519,7 +3495,7 @@ mod tests {
         let _a_to_b = a.open_stream(b.node_id(), Alpn::Bao).await?;
         let _b_to_a = b.open_stream(a.node_id(), Alpn::Bao).await?;
 
-        let status = wait_for_open_connections(&a, 2).await;
+        let status = await_open_connections(&a, 2).await;
         assert!(protocol_connection_count(&status) >= 2);
 
         let mut connection_ids = status
@@ -3546,7 +3522,7 @@ mod tests {
         a.add_peer_addr(b.endpoint_addr()).await;
         let _stream = a.open_stream(b.node_id(), Alpn::Bao).await?;
 
-        let status = wait_for_open_connections(&a, 1).await;
+        let status = await_open_connections(&a, 1).await;
         assert!(status.connections.iter().any(|peer| {
             peer.node_id == b.node_id()
                 && peer.status == PeerConnectionStatus::Connected
@@ -3619,7 +3595,7 @@ mod tests {
         )
         .await?;
 
-        let status = wait_for_bootstrap_failure(&handle).await;
+        let status = await_bootstrap_failure(&handle).await;
         assert!(status.requests.failures > 0);
         assert!(
             status
@@ -3646,7 +3622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_stream_target_is_managed_with_backoff() -> Result<()> {
+    async fn failed_target_backoff() -> Result<()> {
         let (handle, _dir) = test_net_handle().await?;
         let missing_peer = iroh::SecretKey::from_bytes(&[77u8; 32]).public();
 
@@ -3654,7 +3630,7 @@ mod tests {
             .open_stream(missing_peer, Alpn::Bao)
             .await
             .expect_err("missing peer should fail to connect");
-        let status = wait_for_peer_failure(&handle, missing_peer).await;
+        let status = await_peer_failure(&handle, missing_peer).await;
 
         assert!(matches!(err, NetError::Connection(_)));
         assert!(status.connections.iter().any(|peer| {

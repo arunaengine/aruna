@@ -49,7 +49,7 @@ async fn bucket_fanout_partial() {
 }
 
 #[tokio::test]
-async fn object_fanout_reports_partial_partitions() {
+async fn object_fanout_reports() {
     let directory = tempdir().unwrap();
     let context = DriverContext {
         storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
@@ -97,7 +97,7 @@ async fn object_fanout_reports_partial_partitions() {
 }
 
 #[tokio::test]
-async fn object_fanout_strict_fails_instead_of_downgrading() {
+async fn object_fanout_strict() {
     let directory = tempdir().unwrap();
     let context = DriverContext {
         storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),

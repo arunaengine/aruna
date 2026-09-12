@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::{
     AdvertisementEpoch, JobFamilyRecord, JobRecordKind, LaunchIntent, NodeInfoDocument, NodeUrls,
-    NodeUtilization, PlacementSubject, node_info_storage_key,
+    NodeUtilization, PlacementSubject, node_info_key,
 };
 use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, Value};
@@ -155,7 +155,7 @@ async fn advertise(ctx: &DriverContext, document: &NodeInfoDocument) {
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Write {
             key_space: NODE_INFO_KEYSPACE.to_string(),
-            key: Key::from(node_info_storage_key(document.node_id)),
+            key: Key::from(node_info_key(document.node_id)),
             value: Value::from(document.to_bytes().expect("document validates").as_slice()),
             txn_id: None,
         }))

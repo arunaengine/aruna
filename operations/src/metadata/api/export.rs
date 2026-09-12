@@ -1,14 +1,14 @@
-use super::read::{load_record_txn, metadata_graph_is_deleted};
+use super::read::{is_deleted, load_record_txn};
 use super::*;
 
-pub async fn get_visible_metadata_document(
+pub async fn get_visible_document(
     context: &DriverContext,
     realm_id: RealmId,
     request: GetVisibleMetadataDocumentRequest,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
-    let record = load_record_by_document(context, request.document_id).await?;
+    let record = load_document_record(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record, None).await?;
-    ensure_record_materialized_for_graph_read(context, &record).await?;
+    ensure_record_materialized(context, &record).await?;
     Ok(record)
 }
 
@@ -20,31 +20,27 @@ pub async fn export_metadata_rocrate(
     if request.view == MetadataRoCrateExportView::Raw {
         return export_raw(context, realm_id, request).await;
     }
-    let record = load_record_by_document(context, request.document_id).await?;
+    let record = load_document_record(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record, None).await?;
 
     match request.view {
         MetadataRoCrateExportView::Full => {
-            ensure_record_materialized_for_graph_read(context, &record).await?;
+            ensure_record_materialized(context, &record).await?;
             Ok(ExportMetadataRoCrateResult::Full {
                 jsonld: export_rocrate_jsonld(context, &record.graph_iri).await?,
                 record,
             })
         }
         MetadataRoCrateExportView::Summary => {
-            ensure_record_materialized_for_graph_read(context, &record).await?;
+            ensure_record_materialized(context, &record).await?;
             Ok(ExportMetadataRoCrateResult::Summary {
-                jsonld: export_rocrate_summary_jsonld(
-                    context,
-                    &record.graph_iri,
-                    record.last_event_id,
-                )
-                .await?,
+                jsonld: export_summary_jsonld(context, &record.graph_iri, record.last_event_id)
+                    .await?,
                 record,
             })
         }
         MetadataRoCrateExportView::Page => {
-            ensure_record_materialized_for_graph_read(context, &record).await?;
+            ensure_record_materialized(context, &record).await?;
             Ok(ExportMetadataRoCrateResult::Page {
                 page: export_rocrate_page(
                     context,
@@ -169,13 +165,13 @@ async fn export_rocrate_jsonld(
     handle
         .export_rocrate_jsonld(graph_iri.to_string())
         .await
-        .map_err(map_metadata_event_error)
+        .map_err(map_event_error)
 }
 
 /// Summaries are cached per `(graph_iri, cursor)`. The lookup carries no
 /// authorization data because it only runs once `can_read_record` accepted that
 /// record; it MUST NOT be moved above that check.
-pub(super) async fn export_rocrate_summary_jsonld(
+pub(super) async fn export_summary_jsonld(
     context: &DriverContext,
     graph_iri: &str,
     cursor: Ulid,
@@ -187,16 +183,16 @@ pub(super) async fn export_rocrate_summary_jsonld(
     // The handle rejects deleted graphs before every export, so a hit has to
     // re-check the authoritative lifecycle record itself.
     if let Some(summary) = summary_cache().get(graph_iri, cursor, Instant::now()) {
-        if !metadata_graph_is_deleted(context, graph_iri).await? {
+        if !is_deleted(context, graph_iri).await? {
             return Ok(summary.to_string());
         }
         summary_cache().remove(graph_iri);
     }
 
     let summary = handle
-        .export_rocrate_summary_jsonld(graph_iri.to_string())
+        .export_summary_jsonld(graph_iri.to_string())
         .await
-        .map_err(map_metadata_event_error)?;
+        .map_err(map_event_error)?;
     summary_cache().insert(graph_iri, cursor, &summary, Instant::now());
     Ok(summary)
 }
@@ -219,5 +215,5 @@ async fn export_rocrate_page(
     handle
         .export_rocrate_page(graph_iri.to_string(), limit, offset, after)
         .await
-        .map_err(map_metadata_event_error)
+        .map_err(map_event_error)
 }

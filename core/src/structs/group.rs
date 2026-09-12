@@ -1,7 +1,7 @@
 use crate::errors::ConversionError;
 use crate::structs::Actor;
 use crate::structs::realm::RealmId;
-use crate::structs::structs::{Permission, Role};
+use crate::structs::{Permission, Role};
 use crate::types::{GroupId, RoleId, UserId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -27,13 +27,13 @@ impl Group {
 
 /// Key in GROUP_OWNER_INDEX_KEYSPACE: owner storage key (realm + user ulid)
 /// followed by the group id, so a prefix scan counts a user's owned groups.
-pub fn group_owner_index_key(owner: UserId, group_id: GroupId) -> Vec<u8> {
+pub fn owner_index_key(owner: UserId, group_id: GroupId) -> Vec<u8> {
     let mut bytes = owner.to_storage_key();
     bytes.extend_from_slice(&group_id.to_bytes());
     bytes
 }
 
-pub fn group_owner_index_prefix(owner: UserId) -> Vec<u8> {
+pub fn owner_index_prefix(owner: UserId) -> Vec<u8> {
     owner.to_storage_key()
 }
 
@@ -47,7 +47,7 @@ pub struct GroupAuthorizationDocument {
 }
 
 impl GroupAuthorizationDocument {
-    pub fn new_default_group_doc(user_id: UserId, realm_id: RealmId, group_id: GroupId) -> Self {
+    pub fn default_group_doc(user_id: UserId, realm_id: RealmId, group_id: GroupId) -> Self {
         let mut roles = HashMap::new();
         let admin = Ulid::generate();
         roles.insert(
@@ -164,8 +164,8 @@ mod test {
     }
 
     #[test]
-    pub fn test_group_auth_doc_conversion() {
-        let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
+    pub fn group_auth_roundtrip() {
+        let auth_doc = GroupAuthorizationDocument::default_group_doc(
             UserId::local(Ulid::generate(), RealmId([0u8; 32])),
             RealmId([0u8; 32]),
             Ulid::generate(),

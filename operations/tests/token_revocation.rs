@@ -19,7 +19,7 @@ use aruna_core::structs::{
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::bearer_token::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_aruna_bearer_token,
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_bearer_token,
     realm_token_revoked,
 };
 use aruna_operations::auth::revoke_token::{
@@ -82,7 +82,7 @@ async fn peer_denies_token() -> TestResult<()> {
     let token_hash = bearer_token_hash(&token);
 
     let peer = peer_auth(&nodes[1], realm_id);
-    decode_aruna_bearer_token(&peer, &token)
+    decode_bearer_token(&peer, &token)
         .await
         .expect("peer accepts the token before it is revoked");
 
@@ -97,7 +97,7 @@ async fn peer_denies_token() -> TestResult<()> {
             expires_at,
             token_owner: user_id,
             admission: RevokeTokenAdmission::SelfService,
-            now: aruna_core::util::unix_timestamp_secs(),
+            now: aruna_core::time::unix_timestamp_secs(),
         }),
         nodes[0].context.as_ref(),
     )
@@ -114,7 +114,7 @@ async fn peer_denies_token() -> TestResult<()> {
     )
     .await?;
 
-    let error = decode_aruna_bearer_token(&peer, &token)
+    let error = decode_bearer_token(&peer, &token)
         .await
         .expect_err("peer rejects the revoked token");
     assert!(matches!(error, ArunaBearerTokenError::TokenRevoked));
@@ -123,13 +123,13 @@ async fn peer_denies_token() -> TestResult<()> {
     // state built fresh over the same storage still denies the token.
     let restarted = peer_auth(&nodes[1], realm_id);
     assert!(matches!(
-        decode_aruna_bearer_token(&restarted, &token).await,
+        decode_bearer_token(&restarted, &token).await,
         Err(ArunaBearerTokenError::TokenRevoked)
     ));
 
     // Only the revoked token is denied; the realm stays usable.
     let (other, _) = mint_token(&signing_key, realm_id, user_id);
-    decode_aruna_bearer_token(&peer, &other)
+    decode_bearer_token(&peer, &other)
         .await
         .expect("peer still accepts a token that was never revoked");
 
@@ -273,7 +273,7 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: RealmId) -> TestResu
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
     seed_sync_topic(nodes, realm_id, &config).await?;
     for node in nodes {

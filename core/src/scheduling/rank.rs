@@ -1,9 +1,6 @@
-//! Screening and ranking of one advertised target.
-//!
-//! Every screened advertisement is routed and scored. Only the best
-//! [`MAX_PLAN_CANDIDATES`] of the survivors are kept, so a drained,
-//! unauthorized, or unfit prefix can never hide a legal target behind the
-//! ranking bound.
+//! Screening and ranking of one advertised target. Every screened advertisement is routed and scored.
+//! Only the best [`MAX_PLAN_CANDIDATES`] of the survivors are kept, so a drained, unauthorized, or
+//! unfit prefix can never hide a legal target behind the ranking bound.
 
 use crate::compute::ExecutionTargetId;
 use crate::scheduling::cost::{self, InputRoute, LinkIndex};

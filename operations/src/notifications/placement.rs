@@ -41,7 +41,7 @@ pub fn resolve_inbox_holder(
         .next())
 }
 
-pub fn filter_locally_held_watch_subscriptions(
+pub fn filter_local_subscriptions(
     subscriptions: Vec<WatchSubscription>,
     realm_config: &RealmConfigDocument,
     local_node_id: NodeId,
@@ -118,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn holder_is_uniform_across_resolving_nodes() {
+    fn holder_uniform_nodes() {
         let u = user(5);
         let config = config_with(&[
             (node(1), RealmNodeKind::Server),
@@ -134,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn different_users_can_map_to_different_holders() {
+    fn users_choose_holders() {
         let config = config_with(&[
             (node(1), RealmNodeKind::Server),
             (node(2), RealmNodeKind::Server),
@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn user_nodes_are_never_holders() {
+    fn user_nodes_excluded() {
         let server = node(1);
         let user_node = node(2);
         let config = config_with(&[(server, RealmNodeKind::Server), (user_node, device())]);
@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn holder_re_ranks_when_eligible_set_changes() {
+    fn holder_reranks() {
         let all = [
             (node(1), RealmNodeKind::Server),
             (node(2), RealmNodeKind::Server),
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_eligible_set_yields_none() {
+    fn empty_set_none() {
         let only_users = config_with(&[(node(1), device()), (node(2), device())]);
         assert_eq!(resolve_inbox_holder(&user(1), &only_users).unwrap(), None);
 
@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn topic_id_is_domain_separated() {
+    fn topic_domain_separated() {
         let u = user(1);
         let other = user(2);
 

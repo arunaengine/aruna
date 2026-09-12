@@ -16,7 +16,7 @@ pub(crate) async fn persist_task_effect(
     storage: &StorageHandle,
     effect: &TaskEffect,
 ) -> Result<(), String> {
-    if timer_is_restored_from_durable_queue(effect) {
+    if timer_is_restored(effect) {
         return Ok(());
     }
 
@@ -30,7 +30,7 @@ pub(crate) async fn persist_task_effect(
 
 // Queue-backed tasks below re-arm from durable state, so their timer writes remain
 // redundant. The document-sync outbox keeps its retry deadline across restarts.
-fn timer_is_restored_from_durable_queue(effect: &TaskEffect) -> bool {
+fn timer_is_restored(effect: &TaskEffect) -> bool {
     let key = match effect {
         TaskEffect::ResetTimer { key, .. } | TaskEffect::ShortenTimer { key, .. } => key,
         _ => return false,
@@ -57,7 +57,7 @@ pub(crate) async fn delete_persisted_timer(storage: &StorageHandle, key: &TaskKe
     }
 }
 
-pub async fn restore_persisted_task_timers(storage: &StorageHandle, task_handle: &TaskHandle) {
+pub async fn restore_task_timers(storage: &StorageHandle, task_handle: &TaskHandle) {
     let mut start_after = None;
     loop {
         let event = storage
@@ -90,7 +90,7 @@ pub async fn restore_persisted_task_timers(storage: &StorageHandle, task_handle:
                 Ok(record) => record,
                 Err(error) => {
                     warn!(error = %error, "Failed to decode persisted task timer");
-                    delete_timer_by_key(storage, key_bytes).await;
+                    delete_timer(storage, key_bytes).await;
                     continue;
                 }
             };
@@ -158,7 +158,7 @@ async fn read_timer(
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: TASK_TIMER_KEYSPACE.to_string(),
-            key: task_key_storage_key(key)?,
+            key: task_storage_key(key)?,
             txn_id: None,
         })
         .await
@@ -175,7 +175,7 @@ async fn write_record(storage: &StorageHandle, record: &PersistedTaskTimer) -> R
     match storage
         .send_storage_effect(StorageEffect::Write {
             key_space: TASK_TIMER_KEYSPACE.to_string(),
-            key: task_key_storage_key(&record.key)?,
+            key: task_storage_key(&record.key)?,
             value: ByteView::from(
                 postcard::to_allocvec(record).map_err(|error| error.to_string())?,
             ),
@@ -190,11 +190,11 @@ async fn write_record(storage: &StorageHandle, record: &PersistedTaskTimer) -> R
 }
 
 async fn delete_timer(storage: &StorageHandle, key: &TaskKey) -> Result<(), String> {
-    delete_timer_by_key(storage, task_key_storage_key(key)?).await;
+    delete_timer(storage, task_storage_key(key)?).await;
     Ok(())
 }
 
-async fn delete_timer_by_key(storage: &StorageHandle, key: ByteView) {
+async fn delete_timer(storage: &StorageHandle, key: ByteView) {
     if let Event::Storage(StorageEvent::Error { error }) = storage
         .send_storage_effect(StorageEffect::Delete {
             key_space: TASK_TIMER_KEYSPACE.to_string(),
@@ -207,7 +207,7 @@ async fn delete_timer_by_key(storage: &StorageHandle, key: ByteView) {
     }
 }
 
-fn task_key_storage_key(key: &TaskKey) -> Result<ByteView, String> {
+fn task_storage_key(key: &TaskKey) -> Result<ByteView, String> {
     postcard::to_allocvec(key)
         .map(ByteView::from)
         .map_err(|error| error.to_string())
@@ -252,7 +252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restores_persisted_timer_to_new_task_handle() {
+    async fn restores_persisted_handle() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
             .expect("storage opens");
@@ -278,7 +278,7 @@ mod tests {
             }))
             .await;
 
-        restore_persisted_task_timers(&storage, &task_handle).await;
+        restore_task_timers(&storage, &task_handle).await;
         tokio::time::timeout(Duration::from_secs(1), notify.notified())
             .await
             .expect("restored timer should fire");
@@ -328,10 +328,9 @@ mod tests {
         assert!(shortened_timer.due_at_unix_millis < reset_timer.due_at_unix_millis);
 
         let task_handle = TaskHandle::new();
-        restore_persisted_task_timers(&storage, &task_handle).await;
-        let aruna_core::task::TaskEvent::TimerScheduled { after, .. } = task_handle
-            .schedule_timer_if_idle(key, Duration::ZERO)
-            .await
+        restore_task_timers(&storage, &task_handle).await;
+        let aruna_core::task::TaskEvent::TimerScheduled { after, .. } =
+            task_handle.schedule_idle_timer(key, Duration::ZERO).await
         else {
             panic!("expected restored timer");
         };
@@ -342,7 +341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_graph_prune_drain_timer_is_not_persisted() {
+    async fn metadata_graph_persisted() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
             .expect("storage opens");
@@ -361,7 +360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_notification_outbox_timer_reset_is_not_persisted() {
+    async fn drain_notification_persisted() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
             .expect("storage opens");
@@ -380,7 +379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_timer_reset_is_not_persisted() {
+    async fn prune_timer_persisted() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
             .expect("storage opens");
@@ -399,7 +398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_projection_timer_reset_is_persisted() {
+    async fn metadata_projection_persisted() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
             .expect("storage opens");
@@ -445,7 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_projection_timer_restores_to_new_task_handle() {
+    async fn metadata_projection_handle() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
             .expect("storage opens");
@@ -471,7 +470,7 @@ mod tests {
             }))
             .await;
 
-        restore_persisted_task_timers(&storage, &task_handle).await;
+        restore_task_timers(&storage, &task_handle).await;
         tokio::time::timeout(Duration::from_secs(1), notify.notified())
             .await
             .expect("restored timer should fire");

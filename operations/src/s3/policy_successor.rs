@@ -2,7 +2,7 @@
 //! version: it mints a successor and advances the head from an exact pointer, with
 //! the VersionId durably assigned under `mutation_id` so retries resolve to it.
 
-use crate::blob::blob_storage::HeadAliasContext;
+use crate::blob::records::HeadAliasContext;
 use crate::blob::managed_copy::{
     COPY_PAGE_LIMIT, CopyRegistration, CopyRequest, ManagedCopyError, ManagedCopyPage,
     register_entry, scan_effect, validate_registration, version_scope,
@@ -564,9 +564,7 @@ impl SuccessorMint {
             self.plan.version_key(version_id).to_bytes()?.into(),
             successor.to_bytes()?.into(),
         ));
-        // The head was read and written inside this transaction against the
-        // exact expected pointer, so the successor always advances one
-        // generation and can never contend with a local same-generation write.
+        // The expected pointer makes this transaction advance exactly one generation.
         writes.push((
             BLOB_HEAD_KEYSPACE.to_string(),
             self.plan.context.head_key().to_bytes()?.into(),
@@ -596,7 +594,7 @@ impl SuccessorMint {
                 HASH_PATHS_INDEX_KEYSPACE.to_string(),
                 self.plan
                     .context
-                    .hash_path_index_key(hash, version_id)
+                    .path_index_key(hash, version_id)
                     .to_bytes()?
                     .into(),
                 Vec::new().into(),
@@ -992,7 +990,7 @@ mod tests {
         CapturedDefault, MintPolicySuccessorOperation, MintState, SuccessorError, SuccessorMint,
         SuccessorOutcome, SuccessorPlan, successor_version,
     };
-    use crate::blob::blob_storage::HeadAliasContext;
+    use crate::blob::records::HeadAliasContext;
     use crate::s3::purge_fence::PurgeFenceError;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
@@ -1775,9 +1773,7 @@ mod tests {
 
     #[test]
     fn refuses_over_ceiling() {
-        // The successor books its own bytes, so a mint that would put the
-        // owning group past its hard ceiling must fail before the counters
-        // commit.
+        // Successor bytes must fit the group ceiling before counters commit.
         let policy = verified(1, Some(node_id()));
         let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
         mint.plan.resolved = resolution(&policy);

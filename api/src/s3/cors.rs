@@ -18,7 +18,7 @@ pub(crate) struct MatchedCorsRule {
     pub max_age_seconds: Option<i32>,
 }
 
-pub(crate) fn dto_to_bucket_cors(
+pub(crate) fn parse_bucket_cors(
     input: CORSConfiguration,
 ) -> Result<BucketCorsConfiguration, S3Error> {
     if input.cors_rules.is_empty() {
@@ -31,18 +31,14 @@ pub(crate) fn dto_to_bucket_cors(
     let rules = input
         .cors_rules
         .into_iter()
-        .map(dto_rule_to_bucket_rule)
+        .map(parse_cors_rule)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(BucketCorsConfiguration { rules })
 }
 
-pub(crate) fn bucket_cors_to_get_output(config: BucketCorsConfiguration) -> GetBucketCorsOutput {
-    let cors_rules = config
-        .rules
-        .into_iter()
-        .map(bucket_rule_to_dto_rule)
-        .collect();
+pub(crate) fn map_bucket_cors(config: BucketCorsConfiguration) -> GetBucketCorsOutput {
+    let cors_rules = config.rules.into_iter().map(map_cors_rule).collect();
 
     GetBucketCorsOutput {
         cors_rules: Some(cors_rules),
@@ -104,7 +100,7 @@ pub(crate) fn parse_requested_headers(raw_headers: &str) -> Vec<String> {
         .collect()
 }
 
-fn dto_rule_to_bucket_rule(rule: CORSRule) -> Result<BucketCorsRule, S3Error> {
+fn parse_cors_rule(rule: CORSRule) -> Result<BucketCorsRule, S3Error> {
     if rule.allowed_methods.is_empty() || rule.allowed_origins.is_empty() {
         return Err(s3_error!(
             MalformedXML,
@@ -142,7 +138,7 @@ fn dto_rule_to_bucket_rule(rule: CORSRule) -> Result<BucketCorsRule, S3Error> {
     })
 }
 
-fn bucket_rule_to_dto_rule(rule: BucketCorsRule) -> CORSRule {
+fn map_cors_rule(rule: BucketCorsRule) -> CORSRule {
     CORSRule {
         allowed_headers: (!rule.allowed_headers.is_empty())
             .then_some(rule.allowed_headers.into_iter().collect()),
@@ -257,7 +253,7 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 pub(crate) fn build_preflight_response(matched_rule: MatchedCorsRule) -> HttpResponse {
     let mut response = HttpResponse::new(s3s::Body::empty());
     *response.status_mut() = StatusCode::NO_CONTENT;
-    append_allow_origin_and_methods(&mut response, &matched_rule);
+    append_cors_allowance(&mut response, &matched_rule);
     if !matched_rule.allow_headers.is_empty() {
         append_header(
             &mut response,
@@ -276,18 +272,15 @@ pub(crate) fn build_preflight_response(matched_rule: MatchedCorsRule) -> HttpRes
     response
 }
 
-pub(crate) fn build_preflight_forbidden_response() -> HttpResponse {
+pub(crate) fn forbidden_preflight_response() -> HttpResponse {
     let mut response = HttpResponse::new(s3s::Body::empty());
     *response.status_mut() = StatusCode::FORBIDDEN;
     append_vary_headers(response.headers_mut(), S3_PREFLIGHT_VARY);
     response
 }
 
-pub(crate) fn inject_actual_cors_headers(
-    response: &mut HttpResponse,
-    matched_rule: MatchedCorsRule,
-) {
-    append_allow_origin_and_methods(response, &matched_rule);
+pub(crate) fn inject_cors_headers(response: &mut HttpResponse, matched_rule: MatchedCorsRule) {
+    append_cors_allowance(response, &matched_rule);
     if !matched_rule.expose_headers.is_empty() {
         append_header(
             response,
@@ -298,7 +291,7 @@ pub(crate) fn inject_actual_cors_headers(
     append_vary_headers(response.headers_mut(), &[header::ORIGIN]);
 }
 
-fn append_allow_origin_and_methods(response: &mut HttpResponse, matched_rule: &MatchedCorsRule) {
+fn append_cors_allowance(response: &mut HttpResponse, matched_rule: &MatchedCorsRule) {
     append_header(
         response,
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -323,7 +316,7 @@ mod tests {
     use http::header::VARY;
 
     #[test]
-    fn converts_cors_configuration_between_dto_and_core() {
+    fn cors_configuration_roundtrips() {
         let dto = CORSConfiguration {
             cors_rules: vec![CORSRule {
                 allowed_headers: Some(vec!["content-type".to_string(), "x-amz-meta-*".to_string()]),
@@ -335,12 +328,12 @@ mod tests {
             }],
         };
 
-        let core = dto_to_bucket_cors(dto.clone()).unwrap();
+        let core = parse_bucket_cors(dto.clone()).unwrap();
         assert_eq!(core.rules.len(), 1);
         assert_eq!(core.rules[0].allowed_methods, vec!["GET", "PUT"]);
         assert_eq!(core.rules[0].allowed_origins, vec!["https://example.org"]);
 
-        let output = bucket_cors_to_get_output(core);
+        let output = map_bucket_cors(core);
         let roundtrip = CORSConfiguration {
             cors_rules: output.cors_rules.unwrap(),
         };
@@ -348,11 +341,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_cors_configuration() {
-        let err = dto_to_bucket_cors(CORSConfiguration { cors_rules: vec![] }).unwrap_err();
+    fn invalid_cors_rejected() {
+        let err = parse_bucket_cors(CORSConfiguration { cors_rules: vec![] }).unwrap_err();
         assert_eq!(err.code(), &s3s::S3ErrorCode::MalformedXML);
 
-        let err = dto_to_bucket_cors(CORSConfiguration {
+        let err = parse_bucket_cors(CORSConfiguration {
             cors_rules: vec![CORSRule {
                 allowed_headers: None,
                 allowed_methods: vec!["OPTIONS".to_string()],
@@ -367,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_preflight_rules_with_case_insensitive_header_checks() {
+    fn preflight_matches_headers() {
         let config = BucketCorsConfiguration {
             rules: vec![BucketCorsRule {
                 id: None,
@@ -396,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_actual_rules_with_wildcard_origin() {
+    fn actual_matches_wildcard() {
         let config = BucketCorsConfiguration {
             rules: vec![BucketCorsRule {
                 id: None,
@@ -415,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_preflight_when_requested_header_is_not_allowed() {
+    fn preflight_rejects_header() {
         let config = BucketCorsConfiguration {
             rules: vec![BucketCorsRule {
                 id: None,
@@ -448,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_preflight_success_response_with_expected_headers() {
+    fn preflight_success_headers() {
         let response = build_preflight_response(matched_rule());
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -472,8 +465,8 @@ mod tests {
     }
 
     #[test]
-    fn builds_preflight_failure_response_without_allow_headers() {
-        let response = build_preflight_forbidden_response();
+    fn preflight_failure_headers() {
+        let response = forbidden_preflight_response();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(
@@ -489,14 +482,14 @@ mod tests {
     }
 
     #[test]
-    fn injects_actual_cors_headers_and_preserves_existing_vary_entries() {
+    fn cors_preserves_vary() {
         let mut response = HttpResponse::new(s3s::Body::empty());
         *response.status_mut() = StatusCode::OK;
         response
             .headers_mut()
             .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
 
-        inject_actual_cors_headers(&mut response, matched_rule());
+        inject_cors_headers(&mut response, matched_rule());
 
         assert_eq!(
             response.headers()["access-control-allow-origin"],

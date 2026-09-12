@@ -1,14 +1,10 @@
-//! Realm-admin placement-policy administration.
-//!
-//! Every handler here only validates transport input, builds an operation
-//! configuration and maps domain errors: authorization, ref authentication and
-//! all transactional rules live in the operations. None of these surfaces is
-//! reachable without a realm bearer token, so policy ids never leak to a public
-//! S3 caller.
+//! Realm-admin placement policy transport and domain-error mapping.
+//! Operations own authorization, reference authentication, and transactional rules.
+//! Realm bearer authentication prevents policy identifiers from reaching public S3 callers.
 
 use crate::auth::{ValidatedArunaBearerTokenCarrier, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::metadata::forwarded_auth_token;
+use crate::metadata::forwarded_auth_token;
 use crate::server_state::ServerState;
 use aruna_core::structs::{
     Actor, AuthContext, CurrentVersionPointer, LabelMatch, PlacementPolicy,
@@ -77,10 +73,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(resolve_placement_quarantine))
 }
 
-/// A rule reference: the immutable policy id plus the digest of its definition.
-/// Both are required, because an id alone could be answered with other bytes.
-/// `name` and `owner_group_id` are what this node resolved for the id and are
-/// null when it holds no such rule; a request body may omit both.
+/// Identifies an immutable policy by identifier and definition digest.
+/// Resolved `name` and `owner_group_id` are null when this node lacks the rule.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct PolicyRefBody {
     pub policy_id: String,
@@ -641,11 +635,8 @@ fn bulk_status(status: PolicyBulkStatus) -> String {
     .to_string()
 }
 
-/// This node's advertised placement subject, without which nothing governed may
-/// be minted here. A node that is blocked or draining is refused up front, so a
-/// run is never started where the first mint would immediately stop it.
-/// The boundary check the operations repeat: realm configuration writers and
-/// the admins of the bucket's group may change its placement.
+/// Requires this node to advertise the subject and accept new governed work.
+/// Realm configuration writers and bucket-group admins may change placement.
 async fn ensure_placement_writer(
     state: &ServerState,
     auth: &AuthContext,
@@ -1147,7 +1138,7 @@ pub async fn get_object_placement(
     crate::auth::ensure_permission(
         &state,
         &auth,
-        aruna_core::structs::blob_object_permission_path(
+        aruna_core::structs::object_permission_path(
             auth.realm_id,
             info.group_id,
             state.get_node_id(),
@@ -1259,7 +1250,7 @@ pub async fn mint_object_placement(
         Ulid::from_string(&request.expected_version_id).map_err(|_| ServerError::BadRequest)?;
     let outcome = drive(
         PolicyMutationOperation::new(PolicyMutationConfig {
-            context: aruna_operations::blob::blob_storage::HeadAliasContext::new(
+            context: aruna_operations::blob::records::HeadAliasContext::new(
                 auth.realm_id,
                 info.group_id,
                 state.get_node_id(),
@@ -2001,13 +1992,12 @@ mod test_routes {
             &state,
             AUTH_KEYSPACE,
             realm_id.as_bytes().to_vec(),
-            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+            RealmAuthorizationDocument::default_realm_doc(realm_id)
                 .to_bytes(&actor)
                 .expect("realm auth serializes"),
         )
         .await;
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
         write_fixture(
             &state,
             AUTH_KEYSPACE,

@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::storage_entries::notification_outbox_write_entry;
+use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::{NotificationOutboxRecord, NotificationRecord};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -11,7 +11,7 @@ use smallvec::smallvec;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::notifications::outbox::schedule_notification_outbox_drain_effect;
+use crate::notifications::outbox::schedule_drain_effect;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EmitNotificationsInput {
@@ -63,7 +63,7 @@ impl EmitNotificationsOperation {
                 outbox_id: Ulid::generate(),
                 record: record.clone(),
             };
-            match notification_outbox_write_entry(&outbox_record) {
+            match outbox_write_entry(&outbox_record) {
                 Ok(entry) => writes.push(entry),
                 Err(error) => warn!(%error, "Skipping unserializable notification outbox row"),
             }
@@ -96,7 +96,7 @@ impl EmitNotificationsOperation {
             return self.drop_emission(got, Some(txn_id));
         };
         self.state = EmitNotificationsState::ScheduleDrain;
-        smallvec![schedule_notification_outbox_drain_effect()]
+        smallvec![schedule_drain_effect()]
     }
 
     fn handle_schedule_drain(&mut self, event: Event) -> Effects {
@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_writes_outbox_rows_and_finishes_ok() {
+    async fn emit_writes_outbox() {
         let (_tempdir, context) = context_with_storage();
         let records = vec![make_record(1, 2), make_record(1, 3)];
         let result = drive(
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_input_is_a_no_op() {
+    async fn empty_input_noop() {
         let (_tempdir, context) = context_with_storage();
         let result = drive(
             EmitNotificationsOperation::new(EmitNotificationsInput { records: vec![] }),
@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_error_at_start_transaction_finishes_ok() {
+    fn start_error_finishes() {
         let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
             records: vec![make_record(1, 2)],
         });
@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_error_at_batch_write_aborts_and_finishes_ok() {
+    fn write_error_aborts() {
         let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
             records: vec![make_record(1, 2)],
         });
@@ -309,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_error_at_commit_finishes_ok() {
+    fn commit_error_finishes() {
         let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
             records: vec![make_record(1, 2)],
         });
@@ -338,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn unexpected_event_is_swallowed() {
+    fn unexpected_event_swallowed() {
         let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
             records: vec![make_record(1, 2)],
         });
@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suboperation_wrapper_maps_to_notifications_emitted() {
+    async fn wrapper_maps_event() {
         let (_tempdir, context) = context_with_storage();
         let observed = drive(HostOperation::new(make_record(1, 2)), &context)
             .await
@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_drive_is_not_deduplicated() {
+    async fn duplicate_drive_repeats() {
         let (_tempdir, context) = context_with_storage();
         let record = make_record(1, 2);
         for _ in 0..2 {
@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_schedules_drain_then_finishes() {
+    fn commit_schedules_drain() {
         let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
             records: vec![make_record(1, 2)],
         });
@@ -470,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_schedule_drain_swallows_task_error() {
+    fn drain_error_swallowed() {
         let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
             records: vec![make_record(1, 2)],
         });
@@ -494,7 +494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_schedules_drain_timer_after_commit_end_to_end() {
+    async fn emit_schedules_drain() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let task_handle = TaskHandle::new();

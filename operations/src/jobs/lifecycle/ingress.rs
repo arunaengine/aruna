@@ -10,10 +10,10 @@ use aruna_core::structs::{
     AuthContext, CapturedInput, ExecutionSpec, JobAdmissionRecord, JobFamilyId, JobFamilyRecord,
     JobId, JobRecordEnvelope, JobRecordKind, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
     OutputDestination, Permission, RealmConfigDocument, SubmissionClaim, SubmissionId,
-    WorkspaceMode, blob_group_permission_path,
+    WorkspaceMode, group_permission_path,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{NodeId, UserId};
-use aruna_core::util::unix_timestamp_millis;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -837,7 +837,7 @@ async fn authorize_group(
         context,
         auth.realm_id,
         auth,
-        &blob_group_permission_path(auth.realm_id, request.spec.group_id, local),
+        &group_permission_path(auth.realm_id, request.spec.group_id, local),
         &Permission::WRITE,
         PolicyRequestExtras::rest(),
     )

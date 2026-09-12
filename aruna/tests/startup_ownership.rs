@@ -1,54 +1,96 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+
+#[path = "../../api/tests/support/syntax.rs"]
+mod syntax;
+
 const MAIN_SOURCE: &str = include_str!("../src/main.rs");
-const TASK_SOURCE: &str = concat!(
-    include_str!("../../operations/src/tasks/incoming/restore.rs"),
-    include_str!("../../operations/src/tasks/incoming/outbox.rs"),
-    include_str!("../../operations/src/tasks/incoming/mod.rs"),
-);
 
 #[test]
 fn startup_ownership() {
-    let recovery = MAIN_SOURCE
-        .find(".recover_stale_jobs(")
-        .expect("main must recover stale jobs");
-    let runtime = MAIN_SOURCE
-        .find("jobs_runtime.start();")
-        .expect("main must start the jobs runtime");
-    let queues = MAIN_SOURCE
-        .find("task_queues.start(&shutdown).await;")
-        .expect("main must start task queues");
-    let timer = MAIN_SOURCE
-        .find("restore_job_queue_timer(")
-        .expect("main must restore the job timer");
+    let main = syntax::production(MAIN_SOURCE);
 
-    assert_eq!(MAIN_SOURCE.matches(".recover_stale_jobs(").count(), 1);
-    assert_eq!(MAIN_SOURCE.matches("restore_job_queue_timer(").count(), 1);
+    assert_eq!(count(&main, ".recover_stale_jobs("), 1);
+    assert_eq!(count(&main, "restore_drain_timer("), 1);
+
+    let recovery = position(&main, ".recover_stale_jobs(");
+    let runtime = position(&main, "jobs_runtime.start();");
+    let queues = position(&main, "task_queues.start(&shutdown).await;");
+    let timer = position(&main, "restore_drain_timer(");
     assert!(recovery < runtime && runtime < queues && queues < timer);
 
-    let task_prod = TASK_SOURCE
-        .split_once("\n#[cfg(test)]\nmod tests")
-        .map(|(source, _)| source)
-        .expect("task production boundary must exist");
-    assert_eq!(task_prod.matches(".recover_stale_jobs(").count(), 0);
-    assert_eq!(task_prod.matches("restore_job_queue_timer(").count(), 1);
+    let tasks = task_sources();
+    for required in ["mod.rs", "outbox.rs", "restore.rs"] {
+        assert!(
+            tasks.contains_key(required),
+            "task source {required} is missing"
+        );
+    }
 
-    let queues_start = task_prod
-        .find("impl TaskQueues {")
-        .expect("TaskQueues implementation must exist");
-    let queues_end = task_prod[queues_start..]
-        .find("/// Kicks the installed document-sync drain owner")
-        .map(|offset| queues_start + offset)
-        .expect("TaskQueues implementation boundary must exist");
-    let queues_source = &task_prod[queues_start..queues_end];
-    assert!(!queues_source.contains(".recover_stale_jobs("));
-    assert!(!queues_source.contains("restore_job_queue_timer("));
+    let task_recovery = tasks
+        .values()
+        .map(|source| count(source, ".recover_stale_jobs("))
+        .sum::<usize>();
+    let task_timer = tasks
+        .values()
+        .map(|source| count(source, "restore_drain_timer("))
+        .sum::<usize>();
+    assert_eq!(task_recovery, 0);
+    assert_eq!(task_timer, 1);
 
-    let rearm_start = task_prod
-        .find("async fn durable_rearm_loop(")
-        .expect("durable rearm loop must exist");
-    let rearm_end = task_prod[rearm_start..]
-        .find("\n}\n\n// A batch that processed nothing")
-        .map(|offset| rearm_start + offset)
-        .expect("durable rearm loop boundary must exist");
-    let rearm_source = &task_prod[rearm_start..rearm_end];
-    assert_eq!(rearm_source.matches("restore_job_queue_timer(").count(), 1);
+    let restore = &tasks["restore.rs"];
+    let queues_block = item_block(restore, "impl TaskQueues {");
+    assert_eq!(count(queues_block, ".recover_stale_jobs("), 0);
+    assert_eq!(count(queues_block, "restore_drain_timer("), 0);
+
+    let rearm = item_block(restore, "async fn durable_rearm_loop(");
+    assert_eq!(count(rearm, "restore_drain_timer("), 1);
+}
+
+/// Reads every production source beside the task module so a moved operation
+/// cannot hide in a new child file.
+fn task_sources() -> BTreeMap<String, String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../operations/src/tasks/incoming");
+    let mut sources = BTreeMap::new();
+
+    for entry in fs::read_dir(&dir).unwrap_or_else(|error| panic!("read {dir:?}: {error}")) {
+        let path = entry
+            .unwrap_or_else(|error| panic!("read entry: {error}"))
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .expect("task source has a file name")
+            .to_string_lossy()
+            .into_owned();
+        let source =
+            fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path:?}: {error}"));
+        sources.insert(name, syntax::production(&source));
+    }
+
+    assert!(!sources.is_empty(), "task source directory is empty");
+    sources
+}
+
+fn item_block<'a>(source: &'a str, needle: &str) -> &'a str {
+    let start = position(source, needle);
+    let open = source[start..]
+        .find('{')
+        .map(|at| start + at)
+        .unwrap_or_else(|| panic!("{needle} must have a body"));
+    let close = syntax::delimiter(source, open, b'{', b'}');
+    &source[start..=close]
+}
+
+fn position(source: &str, needle: &str) -> usize {
+    source
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle} must exist"))
+}
+
+fn count(source: &str, needle: &str) -> usize {
+    source.match_indices(needle).count()
 }

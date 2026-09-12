@@ -1,13 +1,13 @@
-use crate::blob::blob_storage::{
-    HeadAliasContext, add_hash_path_index_effect, blob_location_read,
-    build_head_transition_effects, write_blob_location_effect, write_blob_version_effect,
-};
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
+use crate::blob::records::{
+    HeadAliasContext, add_index_effect, blob_location_read, build_transition_effects,
+    write_location_effect, write_version_effect,
+};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::storage_routing::load_group_inputs;
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
-    schedule_usage_snapshot_publish_effect,
+    schedule_snapshot_publish,
 };
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
@@ -19,7 +19,7 @@ use crate::replication::protocol::{
     ReferenceAdvance, VersionReplicationManifest, VersionReplicationMessage,
 };
 use crate::replication::queue::{
-    LiveReplicationObligationRecord, live_obligation_effect, schedule_blob_replication_drain_effect,
+    LiveReplicationObligationRecord, live_obligation_effect, schedule_blob_drain,
 };
 use crate::s3::create_bucket::CreateBucketOperation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
@@ -38,7 +38,7 @@ use aruna_core::structs::{
     NodeRouting, PlacementPolicyRef, RealmConfigDocument, RealmId, ReclaimCandidate,
     ReclaimCandidateKey, ReplicationItemKind, ReplicationNegotiationResult, ResolvedBackend,
     RoCrateLimits, RoutingError, StorageRoutingRule, UsageDelta, VersionKey, WriteOwner,
-    blob_bucket_permission_path, blob_object_permission_path, resolve_backend,
+    bucket_permission_path, object_permission_path, resolve_backend,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, NodeId};
@@ -450,14 +450,14 @@ impl IncomingVersionReplicationOperation {
 
     fn target_authorization_path(&self, group_id: Ulid) -> String {
         if self.manifest.key.is_empty() {
-            blob_bucket_permission_path(
+            bucket_permission_path(
                 self.local_realm_id,
                 group_id,
                 self.local_node_id,
                 &self.manifest.bucket,
             )
         } else {
-            blob_object_permission_path(
+            object_permission_path(
                 self.local_realm_id,
                 group_id,
                 self.local_node_id,
@@ -481,7 +481,7 @@ impl IncomingVersionReplicationOperation {
         ))
     }
 
-    fn current_materialized_hash_from_manifest(&self) -> Option<[u8; 32]> {
+    fn current_manifest_hash(&self) -> Option<[u8; 32]> {
         if !self.manifest.current_version
             || self.manifest.kind != ReplicationItemKind::Materialized
             || self.manifest.reference_intent
@@ -623,7 +623,7 @@ impl IncomingVersionReplicationOperation {
             Ok(context) => context,
             Err(err) => return self.fail(err),
         };
-        let effects = match build_head_transition_effects(
+        let effects = match build_transition_effects(
             &context,
             self.pending_new_pointer.take(),
             self.pending_new_current_hash.take(),
@@ -635,10 +635,10 @@ impl IncomingVersionReplicationOperation {
 
         self.pending_head_transition_effects = effects.into_iter().collect();
         self.state = IncomingVersionReplicationState::ApplyHeadTransition;
-        self.emit_next_head_transition_effect_or_continue()
+        self.emit_head_transition()
     }
 
-    fn emit_next_head_transition_effect_or_continue(&mut self) -> Effects {
+    fn emit_head_transition(&mut self) -> Effects {
         if let Some(effect) = self.pending_head_transition_effects.pop_front() {
             return smallvec![effect];
         }
@@ -952,7 +952,7 @@ impl IncomingVersionReplicationOperation {
 
     fn read_replaced_metadata(&mut self) -> Effects {
         if self.replaced_version.is_none() {
-            return self.write_hash_lookup_or_continue();
+            return self.write_hash_lookup();
         }
         let prefix = match MultipartObjectMetadataKey::part_prefix(self.manifest.version_id) {
             Ok(prefix) => prefix.into(),
@@ -1041,7 +1041,7 @@ impl IncomingVersionReplicationOperation {
                 Err(error) => return self.fail(error),
             };
             let key = match context
-                .hash_path_index_key(*hash, self.manifest.version_id)
+                .path_index_key(*hash, self.manifest.version_id)
                 .to_bytes()
             {
                 Ok(key) => key.into(),
@@ -1121,9 +1121,9 @@ impl IncomingVersionReplicationOperation {
         Ok(())
     }
 
-    fn write_hash_lookup_or_continue(&mut self) -> Effects {
+    fn write_hash_lookup(&mut self) -> Effects {
         if self.is_reference_item() {
-            return self.write_object_lookup_or_continue();
+            return self.write_object_lookup();
         }
         if let Some(location) = self.received_blob_location.as_ref()
             && let Err(err) = self.validate_materialized_location(location)
@@ -1132,15 +1132,15 @@ impl IncomingVersionReplicationOperation {
         }
 
         if self.received_blob_location.is_none() && self.existing_blob_location.is_none() {
-            return self.write_object_lookup_or_continue();
+            return self.write_object_lookup();
         }
 
-        self.write_blob_location_or_continue()
+        self.write_blob_location()
     }
 
-    fn write_blob_location_or_continue(&mut self) -> Effects {
+    fn write_blob_location(&mut self) -> Effects {
         let Ok(location) = self.effective_materialized_location() else {
-            return self.write_object_lookup_or_continue();
+            return self.write_object_lookup();
         };
         if let Some(effect) = fence_backend(&location.backend, self.txn_id) {
             self.state = IncomingVersionReplicationState::FenceBackend;
@@ -1175,14 +1175,14 @@ impl IncomingVersionReplicationOperation {
 
     fn write_blob_location(&mut self) -> Effects {
         let Ok(location) = self.effective_materialized_location() else {
-            return self.write_object_lookup_or_continue();
+            return self.write_object_lookup();
         };
         let Some(blake3_hash) = location.get_blake3() else {
-            return self.write_object_lookup_or_continue();
+            return self.write_object_lookup();
         };
 
         self.state = IncomingVersionReplicationState::WriteBlobLocation;
-        let effect = match write_blob_location_effect(
+        let effect = match write_location_effect(
             match blake3_hash.try_into() {
                 Ok(hash) => hash,
                 Err(err) => return self.fail(ConversionError::from(err).into()),
@@ -1196,7 +1196,7 @@ impl IncomingVersionReplicationOperation {
         smallvec![effect]
     }
 
-    fn write_object_lookup_or_continue(&mut self) -> Effects {
+    fn write_object_lookup(&mut self) -> Effects {
         if !self.manifest.current_version {
             return self.write_version();
         }
@@ -1238,7 +1238,7 @@ impl IncomingVersionReplicationOperation {
         self.prepare_head_transition()
     }
 
-    fn write_object_lookup_after_compare(&mut self, existing: Option<&[u8]>) -> Effects {
+    fn write_compared_object(&mut self, existing: Option<&[u8]>) -> Effects {
         let Some(incoming_generation) = self.manifest.current_version_generation else {
             return self.write_version();
         };
@@ -1293,7 +1293,7 @@ impl IncomingVersionReplicationOperation {
         self.existing_current_pointer = existing_pointer.clone();
         if should_write {
             self.pending_new_pointer = Some(candidate.clone());
-            self.pending_new_current_hash = self.current_materialized_hash_from_manifest();
+            self.pending_new_current_hash = self.current_manifest_hash();
         } else {
             self.pending_new_pointer = None;
             self.pending_new_current_hash = None;
@@ -1301,7 +1301,7 @@ impl IncomingVersionReplicationOperation {
         self.resume_head_transition()
     }
 
-    /// Continues exactly where `write_object_lookup_after_compare` left off; the
+    /// Continues exactly where `write_compared_object` left off; the
     /// stored pointers carry the decision, so no continuation state is needed.
     fn resume_head_transition(&mut self) -> Effects {
         if self.pending_new_pointer.is_none() {
@@ -1370,7 +1370,7 @@ impl IncomingVersionReplicationOperation {
             ),
         };
 
-        let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
+        let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.fail(err.into()),
         };
@@ -1379,8 +1379,7 @@ impl IncomingVersionReplicationOperation {
                 Ok(context) => context,
                 Err(err) => return self.fail(err),
             };
-            match add_hash_path_index_effect(&context, hash, self.manifest.version_id, self.txn_id)
-            {
+            match add_index_effect(&context, hash, self.manifest.version_id, self.txn_id) {
                 Ok(index_effect) => self.pending_version_effects.push_back(index_effect),
                 Err(err) => return self.fail(err.into()),
             }
@@ -1409,7 +1408,7 @@ impl IncomingVersionReplicationOperation {
         smallvec![effect]
     }
 
-    fn write_multipart_metadata_or_continue(&mut self) -> Effects {
+    fn write_multipart_metadata(&mut self) -> Effects {
         let Some(multipart) = self.manifest.multipart.as_ref() else {
             return self.write_live_obligation();
         };
@@ -1691,7 +1690,7 @@ impl IncomingVersionReplicationOperation {
         self.release_id = None;
         if self.apply_committed {
             self.state = IncomingVersionReplicationState::ScheduleUsage;
-            smallvec![schedule_usage_snapshot_publish_effect()]
+            smallvec![schedule_snapshot_publish()]
         } else {
             self.send_apply_rejected()
         }
@@ -1709,7 +1708,7 @@ impl IncomingVersionReplicationOperation {
         }
     }
 
-    fn register_blob_in_dht_or_continue(&mut self) -> Effects {
+    fn register_blob_dht(&mut self) -> Effects {
         if self.is_reference_item() {
             return self.send_apply_complete();
         }
@@ -1731,7 +1730,7 @@ impl IncomingVersionReplicationOperation {
 
     fn finish_live_drain(&mut self) -> Effects {
         match self.manifest.kind {
-            ReplicationItemKind::Materialized => self.register_blob_in_dht_or_continue(),
+            ReplicationItemKind::Materialized => self.register_blob_dht(),
             ReplicationItemKind::DeleteMarker => self.send_apply_complete(),
         }
     }
@@ -1769,16 +1768,16 @@ impl IncomingVersionReplicationOperation {
         })]
     }
 
-    fn abort_transaction_or_close(&mut self) -> Effects {
+    fn abort_or_close(&mut self) -> Effects {
         if let Some(txn_id) = self.txn_id.take() {
             self.state = IncomingVersionReplicationState::AbortTransaction;
             smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         } else {
-            self.cleanup_received_blob_or_close()
+            self.cleanup_or_close()
         }
     }
 
-    fn cleanup_received_blob_or_close(&mut self) -> Effects {
+    fn cleanup_or_close(&mut self) -> Effects {
         if let Some(location) = self.cleanup_blob_location.take() {
             self.state = IncomingVersionReplicationState::CleanupReceivedBlob;
             smallvec![Effect::Blob(BlobEffect::Delete { location })]
@@ -2341,7 +2340,7 @@ impl Operation for IncomingVersionReplicationOperation {
                     ));
                 }
                 if self.advance_version_exists {
-                    return self.write_hash_lookup_or_continue();
+                    return self.write_hash_lookup();
                 }
                 self.read_replaced_metadata()
             }
@@ -2374,7 +2373,7 @@ impl Operation for IncomingVersionReplicationOperation {
                     Some(key) => self.write_replaced_candidate(key),
                     None => {
                         self.replaced_version = None;
-                        self.write_hash_lookup_or_continue()
+                        self.write_hash_lookup()
                     }
                 }
             }
@@ -2387,7 +2386,7 @@ impl Operation for IncomingVersionReplicationOperation {
                     });
                 };
                 self.replaced_version = None;
-                self.write_hash_lookup_or_continue()
+                self.write_hash_lookup()
             }
             IncomingVersionReplicationState::FenceBackend => match check_fence(event) {
                 Ok(()) => self.verify_existing_blob(),
@@ -2421,7 +2420,7 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
-                self.write_object_lookup_or_continue()
+                self.write_object_lookup()
             }
             IncomingVersionReplicationState::ReadObjectLookup => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
@@ -2450,7 +2449,7 @@ impl Operation for IncomingVersionReplicationOperation {
                     pointer_will_update,
                     "Compared destination current version pointer"
                 );
-                self.write_object_lookup_after_compare(value.as_deref())
+                self.write_compared_object(value.as_deref())
             }
             IncomingVersionReplicationState::ReadCurrentVersion => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
@@ -2478,9 +2477,7 @@ impl Operation for IncomingVersionReplicationOperation {
             }
             IncomingVersionReplicationState::ApplyHeadTransition => match event {
                 Event::Storage(StorageEvent::WriteResult { .. })
-                | Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                    self.emit_next_head_transition_effect_or_continue()
-                }
+                | Event::Storage(StorageEvent::DeleteResult { .. }) => self.emit_head_transition(),
                 _ => self.fail(IncomingVersionReplicationError::InvalidStateEvent {
                     state: self.state_name(),
                     expected: "Event::Storage(StorageEvent::{WriteResult|DeleteResult})",
@@ -2498,7 +2495,7 @@ impl Operation for IncomingVersionReplicationOperation {
                 if let Some(effect) = self.pending_version_effects.pop_front() {
                     return smallvec![effect];
                 }
-                self.write_multipart_metadata_or_continue()
+                self.write_multipart_metadata()
             }
             IncomingVersionReplicationState::WriteMultipartMetadata => {
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
@@ -2590,7 +2587,7 @@ impl Operation for IncomingVersionReplicationOperation {
                         smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
                     } else {
                         self.state = IncomingVersionReplicationState::ScheduleUsage;
-                        smallvec![schedule_usage_snapshot_publish_effect()]
+                        smallvec![schedule_snapshot_publish()]
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.handle_commit_failure(error),
@@ -2604,12 +2601,12 @@ impl Operation for IncomingVersionReplicationOperation {
                 Event::Task(TaskEvent::TimerScheduled { .. })
                 | Event::Task(TaskEvent::Error { .. }) => {
                     self.state = IncomingVersionReplicationState::ScheduleLiveDrain;
-                    smallvec![schedule_blob_replication_drain_effect()]
+                    smallvec![schedule_blob_drain()]
                 }
                 other => {
                     warn!(event = ?other, "Incoming replication committed but usage scheduling returned an unexpected event");
                     self.state = IncomingVersionReplicationState::ScheduleLiveDrain;
-                    smallvec![schedule_blob_replication_drain_effect()]
+                    smallvec![schedule_blob_drain()]
                 }
             },
             IncomingVersionReplicationState::ScheduleLiveDrain => match event {
@@ -2628,7 +2625,7 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
-                self.abort_transaction_or_close()
+                self.abort_or_close()
             }
             IncomingVersionReplicationState::AbortTransaction => {
                 let Event::Storage(StorageEvent::TransactionAborted { .. }) = event else {
@@ -2638,7 +2635,7 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
-                self.cleanup_received_blob_or_close()
+                self.cleanup_or_close()
             }
             IncomingVersionReplicationState::CleanupReceivedBlob => match event {
                 Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
@@ -3016,7 +3013,7 @@ mod tests {
         }))
     }
 
-    fn advance_to_version_lookup(
+    fn advance_version_lookup(
         op: &mut IncomingVersionReplicationOperation,
         group_id: Ulid,
     ) -> Effect {
@@ -3185,7 +3182,7 @@ mod tests {
             manifest.clone(),
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
+        let _effects = advance_version_lookup(&mut op, Ulid::generate());
 
         let version = BlobVersion::materialized(
             manifest.blob.as_ref().unwrap().hash,
@@ -3218,7 +3215,7 @@ mod tests {
             manifest.clone(),
         );
 
-        let _effects = advance_to_version_lookup(&mut op, test_group_id());
+        let _effects = advance_version_lookup(&mut op, test_group_id());
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(
@@ -3248,7 +3245,7 @@ mod tests {
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, test_group_id());
+        let _effects = advance_version_lookup(&mut op, test_group_id());
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: None,
@@ -3341,7 +3338,7 @@ mod tests {
         assert!(manifest.writer_auth_context.is_none());
         let mut op = advance_operation(manifest, publisher);
 
-        advance_to_version_lookup(&mut op, test_group_id());
+        advance_version_lookup(&mut op, test_group_id());
         let existing = op.reference_version().unwrap();
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
@@ -3573,7 +3570,7 @@ mod tests {
         collision
             .metadata
             .insert("collision".to_string(), "true".to_string());
-        advance_to_version_lookup(&mut op, test_group_id());
+        advance_version_lookup(&mut op, test_group_id());
 
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
@@ -3595,7 +3592,7 @@ mod tests {
         let advance = manifest.reference_advance.unwrap();
         let mut op = advance_operation(manifest, publisher);
         let duplicate = op.reference_version().unwrap();
-        advance_to_version_lookup(&mut op, test_group_id());
+        advance_version_lookup(&mut op, test_group_id());
 
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
@@ -3834,7 +3831,7 @@ mod tests {
             test_realm_id(),
             manifest.clone(),
         );
-        let _effects = advance_to_version_lookup(&mut op, test_group_id());
+        let _effects = advance_version_lookup(&mut op, test_group_id());
         let mut metadata = manifest.reference_metadata.clone().unwrap();
         metadata.etag = Some("old-etag".to_string());
         let existing = BlobVersion::reference(
@@ -4015,7 +4012,7 @@ mod tests {
             test_realm_id(),
             manifest,
         );
-        let _effects = advance_to_version_lookup(&mut op, group_id);
+        let _effects = advance_version_lookup(&mut op, group_id);
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: None,
@@ -4097,7 +4094,7 @@ mod tests {
         )
         .with_routing(routing);
 
-        let _effects = advance_to_version_lookup(&mut op, group_id);
+        let _effects = advance_version_lookup(&mut op, group_id);
         let effects = advance_blob_lookup(&mut op);
         assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
         assert!(matches!(
@@ -4139,7 +4136,7 @@ mod tests {
         )
         .with_routing(routing);
 
-        let _effects = advance_to_version_lookup(&mut op, group_id);
+        let _effects = advance_version_lookup(&mut op, group_id);
         advance_blob_lookup(&mut op);
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
@@ -4170,7 +4167,7 @@ mod tests {
         )
         .with_routing(routing);
 
-        let _effects = advance_to_version_lookup(&mut op, group_id);
+        let _effects = advance_version_lookup(&mut op, group_id);
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: None,
@@ -4186,7 +4183,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_current_pointer_update_skips_current_pointer_overwrite() {
+    fn stale_pointer_skips() {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.current_version_generation = Some(10);
         let mut op = IncomingVersionReplicationOperation::new(
@@ -4213,7 +4210,7 @@ mod tests {
     }
 
     #[test]
-    fn current_manifest_without_pointer_generation_rejects_apply() {
+    fn rejects_missing_generation() {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.current_version_generation = None;
         let mut op = IncomingVersionReplicationOperation::new(
@@ -4256,7 +4253,7 @@ mod tests {
     }
 
     #[test]
-    fn unparsable_existing_current_pointer_rejects_apply() {
+    fn rejects_bad_pointer() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::generate(),
@@ -4283,7 +4280,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_current_pointer_update_still_writes_version_metadata() {
+    fn stale_pointer_writes() {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.current_version_generation = Some(1);
         let mut op = IncomingVersionReplicationOperation::new(
@@ -4308,7 +4305,7 @@ mod tests {
     }
 
     #[test]
-    fn write_version_preserves_manifest_source_binding() {
+    fn preserves_source_binding() {
         let source = make_source_binding();
         let mut manifest = make_manifest(ReplicationItemKind::Materialized);
         manifest.source = Some(source.clone());
@@ -4338,7 +4335,7 @@ mod tests {
     }
 
     #[test]
-    fn write_version_indexes_non_current_materialized_version_by_content_hash() {
+    fn indexes_noncurrent_version() {
         let mut manifest = make_manifest(ReplicationItemKind::Materialized);
         manifest.current_version = false;
         manifest.writer_auth_context = Some(manifest.auth_context.clone());
@@ -4438,7 +4435,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_current_pointer_generation_allows_rollback_to_older_version_id() {
+    fn newer_generation_rollback() {
         let existing_version_id = Ulid::from_bytes([9u8; 16]);
         let incoming_version_id = Ulid::from_bytes([1u8; 16]);
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
@@ -4578,7 +4575,7 @@ mod tests {
     }
 
     #[test]
-    fn same_generation_lower_ulid_skips_current_pointer_overwrite() {
+    fn lower_ulid_skips() {
         let existing_version_id = Ulid::from_bytes([9u8; 16]);
         let incoming_version_id = Ulid::from_bytes([1u8; 16]);
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
@@ -4606,7 +4603,7 @@ mod tests {
     }
 
     #[test]
-    fn target_authorization_path_uses_canonical_blob_path_format() {
+    fn canonical_auth_path() {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.bucket = "bucket-a".to_string();
         manifest.key = "nested/file.txt".to_string();
@@ -4622,7 +4619,7 @@ mod tests {
 
         assert_eq!(
             op.target_authorization_path(group_id),
-            aruna_core::structs::blob_object_permission_path(
+            aruna_core::structs::object_permission_path(
                 local_realm_id,
                 group_id,
                 local_node_id,
@@ -4633,7 +4630,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_blob_with_manifest_mismatch_requests_blob_transfer() {
+    fn mismatch_requests_transfer() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::generate(),
@@ -4642,7 +4639,7 @@ mod tests {
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
+        let _effects = advance_version_lookup(&mut op, Ulid::generate());
         let effects = advance_blob_lookup(&mut op);
         assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
         assert!(matches!(
@@ -4667,7 +4664,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_blob_requests_location_lookup_in_new_keyspace() {
+    fn missing_blob_location() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::generate(),
@@ -4676,7 +4673,7 @@ mod tests {
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
+        let _effects = advance_version_lookup(&mut op, Ulid::generate());
         let effects = advance_blob_lookup(&mut op);
 
         assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
@@ -4743,7 +4740,7 @@ mod tests {
         op.destination_group_id = Some(test_group_id());
         op.existing_blob_location = Some(make_location());
 
-        let effects = op.write_blob_location_or_continue();
+        let effects = op.write_blob_location();
         assert_eq!(
             op.state,
             IncomingVersionReplicationState::VerifyExistingBlob
@@ -4832,7 +4829,7 @@ mod tests {
     }
 
     #[test]
-    fn received_blob_manifest_mismatch_is_rejected_and_cleaned_up() {
+    fn rejects_mismatched_blob() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let stream_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
@@ -5108,7 +5105,7 @@ mod tests {
             .with_manifest_policy(Some(path.clone()))
             .with_writer_policy(Some(path));
 
-        let _effects = advance_to_version_lookup(&mut op, group_id);
+        let _effects = advance_version_lookup(&mut op, group_id);
         assert_eq!(
             op.state,
             IncomingVersionReplicationState::ReadExistingVersion
@@ -5116,7 +5113,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_marker_requests_version_only() {
+    fn delete_marker_only() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::generate(),
@@ -5125,7 +5122,7 @@ mod tests {
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
+        let _effects = advance_version_lookup(&mut op, Ulid::generate());
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: None,
@@ -5141,7 +5138,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_blob_requests_blob_transfer() {
+    fn missing_blob_transfer() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::generate(),
@@ -5150,7 +5147,7 @@ mod tests {
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
+        let _effects = advance_version_lookup(&mut op, Ulid::generate());
         let effects = advance_blob_lookup(&mut op);
         assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
         assert!(matches!(
@@ -5172,7 +5169,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_failures_send_explicit_rejection_before_abort() {
+    fn failure_rejects_first() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let stream_id = Ulid::generate();
         let txn_id = Ulid::generate();
@@ -5210,7 +5207,7 @@ mod tests {
     }
 
     #[test]
-    fn received_blobs_are_deleted_after_apply_failure_before_commit() {
+    fn failure_deletes_blobs() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let stream_id = Ulid::generate();
         let received = make_location();
@@ -5446,7 +5443,7 @@ mod tests {
     }
 
     #[test]
-    fn failures_without_received_blob_close_without_delete() {
+    fn failure_without_delete() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let stream_id = Ulid::generate();
         let txn_id = Ulid::generate();
@@ -5484,7 +5481,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_replication_does_not_delete_received_blob_on_late_failure() {
+    fn commit_preserves_blob() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let stream_id = Ulid::generate();
         let received = make_location();
@@ -5659,7 +5656,7 @@ mod gate_tests {
     }
 
     #[test]
-    fn no_subject_refuses_replica() {
+    fn missing_subject_refuses() {
         // A node that advertises no subject may hold nothing governed, so it
         // never invites the bytes.
         let rule = policy("eu-west");

@@ -19,8 +19,8 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
 use aruna_operations::metadata::list_documents::ListMetadataDocumentsOperation;
-use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
-use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::metadata::materialization_queue::process_materialization_batch;
+use aruna_operations::metadata::projector::replay_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
 use aruna_storage::{FjallPersistPolicy, FjallStorage};
 use tempfile::TempDir;
@@ -29,11 +29,10 @@ use ulid::Ulid;
 const CHILD_MODE_ENV: &str = "ARUNA_METADATA_RESTART_PERSISTENCE_CHILD";
 const CHILD_STORAGE_PATH_ENV: &str = "ARUNA_METADATA_RESTART_STORAGE_PATH";
 const CHILD_METADATA_PATH_ENV: &str = "ARUNA_METADATA_RESTART_METADATA_PATH";
-const CHILD_TEST_NAME: &str = "metadata_backend_restart_child_writes_and_flushes";
+const CHILD_TEST_NAME: &str = "child_writes_flushes";
 
 #[tokio::test]
-async fn metadata_backend_restart_persists_after_child_flush_without_destructors()
--> Result<(), Box<dyn std::error::Error>> {
+async fn restart_persists_flush() -> Result<(), Box<dyn std::error::Error>> {
     let storage_dir = TempDir::new()?;
     let metadata_dir = TempDir::new()?;
 
@@ -86,9 +85,8 @@ async fn metadata_backend_restart_persists_after_child_flush_without_destructors
 }
 
 #[tokio::test]
-#[ignore = "spawned by metadata_backend_restart_persists_after_child_flush_without_destructors"]
-async fn metadata_backend_restart_child_writes_and_flushes()
--> Result<(), Box<dyn std::error::Error>> {
+#[ignore = "spawned by restart_persists_flush"]
+async fn child_writes_flushes() -> Result<(), Box<dyn std::error::Error>> {
     if env::var(CHILD_MODE_ENV).ok().as_deref() != Some("1") {
         return Ok(());
     }
@@ -97,7 +95,7 @@ async fn metadata_backend_restart_child_writes_and_flushes()
     let metadata_path = child_path(CHILD_METADATA_PATH_ENV)?;
     let (context, actor, config) = build_context(&storage_path, &metadata_path)?;
     seed_realm_config(&context, &actor, &config).await?;
-    create_and_materialize_document(&context, actor, &config).await?;
+    create_materialized_document(&context, actor, &config).await?;
     context
         .metadata_handle
         .as_ref()
@@ -109,7 +107,7 @@ async fn metadata_backend_restart_child_writes_and_flushes()
     std::process::exit(0);
 }
 
-async fn create_and_materialize_document(
+async fn create_materialized_document(
     context: &Arc<DriverContext>,
     actor: Actor,
     config: &RealmConfigDocument,
@@ -135,9 +133,9 @@ async fn create_and_materialize_document(
     .await?;
     assert_eq!(created.record.document_id, document_id);
 
-    let replayed = replay_metadata_event_log(context.as_ref()).await?;
+    let replayed = replay_event_log(context.as_ref()).await?;
     assert_eq!(replayed, 1);
-    let materialized = process_metadata_materialization_batch(context.as_ref()).await?;
+    let materialized = process_materialization_batch(context.as_ref()).await?;
     assert_eq!(materialized.processed, 1);
     assert!(!materialized.has_more_due);
 
@@ -170,7 +168,7 @@ fn build_context(
     storage_path: &Path,
     metadata_path: &Path,
 ) -> Result<(Arc<DriverContext>, Actor, RealmConfigDocument), Box<dyn std::error::Error>> {
-    let storage_handle = FjallStorage::open_with_persist_policy(
+    let storage_handle = FjallStorage::open_with_policy(
         storage_path.to_str().ok_or("invalid storage path")?,
         FjallPersistPolicy::SyncAll,
     )?;
@@ -184,7 +182,7 @@ fn build_context(
         None,
         MetadataHandleOptions::default()
             .with_search_storage(MetadataSearchStorage::Disk)
-            .with_document_sync_persist_policy(FjallPersistPolicy::SyncAll),
+            .with_sync_policy(FjallPersistPolicy::SyncAll),
     )?;
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     config.seed_default_placement();

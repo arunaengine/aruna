@@ -19,7 +19,7 @@ fn idle_timeout_error(action: &'static str, timeout: Duration) -> io::Error {
     )
 }
 
-async fn with_transfer_idle_timeout<F, T>(
+async fn with_idle_timeout<F, T>(
     future: F,
     timeout_duration: Duration,
     action: &'static str,
@@ -51,7 +51,7 @@ impl<'a> SendStreamWrapper<'a> {
 impl AsyncStreamWriter for SendStreamWrapper<'_> {
     async fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
         debug!("Sending chunk with len: {}", data.len());
-        with_transfer_idle_timeout(
+        with_idle_timeout(
             async {
                 self.stream
                     .write_all(data)
@@ -66,7 +66,7 @@ impl AsyncStreamWriter for SendStreamWrapper<'_> {
     }
 
     async fn write_bytes(&mut self, data: Bytes) -> std::io::Result<()> {
-        with_transfer_idle_timeout(
+        with_idle_timeout(
             async {
                 self.stream
                     .write_all(&data)
@@ -81,7 +81,7 @@ impl AsyncStreamWriter for SendStreamWrapper<'_> {
     }
 
     async fn sync(&mut self) -> std::io::Result<()> {
-        with_transfer_idle_timeout(
+        with_idle_timeout(
             async {
                 self.stream
                     .flush()
@@ -115,7 +115,7 @@ impl AsyncStreamReader for RecvStreamWrapper<'_> {
         debug!("Receiving chunk with len: {}", len);
         // Read bytes into buffer
         let mut bs = vec![0u8; len];
-        with_transfer_idle_timeout(
+        with_idle_timeout(
             async {
                 self.stream
                     .read_exact(&mut bs)
@@ -133,7 +133,7 @@ impl AsyncStreamReader for RecvStreamWrapper<'_> {
     async fn read<const L: usize>(&mut self) -> std::io::Result<[u8; L]> {
         // Read bytes into buffer
         let mut bs = [0u8; L];
-        with_transfer_idle_timeout(
+        with_idle_timeout(
             async {
                 self.stream
                     .read_exact(&mut bs)
@@ -223,7 +223,7 @@ impl AsyncSliceWriter for BaoReadWriter {
 impl AsyncSliceWriter for OpenDalWriter {
     async fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
         self.check_offset(offset)?;
-        with_transfer_idle_timeout(
+        with_idle_timeout(
             async {
                 self.writer
                     .write(data.to_vec())
@@ -241,7 +241,7 @@ impl AsyncSliceWriter for OpenDalWriter {
 
     async fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> std::io::Result<()> {
         self.check_offset(offset)?;
-        with_transfer_idle_timeout(
+        with_idle_timeout(
             async {
                 self.writer
                     .write(data.clone())
@@ -307,7 +307,7 @@ impl OpenDalWriter {
     }
 
     pub async fn finalize(mut self) -> Result<(), BlobError> {
-        let close_result = with_transfer_idle_timeout(
+        let close_result = with_idle_timeout(
             async {
                 self.writer
                     .close()
@@ -346,7 +346,7 @@ impl AsyncSliceReader for OpenDalReader {
 
     async fn read_exact_at(&mut self, offset: u64, len: usize) -> std::io::Result<Bytes> {
         // Jump to offset
-        with_transfer_idle_timeout(
+        with_idle_timeout(
             self.stream.seek(std::io::SeekFrom::Start(offset)),
             self.idle_timeout,
             "seeking source blob for bao transfer",
@@ -355,7 +355,7 @@ impl AsyncSliceReader for OpenDalReader {
 
         // Read bytes into buffer
         let mut bs = vec![0u8; len];
-        with_transfer_idle_timeout(
+        with_idle_timeout(
             self.stream.read_exact(&mut bs),
             self.idle_timeout,
             "reading source blob chunk for bao transfer",
@@ -431,14 +431,14 @@ impl OpenDalReader {
 
 #[cfg(test)]
 mod tests {
-    use super::{BaoReadWriter, OpenDalWriter, idle_timeout_error, with_transfer_idle_timeout};
+    use super::{BaoReadWriter, OpenDalWriter, idle_timeout_error, with_idle_timeout};
     use iroh_io::AsyncSliceWriter;
     use std::io;
     use std::time::Duration;
 
     #[tokio::test]
-    async fn transfer_idle_timeout_returns_timed_out_error() {
-        let err = with_transfer_idle_timeout(
+    async fn reports_idle_timeout() {
+        let err = with_idle_timeout(
             std::future::pending::<io::Result<()>>(),
             Duration::from_millis(1),
             "reading bao chunk from network stream",
@@ -454,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_timeout_error_uses_timed_out_kind() {
+    fn idle_timeout_kind() {
         let err = idle_timeout_error(
             "writing replicated chunk to backend storage",
             Duration::from_secs(1800),

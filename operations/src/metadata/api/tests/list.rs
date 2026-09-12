@@ -16,7 +16,7 @@ async fn filters_graph_delete() {
     );
     write_entry(
         &test,
-        metadata_graph_lifecycle_write_entry(&tombstone).expect("lifecycle entry"),
+        graph_lifecycle_entry(&tombstone).expect("lifecycle entry"),
     )
     .await;
 
@@ -47,7 +47,7 @@ async fn filters_document_delete() {
     };
     write_entry(
         &test,
-        metadata_document_lifecycle_write_entry(&lifecycle).expect("lifecycle entry"),
+        document_lifecycle_entry(&lifecycle).expect("lifecycle entry"),
     )
     .await;
 
@@ -65,7 +65,7 @@ async fn rejects_bad_lifecycle() {
         &test,
         (
             METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            metadata_graph_lifecycle_key(&record.graph_iri),
+            graph_lifecycle_key(&record.graph_iri),
             ByteView::from(vec![1u8]),
         ),
     )
@@ -97,7 +97,7 @@ async fn foreign_lifecycle_rejected() {
         &test,
         (
             METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            metadata_graph_lifecycle_key(&graph_record.graph_iri),
+            graph_lifecycle_key(&graph_record.graph_iri),
             ByteView::from(postcard::to_allocvec(&tombstone).expect("tombstone encodes")),
         ),
     )
@@ -113,7 +113,7 @@ async fn foreign_lifecycle_rejected() {
         &test,
         (
             METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
-            metadata_document_lifecycle_key(document_record.document_id),
+            document_lifecycle_key(document_record.document_id),
             ByteView::from(postcard::to_allocvec(&lifecycle).expect("lifecycle encodes")),
         ),
     )
@@ -140,7 +140,7 @@ async fn group_scan_capped() {
     let first = public_record(group_id, Ulid::generate());
     let second = public_record(group_id, Ulid::generate());
     for record in [&first, &second] {
-        for entry in aruna_core::storage_entries::metadata_registry_write_entries(record)
+        for entry in aruna_core::storage_entries::registry_write_entries(record)
             .expect("registry entries encode")
         {
             write_entry(&test, entry).await;
@@ -194,7 +194,7 @@ async fn estimate_beyond_page() {
         seed_registry_cache(&test, &public_record(group_id, Ulid::generate())).await;
     }
 
-    let page = list_visible_metadata_documents(
+    let page = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -208,7 +208,7 @@ async fn estimate_beyond_page() {
     assert_eq!(page.total_returned, METADATA_ESTIMATE_MIN_LIMIT);
     assert_eq!(page.total_estimate, Some(seeded));
 
-    let tail = list_visible_metadata_documents(
+    let tail = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -233,7 +233,7 @@ async fn lookup_omits_estimate() {
         seed_registry_cache(&test, &public_record(group_id, Ulid::generate())).await;
     }
 
-    let lookup = list_visible_metadata_documents(
+    let lookup = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -246,7 +246,7 @@ async fn lookup_omits_estimate() {
     assert_eq!(lookup.total_returned, 3);
     assert_eq!(lookup.total_estimate, None);
 
-    let browse = list_visible_metadata_documents(
+    let browse = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -270,7 +270,7 @@ async fn estimate_skips_private() {
     private.public = false;
     seed_registry_cache(&test, &private).await;
 
-    let result = list_visible_metadata_documents(
+    let result = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         summary_request(group_id, false),
@@ -321,7 +321,7 @@ async fn cross_shard_unknown() {
     seed_registry_cache(&test, &first).await;
     seed_registry_cache(&test, &second).await;
 
-    let listed = list_visible_metadata_documents(
+    let listed = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         summary_request(group_id, false),
@@ -476,7 +476,7 @@ async fn hidden_ids_match() {
     let missing = public_record(group_id, Ulid::generate());
 
     for document_id in [public.document_id, private.document_id, missing.document_id] {
-        let result = get_visible_metadata_document(
+        let result = get_visible_document(
             &test.context,
             TEST_REALM_ID,
             GetVisibleMetadataDocumentRequest {
@@ -515,7 +515,7 @@ async fn policy_hides_record() {
     seed_registry_cache(&test, &hidden).await;
     seed_registry_cache(&test, &visible).await;
 
-    let page = list_visible_metadata_documents(
+    let page = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -556,7 +556,7 @@ async fn stranger_sees_public() {
         seed_registry_cache(&test, &hidden).await;
     }
 
-    let page = list_visible_metadata_documents(
+    let page = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -570,7 +570,7 @@ async fn stranger_sees_public() {
     assert_eq!(page.total_returned, 1);
     assert_eq!(page.total_estimate, Some(1));
 
-    let beyond = list_visible_metadata_documents(
+    let beyond = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -610,7 +610,7 @@ async fn anonymous_sees_public() {
     hidden.public = false;
     seed_registry_cache(&test, &hidden).await;
 
-    let anonymous = list_visible_metadata_documents(
+    let anonymous = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         summary_request(group_id, false),
@@ -620,7 +620,7 @@ async fn anonymous_sees_public() {
     assert_eq!(listed_ids(&anonymous), vec![visible.document_id]);
     assert_eq!(anonymous.total_estimate, Some(1));
 
-    let signed = list_visible_metadata_documents(
+    let signed = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -663,7 +663,7 @@ async fn foreign_policy_identity() {
         session: None,
     };
 
-    let listed = list_visible_metadata_documents(
+    let listed = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -717,7 +717,7 @@ async fn estimate_counts_exact() {
     seed_registry_cache(&test, &allowed).await;
     seed_registry_cache(&test, &denied).await;
 
-    let page = list_visible_metadata_documents(
+    let page = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -731,7 +731,7 @@ async fn estimate_counts_exact() {
     assert_eq!(page.total_estimate, Some(1));
 
     // A targeted lookup still reports no estimate for the same caller.
-    let lookup = list_visible_metadata_documents(
+    let lookup = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -758,7 +758,7 @@ async fn estimate_honours_prefix() {
     other.document_path = "other/excluded".to_string();
     seed_registry_cache(&test, &other).await;
 
-    let result = list_visible_metadata_documents(
+    let result = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -800,7 +800,7 @@ async fn orders_recent_first() {
     let group_id = Ulid::generate();
     let records = seed_timed_records(&test, group_id).await;
 
-    let page = list_visible_metadata_documents(
+    let page = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -819,7 +819,7 @@ async fn orders_recent_first() {
         ]
     );
 
-    let second = list_visible_metadata_documents(
+    let second = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleMetadataDocumentsRequest {
@@ -841,7 +841,7 @@ async fn default_keeps_created() {
     let group_id = Ulid::generate();
     let records = seed_timed_records(&test, group_id).await;
 
-    let page = list_visible_metadata_documents(
+    let page = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         summary_request(group_id, false),
@@ -903,7 +903,7 @@ pub(super) async fn write_policy_docs(
         user_id: UserId::local(Ulid::generate(), TEST_REALM_ID),
         realm_id: TEST_REALM_ID,
     };
-    let realm_doc = RealmAuthorizationDocument::new_default_realm_doc(TEST_REALM_ID);
+    let realm_doc = RealmAuthorizationDocument::default_realm_doc(TEST_REALM_ID);
     let group = Group {
         display_name: "Test".to_string(),
         group_id,
@@ -916,9 +916,8 @@ pub(super) async fn write_policy_docs(
         roles,
         policies,
     };
-    // The policy evaluator reads the group through GetGroupOperation, which
-    // needs the group record as well as the auth doc, and fails closed
-    // without the realm config.
+    // The policy evaluator reads the group through GetGroupOperation, which needs the group
+    // record as well as the auth doc, and fails closed without the realm config.
     let entries = [
         (
             aruna_core::keyspaces::REALM_CONFIG_KEYSPACE,

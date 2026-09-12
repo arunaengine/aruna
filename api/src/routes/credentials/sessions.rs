@@ -5,7 +5,9 @@ use super::{
 use crate::auth::{ValidatedArunaBearerTokenCarrier, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{AuthContext, PathRestriction, S3_SESSION_ACCESS_PREFIX, S3Session};
+use aruna_core::structs::{
+    AuthContext, PathRestriction, S3_SESSION_ACCESS_PREFIX, S3Session, group_permission_path,
+};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::s3::session::{
@@ -249,7 +251,7 @@ pub async fn list_s3_sessions(
     description = r#"Rotates the secret and session token of an active S3 session inside its refresh window.
 
 **Authentication**: realm bearer token of the session's owner, who must still be a member of the
-session's group with effective WRITE on its data path.
+session's group with READ or WRITE on some path under its data root.
 
 **Behavior**
 - The access key id is kept while the signing secret and session token are rotated in place, so the
@@ -286,7 +288,7 @@ session's group with effective WRITE on its data path.
             })
         ),
         (status = 401, description = "Missing or invalid bearer token, or one with no remaining lifetime", body = ErrorResponse),
-        (status = 403, description = "The caller is no longer a member of the group, or lacks effective WRITE on its data path", body = ErrorResponse),
+        (status = 403, description = "The caller is no longer a member of the group, or lacks readable access under its data path", body = ErrorResponse),
         (status = 404, description = "Session not found on this node, or it belongs to another user", body = ErrorResponse),
         (status = 409, description = "The session is idle, expired, or not yet in its refresh window", body = ErrorResponse)
     ),
@@ -386,6 +388,7 @@ async fn session_scope(
     group_id: Ulid,
 ) -> ServerResult<Option<Vec<PathRestriction>>> {
     ensure_membership(state, auth, group_id).await?;
+    let group_root = group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
     let restrictions = build_credential_restrictions(auth, state, group_id, None).await?;
     authorize_credential_issuance(auth, state, group_id, restrictions.as_deref()).await?;
     Ok(restrictions.as_deref().map(serialize_restrictions))
@@ -670,7 +673,7 @@ mod tests {
             realm_id,
         };
         let authorization =
-            GroupAuthorizationDocument::new_default_group_doc(member, realm_id, group_id);
+            GroupAuthorizationDocument::default_group_doc(member, realm_id, group_id);
         let group = Group {
             display_name: "session-group".to_string(),
             group_id,

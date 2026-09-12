@@ -24,9 +24,8 @@ fn blocked_batch_waits() {
 
 #[test]
 fn reclaim_retry_climbs() {
-    // A failing sweep earns the fast retry, then doubles up to the normal
-    // interval so a candidate that always fails cannot hot-loop a full
-    // rescan every minute.
+    // A failing sweep earns the fast retry, then doubles up to the normal interval so a candidate that
+    // always fails cannot hot-loop a full rescan every minute.
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
@@ -167,7 +166,7 @@ async fn start_keeps_job() {
 
     let requested = Duration::from_secs(7200);
     let TaskEvent::TimerScheduled { after, .. } = task_handle
-        .schedule_timer_if_idle(TaskKey::DrainJobQueue, requested)
+        .schedule_idle_timer(TaskKey::DrainJobQueue, requested)
         .await
     else {
         panic!("expected timer schedule event");

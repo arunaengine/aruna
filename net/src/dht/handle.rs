@@ -316,7 +316,7 @@ mod tests {
     use crate::test_support::make_node;
 
     #[test]
-    fn add_peer_returns_queue_full_when_channel_saturated() {
+    fn peer_queue_saturation() {
         let (cmd_tx, _cmd_rx) = mpsc::bounded_blocking_async(1);
         let local_id = make_node(1);
         let handle = DhtHandle {

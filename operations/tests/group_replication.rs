@@ -36,7 +36,7 @@ struct TestNode {
 }
 
 #[tokio::test]
-async fn group_creation_replicates_to_all_realm_nodes() -> Result<(), Box<dyn std::error::Error>> {
+async fn creation_replicates_globally() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([31u8; 32]);
     let (nodes, _config) = build_realm_nodes(&realm_id, 3).await?;
 
@@ -56,21 +56,14 @@ async fn group_creation_replicates_to_all_realm_nodes() -> Result<(), Box<dyn st
     )
     .await?;
 
-    wait_for_group_convergence(&nodes, expected.0.group_id, &expected.0, &expected.1).await?;
+    wait_group_convergence(&nodes, expected.0.group_id, &expected.0, &expected.1).await?;
     shutdown_nodes(nodes).await;
     Ok(())
 }
 
-/// Five nodes at replication factor three, so a replica-capped bucket leaves real
-/// non-holders; the three- and four-node fixtures cannot see this class of bug,
-/// since there every node holds every bucket. The group is created on a node that
-/// holds none of the group id's bucket under the realm's capped default strategy:
-/// binding the group class to that strategy would leave the create unpublishable
-/// (its shard topic cannot exist locally), the outbox record undeliverable, and
-/// the group silently lost after an HTTP 200. Binding the class to `everywhere`
-/// instead is what makes this converge, including the authorization document,
-/// which `CheckPermissionsOperation` reads from the local `AUTH_KEYSPACE` and
-/// hard-fails without.
+/// Five nodes at replication factor three, so a replica-capped bucket leaves real non-holders;
+/// the three- and four-node fixtures cannot see this class of bug, since there every node holds
+/// every bucket.
 #[tokio::test]
 async fn unheld_group_replicates() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([33u8; 32]);
@@ -99,7 +92,7 @@ async fn unheld_group_replicates() -> Result<(), Box<dyn std::error::Error>> {
     }
     let expected = expected.ok_or("no group id hashed outside the origin's capped buckets")?;
 
-    wait_for_group_convergence(&nodes, expected.0.group_id, &expected.0, &expected.1).await?;
+    wait_group_convergence(&nodes, expected.0.group_id, &expected.0, &expected.1).await?;
 
     // What makes the create publishable from an origin the capped strategy would
     // have excluded: every node holds the group's real bucket.
@@ -242,12 +235,10 @@ async fn install_realm_config(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
-    // Config apply hook: the shard's rank-0 holder eagerly creates each shard
-    // topic genesis and every other holder pulls it (mirrors the production
-    // realm-config apply path). A holder whose rank-0 co-holder has not created
-    // the genesis yet defers, so run the hook until nothing is left pending.
+    // Config apply hook: the shard's rank-0 holder eagerly creates each shard topic genesis and
+    // every other holder pulls it (mirrors the production realm-config apply path).
     for _ in 0..5 {
         for node in nodes {
             aruna_operations::node::startup::restore_shard_subscriptions(
@@ -275,7 +266,7 @@ async fn install_realm_config(
     Ok(config)
 }
 
-async fn wait_for_group_convergence(
+async fn wait_group_convergence(
     nodes: &[TestNode],
     group_id: Ulid,
     expected_group: &Group,

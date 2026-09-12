@@ -28,9 +28,8 @@ fn admin_block_spans() {
     assert!(undeliverable.is_empty());
 }
 
-// A blocked admin operation blocks the rest of its origin sequence for the
-// whole rotation, whatever topic the later records ride: publishing a later
-// origin_seq first would drop the earlier one as StaleOriginSequence.
+// A blocked admin operation blocks its later origin sequence for the rotation across all topics.
+// Publishing a later sequence first would make the earlier record stale.
 #[test]
 fn admin_origin_blocks() {
     let origin = node(4);
@@ -89,11 +88,10 @@ fn topic_block_spans() {
     assert!(undeliverable.is_empty());
 }
 
-// Two FIFO-adjacent records for one shard topic must never split across a
-// defer/publish boundary, or a between-records availability flip would publish the
-// newer first and invert origin sequence. Availability is evaluated once per topic.
+// Evaluate topic availability once so adjacent records cannot split across defer and publish.
+// Publishing the newer record first would invert the origin sequence.
 #[test]
-fn drain_partition_never_splits_a_topic_when_availability_flips() {
+fn drain_partition_flips() {
     let topic = irokle::TopicId::hash(b"shard-genesis-race");
     let older = shard_topic_record(1);
     let newer = shard_topic_record(2);
@@ -126,11 +124,11 @@ fn drain_partition_never_splits_a_topic_when_availability_flips() {
 }
 
 #[test]
-fn outbox_upsert_maps_to_publish_with_revision() {
+fn outbox_upsert_revision() {
     let event_id = Ulid::from_parts(10, 1);
     let target = target();
     let change = change();
-    let publish = document_publish_from_outbox(
+    let publish = publish_from_outbox(
         event_id,
         target.clone(),
         DocumentSyncOutboxEvent::Upsert {
@@ -152,7 +150,7 @@ fn outbox_upsert_maps_to_publish_with_revision() {
 }
 
 #[test]
-fn partial_publish_indices_select_exact_outbox_records() {
+fn partial_publish_records() {
     let duplicate_target = target();
     let other_target = DocumentSyncTarget::Group {
         group_id: Ulid::from_parts(7, 2),
@@ -216,9 +214,9 @@ async fn topic_page_blocks() {
     let healthy_change = shard_change(51);
     let blocked_topic = blocked_target.sync_topic_id(realm_id, &blocked_change.placement);
     let healthy_topic = healthy_target.sync_topic_id(realm_id, &healthy_change.placement);
-    net.ensure_document_sync_topics(&[healthy_topic], Vec::new())
+    net.ensure_sync_topics(&[healthy_topic], Vec::new())
         .expect("healthy topic genesis");
-    let blocked = crate::sync::document_outbox::new_outbox_record_with_id(
+    let blocked = crate::sync::document_outbox::new_identified_record(
         Ulid::from_parts(1, 1),
         node(1),
         blocked_target,
@@ -230,7 +228,7 @@ async fn topic_page_blocks() {
         aruna_core::structs::PlacementRef::NIL,
         true,
     );
-    let healthy = crate::sync::document_outbox::new_outbox_record_with_id(
+    let healthy = crate::sync::document_outbox::new_identified_record(
         Ulid::from_parts(1, 2),
         node(1),
         healthy_target,
@@ -249,7 +247,7 @@ async fn topic_page_blocks() {
     let handler =
         OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 2);
 
-    handler.drain_document_sync_outbox().await;
+    handler.drain_sync_outbox().await;
     assert_eq!(
         read_outbox_record(&storage, &blocked_key)
             .await
@@ -260,7 +258,7 @@ async fn topic_page_blocks() {
         scheduled_after(&task_handle).await,
         OUTBOX_CONTINUATION_AFTER
     );
-    handler.drain_document_sync_outbox().await;
+    handler.drain_sync_outbox().await;
     assert_eq!(
         read_outbox_record(&storage, &healthy_key)
             .await
@@ -268,10 +266,10 @@ async fn topic_page_blocks() {
         None,
         "a later page may progress while the blocked topic is retained"
     );
-    net.ensure_document_sync_topics(&[blocked_topic], Vec::new())
+    net.ensure_sync_topics(&[blocked_topic], Vec::new())
         .expect("blocked topic genesis");
     for _ in 0..3 {
-        handler.drain_document_sync_outbox().await;
+        handler.drain_sync_outbox().await;
     }
     assert_eq!(
         read_outbox_record(&storage, &blocked_key)
@@ -314,7 +312,7 @@ async fn admin_page_blocks() {
     let healthy_placement = admin_placement(2);
     let blocked_topic = blocked_target.sync_topic_id(realm_id, &blocked_placement);
     let healthy_topic = healthy_target.sync_topic_id(realm_id, &healthy_placement);
-    net.ensure_document_sync_topics(&[healthy_topic], Vec::new())
+    net.ensure_sync_topics(&[healthy_topic], Vec::new())
         .expect("healthy topic genesis");
     let blocked = admin_outbox(realm_id, origin, 1, blocked_target, blocked_placement);
     let healthy = admin_outbox(realm_id, origin, 2, healthy_target, healthy_placement);
@@ -325,12 +323,12 @@ async fn admin_page_blocks() {
     let handler =
         OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 2);
 
-    handler.drain_document_sync_outbox().await;
+    handler.drain_sync_outbox().await;
     assert_eq!(
         scheduled_after(&task_handle).await,
         OUTBOX_CONTINUATION_AFTER
     );
-    handler.drain_document_sync_outbox().await;
+    handler.drain_sync_outbox().await;
     assert_eq!(
         read_outbox_record(&storage, &healthy_key)
             .await
@@ -338,10 +336,10 @@ async fn admin_page_blocks() {
         Some(healthy.clone()),
         "a later origin sequence must remain blocked across pages"
     );
-    net.ensure_document_sync_topics(&[blocked_topic], Vec::new())
+    net.ensure_sync_topics(&[blocked_topic], Vec::new())
         .expect("blocked topic genesis");
     for _ in 0..3 {
-        handler.drain_document_sync_outbox().await;
+        handler.drain_sync_outbox().await;
     }
     assert_eq!(
         read_outbox_record(&storage, &blocked_key)
@@ -600,7 +598,7 @@ async fn config_reloads_between() {
         placement,
         shard_target,
     } = config_setup().await;
-    handler.drain_document_sync_outbox().await;
+    handler.drain_sync_outbox().await;
     {
         let rotation = handler.rotation.lock().expect("rotation lock");
         assert!(rotation.cursor.is_some());
@@ -610,10 +608,10 @@ async fn config_reloads_between() {
     config.ensure_node(net.node_id(), RealmNodeKind::Server);
     write_realm_config(&storage, realm_id, &config, net.node_id()).await;
     let shard_topic = shard_target.sync_topic_id(realm_id, &placement);
-    net.ensure_document_sync_topics(&[shard_topic], Vec::new())
+    net.ensure_sync_topics(&[shard_topic], Vec::new())
         .expect("updated holder topic genesis");
 
-    handler.drain_document_sync_outbox().await;
+    handler.drain_sync_outbox().await;
     assert!(
         read_outbox_records(&storage, &[], None, 4)
             .await
@@ -637,7 +635,7 @@ fn outbox_bound_finite() {
 }
 
 #[test]
-fn drain_partition_publishes_all_records_of_an_available_topic_in_fifo_order() {
+fn drain_partition_order() {
     let topic = irokle::TopicId::hash(b"shard-genesis-present");
     let records = vec![
         (b"older".to_vec(), shard_topic_record(1), topic),
@@ -654,11 +652,10 @@ fn drain_partition_publishes_all_records_of_an_available_topic_in_fifo_order() {
     assert_eq!(keys, vec![b"older".to_vec(), b"newer".to_vec()]);
 }
 
-// A record for a bucket this node does not hold can never publish: it may
-// neither mint the topic's genesis nor join the topic. Deferring it forever
-// would be silent data loss, so it is separated out to be dropped loudly.
+// A non-holder can neither create nor join a bucket topic, so it cannot publish the record.
+// It is classified for reporting and retained unless a relay succeeds.
 #[test]
-fn unheld_bucket_records_are_undeliverable() {
+fn unheld_bucket_undeliverable() {
     let topic = irokle::TopicId::hash(b"unheld-bucket");
     let records = vec![
         (b"older".to_vec(), shard_topic_record(1), topic),
@@ -755,7 +752,7 @@ async fn blocked_keeps_backoff() {
     );
     write_outbox_record(&storage, &record).await;
 
-    handler.drain_document_sync_outbox().await;
+    handler.drain_sync_outbox().await;
 
     assert_eq!(
         scheduled_after(&task_handle).await,
@@ -772,9 +769,8 @@ async fn blocked_keeps_backoff() {
     shutdown_net(&net).await;
 }
 
-// A full first page of records for a genesis-less shard topic (all deferred)
-// must not starve records for other topics behind it in the FIFO: the drain
-// pages the whole outbox per run, so a later-page record still publishes.
+// A deferred first page must not starve later topics. Each drain scans the whole outbox,
+// allowing records on later pages to publish.
 #[tokio::test(start_paused = true)]
 async fn deferred_head_paginates() {
     let _clock = freeze_clock();
@@ -826,7 +822,7 @@ async fn deferred_head_paginates() {
     };
     let mut writes = Vec::with_capacity(OUTBOX_DRAIN_BATCH_SIZE + 1);
     for index in 0..OUTBOX_DRAIN_BATCH_SIZE {
-        let record = crate::sync::document_outbox::new_outbox_record_with_id(
+        let record = crate::sync::document_outbox::new_identified_record(
             Ulid::from_parts(1, index as u128),
             node(1),
             deferred_target.clone(),
@@ -844,7 +840,7 @@ async fn deferred_head_paginates() {
 
     // One later origin record for a shared (non-shard) topic, ordered
     // strictly after the head page, so only pagination reaches it.
-    let publish_record = crate::sync::document_outbox::new_outbox_record_with_id(
+    let publish_record = crate::sync::document_outbox::new_identified_record(
         Ulid::from_parts(2, 0),
         node(1),
         DocumentSyncTarget::RealmAuthorization { realm_id },
@@ -871,7 +867,7 @@ async fn deferred_head_paginates() {
     }
 
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    handler.drain_document_sync_outbox().await;
+    handler.drain_sync_outbox().await;
 
     assert_eq!(
         read_outbox_record(&storage, &publish_key)
@@ -903,7 +899,7 @@ async fn boundary_appends_wait() {
     let mut harness = BoundaryHarness::new().await;
     harness.seed_records().await;
 
-    harness.handler.drain_document_sync_outbox().await;
+    harness.handler.drain_sync_outbox().await;
     harness.assert_rotation(1, true, 1);
     assert_eq!(
         scheduled_after(&harness.task_handle).await,
@@ -911,7 +907,7 @@ async fn boundary_appends_wait() {
     );
 
     harness.append_records().await;
-    harness.handler.drain_document_sync_outbox().await;
+    harness.handler.drain_sync_outbox().await;
     harness.assert_rotation(2, true, 0);
     assert_eq!(
         scheduled_after(&harness.task_handle).await,
@@ -919,14 +915,14 @@ async fn boundary_appends_wait() {
     );
 
     harness.append_later().await;
-    harness.handler.drain_document_sync_outbox().await;
+    harness.handler.drain_sync_outbox().await;
     harness.assert_rotation(3, true, 1);
     assert_eq!(
         scheduled_after(&harness.task_handle).await,
         OUTBOX_CONTINUATION_AFTER
     );
 
-    harness.handler.drain_document_sync_outbox().await;
+    harness.handler.drain_sync_outbox().await;
     harness.assert_rotation(0, false, 0);
     harness.assert_appends().await;
     harness.finish_retry().await;
@@ -943,7 +939,7 @@ async fn rotation_streak() {
     tokio::time::pause();
     let target = DocumentSyncTarget::RealmAuthorization { realm_id };
     let topic = target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
-    net.ensure_document_sync_topics(&[topic], Vec::new())
+    net.ensure_sync_topics(&[topic], Vec::new())
         .expect("shared topic genesis");
     let task_handle = TaskHandle::new();
     let context = Arc::new(DriverContext {
@@ -961,7 +957,7 @@ async fn rotation_streak() {
     );
     let total = u128::from(OUTBOX_CONTINUATION_STREAK) + 2;
     for index in 1..=total {
-        let record = crate::sync::document_outbox::new_outbox_record_with_id(
+        let record = crate::sync::document_outbox::new_identified_record(
             Ulid::from_parts(1, index),
             node(1),
             target.clone(),
@@ -977,7 +973,7 @@ async fn rotation_streak() {
     }
 
     for expected in 1..=OUTBOX_CONTINUATION_STREAK {
-        handler.drain_document_sync_outbox().await;
+        handler.drain_sync_outbox().await;
         assert_eq!(
             handler
                 .rotation
@@ -991,7 +987,7 @@ async fn rotation_streak() {
             OUTBOX_CONTINUATION_AFTER
         );
     }
-    handler.drain_document_sync_outbox().await;
+    handler.drain_sync_outbox().await;
     assert_eq!(
         handler
             .rotation
@@ -1005,7 +1001,7 @@ async fn rotation_streak() {
         DOCUMENT_SYNC_DEFER_RETRY_AFTER
     );
     for _ in 0..4 {
-        handler.drain_document_sync_outbox().await;
+        handler.drain_sync_outbox().await;
     }
     assert!(
         read_outbox_records(&storage, &[], None, 32)
@@ -1017,11 +1013,10 @@ async fn rotation_streak() {
     shutdown_net(&net).await;
 }
 
-// A realm-config change originated locally lands only in the outbox; draining
-// it must kick the placement reconciler so this rank-0 node creates its shard
-// topic geneses without waiting for a restart.
+// Draining a local realm-config change must start placement reconciliation.
+// That lets the rank-zero node create newly assigned shard topics immediately.
 #[tokio::test]
-async fn draining_a_local_realm_config_change_creates_rank0_shard_topics() {
+async fn draining_a_topics() {
     let realm_id = RealmId::from_bytes([61u8; 32]);
     let temp_dir = tempdir().expect("temp dir");
     let storage =
@@ -1070,7 +1065,7 @@ async fn draining_a_local_realm_config_change_creates_rank0_shard_topics() {
         Event::Storage(StorageEvent::WriteResult { .. }) => {}
         other => panic!("unexpected realm config write: {other:?}"),
     }
-    net.refresh_realm_peers_from_document(&config)
+    net.refresh_document_peers(&config)
         .await
         .expect("refresh peers");
 
@@ -1085,7 +1080,7 @@ async fn draining_a_local_realm_config_change_creates_rank0_shard_topics() {
         },
     );
     assert!(
-        !net.document_sync_topic_exists(topic).unwrap_or(false),
+        !net.sync_topic_exists(topic).unwrap_or(false),
         "the rank-0 shard topic must not exist before the config change is drained"
     );
 
@@ -1102,12 +1097,12 @@ async fn draining_a_local_realm_config_change_creates_rank0_shard_topics() {
     );
     write_outbox_record(&storage, &record).await;
     task_handle
-        .send_effect(crate::sync::document_outbox::schedule_outbox_drain_effect())
+        .send_effect(crate::sync::document_outbox::schedule_drain_effect())
         .await;
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if net.document_sync_topic_exists(topic).unwrap_or(false) {
+        if net.sync_topic_exists(topic).unwrap_or(false) {
             break;
         }
         assert!(
@@ -1151,11 +1146,11 @@ async fn config_setup() -> ConfigHarness {
     };
     let shared_topic =
         shared_target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
-    net.ensure_document_sync_topics(&[shared_topic], Vec::new())
+    net.ensure_sync_topics(&[shared_topic], Vec::new())
         .expect("shared topic genesis");
     let mut shard_change = change();
     shard_change.placement = placement;
-    let shared = crate::sync::document_outbox::new_outbox_record_with_id(
+    let shared = crate::sync::document_outbox::new_identified_record(
         Ulid::from_parts(1, 1),
         node(1),
         shared_target,
@@ -1167,7 +1162,7 @@ async fn config_setup() -> ConfigHarness {
         aruna_core::structs::PlacementRef::NIL,
         true,
     );
-    let shard = crate::sync::document_outbox::new_outbox_record_with_id(
+    let shard = crate::sync::document_outbox::new_identified_record(
         Ulid::from_parts(1, 2),
         node(1),
         shard_target.clone(),
@@ -1204,11 +1199,10 @@ async fn config_setup() -> ConfigHarness {
     }
 }
 
-// Post-rebalance genesis adoption: live holders no longer include the emit-time
-// stamped holder carrying the genesis, so the bootstrap pull must union stamp and
-// live holders; otherwise a fresh genesis could fork the topic and evict writes.
+// Bootstrap candidates include stamped and live holders after rebalancing.
+// Otherwise removal of the genesis holder could fork the topic and evict writes.
 #[tokio::test]
-async fn pull_reaches_ex_holder() {
+async fn pull_reaches_holder() {
     let realm_id = RealmId::from_bytes([53u8; 32]);
     let ex_dir = tempdir().expect("temp dir");
     let ex_storage =
@@ -1278,7 +1272,7 @@ async fn pull_reaches_ex_holder() {
     // The ex-holder keeps the realm config that rebalanced it out, so it
     // still admits inbound sync from the current holders.
     ex_holder
-        .refresh_realm_peers_from_document(&config)
+        .refresh_document_peers(&config)
         .await
         .expect("ex-holder refreshes realm peers");
 
@@ -1296,9 +1290,9 @@ async fn pull_reaches_ex_holder() {
     // Only the ex-holder carries the genesis (with this node as a member,
     // as the pre-rebalance membership reconciliation would have left it).
     ex_holder
-        .ensure_document_sync_topics(&[topic], vec![net.node_id()])
+        .ensure_sync_topics(&[topic], vec![net.node_id()])
         .expect("genesis on the ex-holder");
-    assert!(!net.document_sync_topic_exists(topic).unwrap_or(true));
+    assert!(!net.sync_topic_exists(topic).unwrap_or(true));
 
     let mut change = change();
     change.placement = placement;
@@ -1327,7 +1321,7 @@ async fn pull_reaches_ex_holder() {
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        handler.drain_document_sync_outbox().await;
+        handler.drain_sync_outbox().await;
         if read_outbox_record(&storage, &record_key)
             .await
             .expect("read outbox record")
@@ -1342,7 +1336,7 @@ async fn pull_reaches_ex_holder() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(
-        net.document_sync_topic_exists(topic).unwrap_or(false),
+        net.sync_topic_exists(topic).unwrap_or(false),
         "the genesis must be adopted from the stamped ex-holder"
     );
 
@@ -1480,7 +1474,7 @@ impl BoundaryHarness {
         target: DocumentSyncTarget,
         event: DocumentSyncOutboxEvent,
     ) -> DocumentSyncOutboxRecord {
-        crate::sync::document_outbox::new_outbox_record_with_id(
+        crate::sync::document_outbox::new_identified_record(
             Ulid::from_parts(1, id),
             node(1),
             target,
@@ -1519,7 +1513,7 @@ impl BoundaryHarness {
         };
         let topic = shared.sync_topic_id(self.realm_id, &aruna_core::structs::PlacementRef::NIL);
         self.net
-            .ensure_document_sync_topics(&[topic], Vec::new())
+            .ensure_sync_topics(&[topic], Vec::new())
             .expect("appended topic genesis");
         let records = [
             self.record(
@@ -1580,10 +1574,10 @@ impl BoundaryHarness {
     async fn finish_retry(self) {
         let shard_topic = target().sync_topic_id(self.realm_id, &self.placed_change().placement);
         self.net
-            .ensure_document_sync_topics(&[shard_topic], Vec::new())
+            .ensure_sync_topics(&[shard_topic], Vec::new())
             .expect("blocked head topic genesis");
         for _ in 0..6 {
-            self.handler.drain_document_sync_outbox().await;
+            self.handler.drain_sync_outbox().await;
         }
         let remaining = read_outbox_records(&self.storage, &[], None, 8)
             .await

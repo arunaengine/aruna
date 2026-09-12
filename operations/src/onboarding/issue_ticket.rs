@@ -214,7 +214,7 @@ mod tests {
     use ulid::Ulid;
 
     #[test]
-    fn ticket_includes_shared_realm_topics_for_issuer_node() {
+    fn ticket_includes_topics() {
         let realm_signing_key = SigningKey::from_bytes(&[3u8; 32]);
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let joiner_node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_user_discovery_paginates_beyond_ten_thousand() {
+    async fn ticket_discovery_paginates() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {

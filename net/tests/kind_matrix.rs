@@ -51,9 +51,8 @@ fn config(realm_id: RealmId, secret_key: iroh::SecretKey) -> NetConfig {
 
 #[tokio::test]
 async fn refuses_user_sync() -> Result<(), Box<dyn std::error::Error>> {
-    // The realm node knows the dialer as a User device, so document sync is
-    // refused while the metadata read surface stays open. The device's own
-    // config calls it Management, so only the accept side can refuse.
+    // The realm node knows the dialer as a User device, so document sync is refused
+    // while the metadata read surface stays open: only the accept side can refuse.
     let realm_id = RealmId::from_bytes([91u8; 32]);
     let temp_device = tempdir()?;
     let temp_realm = tempdir()?;
@@ -75,14 +74,12 @@ async fn refuses_user_sync() -> Result<(), Box<dyn std::error::Error>> {
     let mut realm_view = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     realm_view.ensure_node(realm.node_id(), RealmNodeKind::Management);
     realm_view.ensure_node(device.node_id(), user_kind(realm_id));
-    realm.refresh_realm_peers_from_document(&realm_view).await?;
+    realm.refresh_document_peers(&realm_view).await?;
 
     let mut device_view = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     device_view.ensure_node(realm.node_id(), RealmNodeKind::Management);
     device_view.ensure_node(device.node_id(), RealmNodeKind::Management);
-    device
-        .refresh_realm_peers_from_document(&device_view)
-        .await?;
+    device.refresh_document_peers(&device_view).await?;
 
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
     realm.set_inbound_handler(Arc::new(TestInboundHandler {
@@ -122,9 +119,8 @@ async fn refuses_user_sync() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn sync_skips_devices() -> Result<(), Box<dyn std::error::Error>> {
-    // Dial-side mirror of the accept matrix: whatever peer list a caller hands
-    // it, a realm node never writes a device into a topic's membership and
-    // never picks one as a sync target.
+    // Dial-side mirror of the accept matrix: a realm node never writes a device
+    // into a topic's membership and never picks one as a sync target.
     let realm_id = RealmId::from_bytes([95u8; 32]);
     let temp_realm = tempdir()?;
     let storage_realm = FjallStorage::open(temp_realm.path().to_str().ok_or("invalid temp path")?)?;
@@ -140,12 +136,12 @@ async fn sync_skips_devices() -> Result<(), Box<dyn std::error::Error>> {
     view.ensure_node(realm.node_id(), RealmNodeKind::Management);
     view.ensure_node(server, RealmNodeKind::Server);
     view.ensure_node(device, user_kind(realm_id));
-    realm.refresh_realm_peers_from_document(&view).await?;
+    realm.refresh_document_peers(&view).await?;
 
     let topic =
         DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
-    realm.ensure_document_sync_topics(&[topic], vec![device, server])?;
-    realm.allow_document_sync_peers(&[topic], vec![device])?;
+    realm.ensure_sync_topics(&[topic], vec![device, server])?;
+    realm.allow_topic_peers(&[topic], vec![device])?;
 
     let members = realm
         .document_sync_node()
@@ -163,7 +159,7 @@ async fn sync_skips_devices() -> Result<(), Box<dyn std::error::Error>> {
     // would fail this sync instead of finishing with nothing to dial.
     tokio::time::timeout(
         NETWORK_HANG_CAP,
-        realm.sync_document_topic_with_peers(topic, vec![device]),
+        realm.sync_topic_peers(topic, vec![device]),
     )
     .await??;
 
@@ -196,8 +192,8 @@ async fn device_refuses_sync() -> Result<(), Box<dyn std::error::Error>> {
     let mut view = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     view.ensure_node(realm.node_id(), RealmNodeKind::Management);
     view.ensure_node(device.node_id(), user_kind(realm_id));
-    device.refresh_realm_peers_from_document(&view).await?;
-    realm.refresh_realm_peers_from_document(&view).await?;
+    device.refresh_document_peers(&view).await?;
+    realm.refresh_document_peers(&view).await?;
 
     realm.set_inbound_handler(Arc::new(TestInboundHandler::default()));
     device.add_peer_addr(realm.endpoint_addr()).await;

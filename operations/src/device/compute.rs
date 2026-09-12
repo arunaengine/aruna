@@ -635,7 +635,7 @@ mod tests {
         let local = node(1);
         let config = realm_config(local, RealmNodeKind::User { owner: owner(2) });
         write_config(&ctx, &config, local).await;
-        crate::node::node_info::seed_node_info_document(
+        crate::node::node_info::seed_info_document(
             &ctx,
             local,
             REALM,

@@ -98,7 +98,7 @@ pub(super) fn outbox_handler() -> (tempfile::TempDir, OperationsTaskHandler, Tas
 
 pub(super) async fn scheduled_after(task_handle: &TaskHandle) -> Duration {
     let TaskEvent::TimerScheduled { after, .. } = task_handle
-        .schedule_timer_if_idle(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
+        .schedule_idle_timer(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
         .await
     else {
         panic!("expected timer schedule event");
@@ -115,10 +115,10 @@ pub(super) async fn installed_setup() -> InstalledHarness {
     tokio::time::pause();
     let target = DocumentSyncTarget::RealmAuthorization { realm_id };
     let topic = target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
-    net.ensure_document_sync_topics(&[topic], Vec::new())
+    net.ensure_sync_topics(&[topic], Vec::new())
         .expect("shared topic genesis");
     for index in 1..=2u128 {
-        let record = crate::sync::document_outbox::new_outbox_record_with_id(
+        let record = crate::sync::document_outbox::new_identified_record(
             Ulid::from_parts(1, index),
             node(1),
             target.clone(),
@@ -183,7 +183,7 @@ pub(super) fn change() -> DocumentSyncChange {
     }
 }
 
-pub(super) async fn read_graph_prune_jobs(
+pub(super) async fn read_graph_jobs(
     storage: &aruna_storage::StorageHandle,
 ) -> Vec<MetadataGraphPruneJobRecord> {
     match storage

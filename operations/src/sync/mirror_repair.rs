@@ -8,12 +8,12 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{SYNC_MIRROR_REPAIR_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{
-    AuthContext, Permission, SyncRelationship, SyncState, blob_bucket_permission_path,
+    AuthContext, Permission, SyncRelationship, SyncState, bucket_permission_path,
     sync_relationship_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -31,7 +31,7 @@ use crate::sync::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
 };
-use crate::tasks::queue_backoff::queue_retry_after_ms;
+use crate::tasks::queue_backoff::retry_after_ms;
 
 const REPAIR_PAGE_SIZE: usize = 128;
 const REPAIR_BATCH_SIZE: usize = 64;
@@ -159,9 +159,7 @@ pub async fn store_sync_status(
             return Ok(false);
         };
         if existing.state == SyncState::Detached {
-            // The relationship was deleted and only survives as a serving
-            // stub; status updates must not overwrite it or re-stage a
-            // reconcile that would resurrect the target mirror.
+            // A detached serving stub cannot be overwritten or restage its deleted mirror.
             commit_repair_transaction(&context.storage_handle, txn_id).await?;
             return Ok(false);
         }
@@ -230,7 +228,7 @@ pub async fn clear_mirror_repair(
 
 /// Forwards a user-authorized sync mirror creation request to the target
 /// node so routes never orchestrate metadata effects directly.
-pub async fn request_sync_mirror_create(
+pub async fn request_mirror_create(
     context: &DriverContext,
     target_node: NodeId,
     auth_token: MetadataAuthToken,
@@ -302,7 +300,7 @@ pub async fn ensure_sync_mirror(
         context,
         relationship,
         relationship.source.realm_id,
-        &blob_bucket_permission_path(
+        &bucket_permission_path(
             relationship.source.realm_id,
             source_group_id,
             relationship.source.node_id,
@@ -500,7 +498,7 @@ async fn ensure_target_write(
         context,
         relationship,
         relationship.target.realm_id,
-        &blob_bucket_permission_path(
+        &bucket_permission_path(
             relationship.target.realm_id,
             bucket_info.group_id,
             relationship.target.node_id,
@@ -685,7 +683,7 @@ async fn reschedule_repair_record(
     let next = SyncMirrorRepairRecord {
         relationship: record.relationship.clone(),
         intent: record.intent,
-        due_at_ms: unix_timestamp_millis().saturating_add(queue_retry_after_ms(attempts)),
+        due_at_ms: unix_timestamp_millis().saturating_add(retry_after_ms(attempts)),
         attempts,
         last_error: Some(error),
     };
@@ -1007,7 +1005,7 @@ mod tests {
             user_id: relationship.created_by,
             realm_id,
         };
-        let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
+        let auth_doc = GroupAuthorizationDocument::default_group_doc(
             relationship.created_by,
             realm_id,
             group_id,
@@ -1048,7 +1046,7 @@ mod tests {
                     (
                         AUTH_KEYSPACE.to_string(),
                         realm_id.as_bytes().to_vec().into(),
-                        RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                        RealmAuthorizationDocument::default_realm_doc(realm_id)
                             .to_bytes(&actor)
                             .unwrap()
                             .into(),
@@ -1230,7 +1228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_cannot_revert_handling() {
+    async fn status_stays_handling() {
         let tempdir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {

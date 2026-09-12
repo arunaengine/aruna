@@ -23,16 +23,11 @@ pub struct DataWatchResourcePath<'a> {
     pub key_prefix: &'a str,
 }
 
-pub fn data_watch_resource_path(
-    group_id: GroupId,
-    node_id: NodeId,
-    bucket: &str,
-    key: &str,
-) -> String {
+pub fn watch_resource_path(group_id: GroupId, node_id: NodeId, bucket: &str, key: &str) -> String {
     format!("s3/{group_id}/{node_id}/{bucket}/{key}")
 }
 
-pub fn parse_data_watch_resource_path(path: &str) -> Option<DataWatchResourcePath<'_>> {
+pub fn parse_watch_path(path: &str) -> Option<DataWatchResourcePath<'_>> {
     let mut segments = path.strip_prefix("s3/")?.splitn(4, '/');
     let raw_group_id = segments.next()?;
     let raw_node_id = segments.next()?;
@@ -67,10 +62,7 @@ pub fn watch_path_matches(kind: WatchEventKind, path: &str, prefix: &str) -> boo
     ) {
         return false;
     }
-    let (Some(path), Some(prefix)) = (
-        parse_data_watch_resource_path(path),
-        parse_data_watch_resource_path(prefix),
-    ) else {
+    let (Some(path), Some(prefix)) = (parse_watch_path(path), parse_watch_path(prefix)) else {
         return false;
     };
     path.node_id == prefix.node_id
@@ -180,11 +172,8 @@ impl WatchEventMask {
     }
 }
 
-/// Raw origin-plane watch event that crosses the wire from the node where a
-/// mutation committed to every interested inbox-holder node. `event_id` is minted
-/// exactly once at the origin and is the idempotency root: holder-side expansion
-/// derives a deterministic per-subscription record id from it, so a redelivered
-/// event re-expands to the same records.
+/// Origin watch event replicated to interested inbox holders. Its origin-minted `event_id` is the
+/// idempotency root for deterministic per-subscription record IDs during holder expansion.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchEvent {
     pub event_id: Ulid,
@@ -308,10 +297,9 @@ impl WatchEvent {
 /// Domain separator for the deterministic per-subscription notification id.
 pub const WATCH_NOTIFICATION_ID_DOMAIN: &[u8] = b"aruna-watch-notification-v1\0";
 
-/// Deterministic notification-record id for the `(event, subscription)` pair.
-/// Because it is a pure function of the origin-minted `event_id` and the
-/// `watch_id`, re-expanding a redelivered event mints the same id, so the
-/// holder-side idempotent upsert collapses duplicate deliveries.
+/// Deterministic notification-record id for the `(event, subscription)` pair. Because it is a pure
+/// function of the origin-minted `event_id` and the `watch_id`, re-expanding a redelivered event mints
+/// the same id, so the holder-side idempotent upsert collapses duplicate deliveries.
 pub fn watch_notification_id(event_id: Ulid, watch_id: Ulid) -> Ulid {
     let mut hasher = blake3::Hasher::new();
     hasher.update(WATCH_NOTIFICATION_ID_DOMAIN);
@@ -422,7 +410,7 @@ pub fn watch_subscription_prefix(owner: UserId) -> Key {
     ByteView::from(owner.to_storage_key())
 }
 
-pub fn parse_watch_subscription_key(key: &[u8]) -> Result<(UserId, Ulid), ConversionError> {
+pub fn parse_watch_key(key: &[u8]) -> Result<(UserId, Ulid), ConversionError> {
     if key.len() != 64 {
         return Err(ConversionError::InvalidLength(format!(
             "expected 64-byte watch subscription key, got {} bytes",
@@ -434,10 +422,8 @@ pub fn parse_watch_subscription_key(key: &[u8]) -> Result<(UserId, Ulid), Conver
     Ok((owner, watch_id))
 }
 
-/// Keys in the watch-interest keyspace. Per-node digests use fixed-length keys
-/// so their prefixes are unambiguous: `n/` + realm id + node id (realm first so
-/// all nodes' digests for one realm form a single scan range). Local-only
-/// markers use text prefixes that never collide with the binary digest prefix.
+/// Watch-interest keys use fixed binary prefixes for per-realm node scans.
+/// Local text-prefixed markers cannot collide with the binary digest prefix.
 pub const WATCH_INTEREST_NODE_PREFIX: &[u8] = b"n/";
 pub const WATCH_INTEREST_DIRTY_PREFIX: &[u8] = b"dirty/";
 const WATCH_INTEREST_PENDING_PREFIX: &[u8] = b"pending/";
@@ -494,7 +480,7 @@ impl WatchInterestDigest {
     }
 }
 
-pub fn watch_interest_node_key(realm_id: RealmId, node_id: NodeId) -> Vec<u8> {
+pub fn interest_node_key(realm_id: RealmId, node_id: NodeId) -> Vec<u8> {
     let mut key = Vec::with_capacity(WATCH_INTEREST_NODE_PREFIX.len() + 64);
     key.extend_from_slice(WATCH_INTEREST_NODE_PREFIX);
     key.extend_from_slice(realm_id.as_bytes());
@@ -503,12 +489,12 @@ pub fn watch_interest_node_key(realm_id: RealmId, node_id: NodeId) -> Vec<u8> {
 }
 
 /// Scan prefix over every node's digest, ordered by realm.
-pub fn watch_interest_node_prefix() -> Vec<u8> {
+pub fn interest_node_prefix() -> Vec<u8> {
     WATCH_INTEREST_NODE_PREFIX.to_vec()
 }
 
 /// Scan prefix over one realm's digests (all nodes, contiguous range).
-pub fn watch_interest_realm_prefix(realm_id: RealmId) -> Vec<u8> {
+pub fn interest_realm_prefix(realm_id: RealmId) -> Vec<u8> {
     let mut key = Vec::with_capacity(WATCH_INTEREST_NODE_PREFIX.len() + 32);
     key.extend_from_slice(WATCH_INTEREST_NODE_PREFIX);
     key.extend_from_slice(realm_id.as_bytes());
@@ -516,27 +502,27 @@ pub fn watch_interest_realm_prefix(realm_id: RealmId) -> Vec<u8> {
 }
 
 /// Recovers the realm id from a `n/<realm><node>` digest key.
-pub fn watch_interest_key_realm_id(key: &[u8]) -> Option<RealmId> {
+pub fn interest_realm_id(key: &[u8]) -> Option<RealmId> {
     let tail = key.strip_prefix(WATCH_INTEREST_NODE_PREFIX)?;
     let bytes: [u8; 32] = tail.get(..32)?.try_into().ok()?;
     Some(RealmId::from_bytes(bytes))
 }
 
 /// Recovers the node id from a `n/<realm><node>` digest key.
-pub fn watch_interest_key_node_id(key: &[u8]) -> Option<NodeId> {
+pub fn interest_node_id(key: &[u8]) -> Option<NodeId> {
     let tail = key.strip_prefix(WATCH_INTEREST_NODE_PREFIX)?;
     let bytes: [u8; 32] = tail.get(32..64)?.try_into().ok()?;
     NodeId::from_bytes(&bytes).ok()
 }
 
-pub fn watch_interest_dirty_key(realm_id: RealmId) -> Vec<u8> {
+pub fn interest_dirty_key(realm_id: RealmId) -> Vec<u8> {
     let mut key = Vec::with_capacity(WATCH_INTEREST_DIRTY_PREFIX.len() + 32);
     key.extend_from_slice(WATCH_INTEREST_DIRTY_PREFIX);
     key.extend_from_slice(realm_id.as_bytes());
     key
 }
 
-pub fn watch_interest_pending_key(realm_id: RealmId) -> Vec<u8> {
+pub fn interest_pending_key(realm_id: RealmId) -> Vec<u8> {
     let mut key = Vec::with_capacity(WATCH_INTEREST_PENDING_PREFIX.len() + 32);
     key.extend_from_slice(WATCH_INTEREST_PENDING_PREFIX);
     key.extend_from_slice(realm_id.as_bytes());
@@ -557,26 +543,23 @@ pub fn watch_retry_key(realm_id: RealmId, event_id: Ulid) -> Vec<u8> {
 }
 
 /// Recovers the realm id from a `dirty/<realm>` marker key.
-pub fn watch_interest_dirty_realm_id(key: &[u8]) -> Option<RealmId> {
+pub fn dirty_interest_realm(key: &[u8]) -> Option<RealmId> {
     let tail = key.strip_prefix(WATCH_INTEREST_DIRTY_PREFIX)?;
     let bytes: [u8; 32] = tail.try_into().ok()?;
     Some(RealmId::from_bytes(bytes))
 }
 
-/// In-memory realm -> node -> interest entries cache rebuilt from the replicated
-/// digests. Consumed by origin nodes to match events against realm-wide watch
-/// interest without a per-event storage read. Only nodes with live watches are
-/// retained, so an empty node map means no held interest.
+/// In-memory realm -> node -> interest entries cache rebuilt from the replicated digests. Consumed by
+/// origin nodes to match events against realm-wide watch interest without a per-event storage read.
+/// Only nodes with live watches are retained, so an empty node map means no held interest.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WatchInterestTable {
     realms: HashMap<RealmId, HashMap<NodeId, Vec<WatchInterestEntry>>>,
     local: HashMap<Ulid, LocalWatchInterest>,
 }
 
-/// Interest a node recorded when it handled a watch create, before the holder's
-/// durable digest replicated back over the shared realm topic. Keyed by watch id
-/// so a delete retracts exactly one subscription's contribution. Consulted by
-/// `matching_nodes` alongside `realms`, and never touched by `set_realm`.
+/// Local watch interest retained until the durable holder digest replicates. Watch IDs permit exact
+/// retraction; matching consults it alongside realm digests, while `set_realm` leaves it untouched.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LocalWatchInterest {
     realm_id: RealmId,
@@ -690,7 +673,7 @@ impl WatchInterestTable {
 mod tests {
     use super::*;
     use crate::keyspaces::NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE;
-    use crate::storage_entries::{watch_subscription_delete_entry, watch_subscription_write_entry};
+    use crate::storage_entries::{watch_delete_entry, watch_write_entry};
     use crate::structs::RealmId;
 
     fn user(realm: u8, user_byte: u8) -> UserId {
@@ -707,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn subscription_roundtrips_through_postcard() {
+    fn subscription_roundtrips_postcard() {
         let owner = user(1, 2);
         for mask in [
             WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
@@ -725,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_order_by_watch_id_within_owner() {
+    fn keys_order_owner() {
         let owner = user(1, 2);
         let a = Ulid::from_parts(1, 0);
         let b = Ulid::from_parts(2, 0);
@@ -733,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_owner_isolated() {
+    fn keys_are_isolated() {
         let a = user(1, 2);
         let b = user(1, 3);
         let watch_id = Ulid::generate();
@@ -745,22 +728,19 @@ mod tests {
     }
 
     #[test]
-    fn key_roundtrips_through_parser() {
+    fn key_roundtrips_parser() {
         let owner = user(5, 9);
         let watch_id = Ulid::generate();
         let key = watch_subscription_key(owner, watch_id);
-        assert_eq!(
-            parse_watch_subscription_key(&key).unwrap(),
-            (owner, watch_id)
-        );
+        assert_eq!(parse_watch_key(&key).unwrap(), (owner, watch_id));
         assert!(matches!(
-            parse_watch_subscription_key(&key[..63]),
+            parse_watch_key(&key[..63]),
             Err(ConversionError::InvalidLength(_))
         ));
         let mut long = key.to_vec();
         long.push(0);
         assert!(matches!(
-            parse_watch_subscription_key(&long),
+            parse_watch_key(&long),
             Err(ConversionError::InvalidLength(_))
         ));
     }
@@ -826,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_event_roundtrips_through_postcard() {
+    fn watch_event_postcard() {
         let actor = user(1, 2);
         let metadata = metadata_event(actor);
         assert_eq!(
@@ -840,7 +820,7 @@ mod tests {
             event_id: Ulid::from_bytes([10u8; 16]),
             realm_id: RealmId([1u8; 32]),
             kind: WatchEventKind::DataUploaded,
-            path: data_watch_resource_path(group_id, node_id, "bucket", "object"),
+            path: watch_resource_path(group_id, node_id, "bucket", "object"),
             actor,
             occurred_at_ms: 42,
             detail: WatchEventDetail::DataUploaded {
@@ -860,7 +840,7 @@ mod tests {
             event_id: Ulid::from_bytes([11u8; 16]),
             realm_id: RealmId([1u8; 32]),
             kind: WatchEventKind::SyncCompleted,
-            path: data_watch_resource_path(group_id, node_id, "bucket", "prefix/"),
+            path: watch_resource_path(group_id, node_id, "bucket", "prefix/"),
             actor,
             occurred_at_ms: 43,
             detail: WatchEventDetail::SyncCompleted {
@@ -895,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_event_maps_to_notification_kind() {
+    fn watch_event_kind() {
         let actor = user(1, 2);
         match metadata_event(actor).notification_kind() {
             NotificationKind::MetadataCreated {
@@ -924,7 +904,7 @@ mod tests {
             event_id: Ulid::generate(),
             realm_id: RealmId([1u8; 32]),
             kind: WatchEventKind::DataUploaded,
-            path: data_watch_resource_path(group_id, node_id, "bucket", "object"),
+            path: watch_resource_path(group_id, node_id, "bucket", "object"),
             actor,
             occurred_at_ms: 1,
             detail: WatchEventDetail::DataUploaded {
@@ -947,7 +927,7 @@ mod tests {
             } => {
                 assert_eq!(
                     path,
-                    data_watch_resource_path(group_id, node_id, "bucket", "object")
+                    watch_resource_path(group_id, node_id, "bucket", "object")
                 );
                 assert_eq!(event_group_id, group_id);
                 assert_eq!(event_node_id, node_id);
@@ -961,16 +941,16 @@ mod tests {
     }
 
     #[test]
-    fn data_resource_path_is_node_disambiguated_and_roundtrips() {
+    fn data_resource_roundtrips() {
         let group_id = Ulid::from_bytes([5u8; 16]);
         let first_node = node(6);
         let second_node = node(7);
-        let first = data_watch_resource_path(group_id, first_node, "bucket", "reports/q3");
-        let second = data_watch_resource_path(group_id, second_node, "bucket", "reports/q3");
+        let first = watch_resource_path(group_id, first_node, "bucket", "reports/q3");
+        let second = watch_resource_path(group_id, second_node, "bucket", "reports/q3");
 
         assert_ne!(first, second);
         assert_eq!(
-            parse_data_watch_resource_path(&first),
+            parse_watch_path(&first),
             Some(DataWatchResourcePath {
                 group_id,
                 node_id: first_node,
@@ -985,8 +965,8 @@ mod tests {
         let credential_group = Ulid::from_bytes([4u8; 16]);
         let bucket_group = Ulid::from_bytes([5u8; 16]);
         let node_id = node(6);
-        let prefix = data_watch_resource_path(credential_group, node_id, "bucket", "reports/");
-        let event = data_watch_resource_path(bucket_group, node_id, "bucket", "reports/result.csv");
+        let prefix = watch_resource_path(credential_group, node_id, "bucket", "reports/");
+        let event = watch_resource_path(bucket_group, node_id, "bucket", "reports/result.csv");
 
         assert!(watch_path_matches(
             WatchEventKind::DataUploaded,
@@ -1000,13 +980,13 @@ mod tests {
         ));
         assert!(!watch_path_matches(
             WatchEventKind::DataUploaded,
-            &data_watch_resource_path(bucket_group, node(7), "bucket", "reports/result.csv"),
+            &watch_resource_path(bucket_group, node(7), "bucket", "reports/result.csv"),
             &prefix,
         ));
     }
 
     #[test]
-    fn watch_notification_id_is_deterministic_per_event_and_watch() {
+    fn watch_notification_watch() {
         let event_id = Ulid::from_bytes([1u8; 16]);
         let watch_id = Ulid::from_bytes([2u8; 16]);
         assert_eq!(
@@ -1024,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_authorization_hash_must_be_canonical() {
+    fn watch_authorization_canonical() {
         let mut binding = WatchAuthorizationBinding::default();
         assert!(binding.is_valid());
         binding.token_hash.make_ascii_uppercase();
@@ -1041,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn event_kind_names_are_stable() {
+    fn event_kind_stable() {
         assert_eq!(WatchEventKind::MetadataCreated.name(), "metadata_created");
         assert_eq!(WatchEventKind::DataUploaded.name(), "data_uploaded");
         assert_eq!(WatchEventKind::SyncCompleted.name(), "sync_completed");
@@ -1066,16 +1046,16 @@ mod tests {
     }
 
     #[test]
-    fn write_and_delete_entries_target_the_keyspace() {
+    fn write_and_keyspace() {
         let owner = user(1, 2);
         let record = subscription(owner);
 
-        let write = watch_subscription_write_entry(&record).unwrap();
+        let write = watch_write_entry(&record).unwrap();
         assert_eq!(write.0, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE);
         assert_eq!(write.1, watch_subscription_key(owner, record.watch_id));
         assert_eq!(WatchSubscription::from_bytes(&write.2).unwrap(), record);
 
-        let delete = watch_subscription_delete_entry(owner, record.watch_id);
+        let delete = watch_delete_entry(owner, record.watch_id);
         assert_eq!(delete.0, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE);
         assert_eq!(delete.1, watch_subscription_key(owner, record.watch_id));
     }
@@ -1085,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    fn digest_roundtrips_through_postcard() {
+    fn digest_roundtrips_postcard() {
         let digest = WatchInterestDigest {
             node_id: node(3),
             entries: vec![
@@ -1107,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn digest_dedupes_prefixes_and_sorts_deterministically() {
+    fn digest_dedupes_deterministically() {
         let node_id = node(4);
         let metadata = WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]);
         let data = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
@@ -1148,26 +1128,26 @@ mod tests {
     }
 
     #[test]
-    fn interest_keys_recover_realm_and_node() {
+    fn interest_keys_node() {
         let realm_id = RealmId([7u8; 32]);
         let node_id = node(9);
 
-        let key = watch_interest_node_key(realm_id, node_id);
+        let key = interest_node_key(realm_id, node_id);
         assert!(key.starts_with(WATCH_INTEREST_NODE_PREFIX));
-        assert!(key.starts_with(&watch_interest_realm_prefix(realm_id)));
-        assert!(key.starts_with(&watch_interest_node_prefix()));
-        assert_eq!(watch_interest_key_realm_id(&key), Some(realm_id));
-        assert_eq!(watch_interest_key_node_id(&key), Some(node_id));
+        assert!(key.starts_with(&interest_realm_prefix(realm_id)));
+        assert!(key.starts_with(&interest_node_prefix()));
+        assert_eq!(interest_realm_id(&key), Some(realm_id));
+        assert_eq!(interest_node_id(&key), Some(node_id));
 
-        let dirty = watch_interest_dirty_key(realm_id);
-        assert_eq!(watch_interest_dirty_realm_id(&dirty), Some(realm_id));
+        let dirty = interest_dirty_key(realm_id);
+        assert_eq!(dirty_interest_realm(&dirty), Some(realm_id));
         // Marker and digest prefixes never collide.
-        assert_eq!(watch_interest_key_realm_id(&dirty), None);
-        assert_eq!(watch_interest_dirty_realm_id(&key), None);
+        assert_eq!(interest_realm_id(&dirty), None);
+        assert_eq!(dirty_interest_realm(&key), None);
     }
 
     #[test]
-    fn interest_table_matches_by_prefix_and_mask() {
+    fn interest_table_mask() {
         let realm_id = RealmId([1u8; 32]);
         let other_realm = RealmId([2u8; 32]);
         let holder = node(10);
@@ -1214,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn local_registration_matches_and_retracts() {
+    fn local_registration_retracts() {
         // A creating node knows the holder before the digest replicates back.
         let realm_id = RealmId([1u8; 32]);
         let holder = node(10);

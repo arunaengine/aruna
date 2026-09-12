@@ -6,8 +6,8 @@ use super::{
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    AuthContext, BucketInfo, OBJECT_CONTENT_TYPE_KEY, Permission, blob_bucket_permission_path,
-    blob_object_permission_path, key_content_type,
+    AuthContext, BucketInfo, OBJECT_CONTENT_TYPE_KEY, Permission, bucket_permission_path,
+    object_permission_path, key_content_type,
 };
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
 use aruna_operations::realm::get_config::GetRealmConfigOperation;
@@ -58,10 +58,8 @@ pub struct BucketsOutput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ListObjectsInput {
-    /// Bucket name as the S3 surface uses it, for example `project-data`. Three
-    /// to 63 characters of lowercase letters, digits, dots, and hyphens. Call
-    /// `list_buckets` for the readable names; this is not an `s3://` URL and
-    /// carries no key.
+    /// S3 bucket name, containing three to 63 lowercase letters, digits, dots, or hyphens.
+    /// Call `list_buckets` for names. Do not pass an `s3://` URL or key.
     pub bucket: String,
     /// Optional key prefix filter, for example `reads/2026/`. Matched literally
     /// from the start of the key, with no wildcards and no leading slash.
@@ -276,10 +274,8 @@ impl SearchKind {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SearchInput {
-    /// Search text, at least two characters after trimming. Matched as a
-    /// substring for buckets, groups, and users, and as a full-text query over
-    /// name, description, keywords, and identifier for documents. Plain terms
-    /// only: boolean operators, quotes, and wildcards are stripped.
+    /// Search text of at least two characters. Buckets, groups, and users use substring matching.
+    /// Documents search names, descriptions, keywords, and identifiers after removing operators.
     pub q: String,
     /// Restrict the answer to one section: `documents`, `buckets`, `groups`, or
     /// `users`. Omit to search all four. Each section returns at most ten hits,
@@ -331,7 +327,7 @@ impl McpServer {
                 authorize_tool(
                     &self.state,
                     &auth,
-                    blob_bucket_permission_path(
+                    bucket_permission_path(
                         self.state.get_realm_id(),
                         info.group_id,
                         self.state.get_node_id(),
@@ -372,7 +368,7 @@ impl McpServer {
         authorize_tool(
             &self.state,
             &auth,
-            blob_bucket_permission_path(
+            bucket_permission_path(
                 self.state.get_realm_id(),
                 bucket_info.group_id,
                 self.state.get_node_id(),
@@ -495,7 +491,7 @@ impl McpServer {
         authorize_tool(
             &self.state,
             &auth,
-            blob_object_permission_path(
+            object_permission_path(
                 self.state.get_realm_id(),
                 bucket_info.group_id,
                 self.state.get_node_id(),
@@ -608,7 +604,7 @@ impl McpServer {
         authorize_tool(
             &self.state,
             &auth,
-            blob_bucket_permission_path(
+            bucket_permission_path(
                 self.state.get_realm_id(),
                 bucket_info.group_id,
                 self.state.get_node_id(),
@@ -883,7 +879,7 @@ pub(crate) async fn read_text(
     authorize_tool(
         &server.state,
         auth,
-        blob_object_permission_path(
+        object_permission_path(
             server.state.get_realm_id(),
             bucket_info.group_id,
             server.state.get_node_id(),
@@ -984,7 +980,7 @@ pub(crate) async fn write_text(
     authorize_tool(
         &server.state,
         auth,
-        blob_object_permission_path(
+        object_permission_path(
             server.state.get_realm_id(),
             bucket_info.group_id,
             server.state.get_node_id(),
@@ -1201,6 +1197,10 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
         GetObjectError::ManagedCopyError(error) => internal_error(error),
         GetObjectError::PolicyError(error) => internal_error(error),
         error @ GetObjectError::BlobNotLocal { .. } => internal_error(error),
+        GetObjectError::HolderAccessDenied => server_error(crate::error::ServerError::Forbidden),
+        error @ (GetObjectError::HoldersUnavailable | GetObjectError::HolderIntegrityFailure) => {
+            internal_error(error)
+        }
         GetObjectError::GetObjectFailed => internal_error("object read failed"),
     }
 }

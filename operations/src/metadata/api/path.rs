@@ -518,7 +518,7 @@ pub(super) fn validate_path_candidate(
 /// Nodes a document query fans out to: the live holders of the bucket the
 /// document was created into, not the holder set stamped at event time (which a
 /// rebalance leaves stale).
-pub fn document_replica_query_nodes(
+pub fn replica_query_nodes(
     config: Option<&RealmConfigDocument>,
     record: &MetadataRegistryRecord,
     local_node_id: NodeId,

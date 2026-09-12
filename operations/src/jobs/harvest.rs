@@ -6,23 +6,23 @@ use aruna_blob::blob::BlobHandle;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::identifiers::StructuredId;
 use aruna_core::keyspaces::METADATA_PENDING_PROJECTION_KEYSPACE;
 use aruna_core::structs::{
     Actor, AuthContext, HarvestCursor, HarvestGranularity, HarvestJobSpec, HarvestProvenance,
     HarvestRecordState, HarvestSource, IncomingRecord, JobError, JobResultPayload,
     MetadataRegistryRecord, ProvenanceDecision, RealmId, RepositoryConnector, provenance_decision,
 };
+use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::harvest::oai_mapping::dc_to_jsonld;
-use crate::harvest::oai_parse::{
+use crate::harvest::oai_pmh::mapping::dc_to_jsonld;
+use crate::harvest::oai_pmh::parse::{
     OaiParseError, OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page,
 };
-use crate::harvest::oai_request::{format_window, identify_url, list_records_url};
+use crate::harvest::oai_pmh::request::{format_window, identify_url, list_records_url};
 use crate::harvest::repository::{
     StorageReadError, parse_connector_read, parse_provenance_read, parse_source_read,
     read_connector_effect, read_provenance_effect, read_source_effect, write_provenance_effect,
@@ -312,9 +312,8 @@ async fn apply_record(
                     write_provenance(ctx, &row).await?;
                     counts.updated += 1;
                 }
-                // Local absence may only be registry lag. Ask the routed holders
-                // to update first; retire the identity only when all report it
-                // gone.
+                // Local absence may be registry lag: ask the routed holders to update first
+                // and retire the identity only when all report it gone.
                 None => {
                     confirm_absent(ctx, meta_resource_id).await?;
                     match update_document(

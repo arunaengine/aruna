@@ -79,7 +79,7 @@ impl SearchUsersOperation {
         smallvec![]
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn fail_storage(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -190,7 +190,7 @@ impl Operation for SearchUsersOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.fail_storage(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_name_case_insensitively() {
+    fn matches_case_insensitively() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let alice = user(realm_id, 2, "Alice");
         let bob = user(realm_id, 3, "bob");
@@ -342,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn returns_cursor_when_more_matches_than_limit() {
+    fn returns_match_cursor() {
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let alice = user(realm_id, 2, "match-alice");
         let bob = user(realm_id, 3, "match-bob");
@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn continues_iteration_until_enough_matches() {
+    fn continues_until_limit() {
         let realm_id = RealmId::from_bytes([5u8; 32]);
         let alice = user(realm_id, 2, "match-alice");
         let skipped = user(realm_id, 3, "other");

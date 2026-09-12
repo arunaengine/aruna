@@ -1,8 +1,7 @@
 use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::metadata::{
-    MetadataQueryMode, MetadataSearchHitResponse, map_metadata_api_error, map_query_mode,
-    map_search_hit,
+use crate::metadata::{
+    MetadataQueryMode, MetadataSearchHitResponse, map_api_error, map_query_mode, map_search_hit,
 };
 use crate::routes::users::MIN_SEARCH_QUERY_CHARS;
 use crate::server_state::ServerState;
@@ -41,13 +40,8 @@ const SEARCH_TYPE_USERS: &str = "users";
 )]
 pub struct SearchApiDoc;
 
-// IMPLEMENTED (2H pragmatic inventory): /search/objects searches authenticated
-// live local heads and can federate them with explicit partial/strict coverage.
-// DEFERRED (#260): durable signed inventory generations/snapshots are still not
-// built; pagination is a query-bound live-head keyset with an as-of watermark.
-// DEFERRED (#266 directories): the /search groups/users and /search/buckets core
-// landed (#427); visibility tiers, public profiles, and the signed bucket
-// directory are the deferred enhancements.
+// Object search uses authenticated live heads with explicit partial or strict federation.
+// Pagination is a watermarked live keyset; signed snapshots and directory tiers remain deferred.
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(SearchApiDoc::openapi())
         .routes(routes!(unified_search))
@@ -403,7 +397,7 @@ pub async fn bucket_search(
         },
     )
     .await
-    .map_err(map_metadata_api_error)?;
+    .map_err(map_api_error)?;
     Ok((StatusCode::OK, Json(map_bucket_section(result))))
 }
 
@@ -534,14 +528,11 @@ pub async fn object_search(
         },
     )
     .await
-    .map_err(map_metadata_api_error)?;
-    Ok((
-        StatusCode::OK,
-        Json(map_object_search_response(result, mode)),
-    ))
+    .map_err(map_api_error)?;
+    Ok((StatusCode::OK, Json(map_search_response(result, mode))))
 }
 
-fn map_object_search_response(
+fn map_search_response(
     result: ObjectSearchExecution,
     mode: ObjectSearchMode,
 ) -> ObjectSearchResponse {
@@ -815,7 +806,7 @@ async fn run_buckets(
         },
     )
     .await
-    .map_err(map_metadata_api_error)?;
+    .map_err(map_api_error)?;
     Ok(Some(map_bucket_section(result)))
 }
 
@@ -883,7 +874,7 @@ async fn run_documents(
         },
     )
     .await
-    .map_err(map_metadata_api_error)?;
+    .map_err(map_api_error)?;
     Ok(Some(map_documents_section(result)))
 }
 
@@ -1013,7 +1004,7 @@ async fn run_users(
 mod tests {
     use super::*;
     use crate::error::ServerError;
-    use crate::routes::metadata::{
+    use crate::metadata::{
         CreateMetadataRequest, CreateMetadataScaffoldRequest, MetadataQueryMode,
         ReplaceMetadataRoCrateRequest, create_metadata_document, replace_metadata_rocrate,
     };
@@ -1031,10 +1022,8 @@ mod tests {
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::metadata::MetadataHandle;
-    use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
-    use aruna_operations::metadata::projector::{
-        drain_pending_metadata_projection_queue, replay_metadata_event_log,
-    };
+    use aruna_operations::metadata::materialization_queue::process_materialization_batch;
+    use aruna_operations::metadata::projector::{drain_projection_queue, replay_event_log};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use axum::extract::Path;
@@ -1089,7 +1078,7 @@ mod tests {
     ) {
         let realm = actor.realm_id;
         let mut auth_doc =
-            GroupAuthorizationDocument::new_default_group_doc(actor.user_id, realm, group_id);
+            GroupAuthorizationDocument::default_group_doc(actor.user_id, realm, group_id);
         auth_doc.policies = policies;
         let group = Group {
             display_name: name.to_string(),
@@ -1225,7 +1214,7 @@ mod tests {
 
         // The fixture user holds every realm role so the user directory section
         // of a unified search is authorized.
-        let mut realm_doc = RealmAuthorizationDocument::new_default_realm_doc(realm);
+        let mut realm_doc = RealmAuthorizationDocument::default_realm_doc(realm);
         for role in realm_doc.roles.values_mut() {
             role.assigned_users.insert(user_id);
         }
@@ -1334,15 +1323,11 @@ mod tests {
 
     async fn drain_projection(state: &ServerState) {
         let ctx = state.get_ctx();
-        let drained = drain_pending_metadata_projection_queue(ctx.as_ref())
-            .await
-            .unwrap();
+        let drained = drain_projection_queue(ctx.as_ref()).await.unwrap();
         if drained.markers_examined == 0 {
-            replay_metadata_event_log(ctx.as_ref()).await.unwrap();
+            replay_event_log(ctx.as_ref()).await.unwrap();
         }
-        process_metadata_materialization_batch(ctx.as_ref())
-            .await
-            .unwrap();
+        process_materialization_batch(ctx.as_ref()).await.unwrap();
     }
 
     async fn flush_search(state: &ServerState) {
@@ -1777,7 +1762,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn documents_carry_subject_types() {
+    async fn documents_include_types() {
         // Root and file entity match as separate subjects of one document, so
         // only subject_types tells a file hit apart from a dataset hit.
         let fx = setup().await;
@@ -1882,7 +1867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn object_search_requires_auth() {
+    async fn search_requires_auth() {
         let fx = setup().await;
         let result = object_search(
             State(fx.state.clone()),
@@ -1900,7 +1885,7 @@ mod tests {
     }
 
     #[test]
-    fn object_search_maps_partiality_without_totals() {
+    fn search_maps_partiality() {
         let healthy = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
         let failed = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
         let result = ObjectSearchExecution {
@@ -1933,7 +1918,7 @@ mod tests {
             complete: false,
         };
 
-        let response = map_object_search_response(result, ObjectSearchMode::DistributedBestEffort);
+        let response = map_search_response(result, ObjectSearchMode::DistributedBestEffort);
         assert_eq!(response.hits.len(), 1);
         assert_eq!(response.coverage.scope, ObjectSearchScope::Realm);
         assert!(!response.coverage.complete);

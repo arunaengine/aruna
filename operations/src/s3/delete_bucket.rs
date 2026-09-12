@@ -1,5 +1,5 @@
 use crate::node::usage_stats::{
-    UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
+    UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -153,7 +153,7 @@ impl DeleteBucketOperation {
         })]
     }
 
-    fn handle_current_objects_checked(&mut self, event: Event) -> Effects {
+    fn objects_checked(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -204,7 +204,7 @@ impl DeleteBucketOperation {
         })]
     }
 
-    fn handle_multipart_uploads_checked(&mut self, event: Event) -> Effects {
+    fn uploads_checked(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -398,7 +398,7 @@ impl DeleteBucketOperation {
         self.txn_id = None;
         self.state = DeleteBucketState::Finish;
         self.output = Some(Ok(()));
-        let mut effects = smallvec![schedule_usage_snapshot_publish_effect()];
+        let mut effects = smallvec![schedule_snapshot_publish()];
         if !self.relationships.is_empty() {
             effects.push(Effect::Task(TaskEffect::ShortenTimer {
                 key: TaskKey::DrainSyncMirrorRepair,
@@ -425,10 +425,10 @@ impl Operation for DeleteBucketOperation {
             DeleteBucketState::Init => self.handle_init(),
             DeleteBucketState::StartTransaction => self.handle_transaction_started(event),
             DeleteBucketState::ReadBucket => self.handle_bucket_read(event),
-            DeleteBucketState::CheckCurrentObjects => self.handle_current_objects_checked(event),
+            DeleteBucketState::CheckCurrentObjects => self.objects_checked(event),
             DeleteBucketState::CheckVersions => self.handle_versions_checked(event),
             DeleteBucketState::CheckMultipartUploads => {
-                self.handle_multipart_uploads_checked(event)
+                self.uploads_checked(event)
             }
             DeleteBucketState::ScanOutRelationships | DeleteBucketState::ScanInRelationships => {
                 self.handle_relationship_scan(event)
@@ -541,7 +541,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_delete_bucket_removes_replication_config() {
+    async fn removes_replication_config() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -717,7 +717,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_delete_bucket_not_empty() {
+    async fn nonempty_bucket_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -783,7 +783,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_delete_bucket_not_empty_with_versions_only() {
+    async fn versioned_bucket_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();

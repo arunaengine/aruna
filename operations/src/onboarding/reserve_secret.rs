@@ -15,7 +15,7 @@ use crate::onboarding::create_secret::{
     enrolled_devices, pending_devices, scan_secrets, secret_record_key,
 };
 use crate::onboarding::secret_state::{
-    resolve_secret_state, secret_state_key, secret_state_write_entry,
+    resolve_secret_state, secret_state_key, secret_state_entry,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,7 +172,7 @@ impl ReserveOnboardingSecretOperation {
                 );
             }
         };
-        let state_entry = match secret_state_write_entry(
+        let state_entry = match secret_state_entry(
             self.input.enrollment_id,
             if self.input.finalizing {
                 OnboardingSecretState::Finalizing {
@@ -639,7 +639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserves_secret_idempotently_for_same_node() {
+    async fn reserves_same_node() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
@@ -716,7 +716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_reservation_can_be_reclaimed_before_secret_expiry() {
+    async fn expired_reservation_reclaimed() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {

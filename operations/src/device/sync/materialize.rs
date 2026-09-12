@@ -1,6 +1,6 @@
 //! Writes one remote version into a synced folder and records what happened.
 //!
-//! The guard refuses renames once bytes changed, leaving a pending entry; an action's audit joins its base row.
+//! A rename whose bytes changed leaves a pending entry; the action's audit joins its base row.
 
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use aruna_core::structs::{
     SyncActionRecord, SyncBase, SyncedBytes, SyncedFolder, VersionedObjectArn, WriteGuard,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use bytes::Bytes;
 use smallvec::smallvec;
 use thiserror::Error;

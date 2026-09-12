@@ -53,7 +53,7 @@ pub(crate) fn shard_override<'a>(
 /// Placement reference stamped into a change's sync envelope for `target`:
 /// resolves the governing strategy from the realm config, falling back to
 /// [`PlacementRef::NIL`] only when the realm has no strategies (early bootstrap).
-pub fn placement_ref_for_target(
+pub fn target_placement_ref(
     config: &RealmConfigDocument,
     target: &DocumentSyncTarget,
     context: PlacementResolutionContext<'_>,
@@ -154,18 +154,18 @@ pub enum PlacementResolveError {
 
 /// Rank-ordered holders of a specific shard, capped by `replica_count` or all
 /// eligible for an everywhere strategy. Returns `Vec::new()` for housekeeping
-/// callers whenever [`resolve_shard_holders_checked`] fails.
+/// callers whenever [`try_resolve_holders`] fails.
 pub fn resolve_shard_holders(
     config: &RealmConfigDocument,
     placement: &PlacementRef,
 ) -> Vec<NodeId> {
-    resolve_shard_holders_checked(config, placement).unwrap_or_default()
+    try_resolve_holders(config, placement).unwrap_or_default()
 }
 
 /// Holder resolution pinned to the bucket's activated candidate map: a config
 /// edit moves no holder, only a completed transition can. Routing callers map
 /// failures to 503, because an unresolvable bucket is not an absent document.
-pub fn resolve_shard_holders_checked(
+pub fn try_resolve_holders(
     config: &RealmConfigDocument,
     placement: &PlacementRef,
 ) -> Result<Vec<NodeId>, PlacementResolveError> {
@@ -343,7 +343,7 @@ pub(crate) fn map_selection<'a>(
 /// First shard of a referenced strategy that resolves to zero holders while the
 /// realm still has usable capacity: a filter, affinity or override leaves
 /// documents with nowhere to live. Usable-node-free realms are not flagged.
-pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<PlacementRef> {
+pub fn first_empty_shard(config: &RealmConfigDocument) -> Option<PlacementRef> {
     // Checked against the newest map, which is what a future activation would
     // pin: activated buckets are already frozen and cannot be emptied by an edit.
     let newest_epoch = config
@@ -446,9 +446,7 @@ pub fn bucket_membership(
                 }
             }
             Some(completion) => {
-                // Retention ends on grace AND the holder's reduced drain
-                // report, so an acknowledged pre-cutover write is never cut
-                // off by the clock alone.
+                // Retention ends after both grace and the holder's reduced drain report.
                 let retained_until = completion
                     .completed_at_ms
                     .saturating_add(transition.plan.limits.grace_ms);
@@ -547,7 +545,7 @@ pub fn holds_placement(
 /// Whether `node_id` is a draining former-holder of `placement`: marked draining
 /// yet it would hold the shard with that flag cleared. It keeps publish rights
 /// until its outbox flushes (DECISIONS K3); a fully removed node does not.
-pub fn is_draining_former_holder(
+pub fn is_draining_holder(
     config: &RealmConfigDocument,
     placement: &PlacementRef,
     node_id: NodeId,
@@ -582,7 +580,7 @@ pub fn is_draining_former_holder(
 /// First shard whose retained holdership would be lost for a node that remains
 /// draining across a config transition. Rejecting such transitions preserves
 /// its acknowledged writes until that node un-drains or is removed.
-pub fn first_draining_holder_set_change(
+pub fn first_draining_change(
     pre: &RealmConfigDocument,
     post: &RealmConfigDocument,
 ) -> Option<(NodeId, PlacementRef)> {
@@ -609,8 +607,8 @@ pub fn first_draining_holder_set_change(
                     strategy_id: strategy.strategy_id,
                     shard,
                 };
-                if is_draining_former_holder(pre, &placement, node_id)
-                    && !is_draining_former_holder(post, &placement, node_id)
+                if is_draining_holder(pre, &placement, node_id)
+                    && !is_draining_holder(post, &placement, node_id)
                 {
                     return Some((node_id, placement));
                 }
@@ -620,7 +618,7 @@ pub fn first_draining_holder_set_change(
     None
 }
 
-/// Every draining former-holder of `placement` (see [`is_draining_former_holder`]).
+/// Every draining former-holder of `placement` (see [`is_draining_holder`]).
 /// Co-holders keep these peers in the topic's membership and publisher set until
 /// they leave the config, so their in-flight flush is never cut off.
 pub fn draining_former_holders(
@@ -635,7 +633,7 @@ pub fn draining_former_holders(
         .iter()
         .filter(|entry| entry.draining)
         .map(|entry| entry.node_id)
-        .filter(|node_id| is_draining_former_holder(config, placement, *node_id))
+        .filter(|node_id| is_draining_holder(config, placement, *node_id))
         .collect()
 }
 
@@ -713,7 +711,7 @@ mod tests {
     use super::*;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::reducer::{
-        AdminDocumentReducerState, overlay_realm_config_placement_reducer_materialization,
+        AdminDocumentReducerState, overlay_placement,
     };
     use aruna_core::structs::{
         Actor, AffinityRule, BindingScope, CandidateMapNode, CandidatePlacementMap,
@@ -837,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn origin_bucket_is_deterministic() {
+    fn origin_bucket_deterministic() {
         let (config, _) = config_and_placement();
         let strategy = strategy_of(&config);
         let first = choose_origin_bucket(&config, strategy, node(1), &subject(1));
@@ -850,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn origin_holds_chosen_bucket() {
+    fn origin_holds_bucket() {
         let (config, _) = config_and_placement();
         let strategy = strategy_of(&config);
         // Replica 2 of 4 nodes: no node holds every bucket, so a blind hash
@@ -896,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_origin_holds_nothing() {
+    fn unknown_origin_empty() {
         let (config, _) = config_and_placement();
         let strategy = strategy_of(&config);
         assert!(held_buckets(&config, strategy, node(9)).is_empty());
@@ -925,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn user_origin_holds_nothing() {
+    fn user_origin_empty() {
         let (mut config, _) = config_and_placement();
         let owner = aruna_core::UserId::nil(config.realm_id);
         config.ensure_node(node(5), RealmNodeKind::User { owner });
@@ -938,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_subject_override_pins_and_excludes_holders() {
+    fn shard_override_filters() {
         let (mut config, placement) = config_and_placement();
         let baseline = resolve_shard_holders(&config, &placement);
         assert_eq!(baseline.len(), 2);
@@ -958,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn document_subject_override_does_not_touch_shard_holders() {
+    fn document_override_ignored() {
         let (mut config, placement) = config_and_placement();
         let baseline = resolve_shard_holders(&config, &placement);
 
@@ -1012,9 +1010,7 @@ mod tests {
 
     #[test]
     fn edits_stay_inert() {
-        // After activation, selector edits (replica count, affinity, distinct
-        // locations) and a shard override must not move holders: selection
-        // reads only the activated map's frozen selector inputs.
+        // Selection uses the activated map, so later selector and shard edits cannot move holders.
         let (mut config, placement) = config_and_placement();
         config.snapshot_candidate_map();
         let pinned = resolve_shard_holders(&config, &placement);
@@ -1100,9 +1096,7 @@ mod tests {
 
     #[test]
     fn membership_per_bucket() {
-        // Retention is the bucket's own: bucket 7 releases at its grace end
-        // while bucket 8's target stays a member without publish authority,
-        // and an abort drops incomplete targets immediately.
+        // Each bucket releases independently; abort drops incomplete targets immediately.
         let (config, strategy_id) = membership_fixture();
         let at = |shard: u32, now_ms: u64| {
             bucket_membership(&config, &PlacementRef { strategy_id, shard }, now_ms)
@@ -1244,7 +1238,7 @@ mod tests {
             transition_id: None,
         });
         assert_eq!(
-            resolve_shard_holders_checked(
+            try_resolve_holders(
                 &config,
                 &PlacementRef {
                     strategy_id: late.strategy_id,
@@ -1256,7 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_activation_fails_closed() {
+    fn missing_activation_fails() {
         let (mut config, placement) = config_and_placement();
         config.snapshot_candidate_map();
         let strategy_id = placement.strategy_id;
@@ -1265,7 +1259,7 @@ mod tests {
             .placement_activations
             .retain(|activation| activation.shard != placement.shard);
         assert_eq!(
-            resolve_shard_holders_checked(&config, &placement),
+            try_resolve_holders(&config, &placement),
             Err(PlacementResolveError::ActivationUnavailable(
                 placement.shard
             ))
@@ -1286,7 +1280,7 @@ mod tests {
                 });
         }
         assert_eq!(
-            resolve_shard_holders_checked(&config, &placement),
+            try_resolve_holders(&config, &placement),
             Err(PlacementResolveError::ActivationConflicted(placement.shard))
         );
 
@@ -1302,7 +1296,7 @@ mod tests {
             shard_overrides: Vec::new(),
         });
         assert_eq!(
-            resolve_shard_holders_checked(&config, &placement),
+            try_resolve_holders(&config, &placement),
             Err(PlacementResolveError::CandidateMapUnavailable(1))
         );
 
@@ -1311,13 +1305,13 @@ mod tests {
             shard: 0,
         };
         assert_eq!(
-            resolve_shard_holders_checked(&config, &unknown),
+            try_resolve_holders(&config, &unknown),
             Err(PlacementResolveError::StrategyUnknown(unknown.strategy_id))
         );
     }
 
     #[test]
-    fn empty_shard_check_uses_newest_map() {
+    fn empty_shard_newest() {
         // The guard validates the map a future activation would pin, not the
         // one already activated.
         let (mut config, _) = config_and_placement();
@@ -1341,20 +1335,20 @@ mod tests {
                 effect: aruna_core::structs::AffinityEffect::Filter,
             }];
         }
-        assert_eq!(first_empty_referenced_shard(&config), None);
+        assert_eq!(first_empty_shard(&config), None);
 
         // The frozen map still carries the matching labels, so nothing is empty
         // until the edit is snapshotted into a new map.
         for entry in config.placement_map.iter_mut() {
             entry.labels.insert("tier".to_string(), "cold".to_string());
         }
-        assert_eq!(first_empty_referenced_shard(&config), None);
+        assert_eq!(first_empty_shard(&config), None);
         config.snapshot_candidate_map();
-        assert!(first_empty_referenced_shard(&config).is_some());
+        assert!(first_empty_shard(&config).is_some());
     }
 
     #[test]
-    fn read_union_spans_transition() {
+    fn read_union_spans() {
         // Readers must reach both sides of a bucket in flight; writers must not.
         let (mut config, placement) = config_and_placement();
         config.snapshot_candidate_map();
@@ -1454,7 +1448,7 @@ mod tests {
         }
 
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+        overlay_placement(&mut config, &state, 0);
         let plan = crate::placement::transition::plan_transition(
             &config,
             crate::placement::transition::TransitionRequest {
@@ -1558,15 +1552,13 @@ mod tests {
 
     #[test]
     fn prune_keeps_holders() {
-        // Dropping a released record must leave every bucket exactly where the
-        // transition put it: the fold that advances activations replays the
-        // whole reduced chain, pruned records included.
+        // Pruning a released record preserves the bucket placements produced by the reduced chain.
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let strategy_id = Ulid::from_bytes([5u8; 16]);
         let state = reduced_handoff(realm_id, strategy_id);
         let materialize = |now_ms: u64| {
             let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-            overlay_realm_config_placement_reducer_materialization(&mut config, &state, now_ms);
+            overlay_placement(&mut config, &state, now_ms);
             config
         };
         let buckets = [

@@ -8,11 +8,7 @@ use tracing::warn;
 pub(crate) const SLOW_IROH_PHASE_THRESHOLD: Duration = Duration::from_millis(500);
 pub(crate) const SLOW_IROH_REQUEST_THRESHOLD: Duration = Duration::from_secs(2);
 
-pub(crate) fn warn_if_slow_iroh_phase(
-    operation: &'static str,
-    phase: &'static str,
-    duration: Duration,
-) {
+pub(crate) fn warn_iroh_phase(operation: &'static str, phase: &'static str, duration: Duration) {
     if duration >= SLOW_IROH_PHASE_THRESHOLD {
         warn!(
             event = "iroh.network.slow_phase",
@@ -25,7 +21,7 @@ pub(crate) fn warn_if_slow_iroh_phase(
     }
 }
 
-pub(crate) fn warn_if_slow_iroh_request(operation: &'static str, duration: Duration) {
+pub(crate) fn warn_iroh_request(operation: &'static str, duration: Duration) {
     if duration >= SLOW_IROH_REQUEST_THRESHOLD {
         warn!(
             event = "iroh.network.slow_request",

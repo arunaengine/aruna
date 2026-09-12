@@ -11,7 +11,7 @@ use aruna_core::structs::{BlobVersion, BlobVersionState, SourceMetadata, Version
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{Effects, Key};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::tasks::queue_backoff::{due_after, min_due_at, queue_retry_after_ms};
+use crate::tasks::queue_backoff::{due_after, min_due_at, retry_after_ms};
 
 const REFRESH_SCAN_PAGE_SIZE: usize = 512;
 const REFRESH_BATCH_SIZE: usize = 64;
@@ -98,7 +98,7 @@ impl ReferenceMetadataRefreshJobRecord {
     }
 }
 
-pub fn reference_metadata_refresh_job_key(
+pub fn job_key(
     refresh: &ReferenceMetadataRefresh,
 ) -> Result<Key, ConversionError> {
     let identity = ReferenceMetadataRefreshJobIdentity {
@@ -112,24 +112,24 @@ pub fn reference_metadata_refresh_job_key(
     Ok(ByteView::from(key))
 }
 
-fn reference_metadata_refresh_job_write_entry(
+fn job_entry(
     record: &ReferenceMetadataRefreshJobRecord,
 ) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((
         REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
-        reference_metadata_refresh_job_key(&record.refresh)?,
+        job_key(&record.refresh)?,
         ByteView::from(postcard::to_allocvec(record)?),
     ))
 }
 
-fn reference_metadata_refresh_job_preferred(
+fn job_preferred(
     candidate: &ReferenceMetadataRefreshJobRecord,
     current: &ReferenceMetadataRefreshJobRecord,
 ) -> bool {
     (candidate.attempts, candidate.due_at_ms) > (current.attempts, current.due_at_ms)
 }
 
-pub fn schedule_reference_metadata_refresh_drain_effect() -> Effect {
+pub fn schedule_drain() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainReferenceMetadataRefreshQueue,
         after: Duration::ZERO,
@@ -169,7 +169,7 @@ impl QueueReferenceMetadataRefreshOperation {
     }
 
     fn read_existing(&mut self) -> Effects {
-        let key = match reference_metadata_refresh_job_key(&self.refresh) {
+        let key = match job_key(&self.refresh) {
             Ok(key) => key,
             Err(error) => return self.fail(error.into()),
         };
@@ -184,7 +184,7 @@ impl QueueReferenceMetadataRefreshOperation {
     fn write_job(&mut self) -> Effects {
         let record =
             ReferenceMetadataRefreshJobRecord::new(self.refresh.clone(), unix_timestamp_millis());
-        let (key_space, key, value) = match reference_metadata_refresh_job_write_entry(&record) {
+        let (key_space, key, value) = match job_entry(&record) {
             Ok(entry) => entry,
             Err(error) => return self.fail(error.into()),
         };
@@ -199,7 +199,7 @@ impl QueueReferenceMetadataRefreshOperation {
 
     fn schedule_drain(&mut self) -> Effects {
         self.state = QueueReferenceMetadataRefreshState::ScheduleDrain;
-        smallvec![schedule_reference_metadata_refresh_drain_effect()]
+        smallvec![schedule_drain()]
     }
 
     fn finish(&mut self, queued: bool, scheduled: bool) -> Effects {
@@ -233,7 +233,7 @@ impl Operation for QueueReferenceMetadataRefreshOperation {
                     );
                     match postcard::from_bytes::<ReferenceMetadataRefreshJobRecord>(&value) {
                         Ok(existing)
-                            if reference_metadata_refresh_job_preferred(&existing, &record) =>
+                            if job_preferred(&existing, &record) =>
                         {
                             self.schedule_drain()
                         }
@@ -292,10 +292,10 @@ pub async fn refresh_reference_metadata(
     context: Arc<DriverContext>,
     refresh: ReferenceMetadataRefresh,
 ) -> Result<(), String> {
-    refresh_reference_metadata_with_context(context.as_ref(), refresh).await
+    refresh_with_context(context.as_ref(), refresh).await
 }
 
-pub async fn refresh_reference_metadata_with_context(
+pub async fn refresh_with_context(
     context: &DriverContext,
     refresh: ReferenceMetadataRefresh,
 ) -> Result<(), String> {
@@ -440,11 +440,11 @@ async fn abort_reference_refresh(context: &DriverContext, txn_id: Ulid) {
         .await;
 }
 
-pub async fn restore_reference_metadata_refresh_timer(
+pub async fn restore_timer(
     storage: &StorageHandle,
     task_handle: &TaskHandle,
 ) {
-    match next_reference_metadata_refresh_timer_after(storage).await {
+    match next_timer(storage).await {
         Ok(None) => {}
         Ok(Some(after)) => {
             let event = task_handle
@@ -461,7 +461,7 @@ pub async fn restore_reference_metadata_refresh_timer(
     }
 }
 
-pub async fn reference_metadata_refresh_jobs_exist(
+pub async fn jobs_exist(
     storage: &StorageHandle,
 ) -> Result<bool, ReferenceMetadataRefreshQueueError> {
     match storage
@@ -482,11 +482,11 @@ pub async fn reference_metadata_refresh_jobs_exist(
     }
 }
 
-pub async fn next_reference_metadata_refresh_timer_after(
+pub async fn next_timer(
     storage: &StorageHandle,
 ) -> Result<Option<Duration>, ReferenceMetadataRefreshQueueError> {
     let now_ms = unix_timestamp_millis();
-    let scan = scan_due_reference_metadata_refresh_jobs(storage, now_ms, 1).await?;
+    let scan = scan_due_jobs(storage, now_ms, 1).await?;
     if !scan.jobs.is_empty() || scan.has_more_due {
         return Ok(Some(Duration::ZERO));
     }
@@ -496,12 +496,12 @@ pub async fn next_reference_metadata_refresh_timer_after(
         .map(|due_at_ms| due_after(now_ms, due_at_ms)))
 }
 
-pub async fn process_reference_metadata_refresh_batch(
+pub async fn process_batch(
     context: &DriverContext,
 ) -> Result<ReferenceMetadataRefreshDrainResult, ReferenceMetadataRefreshQueueError> {
     let batch_started = Instant::now();
     let now_ms = unix_timestamp_millis();
-    let scan = scan_due_reference_metadata_refresh_jobs(
+    let scan = scan_due_jobs(
         &context.storage_handle,
         now_ms,
         REFRESH_BATCH_SIZE,
@@ -521,13 +521,13 @@ pub async fn process_reference_metadata_refresh_batch(
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     for (job_key, job) in scan.jobs {
-        match refresh_reference_metadata_with_context(context, job.refresh.clone()).await {
+        match refresh_with_context(context, job.refresh.clone()).await {
             Ok(()) => {
-                delete_reference_metadata_refresh_job(&context.storage_handle, job_key).await?;
+                delete_job(&context.storage_handle, job_key).await?;
                 succeeded = succeeded.saturating_add(1);
             }
             Err(error) => {
-                let retry_due_at = reschedule_reference_metadata_refresh_job(
+                let retry_due_at = reschedule_job(
                     &context.storage_handle,
                     job_key,
                     &job,
@@ -567,7 +567,7 @@ pub async fn process_reference_metadata_refresh_batch(
     })
 }
 
-async fn scan_due_reference_metadata_refresh_jobs(
+async fn scan_due_jobs(
     storage: &StorageHandle,
     now_ms: u64,
     limit: usize,
@@ -604,18 +604,18 @@ async fn scan_due_reference_metadata_refresh_jobs(
                 Ok(job) => job,
                 Err(error) => {
                     warn!(error = %error, key = ?key, "Deleting malformed reference metadata refresh job");
-                    delete_reference_metadata_refresh_job(storage, key).await?;
+                    delete_job(storage, key).await?;
                     continue;
                 }
             };
-            let canonical_key = reference_metadata_refresh_job_key(&job.refresh)?.to_vec();
+            let canonical_key = job_key(&job.refresh)?.to_vec();
             if canonical_key.as_slice() != key.as_slice() {
                 warn!(key = ?key, "Repairing reference metadata refresh job stored under non-canonical key");
                 if let Some(existing) =
-                    read_reference_metadata_refresh_job_at_key(storage, &canonical_key).await?
-                    && reference_metadata_refresh_job_preferred(&existing, &job)
+                    read_job(storage, &canonical_key).await?
+                    && job_preferred(&existing, &job)
                 {
-                    delete_reference_metadata_refresh_job(storage, key).await?;
+                    delete_job(storage, key).await?;
                     if existing.due_at_ms > now_ms {
                         next_due_at_ms = min_due_at(next_due_at_ms, existing.due_at_ms);
                         continue;
@@ -630,27 +630,27 @@ async fn scan_due_reference_metadata_refresh_jobs(
                     }
                     continue;
                 }
-                write_reference_metadata_refresh_job(storage, &job).await?;
-                delete_reference_metadata_refresh_job(storage, key).await?;
+                write_job(storage, &job).await?;
+                delete_job(storage, key).await?;
                 key = canonical_key;
             }
             if let Some((existing_key, existing)) =
-                find_decoded_reference_metadata_refresh_duplicate(
+                find_duplicate(
                     storage,
                     &job,
                     Some(key.as_slice()),
                 )
                 .await?
-                && reference_metadata_refresh_job_preferred(&existing, &job)
+                && job_preferred(&existing, &job)
             {
                 let existing_canonical_key =
-                    reference_metadata_refresh_job_key(&existing.refresh)?.to_vec();
-                write_reference_metadata_refresh_job(storage, &existing).await?;
+                    job_key(&existing.refresh)?.to_vec();
+                write_job(storage, &existing).await?;
                 if existing_key.as_slice() != existing_canonical_key.as_slice() {
-                    delete_reference_metadata_refresh_job(storage, existing_key).await?;
+                    delete_job(storage, existing_key).await?;
                 }
                 if key.as_slice() != existing_canonical_key.as_slice() {
-                    delete_reference_metadata_refresh_job(storage, key).await?;
+                    delete_job(storage, key).await?;
                 }
                 if existing.due_at_ms > now_ms {
                     next_due_at_ms = min_due_at(next_due_at_ms, existing.due_at_ms);
@@ -693,13 +693,13 @@ async fn scan_due_reference_metadata_refresh_jobs(
     }
 }
 
-async fn find_decoded_reference_metadata_refresh_duplicate(
+async fn find_duplicate(
     storage: &StorageHandle,
     job: &ReferenceMetadataRefreshJobRecord,
     skip_key: Option<&[u8]>,
 ) -> Result<Option<(Vec<u8>, ReferenceMetadataRefreshJobRecord)>, ReferenceMetadataRefreshQueueError>
 {
-    let canonical_key = reference_metadata_refresh_job_key(&job.refresh)?.to_vec();
+    let canonical_key = job_key(&job.refresh)?.to_vec();
     let mut selected = None;
     let mut start_after = None;
     loop {
@@ -733,14 +733,14 @@ async fn find_decoded_reference_metadata_refresh_duplicate(
             else {
                 continue;
             };
-            if reference_metadata_refresh_job_key(&candidate.refresh)?.as_ref()
+            if job_key(&candidate.refresh)?.as_ref()
                 != canonical_key.as_slice()
             {
                 continue;
             }
             match selected.as_mut() {
                 Some((_, selected_job))
-                    if reference_metadata_refresh_job_preferred(&candidate, selected_job) =>
+                    if job_preferred(&candidate, selected_job) =>
                 {
                     selected = Some((key.to_vec(), candidate));
                 }
@@ -756,7 +756,7 @@ async fn find_decoded_reference_metadata_refresh_duplicate(
     }
 }
 
-async fn read_reference_metadata_refresh_job_at_key(
+async fn read_job(
     storage: &StorageHandle,
     key: &[u8],
 ) -> Result<Option<ReferenceMetadataRefreshJobRecord>, ReferenceMetadataRefreshQueueError> {
@@ -781,11 +781,11 @@ async fn read_reference_metadata_refresh_job_at_key(
     }
 }
 
-async fn write_reference_metadata_refresh_job(
+async fn write_job(
     storage: &StorageHandle,
     job: &ReferenceMetadataRefreshJobRecord,
 ) -> Result<(), ReferenceMetadataRefreshQueueError> {
-    let (key_space, key, value) = reference_metadata_refresh_job_write_entry(job)?;
+    let (key_space, key, value) = job_entry(job)?;
     match storage
         .send_storage_effect(StorageEffect::Write {
             key_space,
@@ -803,7 +803,7 @@ async fn write_reference_metadata_refresh_job(
     }
 }
 
-async fn delete_reference_metadata_refresh_job(
+async fn delete_job(
     storage: &StorageHandle,
     key: Vec<u8>,
 ) -> Result<(), ReferenceMetadataRefreshQueueError> {
@@ -823,14 +823,14 @@ async fn delete_reference_metadata_refresh_job(
     }
 }
 
-async fn reschedule_reference_metadata_refresh_job(
+async fn reschedule_job(
     storage: &StorageHandle,
     key: Vec<u8>,
     job: &ReferenceMetadataRefreshJobRecord,
     error: String,
 ) -> Result<u64, ReferenceMetadataRefreshQueueError> {
     let attempts = job.attempts.saturating_add(1);
-    let due_at_ms = unix_timestamp_millis().saturating_add(queue_retry_after_ms(attempts));
+    let due_at_ms = unix_timestamp_millis().saturating_add(retry_after_ms(attempts));
     let next_job = ReferenceMetadataRefreshJobRecord {
         refresh: job.refresh.clone(),
         due_at_ms,
@@ -1050,7 +1050,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_reference_metadata_refresh_drains_and_preserves_stale_guard() {
+    async fn drain_preserves_guard() {
         let test = setup_state();
         let last_refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
         let original_metadata = source_metadata(10, "original");
@@ -1066,7 +1066,7 @@ mod tests {
         )
         .await
         .expect("queue succeeds");
-        let result = process_reference_metadata_refresh_batch(&test.context)
+        let result = process_batch(&test.context)
             .await
             .expect("drain succeeds");
 
@@ -1076,7 +1076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_reference_metadata_refresh_updates_newer_cache() {
+    async fn newer_cache_updated() {
         let test = setup_state();
         let last_refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
         let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
@@ -1093,7 +1093,7 @@ mod tests {
         )
         .await
         .expect("queue succeeds");
-        process_reference_metadata_refresh_batch(&test.context)
+        process_batch(&test.context)
             .await
             .expect("drain succeeds");
 
@@ -1125,7 +1125,7 @@ mod tests {
         )
         .await
         .expect("queue succeeds");
-        process_reference_metadata_refresh_batch(&test.context)
+        process_batch(&test.context)
             .await
             .expect("drain succeeds");
 
@@ -1134,7 +1134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_reference_metadata_refresh_keeps_newest_job() {
+    async fn newest_job_kept() {
         let test = setup_state();
         let last_refresh = SystemTime::UNIX_EPOCH;
         let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
@@ -1166,7 +1166,7 @@ mod tests {
         let jobs = read_jobs(&test.context.storage_handle).await;
         assert_eq!(jobs.len(), 2);
 
-        let result = process_reference_metadata_refresh_batch(&test.context)
+        let result = process_batch(&test.context)
             .await
             .expect("drain succeeds");
         assert_eq!(result.succeeded, 2);
@@ -1174,7 +1174,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_reference_metadata_refresh_preserves_future_retry() {
+    async fn future_retry_preserved() {
         let test = setup_state();
         let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         let refresh = refresh(&test, source_metadata(30, "future"), refreshed_at);
@@ -1185,7 +1185,7 @@ mod tests {
             last_error: Some("transient".to_string()),
         };
         let (key_space, key, value) =
-            reference_metadata_refresh_job_write_entry(&future_job).expect("future job serializes");
+            job_entry(&future_job).expect("future job serializes");
         match test
             .context
             .storage_handle
@@ -1215,7 +1215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn future_reference_metadata_refresh_does_not_report_more_due() {
+    async fn future_not_due() {
         let test = setup_state();
         let due_at_ms = unix_timestamp_millis().saturating_add(60_000);
         let record = ReferenceMetadataRefreshJobRecord::new(
@@ -1226,7 +1226,7 @@ mod tests {
             ),
             due_at_ms,
         );
-        let (key_space, key, value) = reference_metadata_refresh_job_write_entry(&record).unwrap();
+        let (key_space, key, value) = job_entry(&record).unwrap();
         match test
             .context
             .storage_handle
@@ -1242,7 +1242,7 @@ mod tests {
             other => panic!("unexpected job write event: {other:?}"),
         }
 
-        let result = process_reference_metadata_refresh_batch(&test.context)
+        let result = process_batch(&test.context)
             .await
             .expect("future-only drain succeeds");
 
@@ -1252,11 +1252,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_reference_metadata_refresh_job_only_is_deleted() {
+    async fn corrupt_job_deleted() {
         let test = setup_state();
         write_corrupt_job(&test.context.storage_handle, "000-corrupt-refresh-job").await;
 
-        let result = process_reference_metadata_refresh_batch(&test.context)
+        let result = process_batch(&test.context)
             .await
             .expect("corrupt-only refresh drain succeeds");
 
@@ -1264,14 +1264,14 @@ mod tests {
         assert!(!result.has_more_due);
         assert!(result.next_due_after.is_none());
         assert!(
-            !reference_metadata_refresh_jobs_exist(&test.context.storage_handle)
+            !jobs_exist(&test.context.storage_handle)
                 .await
                 .unwrap()
         );
     }
 
     #[tokio::test]
-    async fn corrupt_reference_metadata_refresh_job_before_valid_is_deleted() {
+    async fn corrupt_precedes_valid() {
         let test = setup_state();
         write_corrupt_job(&test.context.storage_handle, "000-corrupt-refresh-job").await;
         crate::driver::drive(
@@ -1285,7 +1285,7 @@ mod tests {
         .await
         .expect("queue succeeds");
 
-        let result = process_reference_metadata_refresh_batch(&test.context)
+        let result = process_batch(&test.context)
             .await
             .expect("mixed corrupt/valid refresh drain succeeds");
 

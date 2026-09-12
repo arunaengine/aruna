@@ -13,7 +13,7 @@ use aruna_core::metadata::{
 };
 use aruna_core::structs::{AuthContext, RealmConfigDocument, RealmId, SyncRefusal};
 use aruna_core::types::UserId;
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use rand::seq::SliceRandom;
 use tracing::{debug, warn};
 use ulid::Ulid;

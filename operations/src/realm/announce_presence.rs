@@ -162,7 +162,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn presence_ttl_outlives_refresh_and_dht_tick() {
+    fn presence_ttl_sufficient() {
         let realm_id = RealmId([1u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let mut op = AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn dht_put_error_fails_operation() {
+    fn dht_error_fails() {
         let realm_id = RealmId([1u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let mut op = AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {

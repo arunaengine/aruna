@@ -12,12 +12,12 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::storage_entries::{
-    admin_document_reducer_state_write_entry, document_sync_revision_write_entry,
+    reducer_state_entry, sync_revision_entry,
 };
 use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, User, oidc_subject_key};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId, UserId};
-use aruna_core::util::unix_timestamp_millis as current_timestamp_ms;
+use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::{USER_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -25,11 +25,11 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::placement::placement_ref_for_target;
+use crate::placement::target_placement_ref;
 use crate::sync::document_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
-use crate::users::subject_index::rewrite_subject_index_effects;
+use crate::users::subject_index::rewrite_subjects;
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegisterOrGetOidcUserInput {
     pub actor: Actor,
@@ -121,7 +121,7 @@ impl RegisterOrGetOidcUserOperation {
         )?)
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn fail_storage(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -152,13 +152,13 @@ impl RegisterOrGetOidcUserOperation {
             );
         };
 
-        match self.emit_read_subject_index(txn_id) {
+        match self.read_subject(txn_id) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn emit_read_subject_index(
+    fn read_subject(
         &mut self,
         txn_id: TxnId,
     ) -> Result<Effects, RegisterOrGetOidcUserError> {
@@ -176,7 +176,7 @@ impl RegisterOrGetOidcUserOperation {
         })])
     }
 
-    fn handle_read_subject_index(&mut self, event: Event, txn_id: TxnId) -> Effects {
+    fn accept_subject(&mut self, event: Event, txn_id: TxnId) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event(
@@ -198,7 +198,7 @@ impl RegisterOrGetOidcUserOperation {
         }
 
         match subject_value.clone() {
-            Some(value) => self.emit_read_existing_user(txn_id, value),
+            Some(value) => self.read_existing(txn_id, value),
             None => match self.emit_create_user(txn_id) {
                 Ok(effects) => effects,
                 Err(err) => self.fail(err),
@@ -206,7 +206,7 @@ impl RegisterOrGetOidcUserOperation {
         }
     }
 
-    fn emit_read_existing_user(&mut self, txn_id: TxnId, user_id: ByteView) -> Effects {
+    fn read_existing(&mut self, txn_id: TxnId, user_id: ByteView) -> Effects {
         self.state = RegisterOrGetOidcUserState::ReadExistingUser { txn_id };
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: USER_KEYSPACE.to_string(),
@@ -238,27 +238,27 @@ impl RegisterOrGetOidcUserOperation {
         let placement = self
             .realm_config
             .as_ref()
-            .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
+            .map(|config| target_placement_ref(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
         let realm_id = self.input.actor.realm_id;
         if let Some(config) = self.realm_config.as_ref() {
             self.fence.add(realm_id, config, [placement]);
         }
         let generation = self.fence.generation(&realm_id, &placement);
-        let document_revision = initial_user_document_sync_change(&self.input.actor, placement);
+        let document_revision = initial_sync_change(&self.input.actor, placement);
         let mut reducer_state = AdminDocumentReducerState::new(admin_target);
-        let admin_events = seed_user_admin_events(&mut reducer_state, &self.input, subject_id)?;
+        let admin_events = seed_admin_events(&mut reducer_state, &self.input, subject_id)?;
         let mut writes = vec![
             (
                 USER_KEYSPACE.to_string(),
                 ByteView::from(self.input.user_id.to_bytes()),
                 ByteView::from(user.to_bytes(&self.input.actor)?),
             ),
-            document_sync_revision_write_entry(&document_target, &document_revision)?,
-            admin_document_reducer_state_write_entry(&reducer_state)?,
+            sync_revision_entry(&document_target, &document_revision)?,
+            reducer_state_entry(&reducer_state)?,
         ];
         for event in &admin_events {
-            let record = new_outbox_record_with_id(
+            let record = new_identified_record(
                 event.event_id,
                 self.input.actor.node_id,
                 document_target.clone(),
@@ -284,13 +284,13 @@ impl RegisterOrGetOidcUserOperation {
                 .unexpected_event("Event::Storage(StorageEvent::BatchWriteResult { .. })", got);
         };
 
-        match self.emit_write_subject_index(txn_id, user) {
+        match self.write_subject(txn_id, user) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn emit_write_subject_index(
+    fn write_subject(
         &mut self,
         txn_id: TxnId,
         user: User,
@@ -299,7 +299,7 @@ impl RegisterOrGetOidcUserOperation {
             txn_id,
             user: user.clone(),
         };
-        let mut effects = rewrite_subject_index_effects(None, &user, txn_id)?;
+        let mut effects = rewrite_subjects(None, &user, txn_id)?;
         let claims = postcard::to_allocvec(&BTreeSet::from([user.user_id])).map_err(|error| {
             RegisterOrGetOidcUserError::ConversionError(ConversionError::FromStrError(
                 error.to_string(),
@@ -321,7 +321,7 @@ impl RegisterOrGetOidcUserOperation {
         Ok(effects)
     }
 
-    fn handle_write_subject_index(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
+    fn accept_subject_write(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
         let got = format!("{event:?}");
         match event {
             Event::Storage(StorageEvent::WriteResult { .. })
@@ -338,7 +338,7 @@ impl RegisterOrGetOidcUserOperation {
         self.emit_commit(txn_id, user, true)
     }
 
-    fn handle_read_existing_user(&mut self, event: Event, txn_id: TxnId) -> Effects {
+    fn accept_existing(&mut self, event: Event, txn_id: TxnId) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
@@ -347,13 +347,13 @@ impl RegisterOrGetOidcUserOperation {
             );
         };
 
-        match self.emit_parsed_user_and_commit(txn_id, value) {
+        match self.commit_parsed_user(txn_id, value) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn emit_parsed_user_and_commit(
+    fn commit_parsed_user(
         &mut self,
         txn_id: TxnId,
         value: Option<ByteView>,
@@ -416,13 +416,13 @@ impl RegisterOrGetOidcUserOperation {
 
         if announce {
             self.state = RegisterOrGetOidcUserState::ScheduleAdminDocumentOutboxDrain { user };
-            smallvec![schedule_outbox_drain_effect()]
+            smallvec![schedule_drain_effect()]
         } else {
             self.emit_finish(user)
         }
     }
 
-    fn handle_schedule_admin_document_outbox_drain(&mut self, event: Event, user: User) -> Effects {
+    fn schedule_outbox_drain(&mut self, event: Event, user: User) -> Effects {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. })
             | Event::Task(TaskEvent::Error { .. }) => self.emit_finish(user),
@@ -452,7 +452,7 @@ impl Operation for RegisterOrGetOidcUserOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.fail_storage(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
@@ -460,16 +460,16 @@ impl Operation for RegisterOrGetOidcUserOperation {
         match self.state.clone() {
             RegisterOrGetOidcUserState::StartTransaction => self.handle_start_txn(event),
             RegisterOrGetOidcUserState::ReadSubjectIndex { txn_id } => {
-                self.handle_read_subject_index(event, txn_id)
+                self.accept_subject(event, txn_id)
             }
             RegisterOrGetOidcUserState::WriteUserAndDocumentRevision { txn_id, user } => {
                 self.handle_write_user(event, txn_id, user)
             }
             RegisterOrGetOidcUserState::WriteSubjectIndex { txn_id, user } => {
-                self.handle_write_subject_index(event, txn_id, user)
+                self.accept_subject_write(event, txn_id, user)
             }
             RegisterOrGetOidcUserState::ReadExistingUser { txn_id } => {
-                self.handle_read_existing_user(event, txn_id)
+                self.accept_existing(event, txn_id)
             }
             RegisterOrGetOidcUserState::ReadBucketFence {
                 txn_id,
@@ -480,7 +480,7 @@ impl Operation for RegisterOrGetOidcUserOperation {
                 self.handle_commit_txn(event, user, announce)
             }
             RegisterOrGetOidcUserState::ScheduleAdminDocumentOutboxDrain { user } => {
-                self.handle_schedule_admin_document_outbox_drain(event, user)
+                self.schedule_outbox_drain(event, user)
             }
             RegisterOrGetOidcUserState::Init
             | RegisterOrGetOidcUserState::Finish
@@ -513,7 +513,7 @@ impl Operation for RegisterOrGetOidcUserOperation {
     }
 }
 
-fn seed_user_admin_events(
+fn seed_admin_events(
     state: &mut AdminDocumentReducerState,
     input: &RegisterOrGetOidcUserInput,
     subject_id: String,
@@ -532,7 +532,7 @@ fn seed_user_admin_events(
     Ok(events)
 }
 
-fn initial_user_document_sync_change(actor: &Actor, placement: PlacementRef) -> DocumentSyncChange {
+fn initial_sync_change(actor: &Actor, placement: PlacementRef) -> DocumentSyncChange {
     let updated_at_ms = current_timestamp_ms();
     DocumentSyncChange {
         base: None,
@@ -562,7 +562,7 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentReducerState;
     use aruna_core::storage_entries::{
-        admin_document_reducer_state_key, document_sync_revision_key,
+        reducer_state_key, sync_revision_key,
     };
     use aruna_core::structs::{Actor, User, oidc_subject_key};
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -573,7 +573,7 @@ mod tests {
     use ulid::Ulid;
 
     #[tokio::test]
-    async fn creates_user_subject_index_and_announces_user_document() {
+    async fn creates_user_index() {
         let realm_id = aruna_core::structs::RealmId([3u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
@@ -647,7 +647,7 @@ mod tests {
                     .expect("reducer state write is included");
                 assert_eq!(
                     reducer_state_write.1,
-                    admin_document_reducer_state_key(&admin_target)
+                    reducer_state_key(&admin_target)
                 );
                 let reducer_state: AdminDocumentReducerState =
                     postcard::from_bytes(reducer_state_write.2.as_ref()).unwrap();
@@ -656,10 +656,10 @@ mod tests {
                     reducer_state.materialized_user_name(),
                     Some("alice".to_string())
                 );
-                assert_eq!(reducer_state.materialized_user_subject_ids().len(), 1);
+                assert_eq!(reducer_state.materialized_subject_ids().len(), 1);
                 assert!(
                     reducer_state
-                        .materialized_user_subject_ids()
+                        .materialized_subject_ids()
                         .contains(&subject_id)
                 );
                 assert_eq!(reducer_state.applied_event_ids.len(), 2);
@@ -764,7 +764,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writes_document_sync_revision_sidecar_with_new_user() {
+    async fn writes_sync_sidecar() {
         let realm_id = aruna_core::structs::RealmId([7u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
@@ -824,7 +824,7 @@ mod tests {
                 )
             })
             .expect("revision sidecar write exists");
-        assert_eq!(revision_key, &document_sync_revision_key(&document_target));
+        assert_eq!(revision_key, &sync_revision_key(&document_target));
         assert_eq!(revision.base, None);
         assert_eq!(revision.current.actor, actor.node_id);
         assert!(revision.current.generation > 0);
@@ -833,7 +833,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_user_is_returned_without_new_announcement() {
+    async fn returns_existing_user() {
         let realm_id = aruna_core::structs::RealmId([5u8; 32]);
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let existing_user = User {

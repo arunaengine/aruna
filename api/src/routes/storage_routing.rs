@@ -3,7 +3,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{
     AuthContext, BackendRef, Permission, RoutingTarget, StorageRoutingRule,
-    blob_bucket_permission_path, target_warnings,
+    bucket_permission_path, target_warnings,
 };
 use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::groups::storage_routing::{
@@ -206,7 +206,7 @@ async fn ensure_bucket_read(
     crate::auth::ensure_permission(
         state,
         auth,
-        blob_bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
+        bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
         Permission::READ,
     )
     .await

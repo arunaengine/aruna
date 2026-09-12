@@ -11,7 +11,7 @@ pub fn secret_state_key(enrollment_id: Ulid) -> ByteView {
     ByteView::from(format!("secret-state:{enrollment_id}").into_bytes())
 }
 
-pub fn secret_state_write_entry(
+pub fn secret_state_entry(
     enrollment_id: Ulid,
     state: OnboardingSecretState,
 ) -> Result<(String, Key, Value), ConversionError> {

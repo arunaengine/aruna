@@ -475,7 +475,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn range_copy_writes_part_bytes_and_record() {
+    async fn range_copy_persists() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = Ulid::generate();
@@ -757,7 +757,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn missing_destination_upload_fails_before_source_lookup() {
+    async fn upload_precedes_lookup() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let group_id = Ulid::generate();

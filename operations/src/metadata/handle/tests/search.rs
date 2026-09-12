@@ -359,7 +359,7 @@ fn filters_restrict_candidates() {
     assert_eq!(filter_candidate_records(records, None, None).len(), 3);
 }
 #[test]
-fn rejected_lifecycle_refresh_uses_fresh_tombstone_snapshot() {
+fn rejected_lifecycle_refresh() {
     let deleted_record = registry_record("datasets/deleted-race");
     let cache = MetadataVisibilityCache::new();
     cache.store_lifecycle_deleted(deleted_record.graph_iri.clone(), false);
@@ -374,7 +374,7 @@ fn rejected_lifecycle_refresh_uses_fresh_tombstone_snapshot() {
     assert!(!scope.graph_visible(&cache, &deleted_record.graph_iri));
 }
 #[test]
-fn lifecycle_refresh_restamps_entries_and_prunes_expired_leftovers() {
+fn lifecycle_refresh_restamps() {
     let cache = MetadataVisibilityCache::new();
     cache.store_lifecycle_deleted("urn:graph:kept".to_string(), true);
     cache.store_lifecycle_deleted("urn:graph:gone".to_string(), false);
@@ -389,11 +389,11 @@ fn lifecycle_refresh_restamps_entries_and_prunes_expired_leftovers() {
 }
 
 #[test]
-fn remote_search_graph_limit_clamps_at_protocol_ingress() {
-    assert_eq!(clamp_remote_search_graph_limit(0), 1);
-    assert_eq!(clamp_remote_search_graph_limit(25), 25);
+fn search_limit_clamps() {
+    assert_eq!(clamp_remote_limit(0), 1);
+    assert_eq!(clamp_remote_limit(25), 25);
     assert_eq!(
-        clamp_remote_search_graph_limit(METADATA_SEARCH_MAX_PAGINATION_DEPTH + 1),
+        clamp_remote_limit(METADATA_SEARCH_MAX_PAGINATION_DEPTH + 1),
         METADATA_SEARCH_MAX_PAGINATION_DEPTH
     );
 }

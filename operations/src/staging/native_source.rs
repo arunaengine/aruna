@@ -9,7 +9,7 @@ use aruna_core::events::{Event, StagingSourceEvent};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     AuthContext, Permission, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
-    SyncRelationship, SyncState, blob_object_permission_path,
+    SyncRelationship, SyncState, object_permission_path,
 };
 use aruna_net::NetHandle;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
@@ -345,7 +345,7 @@ async fn prepare_reference(
         path_restrictions: None,
         session: None,
     };
-    let path = blob_object_permission_path(
+    let path = object_permission_path(
         relationship.source.realm_id,
         bucket_info.group_id,
         relationship.source.node_id,
@@ -443,9 +443,8 @@ fn validate_relationship(
         .source
         .key_prefix()
         .is_none_or(|prefix| request.key.starts_with(prefix));
-    // Detached stubs are deleted relationships that must keep serving the
-    // reference records the target retained; every other non-enabled state
-    // still refuses access.
+    // Detached stubs keep serving retained references after relationship deletion.
+    // Other disabled states refuse access.
     if !relationship.serves_references()
         || !matches!(relationship.state, SyncState::Enabled | SyncState::Detached)
         || relationship.source.realm_id != *net_handle.realm_id()
@@ -471,9 +470,8 @@ fn map_get_error(error: GetObjectError) -> NativeReferenceReject {
         GetObjectError::NoSuchKey
         | GetObjectError::NoSuchVersion
         | GetObjectError::DeleteMarker
-        // The pinned observation is gone from the origin, so this read has no
-        // bytes to relay; drift and an exhausted binding are both transport-level
-        // unavailability the caller may retry or heal by rebinding.
+        // The pinned observation no longer has bytes to relay.
+        // Drift and exhausted bindings remain retryable through rebinding.
         | GetObjectError::HistoricalReferenceUnavailable => NativeReferenceReject::NotFound,
         GetObjectError::ReferenceSourceChanged | GetObjectError::ReferenceAdvanceExhausted => {
             NativeReferenceReject::Unavailable(error.to_string())
@@ -551,9 +549,8 @@ fn head_metadata(
 
 async fn mark_access_denied(context: &DriverContext, mut relationship: SyncRelationship) {
     if relationship.state == SyncState::Detached {
-        // A detached stub has no owner-visible entry left to surface the
-        // failure in, and flipping it to Failed would stop serving retained
-        // data permanently; the per-request denial is the only surface.
+        // Detached stubs have no visible status entry. Marking them failed would stop retained
+        // reads, so only the request reports denial.
         return;
     }
     relationship.state = SyncState::Failed {

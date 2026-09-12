@@ -37,7 +37,7 @@ use crate::jobs::records::{
 };
 use crate::jobs::store::{batch_delete, iter_prefix_page};
 use crate::metadata::api::load_realm_config;
-use crate::node::node_info::read_node_info_document;
+use crate::node::node_info::read_info_document;
 
 /// Domain of the stable witness order.
 pub const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
@@ -446,9 +446,8 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     if !view.holds(local) {
         return RoundOutcome::Done;
     }
-    // An incomplete family read is undecided evidence: a suppression, a
-    // cancellation, or an earlier launch may be in the part that did not load,
-    // so this round stores no budget and offers no launch.
+    // An incomplete family read is undecided evidence: a suppression, cancel or
+    // earlier launch may be in the unloaded part, so no budget and no offer.
     let records = match load_family_complete(context, family).await {
         Ok(records) => records,
         Err(error) => {
@@ -740,7 +739,7 @@ async fn silent_nodes(
         .map(|execution| execution.executor_node_id)
         .collect();
     for node in running {
-        if let Ok(Some(document)) = read_node_info_document(&context.storage_handle, node).await
+        if let Ok(Some(document)) = read_info_document(&context.storage_handle, node).await
             && now_ms.saturating_sub(document.utilization.heartbeat_at_ms) > window_ms
         {
             silent.insert(node);

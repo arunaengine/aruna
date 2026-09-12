@@ -90,7 +90,7 @@ pub fn parse_group_document(key: &[u8]) -> Result<DocumentSyncTarget, Conversion
     })
 }
 
-pub fn parse_realm_config_document(key: &[u8]) -> Result<DocumentSyncTarget, ConversionError> {
+pub fn parse_realm_config(key: &[u8]) -> Result<DocumentSyncTarget, ConversionError> {
     if key.len() != 32 {
         return Err(ConversionError::InvalidLength(format!(
             "unexpected realm config key length {}",
@@ -105,7 +105,7 @@ pub fn parse_realm_config_document(key: &[u8]) -> Result<DocumentSyncTarget, Con
     })
 }
 
-pub fn event_to_iter_values(event: Event) -> Result<Vec<(Key, ByteView)>, StorageError> {
+pub fn iter_event_values(event: Event) -> Result<Vec<(Key, ByteView)>, StorageError> {
     match event {
         Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values),
         Event::Storage(StorageEvent::Error { error }) => Err(error),

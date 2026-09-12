@@ -1,8 +1,6 @@
-//! Application Layer Protocol Negotiation identifiers for Aruna streams.
-//!
-//! The version suffix is the whole compatibility contract: a peer whose frames
-//! differ never negotiates the ALPN, so it fails the connection instead of
-//! decoding foreign bytes. There is no fallback ALPN and no downgrade.
+//! Application Layer Protocol Negotiation identifiers for Aruna streams. The version suffix is the
+//! whole compatibility contract: a peer whose frames differ never negotiates the ALPN, so it fails the
+//! connection instead of decoding foreign bytes. There is no fallback ALPN and no downgrade.
 
 use crate::structs::RealmNodeKind;
 
@@ -62,13 +60,8 @@ impl Alpn {
         Alpn::JobControl,
     ];
 
-    /// The ALPN x node-kind allow matrix, consulted on both sides of every
-    /// connection. `None` is a key the realm config does not name: it keeps the
-    /// pre-matrix provisional behaviour and is bounded by admission instead.
-    ///
-    /// A `User` device speaks the read and forward surface only. Document sync
-    /// and shard exchange are realm infrastructure a device never touches in
-    /// any direction; job control it dials for its owner but never serves.
+    /// ALPN and node-kind allow matrix enforced at both connection ends. Unknown kinds retain provisional
+    /// admission behavior. User devices read and forward, but never serve sync, shard, or job control.
     pub const fn permits(&self, kind: Option<&RealmNodeKind>, role: AlpnRole) -> bool {
         match kind {
             None | Some(RealmNodeKind::Management) | Some(RealmNodeKind::Server) => true,

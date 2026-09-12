@@ -1,13 +1,6 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 //! The PID authority on a realm sized above the replication factor.
-//!
-//! The mapping keyspace is deliberately not the registry row: the row is deleted
-//! with the document while the mapping has to survive it to serve a permanent 410.
-//! These tests prove that every node answers the same way regardless of which one
-//! receives the request, that retirement is terminal against a racing mint, and
-//! that a node which cannot reach the authority reports unavailable rather than
-//! inventing a local 404.
 
 mod topology;
 
@@ -16,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{METADATA_PENDING_PROJECTION_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE};
-use aruna_core::storage_entries::metadata_pending_projection_key;
+use aruna_core::storage_entries::pending_projection_key;
 use aruna_core::structs::{
     JobId, MetadataRegistryRecord, MintPersistentIdSpec, PersistentIdMapping, PersistentIdRevision,
     PersistentIdStatus, PlacementRef, persistent_id_key, pid_dedup_key,
@@ -32,12 +25,12 @@ use aruna_operations::metadata::create_document::{
     mint_local_document,
 };
 use aruna_operations::metadata::forward::{
-    MetadataWriteError, create_metadata_document_routed, delete_metadata_document_routed,
-    mint_pid_routed, resolve_pid_routed, withdraw_pid_routed,
+    MetadataWriteError, mint_pid_routed, resolve_pid_routed, route_metadata_create,
+    route_metadata_delete, withdraw_pid_routed,
 };
-use aruna_operations::metadata::get_document::load_metadata_record_by_document;
+use aruna_operations::metadata::get_document::load_document_record;
 use aruna_operations::metadata::persistent_id::read_mapping;
-use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::metadata::projector::replay_event_log;
 use aruna_operations::realm::claim_admin::{
     ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
 };
@@ -190,7 +183,7 @@ async fn delete_withdraws_mapping() -> TestResult<()> {
 /// that answers PID landing requests; otherwise the successful delete can race an
 /// authoritative redirect until its tombstone happens to replicate.
 #[tokio::test]
-async fn replica_delete_routes_to_pid_authority() -> TestResult<()> {
+async fn delete_routes_authority() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let group_id = realm.seed_group().await?;
     let (document_id, placement) =
@@ -335,10 +328,8 @@ async fn authority_loss_unavailable() -> TestResult<()> {
     Ok(())
 }
 
-/// Two authorized users minting the same document through two ingress nodes get
-/// one job on one owner. A node-local dedup row would let alternating ingress
-/// open a job each, and the handle each caller receives must be readable by that
-/// caller: an owner-scoped id its holder cannot inspect is not a handle.
+/// Two authorized users minting the same document through two ingress nodes get one job on one
+/// owner.
 #[tokio::test]
 async fn mint_dedups_ingress() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
@@ -406,10 +397,8 @@ async fn mint_dedups_ingress() -> TestResult<()> {
     Ok(())
 }
 
-/// A mapping row on a node that is not the authority carries no version anyone
-/// can compare, so it may neither create a redirect nor a tombstone. Both
-/// directions are checked: a fabricated Active row must not redirect an unminted
-/// document, and a fabricated Withdrawn row must not retire a live one.
+/// A mapping row on a node that is not the authority carries no version anyone can compare, so
+/// it may neither create a redirect nor a tombstone.
 #[tokio::test]
 async fn replica_mapping_ignored() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
@@ -453,10 +442,8 @@ async fn replica_mapping_ignored() -> TestResult<()> {
     Ok(())
 }
 
-/// An active mapping that reached the authority before the document did is not
-/// evidence of deletion. Answering Gone from that state emits a permanent 410 for
-/// a live document, so the authority reports unavailable until it can tell the
-/// two apart.
+/// An active mapping that reached the authority before the document did is not evidence of
+/// deletion.
 #[tokio::test]
 async fn premature_mapping_unavailable() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
@@ -508,7 +495,7 @@ async fn owner_cannot_withdraw() -> TestResult<()> {
         document_id,
         owner,
         "test denial".to_string(),
-        aruna_core::util::unix_timestamp_millis(),
+        aruna_core::time::unix_timestamp_millis(),
         Some(realm.bearer_for(owner)),
     )
     .await;
@@ -530,7 +517,7 @@ async fn owner_cannot_withdraw() -> TestResult<()> {
         never_created,
         owner,
         "test denial".to_string(),
-        aruna_core::util::unix_timestamp_millis(),
+        aruna_core::time::unix_timestamp_millis(),
         Some(realm.bearer_for(owner)),
     )
     .await;
@@ -557,10 +544,9 @@ async fn owner_cannot_withdraw() -> TestResult<()> {
     Ok(())
 }
 
-/// A holder that still owes a create's registry projection may not answer a
-/// routed delete with absence: with every holder lagging, the harvest deletion
-/// path would take that fan-out as proof the document never existed and go
-/// terminal over a live document.
+/// A holder that still owes a create's registry projection may not answer a routed delete with
+/// absence: with every holder lagging, the harvest deletion path would take that fan-out as
+/// proof the document never existed and go terminal over a live document.
 #[tokio::test]
 async fn delete_waits_projection() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
@@ -602,7 +588,7 @@ async fn routed_delete(
     node: &TestNode,
     document_id: Ulid,
 ) -> Result<(), MetadataWriteError> {
-    delete_metadata_document_routed(
+    route_metadata_delete(
         &node.context,
         realm.actor(node),
         None,
@@ -612,10 +598,8 @@ async fn routed_delete(
     .await
 }
 
-/// A routed delete, retried while the forward reports it undeliverable: a
-/// response lost on a starved machine leaves the write possibly sent. The frozen
-/// record routes the first attempt only, so a replay can still answer
-/// `NotFound` once the row is gone from the current holders.
+/// A routed delete, retried while the forward reports it undeliverable: a response lost on a
+/// starved machine leaves the write possibly sent.
 async fn delete_until_applied(
     realm: &Topology,
     node: &TestNode,
@@ -627,7 +611,7 @@ async fn delete_until_applied(
         "no routed delete reached the authority",
         || async {
             let replay = attempted.replace(true);
-            match delete_metadata_document_routed(
+            match route_metadata_delete(
                 &node.context,
                 realm.actor(node),
                 (!replay).then_some(record),
@@ -701,7 +685,7 @@ async fn queue_projection(node: &TestNode, document_id: Ulid) -> TestResult<()> 
     write_entry(
         node,
         METADATA_PENDING_PROJECTION_KEYSPACE,
-        metadata_pending_projection_key(document_id, Ulid::generate()).to_vec(),
+        pending_projection_key(document_id, Ulid::generate()).to_vec(),
         Vec::new(),
     )
     .await
@@ -783,7 +767,7 @@ async fn mint_routed(
                 realm.realm_id,
                 document_id,
                 realm.user_id,
-                aruna_core::util::unix_timestamp_millis(),
+                aruna_core::time::unix_timestamp_millis(),
                 Some(realm.bearer_token()),
             )
             .await
@@ -819,7 +803,7 @@ async fn withdraw_routed(
                 document_id,
                 realm.user_id,
                 "test administrator withdrawal".to_string(),
-                aruna_core::util::unix_timestamp_millis(),
+                aruna_core::time::unix_timestamp_millis(),
                 Some(realm.bearer_token()),
             )
             .await
@@ -901,7 +885,7 @@ async fn seed_document(
     realm
         .origin_placement(origin, group_id, document_id, path)
         .ok_or("a Management node holds buckets")?;
-    let created = create_metadata_document_routed(
+    let created = route_metadata_create(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: realm.actor(origin),
             group_id,
@@ -921,7 +905,7 @@ async fn seed_document(
     .await?;
     let placement = created.record.placement;
     let authority = realm.holder(&placement);
-    replay_metadata_event_log(authority.context.as_ref()).await?;
+    replay_event_log(authority.context.as_ref()).await?;
 
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "the seeded document's registry row never reached every sync-eligible node",
@@ -950,7 +934,7 @@ async fn seed_document(
 }
 
 async fn registry_present(context: &DriverContext, document_id: Ulid) -> bool {
-    load_metadata_record_by_document(context, document_id)
+    load_document_record(context, document_id)
         .await
         .is_ok_and(|record| record.is_some())
 }
@@ -959,7 +943,7 @@ async fn registry_record(
     node: &TestNode,
     document_id: Ulid,
 ) -> Option<aruna_core::structs::MetadataRegistryRecord> {
-    load_metadata_record_by_document(node.context.as_ref(), document_id)
+    load_document_record(node.context.as_ref(), document_id)
         .await
         .ok()
         .flatten()

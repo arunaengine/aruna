@@ -11,25 +11,22 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::MetadataCreateEventRecord;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState,
-    overlay_realm_config_placement_reducer_materialization,
+    AdminDocumentReducerError, AdminDocumentReducerState, overlay_placement,
 };
 use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, metadata_pending_projection_target,
-    stale_admin_document_conflict_delete_entries,
+    conflict_write_entries, pending_projection_target, reducer_state_entry, reducer_state_key,
+    stale_conflict_deletes,
 };
 use aruna_core::structs::{
     Actor, AuthContext, BindingError, BindingScope, BucketPlan, CandidatePlacementMap,
     CompletionProof, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass, MetadataRegistryRecord,
     NodePlacementEntry, Permission, PlacementBinding, PlacementOverride, PlacementRef,
     PlacementScope, PlacementStrategy, RealmConfigDocument, RealmNodeKind, StrategyBinding,
-    TransitionPlan, normalize_node_placement_input, policy_admin_path, reserved_label,
-    storage_subject,
+    TransitionPlan, normalize_placement_input, policy_admin_path, reserved_label, storage_subject,
 };
 use aruna_core::task::TaskEvent;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use aruna_core::util::unix_timestamp_millis;
 use smallvec::smallvec;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -41,8 +38,9 @@ use crate::placement::placement_ref_for_target;
 use crate::sync::document_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::queue_backoff::conflict_backoff;
 use crate::sync::shard_placement::schedule_placement_revalidation_effect;
+
+pub(crate) const CONFLICT_ATTEMPTS: usize = 10;
 
 const STRATEGY_REFERENCE_SCAN_PAGE_SIZE: usize = 8_192;
 
@@ -316,7 +314,7 @@ impl RealmPlacementMutation {
                     ));
                 }
                 if let Some(location) = location {
-                    normalize_node_placement_input(Some(location), None).map_err(|error| {
+                    normalize_placement_input(Some(location), None).map_err(|error| {
                         MutateRealmPlacementError::InvalidInput(error.to_string())
                     })?;
                 }
@@ -867,14 +865,14 @@ impl MutateRealmPlacementOperation {
                 ),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                 ),
             ],
             txn_id: Some(txn_id),
         })]
     }
 
-    fn emit_write_document_and_admin_state(
+    fn emit_document_write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
@@ -896,7 +894,7 @@ impl MutateRealmPlacementOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                aruna_core::reducer::decode_reducer_state(value.as_ref())
                     .map_err(ConversionError::from)
             })
             .transpose()?;
@@ -917,11 +915,7 @@ impl MutateRealmPlacementOperation {
             mutation.validate(&document)?;
             let admin_event =
                 reducer_state.apply_operation(&self.actor, mutation.admin_operation(&document)?)?;
-            overlay_realm_config_placement_reducer_materialization(
-                &mut document,
-                &reducer_state,
-                unix_timestamp_millis(),
-            );
+            overlay_placement(&mut document, &reducer_state, unix_timestamp_millis());
             admin_events.push(admin_event);
         }
 
@@ -940,10 +934,8 @@ impl MutateRealmPlacementOperation {
             });
         }
 
-        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
-            previous_reducer_state.as_ref(),
-            Some(&reducer_state),
-        );
+        let stale_conflict_deletes =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let document_target = self.document_ref();
         let placement = placement_ref_for_target(&document, &document_target, Default::default());
         let mut writes = vec![
@@ -952,7 +944,7 @@ impl MutateRealmPlacementOperation {
                 document_target.storage_key(),
                 document.to_bytes(&self.actor)?.into(),
             ),
-            admin_document_reducer_state_write_entry(&reducer_state)?,
+            reducer_state_entry(&reducer_state)?,
         ];
         for admin_event in admin_events {
             let record = new_outbox_record_with_id(
@@ -966,7 +958,7 @@ impl MutateRealmPlacementOperation {
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
-        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+        writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
         self.state = MutateRealmPlacementState::WriteDocumentAndAdminState {
@@ -979,7 +971,7 @@ impl MutateRealmPlacementOperation {
         })])
     }
 
-    fn emit_reference_check_or_write(
+    fn emit_reference_check(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
@@ -1016,10 +1008,7 @@ impl MutateRealmPlacementOperation {
                         "strategy removal cannot be batched".to_string(),
                     ));
                 }
-                return self.emit_write_document_and_admin_state(
-                    Some(document_value),
-                    reducer_state_value,
-                );
+                return self.emit_document_write(Some(document_value), reducer_state_value);
             }
         };
         let check = StrategyRemovalCheck {
@@ -1027,10 +1016,10 @@ impl MutateRealmPlacementOperation {
             reducer_state_value,
             strategy_id,
         };
-        Ok(self.emit_registry_reference_scan(check, None))
+        Ok(self.scan_registry_refs(check, None))
     }
 
-    fn emit_registry_reference_scan(
+    fn scan_registry_refs(
         &mut self,
         check: StrategyRemovalCheck,
         start_after: Option<Key>,
@@ -1048,7 +1037,7 @@ impl MutateRealmPlacementOperation {
         })]
     }
 
-    fn emit_pending_reference_scan(
+    fn scan_pending_refs(
         &mut self,
         check: StrategyRemovalCheck,
         start_after: Option<Key>,
@@ -1072,11 +1061,8 @@ impl MutateRealmPlacementOperation {
             && record.placement.strategy_id == strategy_id
     }
 
-    fn emit_write_after_reference_check(&mut self, check: StrategyRemovalCheck) -> Effects {
-        match self.emit_write_document_and_admin_state(
-            Some(check.document_value),
-            check.reducer_state_value,
-        ) {
+    fn write_after_check(&mut self, check: StrategyRemovalCheck) -> Effects {
+        match self.emit_document_write(Some(check.document_value), check.reducer_state_value) {
             Ok(effects) => effects,
             Err(error) => self.fail(error),
         }
@@ -1187,10 +1173,9 @@ impl Operation for MutateRealmPlacementOperation {
                             format!("{values:?}"),
                         );
                     };
-                    match self.emit_reference_check_or_write(
-                        document_value.clone(),
-                        reducer_state_value.clone(),
-                    ) {
+                    match self
+                        .emit_reference_check(document_value.clone(), reducer_state_value.clone())
+                    {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }
@@ -1215,10 +1200,8 @@ impl Operation for MutateRealmPlacementOperation {
                         }
                     }
                     match next_start_after {
-                        Some(start_after) => {
-                            self.emit_registry_reference_scan(check, Some(start_after))
-                        }
-                        None => self.emit_pending_reference_scan(check, None),
+                        Some(start_after) => self.scan_registry_refs(check, Some(start_after)),
+                        None => self.scan_pending_refs(check, None),
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
@@ -1233,10 +1216,8 @@ impl Operation for MutateRealmPlacementOperation {
                 }) => {
                     if values.is_empty() {
                         return match next_start_after {
-                            Some(start_after) => {
-                                self.emit_pending_reference_scan(check, Some(start_after))
-                            }
-                            None => self.emit_write_after_reference_check(check),
+                            Some(start_after) => self.scan_pending_refs(check, Some(start_after)),
+                            None => self.write_after_check(check),
                         };
                     }
                     let Some(txn_id) = self.txn_id else {
@@ -1278,11 +1259,12 @@ impl Operation for MutateRealmPlacementOperation {
                                 });
                             }
                         };
-                        let valid_target = metadata_pending_projection_target(key.as_ref())
-                            .is_some_and(|(document_id, event_id)| {
+                        let valid_target = pending_projection_target(key.as_ref()).is_some_and(
+                            |(document_id, event_id)| {
                                 event.record.document_id == document_id
                                     && event.event_id == event_id
-                            });
+                            },
+                        );
                         if !valid_target || self.reference_matches(&event.record, check.strategy_id)
                         {
                             return self.fail(MutateRealmPlacementError::StrategyReferenced {
@@ -1291,10 +1273,8 @@ impl Operation for MutateRealmPlacementOperation {
                         }
                     }
                     match next_start_after {
-                        Some(start_after) => {
-                            self.emit_pending_reference_scan(check, Some(start_after))
-                        }
-                        None => self.emit_write_after_reference_check(check),
+                        Some(start_after) => self.scan_pending_refs(check, Some(start_after)),
+                        None => self.write_after_check(check),
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
@@ -1402,13 +1382,10 @@ impl Operation for MutateRealmPlacementOperation {
     }
 }
 
-/// Attempts one mutation gets before a persisting conflict is reported.
-const MUTATION_CONFLICT_RETRIES: usize = 10;
-
 /// Drives a realm placement mutation, then when it drains the local node kicks the
 /// installed outbox drain owner so pre-holdership-loss records retry without a second
 /// drainer or replacing a persisted deadline. `auth_context` is `None` for local origin.
-pub async fn drive_realm_placement_mutation(
+pub async fn drive_placement_mutation(
     config: MutateRealmPlacementConfig,
     auth_context: Option<AuthContext>,
     context: &crate::driver::DriverContext,
@@ -1429,11 +1406,14 @@ pub async fn drive_realm_placement_mutation(
         };
         match crate::driver::drive(operation, context).await {
             Err(MutateRealmPlacementError::StorageError(StorageError::TransactionConflict))
-                if attempts < MUTATION_CONFLICT_RETRIES =>
+                if attempts < CONFLICT_ATTEMPTS =>
             {
                 // Retrying with no wait spends every attempt in one contention window.
-                tokio::time::sleep(conflict_backoff(attempts, config.actor.node_id.as_bytes()))
-                    .await;
+                tokio::time::sleep(crate::tasks::queue_backoff::conflict_backoff(
+                    attempts,
+                    config.actor.node_id.as_bytes(),
+                ))
+                .await;
                 attempts += 1;
             }
             Err(MutateRealmPlacementError::StorageError(StorageError::TransactionConflict)) => {
@@ -1446,10 +1426,7 @@ pub async fn drive_realm_placement_mutation(
         }
     };
     if outcome.is_ok() && drains_node && context.net_handle.is_some() {
-        crate::tasks::incoming::drive_document_sync_outbox_drain(std::sync::Arc::new(
-            context.clone(),
-        ))
-        .await;
+        crate::tasks::incoming::drive_sync_drain(std::sync::Arc::new(context.clone())).await;
     }
     outcome
 }
@@ -1460,16 +1437,14 @@ mod tests {
 
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::StorageEvent;
-    use aruna_core::identifiers::PlacementHandle;
     use aruna_core::metadata::{MetadataCreateEventPayload, MetadataCreateEventRecord};
-    use aruna_core::storage_entries::{
-        metadata_create_event_and_pending_projection_write_entries, metadata_registry_write_entries,
-    };
+    use aruna_core::storage_entries::{create_projection_entries, registry_write_entries};
     use aruna_core::structs::{
         AffinityEffect, AffinityRule, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT, DocumentClass,
         FIRST_GRANTABLE_HANDLE, HandleRange, LabelMatch, MetadataRegistryRecord, PlacementBinding,
         PlacementRef, PlacementScope, RealmId, RealmNodeKind,
     };
+    use aruna_core::structured_id::PlacementHandle;
     use aruna_core::task::{TaskEffect, TaskKey};
     use aruna_core::types::UserId;
     use tempfile::tempdir;
@@ -1665,7 +1640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strategy_default_binding_and_override_lifecycle() {
+    async fn strategy_binding_lifecycle() {
         let directory = tempdir().unwrap();
         let context = context(directory.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([3; 32]);
@@ -1839,7 +1814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_placement_rejects_reserved_kind_label() {
+    async fn rejects_reserved_label() {
         let directory = tempdir().unwrap();
         let context = context(directory.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([13; 32]);
@@ -1866,7 +1841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_validation_rejects_zero_and_dangling_references() {
+    async fn rejects_dangling_refs() {
         let directory = tempdir().unwrap();
         let context = context(directory.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([4; 32]);
@@ -1975,7 +1950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removing_a_referenced_strategy_is_a_conflict() {
+    async fn referenced_strategy_conflicts() {
         let directory = tempdir().unwrap();
         let context = context(directory.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([5; 32]);
@@ -2010,11 +1985,7 @@ mod tests {
         .await
         .unwrap();
         let event = create_event(&actor, strategy_id, 31);
-        write_entries(
-            &context,
-            metadata_registry_write_entries(&event.record).unwrap(),
-        )
-        .await;
+        write_entries(&context, registry_write_entries(&event.record).unwrap()).await;
 
         assert_eq!(
             mutate(
@@ -2043,11 +2014,7 @@ mod tests {
         .await
         .unwrap();
         let event = create_event(&actor, strategy_id, 41);
-        write_entries(
-            &context,
-            metadata_create_event_and_pending_projection_write_entries(&event).unwrap(),
-        )
-        .await;
+        write_entries(&context, create_projection_entries(&event).unwrap()).await;
 
         assert_eq!(
             mutate(
@@ -2061,7 +2028,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_realm_config_is_not_found() {
+    async fn missing_config_absent() {
         let directory = tempdir().unwrap();
         let context = context(directory.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([11; 32]);
@@ -2079,7 +2046,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_mutation_schedules_zero_delay_revalidation() {
+    fn mutation_schedules_revalidation() {
         let realm_id = RealmId::from_bytes([6; 32]);
         let actor = actor(realm_id);
         let mut operation = MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
@@ -2412,7 +2379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_holder_config_rejected() {
+    async fn rejects_empty_holders() {
         let directory = tempdir().unwrap();
         let context = context(directory.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([23; 32]);
@@ -2448,7 +2415,7 @@ mod tests {
     }
 
     #[test]
-    fn override_without_strategy_is_valid() {
+    fn accepts_override_only() {
         let realm_id = RealmId::from_bytes([7; 32]);
         let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         assert!(
@@ -2464,7 +2431,7 @@ mod tests {
     }
 
     #[test]
-    fn affinity_data_is_not_changed_by_operation_input() {
+    fn preserves_affinity_data() {
         let strategy = PlacementStrategy {
             strategy_id: Ulid::from_bytes([10; 16]),
             name: "affinity".to_string(),
@@ -2615,7 +2582,7 @@ mod tests {
     }
 
     #[test]
-    fn transition_plan_must_match() {
+    fn rejects_plan_mismatch() {
         let (document, strategy_id) = transition_document();
         let plan = plan_transition(&document, transition_request(strategy_id)).unwrap();
         assert_eq!(plan.buckets.len(), 4);
@@ -2708,7 +2675,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_need_planned_role() {
+    fn reports_require_roles() {
         // A non-Management participant may only report the role its bucket
         // plan names it for, and only for itself.
         let (mut document, strategy_id) = transition_document();
@@ -2855,7 +2822,7 @@ mod tests {
     }
 
     #[test]
-    fn force_needs_one_proof() {
+    fn force_requires_proof() {
         let (mut document, strategy_id) = transition_document();
         let plan = plan_transition(&document, transition_request(strategy_id)).unwrap();
         let bucket = plan.buckets[0].bucket;

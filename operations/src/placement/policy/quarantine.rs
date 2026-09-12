@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn clears_when_nothing_remains() {
+    fn clears_when_empty() {
         // The revalidation walk ends the block exactly when no quarantined copy
         // is left, which is what reopens governed admission.
         let mut operation = operation(None);

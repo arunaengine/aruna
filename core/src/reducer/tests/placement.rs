@@ -65,39 +65,33 @@ pub(super) fn upsert_placement_strategy(
 }
 
 #[test]
-pub(super) fn admin_document_placement_paths_preserve_strings_and_round_trip() {
+pub(super) fn admin_document_trip() {
     let node_id = node(6);
     let strategy_id = Ulid::from_bytes([4; 16]);
 
-    let node_path = realm_config_placement_node_path(&node_id);
+    let node_path = placement_node_path(&node_id);
     assert_eq!(node_path, format!("realm_config.placement.nodes.{node_id}"));
-    assert_eq!(
-        realm_config_placement_node_id_from_path(&node_path),
-        Some(node_id)
-    );
+    assert_eq!(parse_placement_node(&node_path), Some(node_id));
 
-    let strategy_path = realm_config_placement_strategy_path(&strategy_id);
+    let strategy_path = placement_strategy_path(&strategy_id);
     assert_eq!(
         strategy_path,
         format!("realm_config.placement.strategies.{strategy_id}")
     );
-    assert_eq!(
-        realm_config_placement_strategy_id_from_path(&strategy_path),
-        Some(strategy_id)
-    );
+    assert_eq!(parse_placement_strategy(&strategy_path), Some(strategy_id));
 
     assert_eq!(
         REALM_CONFIG_DEFAULT_STRATEGY_PATH,
         "realm_config.placement.default_strategy"
     );
     assert_eq!(
-        realm_config_placement_node_id_from_path("realm_config.placement.nodes.invalid"),
+        parse_placement_node("realm_config.placement.nodes.invalid"),
         None
     );
 }
 
 #[test]
-pub(super) fn binding_scope_keys_use_stable_canonical_text_and_parse_from_paths() {
+pub(super) fn binding_scope_paths() {
     let group_id = group_id();
     let cases = [
         (BindingScope::Realm, "realm".to_string()),
@@ -135,20 +129,17 @@ pub(super) fn binding_scope_keys_use_stable_canonical_text_and_parse_from_paths(
     for (scope, expected_key) in cases {
         assert_eq!(binding_scope_key(&scope), expected_key);
 
-        let path = realm_config_strategy_binding_path(&scope);
+        let path = strategy_binding_path(&scope);
         assert_eq!(
             path,
             format!("realm_config.placement.bindings.{expected_key}")
         );
-        assert_eq!(
-            realm_config_strategy_binding_scope_key_from_path(&path),
-            Some(expected_key.as_str())
-        );
+        assert_eq!(parse_strategy_scope(&path), Some(expected_key.as_str()));
     }
 }
 
 #[test]
-fn realm_config_placement_overlay_replaces_owned_paths_deterministically() {
+fn realm_config_deterministically() {
     let owned_node = node(11);
     let unowned_node = node(12);
     let owned_entry = placement_entry(owned_node, 250);
@@ -201,7 +192,7 @@ fn realm_config_placement_overlay_replaces_owned_paths_deterministically() {
     ];
 
     let untouched = config.clone();
-    overlay_realm_config_placement_reducer_materialization(&mut config, &realm_config_state(), 0);
+    overlay_placement(&mut config, &realm_config_state(), 0);
     assert_eq!(config, untouched);
 
     let mut state = realm_config_state();
@@ -226,7 +217,7 @@ fn realm_config_placement_overlay_replaces_owned_paths_deterministically() {
         state.apply_operation(&actor, op).unwrap();
     }
 
-    overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+    overlay_placement(&mut config, &state, 0);
     assert_eq!(config.placement_map, vec![unowned_entry, owned_entry]);
     assert_eq!(
         config.strategies,
@@ -243,12 +234,12 @@ fn realm_config_placement_overlay_replaces_owned_paths_deterministically() {
     );
 
     let materialized = config.clone();
-    overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+    overlay_placement(&mut config, &state, 0);
     assert_eq!(config, materialized);
 }
 
 #[test]
-fn realm_config_placement_repair_clears_refs_but_preserves_override_without_live_strategy() {
+fn realm_config_strategy() {
     let missing_strategy_id = Ulid::from_bytes([8; 16]);
     let pinned = node(11);
     let excluded = node(12);
@@ -265,7 +256,7 @@ fn realm_config_placement_repair_clears_refs_but_preserves_override_without_live
         strategy_id: Some(missing_strategy_id),
     }];
 
-    overlay_realm_config_placement_reducer_materialization(&mut config, &realm_config_state(), 0);
+    overlay_placement(&mut config, &realm_config_state(), 0);
 
     assert_eq!(config.default_strategy_id, None);
     assert!(config.strategy_bindings.is_empty());
@@ -276,7 +267,7 @@ fn realm_config_placement_repair_clears_refs_but_preserves_override_without_live
 }
 
 #[test]
-fn realm_config_placement_entry_materializes() {
+fn realm_config_materializes() {
     let mut state = realm_config_state();
     let config_node = node(11);
     let entry = placement_entry(config_node, 250);
@@ -286,14 +277,14 @@ fn realm_config_placement_entry_materializes() {
         .unwrap();
 
     assert_eq!(
-        state.materialized_realm_config_placement_map(),
+        state.materialized_placement_map(),
         BTreeMap::from([(config_node, entry)])
     );
     assert!(state.conflicts.is_empty());
 }
 
 #[test]
-fn realm_config_disjoint_placement_entries_merge_deterministically() {
+fn realm_disjoint_deterministically() {
     let first_node = node(11);
     let second_node = node(12);
     let first = placement_entry(first_node, 100);
@@ -311,14 +302,14 @@ fn realm_config_disjoint_placement_entries_merge_deterministically() {
 
     assert_eq!(left.user_subject_ids, right.user_subject_ids);
     assert_eq!(
-        left.materialized_realm_config_placement_map(),
+        left.materialized_placement_map(),
         BTreeMap::from([(first_node, first), (second_node, second)])
     );
     assert!(left.conflicts.is_empty());
 }
 
 #[test]
-fn concurrent_realm_config_same_placement_node_conflicts_fail_closed() {
+fn concurrent_realm_closed() {
     let mut state = realm_config_state();
     let config_node = node(11);
 
@@ -339,18 +330,18 @@ fn concurrent_realm_config_same_placement_node_conflicts_fail_closed() {
 
     assert!(
         !state
-            .materialized_realm_config_placement_map()
+            .materialized_placement_map()
             .contains_key(&config_node)
     );
     let conflict = state
         .conflicts
-        .get(&realm_config_placement_node_path(&config_node))
+        .get(&placement_node_path(&config_node))
         .expect("conflict is recorded");
     assert_eq!(conflict.values.len(), 2);
 }
 
 #[test]
-fn equal_concurrent_placement_writes_preserve_causal_frontier() {
+fn equal_concurrent_frontier() {
     let config_node = node(11);
     let origin_a = node(1);
     let origin_b = node(2);
@@ -404,12 +395,12 @@ fn equal_concurrent_placement_writes_preserve_causal_frontier() {
     let state = &states[0];
     assert!(
         !state
-            .materialized_realm_config_placement_map()
+            .materialized_placement_map()
             .contains_key(&config_node)
     );
     let conflict = state
         .conflicts
-        .get(&realm_config_placement_node_path(&config_node))
+        .get(&placement_node_path(&config_node))
         .expect("causally concurrent values conflict");
     assert_eq!(
         conflict
@@ -422,7 +413,7 @@ fn equal_concurrent_placement_writes_preserve_causal_frontier() {
 }
 
 #[test]
-fn observed_realm_config_placement_entry_remove_removes_entry() {
+fn observed_realm_entry() {
     let mut state = realm_config_state();
     let config_node = node(11);
     let set_origin = node(1);
@@ -448,7 +439,7 @@ fn observed_realm_config_placement_entry_remove_removes_entry() {
     state.apply(&set).unwrap();
     state.apply(&removal).unwrap();
 
-    assert!(state.materialized_realm_config_placement_map().is_empty());
+    assert!(state.materialized_placement_map().is_empty());
     assert!(state.conflicts.is_empty());
 }
 
@@ -473,7 +464,7 @@ fn rejects_derived_labels() {
 }
 
 #[test]
-fn realm_config_placement_strategy_materializes() {
+fn realm_placement_materializes() {
     let mut state = realm_config_state();
     let strategy_id = Ulid::from_bytes([4; 16]);
     let strategy = placement_strategy(strategy_id, Some(3));
@@ -491,7 +482,7 @@ fn realm_config_placement_strategy_materializes() {
         .unwrap();
 
     assert_eq!(
-        state.materialized_realm_config_placement_strategies(),
+        state.materialized_strategies(),
         BTreeMap::from([(strategy_id, strategy)])
     );
     assert!(state.conflicts.is_empty());
@@ -546,7 +537,7 @@ fn strategy_shards_immutable() {
 }
 
 #[test]
-fn realm_config_placement_strategy_rejects_zero_replica_count() {
+fn realm_config_count() {
     let mut state = realm_config_state();
     let before = state.clone();
 
@@ -566,7 +557,7 @@ fn realm_config_placement_strategy_rejects_zero_replica_count() {
 }
 
 #[test]
-fn realm_config_placement_strategy_accepts_max_shard_count() {
+fn realm_placement_count() {
     let mut state = realm_config_state();
     let strategy_id = Ulid::from_bytes([4; 16]);
     let mut strategy = placement_strategy(strategy_id, Some(3));
@@ -585,14 +576,14 @@ fn realm_config_placement_strategy_accepts_max_shard_count() {
         .unwrap();
 
     assert_eq!(
-        state.materialized_realm_config_placement_strategies(),
+        state.materialized_strategies(),
         BTreeMap::from([(strategy_id, strategy)])
     );
     assert!(state.conflicts.is_empty());
 }
 
 #[test]
-fn realm_config_placement_strategy_rejects_shard_count_above_max() {
+fn realm_config_max() {
     let mut state = realm_config_state();
     let before = state.clone();
     let mut strategy = placement_strategy(Ulid::from_bytes([4; 16]), Some(3));
@@ -612,7 +603,7 @@ fn realm_config_placement_strategy_rejects_shard_count_above_max() {
 }
 
 #[test]
-fn realm_config_placement_strategy_rejects_zero_and_non_power_of_two_shard_count() {
+fn realm_strategy_count() {
     let mut state = realm_config_state();
     let before = state.clone();
 
@@ -635,7 +626,7 @@ fn realm_config_placement_strategy_rejects_zero_and_non_power_of_two_shard_count
 }
 
 #[test]
-fn realm_config_default_strategy_materializes() {
+fn realm_default_materializes() {
     let mut state = realm_config_state();
     let strategy_id = Ulid::from_bytes([4; 16]);
     upsert_placement_strategy(&mut state, 9, 9, strategy_id);
@@ -650,10 +641,7 @@ fn realm_config_default_strategy_materializes() {
         ))
         .unwrap();
 
-    assert_eq!(
-        state.materialized_realm_config_default_strategy(),
-        Some(strategy_id)
-    );
+    assert_eq!(state.materialized_default_strategy(), Some(strategy_id));
     assert!(state.conflicts.is_empty());
 }
 
@@ -676,7 +664,7 @@ fn family_survives_rebuild() {
 
     assert_eq!(state.materialized_family_strategy(), Some(strategy_id));
     let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-    overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+    overlay_placement(&mut config, &state, 0);
     assert_eq!(config.job_family_strategy_id, strategy_id);
     assert!(config.strategy(&strategy_id).is_some());
 }
@@ -735,7 +723,7 @@ fn rejects_family_mutation() {
 }
 
 #[test]
-fn concurrent_realm_config_strategy_remove_and_references_are_replay_order_independent() {
+fn concurrent_realm_independent() {
     let strategy_id = Ulid::from_bytes([4; 16]);
     let fallback_strategy_id = Ulid::from_bytes([3; 16]);
     let subject = b"document-subject".to_vec();
@@ -799,11 +787,7 @@ fn concurrent_realm_config_strategy_remove_and_references_are_replay_order_indep
         );
 
         assert_eq!(remove_first, reference_first);
-        assert!(
-            remove_first
-                .materialized_realm_config_placement_strategies()
-                .is_empty()
-        );
+        assert!(remove_first.materialized_strategies().is_empty());
         assert!(remove_first.conflicts.is_empty());
 
         let mut base_config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
@@ -814,24 +798,16 @@ fn concurrent_realm_config_strategy_remove_and_references_are_replay_order_indep
         base_config.default_strategy_id = Some(fallback_strategy_id);
 
         let mut remove_first_config = base_config.clone();
-        overlay_realm_config_placement_reducer_materialization(
-            &mut remove_first_config,
-            &remove_first,
-            0,
-        );
+        overlay_placement(&mut remove_first_config, &remove_first, 0);
         let mut reference_first_config = base_config;
-        overlay_realm_config_placement_reducer_materialization(
-            &mut reference_first_config,
-            &reference_first,
-            0,
-        );
+        overlay_placement(&mut reference_first_config, &reference_first, 0);
         assert_eq!(remove_first_config, reference_first_config);
         assert_eq!(
             remove_first_config.default_strategy_id,
             Some(fallback_strategy_id)
         );
         assert!(remove_first_config.strategy(&strategy_id).is_none());
-        assert_realm_config_strategy_references_are_live(&remove_first_config);
+        assert_realm_live(&remove_first_config);
 
         match &reference_op {
             AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => {}
@@ -867,13 +843,9 @@ fn concurrent_realm_config_strategy_remove_and_references_are_replay_order_indep
             },
         );
         remove_first.apply(&restoration).unwrap();
-        overlay_realm_config_placement_reducer_materialization(
-            &mut remove_first_config,
-            &remove_first,
-            0,
-        );
+        overlay_placement(&mut remove_first_config, &remove_first, 0);
         assert!(remove_first_config.strategy(&strategy_id).is_some());
-        assert_realm_config_strategy_references_are_live(&remove_first_config);
+        assert_realm_live(&remove_first_config);
         match reference_op {
             AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => {
                 assert_eq!(remove_first_config.default_strategy_id, Some(strategy_id))
@@ -903,7 +875,7 @@ fn concurrent_realm_config_strategy_remove_and_references_are_replay_order_indep
     }
 }
 
-fn assert_realm_config_strategy_references_are_live(config: &RealmConfigDocument) {
+fn assert_realm_live(config: &RealmConfigDocument) {
     assert!(
         config
             .default_strategy_id
@@ -923,7 +895,7 @@ fn assert_realm_config_strategy_references_are_live(config: &RealmConfigDocument
 }
 
 #[test]
-fn realm_config_strategy_binding_materializes_and_removes() {
+fn realm_config_removes() {
     let mut state = realm_config_state();
     let scope = BindingScope::Class(DocumentClass::MetadataRegistry);
     let binding = StrategyBinding {
@@ -945,14 +917,10 @@ fn realm_config_strategy_binding_materializes_and_removes() {
 
     state.apply(&set).unwrap();
     assert_eq!(
-        state.materialized_realm_config_strategy_bindings(),
+        state.materialized_strategy_bindings(),
         BTreeMap::from([(scope_key, binding)])
     );
-    assert!(
-        !state
-            .conflicts
-            .contains_key(&realm_config_strategy_binding_path(&scope))
-    );
+    assert!(!state.conflicts.contains_key(&strategy_binding_path(&scope)));
 
     let removal = realm_config_event(
         2,
@@ -962,16 +930,12 @@ fn realm_config_strategy_binding_materializes_and_removes() {
         AdminDocumentOperation::RealmConfigStrategyBindingRemoved { scope },
     );
     state.apply(&removal).unwrap();
-    assert!(
-        state
-            .materialized_realm_config_strategy_bindings()
-            .is_empty()
-    );
+    assert!(state.materialized_strategy_bindings().is_empty());
     assert!(state.conflicts.is_empty());
 }
 
 #[test]
-fn realm_config_metadata_path_prefix_binding_remove_uses_normalized_key() {
+fn realm_config_key() {
     let mut state = realm_config_state();
     let raw_scope = BindingScope::MetadataPathPrefix("/datasets/".to_string());
     let canonical_scope = BindingScope::MetadataPathPrefix("datasets".to_string());
@@ -997,13 +961,13 @@ fn realm_config_metadata_path_prefix_binding_remove_uses_normalized_key() {
 
     state.apply(&set).unwrap();
     assert_eq!(
-        state.materialized_realm_config_strategy_bindings(),
+        state.materialized_strategy_bindings(),
         BTreeMap::from([(canonical_scope_key, canonical_binding)])
     );
     assert!(
         state
             .user_subject_ids
-            .contains_key(&realm_config_strategy_binding_path(&canonical_scope))
+            .contains_key(&strategy_binding_path(&canonical_scope))
     );
     assert!(!state.user_subject_ids.contains_key(unnormalized_path));
 
@@ -1018,16 +982,12 @@ fn realm_config_metadata_path_prefix_binding_remove_uses_normalized_key() {
     );
 
     state.apply(&removal).unwrap();
-    assert!(
-        state
-            .materialized_realm_config_strategy_bindings()
-            .is_empty()
-    );
+    assert!(state.materialized_strategy_bindings().is_empty());
     assert!(state.conflicts.is_empty());
 }
 
 #[test]
-fn realm_config_placement_override_materializes() {
+fn realm_override_materializes() {
     let mut state = realm_config_state();
     let subject = b"document-subject".to_vec();
     let strategy_id = Ulid::from_bytes([4; 16]);
@@ -1053,16 +1013,16 @@ fn realm_config_placement_override_materializes() {
         .unwrap();
 
     assert_eq!(
-        state.materialized_realm_config_placement_overrides(),
+        state.materialized_placement_overrides(),
         BTreeMap::from([(subject_key, record)])
     );
     assert_eq!(
-        state.apply(&realm_config_placement_override_removed(2, subject)),
+        state.apply(&realm_config_removed(2, subject)),
         Ok(AdminDocumentApplyStatus::Applied)
     );
 }
 
-fn realm_config_placement_override_removed(event_seed: u8, subject: Vec<u8>) -> AdminDocumentEvent {
+fn realm_config_removed(event_seed: u8, subject: Vec<u8>) -> AdminDocumentEvent {
     realm_config_event(
         event_seed,
         node(2),
@@ -1073,7 +1033,7 @@ fn realm_config_placement_override_removed(event_seed: u8, subject: Vec<u8>) -> 
 }
 
 #[test]
-fn placement_op_is_rejected_for_non_realm_config_target() {
+fn placement_op_target() {
     let mut state = user_state();
     let before = state.clone();
     let event = event(
@@ -1151,7 +1111,7 @@ fn grants_replicate_usable() {
     assert_eq!(state.materialized_handle_ranges().len(), 2);
 
     let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-    overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+    overlay_placement(&mut config, &state, 0);
     let directory = config.handle_range_directory();
     assert_eq!(directory.conflicts(), 0);
     assert_eq!(directory.granted_to(&owner).len(), 2);
@@ -1200,7 +1160,7 @@ fn overlap_conflicts_converge() {
 
     for state in [&left, &right] {
         let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-        overlay_realm_config_placement_reducer_materialization(&mut config, state, 0);
+        overlay_placement(&mut config, state, 0);
         assert_eq!(config.placement_handle_ranges.len(), 2);
         let directory = config.handle_range_directory();
         assert_eq!(directory.conflicts(), 2);
@@ -1215,11 +1175,8 @@ fn binding_paths_disjoint() {
     assert_eq!(path, "realm_config.placement.placement_bindings.42");
     assert_eq!(placement_binding_handle(&path), Some(handle));
     // The two placement-binding namespaces must not parse each other's paths.
-    assert_eq!(
-        realm_config_strategy_binding_scope_key_from_path(&path),
-        None
-    );
-    let strategy_path = realm_config_strategy_binding_path(&BindingScope::Realm);
+    assert_eq!(parse_strategy_scope(&path), None);
+    let strategy_path = strategy_binding_path(&BindingScope::Realm);
     assert_eq!(placement_binding_handle(&strategy_path), None);
 }
 
@@ -1267,7 +1224,7 @@ fn binding_conflicts_converge() {
 
     for state in [&left, &right] {
         let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-        overlay_realm_config_placement_reducer_materialization(&mut config, state, 0);
+        overlay_placement(&mut config, state, 0);
         let directory = config.binding_directory();
         assert_eq!(
             directory.resolve(handle),
@@ -1297,7 +1254,7 @@ fn provenance_conflicts() {
     assert!(state.materialized_placement_bindings().is_empty());
 
     let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-    overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+    overlay_placement(&mut config, &state, 0);
     assert_eq!(config.placement_bindings.len(), 2);
     assert_eq!(
         config.binding_directory().resolve(handle),
@@ -1335,7 +1292,7 @@ fn binding_reappend_idempotent() {
     config
         .placement_handle_ranges
         .push(handle_range(8, origin, 3, 20));
-    overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+    overlay_placement(&mut config, &state, 0);
     assert_eq!(config.placement_bindings.len(), 1);
     assert_eq!(
         config
@@ -1361,7 +1318,7 @@ fn overlay_retains_conflicts() {
     let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
     // A stale local entry for the handle must be replaced, not accumulated.
     config.placement_bindings.push(first.clone());
-    overlay_realm_config_placement_reducer_materialization(&mut config, &state, 0);
+    overlay_placement(&mut config, &state, 0);
 
     assert_eq!(config.placement_bindings.len(), 2);
     let strategies: BTreeSet<_> = config

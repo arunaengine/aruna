@@ -14,8 +14,8 @@ use aruna_core::metadata::{
     resolve_raw_revision,
 };
 use aruna_core::storage_entries::{
-    metadata_document_lifecycle_key, metadata_event_log_key, metadata_event_log_prefix,
-    metadata_graph_lifecycle_key, metadata_pending_projection_target, raw_revision_key,
+    document_lifecycle_key, event_log_key, event_log_prefix, graph_lifecycle_key,
+    pending_projection_target, raw_revision_key,
 };
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::{Key, TxnId};
@@ -25,9 +25,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::metadata::repository::{
-    parse_materialization_status_read, read_materialization_status_effect,
-};
+use crate::metadata::repository::{parse_status_read, read_status_effect};
 
 const RAW_PAGE_SIZE: usize = 1;
 const RAW_EVENT_LIMIT: usize = METADATA_RAW_EVENT_LIMIT as usize;
@@ -137,10 +135,10 @@ pub async fn load_raw_view(
     document_id: Ulid,
     txn_id: Option<TxnId>,
 ) -> Result<Option<MetadataRawView>, MetadataRawReadError> {
-    let status = parse_materialization_status_read(
+    let status = parse_status_read(
         context
             .storage_handle
-            .send_effect(read_materialization_status_effect(document_id, txn_id))
+            .send_effect(read_status_effect(document_id, txn_id))
             .await,
     )
     .map_err(|error| match error {
@@ -221,7 +219,7 @@ async fn raw_deleted(
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_document_lifecycle_key(document_id),
+            key: document_lifecycle_key(document_id),
             txn_id,
         })
         .await
@@ -244,7 +242,7 @@ async fn raw_deleted(
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(document_id)),
+            key: graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(document_id)),
             txn_id,
         })
         .await
@@ -592,7 +590,7 @@ async fn read_raw_event(
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
-            key: metadata_event_log_key(document_id, event_id),
+            key: event_log_key(document_id, event_id),
             txn_id: None,
         })
         .await
@@ -605,11 +603,7 @@ async fn read_raw_event(
             }
             let event: MetadataCreateEventRecord =
                 postcard::from_bytes(&value).map_err(ConversionError::from)?;
-            validate_raw_entry(
-                document_id,
-                &metadata_event_log_key(document_id, event_id),
-                &event,
-            )?;
+            validate_raw_entry(document_id, &event_log_key(document_id, event_id), &event)?;
             Ok(event)
         }
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Err(
@@ -628,9 +622,8 @@ async fn load_raw_events(
     txn_id: Option<TxnId>,
     mut budget: RawLoadBudget,
 ) -> Result<Vec<MetadataCreateEventRecord>, MetadataRawReadError> {
-    let prefix = metadata_event_log_prefix(document_id);
-    let mut start: Option<Key> =
-        start_after.map(|event_id| metadata_event_log_key(document_id, event_id));
+    let prefix = event_log_prefix(document_id);
+    let mut start: Option<Key> = start_after.map(|event_id| event_log_key(document_id, event_id));
     let mut events = Vec::new();
     loop {
         let remaining = RAW_EVENT_LIMIT.saturating_sub(budget.events);
@@ -693,7 +686,7 @@ fn validate_raw_entry(
     key: &[u8],
     event: &MetadataCreateEventRecord,
 ) -> Result<(), MetadataRawReadError> {
-    let Some((key_document_id, key_event_id)) = metadata_pending_projection_target(key) else {
+    let Some((key_document_id, key_event_id)) = pending_projection_target(key) else {
         return Err(MetadataRawReadError::InconsistentLog(
             "raw event key has invalid identity".to_string(),
         ));
@@ -720,7 +713,7 @@ fn validate_raw_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::storage_entries::metadata_create_event_write_entry;
+    use aruna_core::storage_entries::create_event_entry;
     use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -899,7 +892,7 @@ mod tests {
     fn rejects_raw_key() {
         let event_id = Ulid::from_parts(1, 10);
         let event = test_event(event_id, 1);
-        let key = metadata_event_log_key(event.record.document_id, Ulid::from_parts(2, 10));
+        let key = event_log_key(event.record.document_id, Ulid::from_parts(2, 10));
 
         assert!(matches!(
             validate_raw_entry(event.record.document_id, &key, &event),
@@ -934,7 +927,7 @@ mod tests {
         };
         let mut writes = [&base, &late, &latest]
             .into_iter()
-            .map(metadata_create_event_write_entry)
+            .map(create_event_entry)
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         writes.push((

@@ -160,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn neg_log2_exact_vectors() {
+    fn neg_log2_vectors() {
         assert_eq!(neg_log2_q48(1 << 63), Q48_ONE);
         assert_eq!(neg_log2_q48(1 << 62), 2 * Q48_ONE);
         assert_eq!(neg_log2_q48(1), 64 * Q48_ONE);
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn neg_log2_matches_float_reference() {
+    fn neg_log2_matches() {
         let mut worst = 0f64;
         for counter in 0u64..4096 {
             let h = counter_hash(counter);
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn rank_weighted_golden_order() {
+    fn weighted_golden_order() {
         let ids: [[u8; 32]; 6] = [[1; 32], [2; 32], [3; 32], [4; 32], [5; 32], [6; 32]];
         let weights = [100u64, 100, 100, 300, 50, 200];
         let candidates: Vec<([u8; 32], u64)> =
@@ -192,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn weighted_top_one_frequency_tracks_weight() {
+    fn frequency_tracks_weight() {
         let light = [0xAAu8; 32];
         let heavy = [0xBBu8; 32];
         let candidates = [(light, 100u64), (heavy, 300u64)];
@@ -211,7 +211,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn neg_log2_is_monotone(a in any::<u64>(), b in any::<u64>()) {
+        fn neg_log2_monotone(a in any::<u64>(), b in any::<u64>()) {
             let h1 = a | 1;
             let h2 = b | 1;
             let (lo, hi) = if h1 <= h2 { (h1, h2) } else { (h2, h1) };
@@ -219,7 +219,7 @@ mod tests {
         }
 
         #[test]
-        fn rank_is_permutation_and_deterministic(candidates in candidate_strategy()) {
+        fn rank_deterministic_permutation(candidates in candidate_strategy()) {
             let first = rank_weighted(ROLE_NODE, b"subject", &candidates);
             let second = rank_weighted(ROLE_NODE, b"subject", &candidates);
             prop_assert_eq!(&first, &second);
@@ -229,7 +229,7 @@ mod tests {
         }
 
         #[test]
-        fn rank_is_input_order_independent(
+        fn rank_order_independent(
             candidates in candidate_strategy(),
             keys in prop::collection::vec(any::<u64>(), 0..12),
         ) {
@@ -246,7 +246,7 @@ mod tests {
         }
 
         #[test]
-        fn rank_is_weight_scale_invariant(
+        fn rank_scale_invariant(
             candidates in candidate_strategy(),
             k in 1u64..1_048_576,
         ) {
@@ -258,7 +258,7 @@ mod tests {
         }
 
         #[test]
-        fn zero_weight_ranks_after_positive(candidates in candidate_strategy()) {
+        fn zero_weight_last(candidates in candidate_strategy()) {
             prop_assume!(candidates.len() >= 2);
             let mut candidates = candidates;
             candidates[0].1 = 0;
@@ -275,7 +275,7 @@ mod tests {
         }
 
         #[test]
-        fn removing_candidate_preserves_relative_order(
+        fn removal_preserves_order(
             candidates in candidate_strategy(),
             victim in any::<u64>(),
         ) {

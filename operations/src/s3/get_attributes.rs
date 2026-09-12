@@ -1,7 +1,7 @@
-use crate::blob::blob_storage::blob_location_read;
+use crate::blob::records::blob_location_read;
 use crate::blob::managed_copy::ManagedCopyError;
 use crate::s3::object_lookup::{
-    CopyNodeId, LookupError, location_from_read, managed_copy_check, managed_copy_read,
+    ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read,
 };
 use aruna_core::effects::{Effect, StorageEffect};
@@ -185,7 +185,7 @@ impl GetObjectAttributesOperation {
         }
     }
 
-    fn handle_received_current_version(&mut self, event: Event) -> Effects {
+    fn current_version_received(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(GetObjectAttributesError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -297,7 +297,7 @@ impl GetObjectAttributesOperation {
         blob_hash: [u8; 32],
         backend: aruna_core::structs::BackendRef,
     ) -> Effects {
-        let check = match managed_copy_check(
+        let check = match begin_copy_check(
             &self.input.bucket,
             &self.input.key,
             version_id,
@@ -315,12 +315,12 @@ impl GetObjectAttributesOperation {
     }
 
     fn handle_managed_copy(&mut self, event: Event) -> Effects {
-        let key = match managed_copy_read(
+        let key = match finish_copy_check(
             event,
             &mut self.pending_copy,
             &mut self.pending_location,
             &self.source_policies,
-            CopyNodeId::Subject,
+            ExpectedNode::Subject,
         ) {
             Ok(key) => key,
             Err(err) => {
@@ -331,12 +331,10 @@ impl GetObjectAttributesOperation {
         self.read_blob_location(key)
     }
 
-    fn handle_blob_location_read(&mut self, event: Event) -> Effects {
+    fn location_read(&mut self, event: Event) -> Effects {
         let location = match location_from_read(event) {
             Ok(Some(location)) => location,
-            Ok(None) => {
-                return self.emit_error(GetObjectAttributesError::GetObjectAttributesFailed);
-            }
+            Ok(None) => return self.read_multipart_summary(),
             Err(err) => {
                 let error = self.lookup_error("Event::Storage(StorageEvent::ReadResult)", err);
                 return self.emit_error(error);
@@ -361,7 +359,7 @@ impl GetObjectAttributesOperation {
         smallvec![effect]
     }
 
-    fn handle_multipart_summary_read(&mut self, event: Event) -> Effects {
+    fn summary_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(GetObjectAttributesError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -399,7 +397,7 @@ impl GetObjectAttributesOperation {
         })]
     }
 
-    fn handle_multipart_parts_read(&mut self, event: Event) -> Effects {
+    fn parts_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             return self.emit_error(GetObjectAttributesError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -428,10 +426,6 @@ impl GetObjectAttributesOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(GetObjectAttributesError::NoTransactionFound);
         };
-        if self.location.is_none() && self.source_metadata.is_none() {
-            return self.emit_error(GetObjectAttributesError::GetObjectAttributesFailed);
-        }
-
         let checksum_type = self
             .summary
             .as_ref()
@@ -485,14 +479,14 @@ impl Operation for GetObjectAttributesOperation {
             GetObjectAttributesState::StartTransaction => self.handle_transaction_started(event),
             GetObjectAttributesState::GetVersion => self.handle_received_version(event),
             GetObjectAttributesState::GetCurrentVersion => {
-                self.handle_received_current_version(event)
+                self.current_version_received(event)
             }
             GetObjectAttributesState::CheckManagedCopy => self.handle_managed_copy(event),
-            GetObjectAttributesState::GetBlobLocation => self.handle_blob_location_read(event),
+            GetObjectAttributesState::GetBlobLocation => self.location_read(event),
             GetObjectAttributesState::ReadMultipartSummary => {
-                self.handle_multipart_summary_read(event)
+                self.summary_read(event)
             }
-            GetObjectAttributesState::ReadMultipartParts => self.handle_multipart_parts_read(event),
+            GetObjectAttributesState::ReadMultipartParts => self.parts_read(event),
             GetObjectAttributesState::CommitTransaction => self.handle_transaction_committed(event),
             GetObjectAttributesState::Finish | GetObjectAttributesState::Error => smallvec![],
         }
@@ -672,7 +666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multipart_object_returns_parts_and_composite_type() {
+    async fn multipart_returns_parts() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -717,7 +711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simple_object_omits_parts() {
+    async fn simple_omits_parts() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -803,7 +797,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_marker_version_returns_error() {
+    async fn delete_marker_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();

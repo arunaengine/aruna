@@ -1,19 +1,8 @@
 use super::*;
 
-/// Overlays the realm-config placement paths owned by `reducer_state` onto `config`.
-/// Paths absent from both the reducer values and conflicts remain untouched.
-///
-/// The final repair uses the live strategy with the lowest id as the deterministic
-/// fallback for missing defaults, bindings, and explicit override strategy ids. If
-/// no strategy is live, references are cleared while override pins and exclusions
-/// are retained. Reducer values are not changed, so a later strategy upsert can
-/// restore an assignment that was only dangling in the materialized snapshot.
-/// Materializes every placement structure the reducer owns into `config`.
-///
-/// `now_ms` decides only which terminal transitions have outlived their grace
-/// and are dropped from the document; it never reaches an activation, so two
-/// replicas reading different clocks still route identically.
-pub fn overlay_realm_config_placement_reducer_materialization(
+/// Materializes reducer-owned placement state and repairs dangling references with the lowest live
+/// strategy. `now_ms` prunes expired terminal transitions but never changes activation routing.
+pub fn overlay_placement(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
     now_ms: u64,
@@ -25,7 +14,7 @@ pub fn overlay_realm_config_placement_reducer_materialization(
             .conflicts
             .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
     {
-        config.default_strategy_id = reducer_state.materialized_realm_config_default_strategy();
+        config.default_strategy_id = reducer_state.materialized_default_strategy();
     }
 
     // The stored family strategy is immutable, so a materialized value always
@@ -34,16 +23,16 @@ pub fn overlay_realm_config_placement_reducer_materialization(
         config.job_family_strategy_id = strategy_id;
     }
 
-    let materialized_placement_map = reducer_state.materialized_realm_config_placement_map();
+    let materialized_placement_map = reducer_state.materialized_placement_map();
     for path in reducer_state.conflicts.keys() {
-        if let Some(node_id) = realm_config_placement_node_id_from_path(path) {
+        if let Some(node_id) = parse_placement_node(path) {
             config
                 .placement_map
                 .retain(|entry| entry.node_id != node_id);
         }
     }
     for path in reducer_state.user_subject_ids.keys() {
-        let Some(node_id) = realm_config_placement_node_id_from_path(path) else {
+        let Some(node_id) = parse_placement_node(path) else {
             continue;
         };
         config
@@ -57,16 +46,16 @@ pub fn overlay_realm_config_placement_reducer_materialization(
         }
     }
 
-    let materialized_strategies = reducer_state.materialized_realm_config_placement_strategies();
+    let materialized_strategies = reducer_state.materialized_strategies();
     for path in reducer_state.conflicts.keys() {
-        if let Some(strategy_id) = realm_config_placement_strategy_id_from_path(path) {
+        if let Some(strategy_id) = parse_placement_strategy(path) {
             config
                 .strategies
                 .retain(|strategy| strategy.strategy_id != strategy_id);
         }
     }
     for path in reducer_state.user_subject_ids.keys() {
-        let Some(strategy_id) = realm_config_placement_strategy_id_from_path(path) else {
+        let Some(strategy_id) = parse_placement_strategy(path) else {
             continue;
         };
         config
@@ -80,16 +69,16 @@ pub fn overlay_realm_config_placement_reducer_materialization(
         }
     }
 
-    let materialized_bindings = reducer_state.materialized_realm_config_strategy_bindings();
+    let materialized_bindings = reducer_state.materialized_strategy_bindings();
     for path in reducer_state.conflicts.keys() {
-        if let Some(scope_key) = realm_config_strategy_binding_scope_key_from_path(path) {
+        if let Some(scope_key) = parse_strategy_scope(path) {
             config
                 .strategy_bindings
                 .retain(|binding| binding_scope_key(&binding.scope) != scope_key);
         }
     }
     for path in reducer_state.user_subject_ids.keys() {
-        let Some(scope_key) = realm_config_strategy_binding_scope_key_from_path(path) else {
+        let Some(scope_key) = parse_strategy_scope(path) else {
             continue;
         };
         config
@@ -103,16 +92,16 @@ pub fn overlay_realm_config_placement_reducer_materialization(
         }
     }
 
-    let materialized_overrides = reducer_state.materialized_realm_config_placement_overrides();
+    let materialized_overrides = reducer_state.materialized_placement_overrides();
     for path in reducer_state.conflicts.keys() {
-        if let Some(subject_key) = realm_config_placement_override_subject_key_from_path(path) {
+        if let Some(subject_key) = parse_override_subject(path) {
             config
                 .placement_overrides
                 .retain(|record| hex::encode(&record.subject) != subject_key);
         }
     }
     for path in reducer_state.user_subject_ids.keys() {
-        let Some(subject_key) = realm_config_placement_override_subject_key_from_path(path) else {
+        let Some(subject_key) = parse_override_subject(path) else {
             continue;
         };
         config
@@ -126,9 +115,8 @@ pub fn overlay_realm_config_placement_reducer_materialization(
         }
     }
 
-    // Placement bindings are immutable and fail closed: unlike strategy bindings
-    // (which drop a conflicted scope), every divergent value for a conflicted
-    // handle is retained so the derived binding directory reports a conflict.
+    // Immutable placement conflicts retain every divergent value so binding resolution fails closed,
+    // unlike strategy-binding conflicts that drop the conflicted scope.
     let materialized_bindings = reducer_state.materialized_placement_bindings();
     for (path, conflict) in &reducer_state.conflicts {
         let Some(handle) = placement_binding_handle(path) else {
@@ -216,13 +204,12 @@ pub fn overlay_realm_config_placement_reducer_materialization(
     }
 
     overlay_placement_transitions(config, reducer_state, now_ms);
-    repair_realm_config_placement_references(config);
+    repair_placement_refs(config);
 }
 
-/// Overlays candidate maps and transitions, then re-derives every activation
-/// they govern. A conflicted map epoch keeps all its divergent values (the
-/// epoch stays unusable); a conflicted plan or activation drops the record
-/// entirely, so the affected buckets resolve nothing.
+/// Overlays candidate maps and transitions, then re-derives every activation they govern. A conflicted
+/// map epoch keeps all its divergent values (the epoch stays unusable); a conflicted plan or activation
+/// drops the record entirely, so the affected buckets resolve nothing.
 fn overlay_placement_transitions(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
@@ -235,7 +222,7 @@ fn overlay_placement_transitions(
         };
         config.candidate_maps.retain(|map| map.epoch != epoch);
         for value in &conflict.values {
-            if let Some(map) = value.value.as_deref().and_then(candidate_map_from_value) {
+            if let Some(map) = value.value.as_deref().and_then(decode_candidate_map) {
                 config.candidate_maps.push(map);
             }
         }
@@ -264,9 +251,8 @@ fn overlay_placement_transitions(
             .placement_transitions
             .retain(|existing| existing.plan.transition_id != transition.plan.transition_id);
     }
-    // A released record is dropped from the document but never from the fold
-    // below: activations are replayed from the whole reduced chain, so pruning
-    // a cut-over out of that chain would silently regress its buckets.
+    // Released records leave the document but remain in the reduced chain so replay preserves cutovers
+    // instead of regressing buckets to earlier activations.
     config.placement_transitions.extend(
         transitions
             .iter()
@@ -312,9 +298,8 @@ fn overlay_placement_transitions(
                 let Some(bucket_plan) = transition.plan.bucket_plan(shard) else {
                     continue;
                 };
-                // Predecessor gate: a plan derived from another activation
-                // epoch never applies to this bucket, in any replay order, so
-                // concurrent same-base plans cannot chain (see BucketPlan).
+                // Predecessor gate: a plan derived from another activation epoch never applies to this bucket, in any
+                // replay order, so concurrent same-base plans cannot chain (see BucketPlan).
                 if bucket_plan.predecessor_epoch != activation.activation_epoch {
                     continue;
                 }
@@ -356,7 +341,7 @@ fn retain_referenced_maps(config: &mut RealmConfigDocument) {
         .retain(|map| referenced.contains(&map.epoch));
 }
 
-fn order_by_bucket_and_node(left: &BucketBarrier, right: &BucketBarrier) -> Ordering {
+fn order_bucket_node(left: &BucketBarrier, right: &BucketBarrier) -> Ordering {
     left.bucket.cmp(&right.bucket).then_with(|| {
         left.reported_by
             .as_bytes()
@@ -378,10 +363,9 @@ fn order_stalls(left: &StallReport, right: &StallReport) -> Ordering {
     })
 }
 
-fn repair_realm_config_placement_references(config: &mut RealmConfigDocument) {
-    // `placement_bindings` are intentionally exempt: they are immutable, so a
-    // binding naming a removed strategy fails closed at resolve rather than
-    // being repaired here.
+fn repair_placement_refs(config: &mut RealmConfigDocument) {
+    // `placement_bindings` are intentionally exempt: they are immutable, so a binding naming a removed
+    // strategy fails closed at resolve rather than being repaired here.
     let live_strategy_ids: BTreeSet<_> = config
         .strategies
         .iter()
@@ -420,7 +404,7 @@ fn repair_realm_config_placement_references(config: &mut RealmConfigDocument) {
 }
 
 impl AdminDocumentReducerState {
-    pub fn materialized_realm_config_nodes(&self) -> BTreeMap<NodeId, RealmNodeKind> {
+    pub fn materialized_config_nodes(&self) -> BTreeMap<NodeId, RealmNodeKind> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return BTreeMap::new();
         }
@@ -428,11 +412,8 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .iter()
             .filter_map(|(path, version)| {
-                let node_id = realm_config_node_id_from_path(path)?;
-                let kind = version
-                    .value
-                    .as_deref()
-                    .and_then(realm_node_kind_from_value)?;
+                let node_id = parse_config_node(path)?;
+                let kind = version.value.as_deref().and_then(decode_node_kind)?;
                 Some((node_id, kind))
             })
             .collect()
@@ -448,10 +429,10 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .iter()
             .filter(|(_, version)| version.value.is_none())
-            .filter_map(|(path, _)| realm_config_node_id_from_path(path))
+            .filter_map(|(path, _)| parse_config_node(path))
             .collect()
     }
-    pub fn materialized_realm_config_placement_map(&self) -> BTreeMap<NodeId, NodePlacementEntry> {
+    pub fn materialized_placement_map(&self) -> BTreeMap<NodeId, NodePlacementEntry> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return BTreeMap::new();
         }
@@ -459,20 +440,15 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .iter()
             .filter_map(|(path, version)| {
-                let node_id = realm_config_placement_node_id_from_path(path)?;
-                let entry = version
-                    .value
-                    .as_deref()
-                    .and_then(placement_entry_from_value)?;
+                let node_id = parse_placement_node(path)?;
+                let entry = version.value.as_deref().and_then(decode_placement_entry)?;
 
                 (entry.node_id == node_id).then_some((node_id, entry))
             })
             .collect()
     }
 
-    pub fn materialized_realm_config_placement_strategies(
-        &self,
-    ) -> BTreeMap<Ulid, PlacementStrategy> {
+    pub fn materialized_strategies(&self) -> BTreeMap<Ulid, PlacementStrategy> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return BTreeMap::new();
         }
@@ -480,18 +456,18 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .iter()
             .filter_map(|(path, version)| {
-                let strategy_id = realm_config_placement_strategy_id_from_path(path)?;
+                let strategy_id = parse_placement_strategy(path)?;
                 let strategy = version
                     .value
                     .as_deref()
-                    .and_then(placement_strategy_from_value)?;
+                    .and_then(decode_placement_strategy)?;
 
                 (strategy.strategy_id == strategy_id).then_some((strategy_id, strategy))
             })
             .collect()
     }
 
-    pub fn materialized_realm_config_default_strategy(&self) -> Option<Ulid> {
+    pub fn materialized_default_strategy(&self) -> Option<Ulid> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return None;
         }
@@ -516,7 +492,7 @@ impl AdminDocumentReducerState {
             .filter(|strategy_id| !strategy_id.is_nil())
     }
 
-    pub fn materialized_realm_config_strategy_bindings(&self) -> BTreeMap<String, StrategyBinding> {
+    pub fn materialized_strategy_bindings(&self) -> BTreeMap<String, StrategyBinding> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return BTreeMap::new();
         }
@@ -524,11 +500,11 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .iter()
             .filter_map(|(path, version)| {
-                let scope_key = realm_config_strategy_binding_scope_key_from_path(path)?;
+                let scope_key = parse_strategy_scope(path)?;
                 let binding = version
                     .value
                     .as_deref()
-                    .and_then(strategy_binding_from_value)
+                    .and_then(decode_strategy_binding)
                     .map(|binding| normalized_strategy_binding(&binding))?;
 
                 let canonical_scope_key = binding_scope_key(&binding.scope);
@@ -537,9 +513,7 @@ impl AdminDocumentReducerState {
             .collect()
     }
 
-    pub fn materialized_realm_config_placement_overrides(
-        &self,
-    ) -> BTreeMap<String, PlacementOverride> {
+    pub fn materialized_placement_overrides(&self) -> BTreeMap<String, PlacementOverride> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return BTreeMap::new();
         }
@@ -547,11 +521,11 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .iter()
             .filter_map(|(path, version)| {
-                let subject_key = realm_config_placement_override_subject_key_from_path(path)?;
+                let subject_key = parse_override_subject(path)?;
                 let record = version
                     .value
                     .as_deref()
-                    .and_then(placement_override_from_value)?;
+                    .and_then(decode_placement_override)?;
 
                 (hex::encode(&record.subject) == subject_key)
                     .then(|| (subject_key.to_string(), record))
@@ -602,10 +576,7 @@ impl AdminDocumentReducerState {
             .iter()
             .filter_map(|(path, version)| {
                 let epoch = candidate_map_epoch(path)?;
-                let map = version
-                    .value
-                    .as_deref()
-                    .and_then(candidate_map_from_value)?;
+                let map = version.value.as_deref().and_then(decode_candidate_map)?;
 
                 (map.epoch == epoch).then_some((epoch, map))
             })
@@ -641,10 +612,7 @@ impl AdminDocumentReducerState {
                 let (transition_id, TransitionPart::Plan) = transition_part(path)? else {
                     return None;
                 };
-                let plan = version
-                    .value
-                    .as_deref()
-                    .and_then(transition_plan_from_value)?;
+                let plan = version.value.as_deref().and_then(decode_transition_plan)?;
 
                 (plan.transition_id == transition_id).then_some((transition_id, plan))
             })
@@ -691,7 +659,7 @@ impl AdminDocumentReducerState {
                     }
                 }
                 TransitionPart::Proof(bucket, holder) => {
-                    let Some((strategy_id, proof)) = transition_proof_from_value(value) else {
+                    let Some((strategy_id, proof)) = decode_transition_proof(value) else {
                         continue;
                     };
                     // A proof from outside the planned target set never enters
@@ -744,7 +712,7 @@ impl AdminDocumentReducerState {
 
         let mut assembled: Vec<PlacementTransition> = transitions.into_values().collect();
         for transition in assembled.iter_mut() {
-            transition.barriers.sort_by(order_by_bucket_and_node);
+            transition.barriers.sort_by(order_bucket_node);
             transition.proofs.sort_by(order_proofs);
             transition.forced.sort_by_key(|entry| entry.bucket);
             transition.stalls.sort_by(order_stalls);
@@ -816,7 +784,7 @@ impl AdminDocumentReducerState {
 }
 
 impl AdminDocumentReducerState {
-    pub(super) fn apply_realm_config_placement_field(
+    pub(super) fn apply_placement_field(
         &mut self,
         event: &AdminDocumentEvent,
         path: String,
@@ -860,13 +828,8 @@ impl AdminDocumentReducerState {
         self.apply_immutable_value(event, band_pool_path(pool.pool_id), band_pool_value(pool));
     }
 
-    /// One actor's report about one bucket: a retry is not divergence.
-    ///
-    /// A holder re-runs the transition step until it observes its own report, so
-    /// it can legitimately submit twice with a moved frontier or a re-signed
-    /// proof. Treating that as a conflict would strand the bucket forever, so
-    /// the earliest event wins - deterministic on every replica, whatever order
-    /// the two arrived in.
+    /// Retries by one actor are not divergence: the holder may report a moved frontier or re-signed proof.
+    /// The earliest event wins deterministically, preventing retries from stranding a bucket.
     pub(super) fn apply_transition_report(
         &mut self,
         event: &AdminDocumentEvent,
@@ -889,22 +852,22 @@ impl AdminDocumentReducerState {
     }
 }
 
-pub fn realm_config_placement_node_path(node_id: &NodeId) -> String {
+pub fn placement_node_path(node_id: &NodeId) -> String {
     format!("realm_config.placement.nodes.{node_id}")
 }
 
-pub fn realm_config_placement_strategy_path(strategy_id: &Ulid) -> String {
+pub fn placement_strategy_path(strategy_id: &Ulid) -> String {
     format!("realm_config.placement.strategies.{strategy_id}")
 }
 
-pub fn realm_config_strategy_binding_path(scope: &BindingScope) -> String {
+pub fn strategy_binding_path(scope: &BindingScope) -> String {
     format!(
         "realm_config.placement.bindings.{}",
         binding_scope_key(scope)
     )
 }
 
-pub fn realm_config_placement_override_path(subject: &[u8]) -> String {
+pub fn placement_override_path(subject: &[u8]) -> String {
     format!("realm_config.placement.overrides.{}", hex::encode(subject))
 }
 
@@ -984,15 +947,15 @@ pub(super) fn transition_proof_value(strategy_id: &Ulid, proof: &CompletionProof
     serde_json::to_string(&(strategy_id, proof)).expect("admin document proof serializes")
 }
 
-fn candidate_map_from_value(value: &str) -> Option<CandidatePlacementMap> {
+fn decode_candidate_map(value: &str) -> Option<CandidatePlacementMap> {
     serde_json::from_str(value).ok()
 }
 
-fn transition_plan_from_value(value: &str) -> Option<TransitionPlan> {
+fn decode_transition_plan(value: &str) -> Option<TransitionPlan> {
     serde_json::from_str(value).ok()
 }
 
-fn transition_proof_from_value(value: &str) -> Option<(Ulid, CompletionProof)> {
+fn decode_transition_proof(value: &str) -> Option<(Ulid, CompletionProof)> {
     serde_json::from_str(value).ok()
 }
 
@@ -1008,21 +971,21 @@ fn band_pool_value(pool: &BandPool) -> String {
     serde_json::to_string(pool).expect("admin document band pool serializes")
 }
 
-pub fn realm_config_placement_node_id_from_path(path: &str) -> Option<NodeId> {
+pub fn parse_placement_node(path: &str) -> Option<NodeId> {
     let node_id = path.strip_prefix("realm_config.placement.nodes.")?;
     NodeId::from_str(node_id).ok()
 }
 
-pub fn realm_config_placement_strategy_id_from_path(path: &str) -> Option<Ulid> {
+pub fn parse_placement_strategy(path: &str) -> Option<Ulid> {
     let strategy_id = path.strip_prefix("realm_config.placement.strategies.")?;
     Ulid::from_string(strategy_id).ok()
 }
 
-pub fn realm_config_strategy_binding_scope_key_from_path(path: &str) -> Option<&str> {
+pub fn parse_strategy_scope(path: &str) -> Option<&str> {
     path.strip_prefix("realm_config.placement.bindings.")
 }
 
-pub fn realm_config_placement_override_subject_key_from_path(path: &str) -> Option<&str> {
+pub fn parse_override_subject(path: &str) -> Option<&str> {
     path.strip_prefix("realm_config.placement.overrides.")
 }
 
@@ -1089,19 +1052,19 @@ fn transition_part(path: &str) -> Option<(Ulid, TransitionPart)> {
     parts.next().is_none().then_some((transition_id, part))
 }
 
-fn placement_entry_from_value(value: &str) -> Option<NodePlacementEntry> {
+fn decode_placement_entry(value: &str) -> Option<NodePlacementEntry> {
     serde_json::from_str(value).ok()
 }
 
-fn placement_strategy_from_value(value: &str) -> Option<PlacementStrategy> {
+fn decode_placement_strategy(value: &str) -> Option<PlacementStrategy> {
     serde_json::from_str(value).ok()
 }
 
-fn strategy_binding_from_value(value: &str) -> Option<StrategyBinding> {
+fn decode_strategy_binding(value: &str) -> Option<StrategyBinding> {
     serde_json::from_str(value).ok()
 }
 
-fn placement_override_from_value(value: &str) -> Option<PlacementOverride> {
+fn decode_placement_override(value: &str) -> Option<PlacementOverride> {
     serde_json::from_str(value).ok()
 }
 

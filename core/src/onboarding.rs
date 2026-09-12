@@ -274,7 +274,7 @@ impl OnboardingSyncTicket {
     }
 }
 
-pub fn bootstrap_node_proof_message(
+pub fn node_proof_message(
     onboarding_secret: &str,
     node_id: &str,
     transport_public_key: Option<&str>,
@@ -286,7 +286,7 @@ pub fn bootstrap_node_proof_message(
     .into_bytes()
 }
 
-pub fn bootstrap_issuer_proof_message(
+pub fn issuer_proof_message(
     onboarding_secret: &str,
     node_id: &str,
     issuer_public_key: &str,
@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_secret_hash_matches_existing_blake3_hex() {
+    fn onboarding_secret_hex() {
         let secret = OnboardingSecret {
             seed_url: "http://127.0.0.1:3000".to_string(),
             enrollment_id: Ulid::generate(),
@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_sync_ticket_roundtrip_and_verify() {
+    fn onboarding_sync_verify() {
         let realm_signing_key = SigningKey::from_bytes(&[3u8; 32]);
         let node_signing_key = SigningKey::from_bytes(&[4u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&node_signing_key.to_bytes()).public();

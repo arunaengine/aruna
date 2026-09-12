@@ -53,12 +53,9 @@ struct TestNode {
     context: Arc<DriverContext>,
 }
 
-// Two holders write documents of one shard, interleaved from both sides. Once
-// the shard drains and reconciles, both nodes must assemble byte-identical
-// manifests: same entry set, same digest.
+// Two holders write documents of one shard, interleaved from both sides.
 #[tokio::test]
-async fn interleaved_writes_to_one_shard_converge_on_both_holders()
--> Result<(), Box<dyn std::error::Error>> {
+async fn interleaved_writes_converge() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([125u8; 32]);
     let (nodes, config) = build_realm_nodes(&realm_id, 2).await?;
     let group_id = Ulid::generate();
@@ -92,7 +89,7 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     // Every create lands two rows in the shard: the document and its
     // persistent-id mapping. Both holders must converge on set and digest.
     let manifest_rows = document_ids.len() * 2;
-    wait_for_manifest_agreement(&nodes[0], &nodes[1], realm_id, placement, manifest_rows).await?;
+    wait_manifest_agreement(&nodes[0], &nodes[1], realm_id, placement, manifest_rows).await?;
 
     let left = assemble_shard_manifest(nodes[0].context.as_ref(), realm_id, placement).await?;
     let right = assemble_shard_manifest(nodes[1].context.as_ref(), realm_id, placement).await?;
@@ -100,10 +97,7 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     assert_eq!(sorted_entries(&left), sorted_entries(&right));
     assert_eq!(left.digest, right.digest);
 
-    // Delete one document and assert the tombstone converges byte-identically.
-    // Receivers must stamp the ORIGIN's actor into the delete tombstone's
-    // manifest row (not their own local node id), or the entry sets diverge
-    // across holders even though the topic digests agree.
+    // Receivers must stamp the origin actor into identical tombstone manifests.
     let deleted_id = document_ids[0];
     let deleted_target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: deleted_id,
@@ -234,7 +228,7 @@ async fn create_document(
     Ok(())
 }
 
-async fn wait_for_manifest_agreement(
+async fn wait_manifest_agreement(
     left: &TestNode,
     right: &TestNode,
     realm_id: RealmId,
@@ -286,7 +280,7 @@ async fn build_realm_nodes(
         )
         .await?;
     }
-    wait_for_realm_node_convergence(&nodes, realm_id).await?;
+    wait_node_convergence(&nodes, realm_id).await?;
     let config = install_realm_config(&nodes, realm_id).await?;
     Ok((nodes, config))
 }
@@ -370,7 +364,7 @@ async fn install_realm_config(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
     for node in nodes {
         aruna_operations::placement::process_placements::process_shard_placements(
@@ -383,7 +377,7 @@ async fn install_realm_config(
     Ok(config)
 }
 
-async fn wait_for_realm_node_convergence(
+async fn wait_node_convergence(
     nodes: &[TestNode],
     realm_id: &RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {

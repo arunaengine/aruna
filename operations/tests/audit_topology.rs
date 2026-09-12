@@ -17,7 +17,7 @@ use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::metadata::projector::replay_event_log;
 use std::cell::RefCell;
 use ulid::Ulid;
 
@@ -289,7 +289,7 @@ async fn create_document(
         node.context.as_ref(),
     )
     .await?;
-    replay_metadata_event_log(node.context.as_ref()).await?;
+    replay_event_log(node.context.as_ref()).await?;
     Ok(created.record.placement)
 }
 

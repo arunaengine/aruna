@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aruna_api::error::ServerSetupError;
-use aruna_api::ops::Readiness;
+use aruna_api::monitoring::Readiness;
 use aruna_blob::blob::BlobHandle;
 use aruna_core::shutdown::Shutdown;
 use aruna_net::{FORCED_INBOUND_DRAIN, NetHandle};

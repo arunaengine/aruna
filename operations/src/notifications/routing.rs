@@ -5,7 +5,7 @@ use aruna_core::structs::{
 };
 use aruna_core::types::UserId;
 
-pub fn group_admin_user_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId> {
+pub fn group_admin_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId> {
     let mut ids: Vec<UserId> = auth_doc
         .roles
         .values()
@@ -18,7 +18,7 @@ pub fn group_admin_user_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId
     ids
 }
 
-pub fn realm_admin_user_ids(auth_doc: &RealmAuthorizationDocument) -> Vec<UserId> {
+pub fn realm_admin_ids(auth_doc: &RealmAuthorizationDocument) -> Vec<UserId> {
     let mut ids: Vec<UserId> = auth_doc
         .roles
         .values()
@@ -49,7 +49,7 @@ pub fn route_resource_event(
             actor_user_id,
         } => {
             if let Some(group_auth) = ctx.group_auth {
-                for admin in group_admin_user_ids(group_auth) {
+                for admin in group_admin_ids(group_auth) {
                     if admin == *actor_user_id || admin.is_nil() {
                         continue;
                     }
@@ -83,7 +83,7 @@ pub fn route_resource_event(
                 ));
             }
             if let Some(group_auth) = ctx.group_auth {
-                for admin in group_admin_user_ids(group_auth) {
+                for admin in group_admin_ids(group_auth) {
                     if admin == *affected_user || admin == *actor_user_id {
                         continue;
                     }
@@ -119,7 +119,7 @@ pub fn route_resource_event(
         }
         ResourceEvent::NodeOnboarded { realm_id, node_id } => {
             if let Some(realm_auth) = ctx.realm_auth {
-                for admin in realm_admin_user_ids(realm_auth) {
+                for admin in realm_admin_ids(realm_auth) {
                     records.push(NotificationRecord::new(
                         admin,
                         NotificationClass::Direct,
@@ -180,8 +180,8 @@ mod tests {
         UserId::local(Ulid::from_bytes([seed; 16]), REALM)
     }
 
-    fn group_doc_with_admins(assigned: HashSet<UserId>) -> GroupAuthorizationDocument {
-        let mut doc = GroupAuthorizationDocument::new_default_group_doc(
+    fn group_with_admins(assigned: HashSet<UserId>) -> GroupAuthorizationDocument {
+        let mut doc = GroupAuthorizationDocument::default_group_doc(
             user(200),
             REALM,
             Ulid::from_bytes([9u8; 16]),
@@ -198,7 +198,7 @@ mod tests {
     fn join_notifies_admins() {
         let requester = user(3);
         let admins = HashSet::from([user(1), user(2), requester, UserId::nil(REALM)]);
-        let doc = group_doc_with_admins(admins);
+        let doc = group_with_admins(admins);
         let request_id = Ulid::from_bytes([4; 16]);
         let records = route_resource_event(
             &ResourceEvent::GroupJoinRequested {
@@ -233,11 +233,11 @@ mod tests {
     }
 
     #[test]
-    fn group_admins_resolved_from_admin_roles() {
+    fn resolves_group_admins() {
         let creator = user(1);
         let group_id = Ulid::from_bytes([2u8; 16]);
-        let doc = GroupAuthorizationDocument::new_default_group_doc(creator, REALM, group_id);
-        assert_eq!(group_admin_user_ids(&doc), vec![creator]);
+        let doc = GroupAuthorizationDocument::default_group_doc(creator, REALM, group_id);
+        assert_eq!(group_admin_ids(&doc), vec![creator]);
 
         let (u2, u3, ignored) = (user(2), user(3), user(4));
         let mut doc = doc;
@@ -257,14 +257,14 @@ mod tests {
 
         let mut expected = vec![creator, u2, u3];
         expected.sort();
-        assert_eq!(group_admin_user_ids(&doc), expected);
+        assert_eq!(group_admin_ids(&doc), expected);
     }
 
     #[test]
     fn nil_admins_ignored() {
         let nil = UserId::nil(REALM);
-        let group = group_doc_with_admins(HashSet::from([nil]));
-        assert!(group_admin_user_ids(&group).is_empty());
+        let group = group_with_admins(HashSet::from([nil]));
+        assert!(group_admin_ids(&group).is_empty());
         let joins = route_resource_event(
             &ResourceEvent::GroupJoinRequested {
                 group_id: group.group_id,
@@ -279,14 +279,14 @@ mod tests {
         );
         assert!(joins.is_empty());
 
-        let mut realm = RealmAuthorizationDocument::new_default_realm_doc(REALM);
+        let mut realm = RealmAuthorizationDocument::default_realm_doc(REALM);
         realm
             .roles
             .values_mut()
             .find(|role| role.name == "realm_admin")
             .expect("default realm admin role exists")
             .assigned_users = HashSet::from([nil]);
-        assert!(realm_admin_user_ids(&realm).is_empty());
+        assert!(realm_admin_ids(&realm).is_empty());
         let onboarded = route_resource_event(
             &ResourceEvent::NodeOnboarded {
                 realm_id: REALM,
@@ -302,9 +302,9 @@ mod tests {
     }
 
     #[test]
-    fn added_event_targets_affected_user_and_admins() {
+    fn added_event_targets() {
         let (a1, a2, affected) = (user(10), user(11), user(20));
-        let doc = group_doc_with_admins(HashSet::from([a1, a2]));
+        let doc = group_with_admins(HashSet::from([a1, a2]));
         let records = route_resource_event(
             &ResourceEvent::GroupMemberAdded {
                 group_id: doc.group_id,
@@ -335,9 +335,9 @@ mod tests {
     }
 
     #[test]
-    fn self_add_produces_admin_records_only() {
+    fn self_add_admins() {
         let (a1, a2, actor) = (user(10), user(11), user(30));
-        let doc = group_doc_with_admins(HashSet::from([a1, a2]));
+        let doc = group_with_admins(HashSet::from([a1, a2]));
         let records = route_resource_event(
             &ResourceEvent::GroupMemberAdded {
                 group_id: doc.group_id,
@@ -360,9 +360,9 @@ mod tests {
     }
 
     #[test]
-    fn affected_admin_gets_membership_not_admin_record() {
+    fn admin_gets_membership() {
         let (a1, actor) = (user(10), user(30));
-        let doc = group_doc_with_admins(HashSet::from([a1]));
+        let doc = group_with_admins(HashSet::from([a1]));
         let records = route_resource_event(
             &ResourceEvent::GroupMemberAdded {
                 group_id: doc.group_id,
@@ -385,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_event_targets_affected_user_only() {
+    fn removed_event_targets() {
         let (affected, actor) = (user(20), user(30));
         let group_id = Ulid::from_bytes([9u8; 16]);
         let records = route_resource_event(
@@ -427,8 +427,8 @@ mod tests {
     }
 
     fn upload_event(actor: UserId, path: &str) -> WatchEvent {
-        let resource = aruna_core::structs::parse_data_watch_resource_path(path)
-            .expect("canonical data watch path");
+        let resource =
+            aruna_core::structs::parse_watch_path(path).expect("canonical data watch path");
         WatchEvent {
             event_id: Ulid::from_bytes([7u8; 16]),
             realm_id: REALM,
@@ -447,8 +447,8 @@ mod tests {
     }
 
     fn sync_event(actor: UserId, path: &str) -> WatchEvent {
-        let resource = aruna_core::structs::parse_data_watch_resource_path(path)
-            .expect("canonical data watch path");
+        let resource =
+            aruna_core::structs::parse_watch_path(path).expect("canonical data watch path");
         WatchEvent {
             event_id: Ulid::from_bytes([9u8; 16]),
             realm_id: REALM,
@@ -467,12 +467,7 @@ mod tests {
     }
 
     fn data_path(node_id: aruna_core::NodeId, bucket: &str, key: &str) -> String {
-        aruna_core::structs::data_watch_resource_path(
-            Ulid::from_bytes([6u8; 16]),
-            node_id,
-            bucket,
-            key,
-        )
+        aruna_core::structs::watch_resource_path(Ulid::from_bytes([6u8; 16]), node_id, bucket, key)
     }
 
     fn metadata_event(actor: UserId, group_id: Ulid, document_id: Ulid) -> WatchEvent {
@@ -546,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_metadata_document_path_matches_canonical_prefix() {
+    fn nested_path_matches() {
         let owner = user(1);
         let actor = user(2);
         let group_id = Ulid::from_bytes([3u8; 16]);
@@ -602,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_event_ids_are_deterministic_across_invocations() {
+    fn event_ids_deterministic() {
         let owner = user(1);
         let actor = user(2);
         let data_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
@@ -620,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_event_with_no_matches_is_empty() {
+    fn unmatched_event_empty() {
         let actor = user(2);
         let data_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
         assert!(
@@ -633,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn delayed_watch_event_skips_subscriptions_created_after_it_occurred() {
+    fn delayed_event_skips() {
         let owner = user(1);
         let actor = user(2);
         let data_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
@@ -654,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_data_prefix_is_node_disambiguated() {
+    fn data_prefix_disambiguated() {
         let owner = user(1);
         let actor = user(2);
         let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);

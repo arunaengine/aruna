@@ -418,7 +418,7 @@ mod tests {
     use super::*;
     use aruna_core::admin_documents::AdminDocumentTarget;
     use aruna_core::reducer::{
-        AdminDocumentReducerState, overlay_realm_config_placement_reducer_materialization,
+        AdminDocumentReducerState, overlay_placement,
     };
     use aruna_core::structs::{
         AffinityRule, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, KIND_LABEL_KEY, LOCATION_LABEL_KEY,
@@ -514,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn build_view_applies_defaults_labels_and_skips_unparseable() {
+    fn build_view_filters() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let mapped = node_id(1);
         let unmapped = node_id(2);
@@ -559,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_labels_from_config_drive_affinity_filter() {
+    fn config_labels_filter() {
         // The chain ARUNA_NODE_LABELS -> onboarding -> placement-map entry ->
         // build_view -> Filter selects only labeled nodes.
         let realm_id = RealmId::from_bytes([2u8; 32]);
@@ -587,10 +587,8 @@ mod tests {
     }
 
     #[test]
-    fn location_label_is_derived() {
-        // The location label is stamped from the configured location, so a rule
-        // matches a node whose label map was never written by hand. A node with
-        // no configured location carries no label rather than an invented one.
+    fn derives_location_label() {
+        // Derive the location label only from a configured location.
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let placed = node_id(1);
         let unplaced = node_id(2);
@@ -630,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_is_deterministic_and_order_independent() {
+    fn resolve_order_independent() {
         let nodes = vec![
             resolved(1, RealmNodeKind::Server, "a", 100),
             resolved(2, RealmNodeKind::Server, "a", 300),
@@ -655,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_locations_yields_pairwise_distinct_holders() {
+    fn locations_are_distinct() {
         let mut nodes = Vec::new();
         let mut seed = 1u8;
         for location in ["a", "b", "c"] {
@@ -677,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn rejection_stability_replaces_only_full_node() {
+    fn replaces_full_node() {
         let nodes: Vec<ResolvedNode> = (1..=5)
             .map(|seed| resolved(seed, RealmNodeKind::Server, "solo", 100))
             .collect();
@@ -704,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_weight_and_user_kind_never_selected() {
+    fn excludes_ineligible_nodes() {
         let nodes = vec![
             resolved(1, RealmNodeKind::Server, "x", 0),
             resolved(2, device(), "x", 100),
@@ -716,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn multiply_permille_zero_makes_node_ineligible() {
+    fn zero_affinity_excludes() {
         let mut zeroed = resolved(1, RealmNodeKind::Server, "x", 100);
         zeroed.labels.insert("tier".to_string(), "cold".to_string());
         let keep = resolved(2, RealmNodeKind::Server, "x", 100);
@@ -731,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_rules_are_conjunctive() {
+    fn filters_are_conjunctive() {
         let mut both = resolved(1, RealmNodeKind::Server, "x", 100);
         both.labels.insert("tier".to_string(), "hot".to_string());
         both.labels.insert("region".to_string(), "eu".to_string());
@@ -760,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_nodes_contribute_zero_to_location_weight() {
+    fn filtered_nodes_zero() {
         let mut hot_a = resolved(1, RealmNodeKind::Server, "a", 100);
         hot_a.labels.insert("tier".to_string(), "hot".to_string());
         let mut hot_b = resolved(2, RealmNodeKind::Server, "b", 100);
@@ -785,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_pins_are_skipped_and_eligible_pin_counts_toward_target() {
+    fn available_pins_count() {
         let mut pinned_full = resolved(3, RealmNodeKind::Server, "c", 100);
         pinned_full.full = true;
         let mut pinned_draining = resolved(4, RealmNodeKind::Server, "d", 100);
@@ -818,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_and_excluded_node_is_not_selected() {
+    fn exclusion_overrides_pin() {
         let view = PlacementView {
             nodes: vec![
                 resolved(1, RealmNodeKind::Server, "a", 100),
@@ -839,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn everywhere_strategy_returns_all_eligible() {
+    fn everywhere_returns_eligible() {
         let mut full = resolved(4, RealmNodeKind::Server, "b", 100);
         full.full = true;
         let view = PlacementView {
@@ -862,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn strategy_for_target_precedence() {
+    fn target_strategy_precedence() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = sid(2);
         let document_id = sid(3);
@@ -937,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn strategy_for_target_dangling_configured_refs_do_not_fallback() {
+    fn dangling_refs_fail() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = sid(2);
         let target = DocumentSyncTarget::MetadataRegistry {
@@ -1000,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn reducer_materialization_repairs_dangling_refs_and_keeps_resolution_nonempty() {
+    fn materialization_repairs_refs() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let live = sid(10);
         let missing = sid(99);
@@ -1022,7 +1020,7 @@ mod tests {
         let reducer_state =
             AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
 
-        overlay_realm_config_placement_reducer_materialization(&mut config, &reducer_state, 0);
+        overlay_placement(&mut config, &reducer_state, 0);
 
         assert_eq!(config.default_strategy_id, Some(live));
         assert_eq!(config.strategy_bindings[0].strategy_id, live);
@@ -1037,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_path_prefix_binding_requires_path_boundary() {
+    fn prefix_requires_boundary() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = sid(2);
         let target = DocumentSyncTarget::MetadataRegistry {
@@ -1076,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_lifecycle_uses_group_and_path_from_context() {
+    fn lifecycle_uses_context() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = sid(2);
         let target = DocumentSyncTarget::MetadataDocumentLifecycle {
@@ -1117,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn subject_bytes_groups_document_variants() {
+    fn subjects_group_variants() {
         let document_id = sid(4);
         let registry = DocumentSyncTarget::MetadataRegistry {
             group_id: sid(5),
@@ -1152,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn meta_bucket_subject_vector() {
+    fn meta_subject_vector() {
         // Portable 6.3.6 vector: fixed-width realm_id ‖ group_id, then the path.
         let subject = meta_bucket_subject(
             RealmId::from_bytes([1u8; 32]),
@@ -1166,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn all_document_variants_share_one_shard() {
+    fn variants_share_shard() {
         use aruna_core::structs::shard_for_subject;
 
         let document_id = sid(4);
@@ -1188,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn document_class_maps_variants() {
+    fn classes_map_variants() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let user_id = UserId::local(sid(2), realm_id);
         let targets = [
@@ -1277,7 +1275,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn location_order_ignores_status_flips(
+        fn location_order_stable(
             specs in prop::collection::vec((0u8..6, 1u32..1000, any::<bool>(), any::<bool>()), 1..12),
         ) {
             let build = |flip: bool| {
@@ -1310,7 +1308,7 @@ mod tests {
         }
 
         #[test]
-        fn location_weight_sum_excludes_non_sync_eligible(
+        fn location_weight_excludes(
             specs in prop::collection::vec((0u8..4, 1u32..1000, any::<bool>()), 1..12),
         ) {
             let nodes: Vec<ResolvedNode> = specs

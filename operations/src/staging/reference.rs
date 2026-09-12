@@ -1,14 +1,14 @@
-use crate::blob::blob_storage::{
-    HeadAliasContext, build_head_transition_effects, write_blob_version_effect,
+use crate::blob::records::{
+    HeadAliasContext, build_transition_effects, write_version_effect,
 };
-use crate::connectors::repository::{source_connector_key, source_connector_secret_key};
+use crate::connectors::repository::{source_connector_key, connector_secret_key};
 use crate::connectors::resolver::secret_fingerprint;
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{
-    UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
+    UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::staging::descriptor::build_version_source_binding;
+use crate::staging::descriptor::build_source_binding;
 use crate::staging::head_source::{
     HeadStagingSourceError, HeadStagingSourceInput, HeadStagingSourceOperation,
 };
@@ -85,7 +85,7 @@ pub async fn stage_reference_blob(
     )
     .await?;
 
-    let version_source = build_version_source_binding(
+    let version_source = build_source_binding(
         StagingStrategy::Reference,
         &head_result.connector,
         &head_result.metadata,
@@ -226,7 +226,7 @@ pub async fn write_reference_version(
         let was_live = existing_version.is_some_and(|version| !version.is_deleted());
         let next_pointer = CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id)?;
 
-        for effect in build_head_transition_effects(
+        for effect in build_transition_effects(
             &HeadAliasContext::new(
                 write.realm_id,
                 write.group_id,
@@ -244,7 +244,7 @@ pub async fn write_reference_version(
         let version_key = VersionKey::new(&write.bucket, &write.key, version_id);
         apply_storage_effect(
             context,
-            write_blob_version_effect(
+            write_version_effect(
                 &version_key,
                 &BlobVersion::reference(
                     write.version_source.clone(),
@@ -297,7 +297,7 @@ pub async fn write_reference_version(
 
     let (version_id, changed) = result?;
     if changed {
-        schedule_usage_snapshot_publish(context).await;
+        send_snapshot_schedule(context).await;
     }
     Ok((version_id, changed))
 }
@@ -354,7 +354,7 @@ async fn send_storage_effect(
     }
 }
 
-async fn send_single_storage_effect(
+async fn send_single_effect(
     context: &DriverContext,
     mut effects: Effects,
 ) -> Result<Event, MaterializeReferenceError> {
@@ -377,7 +377,7 @@ async fn run_usage_update(
 ) -> Result<(), MaterializeReferenceError> {
     let mut effects = usage_update.start(txn_id);
     loop {
-        let event = send_single_storage_effect(context, effects).await?;
+        let event = send_single_effect(context, effects).await?;
         effects = match usage_update.step(event, txn_id)? {
             Some(effects) => effects,
             None => return Ok(()),
@@ -385,8 +385,8 @@ async fn run_usage_update(
     }
 }
 
-async fn schedule_usage_snapshot_publish(context: &DriverContext) {
-    let Effect::Task(task_effect) = schedule_usage_snapshot_publish_effect() else {
+async fn send_snapshot_schedule(context: &DriverContext) {
+    let Effect::Task(task_effect) = schedule_snapshot_publish() else {
         return;
     };
     if persist_task_effect(&context.storage_handle, &task_effect)
@@ -451,7 +451,7 @@ async fn read_blob_version(
     }
 }
 
-async fn guard_resolved_connector_unchanged(
+async fn guard_connector_unchanged(
     context: &DriverContext,
     txn_id: TxnId,
     resolved_connector: &SourceConnector,
@@ -482,7 +482,7 @@ async fn guard_resolved_connector_unchanged(
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
-            key: source_connector_secret_key(resolved_connector.connector_id),
+            key: connector_secret_key(resolved_connector.connector_id),
             txn_id: Some(txn_id),
         })
         .await
@@ -561,7 +561,7 @@ mod tests {
     use aruna_core::structs::{
         BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey, JobId, RoutingSnapshot,
         SourceConnectorKind, SourceConnectorSecret, StoragePurgeFence, StoragePurgeScope,
-        UsageCounters, usage_global_key_for_group, usage_group_key,
+        UsageCounters, global_group_key, usage_group_key,
     };
     use aruna_storage::storage;
     use axum::{Router, routing::get};
@@ -630,7 +630,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
-                key: source_connector_secret_key(secret.connector_id),
+                key: connector_secret_key(secret.connector_id),
                 value: secret.to_bytes().unwrap().into(),
                 txn_id: None,
             })
@@ -661,7 +661,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Delete {
                 key_space: SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
-                key: source_connector_secret_key(connector_id),
+                key: connector_secret_key(connector_id),
                 txn_id: None,
             })
             .await;
@@ -735,7 +735,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reference_guard_fails_when_connector_deleted_after_resolve() {
+    async fn guard_rejects_deleted() {
         let (_tempdir, context) = test_context();
         let connector = connector();
         let resolved_secret = secret("old-key");
@@ -746,7 +746,7 @@ mod tests {
         let txn_id = start_write_transaction(&context).await;
 
         assert_conflict(
-            guard_resolved_connector_unchanged(
+            guard_connector_unchanged(
                 &context,
                 txn_id,
                 &connector,
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reference_guard_fails_when_secret_changes_after_resolve() {
+    async fn guard_rejects_changed() {
         let (_tempdir, context) = test_context();
         let connector = connector();
         let resolved_secret = secret("old-key");
@@ -768,7 +768,7 @@ mod tests {
         let txn_id = start_write_transaction(&context).await;
 
         assert_conflict(
-            guard_resolved_connector_unchanged(
+            guard_connector_unchanged(
                 &context,
                 txn_id,
                 &connector,
@@ -779,7 +779,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reference_guard_fails_when_secret_removed_after_resolve() {
+    async fn guard_rejects_removed() {
         let (_tempdir, context) = test_context();
         let connector = connector();
         let resolved_secret = secret("old-key");
@@ -790,7 +790,7 @@ mod tests {
         let txn_id = start_write_transaction(&context).await;
 
         assert_conflict(
-            guard_resolved_connector_unchanged(
+            guard_connector_unchanged(
                 &context,
                 txn_id,
                 &connector,
@@ -801,7 +801,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reference_guard_fails_when_secret_added_after_public_resolve() {
+    async fn guard_rejects_added() {
         let (_tempdir, context) = test_context();
         let connector = connector();
         write_connector(&context, &connector).await;
@@ -810,12 +810,12 @@ mod tests {
         let txn_id = start_write_transaction(&context).await;
 
         assert_conflict(
-            guard_resolved_connector_unchanged(&context, txn_id, &connector, None).await,
+            guard_connector_unchanged(&context, txn_id, &connector, None).await,
         );
     }
 
     #[tokio::test]
-    async fn bucket_guard_rejects_recreate() {
+    async fn bucket_rejects_recreate() {
         let (_tempdir, context) = test_context();
         let realm_id = RealmId::from_bytes([6u8; 32]);
         let group_id = Ulid::generate();
@@ -971,7 +971,7 @@ mod tests {
         assert_eq!(group_usage.objects, 1);
         assert_eq!(group_usage.logical_bytes, 5);
         assert_eq!(group_usage.referenced_bytes, 8);
-        let global_usage = read_usage_counters(context, usage_global_key_for_group(group_id)).await;
+        let global_usage = read_usage_counters(context, global_group_key(group_id)).await;
         assert_eq!(global_usage.objects, 1);
         assert_eq!(global_usage.logical_bytes, 5);
         assert_eq!(global_usage.referenced_bytes, 8);

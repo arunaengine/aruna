@@ -7,9 +7,9 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, ServerSideEncryption};
 use shared::{
-    S3Credentials, SeedNode, TestResult, create_bearer_token, create_group_via_http,
-    create_s3_credentials_via_http, revoke_s3_credentials_via_http, s3_client, s3_client_no_retry,
-    spawn_full_seed_node,
+    S3Credentials, SeedNode, TestResult, create_bearer_token, create_group_http,
+    create_s3_credentials, revoke_s3_credentials, s3_client, s3_client_once,
+    spawn_complete_seed,
 };
 
 fn service_error_code<T, E>(result: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> Option<String>
@@ -24,7 +24,7 @@ where
 }
 
 async fn security_setup(group_name: &str) -> TestResult<(SeedNode, String, S3Credentials)> {
-    let seed = spawn_full_seed_node().await?;
+    let seed = spawn_complete_seed().await?;
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -32,9 +32,9 @@ async fn security_setup(group_name: &str) -> TestResult<(SeedNode, String, S3Cre
         seed.capabilities.clone(),
     )
     .await?;
-    let group = create_group_via_http(&seed.base_url, &admin_token, group_name).await?;
+    let group = create_group_http(&seed.base_url, &admin_token, group_name).await?;
     let credentials =
-        create_s3_credentials_via_http(&seed.base_url, &admin_token, &group.group_id).await?;
+        create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
     Ok((seed, admin_token, credentials))
 }
 
@@ -51,7 +51,7 @@ fn no_retry_client(seed: &SeedNode, credentials: &S3Credentials) -> TestResult<S
         .s3
         .as_ref()
         .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
-    Ok(s3_client_no_retry(endpoint, credentials))
+    Ok(s3_client_once(endpoint, credentials))
 }
 
 #[tokio::test]
@@ -98,7 +98,7 @@ async fn revoked_credentials_rejected() -> TestResult<()> {
         // The credential works before revocation.
         client(&seed, &credentials)?.list_buckets().send().await?;
 
-        revoke_s3_credentials_via_http(&seed.base_url, &admin_token, &credentials.access_key_id)
+        revoke_s3_credentials(&seed.base_url, &admin_token, &credentials.access_key_id)
             .await?;
 
         let revoked = client(&seed, &credentials)?.list_buckets().send().await;

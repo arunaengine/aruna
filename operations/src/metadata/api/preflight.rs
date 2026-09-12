@@ -63,19 +63,16 @@ pub(super) async fn resolve_preflight_targets(
                 };
             let prefix = prefix.filter(|prefix| !prefix.is_empty());
             let permission_path = match prefix.as_deref() {
-                Some(prefix) => blob_object_permission_path(
+                Some(prefix) => object_permission_path(
                     realm_id,
                     bucket_info.group_id,
                     local_node_id,
                     &bucket,
                     prefix,
                 ),
-                None => blob_bucket_permission_path(
-                    realm_id,
-                    bucket_info.group_id,
-                    local_node_id,
-                    &bucket,
-                ),
+                None => {
+                    bucket_permission_path(realm_id, bucket_info.group_id, local_node_id, &bucket)
+                }
             };
             ensure_permission(
                 context,
@@ -90,10 +87,10 @@ pub(super) async fn resolve_preflight_targets(
 
             let versions = match operation {
                 MetadataPreflightStorageOperation::LatestVersionTombstone => {
-                    resolve_current_preflight_versions(context, &bucket, prefix.as_deref()).await?
+                    resolve_preflight_versions(context, &bucket, prefix.as_deref()).await?
                 }
                 MetadataPreflightStorageOperation::AllVersionsPurge => {
-                    resolve_all_preflight_versions(context, &bucket, prefix.as_deref()).await?
+                    resolve_all_preflight(context, &bucket, prefix.as_deref()).await?
                 }
             };
             let mut authorized_keys = BTreeSet::new();
@@ -104,7 +101,7 @@ pub(super) async fn resolve_preflight_targets(
                         realm_id,
                         auth.clone(),
                         bucket_info.group_id,
-                        blob_object_permission_path(
+                        object_permission_path(
                             realm_id,
                             bucket_info.group_id,
                             local_node_id,
@@ -182,7 +179,7 @@ pub(super) async fn resolve_preflight_targets(
     }
 }
 
-pub(super) async fn resolve_current_preflight_versions(
+pub(super) async fn resolve_preflight_versions(
     context: &DriverContext,
     bucket: &str,
     prefix: Option<&str>,
@@ -222,7 +219,7 @@ pub(super) async fn resolve_current_preflight_versions(
     Ok(versions)
 }
 
-pub(super) async fn resolve_all_preflight_versions(
+pub(super) async fn resolve_all_preflight(
     context: &DriverContext,
     bucket: &str,
     key_prefix: Option<&str>,
@@ -344,9 +341,9 @@ pub(crate) async fn references_preflight_local(
         .clone()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
     let registry = handle
-        .list_cached_registry_records()
+        .list_cached_records()
         .await
-        .map_err(map_metadata_internal_error)?;
+        .map_err(map_internal_error)?;
     let registry = filter_live_records(&context.storage_handle, registry.as_ref()).await?;
     let freshness =
         crate::metadata::iri_index::iri_index_freshness(&context.storage_handle, registry.as_ref())
@@ -417,7 +414,7 @@ pub(crate) async fn references_preflight_local(
         target_locations.insert(target.content_w3id.clone(), (found, remaining));
     }
     let object_iris = iri_targets.keys().cloned().collect::<BTreeSet<_>>();
-    let backlinks = crate::metadata::iri_index::lookup_iri_backlinks_for_objects(
+    let backlinks = crate::metadata::iri_index::lookup_backlinks_objects(
         &context.storage_handle,
         registry.as_ref(),
         &object_iris,
@@ -578,7 +575,7 @@ pub async fn load_realm_config(
     }
 }
 
-pub async fn load_metadata_realm_nodes(
+pub async fn load_realm_nodes(
     context: &DriverContext,
     realm_id: RealmId,
     local_node_id: NodeId,

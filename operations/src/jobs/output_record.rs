@@ -31,9 +31,8 @@ pub async fn store_outputs(
         .ok_or_else(|| JobError::permanent("execution job carries no plan digest"))?;
     let outputs = OutputSet::canonical(outputs.to_vec())
         .map_err(|error| JobError::permanent(format!("output set is not canonical: {error}")))?;
-    // A replay re-appends an idempotent record, and a family view that was
-    // unavailable before may resolve now. A receipted execution binds the real
-    // chain; without one this is local and the local stand-ins apply.
+    // A replay re-appends an idempotent record and a previously unavailable family
+    // may resolve now; a receipted execution binds the real chain, else locals.
     let chain = chain_of_attempt(context, record.job_id, control.execution_id).await;
     let receipted = chain.is_some();
     if let Some(frame) = stored_record(context, record.job_id, control, &outputs, net.node_id())
@@ -67,7 +66,7 @@ pub async fn store_outputs(
             .map(|chain| chain.receipt_digest)
             .unwrap_or_else(|| control.fence_digest(record.job_id)),
         outputs,
-        committed_at_ms: aruna_core::util::unix_timestamp_millis(),
+        committed_at_ms: aruna_core::time::unix_timestamp_millis(),
     };
     let envelope = JobRecordEnvelope::signed_with(
         record.created_by.realm_id,
@@ -173,7 +172,7 @@ async fn append_output_record(
         }),
         record: frame.clone(),
         origin: RecordOrigin::Local,
-        now_ms: aruna_core::util::unix_timestamp_millis(),
+        now_ms: aruna_core::time::unix_timestamp_millis(),
     };
     match drive(AppendRecordOperation::new(config), context).await {
         Ok(outcome) => match outcome.admission {

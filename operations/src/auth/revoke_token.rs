@@ -16,8 +16,7 @@ use aruna_core::reducer::{
     RevocationIndex,
 };
 use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::{Actor, RealmConfigDocument};
 use aruna_core::task::TaskEvent;
@@ -27,10 +26,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::placement::placement_ref_for_target;
+use crate::placement::target_placement_ref;
 use crate::sync::document_outbox::{
-    admin_outbox_prefix, new_outbox_record_with_id, outbox_write_entry, revocation_index_entry,
-    schedule_outbox_drain_effect,
+    admin_outbox_prefix, new_identified_record, outbox_write_entry, revocation_index_entry,
+    schedule_drain_effect,
 };
 
 const PRIVILEGED_REVOCATION_RESERVE: usize = 128;
@@ -187,7 +186,7 @@ impl RevokeTokenOperation {
                 ),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                 ),
             ],
             txn_id: Some(txn_id),
@@ -214,7 +213,7 @@ impl RevokeTokenOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                aruna_core::reducer::decode_reducer_state(value.as_ref())
                     .map_err(ConversionError::from)
             })
             .transpose()?;
@@ -506,23 +505,23 @@ impl RevokeTokenOperation {
         let admin_event = admin_event.transpose()?;
         revocation_index.compact(&mut reducer_state);
         document.merge_revocation_index(&revocation_index, self.config.now);
-        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
+        let stale_conflict_deletes = stale_conflict_deletes(
             Some(&previous_reducer_state),
             Some(&reducer_state),
         );
 
         let document_target = self.document_ref();
-        let placement = placement_ref_for_target(&document, &document_target, Default::default());
+        let placement = target_placement_ref(&document, &document_target, Default::default());
         let mut writes = vec![
             (
                 document_target.storage_keyspace().to_string(),
                 document_target.storage_key(),
                 document.to_bytes(&self.config.actor)?.into(),
             ),
-            admin_document_reducer_state_write_entry(&reducer_state)?,
+            reducer_state_entry(&reducer_state)?,
         ];
         if let Some(admin_event) = admin_event {
-            let record = new_outbox_record_with_id(
+            let record = new_identified_record(
                 admin_event.event_id,
                 self.config.actor.node_id,
                 document_target,
@@ -534,7 +533,7 @@ impl RevokeTokenOperation {
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
             writes.push(revocation_index_entry(&record));
         }
-        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+        writes.extend(conflict_write_entries(&reducer_state)?);
 
         if self.output.is_none() {
             self.output = Some(Ok(document.clone()));
@@ -822,7 +821,7 @@ impl Operation for RevokeTokenOperation {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.state = RevokeTokenState::ScheduleDocumentSyncOutboxDrain { document };
-                    smallvec![schedule_outbox_drain_effect()]
+                    smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
@@ -875,7 +874,7 @@ mod tests {
     use super::{
         ADMIN_DOCUMENT_STATE_KEYSPACE, AdminDocumentReducerState, AdminDocumentTarget, Event,
         MAX_LIVE_REVOCATIONS_PER_ORIGIN, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError,
-        RevokeTokenOperation, StorageEffect, StorageEvent, admin_document_reducer_state_key,
+        RevokeTokenOperation, StorageEffect, StorageEvent, reducer_state_key,
     };
     use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
@@ -889,7 +888,7 @@ mod tests {
     use aruna_core::keyspaces::{
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE,
     };
-    use aruna_core::storage_entries::admin_document_reducer_state_write_entry;
+    use aruna_core::storage_entries::reducer_state_entry;
     use aruna_core::structs::{Actor, RealmId};
     use aruna_core::types::{Key, Value};
     use aruna_storage::storage::FjallStorage;
@@ -987,7 +986,7 @@ mod tests {
     }
 
     async fn write_state(context: &DriverContext, state: &AdminDocumentReducerState) {
-        let (key_space, key, value) = admin_document_reducer_state_write_entry(state).unwrap();
+        let (key_space, key, value) = reducer_state_entry(state).unwrap();
         match context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -1468,14 +1467,14 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                key: admin_document_reducer_state_key(&target),
+                key: reducer_state_key(&target),
                 txn_id: None,
             })
             .await
         {
             Event::Storage(StorageEvent::ReadResult {
                 value: Some(bytes), ..
-            }) => aruna_core::reducer::decode_admin_document_reducer_state(&bytes)
+            }) => aruna_core::reducer::decode_reducer_state(&bytes)
                 .expect("reducer state decodes"),
             other => panic!("unexpected reducer state read: {other:?}"),
         }

@@ -14,12 +14,12 @@ use aruna_core::{DocumentSyncEffect, NodeId, UserId};
 use aruna_operations::device::realm_documents::fetch_from_peers;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::interest::{
-    ensure_local_watch_interest_digest, mark_watch_interest_dirty,
+    ensure_interest_digest, mark_interest_dirty,
 };
 use aruna_operations::onboarding::create_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
-use aruna_operations::placement::placement_ref_for_target;
+use aruna_operations::placement::target_placement_ref;
 use aruna_operations::realm::get_config::GetRealmConfigOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
@@ -118,13 +118,13 @@ pub async fn prepare_core_documents(
     include_node_info: bool,
 ) -> Result<Vec<DocumentSyncTarget>, Box<dyn std::error::Error>> {
     let digest_created =
-        ensure_local_watch_interest_digest(&driver_ctx.storage_handle, realm_id, node_id)
+        ensure_interest_digest(&driver_ctx.storage_handle, realm_id, node_id)
             .await
             .map_err(|error| {
                 format!("failed to initialize local watch interest digest: {error}")
             })?;
     if digest_created {
-        mark_watch_interest_dirty(driver_ctx, realm_id)
+        mark_interest_dirty(driver_ctx, realm_id)
             .await
             .map_err(|error| format!("failed to mark local watch interest dirty: {error}"))?;
     }
@@ -134,9 +134,8 @@ pub async fn prepare_core_documents(
         DocumentSyncTarget::RealmConfig { realm_id },
     ];
     if include_node_info {
-        // Initial and joining nodes announce their node documents before the
-        // first heartbeat and usage publish; a provisioned restart restores the
-        // shared topics instead and leaves republication to the timers.
+        // Initial and joining nodes publish before timers run. Provisioned restarts restore
+        // shared topics and leave publication to the timers.
         documents.push(DocumentSyncTarget::NodeUsage {
             realm_id,
             node_id,
@@ -151,16 +150,15 @@ pub async fn prepare_core_documents(
             .as_ref()
             .ok_or("net handle unavailable while checking watch interest genesis")?;
         net_handle
-            .document_sync_topic_exists(
+            .sync_topic_exists(
                 watch_target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL),
             )
             .map_err(|error| format!("failed to check watch interest topic: {error}"))?
     } else {
         true
     };
-    // A newly stored digest must be announced once. The authoritative node also
-    // repairs a missing topic after a partial first boot without republishing on
-    // an unchanged healthy restart.
+    // New digests publish once. The authority also repairs a topic lost during first boot
+    // without republishing during a healthy restart.
     if watch_target_needed(digest_created, allow_genesis, topic_exists) {
         documents.push(watch_target);
     }
@@ -193,7 +191,7 @@ pub async fn prepare_core_documents(
 /// Fetches the documents a joining node needs before it serves its realm.
 /// Infrastructure syncs the ticket's topics from the bootstrap peer; a device is
 /// refused that protocol, so it reads the realm documents over metadata instead.
-pub async fn fetch_core_onboarding_documents(
+pub async fn fetch_core_documents(
     driver_ctx: &Arc<DriverContext>,
     node_state: &PersistedNodeState,
     realm_id: &aruna_core::structs::RealmId,
@@ -201,10 +199,8 @@ pub async fn fetch_core_onboarding_documents(
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
-    // Realm infrastructure refuses a device the sync protocol, so a device asks
-    // the bootstrap peer for the realm documents as a routed read instead. Its
-    // own user document is not fetched here: a device holds no shard topic, and
-    // the document reaches it later over the same route.
+    // Devices cannot use infrastructure sync, so they route realm reads through the peer.
+    // Their user document arrives later by the same route because they hold no shard topic.
     if let Some(owner) = node_state.identity.owner() {
         return fetch_device_documents(driver_ctx, owner, bootstrap_peer, timeout).await;
     }
@@ -218,9 +214,7 @@ pub async fn fetch_core_onboarding_documents(
     };
     let realm_id = *realm_id;
 
-    // Fetch the shared realm documents first (they include the realm config), so
-    // the shard-classed user documents can then be routed onto their shard
-    // topics via the freshly synced config.
+    // Shared documents include the config needed to route user documents to shard topics.
     let mut user_documents = Vec::new();
     for document in onboarding_sync_ticket.payload.documents.clone() {
         if matches!(document, DocumentSyncTarget::User { .. }) {
@@ -236,7 +230,7 @@ pub async fn fetch_core_onboarding_documents(
         let mut synced_topics = HashSet::new();
         for document in user_documents {
             let placement = match config.as_ref() {
-                Some(config) => placement_ref_for_target(config, &document, Default::default()),
+                Some(config) => target_placement_ref(config, &document, Default::default()),
                 None => aruna_core::structs::PlacementRef::NIL,
             };
             if placement == aruna_core::structs::PlacementRef::NIL {
@@ -248,11 +242,10 @@ pub async fn fetch_core_onboarding_documents(
             else {
                 continue;
             };
-            // Best effort: the bootstrap peer serves a shard topic only to its
-            // members, and the joiner is admitted once its placement expansion
-            // runs, which waits behind any transition already in flight.
+            // The peer serves shard topics only to members. Placement expansion admits the
+            // joiner after any transition already in flight.
             if let Err(error) =
-                sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document, timeout).await
+                sync_peer_topic(net_handle, topic, bootstrap_peer, &document, timeout).await
             {
                 warn!(error = %error, document = ?document, "Leaving an onboarding user document to placement sync");
             }
@@ -293,7 +286,7 @@ async fn fetch_device_documents(
 /// Waits until the realm configuration names this node as ready, re-reading it
 /// from the bootstrap peer between checks: over document sync, or as a routed
 /// read when `device_owner` says this node is a device.
-pub async fn wait_for_onboarding_placement(
+pub async fn wait_for_placement(
     driver_ctx: &Arc<DriverContext>,
     realm_id: aruna_core::structs::RealmId,
     node_id: NodeId,
@@ -328,7 +321,7 @@ pub async fn wait_for_onboarding_placement(
                     }
                 }
                 None => {
-                    if let Err(error) = sync_topic_from_peer(
+                    if let Err(error) = sync_peer_topic(
                         driver_ctx
                             .net_handle
                             .as_ref()
@@ -411,7 +404,7 @@ fn unique_user_topic(
     synced_topics.insert(topic).then_some(topic)
 }
 
-async fn sync_topic_from_peer(
+async fn sync_peer_topic(
     net_handle: &aruna_net::NetHandle,
     topic: ::irokle::TopicId,
     bootstrap_peer: NodeId,
@@ -457,7 +450,7 @@ async fn sync_with_retry(
     let deadline = tokio::time::Instant::now() + timeout;
     let mut attempt = 0;
     loop {
-        match sync_topic_from_peer(net_handle, topic, bootstrap_peer, document, timeout).await {
+        match sync_peer_topic(net_handle, topic, bootstrap_peer, document, timeout).await {
             Ok(()) => return Ok(()),
             Err(error) if tokio::time::Instant::now() < deadline => {
                 warn!(error = %error, document = ?document, "Retrying onboarding document sync");
@@ -482,7 +475,7 @@ fn onboarding_secret_box(net_secret_key: &[u8; 32]) -> SalsaBox {
     SalsaBox::new(&public, &secret)
 }
 
-pub async fn ensure_initial_local_onboarding_secret(
+pub async fn ensure_onboarding_secret(
     driver_ctx: &DriverContext,
     seed_url: String,
     net_secret_key: &[u8; 32],
@@ -549,7 +542,7 @@ pub async fn ensure_initial_local_onboarding_secret(
 mod tests {
     use super::{
         backoff, node_is_ready, prepare_core_documents, publish_core_documents,
-        sync_topic_from_peer, sync_with_retry, unique_user_topic, watch_target_needed,
+        sync_peer_topic, sync_with_retry, unique_user_topic, watch_target_needed,
     };
     use crate::config::PersistedNodeIdentity;
     use aruna_core::NodeId;
@@ -560,7 +553,7 @@ mod tests {
     use aruna_core::structs::{
         Actor, NodePlacementEntry, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
         WatchEventKind, WatchEventMask, WatchInterestDigest, WatchInterestEntry,
-        watch_interest_dirty_key, watch_interest_node_key,
+        interest_dirty_key, interest_node_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::DriverContext;
@@ -705,7 +698,7 @@ mod tests {
                 .storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-                    key: watch_interest_node_key(realm_id, node_id).into(),
+                    key: interest_node_key(realm_id, node_id).into(),
                     value: ByteView::from(digest.to_bytes().unwrap()),
                     txn_id: None,
                 })
@@ -719,7 +712,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-                key: watch_interest_dirty_key(realm_id).into(),
+                key: interest_dirty_key(realm_id).into(),
                 txn_id: None,
             })
             .await
@@ -796,7 +789,7 @@ mod tests {
                 .net_handle
                 .as_ref()
                 .unwrap()
-                .document_sync_topic_exists(topic)
+                .sync_topic_exists(topic)
                 .unwrap()
         );
     }
@@ -817,9 +810,9 @@ mod tests {
             .unwrap();
         OutboxDrainer::new(context.clone()).run_once().await;
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        assert!(net.document_sync_topic_exists(topic).unwrap());
+        assert!(net.sync_topic_exists(topic).unwrap());
         assert_eq!(net.realm_peers().await, vec![peer_id]);
-        net.reconcile_document_sync_topics(vec![topic])
+        net.reconcile_sync_topics(vec![topic])
             .await
             .unwrap();
         topic
@@ -847,7 +840,7 @@ mod tests {
         assert!(batch.records[0].1.allow_genesis);
         OutboxDrainer::new(Arc::new(context)).run_once().await;
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        assert!(net.document_sync_topic_exists(topic).unwrap());
+        assert!(net.sync_topic_exists(topic).unwrap());
         net.shutdown().await;
     }
 
@@ -869,7 +862,7 @@ mod tests {
         .await;
         let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        assert!(!net.document_sync_topic_exists(topic).unwrap());
+        assert!(!net.sync_topic_exists(topic).unwrap());
 
         let targets = prepare_core_documents(&context, node_id, realm_id, true, false)
             .await
@@ -885,7 +878,7 @@ mod tests {
         assert_eq!(batch.records.len(), 1);
         assert!(batch.records[0].1.allow_genesis);
         OutboxDrainer::new(Arc::new(context)).run_once().await;
-        assert!(net.document_sync_topic_exists(topic).unwrap());
+        assert!(net.sync_topic_exists(topic).unwrap());
         net.shutdown().await;
     }
 
@@ -907,7 +900,7 @@ mod tests {
         )
         .await;
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        net.ensure_document_sync_topics(&[topic], Vec::new())
+        net.ensure_sync_topics(&[topic], Vec::new())
             .unwrap();
 
         for _ in 0..2 {
@@ -971,7 +964,7 @@ mod tests {
             joiner_id,
         )
         .await;
-        sync_topic_from_peer(
+        sync_peer_topic(
             &joiner_net,
             topic,
             bootstrap_id,
@@ -980,7 +973,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(joiner_net.document_sync_topic_exists(topic).unwrap());
+        assert!(joiner_net.sync_topic_exists(topic).unwrap());
 
         let target = DocumentSyncTarget::WatchInterest {
             realm_id,
@@ -1006,7 +999,7 @@ mod tests {
         assert_eq!(batch.records.len(), 1);
         assert!(!batch.records[0].1.allow_genesis);
         OutboxDrainer::new(joiner_context.clone()).run_once().await;
-        assert!(joiner_net.document_sync_topic_exists(topic).unwrap());
+        assert!(joiner_net.sync_topic_exists(topic).unwrap());
         bootstrap_net.shutdown().await;
         joiner_net.shutdown().await;
     }
@@ -1069,7 +1062,7 @@ mod tests {
         );
         assert_eq!(seeded, topic);
         sync.unwrap();
-        assert!(joiner_net.document_sync_topic_exists(topic).unwrap());
+        assert!(joiner_net.sync_topic_exists(topic).unwrap());
         bootstrap_net.shutdown().await;
         joiner_net.shutdown().await;
     }
@@ -1091,7 +1084,7 @@ mod tests {
         // A restart after the digest write must repair the missing shared topic.
         repair_topic(&context, node_id, realm_id, &target).await;
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        assert!(net.document_sync_topic_exists(topic).unwrap());
+        assert!(net.sync_topic_exists(topic).unwrap());
 
         write_digest(
             &context,
@@ -1149,7 +1142,7 @@ mod tests {
             1
         );
         OutboxDrainer::new(restarted.clone()).run_once().await;
-        assert!(net.document_sync_topic_exists(topic).unwrap());
+        assert!(net.sync_topic_exists(topic).unwrap());
         assert!(publish_watch_interest(&restarted, node_id).await.unwrap());
         assert!(read_marker(&restarted, realm_id).await.is_none());
 
@@ -1188,7 +1181,7 @@ mod tests {
         config
             .placement_bindings
             .push(aruna_core::structs::PlacementBinding {
-                handle: aruna_core::identifiers::PlacementHandle::new(
+                handle: aruna_core::structured_id::PlacementHandle::new(
                     aruna_core::structs::FIRST_GRANTABLE_HANDLE,
                 )
                 .unwrap(),
@@ -1211,7 +1204,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-                key: watch_interest_node_key(realm_id, node_id).into(),
+                key: interest_node_key(realm_id, node_id).into(),
                 txn_id: None,
             })
             .await
@@ -1262,7 +1255,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-                key: watch_interest_node_key(realm_id, node_id).into(),
+                key: interest_node_key(realm_id, node_id).into(),
                 value: ByteView::from(digest.to_bytes().unwrap()),
                 txn_id: None,
             })

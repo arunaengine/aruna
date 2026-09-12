@@ -1,10 +1,5 @@
-//! The pure execution planner.
-//!
-//! It hard-filters every scanned advertisement against authenticated
-//! membership, placement policy, and static capability, then ranks whatever
-//! survives by directed transfer cost and stale ranking hints and keeps the
-//! best of them. It performs no I/O, decides nothing about capacity the target
-//! owns, and covers every value it used with a plan digest.
+//! Pure planner that filters authenticated candidates by policy and capability, ranks transfer cost
+//! and hints, and digests all inputs. It performs no I/O or target-owned capacity decisions.
 
 mod cost;
 mod digest;
@@ -146,12 +141,8 @@ impl ExecutionPlan {
     }
 }
 
-/// Plans one execution over already resolved inputs and one complete candidate
-/// set, paging it for the caller. Returns an error only when the request itself
-/// is unusable; an empty or fully rejected scan is a plan without a selection,
-/// not a failure, and stays retryable while a rejection may still resolve
-/// itself. A caller that discovers advertisements incrementally drives
-/// [`Planner`] itself.
+/// Plans resolved inputs across one complete paged candidate set. Invalid requests fail; no selection
+/// remains retryable. Incremental discovery drives `Planner` directly.
 pub fn plan_execution(
     request: &PlanRequest,
     candidates: &[TargetCandidate],

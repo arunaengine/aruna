@@ -7,7 +7,7 @@ use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
-use aruna_operations::metadata::stats::count_group_documents_by_purpose;
+use aruna_operations::metadata::stats::count_group_purpose;
 use aruna_operations::realm::read_authorization::ReadRealmAuthorizationOperation;
 use aruna_operations::users::read_document::{ReadUserDocumentError, ReadUserDocumentOperation};
 use rmcp::Json;
@@ -69,10 +69,8 @@ pub struct DatasetCountsOutput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct GroupIdInput {
-    /// The group's bare 26-character ULID, for example
-    /// `01JZ8Y6T0K4W7M2N9Q5R3S8V1X`. Call `list_groups` or `whoami` for the ids
-    /// the caller belongs to, or read `group_id` from a `search` hit. This is
-    /// not the `<ulid>@<realm>` form a user id uses.
+    /// Bare group ULID. Use `list_groups`, `whoami`, or a search result to find it.
+    /// This is distinct from a user's `<ulid>@<realm>` identifier.
     pub group_id: String,
 }
 
@@ -174,7 +172,7 @@ impl McpServer {
         let mut groups = Vec::new();
         for group in member_groups(self, &auth).await? {
             let counts =
-                count_group_documents_by_purpose(&self.state.get_ctx(), realm_id, group.group_id)
+                count_group_purpose(&self.state.get_ctx(), realm_id, group.group_id)
                     .await
                     .map_err(internal_error)?
                     .ok_or_else(|| {

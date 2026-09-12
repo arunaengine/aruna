@@ -1,9 +1,5 @@
-//! Lightweight observability primitives shared across crates.
-//!
-//! - [`LatencyAggregator`]: unbiased per-key latency histograms flushed as
-//!   rate-limited `latency.summary` INFO lines.
-//! - [`RequestStages`]: a task-local per-request stage timing context used by
-//!   the API middleware to emit `request.slow` WARN breakdowns.
+//! Shared observability: `LatencyAggregator` emits rate-limited per-key histogram summaries;
+//! `RequestStages` supplies task-local stage timings for slow-request warnings.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -28,9 +24,8 @@ pub const DEFAULT_LATENCY_OVERFLOW_KEY: &str = "__overflow__";
 /// Default tick interval for queue lag gauges.
 pub const QUEUE_LAG_INTERVAL: Duration = Duration::from_secs(10);
 
-// 1-2-5 series bucket upper bounds in microseconds (50us .. 10min) plus an
-// implicit overflow bucket. Percentiles report a bucket upper bound capped by
-// the exact observed maximum, so the error is bounded by the bucket width.
+// 1-2-5 microsecond buckets span 50us to 10min plus overflow. Reported percentile bounds are
+// capped by the observed maximum, limiting error to one bucket width.
 const BUCKET_BOUNDS_US: [u64; 22] = [
     50,
     100,
@@ -579,13 +574,13 @@ mod tests {
     }
 
     #[test]
-    fn duration_ms_saturates_at_u64_max() {
+    fn duration_ms_max() {
         assert_eq!(duration_ms(Duration::from_millis(42)), 42);
         assert_eq!(duration_ms(Duration::from_secs(u64::MAX)), u64::MAX);
     }
 
     #[test]
-    fn histogram_percentiles_use_bucket_bounds_capped_by_max() {
+    fn histogram_percentiles_max() {
         let mut histogram = LatencyHistogram::default();
         for _ in 0..99 {
             histogram.record(Duration::from_micros(900));
@@ -602,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn histogram_single_sample_percentile_is_capped_by_observed_max() {
+    fn histogram_single_max() {
         let mut histogram = LatencyHistogram::default();
         histogram.record(Duration::from_micros(300));
         assert_eq!(histogram.percentile_ms(0.50), 0.3);
@@ -610,14 +605,14 @@ mod tests {
     }
 
     #[test]
-    fn histogram_overflow_bucket_reports_exact_max() {
+    fn histogram_overflow_max() {
         let mut histogram = LatencyHistogram::default();
         histogram.record(Duration::from_secs(1_000));
         assert_eq!(histogram.percentile_ms(0.99), 1_000_000.0);
     }
 
     #[test]
-    fn histogram_empty_reports_zero() {
+    fn histogram_empty_zero() {
         let histogram = LatencyHistogram::default();
         assert_eq!(histogram.count(), 0);
         assert_eq!(histogram.percentile_ms(0.5), 0.0);
@@ -626,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregator_flush_resets_window() {
+    fn aggregator_flush_window() {
         let aggregator = LatencyAggregator::new("test");
         aggregator.record("route_a", Duration::from_millis(5));
         aggregator.record("route_a", Duration::from_millis(5));
@@ -646,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregator_split_reports_wait_and_service() {
+    fn aggregator_split_service() {
         let aggregator = LatencyAggregator::new("test");
         aggregator.record_split("write", Duration::from_millis(40), Duration::from_millis(2));
         let summaries = aggregator.flush();
@@ -657,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregator_limits_key_cardinality() {
+    fn aggregator_limits_cardinality() {
         let aggregator = LatencyAggregator::with_options("test", bounded_options(2, 64));
         aggregator.record("route_a", Duration::from_millis(5));
         aggregator.record("route_b", Duration::from_millis(10));
@@ -673,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregator_limits_key_length() {
+    fn aggregator_limits_length() {
         let aggregator = LatencyAggregator::with_options("test", bounded_options(10, 4));
         aggregator.record("ok", Duration::from_millis(5));
         aggregator.record("too-long", Duration::from_millis(10));
@@ -685,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregator_overflow_preserves_split_latency() {
+    fn aggregator_overflow_latency() {
         let aggregator = LatencyAggregator::with_options("test", bounded_options(0, 64));
         aggregator.record_split("write", Duration::from_millis(40), Duration::from_millis(2));
 
@@ -699,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregator_flush_resets_cardinality_window() {
+    fn aggregator_resets_window() {
         let aggregator = LatencyAggregator::with_options("test", bounded_options(1, 64));
         aggregator.record("route_a", Duration::from_millis(5));
         aggregator.record("route_b", Duration::from_millis(10));
@@ -716,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregator_emits_inline_once_interval_elapses() {
+    fn aggregator_emits_elapses() {
         let aggregator = LatencyAggregator::with_interval("test", Duration::ZERO);
         // Window opens and immediately becomes due on the second record.
         aggregator.record("k", Duration::from_millis(1));
@@ -725,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn request_stages_aggregate_and_render() {
+    fn request_stages_render() {
         let stages = RequestStages::default();
         stages.add("storage", Duration::from_millis(10));
         stages.add("storage", Duration::from_millis(20));
@@ -739,7 +734,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_stage_is_noop_without_scope_and_records_in_scope() {
+    async fn record_stage_scope() {
         record_stage("orphan", Duration::from_millis(1));
 
         let stages = RequestStages::default();

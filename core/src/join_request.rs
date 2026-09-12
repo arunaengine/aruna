@@ -205,13 +205,8 @@ mod tests {
             approved.join_requests()[0].decision.as_ref().unwrap().kind,
             JoinDecisionKind::Approved
         );
-        assert!(
-            approved.materialized_group_role_user_assignments()[&role_id]
-                .contains(&request.user_id)
-        );
-        assert!(
-            denied.materialized_group_role_user_assignments()[&role_id].contains(&request.user_id)
-        );
+        assert!(approved.materialized_group_assignments()[&role_id].contains(&request.user_id));
+        assert!(denied.materialized_group_assignments()[&role_id].contains(&request.user_id));
         let before = approved.clone();
         approved.apply(&approval).unwrap();
         assert_eq!(approved, before);

@@ -175,10 +175,9 @@ pub enum StorageError {
 }
 
 impl StorageError {
-    /// Whether a failed `CommitTransaction` proves the transaction's writes
-    /// were discarded: refused by the conflict check, or never handed to the
-    /// storage actor at all. Every other failure leaves the commit either
-    /// already applied or unknown, so its records may exist.
+    /// Whether a failed `CommitTransaction` proves the transaction's writes were discarded: refused by the
+    /// conflict check, or never handed to the storage actor at all. Every other failure leaves the commit
+    /// either already applied or unknown, so its records may exist.
     pub fn proves_no_commit(&self) -> bool {
         matches!(
             self,
