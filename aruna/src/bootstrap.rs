@@ -1,3 +1,11 @@
+//! Realm bootstrap duties after identity resolution: core-document
+//! preparation, publication, and fetch, placement waits, and the local
+//! onboarding secret.
+//!
+//! Persisted identity and the enrollment decision live in `crate::identity`;
+//! operator settings parsing lives in `crate::settings`. This module holds no
+//! second identity or enrollment path.
+
 use crate::config::PersistedNodeState;
 use aruna_api::server_state::{
     INITIAL_LOCAL_ONBOARDING_SECRET_KEY, load_persisted_state, persist_state,

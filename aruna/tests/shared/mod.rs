@@ -4,9 +4,8 @@ use aruna::bootstrap::{
     fetch_core_documents, prepare_core_documents, publish_core_documents, realm_bootstrap_exists,
     wait_for_placement,
 };
-use aruna::config::{
-    Config, mark_onboarding_phase, mark_state_complete, read_settings, resolve_settings,
-};
+use aruna::config::{Config, mark_onboarding_phase, mark_state_complete, resolve_settings};
+use aruna::settings::read_settings_from;
 use aruna_api::cors::CorsConfig;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
 use aruna_api::routes::credentials::{
@@ -54,11 +53,10 @@ use reqwest::StatusCode;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout as time_limit};
 use ulid::Ulid;
@@ -237,26 +235,6 @@ where
 /// sequential network shutdowns.
 pub(crate) async fn shutdown_pair(joiner: JoinerNode, seed: SeedNode) {
     tokio::join!(joiner.shutdown(), seed.shutdown());
-}
-
-struct EnvVarGuard {
-    previous: Vec<(String, Option<String>)>,
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.previous.drain(..) {
-            match value {
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-        }
-    }
-}
-
-pub(crate) fn env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 pub(crate) async fn wait_until<F, Fut>(
@@ -1084,46 +1062,40 @@ async fn load_env_config(
     joiner_dir: &TempDir,
     onboarding_secret: String,
 ) -> TestResult<(Config, StorageHandle)> {
-    let vars = [
+    let env: std::collections::BTreeMap<String, String> = [
         (
-            "STORAGE_PATH",
+            "STORAGE_PATH".to_string(),
             joiner_dir.path().to_str().unwrap().to_string(),
         ),
-        ("SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
-        ("P2P_SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
-        ("S3_HOST", "127.0.0.1:0".to_string()),
+        ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+        ("P2P_SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+        ("S3_HOST".to_string(), "127.0.0.1:0".to_string()),
         (
-            "API_PUBLIC_URL",
+            "API_PUBLIC_URL".to_string(),
             "https://api.joiner.example.test".to_string(),
         ),
         (
-            "S3_PUBLIC_URL",
+            "S3_PUBLIC_URL".to_string(),
             "https://s3.joiner.example.test".to_string(),
         ),
-        ("S3_ADDRESS", "127.0.0.1:0".to_string()),
-        ("ONBOARDING_SECRET", onboarding_secret),
-        ("ARUNA_NODE_LABELS", "fixture=joiner".to_string()),
-        ("ONBOARDING_BOOTSTRAP_TIMEOUT_SECS", "600".to_string()),
-        ("ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS", "600".to_string()),
-    ];
+        ("S3_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+        ("ONBOARDING_SECRET".to_string(), onboarding_secret),
+        (
+            "ARUNA_NODE_LABELS".to_string(),
+            "fixture=joiner".to_string(),
+        ),
+        (
+            "ONBOARDING_BOOTSTRAP_TIMEOUT_SECS".to_string(),
+            "600".to_string(),
+        ),
+        (
+            "ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS".to_string(),
+            "600".to_string(),
+        ),
+    ]
+    .into_iter()
+    .collect();
 
-    // The lock covers the env read only: opening storage and the bootstrap
-    // round trip must not serialize every joiner spawn in the binary.
-    let settings = {
-        let _lock = env_lock().lock().await;
-        let _guard = set_env_vars(&vars);
-        read_settings()?
-    };
+    let settings = read_settings_from(&env)?;
     Ok(resolve_settings(settings).await?)
-}
-
-fn set_env_vars(vars: &[(&str, String)]) -> EnvVarGuard {
-    let previous = vars
-        .iter()
-        .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
-        .collect::<Vec<_>>();
-    for (key, value) in vars {
-        unsafe { std::env::set_var(key, value) };
-    }
-    EnvVarGuard { previous }
 }

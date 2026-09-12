@@ -12,14 +12,16 @@ use aruna_core::onboarding::{
     node_proof_message,
 };
 use aruna_core::structs::{
-    Backend, BackendConfig, BackendsFile, BlobTimeoutConfig, DynamicDiscoveryMethod,
-    KIND_LABEL_KEY, LOCATION_LABEL_KEY, NodeBackendsConfig, NodeCapabilities, OidcProviderConfig,
-    RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy, RoCrateLimits,
-    STORAGE_CLASS_LABEL_PREFIX, StaticRealmEndpoint,
+    BlobTimeoutConfig, DynamicDiscoveryMethod, NodeBackendsConfig, NodeCapabilities,
+    OidcProviderConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
+    RoCrateLimits, StaticRealmEndpoint,
 };
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::UserId;
 use aruna_net::{DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_config};
+
+use crate::identity::{EnrollmentPlan, IdentityStore, plan_enrollment};
+use crate::settings::{Settings, invalid_config_value, normalize_env_value, validate_relay_urls};
 use aruna_operations::metadata::MetadataSearchStorage;
 use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle, errors::StorageLibError};
 use base64::Engine;
@@ -35,8 +37,8 @@ use iroh::EndpointAddr;
 use iroh::KeyParsingError;
 use serde::{Deserialize, Serialize};
 use std::array::TryFromSliceError;
-use std::collections::{BTreeMap, HashMap};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -44,17 +46,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 const NODE_STATE_RECORD_KEY: &[u8] = b"node_state";
-/// Default ops listener bind. Loopback so liveness/readiness probes and the
-/// Prometheus scrape exist out of the box without being publicly reachable.
-const DEFAULT_OPS_SOCKET_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3002);
 const ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// The seed answers a bootstrap with realm-config upsert, placement expansion
-/// and topic reconciliation inline, so the client budget has to cover that work
-/// on a busy seed.
-const DEFAULT_ONBOARDING_BOOTSTRAP_TIMEOUT_SECS: u64 = 120;
-/// Budget for one onboarding document-sync round trip and for the placement
-/// wait that repeats it until the seed has granted this node its placement.
-const DEFAULT_ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS: u64 = 60;
 
 pub struct Config {
     pub storage_path: String,
@@ -179,7 +171,7 @@ pub enum PersistedNodeStatus {
     Complete,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistedNodeIdentity {
     Management {
         realm_private_key_pem: String,
@@ -195,6 +187,25 @@ pub enum PersistedNodeIdentity {
     },
 }
 
+impl std::fmt::Debug for PersistedNodeIdentity {
+    /// Redacts private key material: this record may be printed in a diagnostic
+    /// path, and keys are not diagnostic output.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Management { .. } => f
+                .debug_struct("Management")
+                .field("realm_private_key_pem", &"<redacted>")
+                .finish(),
+            Self::Server { .. } => f
+                .debug_struct("Server")
+                .field("issuer_private_key_pem", &"<redacted>")
+                .field("delegation_signature", &"<redacted>")
+                .finish(),
+            Self::User { owner } => f.debug_struct("User").field("owner", owner).finish(),
+        }
+    }
+}
+
 impl PersistedNodeIdentity {
     /// Owner of a device identity; `None` for infrastructure nodes.
     pub fn owner(&self) -> Option<UserId> {
@@ -205,7 +216,7 @@ impl PersistedNodeIdentity {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedNodeState {
     pub boot_origin: BootOrigin,
     pub status: PersistedNodeStatus,
@@ -214,6 +225,21 @@ pub struct PersistedNodeState {
     pub onboarding_phase: Option<OnboardingPhase>,
     pub onboarding_sync_ticket: Option<String>,
     pub identity: PersistedNodeIdentity,
+}
+
+impl std::fmt::Debug for PersistedNodeState {
+    /// Redacts the network secret; the rest of the record is diagnostic.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistedNodeState")
+            .field("boot_origin", &self.boot_origin)
+            .field("status", &self.status)
+            .field("realm_id", &self.realm_id)
+            .field("net_secret_key", &"<redacted>")
+            .field("onboarding_phase", &self.onboarding_phase)
+            .field("onboarding_sync_ticket", &self.onboarding_sync_ticket)
+            .field("identity", &self.identity)
+            .finish()
+    }
 }
 
 #[derive(Error, Debug)]
@@ -307,322 +333,6 @@ impl Config {
     }
 }
 
-/// Environment token a backend name maps to. The mapping is lossy, so callers
-/// must reject two names that share a token before reading any credential.
-fn credential_token(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// Per-backend S3 credentials. The backends file never holds secrets; this is
-/// the one lookup a node-local vault will replace later.
-fn backend_credentials(name: &str) -> Option<(String, String)> {
-    let upper = credential_token(name);
-    let key = dotenvy::var(format!("BLOB_BACKEND_{upper}_ACCESS_KEY_ID")).ok()?;
-    let secret = dotenvy::var(format!("BLOB_BACKEND_{upper}_SECRET_ACCESS_KEY")).ok()?;
-    Some((key, secret))
-}
-
-/// Refuses a file where two backends would read the same credential variables,
-/// which would let one backend authenticate with another's account.
-fn reject_token_clashes(names: impl Iterator<Item = String>) -> Result<(), SetupError> {
-    let mut seen: BTreeMap<String, String> = BTreeMap::new();
-    for name in names {
-        let token = credential_token(&name);
-        if let Some(other) = seen.insert(token.clone(), name.clone()) {
-            return Err(invalid_config_value(
-                "BLOB_BACKENDS_PATH",
-                format!("{other}, {name}"),
-                format!("both backends resolve to BLOB_BACKEND_{token}_* credentials"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Reads the operator's backends file, or synthesises the implicit single
-/// filesystem backend so a zero-config node keeps working.
-fn load_backends_config(
-    implicit: BackendConfig,
-    timeouts: BlobTimeoutConfig,
-) -> Result<NodeBackendsConfig, SetupError> {
-    let Ok(path) = dotenvy::var("BLOB_BACKENDS_PATH") else {
-        return Ok(NodeBackendsConfig::single(implicit));
-    };
-    let text = std::fs::read_to_string(&path)?;
-    let file = BackendsFile::parse(&text)?;
-    reject_token_clashes(file.backend.keys().cloned())?;
-    Ok(file.resolve(&backend_credentials, timeouts)?)
-}
-
-/// Environment-derived configuration. Reading it performs no network or storage
-/// I/O, so a caller that has to serialize access to the process environment can
-/// scope that serialization to this step alone.
-pub struct Settings {
-    pub storage_path: String,
-    pub metadata_storage_path: String,
-    pub metadata_search_storage: MetadataSearchStorage,
-    pub fjall_persist_policy: FjallPersistPolicy,
-    pub document_sync_storage_path: PathBuf,
-    pub blob_root: String,
-    pub blob_backends: NodeBackendsConfig,
-    pub blob_bucket_prefix: Option<String>,
-    pub blob_max_bucket_size: Option<u64>,
-    pub blob_multipart_bucket: Option<String>,
-    pub blob_control_plane_connect_timeout_secs: u64,
-    pub blob_control_plane_io_timeout_secs: u64,
-    pub blob_transfer_idle_timeout_secs: u64,
-    pub onboarding_bootstrap_timeout_secs: u64,
-    pub onboarding_document_sync_timeout_secs: u64,
-    pub s3_initial_request_timeout_secs: u64,
-    pub s3_connection_idle_timeout_secs: u64,
-    pub s3_stream_lifetime_timeout_secs: u64,
-    pub http_socket_addr: SocketAddr,
-    pub ops_socket_addr: SocketAddr,
-    pub max_http_body_size: usize,
-    pub cors_allowed_origins: Vec<String>,
-    pub desktop_cors: bool,
-    pub mcp_enabled: bool,
-    pub portal_csp_extra_origins: Vec<String>,
-    pub p2p_socket_addr: SocketAddr,
-    pub additional_relay_urls: Vec<String>,
-    pub max_concurrent_uni_streams: Option<u64>,
-    pub max_concurrent_bidi_streams: Option<u64>,
-    pub document_sync_runtime: IrohRuntimeConfig,
-    pub default_metadata_replication_factor: u32,
-    /// `None` when `S3_HOST`/`S3_ADDRESS` are unset or empty: no S3 listener.
-    pub s3_host: Option<String>,
-    pub api_public_url: Option<String>,
-    pub s3_public_url: Option<String>,
-    pub trusted_proxies: Vec<ipnet::IpNet>,
-    pub rocrate_limits: RoCrateLimits,
-    pub rate_limits: RateLimitSettings,
-    pub s3_address: Option<String>,
-    pub onboarding_secret: Option<String>,
-    pub oidc_providers: Vec<OidcProviderConfig>,
-    pub realm_description: String,
-    pub portal: PortalConfig,
-    pub assistant_proxy: bool,
-    pub node_labels: BTreeMap<String, String>,
-    pub node_location: Option<String>,
-    pub node_weight: Option<u32>,
-}
-
-pub fn read_settings() -> Result<Settings, SetupError> {
-    let storage_path = dotenvy::var("STORAGE_PATH")?;
-    let metadata_storage_path =
-        dotenvy::var("CRAQLE_STORAGE_PATH").unwrap_or_else(|_| format!("{storage_path}/craqle"));
-    let metadata_search_storage = search_storage_env()?;
-    let fjall_persist_policy = persist_policy_env()?;
-    let document_sync_storage_path = dotenvy::var("DOCUMENT_SYNC_STORAGE_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(format!("{storage_path}/document-sync")));
-    let document_sync_runtime = load_sync_config()?;
-    let blob_root =
-        dotenvy::var("BLOB_ROOT").unwrap_or_else(|_| format!("{storage_path}/blobstore"));
-    let blob_bucket_prefix = dotenvy::var("BLOB_BUCKET_PREFIX").ok();
-
-    let max_concurrent_uni_streams = dotenvy::var("MAX_CONCURRENT_UNI_STREAMS")
-        .ok()
-        .map(|value| value.parse::<u64>())
-        .transpose()?;
-    let max_concurrent_bidi_streams = dotenvy::var("MAX_CONCURRENT_BIDI_STREAMS")
-        .ok()
-        .map(|value| value.parse::<u64>())
-        .transpose()?;
-
-    let blob_max_bucket_size = dotenvy::var("BLOB_MAX_BUCKET_SIZE")
-        .ok()
-        .map(|value| value.parse::<u64>())
-        .transpose()?
-        .or(Some(100_000));
-    let blob_multipart_bucket = dotenvy::var("BLOB_MULTIPART_BUCKET")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or(Some("uploaded-parts".to_string()));
-    let blob_control_plane_connect_timeout_secs =
-        dotenvy::var("BLOB_CONTROL_PLANE_CONNECT_TIMEOUT_SECS")
-            .ok()
-            .map(|value| value.parse::<u64>())
-            .transpose()?
-            .unwrap_or(30);
-    let blob_control_plane_io_timeout_secs = dotenvy::var("BLOB_CONTROL_PLANE_IO_TIMEOUT_SECS")
-        .ok()
-        .map(|value| value.parse::<u64>())
-        .transpose()?
-        .unwrap_or(30);
-    let blob_transfer_idle_timeout_secs = dotenvy::var("BLOB_TRANSFER_IDLE_TIMEOUT_SECS")
-        .ok()
-        .map(|value| value.parse::<u64>())
-        .transpose()?
-        .unwrap_or(30 * 60);
-    let onboarding_bootstrap_timeout_secs = positive_u64_env(
-        "ONBOARDING_BOOTSTRAP_TIMEOUT_SECS",
-        DEFAULT_ONBOARDING_BOOTSTRAP_TIMEOUT_SECS,
-    )?;
-    let onboarding_document_sync_timeout_secs = positive_u64_env(
-        "ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS",
-        DEFAULT_ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS,
-    )?;
-    let s3_timeouts = S3ServerTimeouts::default();
-    let s3_initial_request_timeout_secs = positive_u64_env(
-        "S3_INITIAL_REQUEST_TIMEOUT_SECS",
-        s3_timeouts.initial_request.as_secs(),
-    )?;
-    let s3_connection_idle_timeout_secs = positive_u64_env(
-        "S3_CONNECTION_IDLE_TIMEOUT_SECS",
-        s3_timeouts.connection_idle.as_secs(),
-    )?;
-    let s3_stream_lifetime_timeout_secs = positive_u64_env(
-        "S3_STREAM_LIFETIME_TIMEOUT_SECS",
-        s3_timeouts.stream_lifetime.as_secs(),
-    )?;
-    let blob_timeouts = BlobTimeoutConfig {
-        control_plane_connect_timeout: Duration::from_secs(blob_control_plane_connect_timeout_secs),
-        control_plane_io_timeout: Duration::from_secs(blob_control_plane_io_timeout_secs),
-        transfer_idle_timeout: Duration::from_secs(blob_transfer_idle_timeout_secs),
-    };
-    let blob_backends = load_backends_config(
-        BackendConfig {
-            backend_type: Backend::FileSystem,
-            root: blob_root.clone(),
-            service_config: HashMap::new(),
-            bucket_prefix: blob_bucket_prefix.clone(),
-            max_bucket_size: blob_max_bucket_size,
-            multipart_bucket: blob_multipart_bucket.clone(),
-            timeouts: blob_timeouts,
-        },
-        blob_timeouts,
-    )?;
-    let http_socket_addr = SocketAddr::from_str(&dotenvy::var("SOCKET_ADDRESS")?)?;
-    let ops_socket_addr = dotenvy::var("OPS_SOCKET_ADDRESS")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| SocketAddr::from_str(value.trim()))
-        .transpose()?
-        .unwrap_or(DEFAULT_OPS_SOCKET_ADDR);
-    let max_http_body_size = dotenvy::var("MAX_HTTP_BODY_SIZE")
-        .ok()
-        .map(|value| value.parse::<usize>())
-        .transpose()?
-        .unwrap_or(aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE);
-    let cors_allowed_origins = parse_list_env("CORS_ALLOWED_ORIGINS");
-    let desktop_cors = desktop_cors_env();
-    let mcp_enabled = mcp_env()?;
-    let portal_csp_extra_origins = parse_list_env("PORTAL_CSP_EXTRA_ORIGINS");
-    let p2p_socket_addr = SocketAddr::from_str(
-        &dotenvy::var("P2P_SOCKET_ADDRESS").unwrap_or_else(|_| http_socket_addr.to_string()),
-    )?;
-    let additional_relay_urls = parse_list_env("P2P_ADDITIONAL_RELAY_URLS");
-    validate_relay_urls("P2P_ADDITIONAL_RELAY_URLS", &additional_relay_urls)?;
-    let default_metadata_replication_factor = dotenvy::var("METADATA_REPLICATION_FACTOR")
-        .ok()
-        .map(|value| value.parse::<u32>())
-        .transpose()?
-        .unwrap_or(3)
-        .max(1);
-    let api_public_url = optional_public_url("API_PUBLIC_URL")?;
-    let s3_public_url = optional_public_url("S3_PUBLIC_URL")?;
-    let trusted_proxies = trusted_proxies_env()?;
-    let rocrate_limits = rocrate_limits_env()?;
-    let rate_limits = rate_limits_env()?;
-    // Devices may omit both S3 values, but supplying only one is always invalid.
-    // The node identity later decides whether the listener is required.
-    let (s3_host, s3_address) = match (
-        optional_nonempty_env("S3_HOST")?,
-        optional_nonempty_env("S3_ADDRESS")?,
-    ) {
-        (Some(host), Some(address)) => {
-            SocketAddr::from_str(&address)?;
-            (Some(host), Some(address))
-        }
-        (None, None) => (None, None),
-        (Some(_), None) => return Err(SetupError::MissingConfigValue("S3_ADDRESS")),
-        (None, Some(_)) => return Err(SetupError::MissingConfigValue("S3_HOST")),
-    };
-    let node_labels = parse_node_labels()?;
-    let node_location = dotenvy::var("ARUNA_NODE_LOCATION")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let node_weight = dotenvy::var("ARUNA_NODE_WEIGHT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| value.trim().parse::<u32>())
-        .transpose()?;
-    let realm_description = dotenvy::var("REALM_DESCRIPTION")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "Aruna Realm".to_string());
-    let onboarding_secret = dotenvy::var("ONBOARDING_SECRET")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let oidc_providers = load_oidc_providers()?;
-    let portal = portal_config_env()?;
-    let assistant_proxy = assistant_proxy_env()?;
-    // The SPA is served from another origin than the API, so it cannot reach a
-    // relative API path and needs the advertised one.
-    if matches!(portal, PortalConfig::Artifact { .. }) && api_public_url.is_none() {
-        return Err(SetupError::MissingConfigValue("API_PUBLIC_URL"));
-    }
-
-    Ok(Settings {
-        storage_path,
-        metadata_storage_path,
-        metadata_search_storage,
-        fjall_persist_policy,
-        document_sync_storage_path,
-        blob_root,
-        blob_backends,
-        blob_bucket_prefix,
-        blob_max_bucket_size,
-        blob_multipart_bucket,
-        blob_control_plane_connect_timeout_secs,
-        blob_control_plane_io_timeout_secs,
-        blob_transfer_idle_timeout_secs,
-        onboarding_bootstrap_timeout_secs,
-        onboarding_document_sync_timeout_secs,
-        s3_initial_request_timeout_secs,
-        s3_connection_idle_timeout_secs,
-        s3_stream_lifetime_timeout_secs,
-        http_socket_addr,
-        ops_socket_addr,
-        max_http_body_size,
-        cors_allowed_origins,
-        desktop_cors,
-        mcp_enabled,
-        portal_csp_extra_origins,
-        p2p_socket_addr,
-        additional_relay_urls,
-        max_concurrent_uni_streams,
-        max_concurrent_bidi_streams,
-        document_sync_runtime,
-        default_metadata_replication_factor,
-        s3_host,
-        api_public_url,
-        s3_public_url,
-        trusted_proxies,
-        rocrate_limits,
-        rate_limits,
-        s3_address,
-        onboarding_secret,
-        oidc_providers,
-        realm_description,
-        portal,
-        assistant_proxy,
-        node_labels,
-        node_location,
-        node_weight,
-    })
-}
-
 /// Opens local storage, resolves or bootstraps the persisted node state and
 /// derives the realm network configuration from it.
 pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHandle), SetupError> {
@@ -676,66 +386,70 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
     } = settings;
     let bootstrap_timeout = Duration::from_secs(onboarding_bootstrap_timeout_secs);
     let storage_handle = FjallStorage::open_with_policy(&storage_path, fjall_persist_policy)?;
-    let mut temporary_bootstrap_endpoint = None;
-    let mut enrollment_endpoints = Vec::new();
-    let node_state = match load_node_state(&storage_handle).await? {
-        Some(state) => state,
-        None => {
-            let state = match onboarding_secret.as_deref() {
-                Some(onboarding_secret) => {
-                    let bootstrapped = bootstrap_node_state(
-                        onboarding_secret,
-                        node_location.clone(),
-                        node_weight,
-                        node_labels.clone(),
-                        bootstrap_timeout,
-                    )
-                    .await?;
-                    temporary_bootstrap_endpoint = Some(bootstrapped.temporary_bootstrap_endpoint);
-                    enrollment_endpoints = bootstrapped.realm_endpoints;
-                    bootstrapped.node_state
-                }
-                None => generate_node_state()?,
-            };
-            persist_node_state(&storage_handle, &state).await?;
-            state
+    // Opening storage is explicit here: the identity store owns every read and
+    // write of the persisted identity record.
+    let identity = IdentityStore::open(storage_handle.clone());
+    let loaded = identity.load().await?;
+    let plan = plan_enrollment(loaded.as_ref(), onboarding_secret.is_some())?;
+    let (mut node_state, mut temporary_bootstrap_endpoint, mut enrollment_endpoints) = match plan {
+        EnrollmentPlan::Generate => {
+            let state = identity.generate()?;
+            identity.persist(&state).await?;
+            (state, None, Vec::new())
         }
-    };
-
-    let net_secret_key = iroh::SecretKey::from_bytes(&node_state.net_secret_key);
-    let node_id = net_secret_key.public();
-    let (realm_id, node_capabilities) = node_capabilities(&node_state)?;
-    if realm_id != node_state.realm_id {
-        return Err(SetupError::PersistedNodeStateMismatch);
-    }
-    validate_s3_profile(s3_address.as_deref(), &node_capabilities)?;
-
-    let mut node_state = node_state;
-    if matches!(node_state.status, PersistedNodeStatus::PendingOnboarding) {
-        let phase = node_state
-            .onboarding_phase
-            .unwrap_or(OnboardingPhase::Bootstrapped);
-        if matches!(phase, OnboardingPhase::Bootstrapped) {
-            let onboarding_secret = onboarding_secret.as_deref().ok_or_else(|| {
-                SetupError::OnboardingBootstrapFailed(
-                    "pending bootstrapped onboarding requires ONBOARDING_SECRET to refresh bootstrap material"
-                        .to_string(),
-                )
-            })?;
-            let response = refresh_onboarding_bootstrap(
-                onboarding_secret,
-                &node_state,
+        EnrollmentPlan::Bootstrap => {
+            let secret = onboarding_secret
+                .as_deref()
+                .expect("the bootstrap plan requires an onboarding secret");
+            let bootstrapped = bootstrap_node_state(
+                secret,
                 node_location.clone(),
                 node_weight,
                 node_labels.clone(),
                 bootstrap_timeout,
             )
             .await?;
-            temporary_bootstrap_endpoint = Some(response.temporary_bootstrap_endpoint);
-            enrollment_endpoints = onboarding_realm_endpoints(&response.realm_endpoints);
-            node_state.onboarding_sync_ticket = Some(response.onboarding_sync_ticket);
-            persist_node_state(&storage_handle, &node_state).await?;
+            identity.persist(&bootstrapped.node_state).await?;
+            (
+                bootstrapped.node_state,
+                Some(bootstrapped.temporary_bootstrap_endpoint),
+                bootstrapped.realm_endpoints,
+            )
         }
+        EnrollmentPlan::Refresh | EnrollmentPlan::Ready => (
+            loaded.expect("a refresh or ready plan has persisted identity"),
+            None,
+            Vec::new(),
+        ),
+    };
+
+    let net_secret_key = iroh::SecretKey::from_bytes(&node_state.net_secret_key);
+    let node_id = net_secret_key.public();
+    let (realm_id, node_capabilities) = identity.capabilities(&node_state)?;
+    if realm_id != node_state.realm_id {
+        return Err(SetupError::PersistedNodeStateMismatch);
+    }
+    validate_s3_profile(s3_address.as_deref(), &node_capabilities)?;
+
+    // A pending bootstrapped enrollment refreshes after the local checks, so a
+    // bad local configuration never sends an enrollment request.
+    if matches!(plan, EnrollmentPlan::Refresh) {
+        let secret = onboarding_secret
+            .as_deref()
+            .expect("the refresh plan requires an onboarding secret");
+        let response = refresh_onboarding_bootstrap(
+            secret,
+            &node_state,
+            node_location.clone(),
+            node_weight,
+            node_labels.clone(),
+            bootstrap_timeout,
+        )
+        .await?;
+        temporary_bootstrap_endpoint = Some(response.temporary_bootstrap_endpoint);
+        enrollment_endpoints = IdentityStore::onboarding_endpoints(&response.realm_endpoints);
+        node_state.onboarding_sync_ticket = Some(response.onboarding_sync_ticket);
+        identity.persist(&node_state).await?;
     }
 
     let startup_mode = match node_state.status {
@@ -826,418 +540,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
 }
 
 pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
-    resolve_settings(read_settings()?).await
-}
-
-fn normalize_env_value(value: &str) -> String {
-    value.trim().to_ascii_lowercase().replace('-', "_")
-}
-
-fn invalid_config_value(
-    key: &'static str,
-    value: impl Into<String>,
-    message: impl std::fmt::Display,
-) -> SetupError {
-    SetupError::InvalidConfigValue {
-        key,
-        value: value.into(),
-        message: message.to_string(),
-    }
-}
-
-fn search_storage_env() -> Result<MetadataSearchStorage, SetupError> {
-    const KEY: &str = "CRAQLE_SEARCH_STORAGE";
-    let Some(value) = dotenvy::var(KEY).ok() else {
-        return Ok(MetadataSearchStorage::Disk);
-    };
-
-    match normalize_env_value(&value).as_str() {
-        "disk" => Ok(MetadataSearchStorage::Disk),
-        "memory" | "in_memory" | "ram" => Ok(MetadataSearchStorage::Memory),
-        _ => Err(invalid_config_value(
-            KEY,
-            value,
-            "expected one of: disk, memory",
-        )),
-    }
-}
-
-fn persist_policy_env() -> Result<FjallPersistPolicy, SetupError> {
-    const KEY: &str = "ARUNA_FJALL_PERSIST_MODE";
-    let Some(value) = dotenvy::var(KEY).ok() else {
-        return Ok(FjallPersistPolicy::default());
-    };
-
-    value
-        .parse::<FjallPersistPolicy>()
-        .map_err(|message| invalid_config_value(KEY, value, message))
-}
-
-fn positive_u64_env(key: &'static str, default: u64) -> Result<u64, SetupError> {
-    let Some(value) = optional_nonempty_env(key)? else {
-        return Ok(default);
-    };
-    let parsed = value
-        .parse::<u64>()
-        .map_err(|error| invalid_config_value(key, &value, error))?;
-    if parsed == 0 {
-        return Err(invalid_config_value(
-            key,
-            value,
-            "must be greater than zero",
-        ));
-    }
-    Ok(parsed)
-}
-
-fn positive_u32_env(key: &'static str, default: u32) -> Result<u32, SetupError> {
-    let Some(value) = optional_nonempty_env(key)? else {
-        return Ok(default);
-    };
-    let parsed = value
-        .parse::<u32>()
-        .map_err(|error| invalid_config_value(key, &value, error))?;
-    if parsed == 0 {
-        return Err(invalid_config_value(
-            key,
-            value,
-            "must be greater than zero",
-        ));
-    }
-    Ok(parsed)
-}
-
-fn rocrate_limits_env() -> Result<RoCrateLimits, SetupError> {
-    let defaults = RoCrateLimits::default();
-    let limits = RoCrateLimits {
-        direct_upload_bytes: positive_u64_env(
-            "ROCRATE_DIRECT_UPLOAD_BYTES",
-            defaults.direct_upload_bytes,
-        )?,
-        import_source_bytes: positive_u64_env(
-            "ROCRATE_IMPORT_SOURCE_BYTES",
-            defaults.import_source_bytes,
-        )?,
-        expanded_import_bytes: positive_u64_env(
-            "ROCRATE_EXPANDED_IMPORT_BYTES",
-            defaults.expanded_import_bytes,
-        )?,
-        export_artifact_bytes: positive_u64_env(
-            "ROCRATE_EXPORT_ARTIFACT_BYTES",
-            defaults.export_artifact_bytes,
-        )?,
-        max_entries: positive_u64_env("ROCRATE_MAX_ENTRIES", defaults.max_entries)?,
-        metadata_bytes: positive_u64_env("ROCRATE_METADATA_BYTES", defaults.metadata_bytes)?,
-        key_bytes: positive_u64_env("ROCRATE_KEY_BYTES", defaults.key_bytes)?,
-        upload_retention_ms: positive_u64_env(
-            "ROCRATE_UPLOAD_RETENTION_MS",
-            defaults.upload_retention_ms,
-        )?,
-        artifact_retention_ms: positive_u64_env(
-            "ROCRATE_JOB_RETENTION_MS",
-            defaults.artifact_retention_ms,
-        )?,
-        max_active_jobs: positive_u32_env("ROCRATE_MAX_ACTIVE_JOBS", defaults.max_active_jobs)?,
-        holder_ttl_ms: positive_u64_env("ROCRATE_HOLDER_TTL_MS", defaults.holder_ttl_ms)?,
-        holder_refresh_ms: positive_u64_env(
-            "ROCRATE_HOLDER_REFRESH_MS",
-            defaults.holder_refresh_ms,
-        )?,
-    };
-    if limits.holder_refresh_ms >= limits.holder_ttl_ms {
-        return Err(invalid_config_value(
-            "ROCRATE_HOLDER_REFRESH_MS",
-            limits.holder_refresh_ms.to_string(),
-            "must be less than ROCRATE_HOLDER_TTL_MS",
-        ));
-    }
-    Ok(limits)
-}
-
-fn rate_limits_env() -> Result<RateLimitSettings, SetupError> {
-    let defaults = RateLimitSettings::default();
-    Ok(RateLimitSettings {
-        ip_per_minute: positive_u32_env("RATE_LIMIT_IP_PER_MINUTE", defaults.ip_per_minute)?,
-        ip_burst: positive_u32_env("RATE_LIMIT_IP_BURST", defaults.ip_burst)?,
-        principal_per_minute: positive_u32_env(
-            "RATE_LIMIT_PRINCIPAL_PER_MINUTE",
-            defaults.principal_per_minute,
-        )?,
-        principal_burst: positive_u32_env("RATE_LIMIT_PRINCIPAL_BURST", defaults.principal_burst)?,
-        s3_max_connections: positive_u32_env("S3_MAX_CONNECTIONS", defaults.s3_max_connections)?,
-        s3_max_requests: positive_u32_env("S3_MAX_CONCURRENT_REQUESTS", defaults.s3_max_requests)?,
-    })
-}
-
-fn portal_config_env() -> Result<PortalConfig, SetupError> {
-    const MODE_KEY: &str = "PORTAL_MODE";
-    let Some(mode) = dotenvy::var(MODE_KEY).ok() else {
-        return Ok(PortalConfig::Disabled);
-    };
-
-    match normalize_env_value(&mode).as_str() {
-        "disabled" => Ok(PortalConfig::Disabled),
-        "artifact" => {
-            let artifact_url = optional_nonempty_env("PORTAL_ARTIFACT_URL")?;
-            if let Some(artifact_url) = &artifact_url {
-                reqwest::Url::parse(artifact_url).map_err(|error| {
-                    invalid_config_value("PORTAL_ARTIFACT_URL", artifact_url, error)
-                })?;
-            }
-            let artifact_sha256 = optional_nonempty_env("PORTAL_ARTIFACT_SHA256")?
-                .map(|value| normalize_sha256_env("PORTAL_ARTIFACT_SHA256", &value))
-                .transpose()?;
-            let portal_dir = PathBuf::from(required_nonempty_env("PORTAL_DIR")?);
-            const ADDRESS_KEY: &str = "PORTAL_SOCKET_ADDRESS";
-            let address = required_nonempty_env(ADDRESS_KEY)?;
-            let socket_addr = SocketAddr::from_str(address.trim())
-                .map_err(|error| invalid_config_value(ADDRESS_KEY, address, error))?;
-            Ok(PortalConfig::Artifact {
-                artifact: PortalArtifactConfig {
-                    artifact_url,
-                    artifact_sha256,
-                    portal_dir,
-                },
-                socket_addr,
-            })
-        }
-        _ => Err(invalid_config_value(
-            MODE_KEY,
-            mode,
-            "expected one of: disabled, artifact",
-        )),
-    }
-}
-
-fn optional_nonempty_env(key: &'static str) -> Result<Option<String>, SetupError> {
-    match dotenvy::var(key) {
-        Ok(value) if value.trim().is_empty() => Ok(None),
-        Ok(value) => Ok(Some(value)),
-        Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn required_nonempty_env(key: &'static str) -> Result<String, SetupError> {
-    match dotenvy::var(key) {
-        Ok(value) if !value.trim().is_empty() => Ok(value),
-        Ok(value) => Err(invalid_config_value(key, value, "must not be empty")),
-        Err(_) => Err(SetupError::MissingConfigValue(key)),
-    }
-}
-
-/// `TRUSTED_PROXIES` is a comma-separated list of CIDR networks or bare IPs
-/// whose `x-forwarded-*` headers the node honors. Empty trusts no proxy.
-fn trusted_proxies_env() -> Result<Vec<ipnet::IpNet>, SetupError> {
-    let Some(value) = optional_nonempty_env("TRUSTED_PROXIES")? else {
-        return Ok(Vec::new());
-    };
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| {
-            entry
-                .parse::<ipnet::IpNet>()
-                .or_else(|_| entry.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
-                .map_err(|error| invalid_config_value("TRUSTED_PROXIES", entry, error))
-        })
-        .collect()
-}
-
-fn optional_public_url(key: &'static str) -> Result<Option<String>, SetupError> {
-    let value = optional_nonempty_env(key)?;
-    if let Some(url) = &value {
-        validate_public_url(key, url)?;
-    }
-    Ok(value)
-}
-
-fn validate_public_url(key: &'static str, value: &str) -> Result<(), SetupError> {
-    let url =
-        reqwest::Url::parse(value).map_err(|error| invalid_config_value(key, value, error))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(invalid_config_value(
-            key,
-            value,
-            "expected an absolute HTTP or HTTPS URL with a host",
-        ));
-    }
-    Ok(())
-}
-
-fn normalize_sha256_env(key: &'static str, value: &str) -> Result<String, SetupError> {
-    let trimmed = value.trim();
-    if trimmed.len() != 64 || !trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(invalid_config_value(
-            key,
-            value,
-            "expected 64 hex characters",
-        ));
-    }
-    Ok(trimmed.to_ascii_lowercase())
-}
-
-fn parse_list_env(key: &str) -> Vec<String> {
-    dotenvy::var(key)
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
-/// `DESKTOP_CORS` opts out of the always-on desktop origin admission.
-fn desktop_cors_env() -> bool {
-    !matches!(
-        dotenvy::var("DESKTOP_CORS")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "off" | "false" | "0" | "no"
-    )
-}
-
-fn assistant_proxy_env() -> Result<bool, SetupError> {
-    let Some(value) = optional_nonempty_env("ASSISTANT_PROXY")? else {
-        return Ok(true);
-    };
-    match normalize_env_value(&value).as_str() {
-        "enabled" => Ok(true),
-        "disabled" => Ok(false),
-        _ => Err(invalid_config_value(
-            "ASSISTANT_PROXY",
-            value,
-            "expected enabled or disabled",
-        )),
-    }
-}
-
-fn mcp_env() -> Result<bool, SetupError> {
-    const KEY: &str = "MCP";
-    match dotenvy::var(KEY).ok().as_deref().map(normalize_env_value) {
-        None => Ok(true),
-        Some(value) if value == "enabled" => Ok(true),
-        Some(value) if value == "disabled" => Ok(false),
-        Some(value) => Err(invalid_config_value(
-            KEY,
-            value,
-            "expected one of: enabled, disabled",
-        )),
-    }
-}
-
-/// Parses the placement-map initialization/onboarding input `ARUNA_NODE_LABELS`
-/// in `k=v,k2=v2` form. Rejects malformed pairs and every derived-only label,
-/// which the owning node stamps for itself.
-fn parse_node_labels() -> Result<BTreeMap<String, String>, SetupError> {
-    const KEY: &str = "ARUNA_NODE_LABELS";
-    let raw = dotenvy::var(KEY).unwrap_or_default();
-    let mut labels = BTreeMap::new();
-    for pair in raw
-        .split(',')
-        .map(str::trim)
-        .filter(|pair| !pair.is_empty())
-    {
-        let (label_key, label_value) = pair
-            .split_once('=')
-            .ok_or_else(|| invalid_config_value(KEY, pair, "expected key=value"))?;
-        let label_key = label_key.trim();
-        let label_value = label_value.trim();
-        if label_key.is_empty() {
-            return Err(invalid_config_value(KEY, pair, "empty label key"));
-        }
-        if label_key == KIND_LABEL_KEY {
-            return Err(invalid_config_value(
-                KEY,
-                pair,
-                format!("{KIND_LABEL_KEY} is a reserved derived label"),
-            ));
-        }
-        if label_key == LOCATION_LABEL_KEY {
-            return Err(invalid_config_value(
-                KEY,
-                pair,
-                format!("{LOCATION_LABEL_KEY} is derived from ARUNA_NODE_LOCATION"),
-            ));
-        }
-        if label_key.starts_with(STORAGE_CLASS_LABEL_PREFIX) {
-            return Err(invalid_config_value(
-                KEY,
-                pair,
-                format!("{STORAGE_CLASS_LABEL_PREFIX}* labels are derived from the backends file"),
-            ));
-        }
-        labels.insert(label_key.to_string(), label_value.to_string());
-    }
-    Ok(labels)
-}
-
-fn load_sync_config() -> Result<IrohRuntimeConfig, SetupError> {
-    let default = IrohRuntimeConfig::default();
-    Ok(IrohRuntimeConfig {
-        connect_timeout: duration_secs_env(
-            "DOCUMENT_SYNC_CONNECT_TIMEOUT_SECS",
-            default.connect_timeout,
-        )?,
-        sync_io_timeout: duration_secs_env(
-            "DOCUMENT_SYNC_IO_TIMEOUT_SECS",
-            default.sync_io_timeout,
-        )?,
-        resync_interval: duration_secs_env(
-            "DOCUMENT_SYNC_RESYNC_INTERVAL_SECS",
-            default.resync_interval,
-        )?,
-        resync_initial_backoff: duration_secs_env(
-            "DOCUMENT_SYNC_RESYNC_INITIAL_BACKOFF_SECS",
-            default.resync_initial_backoff,
-        )?,
-        resync_max_backoff: duration_secs_env(
-            "DOCUMENT_SYNC_RESYNC_MAX_BACKOFF_SECS",
-            default.resync_max_backoff,
-        )?,
-        full_sweep_interval: duration_secs_env(
-            "DOCUMENT_SYNC_FULL_SWEEP_INTERVAL_SECS",
-            default.full_sweep_interval,
-        )?,
-        full_sweep_time_of_day: duration_secs_env(
-            "DOCUMENT_SYNC_FULL_SWEEP_TIME_OF_DAY_SECS",
-            default.full_sweep_time_of_day,
-        )?,
-    })
-}
-
-fn duration_secs_env(key: &'static str, default: Duration) -> Result<Duration, SetupError> {
-    let Some(value) = dotenvy::var(key).ok() else {
-        return Ok(default);
-    };
-    let seconds = value
-        .parse::<u64>()
-        .map_err(|error| invalid_config_value(key, value, error))?;
-    Ok(Duration::from_secs(seconds))
-}
-
-fn load_oidc_providers() -> Result<Vec<OidcProviderConfig>, SetupError> {
-    let Some(provider_ids) = dotenvy::var("OIDC_PROVIDER_IDS").ok() else {
-        return Ok(Vec::new());
-    };
-
-    provider_ids
-        .split(',')
-        .map(str::trim)
-        .filter(|provider_id| !provider_id.is_empty())
-        .map(|provider_id| {
-            let env_prefix = provider_id.to_ascii_uppercase().replace('-', "_");
-            Ok(OidcProviderConfig {
-                id: provider_id.to_string(),
-                issuer: dotenvy::var(format!("OIDC_{env_prefix}_ISSUER"))?,
-                audience: dotenvy::var(format!("OIDC_{env_prefix}_AUDIENCE"))?,
-                discovery_url: dotenvy::var(format!("OIDC_{env_prefix}_DISCOVERY_URL"))?,
-            })
-        })
-        .collect()
+    resolve_settings(crate::settings::read_settings()?).await
 }
 
 pub async fn mark_state_complete(
@@ -1357,7 +660,7 @@ fn fold_components(path: &std::path::Path) -> std::path::PathBuf {
     folded
 }
 
-fn node_capabilities(
+pub(crate) fn node_capabilities(
     node_state: &PersistedNodeState,
 ) -> Result<(RealmId, NodeCapabilities), SetupError> {
     match &node_state.identity {
@@ -1403,7 +706,7 @@ fn node_capabilities(
     }
 }
 
-fn generate_node_state() -> Result<PersistedNodeState, SetupError> {
+pub(crate) fn generate_node_state() -> Result<PersistedNodeState, SetupError> {
     let realm_signing_key = generate_signing_key();
     let node_signing_key = generate_signing_key();
 
@@ -1431,7 +734,7 @@ struct BootstrappedNodeState {
 /// Realm endpoints handed over at enrollment, so a joiner dials the realm
 /// without a discovery read of its own. An entry that does not parse, or whose
 /// address names another node, is dropped instead of failing the join.
-fn onboarding_realm_endpoints(endpoints: &[StaticRealmEndpoint]) -> Vec<EndpointAddr> {
+pub(crate) fn onboarding_realm_endpoints(endpoints: &[StaticRealmEndpoint]) -> Vec<EndpointAddr> {
     endpoints
         .iter()
         .filter_map(
@@ -1457,6 +760,14 @@ fn onboarding_realm_endpoints(endpoints: &[StaticRealmEndpoint]) -> Vec<Endpoint
             },
         )
         .collect()
+}
+
+/// The decode half of the enrollment client, separated so response mapping is
+/// testable without an HTTP server.
+fn decode_bootstrap_response(body: &[u8]) -> Result<BootstrapOnboardingResponse, SetupError> {
+    serde_json::from_slice(body).map_err(|error| {
+        SetupError::OnboardingBootstrapFailed(format!("invalid bootstrap response: {error}"))
+    })
 }
 
 async fn bootstrap_node_state(
@@ -1536,7 +847,8 @@ async fn bootstrap_node_state(
         )));
     }
 
-    let response: BootstrapOnboardingResponse = response.json().await?;
+    let body = response.bytes().await?;
+    let response = decode_bootstrap_response(&body)?;
     if response.mode != decoded_secret.mode {
         return Err(SetupError::OnboardingModeMismatch);
     }
@@ -1709,7 +1021,8 @@ async fn refresh_onboarding_bootstrap(
         )));
     }
 
-    let response: BootstrapOnboardingResponse = response.json().await?;
+    let body = response.bytes().await?;
+    let response = decode_bootstrap_response(&body)?;
     if response.mode != decoded_secret.mode {
         return Err(SetupError::OnboardingModeMismatch);
     }
@@ -1941,16 +1254,7 @@ fn policy_relay_method(policy: &RelayPolicy) -> Result<RelayMethod, SetupError> 
     }
 }
 
-fn validate_relay_urls(key: &'static str, relays: &[String]) -> Result<(), SetupError> {
-    for relay in relays {
-        relay
-            .parse::<iroh::RelayUrl>()
-            .map_err(|error| invalid_config_value(key, relay.as_str(), error))?;
-    }
-    Ok(())
-}
-
-async fn load_node_state(
+pub(crate) async fn load_node_state(
     storage: &StorageHandle,
 ) -> Result<Option<PersistedNodeState>, SetupError> {
     match storage
@@ -1972,7 +1276,7 @@ async fn load_node_state(
     }
 }
 
-async fn persist_node_state(
+pub(crate) async fn persist_node_state(
     storage: &StorageHandle,
     node_state: &PersistedNodeState,
 ) -> Result<(), SetupError> {
@@ -1995,22 +1299,37 @@ async fn persist_node_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
-        S3ServerTimeouts, SetupError, assistant_proxy_env, load, load_oidc_providers,
-        normalize_root, outermost_roots, parse_node_labels, persist_node_state, persist_policy_env,
-        portal_config_env, read_settings, rocrate_limits_env, validate_public_url,
-        validate_s3_profile, validate_wipe_roots,
+        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, SetupError,
+        decode_bootstrap_response, normalize_root, outermost_roots, persist_node_state,
+        resolve_settings, validate_s3_profile, validate_wipe_roots,
     };
+    use crate::settings::read_settings_from;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{
         DynamicDiscoveryMethod, NodeCapabilities, RealmConfigDocument, RealmDiscoveryConfig,
-        RealmId, RelayPolicy, RoCrateLimits, StaticRealmEndpoint,
+        RealmId, RelayPolicy, StaticRealmEndpoint,
     };
-    use aruna_net::{DiscoveryMethod, RelayMethod, format_endpoint_config};
-    use aruna_storage::{FjallPersistPolicy, FjallStorage};
-    use std::sync::OnceLock;
+    use aruna_net::{RelayMethod, format_endpoint_config};
+    use aruna_storage::FjallStorage;
+    use std::collections::BTreeMap;
     use tempfile::tempdir;
-    use tokio::sync::Mutex;
+
+    /// Operator inputs for resolution tests: a minimal valid environment plus
+    /// the case's overrides.
+    fn settings_env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let mut env = BTreeMap::from([
+            ("STORAGE_PATH".to_string(), "/tmp/aruna-none".to_string()),
+            ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("S3_HOST".to_string(), "127.0.0.1:0".to_string()),
+            ("S3_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("PORTAL_MODE".to_string(), "disabled".to_string()),
+            ("ARUNA_FJALL_PERSIST_MODE".to_string(), "buffer".to_string()),
+        ]);
+        for (key, value) in pairs {
+            env.insert((*key).to_string(), (*value).to_string());
+        }
+        env
+    }
 
     // Wipe roots cannot contain the owner's home, another root, or the filesystem.
     // These paths deliberately do not exist because safety must not depend on presence.
@@ -2078,764 +1397,6 @@ mod tests {
             validate_s3_profile(None, &management),
             Err(SetupError::MissingConfigValue("S3_ADDRESS"))
         ));
-    }
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn restore_env(previous: Vec<(String, Option<String>)>) {
-        for (key, value) in previous {
-            match value {
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-        }
-    }
-
-    fn portal_env_keys() -> [&'static str; 5] {
-        [
-            "PORTAL_MODE",
-            "PORTAL_ARTIFACT_URL",
-            "PORTAL_ARTIFACT_SHA256",
-            "PORTAL_DIR",
-            "PORTAL_SOCKET_ADDRESS",
-        ]
-    }
-
-    fn clear_portal_env() {
-        for key in portal_env_keys() {
-            unsafe { std::env::remove_var(key) };
-        }
-    }
-
-    fn rocrate_env_keys() -> [&'static str; 12] {
-        [
-            "ROCRATE_DIRECT_UPLOAD_BYTES",
-            "ROCRATE_IMPORT_SOURCE_BYTES",
-            "ROCRATE_EXPANDED_IMPORT_BYTES",
-            "ROCRATE_EXPORT_ARTIFACT_BYTES",
-            "ROCRATE_MAX_ENTRIES",
-            "ROCRATE_METADATA_BYTES",
-            "ROCRATE_KEY_BYTES",
-            "ROCRATE_UPLOAD_RETENTION_MS",
-            "ROCRATE_JOB_RETENTION_MS",
-            "ROCRATE_MAX_ACTIVE_JOBS",
-            "ROCRATE_HOLDER_TTL_MS",
-            "ROCRATE_HOLDER_REFRESH_MS",
-        ]
-    }
-
-    fn clear_rocrate_env() {
-        for key in rocrate_env_keys() {
-            unsafe { std::env::remove_var(key) };
-        }
-    }
-
-    #[tokio::test]
-    async fn rocrate_defaults() {
-        let _guard = env_lock().lock().await;
-        let previous = rocrate_env_keys()
-            .into_iter()
-            .map(|key| (key.to_string(), std::env::var(key).ok()))
-            .collect();
-        clear_rocrate_env();
-
-        assert_eq!(rocrate_limits_env().unwrap(), RoCrateLimits::default());
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn rocrate_overrides() {
-        let _guard = env_lock().lock().await;
-        let previous = rocrate_env_keys()
-            .into_iter()
-            .map(|key| (key.to_string(), std::env::var(key).ok()))
-            .collect();
-        let values = [1_u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 11];
-        for (key, value) in rocrate_env_keys().into_iter().zip(values) {
-            unsafe { std::env::set_var(key, value.to_string()) };
-        }
-
-        assert_eq!(
-            rocrate_limits_env().unwrap(),
-            RoCrateLimits {
-                direct_upload_bytes: 1,
-                import_source_bytes: 2,
-                expanded_import_bytes: 3,
-                export_artifact_bytes: 4,
-                max_entries: 5,
-                metadata_bytes: 6,
-                key_bytes: 7,
-                upload_retention_ms: 8,
-                artifact_retention_ms: 9,
-                max_active_jobs: 10,
-                holder_ttl_ms: 12,
-                holder_refresh_ms: 11,
-            }
-        );
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn rocrate_rejects_zero() {
-        let _guard = env_lock().lock().await;
-        let previous = rocrate_env_keys()
-            .into_iter()
-            .map(|key| (key.to_string(), std::env::var(key).ok()))
-            .collect();
-        clear_rocrate_env();
-        unsafe { std::env::set_var("ROCRATE_MAX_ENTRIES", "0") };
-
-        assert!(matches!(
-            rocrate_limits_env(),
-            Err(super::SetupError::InvalidConfigValue {
-                key: "ROCRATE_MAX_ENTRIES",
-                ..
-            })
-        ));
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn rocrate_rejects_refresh() {
-        let _guard = env_lock().lock().await;
-        let previous = rocrate_env_keys()
-            .into_iter()
-            .map(|key| (key.to_string(), std::env::var(key).ok()))
-            .collect();
-        clear_rocrate_env();
-        unsafe {
-            std::env::set_var("ROCRATE_HOLDER_TTL_MS", "5");
-            std::env::set_var("ROCRATE_HOLDER_REFRESH_MS", "5");
-        }
-
-        assert!(matches!(
-            rocrate_limits_env(),
-            Err(super::SetupError::InvalidConfigValue {
-                key: "ROCRATE_HOLDER_REFRESH_MS",
-                ..
-            })
-        ));
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn timeout_settings_env() {
-        // The joinable bootstrap budget and the S3 listener deadlines are
-        // operator input; unset keys must keep the shipped defaults.
-        let _guard = env_lock().lock().await;
-        let dir = tempdir().unwrap();
-        let vars = [
-            ("STORAGE_PATH", dir.path().to_str().unwrap().to_string()),
-            ("SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
-            ("S3_HOST", "127.0.0.1:0".to_string()),
-            ("S3_ADDRESS", "127.0.0.1:0".to_string()),
-            ("ONBOARDING_BOOTSTRAP_TIMEOUT_SECS", "240".to_string()),
-            ("ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS", "300".to_string()),
-            ("S3_INITIAL_REQUEST_TIMEOUT_SECS", "45".to_string()),
-            ("S3_CONNECTION_IDLE_TIMEOUT_SECS", "90".to_string()),
-            ("S3_STREAM_LIFETIME_TIMEOUT_SECS", "600".to_string()),
-        ];
-        let previous = vars
-            .iter()
-            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
-            .collect::<Vec<_>>();
-        for (key, value) in &vars {
-            unsafe { std::env::set_var(key, value) };
-        }
-
-        let settings = read_settings().unwrap();
-        assert_eq!(settings.onboarding_bootstrap_timeout_secs, 240);
-        assert_eq!(settings.onboarding_document_sync_timeout_secs, 300);
-        assert_eq!(settings.s3_initial_request_timeout_secs, 45);
-        assert_eq!(settings.s3_connection_idle_timeout_secs, 90);
-        assert_eq!(settings.s3_stream_lifetime_timeout_secs, 600);
-
-        for (key, _) in &vars[4..] {
-            unsafe { std::env::remove_var(key) };
-        }
-        let settings = read_settings().unwrap();
-        let defaults = S3ServerTimeouts::default();
-        assert_eq!(settings.onboarding_bootstrap_timeout_secs, 120);
-        assert_eq!(settings.onboarding_document_sync_timeout_secs, 60);
-        assert_eq!(
-            settings.s3_initial_request_timeout_secs,
-            defaults.initial_request.as_secs()
-        );
-        assert_eq!(
-            settings.s3_connection_idle_timeout_secs,
-            defaults.connection_idle.as_secs()
-        );
-        assert_eq!(
-            settings.s3_stream_lifetime_timeout_secs,
-            defaults.stream_lifetime.as_secs()
-        );
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn s3_listener_optional() {
-        // Empty disables the listener; half a pair stays an error. Removal would
-        // prove nothing: `dotenvy::var` refills a removed key from the .env file.
-        let _guard = env_lock().lock().await;
-        let dir = tempdir().unwrap();
-        let vars = ["STORAGE_PATH", "SOCKET_ADDRESS", "S3_HOST", "S3_ADDRESS"];
-        let previous = vars
-            .iter()
-            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-            .collect::<Vec<_>>();
-        unsafe {
-            std::env::set_var("STORAGE_PATH", dir.path().to_str().unwrap());
-            std::env::set_var("SOCKET_ADDRESS", "127.0.0.1:0");
-            std::env::set_var("S3_HOST", "");
-            std::env::set_var("S3_ADDRESS", "");
-        }
-
-        let settings = read_settings().unwrap();
-        assert!(settings.s3_host.is_none());
-        assert!(settings.s3_address.is_none());
-
-        unsafe { std::env::set_var("S3_HOST", "127.0.0.1:0") };
-        assert!(matches!(
-            read_settings(),
-            Err(SetupError::MissingConfigValue("S3_ADDRESS"))
-        ));
-
-        unsafe {
-            std::env::set_var("S3_HOST", "");
-            std::env::set_var("S3_ADDRESS", "127.0.0.1:0");
-        }
-        assert!(matches!(
-            read_settings(),
-            Err(SetupError::MissingConfigValue("S3_HOST"))
-        ));
-
-        unsafe { std::env::set_var("S3_HOST", "127.0.0.1:0") };
-        let settings = read_settings().unwrap();
-        assert_eq!(settings.s3_host.as_deref(), Some("127.0.0.1:0"));
-        assert_eq!(settings.s3_address.as_deref(), Some("127.0.0.1:0"));
-
-        restore_env(previous);
-    }
-
-    #[test]
-    fn public_url_schemes() {
-        for value in [
-            "http://localhost:1337",
-            "https://s3.example.test/base/path/",
-        ] {
-            validate_public_url("API_PUBLIC_URL", value).unwrap();
-        }
-    }
-
-    #[test]
-    fn public_url_invalid() {
-        for key in ["API_PUBLIC_URL", "S3_PUBLIC_URL"] {
-            for value in [
-                "file:///tmp/s3",
-                "mailto:admin@example.test",
-                "ftp://s3.example.test",
-                "https://",
-                "/relative/path",
-            ] {
-                let error = validate_public_url(key, value).expect_err("invalid URL should fail");
-                assert!(matches!(
-                    error,
-                    super::SetupError::InvalidConfigValue {
-                        key: error_key,
-                        ..
-                    } if error_key == key
-                ));
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn persist_defaults_buffer() {
-        let _guard = env_lock().lock().await;
-        let key = "ARUNA_FJALL_PERSIST_MODE";
-        let previous = vec![(key.to_string(), std::env::var(key).ok())];
-        unsafe { std::env::remove_var(key) };
-
-        assert_eq!(persist_policy_env().unwrap(), FjallPersistPolicy::Buffer);
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn persist_accepts_sync() {
-        let _guard = env_lock().lock().await;
-        let key = "ARUNA_FJALL_PERSIST_MODE";
-        let previous = vec![(key.to_string(), std::env::var(key).ok())];
-        unsafe { std::env::set_var(key, "sync_all") };
-
-        assert_eq!(persist_policy_env().unwrap(), FjallPersistPolicy::SyncAll);
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn persist_rejects_invalid() {
-        let _guard = env_lock().lock().await;
-        let key = "ARUNA_FJALL_PERSIST_MODE";
-        let previous = vec![(key.to_string(), std::env::var(key).ok())];
-        unsafe { std::env::set_var(key, "always") };
-
-        let error = persist_policy_env().expect_err("invalid policy should fail");
-        assert!(matches!(
-            error,
-            super::SetupError::InvalidConfigValue {
-                key: "ARUNA_FJALL_PERSIST_MODE",
-                ..
-            }
-        ));
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn assistant_proxy_defaults() {
-        let _guard = env_lock().lock().await;
-        let key = "ASSISTANT_PROXY";
-        let previous = vec![(key.to_string(), std::env::var(key).ok())];
-        unsafe { std::env::remove_var(key) };
-
-        assert!(assistant_proxy_env().unwrap());
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn assistant_proxy_modes() {
-        let _guard = env_lock().lock().await;
-        let key = "ASSISTANT_PROXY";
-        let previous = vec![(key.to_string(), std::env::var(key).ok())];
-        unsafe { std::env::set_var(key, "disabled") };
-        assert!(!assistant_proxy_env().unwrap());
-        unsafe { std::env::set_var(key, "enabled") };
-        assert!(assistant_proxy_env().unwrap());
-        unsafe { std::env::set_var(key, "sometimes") };
-        assert!(assistant_proxy_env().is_err());
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn labels_default_empty() {
-        let _guard = env_lock().lock().await;
-        let key = "ARUNA_NODE_LABELS";
-        let previous = vec![(key.to_string(), std::env::var(key).ok())];
-        unsafe { std::env::remove_var(key) };
-
-        assert!(parse_node_labels().unwrap().is_empty());
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn labels_parse_pairs() {
-        let _guard = env_lock().lock().await;
-        let key = "ARUNA_NODE_LABELS";
-        let previous = vec![(key.to_string(), std::env::var(key).ok())];
-        unsafe { std::env::set_var(key, "tier=hot, zone = eu-west ") };
-
-        let labels = parse_node_labels().unwrap();
-        assert_eq!(labels.get("tier"), Some(&"hot".to_string()));
-        assert_eq!(labels.get("zone"), Some(&"eu-west".to_string()));
-        assert_eq!(labels.len(), 2);
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn labels_reject_reserved() {
-        let _guard = env_lock().lock().await;
-        let key = "ARUNA_NODE_LABELS";
-        let previous = vec![(key.to_string(), std::env::var(key).ok())];
-        unsafe { std::env::set_var(key, "aruna-engine.org/kind=Server") };
-
-        let error = parse_node_labels().expect_err("reserved key should fail");
-        assert!(matches!(
-            error,
-            super::SetupError::InvalidConfigValue {
-                key: "ARUNA_NODE_LABELS",
-                ..
-            }
-        ));
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn rejects_class_label() {
-        // Class labels are derived from the backends file, never claimed by hand.
-        let _guard = env_lock().lock().await;
-        let key = "ARUNA_NODE_LABELS";
-        let previous = vec![(key.to_string(), std::env::var(key).ok())];
-        unsafe { std::env::set_var(key, "aruna-engine.org/storage-class/cold=true") };
-
-        let error = parse_node_labels().expect_err("derived class label should fail");
-        assert!(matches!(
-            error,
-            super::SetupError::InvalidConfigValue {
-                key: "ARUNA_NODE_LABELS",
-                ..
-            }
-        ));
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn rejects_location_label() {
-        // The location label is derived from ARUNA_NODE_LOCATION, never claimed.
-        let _guard = env_lock().lock().await;
-        let key = "ARUNA_NODE_LABELS";
-        let previous = vec![(key.to_string(), std::env::var(key).ok())];
-        unsafe { std::env::set_var(key, "aruna-engine.org/location=eu-west") };
-
-        let error = parse_node_labels().expect_err("derived location label should fail");
-        assert!(matches!(
-            error,
-            super::SetupError::InvalidConfigValue {
-                key: "ARUNA_NODE_LABELS",
-                ..
-            }
-        ));
-
-        restore_env(previous);
-    }
-
-    #[test]
-    fn rejects_token_clashes() {
-        // The env token is lossy, so two spellings must not share credentials.
-        let names = ["cold-s3", "cold_s3"].map(str::to_string);
-        let error =
-            super::reject_token_clashes(names.into_iter()).expect_err("clash should be rejected");
-        assert!(matches!(
-            error,
-            super::SetupError::InvalidConfigValue {
-                key: "BLOB_BACKENDS_PATH",
-                ..
-            }
-        ));
-
-        let distinct = ["cold", "hot"].map(str::to_string);
-        super::reject_token_clashes(distinct.into_iter()).unwrap();
-    }
-
-    #[tokio::test]
-    async fn labels_reject_malformed() {
-        let _guard = env_lock().lock().await;
-        let key = "ARUNA_NODE_LABELS";
-        let previous = vec![(key.to_string(), std::env::var(key).ok())];
-        unsafe { std::env::set_var(key, "tier") };
-
-        let error = parse_node_labels().expect_err("missing '=' should fail");
-        assert!(matches!(
-            error,
-            super::SetupError::InvalidConfigValue {
-                key: "ARUNA_NODE_LABELS",
-                ..
-            }
-        ));
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn loads_oidc_providers() {
-        let _guard = env_lock().lock().await;
-        let vars = [
-            ("OIDC_PROVIDER_IDS", "main,internal".to_string()),
-            ("OIDC_MAIN_ISSUER", "https://issuer.example".to_string()),
-            ("OIDC_MAIN_AUDIENCE", "aruna-api".to_string()),
-            (
-                "OIDC_MAIN_DISCOVERY_URL",
-                "https://issuer.example/.well-known/openid-configuration".to_string(),
-            ),
-            (
-                "OIDC_INTERNAL_ISSUER",
-                "https://internal.example".to_string(),
-            ),
-            ("OIDC_INTERNAL_AUDIENCE", "internal-client".to_string()),
-            (
-                "OIDC_INTERNAL_DISCOVERY_URL",
-                "https://internal.example/.well-known/openid-configuration".to_string(),
-            ),
-        ];
-        let previous: Vec<_> = vars
-            .iter()
-            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
-
-        for (key, value) in &vars {
-            unsafe { std::env::set_var(key, value) };
-        }
-
-        let providers = load_oidc_providers().unwrap();
-        assert_eq!(providers.len(), 2);
-        assert_eq!(providers[0].id, "main");
-        assert_eq!(providers[0].issuer, "https://issuer.example");
-        assert_eq!(providers[1].id, "internal");
-        assert_eq!(providers[1].audience, "internal-client");
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn oidc_requires_fields() {
-        let _guard = env_lock().lock().await;
-        let vars = [
-            ("OIDC_PROVIDER_IDS", "main".to_string()),
-            ("OIDC_MAIN_ISSUER", "https://issuer.example".to_string()),
-            ("OIDC_MAIN_AUDIENCE", "aruna-api".to_string()),
-        ];
-        let cleanup_keys = [
-            "OIDC_PROVIDER_IDS",
-            "OIDC_MAIN_ISSUER",
-            "OIDC_MAIN_AUDIENCE",
-            "OIDC_MAIN_DISCOVERY_URL",
-        ];
-        let previous: Vec<_> = cleanup_keys
-            .iter()
-            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
-
-        unsafe { std::env::remove_var("OIDC_MAIN_DISCOVERY_URL") };
-        for (key, value) in &vars {
-            unsafe { std::env::set_var(key, value) };
-        }
-
-        assert!(load_oidc_providers().is_err());
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn load_includes_oidc() {
-        let _guard = env_lock().lock().await;
-        let tempdir = tempdir().unwrap();
-        let vars = [
-            ("STORAGE_PATH", tempdir.path().to_str().unwrap().to_string()),
-            ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
-            ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
-            ("S3_HOST", "127.0.0.1:1337".to_string()),
-            ("API_PUBLIC_URL", "https://api.example.test".to_string()),
-            ("S3_PUBLIC_URL", "https://s3.example.test".to_string()),
-            ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
-            ("ARUNA_FJALL_PERSIST_MODE", "sync_all".to_string()),
-            ("OIDC_PROVIDER_IDS", "main".to_string()),
-            ("OIDC_MAIN_ISSUER", "https://issuer.example".to_string()),
-            ("OIDC_MAIN_AUDIENCE", "aruna-api".to_string()),
-            (
-                "OIDC_MAIN_DISCOVERY_URL",
-                "https://issuer.example/.well-known/openid-configuration".to_string(),
-            ),
-            ("PORTAL_MODE", "disabled".to_string()),
-        ];
-        let cleanup_keys = [
-            "STORAGE_PATH",
-            "SOCKET_ADDRESS",
-            "P2P_SOCKET_ADDRESS",
-            "S3_HOST",
-            "API_PUBLIC_URL",
-            "S3_PUBLIC_URL",
-            "S3_ADDRESS",
-            "ARUNA_FJALL_PERSIST_MODE",
-            "OIDC_PROVIDER_IDS",
-            "OIDC_MAIN_ISSUER",
-            "OIDC_MAIN_AUDIENCE",
-            "OIDC_MAIN_DISCOVERY_URL",
-            "PORTAL_MODE",
-            "PORTAL_ARTIFACT_URL",
-            "PORTAL_ARTIFACT_SHA256",
-            "PORTAL_DIR",
-        ];
-        let previous: Vec<_> = cleanup_keys
-            .iter()
-            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
-        for (key, value) in &vars {
-            unsafe { std::env::set_var(key, value) };
-        }
-
-        let (config, _storage) = load().await.unwrap();
-        assert_eq!(config.oidc_providers.len(), 1);
-        assert_eq!(config.oidc_providers[0].id, "main");
-        assert_eq!(config.oidc_providers[0].audience, "aruna-api");
-        assert_eq!(config.discovery_method, DiscoveryMethod::N0Dns);
-        assert_eq!(config.relay_method, RelayMethod::N0);
-        assert_eq!(config.fjall_persist_policy, FjallPersistPolicy::SyncAll);
-        assert!(matches!(config.portal, PortalConfig::Disabled));
-        assert_eq!(
-            config.api_public_url.as_deref(),
-            Some("https://api.example.test")
-        );
-        assert_eq!(
-            config.s3_public_url.as_deref(),
-            Some("https://s3.example.test")
-        );
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn portal_defaults_disabled() {
-        let _guard = env_lock().lock().await;
-        let previous: Vec<_> = portal_env_keys()
-            .iter()
-            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
-        clear_portal_env();
-
-        assert!(matches!(
-            portal_config_env().unwrap(),
-            PortalConfig::Disabled
-        ));
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn portal_accepts_artifact() {
-        let _guard = env_lock().lock().await;
-        let previous: Vec<_> = portal_env_keys()
-            .iter()
-            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
-        let portal_dir = tempdir().unwrap();
-        unsafe {
-            std::env::set_var("PORTAL_MODE", "artifact");
-            std::env::set_var("PORTAL_ARTIFACT_URL", "https://example.test/portal.tar.gz");
-            std::env::set_var(
-                "PORTAL_ARTIFACT_SHA256",
-                "0DCA71F9A1193B09A55843B1D5ABC1E99445A9E1226CE42FBA05EDBC80B5DB61",
-            );
-            std::env::set_var("PORTAL_DIR", portal_dir.path());
-            std::env::set_var("PORTAL_SOCKET_ADDRESS", "127.0.0.1:3005");
-        }
-
-        let PortalConfig::Artifact {
-            artifact: config,
-            socket_addr,
-        } = portal_config_env().unwrap()
-        else {
-            panic!("expected artifact portal config");
-        };
-        assert_eq!(socket_addr, "127.0.0.1:3005".parse().unwrap());
-        assert_eq!(
-            config.artifact_url.as_deref(),
-            Some("https://example.test/portal.tar.gz")
-        );
-        assert_eq!(
-            config.artifact_sha256.as_deref(),
-            Some("0dca71f9a1193b09a55843b1d5abc1e99445a9e1226ce42fba05edbc80b5db61")
-        );
-        assert_eq!(config.portal_dir, portal_dir.path());
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn portal_requires_dir() {
-        let _guard = env_lock().lock().await;
-        let previous: Vec<_> = portal_env_keys()
-            .iter()
-            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
-        clear_portal_env();
-        unsafe { std::env::set_var("PORTAL_MODE", "artifact") };
-
-        let error = portal_config_env().expect_err("missing artifact fields should fail");
-        assert!(matches!(
-            error,
-            super::SetupError::MissingConfigValue("PORTAL_DIR")
-        ));
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn requires_portal_address() {
-        // An enabled portal has its own listener, so a missing address is an
-        // error rather than a silent default.
-        let _guard = env_lock().lock().await;
-        let previous: Vec<_> = portal_env_keys()
-            .iter()
-            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
-        let portal_dir = tempdir().unwrap();
-        clear_portal_env();
-        unsafe {
-            std::env::set_var("PORTAL_MODE", "artifact");
-            std::env::set_var("PORTAL_DIR", portal_dir.path());
-        }
-
-        let error = portal_config_env().expect_err("missing portal address should fail");
-        assert!(matches!(
-            error,
-            super::SetupError::MissingConfigValue("PORTAL_SOCKET_ADDRESS")
-        ));
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn portal_allows_existing() {
-        let _guard = env_lock().lock().await;
-        let previous: Vec<_> = portal_env_keys()
-            .iter()
-            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
-        let portal_dir = tempdir().unwrap();
-        clear_portal_env();
-        unsafe {
-            std::env::set_var("PORTAL_MODE", "artifact");
-            std::env::set_var("PORTAL_DIR", portal_dir.path());
-            std::env::set_var("PORTAL_SOCKET_ADDRESS", "127.0.0.1:3005");
-        }
-
-        let PortalConfig::Artifact {
-            artifact: config, ..
-        } = portal_config_env().unwrap()
-        else {
-            panic!("expected artifact portal config");
-        };
-        assert_eq!(config.artifact_url, None);
-        assert_eq!(config.artifact_sha256, None);
-        assert_eq!(config.portal_dir, portal_dir.path());
-
-        restore_env(previous);
-    }
-
-    #[tokio::test]
-    async fn portal_rejects_mode() {
-        let _guard = env_lock().lock().await;
-        let previous: Vec<_> = portal_env_keys()
-            .iter()
-            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
-        clear_portal_env();
-        unsafe { std::env::set_var("PORTAL_MODE", "local") };
-
-        let error = portal_config_env().expect_err("invalid portal mode should fail");
-        assert!(matches!(
-            error,
-            super::SetupError::InvalidConfigValue {
-                key: "PORTAL_MODE",
-                ..
-            }
-        ));
-
-        restore_env(previous);
     }
 
     #[test]
@@ -2925,43 +1486,14 @@ mod tests {
 
     #[tokio::test]
     async fn extra_relays() {
-        let _guard = env_lock().lock().await;
-        let tempdir = tempdir().unwrap();
-        let vars = [
-            ("STORAGE_PATH", tempdir.path().to_str().unwrap().to_string()),
-            ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
-            ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
-            ("S3_HOST", "127.0.0.1:1337".to_string()),
-            ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
-            ("ARUNA_FJALL_PERSIST_MODE", "buffer".to_string()),
-            (
-                "P2P_ADDITIONAL_RELAY_URLS",
-                "https://relay-a.example, https://relay-b.example".to_string(),
-            ),
-            ("PORTAL_MODE", "disabled".to_string()),
-        ];
-        let cleanup_keys = [
-            "STORAGE_PATH",
-            "SOCKET_ADDRESS",
-            "P2P_SOCKET_ADDRESS",
-            "S3_HOST",
-            "S3_ADDRESS",
-            "ARUNA_FJALL_PERSIST_MODE",
+        let env = settings_env(&[(
             "P2P_ADDITIONAL_RELAY_URLS",
-            "PORTAL_MODE",
-            "PORTAL_ARTIFACT_URL",
-            "PORTAL_ARTIFACT_SHA256",
-            "PORTAL_DIR",
-        ];
-        let previous: Vec<_> = cleanup_keys
-            .iter()
-            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
-        for (key, value) in &vars {
-            unsafe { std::env::set_var(key, value) };
-        }
+            "https://relay-a.example, https://relay-b.example",
+        )]);
 
-        let (config, _storage) = load().await.unwrap();
+        let (config, _storage) = resolve_settings(read_settings_from(&env).unwrap())
+            .await
+            .unwrap();
 
         assert_eq!(
             config.relay_method,
@@ -2970,13 +1502,10 @@ mod tests {
                 "https://relay-b.example".to_string(),
             ])
         );
-
-        restore_env(previous);
     }
 
     #[tokio::test]
     async fn existing_ignores_secret() {
-        let _guard = env_lock().lock().await;
         let tempdir = tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
 
@@ -2997,54 +1526,23 @@ mod tests {
         persist_node_state(&storage, &node_state).await.unwrap();
         drop(storage);
 
-        let vars = [
-            ("STORAGE_PATH", tempdir.path().to_str().unwrap().to_string()),
-            ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
-            ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
-            ("S3_HOST", "127.0.0.1:1337".to_string()),
-            ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
-            ("ARUNA_FJALL_PERSIST_MODE", "buffer".to_string()),
-            (
-                "ONBOARDING_SECRET",
-                "definitely-not-a-valid-secret".to_string(),
-            ),
-            ("PORTAL_MODE", "disabled".to_string()),
-        ];
-        let cleanup_keys = [
-            "STORAGE_PATH",
-            "SOCKET_ADDRESS",
-            "P2P_SOCKET_ADDRESS",
-            "S3_HOST",
-            "S3_ADDRESS",
-            "ARUNA_FJALL_PERSIST_MODE",
-            "ONBOARDING_SECRET",
-            "PORTAL_MODE",
-            "PORTAL_ARTIFACT_URL",
-            "PORTAL_ARTIFACT_SHA256",
-            "PORTAL_DIR",
-        ];
-        let previous: Vec<_> = cleanup_keys
-            .iter()
-            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
+        let env = settings_env(&[
+            ("STORAGE_PATH", tempdir.path().to_str().unwrap()),
+            ("ONBOARDING_SECRET", "definitely-not-a-valid-secret"),
+        ]);
 
-        for (key, value) in &vars {
-            unsafe { std::env::set_var(key, value) };
-        }
-
-        let (config, _storage) = load().await.unwrap();
+        let (config, _storage) = resolve_settings(read_settings_from(&env).unwrap())
+            .await
+            .unwrap();
         assert!(!config.is_initial_node());
         assert!(matches!(
             config.startup_mode,
             super::StartupMode::Provisioned
         ));
-
-        restore_env(previous);
     }
 
     #[tokio::test]
     async fn pending_ignores_secret() {
-        let _guard = env_lock().lock().await;
         let tempdir = tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
 
@@ -3065,39 +1563,13 @@ mod tests {
         persist_node_state(&storage, &node_state).await.unwrap();
         drop(storage);
 
-        let vars = [
-            ("STORAGE_PATH", tempdir.path().to_str().unwrap().to_string()),
-            ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
-            ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
-            ("S3_HOST", "127.0.0.1:1337".to_string()),
-            ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
-            ("ARUNA_FJALL_PERSIST_MODE", "buffer".to_string()),
-            ("PORTAL_MODE", "disabled".to_string()),
-        ];
-        let cleanup_keys = [
-            "STORAGE_PATH",
-            "SOCKET_ADDRESS",
-            "P2P_SOCKET_ADDRESS",
-            "S3_HOST",
-            "S3_ADDRESS",
-            "ARUNA_FJALL_PERSIST_MODE",
-            "ONBOARDING_SECRET",
-            "PORTAL_MODE",
-            "PORTAL_ARTIFACT_URL",
-            "PORTAL_ARTIFACT_SHA256",
-            "PORTAL_DIR",
-        ];
-        let previous: Vec<_> = cleanup_keys
-            .iter()
-            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
+        // No ONBOARDING_SECRET: a phase past the bootstrap refresh must not
+        // require one.
+        let env = settings_env(&[("STORAGE_PATH", tempdir.path().to_str().unwrap())]);
 
-        unsafe { std::env::remove_var("ONBOARDING_SECRET") };
-        for (key, value) in &vars {
-            unsafe { std::env::set_var(key, value) };
-        }
-
-        let (config, _storage) = load().await.unwrap();
+        let (config, _storage) = resolve_settings(read_settings_from(&env).unwrap())
+            .await
+            .unwrap();
         assert!(matches!(
             config.startup_mode,
             super::StartupMode::JoinRealm {
@@ -3105,7 +1577,38 @@ mod tests {
             }
         ));
         assert!(!config.temporary_bootstrap_active);
+    }
+    #[test]
+    fn bootstrap_response_decode_is_a_boundary() {
+        assert!(matches!(
+            decode_bootstrap_response(b"not json"),
+            Err(SetupError::OnboardingBootstrapFailed(_))
+        ));
+    }
 
-        restore_env(previous);
+    #[tokio::test]
+    async fn pending_initialization_restarts_as_initialize_realm() {
+        // An incomplete first startup must resume realm initialization rather
+        // than mint a second identity.
+        let tempdir = tempdir().unwrap();
+        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let store = crate::identity::IdentityStore::open(storage);
+        let generated = store.generate().unwrap();
+        assert!(matches!(
+            generated.status,
+            PersistedNodeStatus::PendingInitialization
+        ));
+        store.persist(&generated).await.unwrap();
+        drop(store);
+
+        let env = settings_env(&[("STORAGE_PATH", tempdir.path().to_str().unwrap())]);
+        let (config, _storage) = resolve_settings(read_settings_from(&env).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            config.startup_mode,
+            super::StartupMode::InitializeRealm { .. }
+        ));
+        assert_eq!(config.node_state, generated);
     }
 }
