@@ -1,8 +1,6 @@
-use crate::blob::records::blob_location_read;
 use crate::blob::managed_copy::ManagedCopyError;
-use crate::connectors::{
-    ResolveVersionSourceBindingInput, resolve_binding_effect,
-};
+use crate::blob::records::blob_location_read;
+use crate::connectors::{ResolveVersionSourceBindingInput, resolve_binding_effect};
 use crate::s3::object_lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read, summary_from_read,
@@ -464,9 +462,9 @@ impl HeadObjectOperation {
             self.txn_id = None;
             if let Some(source) = self.reference_source.take() {
                 self.state = HeadObjectState::ResolveReferenceAccess;
-                return smallvec![resolve_binding_effect(
-                    ResolveVersionSourceBindingInput { source },
-                )];
+                return smallvec![resolve_binding_effect(ResolveVersionSourceBindingInput {
+                    source
+                },)];
             }
             self.state = HeadObjectState::Finish;
             smallvec![]

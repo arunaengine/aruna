@@ -208,9 +208,12 @@ impl UploadPartOperation {
             Ok(record) => record,
             Err(err) => return self.emit_error(err.into()),
         };
-        if let Err(err) =
-            validate_upload(&record, &self.input.bucket, &self.input.key, StatusCheck::Open)
-        {
+        if let Err(err) = validate_upload(
+            &record,
+            &self.input.bucket,
+            &self.input.key,
+            StatusCheck::Open,
+        ) {
             return self.emit_error(err.into());
         }
         // Cheap re-check of the create-time refs: no ref is resolved again, but
@@ -461,9 +464,12 @@ impl UploadPartOperation {
             Ok(record) => record,
             Err(err) => return self.cleanup_failed_write(err.into()),
         };
-        if let Err(err) =
-            validate_upload(&record, &self.input.bucket, &self.input.key, StatusCheck::Open)
-        {
+        if let Err(err) = validate_upload(
+            &record,
+            &self.input.bucket,
+            &self.input.key,
+            StatusCheck::Open,
+        ) {
             return self.cleanup_failed_write(err.into());
         }
 
@@ -691,9 +697,7 @@ impl Operation for UploadPartOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             UploadPartState::Init => self.handle_init(),
-            UploadPartState::CheckPurgeFenceBeforeWrite => {
-                self.check_write_fence(event)
-            }
+            UploadPartState::CheckPurgeFenceBeforeWrite => self.check_write_fence(event),
             UploadPartState::ReadUpload => self.handle_upload_read(event),
             UploadPartState::WritePart => self.handle_write_finished(event),
             UploadPartState::CleanupFailedWrite => self.write_cleanup_failed(event),

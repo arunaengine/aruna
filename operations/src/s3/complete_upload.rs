@@ -1,9 +1,9 @@
+use crate::blob::cleanup::schedule_cleanup_effect;
+use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, write_head_effect,
     write_location_effect, write_version_effect,
 };
-use crate::blob::cleanup::schedule_cleanup_effect;
-use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
@@ -453,10 +453,7 @@ impl CompleteMultipartUploadOperation {
 
     fn finish_commit(&mut self) -> Effects {
         self.state = CompleteMultipartUploadState::Finish;
-        smallvec![
-            schedule_snapshot_publish(),
-            schedule_cleanup_effect()
-        ]
+        smallvec![schedule_snapshot_publish(), schedule_cleanup_effect()]
     }
 
     fn abort_finalize(&mut self, event: Event) -> Effects {
@@ -1765,15 +1762,9 @@ impl Operation for CompleteMultipartUploadOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             CompleteMultipartUploadState::Init => self.handle_init(),
-            CompleteMultipartUploadState::StartMarkTransaction => {
-                self.mark_started(event)
-            }
-            CompleteMultipartUploadState::CheckPurgeFenceForMark => {
-                self.mark_fence_checked(event)
-            }
-            CompleteMultipartUploadState::ReadUploadForMark => {
-                self.mark_upload_read(event)
-            }
+            CompleteMultipartUploadState::StartMarkTransaction => self.mark_started(event),
+            CompleteMultipartUploadState::CheckPurgeFenceForMark => self.mark_fence_checked(event),
+            CompleteMultipartUploadState::ReadUploadForMark => self.mark_upload_read(event),
             CompleteMultipartUploadState::WriteUploadCompleting => self.handle_upload_marked(event),
             CompleteMultipartUploadState::CommitMarkTransaction => {
                 self.handle_mark_committed(event)
@@ -1782,36 +1773,22 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::ReadGateBucket => self.handle_gate_bucket(event),
             CompleteMultipartUploadState::PolicyGate => self.handle_policy_gate(event),
             CompleteMultipartUploadState::ComposeBlob => self.handle_blob_composed(event),
-            CompleteMultipartUploadState::StartFinalizeTransaction => {
-                self.finalize_started(event)
-            }
+            CompleteMultipartUploadState::StartFinalizeTransaction => self.finalize_started(event),
             CompleteMultipartUploadState::CheckPurgeFenceForFinalize => {
                 self.finalize_fence_checked(event)
             }
             CompleteMultipartUploadState::ReadBucketDefault => self.handle_default_read(event),
             CompleteMultipartUploadState::FenceBackend => self.handle_backend_fenced(event),
             CompleteMultipartUploadState::CheckHashLookup => self.hash_checked(event),
-            CompleteMultipartUploadState::WriteBlobLocation => {
-                self.location_written(event)
-            }
+            CompleteMultipartUploadState::WriteBlobLocation => self.location_written(event),
             CompleteMultipartUploadState::ReadObjectLookup => self.object_lookup_read(event),
-            CompleteMultipartUploadState::ReadLivenessVersion => {
-                self.liveness_read(event)
-            }
+            CompleteMultipartUploadState::ReadLivenessVersion => self.liveness_read(event),
             CompleteMultipartUploadState::WriteBlobHead => self.head_written(event),
-            CompleteMultipartUploadState::WriteHashPathIndex => {
-                self.path_index_written(event)
-            }
-            CompleteMultipartUploadState::WriteBlobVersionRecord => {
-                self.version_written(event)
-            }
+            CompleteMultipartUploadState::WriteHashPathIndex => self.path_index_written(event),
+            CompleteMultipartUploadState::WriteBlobVersionRecord => self.version_written(event),
             CompleteMultipartUploadState::RegisterManagedCopy => self.handle_copy_registered(event),
-            CompleteMultipartUploadState::WriteObjectMetadata => {
-                self.metadata_written(event)
-            }
-            CompleteMultipartUploadState::DeleteUploadRecords => {
-                self.records_deleted(event)
-            }
+            CompleteMultipartUploadState::WriteObjectMetadata => self.metadata_written(event),
+            CompleteMultipartUploadState::DeleteUploadRecords => self.records_deleted(event),
             CompleteMultipartUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             CompleteMultipartUploadState::WriteLiveReplicationObligation => {
                 self.obligation_written(event)
@@ -1821,24 +1798,14 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::CommitFinalizeTransaction => {
                 self.handle_finalize_committed(event)
             }
-            CompleteMultipartUploadState::AbortFinalizeTransaction => {
-                self.abort_finalize(event)
-            }
-            CompleteMultipartUploadState::ResetUploadTransaction => {
-                self.reset_started(event)
-            }
-            CompleteMultipartUploadState::ReadUploadForReset => {
-                self.reset_upload_read(event)
-            }
-            CompleteMultipartUploadState::WriteUploadReset => {
-                self.upload_reset(event)
-            }
+            CompleteMultipartUploadState::AbortFinalizeTransaction => self.abort_finalize(event),
+            CompleteMultipartUploadState::ResetUploadTransaction => self.reset_started(event),
+            CompleteMultipartUploadState::ReadUploadForReset => self.reset_upload_read(event),
+            CompleteMultipartUploadState::WriteUploadReset => self.upload_reset(event),
             CompleteMultipartUploadState::CommitResetTransaction => {
                 self.handle_reset_committed(event)
             }
-            CompleteMultipartUploadState::CleanupFailedCompose => {
-                self.compose_cleanup(event)
-            }
+            CompleteMultipartUploadState::CleanupFailedCompose => self.compose_cleanup(event),
             CompleteMultipartUploadState::QueueCleanupRow => self.handle_cleanup_queued(event),
             CompleteMultipartUploadState::ReleaseReservation => self.handle_release(event),
             CompleteMultipartUploadState::Finish => smallvec![],

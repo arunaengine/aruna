@@ -1,10 +1,10 @@
-use crate::blob::records::{
-    HeadAliasContext, add_index_effect, blob_location_read, write_head_effect,
-    write_location_effect, write_version_effect,
-};
 use crate::blob::managed_copy::{
     CopyRegistration, CopyRequest, ManagedCopyError, register_effect, serve_reads,
     split_serve_reads, validate_registration,
+};
+use crate::blob::records::{
+    HeadAliasContext, add_index_effect, blob_location_read, write_head_effect,
+    write_location_effect, write_version_effect,
 };
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
@@ -1449,9 +1449,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadPreassignedCopy => self.handle_preassigned_copy(event),
             PutObjectState::ReadGateBucket => self.handle_gate_bucket(event),
             PutObjectState::PolicyGate => self.handle_policy_gate(event),
-            PutObjectState::CheckPurgeFenceBeforeWrite => {
-                self.write_fence_checked(event)
-            }
+            PutObjectState::CheckPurgeFenceBeforeWrite => self.write_fence_checked(event),
             PutObjectState::WriteBlob => self.handle_write_finished(event),
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
@@ -1466,13 +1464,9 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadLivenessVersion => self.liveness_read(event),
             PutObjectState::WriteBlobHead => self.head_written(event),
             PutObjectState::WriteHashPathIndex => self.path_index_created(event),
-            PutObjectState::CreateBlobVersionRecord => {
-                self.version_created(event)
-            }
+            PutObjectState::CreateBlobVersionRecord => self.version_created(event),
             PutObjectState::RegisterManagedCopy => self.handle_copy_registered(event),
-            PutObjectState::WriteLiveReplicationObligation => {
-                self.obligation_written(event)
-            }
+            PutObjectState::WriteLiveReplicationObligation => self.obligation_written(event),
             PutObjectState::EnforceQuota => self.handle_enforce_quota(event),
             PutObjectState::QuotaRejectAbort => self.abort_quota_reject(event),
             PutObjectState::UpdateUsage => self.handle_usage_update(event),

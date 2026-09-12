@@ -428,30 +428,20 @@ impl Operation for AbortMultipartUploadOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             AbortMultipartUploadState::Init => self.handle_init(),
-            AbortMultipartUploadState::StartMarkTransaction => {
-                self.mark_started(event)
-            }
+            AbortMultipartUploadState::StartMarkTransaction => self.mark_started(event),
             AbortMultipartUploadState::ReadUploadForMark => self.mark_upload_read(event),
             AbortMultipartUploadState::WriteUploadAborting => self.handle_upload_marked(event),
             AbortMultipartUploadState::CommitMarkTransaction => self.handle_mark_committed(event),
             AbortMultipartUploadState::ReadUploadParts => self.upload_parts_read(event),
-            AbortMultipartUploadState::StartDeleteTransaction => {
-                self.delete_started(event)
-            }
-            AbortMultipartUploadState::DeleteUploadRecords => {
-                self.records_deleted(event)
-            }
+            AbortMultipartUploadState::StartDeleteTransaction => self.delete_started(event),
+            AbortMultipartUploadState::DeleteUploadRecords => self.records_deleted(event),
             AbortMultipartUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             AbortMultipartUploadState::CommitDeleteTransaction => {
                 self.handle_delete_committed(event)
             }
             AbortMultipartUploadState::CleanupPartBlobs => self.blob_cleaned(event),
-            AbortMultipartUploadState::ResetUploadTransaction => {
-                self.reset_started(event)
-            }
-            AbortMultipartUploadState::ReadUploadForReset => {
-                self.reset_upload_read(event)
-            }
+            AbortMultipartUploadState::ResetUploadTransaction => self.reset_started(event),
+            AbortMultipartUploadState::ReadUploadForReset => self.reset_upload_read(event),
             AbortMultipartUploadState::WriteUploadReset => self.upload_reset(event),
             AbortMultipartUploadState::CommitResetTransaction => self.handle_reset_committed(event),
             AbortMultipartUploadState::Finish => smallvec![],
