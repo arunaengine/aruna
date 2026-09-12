@@ -39,7 +39,7 @@ use crate::metadata::projector::{create_outbox_record, registry_outbox_record};
 use crate::metadata::repository::{
     StorageReadError, event_projection_entries, parse_registry_read, read_registry_effect,
 };
-use crate::sync::document_outbox::{outbox_write_entry, schedule_outbox_drain_effect};
+use crate::sync::document_outbox::{outbox_write_entry, schedule_drain_effect};
 use crate::sync::shard_placement::sort_node_ids;
 
 const RAW_EVENT_LIMIT: usize = METADATA_RAW_EVENT_LIMIT as usize;
@@ -885,12 +885,12 @@ impl Operation for UpdateMetadataDocumentOperation {
             UpdateMetadataDocumentState::ScheduleMaterializationDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = UpdateMetadataDocumentState::ScheduleOutboxDrain;
-                    smallvec![schedule_outbox_drain_effect()]
+                    smallvec![schedule_drain_effect()]
                 }
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     warn!(message = %message, "Failed to schedule metadata materialization drain after committed update");
                     self.state = UpdateMetadataDocumentState::ScheduleOutboxDrain;
-                    smallvec![schedule_outbox_drain_effect()]
+                    smallvec![schedule_drain_effect()]
                 }
                 other => self.unexpected_event(
                     "metadata materialization drain schedule",

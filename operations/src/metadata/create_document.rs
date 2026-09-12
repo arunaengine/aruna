@@ -771,7 +771,7 @@ pub async fn create_metadata_document(
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     if let Some(task_handle) = context.task_handle.as_ref() {
         task_handle
-            .send_effect(crate::jobs::submit::schedule_materialization())
+            .send_effect(crate::metadata::materialization_queue::schedule_materialization())
             .await;
     }
     Ok(created)

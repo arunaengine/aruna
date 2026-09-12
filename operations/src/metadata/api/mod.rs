@@ -62,7 +62,7 @@ use self::preflight::{
     resolve_preflight_targets,
 };
 pub(crate) use self::read::{
-    can_read_record, ensure_record_readable, filter_live_records, load_document_record,
+    can_read_record, ensure_record_readable, filter_live_records, load_live_record,
     metadata_read_request,
 };
 use self::read::{

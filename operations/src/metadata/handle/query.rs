@@ -9,17 +9,15 @@ use aruna_core::metadata::{MetadataError, MetadataQueryResults};
 use aruna_core::structs::AuthContext;
 use aruna_core::telemetry::{record_duration_ms, record_elapsed_ms};
 use craqle::{CraqleNode, GraphId};
-use oxrdf::{BlankNode, Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use spareval::{CancellationToken, QueryEvaluator};
 use spargebra::{Query, SparqlParser};
-use tokio::time::timeout_at;
 use tracing::{Span, debug_span, field};
 
 use super::effects::{graph_ids, record_error, record_query_counts};
 use super::search::select_authorized_graphs;
 use super::{
-    METADATA_QUERY_COMMON_PREFIXES, METADATA_QUERY_DEADLINE, METADATA_QUERY_MAX_BYTES,
-    METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS, MetadataHandle, MetadataInner,
+    METADATA_QUERY_COMMON_PREFIXES, METADATA_QUERY_DEADLINE, METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS, METADATA_REGISTRY_CANDIDATE_LIMIT, MetadataHandle, MetadataInner,
 };
 use crate::metadata::query_cache::{CachedQuery, LocalScopeKind, graphs_digest, local_key};
 #[tracing::instrument(

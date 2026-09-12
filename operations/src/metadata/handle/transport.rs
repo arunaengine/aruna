@@ -9,15 +9,14 @@ use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_net::streams::{BiStream, RecvStream};
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, timeout_at};
 use tracing::{Span, field};
 use ulid::Ulid;
 
 use super::effects::{record_error, record_query_counts};
 use super::{
-    METADATA_CHUNK_SIZE, METADATA_ENVELOPE_BYTES, METADATA_IO_TIMEOUT, MetadataHandle,
-    MetadataInner, SYNC_MIRROR_REQUEST_TIMEOUT,
+    METADATA_CHUNK_SIZE, METADATA_ENVELOPE_BYTES, METADATA_IO_TIMEOUT, MetadataHandle, MetadataInner, MetadataRequestError, SYNC_MIRROR_REQUEST_TIMEOUT,
 };
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::metadata::protocol::{

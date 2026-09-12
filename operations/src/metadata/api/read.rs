@@ -12,7 +12,7 @@ pub async fn query_metadata_document(
     request: MetadataDocumentQueryRequest,
 ) -> Result<MetadataQueryExecution, MetadataApiError> {
     ensure_query_form(&request.query)?;
-    let record = load_document_record(context, request.document_id).await?;
+    let record = load_live_record(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record, None).await?;
     let metadata = context
         .metadata_handle
@@ -828,7 +828,7 @@ pub(super) fn merge_pending_records(
     }
 }
 
-pub(crate) async fn load_document_record(
+pub(crate) async fn load_live_record(
     context: &DriverContext,
     document_id: Ulid,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {

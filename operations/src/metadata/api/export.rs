@@ -6,7 +6,7 @@ pub async fn get_visible_document(
     realm_id: RealmId,
     request: GetVisibleMetadataDocumentRequest,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
-    let record = load_document_record(context, request.document_id).await?;
+    let record = load_live_record(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record, None).await?;
     ensure_record_materialized(context, &record).await?;
     Ok(record)
@@ -20,7 +20,7 @@ pub async fn export_metadata_rocrate(
     if request.view == MetadataRoCrateExportView::Raw {
         return export_raw(context, realm_id, request).await;
     }
-    let record = load_document_record(context, request.document_id).await?;
+    let record = load_live_record(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record, None).await?;
 
     match request.view {

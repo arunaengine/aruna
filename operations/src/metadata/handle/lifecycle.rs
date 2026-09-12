@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE};
 use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, MetadataGraphLifecycleRecord,
@@ -22,9 +23,7 @@ use ulid::Ulid;
 
 use super::entity_convert::error_from_craqle;
 use super::{
-    METADATA_GRAPH_SYNC_ATTEMPTS, METADATA_GRAPH_SYNC_RETRY_AFTER,
-    METADATA_REGISTRY_CANDIDATE_LIMIT, METADATA_VISIBILITY_CACHE_TTL, MetadataHandle,
-    MetadataInner, summary_cache,
+    LifecycleDeletedCacheEntry, METADATA_GRAPH_SYNC_ATTEMPTS, METADATA_GRAPH_SYNC_RETRY_AFTER, METADATA_REGISTRY_CANDIDATE_LIMIT, METADATA_VISIBILITY_CACHE_TTL, MetadataHandle, MetadataInner, MetadataVisibilityCache, RegistryCacheEntry, VisibilityFillResult, metadata_graph_fence, summary_cache,
 };
 use crate::metadata::repository::{
     StorageReadError, iter_registry_effect, parse_lifecycle_read, parse_registry_iter,
@@ -257,7 +256,7 @@ impl MetadataVisibilityCache {
         }
     }
 
-    pub(super) fn refresh_lifecycle_deleted(
+    pub(super) fn refresh_if_current(
         &self,
         entries: impl IntoIterator<Item = (String, bool)>,
         fill_generation: u64,
@@ -675,7 +674,7 @@ pub(super) async fn list_local_records(
         elapsed_ms = field::Empty,
     )
 )]
-pub(super) async fn list_group_records(
+pub(super) async fn list_local_group(
     inner: Arc<MetadataInner>,
     group_id: GroupId,
 ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {

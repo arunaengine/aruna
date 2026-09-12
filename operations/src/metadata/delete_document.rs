@@ -37,7 +37,7 @@ use crate::metadata::repository::{
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
 use crate::sync::document_outbox::{
-    new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect_with_txn,
+    new_identified_record, schedule_drain_effect, write_transaction_effect,
 };
 use crate::tasks::queue_backoff::conflict_backoff;
 
@@ -224,7 +224,7 @@ impl DeleteMetadataDocumentOperation {
             self.document_lifecycle_placement_ref,
         );
         // A delete mints the graph-lifecycle topic genesis before publishing its tombstone.
-        Ok(new_outbox_record_with_id(
+        Ok(new_identified_record(
             lifecycle_record.event_id(),
             self.actor.node_id,
             DocumentSyncTarget::MetadataDocumentLifecycle {
@@ -248,7 +248,7 @@ impl DeleteMetadataDocumentOperation {
     ) -> Result<Effects, DeleteMetadataDocumentError> {
         let outbox = self.lifecycle_outbox_record(record)?;
         Ok(smallvec![
-            write_outbox_effect_with_txn(&outbox, Some(txn_id))
+            write_transaction_effect(&outbox, Some(txn_id))
                 .map_err(|error| { DeleteMetadataDocumentError::ConversionError(error.into()) })?
         ])
     }
@@ -270,7 +270,7 @@ impl DeleteMetadataDocumentOperation {
             self.actor.node_id,
             self.graph_lifecycle_placement_ref,
         );
-        let outbox = new_outbox_record_with_id(
+        let outbox = new_identified_record(
             outbox_id,
             self.actor.node_id,
             DocumentSyncTarget::MetadataGraphLifecycle {
@@ -288,7 +288,7 @@ impl DeleteMetadataDocumentOperation {
                 .generation(&record.realm_id, &self.graph_lifecycle_placement_ref),
         );
         Ok(smallvec![
-            write_outbox_effect_with_txn(&outbox, Some(txn_id))
+            write_transaction_effect(&outbox, Some(txn_id))
                 .map_err(|error| { DeleteMetadataDocumentError::ConversionError(error.into()) })?
         ])
     }
@@ -297,7 +297,7 @@ impl DeleteMetadataDocumentOperation {
         if self.lifecycle_record.is_none() {
             return Err(DeleteMetadataDocumentError::DocumentNotFound);
         }
-        Ok(smallvec![schedule_outbox_drain_effect()])
+        Ok(smallvec![schedule_drain_effect()])
     }
 
     fn delete_outbox_effect(
@@ -313,7 +313,7 @@ impl DeleteMetadataDocumentOperation {
             self.actor.node_id,
             self.registry_placement_ref,
         );
-        let outbox = new_outbox_record_with_id(
+        let outbox = new_identified_record(
             lifecycle_record.event_id(),
             self.actor.node_id,
             DocumentSyncTarget::MetadataRegistry {
@@ -330,13 +330,13 @@ impl DeleteMetadataDocumentOperation {
                 .generation(&record.realm_id, &self.registry_placement_ref),
         );
         Ok(smallvec![
-            write_outbox_effect_with_txn(&outbox, Some(txn_id))
+            write_transaction_effect(&outbox, Some(txn_id))
                 .map_err(|error| { DeleteMetadataDocumentError::ConversionError(error.into()) })?
         ])
     }
 
     fn delete_schedule_effect(&self) -> Effects {
-        smallvec![schedule_outbox_drain_effect()]
+        smallvec![schedule_drain_effect()]
     }
 
     fn fail(&mut self, error: DeleteMetadataDocumentError) -> Effects {
@@ -358,7 +358,7 @@ impl DeleteMetadataDocumentOperation {
 
 /// The timestamp-index key is only reconstructible from the record's own
 /// `updated_at_ms`, so it is deleted inside the same transaction as the row.
-fn delete_index_effect(record: &MetadataRegistryRecord, txn_id: Option<Ulid>) -> Effect {
+fn delete_updated_index(record: &MetadataRegistryRecord, txn_id: Option<Ulid>) -> Effect {
     let (key_space, key) = updated_index_delete(record);
     Effect::Storage(StorageEffect::Delete {
         key_space,
@@ -620,7 +620,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
                     self.state = DeleteMetadataDocumentState::DeleteUpdatedIndex;
-                    smallvec![delete_index_effect(record, Some(txn_id))]
+                    smallvec![delete_updated_index(record, Some(txn_id))]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("holders delete result", format!("{other:?}")),

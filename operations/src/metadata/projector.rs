@@ -47,7 +47,7 @@ use crate::metadata::repository::{
     parse_status_read, read_document_registry, read_lifecycle_effect, read_status_effect,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
-use crate::sync::document_outbox::schedule_outbox_drain_effect;
+use crate::sync::document_outbox::schedule_drain_effect;
 use crate::sync::shard_placement::sort_node_ids;
 use crate::tasks::task_persistence::persist_task_effect;
 
@@ -1116,7 +1116,7 @@ async fn schedule_outbox_drain(context: &DriverContext) -> Result<(), MetadataPr
         return Ok(());
     };
     match task_handle
-        .send_effect(schedule_outbox_drain_effect())
+        .send_effect(schedule_drain_effect())
         .await
     {
         Event::Task(aruna_core::task::TaskEvent::TimerScheduled { .. }) => Ok(()),
@@ -1848,7 +1848,7 @@ mod tests {
         config.ensure_node(node(4), RealmNodeKind::Server);
         // A user node holds no bucket, so its create fell back to the hashed
         // one (stage 1); it still never becomes a holder of it.
-        event.record.placement = crate::placement::placement_ref_for_target(
+        event.record.placement = crate::placement::target_placement_ref(
             &config,
             &DocumentSyncTarget::MetadataDocumentLifecycle {
                 document_id: event.record.document_id,
