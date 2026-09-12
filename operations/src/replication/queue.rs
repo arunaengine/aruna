@@ -12,9 +12,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, RealmId, ReferenceHandling, SyncMode, SyncRelationship, SyncState,
-    WatchEvent, WatchEventDetail, WatchEventKind, sync_relationship_key, sync_relationship_prefix,
-    watch_resource_path,
+    ArunaArn, AuthContext, RealmId, ReferenceHandling, ReplicationFailure, ReplicationItemError,
+    SyncMode, SyncRelationship, SyncState, WatchEvent, WatchEventDetail, WatchEventKind,
+    sync_relationship_key, sync_relationship_prefix, watch_resource_path,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -29,6 +29,7 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
+use super::error::ReplicationError;
 use super::protocol::{ReferenceAdvance, ReplicationMode, SyncOrigin};
 use super::version_replication::{
     ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
@@ -1244,14 +1245,16 @@ fn mark_success(relationship: &mut SyncRelationship, replicated: u64, bytes: u64
     relationship.status.counters.consecutive_failures = 0;
 }
 
-fn is_access_denied(error: &str) -> bool {
-    error.contains("Replication requires WRITE permission")
-        || error.contains("access_denied")
-        || error.contains("source access denied")
-}
-
-fn is_writer_denied(error: &str) -> bool {
-    error.contains("writer_access_denied")
+/// The stable failure category of a scope-level error. Only a peer rejection
+/// carries one through; everything else is retryable.
+fn scope_failure(error: &ReplicateScopeError) -> ReplicationFailure {
+    match error {
+        ReplicateScopeError::ReplicateObjectVersionError(error) => error.failure_category(),
+        ReplicateScopeError::ReplicationError(ReplicationError::ReplicationRejected(reason)) => {
+            ReplicationItemError::from_peer_reason(reason).failure
+        }
+        _ => ReplicationFailure::Other,
+    }
 }
 
 async fn store_relationship(
@@ -1517,6 +1520,7 @@ async fn finish_blob_job(
     watch_group_id: Option<GroupId>,
     relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
 ) -> Result<BlobReplicationJobOutcome, String> {
+    let mut failure: Option<ReplicationFailure> = None;
     let error = match drive(operation, context).await {
         Ok(Some(Ok(result))) if result.failed == 0 => {
             if let Some(relationship) = relationship.as_mut() {
@@ -1530,11 +1534,12 @@ async fn finish_blob_job(
             return Ok(BlobReplicationJobOutcome::Succeeded);
         }
         Ok(Some(Ok(result))) => {
-            if result.last_error.as_deref().is_some_and(is_writer_denied) {
+            failure = result.failure;
+            if failure.is_some_and(ReplicationFailure::is_writer_denied) {
                 return Ok(BlobReplicationJobOutcome::TerminalFailure);
             }
             if job.reference_advance.is_some()
-                && result.last_error.as_deref().is_some_and(is_access_denied)
+                && failure.is_some_and(ReplicationFailure::is_access_denied)
             {
                 return Ok(BlobReplicationJobOutcome::TerminalFailure);
             }
@@ -1553,7 +1558,7 @@ async fn finish_blob_job(
                     result.replicated, result.skipped, result.failed
                 ),
             };
-            if result.last_error.as_deref().is_some_and(is_access_denied)
+            if failure.is_some_and(ReplicationFailure::is_access_denied)
                 && let Some(relationship) = relationship.as_mut()
             {
                 relationship.state = SyncState::Failed {
@@ -1570,17 +1575,20 @@ async fn finish_blob_job(
             }
             error
         }
-        Ok(Some(Err(error))) => error.to_string(),
+        Ok(Some(Err(error))) => {
+            failure = Some(scope_failure(&error));
+            error.to_string()
+        }
         Ok(None) => "replication produced no result".to_string(),
-        Err(error) => error.to_string(),
+        Err(error) => {
+            failure = Some(scope_failure(&error));
+            error.to_string()
+        }
     };
-    if is_access_denied(&error) || is_writer_denied(&error) {
+    if failure.is_some_and(ReplicationFailure::is_denied) {
         return Ok(BlobReplicationJobOutcome::TerminalFailure);
     }
     if let Some(relationship) = relationship.as_mut() {
-        if is_writer_denied(&error) {
-            return Ok(BlobReplicationJobOutcome::TerminalFailure);
-        }
         mark_failure(relationship, &error);
         let stored = store_relationship(context, relationship.clone()).await?;
         cache_relationship(relationships, job, relationship, stored);
@@ -3602,9 +3610,21 @@ mod tests {
             blob_job_key(&first).unwrap(),
             blob_job_key(&second).unwrap()
         );
-        assert!(is_access_denied("Replication requires WRITE permission"));
-        assert!(is_access_denied("access_denied"));
-        assert!(!is_access_denied("quota"));
+        assert!(
+            ReplicationItemError::from_peer_reason("access_denied")
+                .failure
+                .is_access_denied()
+        );
+        assert!(
+            ReplicationItemError::from_peer_reason("writer_access_denied")
+                .failure
+                .is_writer_denied()
+        );
+        assert!(
+            !ReplicationItemError::from_peer_reason("quota")
+                .failure
+                .is_denied()
+        );
     }
 
     #[test]
