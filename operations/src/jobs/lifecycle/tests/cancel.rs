@@ -17,7 +17,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::cancel::cancel_family;
 use crate::jobs::lifecycle::target::{admit_launch, commit_receipt, commit_with};
-use crate::jobs::records::tests::fixture::{Family, REALM, user};
+use crate::jobs::records::tests::fixtures::{Family, REALM, user};
 use crate::jobs::records::transport::serve_job_record;
 use crate::jobs::records::{
     Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_kind_complete,

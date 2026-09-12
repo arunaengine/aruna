@@ -12,7 +12,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::s3::listing::{ListMarker, pack_page, retain_after_marker};
+use crate::s3::listing::{ListMarker, build_page, retain_after_marker};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ListMultipartUploadsState {
@@ -130,9 +130,8 @@ impl ListMultipartUploadsOperation {
     }
 
     fn handle_init(&mut self) -> Effects {
-        // Mirror the key-listing operations: max_uploads=0 short-circuits to an
-        // empty, non-truncated result instead of reporting truncation with no
-        // usable resume marker.
+        // Mirror the key listings: max_uploads=0 returns an empty,
+        // non-truncated result instead of truncating without a resume marker.
         if self.input.max_uploads == 0 {
             self.state = ListMultipartUploadsState::Finish;
             self.output = Some(Ok(ListMultipartUploadsResult {
@@ -271,7 +270,7 @@ impl ListMultipartUploadsOperation {
             return self.emit_error(ListMultipartUploadsError::NoTransactionFound);
         };
 
-        let page = pack_page(
+        let page = build_page(
             &uploads,
             self.input.max_uploads,
             self.input.prefix.as_deref(),
@@ -435,7 +434,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_multipart_uploads_filters_by_bucket() {
+    async fn bucket_filters() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -577,7 +576,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_multipart_uploads_zero_max_returns_empty_not_truncated() {
+    async fn zero_limit_empty() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -605,7 +604,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_multipart_uploads_orders_by_key_then_upload_id() {
+    async fn key_order_stable() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -714,7 +713,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_multipart_uploads_paginates_with_markers() {
+    async fn markers_paginate() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -877,7 +876,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_multipart_uploads_filters_by_prefix() {
+    async fn prefix_filters() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -916,7 +915,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_multipart_uploads_groups_by_delimiter() {
+    async fn delimiter_groups() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();

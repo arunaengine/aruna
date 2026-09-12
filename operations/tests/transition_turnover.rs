@@ -1,26 +1,15 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 //! A partial-overlap rebalance: one holder leaves a bucket, two stay, one joins.
-//!
-//! Turnover is the case expansion cannot reach: the bucket's holder set both
-//! grows and shrinks, so the leaving node ends up with a complete local copy it
-//! is no longer authority for. The scenario pins that the preview an operator
-//! sees is the outcome they get, that the leaver's stale copy never counts as
-//! holdership, and that a write arriving there is forwarded to the new holders
-//! rather than silently applied (DECISIONS D10).
 
 mod topology;
 
 use aruna_core::StructuredId;
 use aruna_core::structs::{PlacementRef, TransitionLimits};
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
-};
-use aruna_operations::metadata::forward::update_metadata_document_routed;
+use aruna_operations::metadata::create_document::mint_local_document;
+use aruna_operations::metadata::forward::route_metadata_update;
 use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
-use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::update_document::UpdateMetadataDocumentMutation;
 use aruna_operations::placement::holds_placement;
 use aruna_operations::placement::transition::preview_transition;
@@ -42,7 +31,9 @@ async fn turnover_moves_holder() -> TestResult<()> {
     let leaver = origin.node_id();
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
-    let placement = create_document(&realm, origin, group_id, document_id, path).await?;
+    let placement = realm
+        .create_document(origin, group_id, document_id, path, "turnover fixture")
+        .await?;
     let before = realm.assert_holder(leaver, &placement);
     for holder in &before {
         let node = realm.find(*holder);
@@ -123,7 +114,7 @@ async fn turnover_moves_holder() -> TestResult<()> {
 
     // D10: the write arrives at the leaver and reaches the new holders anyway.
     let leaver_node = realm.find(leaver);
-    update_metadata_document_routed(
+    route_metadata_update(
         &leaver_node.context,
         realm.actor(leaver_node),
         None,
@@ -151,34 +142,6 @@ async fn turnover_moves_holder() -> TestResult<()> {
 
     realm.shutdown().await;
     Ok(())
-}
-
-async fn create_document(
-    realm: &Topology,
-    node: &TestNode,
-    group_id: Ulid,
-    document_id: Ulid,
-    document_path: &str,
-) -> TestResult<PlacementRef> {
-    let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
-            actor: realm.actor(node),
-            group_id,
-            document_id,
-            document_path: document_path.to_string(),
-            public: false,
-            payload: CreateMetadataDocumentPayload::Scaffold {
-                name: document_path.to_string(),
-                description: "turnover fixture".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: None,
-            },
-        }),
-        node.context.as_ref(),
-    )
-    .await?;
-    replay_metadata_event_log(node.context.as_ref()).await?;
-    Ok(created.record.placement)
 }
 
 async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {

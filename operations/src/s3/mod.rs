@@ -41,4 +41,5 @@ pub mod session;
 #[cfg(test)]
 mod tests;
 pub mod upload_part;
+mod upload_target;
 mod write_cleanup;

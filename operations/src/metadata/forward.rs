@@ -21,17 +21,15 @@ use aruna_core::metadata::{
     MetadataProfileValidationStatus, MetadataQueryResults, MetadataRawRevision, raw_context_digest,
 };
 use aruna_core::reducer::AdminDocumentReducerState;
-use aruna_core::storage_entries::{
-    admin_document_reducer_state_key, metadata_create_acceptance_key,
-};
+use aruna_core::storage_entries::{create_acceptance_key, reducer_state_key};
 use aruna_core::structs::{
     Actor, AuthContext, BucketInfo, Group, GroupAuthorizationDocument, JobId,
     MetadataRegistryRecord, MintPersistentIdSpec, Permission, PersistentIdFailure,
     PersistentIdMapping, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind, SyncRefusal,
 };
 use aruna_core::telemetry::time_stage;
+use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::{GroupId, UserId};
-use aruna_core::util::unix_timestamp_secs;
 use aruna_core::{MetaResourceId, StructuredId};
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
@@ -54,7 +52,7 @@ use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
     MetadataApiError, MetadataRoCrateExportView, ensure_record_readable, export_metadata_rocrate,
-    get_visible_metadata_document, load_record_by_document,
+    get_visible_document, load_document_record,
 };
 use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
@@ -64,7 +62,7 @@ use crate::metadata::create_document::{
 use crate::metadata::delete_document::{
     DeleteMetadataDocumentError, DeleteMetadataDocumentOperation, delete_metadata_document,
 };
-use crate::metadata::get_document::load_metadata_record_by_document;
+use crate::metadata::get_document::load_document_record;
 use crate::metadata::handle::{
     MetadataRequestDelivery, MetadataRequestError, MetadataWritePeerError,
 };
@@ -79,7 +77,7 @@ use crate::metadata::update_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
     UpdateMetadataDocumentOperation, update_metadata_document,
 };
-use crate::node::node_info::read_node_info_documents;
+use crate::node::node_info::read_info_documents;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::placement::process_placements::load_realm_config;
 use crate::placement::selector::select_top_peers;
@@ -399,7 +397,7 @@ async fn device_export(
         }
         MetadataRoCrateExportView::Summary => Ok(ExportMetadataRoCrateResult::Summary {
             jsonld: handle
-                .export_rocrate_summary_jsonld(record.graph_iri.clone())
+                .export_summary_jsonld(record.graph_iri.clone())
                 .await
                 .map_err(|_| MetadataApiError::ServiceUnavailable)?,
             record,
@@ -442,7 +440,7 @@ pub async fn get_metadata_routed(
     auth_token: Option<MetadataAuthToken>,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
     if context.net_handle.is_none() {
-        return get_visible_metadata_document(context.as_ref(), realm_id, request).await;
+        return get_visible_document(context.as_ref(), realm_id, request).await;
     }
     let config = load_realm_config(context, realm_id)
         .await
@@ -485,7 +483,7 @@ pub async fn get_metadata_routed(
         let auth_token = auth_token.clone();
         Box::pin(async move {
             if Some(holder) == local_node {
-                let record = get_visible_metadata_document(context.as_ref(), realm_id, request)
+                let record = get_visible_document(context.as_ref(), realm_id, request)
                     .await
                     .map_err(read_error)?;
                 if routed_record_matches(&config, realm_id, record.document_id, &placement, &record)
@@ -566,14 +564,14 @@ pub async fn get_metadata_routed(
 
 /// Reads or recomputes Profile status on the document's holders. The holder
 /// performs the same per-document READ check as the ordinary metadata route.
-pub async fn profile_validation_status_routed(
+pub async fn route_profile_status(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     request: GetVisibleMetadataDocumentRequest,
     auth_token: Option<MetadataAuthToken>,
     revalidate: bool,
 ) -> Result<MetadataProfileValidationStatus, MetadataApiError> {
-    let registry = load_record_by_document(context.as_ref(), request.document_id).await?;
+    let registry = load_document_record(context.as_ref(), request.document_id).await?;
     if context.net_handle.is_none() {
         ensure_record_readable(
             context.as_ref(),
@@ -612,7 +610,7 @@ pub async fn profile_validation_status_routed(
         let auth_token = auth_token.clone();
         Box::pin(async move {
             if Some(holder) == local_node {
-                let record = load_record_by_document(context.as_ref(), request.document_id)
+                let record = load_document_record(context.as_ref(), request.document_id)
                     .await
                     .map_err(read_error)?;
                 ensure_record_readable(
@@ -1024,7 +1022,7 @@ pub async fn export_profile_local(
     profile_id: Ulid,
     expected_revision: Ulid,
 ) -> Result<ExportMetadataRoCrateResult, MetadataReadError> {
-    let record = load_record_by_document(context, profile_id)
+    let record = load_document_record(context, profile_id)
         .await
         .map_err(read_error)?;
     if record.realm_id != realm_id
@@ -1101,7 +1099,7 @@ pub(crate) async fn apply_forwarded_profile(
 /// Creates locally when the origin holds the bucket, otherwise at a holder.
 /// Definitely unsent requests may try another holder; ambiguous delivery is
 /// terminal so the create is not replayed.
-pub async fn create_metadata_document_routed(
+pub async fn route_metadata_create(
     operation: CreateMetadataDocumentOperation,
     context: Arc<DriverContext>,
     auth_token: Option<MetadataAuthToken>,
@@ -1197,10 +1195,9 @@ pub enum CreateMetadataAuthorizedError {
     Write(#[from] MetadataWriteError),
 }
 
-/// Shared metadata create used by REST and MCP: normalize the path, mint the
-/// document id, run the non-user-origin permission checks, route the create to a
-/// holder and emit the post-commit watch event. The caller owns bearer
-/// conversion and the transport status mapping.
+/// Shared metadata create used by REST and MCP: normalize the path, mint the document id, run
+/// the non-user-origin permission checks, route the create to a holder and emit the post-commit
+/// watch event. The caller owns bearer conversion and the transport status mapping.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_metadata_authorized(
     context: &Arc<DriverContext>,
@@ -1272,17 +1269,15 @@ pub async fn create_metadata_authorized(
         )
         .await?;
     }
-    let created = create_metadata_document_routed(
-        CreateMetadataDocumentOperation::new_for_generated_document_id(
-            CreateMetadataDocumentConfig {
-                actor,
-                group_id,
-                document_id,
-                document_path: path,
-                public,
-                payload,
-            },
-        ),
+    let created = route_metadata_create(
+        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+            actor,
+            group_id,
+            document_id,
+            document_path: path,
+            public,
+            payload,
+        }),
         context.clone(),
         auth_token,
     )
@@ -1306,7 +1301,7 @@ pub async fn create_metadata_authorized(
     Ok(record)
 }
 
-pub async fn update_metadata_document_routed(
+pub async fn route_metadata_update(
     context: &Arc<DriverContext>,
     actor: Actor,
     record: Option<&MetadataRegistryRecord>,
@@ -1504,7 +1499,7 @@ fn batch_refusal(refusal: SyncRefusal) -> MetadataWriteError {
     }
 }
 
-pub async fn delete_metadata_document_routed(
+pub async fn route_metadata_delete(
     context: &Arc<DriverContext>,
     actor: Actor,
     record: Option<&MetadataRegistryRecord>,
@@ -1672,7 +1667,7 @@ pub(crate) async fn apply_document_query(
     let auth = metadata
         .authorize_read_peer(peer, auth_token, false)
         .await?;
-    let record = get_visible_metadata_document(
+    let record = get_visible_document(
         context.as_ref(),
         realm_id,
         GetVisibleMetadataDocumentRequest {
@@ -1736,7 +1731,7 @@ pub(crate) async fn apply_forwarded_write(
                 Ok(auth)
                     if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
                 {
-                    get_visible_metadata_document(
+                    get_visible_document(
                         context.as_ref(),
                         realm_id,
                         GetVisibleMetadataDocumentRequest {
@@ -1776,8 +1771,7 @@ pub(crate) async fn apply_forwarded_write(
                 Ok(auth)
                     if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
                 {
-                    let record = match load_record_by_document(context.as_ref(), *document_id).await
-                    {
+                    let record = match load_document_record(context.as_ref(), *document_id).await {
                         Ok(record) => record,
                         Err(error) => {
                             return MetadataTransportMessage::ForwardedProfileValidationStatus {
@@ -2142,7 +2136,7 @@ pub async fn withdraw_pid_routed(
     auth_token: Option<MetadataAuthToken>,
 ) -> Result<PersistentIdMapping, MetadataApiError> {
     if context.net_handle.is_none() {
-        return crate::metadata::persistent_id::admin_withdraw_persistent_id(
+        return crate::metadata::persistent_id::admin_withdraw_pid(
             context.as_ref(),
             realm_id,
             document_id,
@@ -2156,7 +2150,7 @@ pub async fn withdraw_pid_routed(
     }
     let (config, authority) = pid_authority(context, realm_id, document_id).await?;
     if is_local_node(context, authority) {
-        return crate::metadata::persistent_id::admin_withdraw_persistent_id(
+        return crate::metadata::persistent_id::admin_withdraw_pid(
             context.as_ref(),
             realm_id,
             document_id,
@@ -2326,12 +2320,11 @@ async fn local_pid_resolution(
     if !mapping.is_active() {
         return Ok(PersistentIdResolution::Missing);
     }
-    let record = load_metadata_record_by_document(context.as_ref(), document_id)
+    let record = load_document_record(context.as_ref(), document_id)
         .await
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    // An active mapping without a registry row is a permanent 410 only once this
-    // node has evidence the document was created here and is gone. An unprojected
-    // create looks identical, and answering Gone for it would kill a live PID.
+    // An active mapping without a registry row is a permanent 410 only once this node has
+    // evidence the document was created here and is gone.
     let Some(record) = record else {
         return if document_deleted_here(context, document_id).await? {
             Ok(PersistentIdResolution::Gone { pid: mapping.pid })
@@ -2480,9 +2473,7 @@ pub(crate) async fn apply_forwarded_pid(
                 return forward_auth_error(error);
             }
         }
-        // Without a registry row there is no permission path, so no transition is
-        // authorized: realm membership must never tombstone an arbitrary id, and a
-        // withdrawal outliving its document was already written by the delete.
+        // Without a registry row there is no permission path that can authorize a transition.
         (_, None) => return MetadataTransportMessage::ForwardedWriteNotFound,
     }
 
@@ -2506,7 +2497,7 @@ pub(crate) async fn apply_forwarded_pid(
             withdrawn_by,
             reason,
             withdrawn_at_ms,
-        } => crate::metadata::persistent_id::admin_withdraw_persistent_id(
+        } => crate::metadata::persistent_id::admin_withdraw_pid(
             context.as_ref(),
             realm_id,
             document_id,
@@ -2618,9 +2609,8 @@ pub async fn forward_group_create(
         auth_token: Some(auth_token),
         display_name,
     };
-    // Retrying a create on another ingress could mint a second group, so only a
-    // request that never left this node moves on. A timeout cannot tell a hung
-    // dial from a slow-but-applied create, so it stops here as well.
+    // Retrying a create on another ingress could mint a second group, so only a request
+    // that never left this node moves on.
     for peer in peers {
         match timeout(
             ADMIN_RELAY_ATTEMPT_TIMEOUT,
@@ -2728,9 +2718,9 @@ async fn read_realm_documents(
     )
     .await?;
     let node_ids = config
-        .sync_eligible_node_ids()
+        .sync_eligible_nodes()
         .map_err(|_| SyncRefusal::Unavailable)?;
-    let node_infos = read_node_info_documents(context, &node_ids)
+    let node_infos = read_info_documents(context, &node_ids)
         .await
         .map_err(|error| {
             warn!(%error, "Failed to read the node info documents for a device");
@@ -2762,7 +2752,7 @@ async fn management_urls(
         .filter(|node| matches!(node.kind, RealmNodeKind::Management))
         .filter_map(|node| NodeId::from_str(&node.node_id).ok())
         .collect();
-    let documents = match read_node_info_documents(context, &node_ids).await {
+    let documents = match read_info_documents(context, &node_ids).await {
         Ok(documents) => documents,
         Err(error) => {
             warn!(%error, "Failed to read the management urls for a device");
@@ -2844,7 +2834,7 @@ fn holds_any_role(authorization: &GroupAuthorizationDocument, user_id: UserId) -
 /// What this node has applied to the realm configuration, as the reducer keeps
 /// it. A device compares it with its own copy's and never accepts less.
 async fn applied_clock(context: &Arc<DriverContext>, realm_id: RealmId) -> AdminDocumentClock {
-    let key = admin_document_reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id });
+    let key = reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id });
     let Event::Storage(StorageEvent::ReadResult {
         value: Some(bytes), ..
     }) = context
@@ -2940,7 +2930,7 @@ async fn read_graph_state(
     if auth.realm_id != realm_id || !peer_acts_for(&config, peer, auth.user_id) {
         return Err(SyncRefusal::Unauthorized);
     }
-    let record = load_record_by_document(context.as_ref(), document_id)
+    let record = load_document_record(context.as_ref(), document_id)
         .await
         .map_err(sync_refusal)?;
     ensure_record_readable(context.as_ref(), realm_id, Some(&auth), &record, None)
@@ -3124,7 +3114,7 @@ async fn create_remote_bucket(
     super::device_pull::authorize_pull(
         context,
         &auth,
-        aruna_core::structs::blob_bucket_permission_path(
+        aruna_core::structs::bucket_permission_path(
             realm_id,
             group_id,
             net_handle.node_id(),
@@ -3678,7 +3668,7 @@ async fn accepted_create(
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
-            key: metadata_create_acceptance_key(document_id),
+            key: create_acceptance_key(document_id),
             txn_id: None,
         })
         .await
@@ -3741,7 +3731,7 @@ async fn existing_record(
     context: &Arc<DriverContext>,
     document_id: Ulid,
 ) -> Result<Option<MetadataRegistryRecord>, String> {
-    load_metadata_record_by_document(context.as_ref(), document_id)
+    load_document_record(context.as_ref(), document_id)
         .await
         .map_err(|error| format!("metadata registry read failed: {error:?}"))
 }
@@ -3771,9 +3761,7 @@ async fn held_record(
         .map_err(HeldRecordError::Unavailable)?
     {
         Some(record) => record,
-        // An empty registry read is not absence while this node still owes the
-        // projection of a committed create: reporting not-found would let a caller
-        // that polls every holder conclude the document never existed.
+        // A pending committed projection makes an empty registry read inconclusive.
         None => {
             return Err(match projection_queued(context, document_id).await {
                 Ok(true) => HeldRecordError::Unavailable(format!(
@@ -4089,11 +4077,11 @@ pub(crate) fn forward_auth_error(error: ForwardAuthError) -> MetadataTransportMe
 mod tests {
     use super::*;
     use crate::device::replica::ReplicaOrigin;
-    use aruna_core::identifiers::{BucketId, PlacementHandle};
     use aruna_core::metadata::{
         MetadataProfileValidationCompleteness, MetadataProfileValidationState,
     };
     use aruna_core::structs::{METADATA_HANDLE, PlacementStrategy, RealmNodeKind};
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::{MetaResourceId, StructuredId};
 
     fn node(seed: u8) -> NodeId {
@@ -4176,7 +4164,7 @@ mod tests {
                 roles: Default::default(),
                 owner: other,
             };
-            let authorization = GroupAuthorizationDocument::new_default_group_doc(
+            let authorization = GroupAuthorizationDocument::default_group_doc(
                 if seed > DEVICE_GROUP_SCAN_PAGE {
                     member
                 } else {
@@ -4418,7 +4406,7 @@ mod tests {
     }
 
     #[test]
-    fn holder_writes_stay_local() {
+    fn holder_writes_local() {
         let (config, placement) = config_and_placement();
         let holders = resolve_shard_holders(&config, &placement);
 
@@ -4429,7 +4417,7 @@ mod tests {
     }
 
     #[test]
-    fn non_holder_writes_forward() {
+    fn nonholder_writes_forward() {
         // Rank order is the holder set's own: rank-0 is tried first, the rest on
         // failure. Replica 2 of 4 servers guarantees a non-holder exists.
         let (config, placement) = config_and_placement();
@@ -4446,10 +4434,9 @@ mod tests {
     }
 
     #[test]
-    fn user_node_writes_forward() {
-        // A User-kind node is never sync-eligible and holds no bucket, so every
-        // write must be forwarded. The receiving half is covered by
-        // `metadata_forwarding::user_node_forwards_create`.
+    fn user_writes_forward() {
+        // A User-kind node is never sync-eligible and holds no bucket, so every write must
+        // be forwarded.
         let (mut config, placement) = config_and_placement();
         let owner = UserId::nil(config.realm_id);
         config.ensure_node(node(9), RealmNodeKind::User { owner });
@@ -4471,7 +4458,7 @@ mod tests {
     }
 
     #[test]
-    fn unplaced_writes_stay_local() {
+    fn unplaced_writes_local() {
         // No strategy governs a NIL ref (early bootstrap): nowhere to forward to,
         // and no sharding to respect.
         let (config, _) = config_and_placement();

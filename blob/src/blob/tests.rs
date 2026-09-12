@@ -1,10 +1,8 @@
-use super::backend::{build_backend_path, build_multipart_part_path, rebuild_backend_path};
+use super::backend::{build_backend_path, build_part_path, rebuild_backend_path};
 use super::{
     BackendRegistry, BlobHandle, BlobHandler, ControlPlaneTimeoutKind, NodeBackend,
-    control_plane::control_plane_timeout_event,
-    control_plane::{
-        parse_replication_init, validate_replication_init_ack, with_control_plane_timeout,
-    },
+    control_plane::timeout_event,
+    control_plane::{parse_replication_init, validate_init_ack, with_timeout},
 };
 use crate::messages::{MessageType, ReplicationMessage};
 use crate::s3::make_bucket;
@@ -691,7 +689,7 @@ async fn pins_part_area() {
 }
 
 #[test]
-fn backend_config_exposes_custom_timeout_values() {
+fn exposes_custom_timeouts() {
     let config = BackendConfig {
         backend_type: Backend::FileSystem,
         root: "/tmp".to_string(),
@@ -721,15 +719,15 @@ fn backend_config_exposes_custom_timeout_values() {
 }
 
 #[test]
-fn replication_init_ack_accepts_matching_ack() {
+fn accepts_matching_ack() {
     let replication_id = Ulid::generate();
     let ack = ReplicationMessage::new(replication_id, MessageType::BaoTreeInfoReceived);
 
-    assert_eq!(validate_replication_init_ack(ack, replication_id), Ok(()));
+    assert_eq!(validate_init_ack(ack, replication_id), Ok(()));
 }
 
 #[test]
-fn replication_init_ack_rejects_unexpected_message_type() {
+fn rejects_unexpected_type() {
     let replication_id = Ulid::generate();
     let message = ReplicationMessage::new(
         replication_id,
@@ -739,7 +737,7 @@ fn replication_init_ack_rejects_unexpected_message_type() {
         },
     );
 
-    let result = validate_replication_init_ack(message, replication_id);
+    let result = validate_init_ack(message, replication_id);
     assert!(matches!(
         result,
         Err(BlobError::ReplicationRejected(message))
@@ -748,13 +746,13 @@ fn replication_init_ack_rejects_unexpected_message_type() {
 }
 
 #[test]
-fn replication_init_ack_rejects_wrong_replication_id() {
+fn rejects_wrong_replication() {
     let replication_id = Ulid::generate();
     let wrong_id = Ulid::generate();
     let ack = ReplicationMessage::new(wrong_id, MessageType::BaoTreeInfoReceived);
 
     assert_eq!(
-        validate_replication_init_ack(ack, replication_id),
+        validate_init_ack(ack, replication_id),
         Err(BlobError::ReplicationRejected(format!(
             "received replication init ack for unexpected replication id: expected {replication_id}, got {wrong_id}"
         )))
@@ -762,7 +760,7 @@ fn replication_init_ack_rejects_wrong_replication_id() {
 }
 
 #[test]
-fn parse_replication_init_accepts_matching_bao_tree_info() {
+fn parses_matching_init() {
     let replication_id = Ulid::generate();
     let location = make_test_location();
     let root = blake3::hash(b"hello world");
@@ -781,7 +779,7 @@ fn parse_replication_init_accepts_matching_bao_tree_info() {
 }
 
 #[test]
-fn parse_replication_init_rejects_wrong_replication_id() {
+fn rejects_mismatched_init() {
     let replication_id = Ulid::generate();
     let wrong_id = Ulid::generate();
     let message = ReplicationMessage::new(
@@ -801,7 +799,7 @@ fn parse_replication_init_rejects_wrong_replication_id() {
 }
 
 #[test]
-fn parse_replication_init_uses_message_id_when_unknown() {
+fn uses_message_fallback() {
     let replication_id = Ulid::generate();
     let location = make_test_location();
     let root = blake3::hash(b"hello world");
@@ -820,8 +818,8 @@ fn parse_replication_init_uses_message_id_when_unknown() {
 }
 
 #[tokio::test]
-async fn control_plane_timeout_reports_read_timeout() {
-    let event = with_control_plane_timeout(
+async fn reports_read_timeout() {
+    let event = with_timeout(
         std::future::pending::<()>(),
         Duration::from_millis(1),
         ControlPlaneTimeoutKind::Read,
@@ -839,9 +837,9 @@ async fn control_plane_timeout_reports_read_timeout() {
 }
 
 #[test]
-fn control_plane_timeout_reports_connection_timeout() {
+fn reports_connect_timeout() {
     assert_eq!(
-        control_plane_timeout_event(
+        timeout_event(
             ControlPlaneTimeoutKind::Connection,
             "opening bao replication stream",
             Duration::from_secs(30),
@@ -853,7 +851,7 @@ fn control_plane_timeout_reports_connection_timeout() {
 }
 
 #[tokio::test]
-async fn reuses_bucket_until_max_object_count_is_reached() {
+async fn reuses_current_bucket() {
     let context = setup_blob_handle(2).await;
 
     let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
@@ -922,7 +920,7 @@ async fn hidden_bucket_registered() {
 }
 
 #[tokio::test]
-async fn creates_new_bucket_after_reaching_max_object_count() {
+async fn starts_fresh_bucket() {
     let context = setup_blob_handle(1).await;
 
     let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
@@ -975,7 +973,7 @@ async fn creates_new_bucket_after_reaching_max_object_count() {
 }
 
 #[tokio::test]
-async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
+async fn keeps_bucket_reusable() {
     let context = setup_blob_handle(1).await;
 
     let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
@@ -1039,7 +1037,7 @@ async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
 }
 
 #[tokio::test]
-async fn multipart_part_bucket_is_excluded_from_bucket_stats() {
+async fn excludes_part_bucket() {
     let context = setup_blob_handle(5).await;
 
     let Event::Blob(BlobEvent::WriteFinished { location }) = context
@@ -1407,6 +1405,34 @@ async fn reports_range_size() {
 }
 
 #[tokio::test]
+async fn reads_empty_blob() {
+    // A zero-length object must round-trip instead of being rejected as absent.
+    let context = setup_blob_handle(16).await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob(
+            "bucket",
+            "empty.bin",
+            ResolvedBackend::node_default(),
+            test_user_id(),
+            stream_from_bytes(b""),
+        )
+        .await
+    else {
+        panic!("empty write failed")
+    };
+
+    assert_eq!(location.blob_size, 0);
+    let BlobEvent::ReadFinished { blob, stream_size } = handler.read_blob(location).await else {
+        panic!("empty read failed")
+    };
+    assert_eq!(stream_size, 0);
+    let chunks: Vec<bytes::Bytes> = blob.try_collect().await.unwrap();
+    assert!(chunks.concat().is_empty());
+}
+
+#[tokio::test]
 async fn keeps_storage_cause() {
     // The storage reason must reach the blob error, not be flattened into a
     // fixed message that hides why the transaction never started.
@@ -1524,12 +1550,12 @@ async fn tracks_concurrent_loads() {
 }
 
 #[tokio::test]
-async fn staging_source_effect_dispatches_via_blob_handle() {
+async fn dispatches_staging_source() {
     let context = setup_blob_handle(1).await;
 
     let event = context
         .blob_handle
-        .send_staging_source_effect(StagingSourceEffect::Head {
+        .send_staging_effect(StagingSourceEffect::Head {
             access: ResolvedSourceAccess::OpenDal {
                 kind: SourceConnectorKind::Http,
                 config: HashMap::from([(
@@ -1550,7 +1576,7 @@ async fn staging_source_effect_dispatches_via_blob_handle() {
 }
 
 #[tokio::test]
-async fn concurrent_connections_receive_distinct_non_nil_ids() {
+async fn assigns_distinct_ids() {
     let context = setup_blob_handle(1).await;
     let handler = context.blob_handle.handler.clone();
     let (net_a, _dir_a, net_b, _dir_b) = connected_stream_pair().await;
@@ -1693,7 +1719,7 @@ async fn connection_limit() {
 }
 
 #[tokio::test]
-async fn add_connection_rejects_nil_and_duplicate_ids() {
+async fn rejects_invalid_connections() {
     let context = setup_blob_handle(1).await;
     let handler = context.blob_handle.handler.clone();
     let (net_a, _dir_a, net_b, _dir_b) = connected_stream_pair().await;
@@ -1728,7 +1754,7 @@ async fn add_connection_rejects_nil_and_duplicate_ids() {
 }
 
 #[tokio::test]
-async fn write_finalization_failure_emits_no_success_or_load() {
+async fn reports_finalization_failure() {
     let context = setup_blob_handle(1).await;
     let handler = context.blob_handle.handler.clone();
     let location = BackendLocation {
@@ -1750,7 +1776,7 @@ async fn write_finalization_failure_emits_no_success_or_load() {
 
     let (operator, aborts) = failing_close::operator_with_aborts();
     let event = handler
-        .write_stream_to_location(location.clone(), operator, stream_from_bytes(b"payload"))
+        .write_stream(location.clone(), operator, stream_from_bytes(b"payload"))
         .await;
 
     assert!(
@@ -1810,7 +1836,7 @@ async fn failed_write_cleans() {
     let event = context
         .blob_handle
         .handler
-        .write_stream_to_location(location.clone(), operator, blob)
+        .write_stream(location.clone(), operator, blob)
         .await;
 
     assert!(matches!(
@@ -1861,7 +1887,7 @@ async fn compose_close_fails() {
 
     let (operator, aborts) = failing_close::operator_with_aborts();
     let event = handler
-        .compose_parts_to_location(target.clone(), operator, vec![part])
+        .compose_parts(target.clone(), operator, vec![part])
         .await;
 
     assert!(
@@ -1916,7 +1942,7 @@ async fn compose_cleanup_error() {
     let event = context
         .blob_handle
         .handler
-        .compose_parts_to_location(target.clone(), operator, Vec::new())
+        .compose_parts(target.clone(), operator, Vec::new())
         .await;
 
     let BlobEvent::Error(BlobError::WriteCleanup { location, .. }) = event else {
@@ -1934,7 +1960,7 @@ async fn write_cleanup_error() {
     let event = context
         .blob_handle
         .handler
-        .write_stream_to_location(location.clone(), operator, stream_from_bytes(b"payload"))
+        .write_stream(location.clone(), operator, stream_from_bytes(b"payload"))
         .await;
 
     let BlobEvent::Error(BlobError::WriteCleanup {
@@ -2125,7 +2151,7 @@ async fn delete_missing_safe() {
 }
 
 #[test]
-fn build_backend_path_rejects_traversal_keys() {
+fn rejects_traversal_keys() {
     let ulid = Ulid::generate();
     assert!(build_backend_path("bucket", "nested/object.bin", ulid).is_ok());
 
@@ -2155,7 +2181,7 @@ fn reserved_bucket_rejected() {
 fn isolates_tenant_parts() {
     // In-flight parts must not share the container namespace with objects.
     let upload_id = Ulid::generate();
-    let path = build_multipart_part_path(upload_id, 1, Ulid::generate());
+    let path = build_part_path(upload_id, 1, Ulid::generate());
 
     assert!(path.starts_with(&format!("_parts/{upload_id}/")));
     assert!(matches!(
@@ -2165,7 +2191,7 @@ fn isolates_tenant_parts() {
 }
 
 #[test]
-fn rebuild_backend_path_rejects_sender_supplied_traversal() {
+fn rejects_sender_traversal() {
     let ulid = Ulid::generate();
     assert!(rebuild_backend_path("bucket/object_0000", ulid).is_ok());
 
@@ -2181,7 +2207,7 @@ fn rebuild_backend_path_rejects_sender_supplied_traversal() {
 }
 
 #[test]
-fn get_storage_path_rejects_replicated_traversal_path() {
+fn rejects_replicated_traversal() {
     let mut location = make_test_location();
     location.storage_bucket = "bucket".to_string();
     location.backend_path = "../../etc/passwd".to_string();
@@ -2606,7 +2632,7 @@ async fn needs_paired_secret() {
 
 #[tokio::test]
 #[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
-async fn serves_group_backend() {
+async fn s3_group_backend() {
     // The tenant endpoint path: MinIO stands in for a group-owned store.
     let env = s3_env();
     let context = setup_s3_mixed(&env).await;
@@ -2656,7 +2682,7 @@ async fn serves_group_backend() {
 
 #[tokio::test]
 #[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
-async fn routes_backends_apart() {
+async fn s3_backend_routes() {
     // A cold-class rule pins to S3 while the default stays on the filesystem.
     let env = s3_env();
     let context = setup_s3_mixed(&env).await;

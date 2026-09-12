@@ -11,8 +11,7 @@ use aruna_core::reducer::{
     AdminDocumentReducerError, AdminDocumentReducerState, REALM_CONFIG_QUOTA_PATH,
 };
 use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::{
     Actor, AuthContext, Permission, QuotaConfig, RealmConfigDocument, policy_admin_path,
@@ -133,14 +132,14 @@ impl SetRealmQuotaOperation {
                 ),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                 ),
             ],
             txn_id: Some(txn_id),
         })]
     }
 
-    fn emit_write_document_and_admin_state(
+    fn emit_document_write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
@@ -162,7 +161,7 @@ impl SetRealmQuotaOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                aruna_core::reducer::decode_reducer_state(value.as_ref())
                     .map_err(ConversionError::from)
             })
             .transpose()?;
@@ -182,15 +181,11 @@ impl SetRealmQuotaOperation {
                 quota: self.config.quota.clone(),
             },
         )?;
-        // Derive the stored quota from the reducer's materialized state so this path
-        // agrees with the replicated overlay in net::irokle: when the quota path
-        // is conflicted, both leave the previously stored quota in place.
+        // Materialized reducer state keeps local and replicated quota conflict outcomes equal.
         apply_reducer_quota(&mut document, &reducer_state);
 
-        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
-            previous_reducer_state.as_ref(),
-            Some(&reducer_state),
-        );
+        let stale_conflict_deletes =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let document_target = self.document_ref();
         let placement = placement_ref_for_target(&document, &document_target, Default::default());
         let mut writes = vec![
@@ -199,7 +194,7 @@ impl SetRealmQuotaOperation {
                 document_target.storage_key(),
                 document.to_bytes(&self.config.actor)?.into(),
             ),
-            admin_document_reducer_state_write_entry(&reducer_state)?,
+            reducer_state_entry(&reducer_state)?,
         ];
         let record = new_outbox_record_with_id(
             admin_event.event_id,
@@ -211,7 +206,7 @@ impl SetRealmQuotaOperation {
             false,
         );
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
-        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+        writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
         self.state = SetRealmQuotaState::WriteDocumentAndAdminState {
@@ -309,10 +304,9 @@ impl Operation for SetRealmQuotaOperation {
                             format!("{values:?}"),
                         );
                     };
-                    match self.emit_write_document_and_admin_state(
-                        document_value.clone(),
-                        reducer_state_value.clone(),
-                    ) {
+                    match self
+                        .emit_document_write(document_value.clone(), reducer_state_value.clone())
+                    {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }
@@ -409,7 +403,7 @@ fn apply_reducer_quota(
     if !reducer_state
         .conflicts
         .contains_key(REALM_CONFIG_QUOTA_PATH)
-        && let Some(quota) = reducer_state.materialized_realm_config_quota()
+        && let Some(quota) = reducer_state.materialized_realm_quota()
     {
         document.quota = quota;
     }
@@ -540,7 +534,7 @@ mod tests {
     /// The realm admin role only grants what the operation checks, so the
     /// permission sub-operation decides on stored rules like production does.
     async fn seed_realm_admin(ctx: &DriverContext, actor: &Actor) {
-        let mut document = RealmAuthorizationDocument::new_default_realm_doc(actor.realm_id);
+        let mut document = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
         for role in document.roles.values_mut() {
             role.assigned_users.insert(actor.user_id);
         }
@@ -606,7 +600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_quota_round_trips_through_config_document() {
+    async fn quota_round_trips() {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1; 32]);
@@ -700,7 +694,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_quota_fails_when_config_missing() {
+    async fn missing_config_fails() {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([2; 32]);
@@ -815,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_quota_rejects_out_of_range_warn_threshold() {
+    fn rejects_warn_threshold() {
         let too_low = QuotaConfig {
             warn_threshold_percent: 0,
             ..QuotaConfig::default()
@@ -835,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_quota_rejects_low_grace_factor() {
+    fn rejects_low_grace() {
         let quota = QuotaConfig {
             grace_factor_percent: 99,
             ..QuotaConfig::default()
@@ -847,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_quota_rejects_duplicate_group_override() {
+    fn rejects_duplicate_group() {
         let mut quota = QuotaConfig::default();
         let group_id = Ulid::from_bytes([3; 16]);
         quota.group_overrides = vec![
@@ -869,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_quota_rejects_duplicate_user_cap_override() {
+    fn rejects_duplicate_user() {
         let mut quota = QuotaConfig::default();
         let user_id = UserId::local(Ulid::from_bytes([4; 16]), RealmId::from_bytes([1; 32]));
         quota.user_group_cap_overrides = vec![
@@ -889,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_quota_rejects_low_override_grace_factor() {
+    fn rejects_override_grace() {
         let quota = QuotaConfig {
             group_overrides: vec![GroupQuotaOverride {
                 group_id: Ulid::from_bytes([5; 16]),
@@ -905,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_quota_accepts_override_grace_factor_at_or_above_100() {
+    fn accepts_override_grace() {
         let quota = QuotaConfig {
             group_overrides: vec![GroupQuotaOverride {
                 group_id: Ulid::from_bytes([5; 16]),
@@ -918,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_quota_rejects_grace_override_on_unlimited_group_quota() {
+    fn rejects_unlimited_grace() {
         let quota = QuotaConfig {
             group_overrides: vec![GroupQuotaOverride {
                 group_id: Ulid::from_bytes([6; 16]),
@@ -934,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_quota_accepts_default() {
+    fn accepts_default_quota() {
         assert!(validate_quota(&QuotaConfig::default()).is_ok());
     }
 
@@ -971,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_reducer_quota_skips_conflicted_quota_path() {
+    fn conflicted_quota_skipped() {
         let realm_id = RealmId::from_bytes([9; 32]);
         let quota_a = QuotaConfig {
             default_group_quota_bytes: Some(1_000),
@@ -983,7 +977,7 @@ mod tests {
         };
         let state = quota_conflict_state(realm_id, quota_a, quota_b);
         assert!(state.conflicts.contains_key(REALM_CONFIG_QUOTA_PATH));
-        assert!(state.materialized_realm_config_quota().is_none());
+        assert!(state.materialized_realm_quota().is_none());
 
         let original = QuotaConfig {
             default_group_quota_bytes: Some(42),
@@ -999,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_reducer_quota_sets_materialized_quota_when_not_conflicted() {
+    fn materialized_quota_applied() {
         use aruna_core::admin_documents::{
             AdminDocumentClock, AdminDocumentEvent, AdminDocumentTarget,
         };

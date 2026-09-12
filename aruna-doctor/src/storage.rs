@@ -80,11 +80,10 @@ pub async fn import(snapshot_path: String, target_path: String) -> Result<(), Cl
     let snapshot_path = PathBuf::from(snapshot_path);
     let target_path = PathBuf::from(target_path);
 
-    let stats = tokio::task::spawn_blocking(move || {
-        import_snapshot_into_new_database(&snapshot_path, &target_path)
-    })
-    .await
-    .map_err(std::io::Error::other)??;
+    let stats =
+        tokio::task::spawn_blocking(move || import_new_database(&snapshot_path, &target_path))
+            .await
+            .map_err(std::io::Error::other)??;
 
     println!(
         "Snapshot imported: keyspaces={}, entries={}, target={}",
@@ -130,7 +129,7 @@ pub fn snapshot_database(
 
     for keyspace_name in keyspace_names {
         let keyspace = db.keyspace(&keyspace_name, KeyspaceCreateOptions::default)?;
-        write_begin_keyspace_record(&mut writer, &mut hasher, &keyspace_name)?;
+        write_keyspace_begin(&mut writer, &mut hasher, &keyspace_name)?;
 
         let mut keyspace_entry_count = 0_u64;
         for entry in snapshot.iter(&keyspace) {
@@ -140,7 +139,7 @@ pub fn snapshot_database(
             entry_count += 1;
         }
 
-        write_end_keyspace_record(&mut writer, &mut hasher, keyspace_entry_count)?;
+        write_keyspace_end(&mut writer, &mut hasher, keyspace_entry_count)?;
         keyspace_count += 1;
     }
 
@@ -156,13 +155,13 @@ pub fn snapshot_database(
     })
 }
 
-pub fn import_snapshot_into_new_database(
+pub fn import_new_database(
     snapshot_path: impl AsRef<Path>,
     target_db_path: impl AsRef<Path>,
 ) -> Result<ImportStats, SnapshotError> {
     let snapshot_path = snapshot_path.as_ref();
     let target_db_path = target_db_path.as_ref();
-    ensure_new_target_path(target_db_path)?;
+    ensure_target_path(target_db_path)?;
 
     let file = File::open(snapshot_path)?;
     let mut reader = BufReader::new(file);
@@ -195,7 +194,7 @@ pub fn import_snapshot_into_new_database(
                 }
 
                 hasher.update(&[tag]);
-                let name_bytes = read_length_prefixed_bytes_hashed(&mut reader, &mut hasher)?;
+                let name_bytes = read_hashed_bytes(&mut reader, &mut hasher)?;
                 let name = String::from_utf8(name_bytes)
                     .map_err(|_| SnapshotError::InvalidKeyspaceName)?;
 
@@ -215,8 +214,8 @@ pub fn import_snapshot_into_new_database(
                 };
 
                 hasher.update(&[tag]);
-                let key = read_length_prefixed_bytes_hashed(&mut reader, &mut hasher)?;
-                let value = read_length_prefixed_bytes_hashed(&mut reader, &mut hasher)?;
+                let key = read_hashed_bytes(&mut reader, &mut hasher)?;
+                let value = read_hashed_bytes(&mut reader, &mut hasher)?;
 
                 state.insert(&db, key, value)?;
                 state.keyspace_entry_count += 1;
@@ -248,7 +247,7 @@ pub fn import_snapshot_into_new_database(
 
                 let expected_keyspace_count = read_u64_plain(&mut reader)?;
                 let expected_entry_count = read_u64_plain(&mut reader)?;
-                let expected_checksum = read_fixed_bytes_plain::<32>(&mut reader)?;
+                let expected_checksum = read_plain_bytes::<32>(&mut reader)?;
 
                 if keyspace_count != expected_keyspace_count {
                     return Err(SnapshotError::InvalidStructure(
@@ -332,7 +331,7 @@ impl ImportKeyspaceState {
     }
 }
 
-fn ensure_new_target_path(target_db_path: &Path) -> Result<(), SnapshotError> {
+fn ensure_target_path(target_db_path: &Path) -> Result<(), SnapshotError> {
     if target_db_path.exists() {
         return Err(SnapshotError::TargetPathExists(
             target_db_path.to_path_buf(),
@@ -374,14 +373,14 @@ fn read_header(reader: &mut BufReader<File>) -> Result<u64, SnapshotError> {
     read_u64_plain(reader)
 }
 
-fn write_begin_keyspace_record(
+fn write_keyspace_begin(
     writer: &mut BufWriter<File>,
     hasher: &mut Hasher,
     keyspace_name: &str,
 ) -> Result<(), SnapshotError> {
     let mut record = Vec::with_capacity(1 + 8 + keyspace_name.len());
     record.push(RECORD_BEGIN_KEYSPACE);
-    push_length_prefixed_bytes(&mut record, keyspace_name.as_bytes())?;
+    push_prefixed_bytes(&mut record, keyspace_name.as_bytes())?;
     write_payload_record(writer, hasher, &record)
 }
 
@@ -393,12 +392,12 @@ fn write_entry_record(
 ) -> Result<(), SnapshotError> {
     let mut record = Vec::with_capacity(1 + 16 + key.len() + value.len());
     record.push(RECORD_ENTRY);
-    push_length_prefixed_bytes(&mut record, key)?;
-    push_length_prefixed_bytes(&mut record, value)?;
+    push_prefixed_bytes(&mut record, key)?;
+    push_prefixed_bytes(&mut record, value)?;
     write_payload_record(writer, hasher, &record)
 }
 
-fn write_end_keyspace_record(
+fn write_keyspace_end(
     writer: &mut BufWriter<File>,
     hasher: &mut Hasher,
     entry_count: u64,
@@ -432,14 +431,14 @@ fn write_payload_record(
     Ok(())
 }
 
-fn push_length_prefixed_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) -> Result<(), SnapshotError> {
+fn push_prefixed_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) -> Result<(), SnapshotError> {
     let len = u64::try_from(bytes.len()).map_err(|_| SnapshotError::LengthOverflow(u64::MAX))?;
     buffer.extend_from_slice(&len.to_be_bytes());
     buffer.extend_from_slice(bytes);
     Ok(())
 }
 
-fn read_length_prefixed_bytes_hashed(
+fn read_hashed_bytes(
     reader: &mut BufReader<File>,
     hasher: &mut Hasher,
 ) -> Result<Vec<u8>, SnapshotError> {
@@ -458,12 +457,12 @@ fn read_u8_plain(reader: &mut BufReader<File>) -> Result<u8, std::io::Error> {
 }
 
 fn read_u16_plain(reader: &mut BufReader<File>) -> Result<u16, SnapshotError> {
-    let bytes = read_fixed_bytes_plain::<2>(reader)?;
+    let bytes = read_plain_bytes::<2>(reader)?;
     Ok(u16::from_be_bytes(bytes))
 }
 
 fn read_u64_plain(reader: &mut BufReader<File>) -> Result<u64, SnapshotError> {
-    let bytes = read_fixed_bytes_plain::<8>(reader)?;
+    let bytes = read_plain_bytes::<8>(reader)?;
     Ok(u64::from_be_bytes(bytes))
 }
 
@@ -471,12 +470,12 @@ fn read_u64_hashed(
     reader: &mut BufReader<File>,
     hasher: &mut Hasher,
 ) -> Result<u64, SnapshotError> {
-    let bytes = read_fixed_bytes_plain::<8>(reader)?;
+    let bytes = read_plain_bytes::<8>(reader)?;
     hasher.update(&bytes);
     Ok(u64::from_be_bytes(bytes))
 }
 
-fn read_fixed_bytes_plain<const N: usize>(
+fn read_plain_bytes<const N: usize>(
     reader: &mut BufReader<File>,
 ) -> Result<[u8; N], SnapshotError> {
     let mut bytes = [0_u8; N];
@@ -498,8 +497,8 @@ fn ensure_reader_exhausted(reader: &mut BufReader<File>) -> Result<(), SnapshotE
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyspaceCreateOptions, OptimisticTxDatabase, SnapshotError,
-        import_snapshot_into_new_database, snapshot_database,
+        KeyspaceCreateOptions, OptimisticTxDatabase, SnapshotError, import_new_database,
+        snapshot_database,
     };
     use crate::tests::fixtures::{TestEnvGuard, env_lock};
     use aruna::config::load;
@@ -533,7 +532,7 @@ mod tests {
     use ulid::Ulid;
 
     #[tokio::test]
-    async fn snapshot_round_trip_preserves_database_contents() {
+    async fn snapshot_preserves_data() {
         let _guard = env_lock().lock().await;
         let temp = tempdir().unwrap();
         let source_db_path = temp.path().join("source-db");
@@ -760,8 +759,7 @@ mod tests {
         assert!(snapshot_stats.keyspace_count >= 10);
         assert!(snapshot_stats.entry_count >= 10);
 
-        let import_stats =
-            import_snapshot_into_new_database(&snapshot_path, &restored_db_path).unwrap();
+        let import_stats = import_new_database(&snapshot_path, &restored_db_path).unwrap();
         assert_eq!(import_stats.keyspace_count, snapshot_stats.keyspace_count);
         assert_eq!(import_stats.entry_count, snapshot_stats.entry_count);
 

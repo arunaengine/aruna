@@ -9,7 +9,7 @@ use aruna_core::onboarding::{
 };
 use aruna_core::structs::{Actor, OidcProviderConfig, RealmId, TokenClaims};
 use aruna_operations::auth::bearer_token::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_aruna_bearer_token,
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_bearer_token,
 };
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
@@ -56,12 +56,7 @@ fn url_encode_component(value: &str) -> String {
     encoded
 }
 
-fn oidc_password_grant_body(
-    client_id: &str,
-    username: &str,
-    password: &str,
-    scope: &str,
-) -> String {
+fn password_grant_body(client_id: &str, username: &str, password: &str, scope: &str) -> String {
     [
         ("grant_type", "password"),
         ("client_id", client_id),
@@ -81,18 +76,18 @@ fn oidc_password_grant_body(
     .join("&")
 }
 
-pub async fn create_local_bootstrap_token(
+pub async fn create_bootstrap_token(
     oidc_username: String,
     oidc_password: String,
     oidc_scope: String,
     bootstrap_secret: String,
 ) -> Result<String, CliError> {
-    if load_oidc_providers_from_env()?.is_empty() {
-        return create_direct_local_bootstrap_token(bootstrap_secret).await;
+    if load_oidc_providers()?.is_empty() {
+        return create_direct_token(bootstrap_secret).await;
     }
 
     let oidc_token = create_oidc_token(oidc_username, oidc_password, oidc_scope, true).await?;
-    let aruna_base_url = format!("http://{}", load_http_socket_addr()?);
+    let aruna_base_url = format!("http://{}", load_http_addr()?);
 
     exchange_bootstrap_token(
         &Client::new(),
@@ -103,7 +98,7 @@ pub async fn create_local_bootstrap_token(
     .await
 }
 
-async fn create_direct_local_bootstrap_token(bootstrap_secret: String) -> Result<String, CliError> {
+async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliError> {
     let (config, storage_handle) = load().await.map_err(Box::new)?;
     let driver_ctx = DriverContext {
         storage_handle,
@@ -251,7 +246,7 @@ pub async fn create_oidc_token(
     scope: String,
     oidc_only: bool,
 ) -> Result<String, CliError> {
-    let provider = load_oidc_providers_from_env()?
+    let provider = load_oidc_providers()?
         .into_iter()
         .next()
         .ok_or_else(|| CliError::OidcProviderNotFound("No OIDC configured".to_string()))?;
@@ -259,19 +254,19 @@ pub async fn create_oidc_token(
     let client = Client::builder().build()?;
     let oidc_token = request_oidc_token(&client, &provider, &username, &password, &scope).await?;
     if !oidc_only {
-        let aruna_base_url = format!("http://{}", load_http_socket_addr()?);
+        let aruna_base_url = format!("http://{}", load_http_addr()?);
         exchange_oidc_token(&client, &aruna_base_url, &oidc_token).await
     } else {
         Ok(oidc_token)
     }
 }
 
-fn load_http_socket_addr() -> Result<SocketAddr, CliError> {
+fn load_http_addr() -> Result<SocketAddr, CliError> {
     let _ = dotenvy::dotenv();
     Ok(SocketAddr::from_str(&dotenvy::var("SOCKET_ADDRESS")?)?)
 }
 
-fn load_oidc_providers_from_env() -> Result<Vec<OidcProviderConfig>, CliError> {
+fn load_oidc_providers() -> Result<Vec<OidcProviderConfig>, CliError> {
     let _ = dotenvy::dotenv();
     let Some(provider_ids) = dotenvy::var("OIDC_PROVIDER_IDS").ok() else {
         return Ok(Vec::new());
@@ -314,7 +309,7 @@ async fn request_oidc_token(
             reqwest::header::CONTENT_TYPE,
             "application/x-www-form-urlencoded",
         )
-        .body(oidc_password_grant_body(
+        .body(password_grant_body(
             &provider.audience,
             username,
             password,
@@ -431,7 +426,7 @@ impl DoctorTokenValidationState {
         // The replicated realm config is the only revocation authority.
         for realm_id in &trusted_realms {
             if let Ok(config) = drive(GetRealmConfigOperation::new(*realm_id), driver_ctx).await {
-                let now = aruna_core::util::unix_timestamp_secs();
+                let now = aruna_core::time::unix_timestamp_secs();
                 revoked_token_hashes.extend(
                     config
                         .revoked_tokens
@@ -481,17 +476,17 @@ pub async fn view_token(token: String) -> Result<String, CliError> {
         compute_handle: None,
     });
     let validation_state = DoctorTokenValidationState::load(driver_ctx.as_ref()).await;
-    let token_view = token_view_from_token(&token, &validation_state).await?;
+    let token_view = build_token_view(&token, &validation_state).await?;
 
     Ok(serde_json::to_string_pretty(&token_view)?)
 }
 
-async fn token_view_from_token(
+async fn build_token_view(
     token: &str,
     validation_state: &DoctorTokenValidationState,
 ) -> Result<TokenView, CliError> {
     let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
-    let valid = match decode_aruna_bearer_token(validation_state, token).await {
+    let valid = match decode_bearer_token(validation_state, token).await {
         Ok(_) => Valid::True,
         Err(err) => Valid::False {
             reason: err.to_string(),
@@ -508,12 +503,11 @@ async fn token_view_from_token(
 #[cfg(test)]
 mod tests {
     use super::{
-        DoctorTokenValidationState, Valid, create_local_bootstrap_token, create_oidc_token,
-        load_oidc_providers_from_env, oidc_password_grant_body, request_oidc_token,
-        token_view_from_token,
+        DoctorTokenValidationState, Valid, build_token_view, create_bootstrap_token,
+        create_oidc_token, load_oidc_providers, password_grant_body, request_oidc_token,
     };
     use crate::tests::fixtures::{TestEnvGuard, env_lock};
-    use aruna::bootstrap::ensure_initial_local_onboarding_secret;
+    use aruna::bootstrap::ensure_onboarding_secret;
     use aruna_api::auth::OidcValidator;
     use aruna_api::routes::onboarding::ListOnboardingSecretsResponse;
     use aruna_api::server::{Server, ServerConfig};
@@ -975,10 +969,7 @@ mod tests {
             .encode(signing_key.verifying_key().to_bytes())
     }
 
-    async fn assert_regular_token_cannot_manage_onboarding(
-        node: &TestNode,
-        token: &str,
-    ) -> Result<(), Box<dyn Error>> {
+    async fn assert_onboarding_refused(node: &TestNode, token: &str) -> Result<(), Box<dyn Error>> {
         let response = reqwest::Client::new()
             .get(format!(
                 "{}/api/v1/access/onboarding/secrets",
@@ -991,7 +982,7 @@ mod tests {
         Ok(())
     }
 
-    async fn list_onboarding_with_token(
+    async fn list_onboarding(
         node: &TestNode,
         token: &str,
     ) -> Result<reqwest::StatusCode, Box<dyn Error>> {
@@ -1012,7 +1003,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revoked_token_view_is_invalid_but_marks_blacklisted() {
+    async fn revoked_token_blacklisted() {
         let (realm_signing_key, realm_id, user_id) = aruna_token_fixture();
         let claims = aruna_token_claims(realm_id, user_id);
         let token = sign_aruna_token(&realm_signing_key, &claims);
@@ -1020,7 +1011,7 @@ mod tests {
         state.trusted_realms.insert(realm_id);
         state.revoked_token_hashes.insert(bearer_token_hash(&token));
 
-        let view = token_view_from_token(&token, &state).await.unwrap();
+        let view = build_token_view(&token, &state).await.unwrap();
 
         assert_eq!(view.claims.sub, user_id.to_string());
         assert!(view.is_blacklisted);
@@ -1031,7 +1022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegated_server_token_view_is_valid_for_trusted_realm() {
+    async fn delegated_token_valid() {
         let (realm_signing_key, realm_id, user_id) = aruna_token_fixture();
         let issuer_signing_key = generate_signing_key();
         let issuer_pubkey = public_key_base64(&issuer_signing_key);
@@ -1043,14 +1034,14 @@ mod tests {
         let mut state = DoctorTokenValidationState::default();
         state.trusted_realms.insert(realm_id);
 
-        let view = token_view_from_token(&token, &state).await.unwrap();
+        let view = build_token_view(&token, &state).await.unwrap();
 
         assert!(!view.is_blacklisted);
         assert!(matches!(view.valid, Valid::True));
     }
 
     #[tokio::test]
-    async fn requests_oidc_token_via_discovery_endpoint() {
+    async fn requests_oidc_token() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{addr}");
@@ -1090,7 +1081,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_to_access_token_when_id_token_is_missing() {
+    async fn uses_access_token() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{addr}");
@@ -1141,8 +1132,8 @@ mod tests {
     }
 
     #[test]
-    fn oidc_password_grant_body_encodes_form_values() {
-        let body = oidc_password_grant_body(
+    fn encodes_grant_body() {
+        let body = password_grant_body(
             "aruna-api",
             "alice@example.com",
             "p@ss word",
@@ -1156,7 +1147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loads_oidc_providers_from_environment() {
+    async fn loads_oidc_providers() {
         let _guard = env_lock().lock().await;
         let _env = TestEnvGuard::set(&[
             ("OIDC_PROVIDER_IDS", "main".to_string()),
@@ -1168,7 +1159,7 @@ mod tests {
             ),
         ]);
 
-        let providers = load_oidc_providers_from_env().unwrap();
+        let providers = load_oidc_providers().unwrap();
 
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id, "main");
@@ -1176,8 +1167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_oidc_token_registers_user_and_returns_aruna_token() -> Result<(), Box<dyn Error>>
-    {
+    async fn creates_oidc_token() -> Result<(), Box<dyn Error>> {
         let _guard = env_lock().lock().await;
         let issuer = "https://issuer.example";
         let kid = "main-key";
@@ -1200,7 +1190,7 @@ mod tests {
         let user_id = UserId::from_string(&claims.sub).unwrap();
         let user = read_user(node.context.as_ref(), user_id).await;
         assert_eq!(user.name, "Alice");
-        assert_regular_token_cannot_manage_onboarding(&node, &token).await?;
+        assert_onboarding_refused(&node, &token).await?;
 
         node.server_task.abort();
         node.net.shutdown().await;
@@ -1209,8 +1199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_local_bootstrap_token_claims_initial_admin_and_returns_aruna_token()
-    -> Result<(), Box<dyn Error>> {
+    async fn creates_bootstrap_token() -> Result<(), Box<dyn Error>> {
         let _guard = env_lock().lock().await;
         let issuer = "https://issuer.example";
         let kid = "main-key";
@@ -1219,7 +1208,7 @@ mod tests {
         let (provider, oidc_task) =
             spawn_oidc_provider(issuer, kid, &signing_key, oidc_token).await;
         let node = spawn_test_node(provider.clone(), false).await;
-        let onboarding_secret = ensure_initial_local_onboarding_secret(
+        let onboarding_secret = ensure_onboarding_secret(
             node.context.as_ref(),
             node.base_url.clone(),
             &[7u8; 32],
@@ -1229,7 +1218,7 @@ mod tests {
         .encode()?;
         let _env = set_oidc_env(&node.base_url, &provider);
 
-        let token = create_local_bootstrap_token(
+        let token = create_bootstrap_token(
             "alice".to_string(),
             "alice-password".to_string(),
             "openid profile".to_string(),
@@ -1241,7 +1230,7 @@ mod tests {
         let user_id = UserId::from_string(&claims.sub).unwrap();
         let user = read_user(node.context.as_ref(), user_id).await;
         assert_eq!(user.name, "Admin");
-        let status = list_onboarding_with_token(&node, &token).await?;
+        let status = list_onboarding(&node, &token).await?;
         assert_eq!(status, reqwest::StatusCode::OK);
 
         node.server_task.abort();

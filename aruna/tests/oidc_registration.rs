@@ -297,7 +297,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
 }
 
 #[tokio::test]
-async fn oidc_registration_route_creates_user_indexes_and_token() {
+async fn registration_creates_token() {
     let issuer = "https://issuer.example";
     let kid = "main-key";
     let signing_key = generate_signing_key();

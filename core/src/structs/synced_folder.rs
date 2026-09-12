@@ -1,11 +1,5 @@
-//! Two-way synced folders on an owner's device.
-//!
-//! Local data takes precedence over convergence (LB1): the automatic sync may
-//! only add files that are absent, add conflicted copies beside files that
-//! diverged, and replace a file whose current fingerprint AND blake3 still
-//! equal the recorded base. Replacing divergent or unknown-base bytes and
-//! removing a file are explicit, audited owner actions, and a remote deletion
-//! never deletes a local file.
+//! Device folder sync adds absent or conflict copies and replaces only an unchanged recorded base.
+//! Deletion or replacement of other local bytes requires the owner.
 
 use crate::errors::ConversionError;
 use crate::id::NodeId;
@@ -434,9 +428,8 @@ fn decide_two_way(
             // even when the realm deleted the object in the meantime.
             false => SyncAction::Upload { deleted: false },
         },
-        // No base: the bytes may be the same file or two unrelated ones, so
-        // nothing local is replaced, nothing local is published, and both sides
-        // stay until the owner decides which one the realm head should be.
+        // Without a base, neither side is replaced or published because equal-looking bytes may be unrelated.
+        // Both remain until the owner chooses the realm head.
         (Some(local), None, Some(remote)) => match same_bytes(local, remote) {
             true => SyncAction::AdoptBase,
             false => SyncAction::ConflictCopy {
@@ -789,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn publishes_edit_over_delete() {
+    fn publishes_edit_delete() {
         // The realm deleted the object and the owner edited the file: the edit
         // wins locally and becomes the next realm version.
         let old = Ulid::from_bytes([1u8; 16]);

@@ -1693,9 +1693,9 @@ mod tests {
             user_id,
             realm_id,
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let mut group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+            GroupAuthorizationDocument::default_group_doc(user_id, realm_id, group_id);
         group_auth.policies.push(RequestPolicy {
             policy_id: Ulid::from_bytes([12u8; 16]),
             name: "deny-audit".to_string(),

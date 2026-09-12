@@ -1,6 +1,5 @@
-//! The metadata path budget a harvest source must satisfy, shared by source
-//! creation and the harvest job so a source is only accepted when every record
-//! it can ever yield has a landing path.
+//! Metadata path budget shared by source creation and the harvest job: a
+//! source is accepted only when every record it can yield has a landing path.
 
 /// Budget for a harvested document's normalized metadata path.
 pub const HARVEST_PATH_BYTES: usize = 512;

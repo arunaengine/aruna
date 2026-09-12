@@ -15,7 +15,7 @@ use aruna_core::metadata::{
     MetadataGraphPolicy, MetadataQueryResults, MetadataRequestDurability,
     MetadataUpsertEntityRequest,
 };
-use aruna_core::storage_entries::{metadata_graph_lifecycle_write_entry, metadata_registry_key};
+use aruna_core::storage_entries::{graph_lifecycle_entry, metadata_registry_key};
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, MetadataRegistryRecord, PlacementRef,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
@@ -55,7 +55,7 @@ async fn build_harness(backend_pool_size: Option<usize>) -> Result<TestHarness, 
     let mut options =
         MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory);
     if let Some(pool_size) = backend_pool_size {
-        options = options.with_backend_pool_size(pool_size);
+        options = options.with_pool_size(pool_size);
     }
     let handle = MetadataHandle::new_with_options(
         metadata_dir.path(),
@@ -75,8 +75,8 @@ async fn build_harness(backend_pool_size: Option<usize>) -> Result<TestHarness, 
         realm_id: REALM,
     };
     let config = RealmConfigDocument::default_for_realm(REALM, Vec::new());
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(REALM);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, REALM, group_id);
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(REALM);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(owner, REALM, group_id);
     let group = Group {
         display_name: "harness-group".to_string(),
         group_id,
@@ -264,7 +264,7 @@ async fn wait_for(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stale_visibility_cache_serves_reads_and_refreshes_in_background() -> Result<(), BoxError> {
+async fn stale_cache_refreshes() -> Result<(), BoxError> {
     let harness = build_harness(None).await?;
     let initial_graphs = 12usize;
 
@@ -316,7 +316,7 @@ async fn stale_visibility_cache_serves_reads_and_refreshes_in_background() -> Re
         new_record.document_id,
         1,
     );
-    let (key_space, key, value) = metadata_graph_lifecycle_write_entry(&lifecycle)?;
+    let (key_space, key, value) = graph_lifecycle_entry(&lifecycle)?;
     match harness
         .storage
         .send_effect(Effect::Storage(StorageEffect::Write {
@@ -332,9 +332,8 @@ async fn stale_visibility_cache_serves_reads_and_refreshes_in_background() -> Re
     }
 
     harness.handle.expire_visibility_caches();
-    // The stale read must not block on the sweep; lazy per-graph visibility
-    // reads the lifecycle state at evaluation time, so it may serve either
-    // the pre- or post-sweep state before converging to hidden.
+    // The stale read must not block on the sweep; lazy per-graph visibility reads the lifecycle
+    // state at evaluation time.
     let _ = query_names(&harness).await?;
     let converged = wait_for(Duration::from_secs(10), async || {
         Ok(!names_contain(&query_names(&harness).await?, new_index))
@@ -438,12 +437,12 @@ async fn write_deleted_lifecycle(
         record.document_id,
         1,
     );
-    let (key_space, key, value) = metadata_graph_lifecycle_write_entry(&lifecycle)?;
+    let (key_space, key, value) = graph_lifecycle_entry(&lifecycle)?;
     write_value(harness, &key_space, key, value).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn search_fills_visible_limit_after_invisible_matches_are_removed() -> Result<(), BoxError> {
+async fn search_fills_limit() -> Result<(), BoxError> {
     let harness = build_harness(None).await?;
     let marker = "visibilitylimitneedle";
     let group_id = harness.group_id;
@@ -507,7 +506,7 @@ async fn search_fills_visible_limit_after_invisible_matches_are_removed() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn search_honors_explicit_graph_filter_before_visible_limit() -> Result<(), BoxError> {
+async fn graph_filter_first() -> Result<(), BoxError> {
     let harness = build_harness(None).await?;
     let marker = "graphfilterlimitneedle";
     let group_id = harness.group_id;
@@ -570,10 +569,7 @@ async fn replay_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn query_cache_invalidates() -> Result<(), BoxError> {
-    // The second crate replays an already-durable write: it skips the
-    // lifecycle read and never advances the visibility generation, so only the
-    // apply counter can invalidate the cached result.
-    let harness = build_harness(None).await?;
+    // Replaying a durable write invalidates cached results through the apply counter.
     let graphs = [0usize, 1]
         .map(|index| format!("https://w3id.org/aruna/bench-{index:04}"))
         .to_vec();
@@ -604,7 +600,7 @@ async fn query_cache_invalidates() -> Result<(), BoxError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn lazy_visibility_matches_eager_query_and_search_semantics() -> Result<(), BoxError> {
+async fn lazy_matches_eager() -> Result<(), BoxError> {
     let harness = build_harness(None).await?;
     let group_id = harness.group_id;
     let member = aruna_core::UserId::local(Ulid::generate(), REALM);
@@ -614,7 +610,7 @@ async fn lazy_visibility_matches_eager_query_and_search_semantics() -> Result<()
         realm_id: REALM,
     };
 
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(member, REALM, group_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(member, REALM, group_id);
     let group = Group {
         display_name: "visibility-group".to_string(),
         group_id,
@@ -622,7 +618,7 @@ async fn lazy_visibility_matches_eager_query_and_search_semantics() -> Result<()
         roles: group_auth.roles.keys().copied().collect(),
         owner: member,
     };
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(REALM);
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(REALM);
     write_value(
         &harness,
         AUTH_KEYSPACE,
@@ -670,7 +666,7 @@ async fn lazy_visibility_matches_eager_query_and_search_semantics() -> Result<()
         deleted_record.document_id,
         1,
     );
-    let (key_space, key, value) = metadata_graph_lifecycle_write_entry(&lifecycle)?;
+    let (key_space, key, value) = graph_lifecycle_entry(&lifecycle)?;
     write_value(&harness, &key_space, key, value).await?;
 
     let member_auth = AuthContext {
@@ -726,9 +722,7 @@ async fn lazy_visibility_matches_eager_query_and_search_semantics() -> Result<()
     let late_record = visibility_record(group_id, "datasets/probe-late", true);
     create_crate(&harness, &late_record.graph_iri, "probe late").await?;
     write_registry_records(&harness, std::slice::from_ref(&late_record)).await?;
-    harness
-        .handle
-        .upsert_cached_registry_record(late_record.clone());
+    harness.handle.cache_registry_record(late_record.clone());
     let names = query_names_as(&harness, None).await?;
     assert!(contains_name(&names, "probe late"));
 
@@ -757,7 +751,7 @@ fn print_stats(label: &str, mut samples: Vec<Duration>) -> Duration {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "timing-sensitive concurrency profile; run manually"]
-async fn concurrent_queries_with_mutation_load_profile() -> Result<(), BoxError> {
+async fn concurrent_mutation_profile() -> Result<(), BoxError> {
     init_logging();
     // Pool sized like a typical 8-core cluster node so mutation pressure on
     // the permit pools is visible regardless of the host's core count.
@@ -839,11 +833,8 @@ async fn concurrent_queries_with_mutation_load_profile() -> Result<(), BoxError>
 
     let conc_idle = run_concurrent("concurrent idle").await;
 
-    // Sustained heavy mutation load saturating the mutation permit pool,
-    // mirroring the materialization queue draining apply batches in the
-    // cluster while reads arrive.
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut writers = Vec::new();
+    // Sustained heavy mutation load saturating the mutation permit pool, mirroring the
+    // materialization queue draining apply batches in the cluster while reads arrive.
     for writer in 0..writer_tasks {
         let harness = harness.clone();
         let stop = stop.clone();

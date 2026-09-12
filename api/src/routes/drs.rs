@@ -7,7 +7,7 @@ use crate::rate_limit::LocalKey;
 use crate::server_state::ServerState;
 use aruna_core::structs::{
     ArunaArn, ArunaArnType, AuthContext, BackendLocation, Permission, SourceMetadata,
-    VersionedObjectArn, W3idDataIdentifier, blob_object_permission_path,
+    VersionedObjectArn, W3idDataIdentifier, object_permission_path,
 };
 use aruna_operations::blob::permission_paths::ResolveBlobPermissionPathsOperation;
 use aruna_operations::driver::{drive, drive_until};
@@ -417,7 +417,7 @@ pub async fn get_object(
 ) -> Response {
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let anonymous = auth.is_none();
-    let auth = match drs_auth_or_anonymous(state.as_ref(), auth) {
+    let auth = match drs_auth(state.as_ref(), auth) {
         Ok(auth) => auth,
         Err(error) => return error.into_response(),
     };
@@ -529,7 +529,7 @@ pub async fn post_objects(
     }
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let anonymous = auth.is_none();
-    let auth = match drs_auth_or_anonymous(state.as_ref(), auth) {
+    let auth = match drs_auth(state.as_ref(), auth) {
         Ok(auth) => auth,
         Err(error) => return error.into_response(),
     };
@@ -640,7 +640,7 @@ pub async fn download_object(
     Query(query): Query<DownloadQuery>,
 ) -> Response {
     let anonymous = auth.is_none();
-    let Ok(auth) = drs_auth_or_anonymous(state.as_ref(), auth) else {
+    let Ok(auth) = drs_auth(state.as_ref(), auth) else {
         return drs_error(StatusCode::NOT_FOUND, "DRS object not found");
     };
     let resolved =
@@ -777,7 +777,7 @@ fn require_drs_auth(
 /// Requests without a bearer token resolve as the Everyone principal. Public
 /// roles are then the only grants that can make an object readable; denied
 /// anonymous lookups are mapped to 404 at the route layer.
-fn drs_auth_or_anonymous(
+fn drs_auth(
     state: &ServerState,
     auth: Option<AuthContext>,
 ) -> Result<AuthContext, DrsError> {
@@ -807,7 +807,7 @@ async fn resolve_object(
     object_id: &str,
     deadline: Instant,
 ) -> Result<ResolveOutcome, DrsError> {
-    match parse_requested_object_id(object_id)? {
+    match parse_object_id(object_id)? {
         RequestedObjectId::CanonicalW3id(hash) => {
             resolve_content_hash(state, auth, object_id, None, &hash).await
         }
@@ -941,14 +941,14 @@ async fn resolve_versioned(
         return Ok(ResolveOutcome::NotFound);
     };
 
-    let path = blob_object_permission_path(
+    let path = object_permission_path(
         arn.realm_id,
         bucket_info.group_id,
         arn.node_id,
         &arn.bucket,
         &arn.key,
     );
-    if !can_read_permission_path(state, auth, &path).await? {
+    if !can_read_path(state, auth, &path).await? {
         return Ok(ResolveOutcome::Denied);
     }
 
@@ -1000,7 +1000,7 @@ async fn resolve_content_hash(
         let allowed = match &last_permission_check {
             Some((cached_path, allowed)) if cached_path == &path => *allowed,
             _ => {
-                let allowed = can_read_permission_path(state, auth, &path).await?;
+                let allowed = can_read_path(state, auth, &path).await?;
                 last_permission_check = Some((path.clone(), allowed));
                 allowed
             }
@@ -1065,7 +1065,7 @@ async fn resolve_content_hash(
     }
 }
 
-async fn can_read_permission_path(
+async fn can_read_path(
     state: &ServerState,
     auth: &AuthContext,
     path: &str,
@@ -1077,7 +1077,7 @@ async fn can_read_permission_path(
     }
 }
 
-fn parse_requested_object_id(object_id: &str) -> Result<RequestedObjectId, DrsError> {
+fn parse_object_id(object_id: &str) -> Result<RequestedObjectId, DrsError> {
     if object_id.starts_with(W3ID_DATA_PREFIX) {
         return match W3idDataIdentifier::parse(object_id)
             .map_err(|error| DrsError::bad_request(error.to_string()))?
@@ -1193,7 +1193,7 @@ mod tests {
         DrsBulkObjectsRequestBody, GetObjectError, MAX_BULK_OBJECT_IDS, RequestedObjectId,
         ResolveOutcome, ResolvedObject, W3ID_DATA_PREFIX, build_object_response, download_error,
         drs_denied_error, encode_component, get_authorizations, get_object,
-        parse_requested_object_id, post_objects, resolve_object, routed_deadline,
+        parse_object_id, post_objects, resolve_object, routed_deadline,
     };
     use crate::openapi::ApiDoc;
     use crate::routes::tests::fixtures::{
@@ -1393,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_drs_denied_error_matches_unknown_object() {
+    fn anonymous_denial_concealed() {
         let anonymous = drs_denied_error(true);
         assert_eq!(anonymous.status, axum::http::StatusCode::NOT_FOUND);
         assert_eq!(anonymous.message, "DRS object not found");
@@ -1404,13 +1404,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_canonical_w3id_object_id() {
+    fn parses_canonical_w3id() {
         let expected_hash = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
             0x1c, 0x1d, 0x1e, 0x1f,
         ];
-        let parsed = parse_requested_object_id(
+        let parsed = parse_object_id(
             "https://w3id.org/aruna/data/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
         )
         .unwrap();
@@ -1423,14 +1423,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_content_hash_arn_preserving_realm_node_and_hash() {
+    fn parses_content_arn() {
         let realm_id = test_realm_id();
         let node_id = test_node_id();
         let arn = format!(
             "arn:aruna:{realm_id}:{node_id}:ch/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
         );
 
-        let parsed = parse_requested_object_id(&arn).unwrap();
+        let parsed = parse_object_id(&arn).unwrap();
 
         match parsed {
             RequestedObjectId::ContentHashArn {
@@ -1461,7 +1461,7 @@ mod tests {
         let bare = format!("arn:aruna:{realm_id}:{node_id}:s3/mybucket/path/file.txt@invalid");
 
         for object_id in [bare.clone(), format!("{W3ID_DATA_PREFIX}{bare}")] {
-            let error = parse_requested_object_id(&object_id)
+            let error = parse_object_id(&object_id)
                 .err()
                 .expect("malformed version should be rejected");
             assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -1614,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_canonical_w3id_response_omits_aliases_and_keeps_download_method() {
+    fn canonical_response_complete() {
         let blake3 = [0x11u8; 32];
         let canonical_w3id = format!("{W3ID_DATA_PREFIX}{}", hex::encode(blake3));
         let resolved = ResolvedObject {
@@ -1666,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_content_hash_arn_response_exposes_canonical_alias() {
+    fn content_response_aliases() {
         let realm_id = test_realm_id();
         let node_id = test_node_id();
         let blake3 = [0x22u8; 32];
@@ -1754,7 +1754,7 @@ mod tests {
     }
 
     #[test]
-    fn drs_openapi_includes_service_and_object_paths() {
+    fn openapi_has_drs() {
         let openapi = ApiDoc::openapi();
         assert!(
             openapi

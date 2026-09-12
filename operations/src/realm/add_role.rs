@@ -9,8 +9,7 @@ use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::{
     Actor, AuthContext, Permission, RealmAuthorizationDocument, RealmId, Role,
@@ -121,7 +120,7 @@ pub enum AddRealmRoleError {
 
 const RESERVED_REALM_ROLE_NAMES: &[&str] = &["realm_admin"];
 
-fn is_reserved_realm_role_name(name: &str) -> bool {
+fn reserved_role_name(name: &str) -> bool {
     RESERVED_REALM_ROLE_NAMES.contains(&name.trim())
 }
 
@@ -143,7 +142,7 @@ impl AddRealmRoleOperation {
                 got,
             );
         };
-        match self.emit_get_auth_doc(txn_id) {
+        match self.emit_auth_read(txn_id) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
@@ -159,7 +158,7 @@ impl AddRealmRoleOperation {
     }
 
     fn validate_role(&self) -> Result<(), AddRealmRoleError> {
-        if is_reserved_realm_role_name(&self.input.role.name) {
+        if reserved_role_name(&self.input.role.name) {
             return Err(AddRealmRoleError::ReservedRoleName);
         }
 
@@ -217,7 +216,7 @@ impl AddRealmRoleOperation {
         }
     }
 
-    fn emit_get_auth_doc(&mut self, txn_id: TxnId) -> Result<Effects, AddRealmRoleError> {
+    fn emit_auth_read(&mut self, txn_id: TxnId) -> Result<Effects, AddRealmRoleError> {
         self.state = AddRealmRoleState::GetAuthDocAndAdminState { txn_id };
         let target = AdminDocumentTarget::Realm {
             realm_id: self.input.realm_id,
@@ -228,14 +227,14 @@ impl AddRealmRoleOperation {
                 (AUTH_KEYSPACE.to_string(), auth_key),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                 ),
             ],
             txn_id: Some(txn_id),
         })])
     }
 
-    fn handle_get_auth_doc_and_admin_state(&mut self, event: Event, txn_id: TxnId) -> Effects {
+    fn handle_auth_read(&mut self, event: Event, txn_id: TxnId) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event(
@@ -252,17 +251,13 @@ impl AddRealmRoleOperation {
             );
         };
 
-        match self.emit_write_realm_auth_doc_and_admin_state(
-            txn_id,
-            auth_doc_value.clone(),
-            reducer_state_value.clone(),
-        ) {
+        match self.emit_auth_write(txn_id, auth_doc_value.clone(), reducer_state_value.clone()) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn emit_write_realm_auth_doc_and_admin_state(
+    fn emit_auth_write(
         &mut self,
         txn_id: TxnId,
         auth_doc: Option<ByteView>,
@@ -277,7 +272,7 @@ impl AddRealmRoleOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                aruna_core::reducer::decode_admin_document_reducer_state(value.as_ref())
+                aruna_core::reducer::decode_reducer_state(value.as_ref())
                     .map_err(ConversionError::from)
             })
             .transpose()?;
@@ -291,16 +286,14 @@ impl AddRealmRoleOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
-        let admin_events = apply_admin_reducer_updates(&mut reducer_state, &self.input)?;
+        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
         materialize_realm_role(&mut auth_doc, &self.input.role, &reducer_state);
 
-        let stale_conflict_delete_keys: Vec<_> = stale_admin_document_conflict_delete_entries(
-            previous_reducer_state.as_ref(),
-            Some(&reducer_state),
-        )
-        .into_iter()
-        .map(|(key_space, key)| (key_space, key.as_ref().to_vec()))
-        .collect();
+        let stale_conflict_delete_keys: Vec<_> =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state))
+                .into_iter()
+                .map(|(key_space, key)| (key_space, key.as_ref().to_vec()))
+                .collect();
 
         let mut writes = vec![
             (
@@ -308,7 +301,7 @@ impl AddRealmRoleOperation {
                 (*auth_doc.realm_id.as_bytes()).into(),
                 auth_doc.to_bytes(&self.input.actor)?.into(),
             ),
-            admin_document_reducer_state_write_entry(&reducer_state)?,
+            reducer_state_entry(&reducer_state)?,
         ];
         let document_target = DocumentSyncTarget::RealmAuthorization {
             realm_id: self.input.realm_id,
@@ -327,7 +320,7 @@ impl AddRealmRoleOperation {
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
-        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+        writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.state = AddRealmRoleState::WriteRealmAuthDocAndAdminState {
             txn_id,
@@ -342,7 +335,7 @@ impl AddRealmRoleOperation {
         })])
     }
 
-    fn handle_write_realm_auth_doc_and_admin_state(
+    fn handle_auth_write(
         &mut self,
         event: Event,
         txn_id: TxnId,
@@ -378,7 +371,7 @@ impl AddRealmRoleOperation {
         self.emit_commit_transaction(txn_id, auth_doc, admin_outbox_written)
     }
 
-    fn handle_delete_stale_admin_conflicts(
+    fn delete_stale_conflicts(
         &mut self,
         event: Event,
         txn_id: TxnId,
@@ -430,10 +423,10 @@ impl AddRealmRoleOperation {
             return smallvec![schedule_outbox_drain_effect()];
         }
 
-        self.emit_announce_auth_doc(auth_doc)
+        self.emit_auth_announce(auth_doc)
     }
 
-    fn handle_schedule_admin_document_outbox_drain(
+    fn schedule_outbox_drain(
         &mut self,
         event: Event,
         auth_doc: RealmAuthorizationDocument,
@@ -453,7 +446,7 @@ impl AddRealmRoleOperation {
         }
     }
 
-    fn emit_announce_auth_doc(&mut self, auth_doc: RealmAuthorizationDocument) -> Effects {
+    fn emit_auth_announce(&mut self, auth_doc: RealmAuthorizationDocument) -> Effects {
         self.state = AddRealmRoleState::AnnounceAuthDoc {
             auth_doc: auth_doc.clone(),
         };
@@ -467,7 +460,7 @@ impl AddRealmRoleOperation {
         )]
     }
 
-    fn handle_announce_auth_doc(
+    fn handle_auth_announce(
         &mut self,
         event: Event,
         auth_doc: RealmAuthorizationDocument,
@@ -517,7 +510,7 @@ impl AddRealmRoleOperation {
         )
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn fail_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -554,7 +547,7 @@ impl Operation for AddRealmRoleOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.fail_storage_error(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
@@ -563,14 +556,14 @@ impl Operation for AddRealmRoleOperation {
             AddRealmRoleState::Auth => self.handle_authorization(event),
             AddRealmRoleState::StartTransaction => self.handle_start_transaction(event),
             AddRealmRoleState::GetAuthDocAndAdminState { txn_id } => {
-                self.handle_get_auth_doc_and_admin_state(event, txn_id)
+                self.handle_auth_read(event, txn_id)
             }
             AddRealmRoleState::WriteRealmAuthDocAndAdminState {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 stale_conflict_delete_keys,
-            } => self.handle_write_realm_auth_doc_and_admin_state(
+            } => self.handle_auth_write(
                 event,
                 txn_id,
                 auth_doc,
@@ -581,22 +574,17 @@ impl Operation for AddRealmRoleOperation {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
-            } => self.handle_delete_stale_admin_conflicts(
-                event,
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-            ),
+            } => self.delete_stale_conflicts(event, txn_id, auth_doc, admin_outbox_written),
             AddRealmRoleState::CommitTransaction {
                 auth_doc,
                 admin_outbox_written,
                 ..
             } => self.handle_commit_transaction(event, auth_doc, admin_outbox_written),
             AddRealmRoleState::ScheduleAdminDocumentOutboxDrain { auth_doc } => {
-                self.handle_schedule_admin_document_outbox_drain(event, auth_doc)
+                self.schedule_outbox_drain(event, auth_doc)
             }
             AddRealmRoleState::AnnounceAuthDoc { auth_doc } => {
-                self.handle_announce_auth_doc(event, auth_doc)
+                self.handle_auth_announce(event, auth_doc)
             }
             AddRealmRoleState::Init | AddRealmRoleState::Finish | AddRealmRoleState::Error => {
                 smallvec![]
@@ -628,7 +616,7 @@ impl Operation for AddRealmRoleOperation {
     }
 }
 
-fn apply_admin_reducer_updates(
+fn apply_reducer_updates(
     state: &mut AdminDocumentReducerState,
     input: &AddRealmRoleConfig,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
@@ -670,7 +658,7 @@ fn materialize_realm_role(
 
     auth_doc.roles.insert(role.role_id, role.clone());
 
-    let materialized_assignments = reducer_state.materialized_realm_role_user_assignments();
+    let materialized_assignments = reducer_state.materialized_realm_assignments();
     let Some(auth_role) = auth_doc.roles.get_mut(&role.role_id) else {
         return;
     };
@@ -713,9 +701,7 @@ pub mod test {
     use aruna_core::reducer::{
         AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
     };
-    use aruna_core::storage_entries::{
-        admin_document_reducer_conflict_key, admin_document_reducer_state_key,
-    };
+    use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
     use aruna_core::structs::{Actor, Permission, RealmAuthorizationDocument, Role};
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::TxnId;
@@ -726,7 +712,7 @@ pub mod test {
     use ulid::Ulid;
 
     #[test]
-    fn rejects_reserved_role_names() {
+    fn rejects_reserved_names() {
         let realm_id = aruna_core::structs::RealmId([1u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
         let actor = Actor {
@@ -759,7 +745,7 @@ pub mod test {
     }
 
     #[test]
-    fn rejects_public_roles_with_write_or_deny_permissions() {
+    fn rejects_public_permissions() {
         let realm_id = aruna_core::structs::RealmId([1u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
         let actor = Actor {
@@ -789,7 +775,7 @@ pub mod test {
     }
 
     #[test]
-    fn rejects_foreign_nil_assigned_users() {
+    fn rejects_foreign_nil() {
         let realm_id = aruna_core::structs::RealmId([1u8; 32]);
         let other_realm_id = aruna_core::structs::RealmId([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
@@ -817,7 +803,7 @@ pub mod test {
     }
 
     #[test]
-    pub fn writes_realm_auth_doc_reducer_state_and_conflicts_in_one_transaction() {
+    pub fn writes_role_atomically() {
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
         let actor_user_id = UserId::local(Ulid::from_bytes([1u8; 16]), realm_id);
         let assigned_user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
@@ -896,8 +882,8 @@ pub mod test {
                 ],
             },
         );
-        let auth_doc = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let stale_conflict_key = admin_document_reducer_conflict_key(&target, &stale_conflict_path);
+        let auth_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
+        let stale_conflict_key = reducer_conflict_key(&target, &stale_conflict_path);
         let mut expected_auth_doc = auth_doc.clone();
         expected_auth_doc.roles.insert(role_id, input.role.clone());
 
@@ -922,7 +908,7 @@ pub mod test {
                     (AUTH_KEYSPACE.to_string(), (*realm_id.as_bytes()).into()),
                     (
                         ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                        admin_document_reducer_state_key(&target),
+                        reducer_state_key(&target),
                     ),
                 ],
                 txn_id: Some(txn_id),
@@ -936,7 +922,7 @@ pub mod test {
                     Some(auth_doc.to_bytes(&actor).unwrap().into()),
                 ),
                 (
-                    admin_document_reducer_state_key(&target),
+                    reducer_state_key(&target),
                     Some(postcard::to_allocvec(&previous_state).unwrap().into()),
                 ),
             ],
@@ -965,11 +951,7 @@ pub mod test {
                     .iter()
                     .find(|(keyspace, key, _)| {
                         keyspace == ADMIN_DOCUMENT_CONFLICT_KEYSPACE
-                            && key
-                                == &admin_document_reducer_conflict_key(
-                                    &target,
-                                    &retained_conflict_path,
-                                )
+                            && key == &reducer_conflict_key(&target, &retained_conflict_path)
                     })
                     .expect("retained conflict write is included");
 
@@ -994,7 +976,7 @@ pub mod test {
                 }));
                 assert!(
                     reducer_state
-                        .materialized_realm_role_user_assignments()
+                        .materialized_realm_assignments()
                         .get(&role_id)
                         .is_some_and(|users| users.contains(&assigned_user_id))
                 );
@@ -1052,7 +1034,7 @@ pub mod test {
     }
 
     #[test]
-    pub fn outbox_drain_scheduling_error_finishes_without_direct_auth_doc() {
+    pub fn outbox_error_finishes() {
         let realm_id = aruna_core::structs::RealmId([6u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([7u8; 16]), realm_id);
         let actor = Actor {

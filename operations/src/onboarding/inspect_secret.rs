@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_finalizing_secret_inspects_for_same_node() {
+    async fn expired_inspects_same() {
         let fixture = setup_finalizing_secret("node-a").await;
 
         let inspected = drive(
@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_finalizing_secret_rejects_different_node() {
+    async fn expired_rejects_other() {
         let fixture = setup_finalizing_secret("node-a").await;
 
         let inspected = drive(

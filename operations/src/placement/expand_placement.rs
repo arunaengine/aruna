@@ -3,7 +3,7 @@
 //! current set get a transition; weight changes, removals and drains never do.
 
 use aruna_core::structs::{Actor, CandidatePlacementMap, RealmConfigDocument, TransitionLimits};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -11,7 +11,7 @@ use crate::placement::transition::{TransitionRequest, expansion_buckets, plan_tr
 use crate::realm::get_config::GetRealmConfigOperation;
 use crate::realm::mutate_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
-    drive_realm_placement_mutation,
+    drive_placement_mutation,
 };
 
 /// Publishes the realm's first candidate map and initializes every strategy's
@@ -66,9 +66,7 @@ pub async fn expand_realm_placement(
 ) -> Result<Vec<Ulid>, MutateRealmPlacementError> {
     let config = ensure_activated_map(context, actor).await?;
     let (next_epoch, map) = next_map(&config);
-    // The newest epoch is the durable pending expansion target when it already
-    // freezes the current view; equality never short-circuits the transition
-    // work below, or a join during an active expansion would be dropped.
+    // Reuse the durable pending view without skipping its unfinished transition work.
     let reuse = config
         .newest_map_epoch()
         .and_then(|epoch| config.candidate_map(epoch))
@@ -178,7 +176,7 @@ pub(crate) async fn mutate(
     actor: &Actor,
     mutation: RealmPlacementMutation,
 ) -> Result<RealmConfigDocument, MutateRealmPlacementError> {
-    drive_realm_placement_mutation(
+    drive_placement_mutation(
         MutateRealmPlacementConfig {
             actor: actor.clone(),
             mutation,

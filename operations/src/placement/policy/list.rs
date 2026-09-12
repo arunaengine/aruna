@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_in_id_order() {
+    fn lists_by_id() {
         let page = page(&[1, 2, 3], false);
 
         let ids: Vec<_> = page

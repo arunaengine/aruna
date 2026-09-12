@@ -1,5 +1,5 @@
-use super::lifecycle::registry_records_for_group;
-use super::search::{GraphVisibilityScope, LifecycleVisibility, registry_record_for_graph};
+use super::lifecycle::records_for_group;
+use super::search::{GraphVisibilityScope, LifecycleVisibility, record_for_graph};
 use super::search::{
     HitDescribe, ScopeAuthorizer, describe_hits_parallel, filter_candidate_records,
     select_visible_records,
@@ -8,7 +8,7 @@ use super::*;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::MetadataApplyRoCrateRequest;
-use aruna_core::storage_entries::metadata_graph_lifecycle_key;
+use aruna_core::storage_entries::graph_lifecycle_key;
 use aruna_core::structs::{
     ArunaArn, PathRestriction, PlacementRef, RealmNodeKind, SyncMode, SyncState,
     SyncStatusSnapshot, TokenRevocation,

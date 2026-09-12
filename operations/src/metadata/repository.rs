@@ -14,14 +14,11 @@ use aruna_core::metadata::{
     MetadataMaterializationStatusRecord,
 };
 pub use aruna_core::storage_entries::{
-    metadata_create_event_and_pending_projection_write_entries, metadata_create_event_write_entry,
-    metadata_document_key, metadata_document_lifecycle_manifest_write_entry,
-    metadata_document_lifecycle_revision_write_entry, metadata_document_lifecycle_write_entry,
-    metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
-    metadata_materialization_document_job_write_entry, metadata_materialization_job_key,
-    metadata_materialization_job_write_entry, metadata_materialization_status_key,
-    metadata_materialization_status_write_entry, metadata_registry_key, metadata_registry_prefix,
-    metadata_registry_write_entries, shard_manifest_write_entry,
+    create_event_entry, create_projection_entries, document_job_entry, document_lifecycle_entry,
+    graph_lifecycle_entry, graph_lifecycle_key, lifecycle_manifest_entry, lifecycle_revision_entry,
+    materialization_job_entry, materialization_job_key, materialization_status_entry,
+    materialization_status_key, metadata_document_key, metadata_registry_key,
+    metadata_registry_prefix, registry_write_entries, shard_manifest_entry,
 };
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -55,7 +52,7 @@ pub fn read_registry_effect(group_id: GroupId, document_id: Ulid, txn_id: Option
     })
 }
 
-pub fn read_registry_by_document_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub fn read_document_registry(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
         key: metadata_document_key(document_id),
@@ -63,18 +60,18 @@ pub fn read_registry_by_document_effect(document_id: Ulid, txn_id: Option<TxnId>
     })
 }
 
-pub fn read_materialization_status_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub fn read_status_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
-        key: metadata_materialization_status_key(document_id),
+        key: materialization_status_key(document_id),
         txn_id,
     })
 }
 
-pub fn read_graph_lifecycle_effect(graph_iri: &str, txn_id: Option<TxnId>) -> Effect {
+pub fn read_lifecycle_effect(graph_iri: &str, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-        key: metadata_graph_lifecycle_key(graph_iri),
+        key: graph_lifecycle_key(graph_iri),
         txn_id,
     })
 }
@@ -103,7 +100,7 @@ pub fn delete_registry_effect(
     })
 }
 
-pub fn delete_document_index_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub fn delete_index_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Delete {
         key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
         key: metadata_document_key(document_id),
@@ -125,11 +122,11 @@ pub fn iter_registry_effect(
     })
 }
 
-pub fn write_graph_lifecycle_effect(
+pub fn write_graph_lifecycle(
     record: &MetadataGraphLifecycleRecord,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
-    let (key_space, key, value) = metadata_graph_lifecycle_write_entry(record)?;
+    let (key_space, key, value) = graph_lifecycle_entry(record)?;
     Ok(Effect::Storage(StorageEffect::Write {
         key_space,
         key,
@@ -138,11 +135,11 @@ pub fn write_graph_lifecycle_effect(
     }))
 }
 
-pub fn write_document_lifecycle_effect(
+pub fn write_document_lifecycle(
     record: &MetadataDocumentLifecycleRecord,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
-    let (key_space, key, value) = metadata_document_lifecycle_write_entry(record)?;
+    let (key_space, key, value) = document_lifecycle_entry(record)?;
     Ok(Effect::Storage(StorageEffect::Write {
         key_space,
         key,
@@ -151,19 +148,17 @@ pub fn write_document_lifecycle_effect(
     }))
 }
 
-pub fn write_document_lifecycle_with_revision_effect(
+pub fn write_lifecycle_revision(
     record: &MetadataDocumentLifecycleRecord,
     delete_actor: NodeId,
     placement: aruna_core::structs::PlacementRef,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     let mut writes = vec![
-        metadata_document_lifecycle_write_entry(record)?,
-        metadata_document_lifecycle_revision_write_entry(record, delete_actor, placement)?,
+        document_lifecycle_entry(record)?,
+        lifecycle_revision_entry(record, delete_actor, placement)?,
     ];
-    if let Some(manifest) =
-        metadata_document_lifecycle_manifest_write_entry(record, delete_actor, placement)?
-    {
+    if let Some(manifest) = lifecycle_manifest_entry(record, delete_actor, placement)? {
         writes.push(manifest);
     }
     Ok(Effect::Storage(StorageEffect::BatchWrite {
@@ -184,9 +179,8 @@ pub fn delete_holders_effect(
     })
 }
 
-// DEFERRED (#280 audit trail): these audit records back the generic audit read
-// endpoint; the causal-event contract is the deferred remainder. DEFERRED (#364
-// lineage, #293 historical replay): read/dashboard projections, not built.
+// DEFERRED (#280 audit trail): these audit records back the generic audit read endpoint;
+// the causal-event contract is the deferred remainder.
 pub fn write_audit_effect(
     record: &MetadataAuditRecord,
     audit_id: Ulid,
@@ -200,14 +194,14 @@ pub fn write_audit_effect(
     }))
 }
 
-pub fn write_create_records_and_outbox_effect(
+pub fn write_create_effect(
     record: &MetadataRegistryRecord,
     audit: &MetadataAuditRecord,
     audit_id: Ulid,
     outbox: Option<&DocumentSyncOutboxRecord>,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
-    let writes = create_records_and_outbox_write_entries(record, audit, audit_id, outbox)?;
+    let writes = create_outbox_entries(record, audit, audit_id, outbox)?;
 
     Ok(Effect::Storage(StorageEffect::BatchWrite {
         writes,
@@ -215,13 +209,13 @@ pub fn write_create_records_and_outbox_effect(
     }))
 }
 
-pub fn create_records_and_outbox_write_entries(
+pub fn create_outbox_entries(
     record: &MetadataRegistryRecord,
     audit: &MetadataAuditRecord,
     audit_id: Ulid,
     outbox: Option<&DocumentSyncOutboxRecord>,
 ) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
-    let mut writes = metadata_registry_write_entries(record)?;
+    let mut writes = registry_write_entries(record)?;
     writes.push((
         METADATA_AUDIT_KEYSPACE.to_string(),
         metadata_audit_key(record.group_id, record.document_id, audit_id),
@@ -229,13 +223,13 @@ pub fn create_records_and_outbox_write_entries(
     ));
     if let Some(outbox) = outbox {
         writes.push(crate::sync::document_outbox::outbox_write_entry(outbox)?);
-        if let Some((lifecycle, change)) = outbox_document_lifecycle_upsert(outbox)? {
-            writes.push(metadata_document_lifecycle_revision_write_entry(
+        if let Some((lifecycle, change)) = outbox_lifecycle_upsert(outbox)? {
+            writes.push(lifecycle_revision_entry(
                 &lifecycle,
                 outbox.node_id,
                 change.placement,
             )?);
-            if let Some(manifest) = shard_manifest_write_entry(&outbox.target, &change)? {
+            if let Some(manifest) = shard_manifest_entry(&outbox.target, &change)? {
                 writes.push(manifest);
             }
         }
@@ -244,7 +238,7 @@ pub fn create_records_and_outbox_write_entries(
     Ok(writes)
 }
 
-fn outbox_document_lifecycle_upsert(
+fn outbox_lifecycle_upsert(
     outbox: &DocumentSyncOutboxRecord,
 ) -> Result<
     Option<(
@@ -266,7 +260,7 @@ fn outbox_document_lifecycle_upsert(
     Ok(Some((lifecycle, *change)))
 }
 
-pub fn create_records_outbox_and_materialization_write_entries(
+pub fn create_materialization_entries(
     record: &MetadataRegistryRecord,
     audit: &MetadataAuditRecord,
     audit_id: Ulid,
@@ -274,28 +268,22 @@ pub fn create_records_outbox_and_materialization_write_entries(
     materialization_status: &MetadataMaterializationStatusRecord,
     materialization_job: &MetadataMaterializationJobRecord,
 ) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
-    let mut writes = create_records_and_outbox_write_entries(record, audit, audit_id, outbox)?;
-    writes.push(metadata_materialization_status_write_entry(
-        materialization_status,
-    )?);
-    writes.push(metadata_materialization_job_write_entry(
-        materialization_job,
-    )?);
-    writes.push(metadata_materialization_document_job_write_entry(
-        materialization_job,
-    )?);
+    let mut writes = create_outbox_entries(record, audit, audit_id, outbox)?;
+    writes.push(materialization_status_entry(materialization_status)?);
+    writes.push(materialization_job_entry(materialization_job)?);
+    writes.push(document_job_entry(materialization_job)?);
     Ok(writes)
 }
 
-pub fn metadata_event_projection_write_entries(
+pub fn event_projection_entries(
     event: &MetadataCreateEventRecord,
     audit: &MetadataAuditRecord,
     outbox: Option<&DocumentSyncOutboxRecord>,
     materialization_status: &MetadataMaterializationStatusRecord,
     materialization_job: &MetadataMaterializationJobRecord,
 ) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
-    let mut writes = vec![metadata_create_event_write_entry(event)?];
-    writes.extend(create_records_outbox_and_materialization_write_entries(
+    let mut writes = vec![create_event_entry(event)?];
+    writes.extend(create_materialization_entries(
         &event.record,
         audit,
         event.event_id,
@@ -314,7 +302,7 @@ pub fn parse_registry_read(
     })
 }
 
-pub fn parse_materialization_status_read(
+pub fn parse_status_read(
     event: Event,
 ) -> Result<Option<MetadataMaterializationStatusRecord>, StorageReadError> {
     parse_storage_read(event, |bytes| {
@@ -322,7 +310,7 @@ pub fn parse_materialization_status_read(
     })
 }
 
-pub fn parse_graph_lifecycle_read(
+pub fn parse_lifecycle_read(
     event: Event,
 ) -> Result<Option<MetadataGraphLifecycleRecord>, StorageReadError> {
     parse_storage_read(event, |bytes| {
@@ -376,7 +364,7 @@ pub async fn delete_index_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::projector::create_event_outbox_record;
+    use crate::metadata::projector::create_outbox_record;
     use crate::sync::document_outbox::outbox_key;
     use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind};
     use aruna_core::keyspaces::{
@@ -384,9 +372,7 @@ mod tests {
         METADATA_UPDATED_INDEX_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
     };
     use aruna_core::metadata::MetadataCreateEventPayload;
-    use aruna_core::storage_entries::{
-        document_sync_revision_key, shard_manifest_key, updated_index_key,
-    };
+    use aruna_core::storage_entries::{shard_manifest_key, sync_revision_key, updated_index_key};
     use aruna_core::structs::{MetadataAuditOperation, PlacementRef, RealmId};
 
     fn node(seed: u8) -> NodeId {
@@ -453,7 +439,7 @@ mod tests {
         (
             record,
             audit,
-            create_event_outbox_record(&create_event, None, false),
+            create_outbox_record(&create_event, None, false),
         )
     }
 
@@ -463,7 +449,7 @@ mod tests {
         audit_id: Ulid,
         outbox: &DocumentSyncOutboxRecord,
     ) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
-        create_records_and_outbox_write_entries(record, audit, audit_id, Some(outbox))
+        create_outbox_entries(record, audit, audit_id, Some(outbox))
     }
 
     fn batch_effect(
@@ -473,7 +459,7 @@ mod tests {
         outbox: &DocumentSyncOutboxRecord,
         txn_id: Option<TxnId>,
     ) -> Result<Effect, ConversionError> {
-        write_create_records_and_outbox_effect(record, audit, audit_id, Some(outbox), txn_id)
+        write_create_effect(record, audit, audit_id, Some(outbox), txn_id)
     }
 
     fn batch_parts(effect: Effect) -> (Vec<(String, ByteView, ByteView)>, Option<TxnId>) {
@@ -501,7 +487,7 @@ mod tests {
         let updated_key = updated_index_key(record.updated_at_ms, record.document_id);
         let audit_key = metadata_audit_key(record.group_id, record.document_id, audit_id);
         let outbox_row_key = outbox_key(&outbox);
-        let revision_key = document_sync_revision_key(&outbox.target);
+        let revision_key = sync_revision_key(&outbox.target);
         let manifest_key = shard_manifest_key(&outbox.placement, &outbox.target);
         let expected = vec![
             (METADATA_INDEX_KEYSPACE.to_string(), registry_key.clone()),

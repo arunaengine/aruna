@@ -41,15 +41,13 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{
-    bucket_blob_permission_path, ensure_permission, require_unrestricted_realm_auth,
-};
+use crate::auth::{blob_permission_path, ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::jobs::{
     JobStatusResponse, coded_response, job_status_response, map_job_route, map_submit_error,
     parse_job_id,
 };
-use crate::routes::staging::queue_live_version_replication;
+use crate::routes::staging::queue_live_replication;
 use crate::server_state::ServerState;
 
 /// Envoy idles an upstream at 60 seconds, so the stream keeps itself alive.
@@ -219,7 +217,7 @@ pub struct PendingInputResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct FailedInputResponse {
     pub dest_key: String,
-    /// Why this item did not land, so the caller can retry or drop it.
+    /// Safe reason this item did not land, so the caller can retry or drop it.
     pub error: String,
 }
 
@@ -473,7 +471,7 @@ pub async fn get_session(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     match live_session(&state, &record, physical_job_id, true).await {
         Ok(session) => Ok(Json(session_response(&session, true)).into_response()),
@@ -519,7 +517,7 @@ pub async fn stream_session(
     Query(query): Query<EventsQuery>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, true).await {
         Ok(session) => session,
@@ -677,7 +675,7 @@ pub async fn submit_cell(
     Path(job_id): Path<String>,
     Json(request): Json<SubmitCellRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
@@ -724,7 +722,7 @@ pub async fn interrupt_session(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
@@ -772,7 +770,7 @@ pub async fn end_session(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
@@ -836,7 +834,7 @@ pub async fn stage_inputs(
     Path(job_id): Path<String>,
     Json(request): Json<SessionInputsRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
@@ -881,10 +879,7 @@ pub async fn stage_inputs(
                 pending.push(entry);
             }
             Err(error) => {
-                failed.push(FailedInputResponse {
-                    dest_key,
-                    error: error.public_message(),
-                });
+                failed.push(failed_input(dest_key, &error));
                 refusal = refusal.or(Some(error));
             }
         }
@@ -945,6 +940,13 @@ fn inputs_outcome(
         .into_response())
 }
 
+fn failed_input(dest_key: String, error: &ServerError) -> FailedInputResponse {
+    FailedInputResponse {
+        dest_key,
+        error: error.public_message(),
+    }
+}
+
 /// The bucket a name resolves to here. Absence reads as 404 like every other
 /// name the caller may not see.
 async fn bucket_info(
@@ -980,7 +982,7 @@ async fn stage_one(
     ensure_permission(
         state,
         auth,
-        bucket_blob_permission_path(state, source_info.group_id, &item.bucket, &item.key),
+        blob_permission_path(state, source_info.group_id, &item.bucket, &item.key),
         Permission::READ,
     )
     .await?;
@@ -1066,7 +1068,7 @@ async fn copy_inline(
     let linked = result.location.is_none();
     if linked {
         // A kept reference writes no replication obligation of its own.
-        queue_live_version_replication(
+        queue_live_replication(
             state,
             auth.clone(),
             bucket,
@@ -1162,7 +1164,7 @@ pub async fn list_scratch(
     Path(job_id): Path<String>,
     Query(query): Query<ScratchQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
@@ -1214,7 +1216,7 @@ pub async fn read_scratch(
     Path(job_id): Path<String>,
     Query(query): Query<ScratchReadQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
@@ -1818,6 +1820,84 @@ mod tests {
             body.ended.map(|ended| ended.reason),
             Some("idle".to_string())
         );
+    }
+
+    fn input(bucket: &str, dest_key: &str) -> SessionInputRequest {
+        SessionInputRequest {
+            bucket: bucket.to_string(),
+            key: "input.txt".to_string(),
+            version_id: None,
+            source_node_id: None,
+            dest_key: dest_key.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn checks_keys_first() {
+        let owner = user(2);
+        let (_dir, state, job_id, _helper) = build_node(owner).await;
+        let response = stage_inputs(
+            State(state),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Json(SessionInputsRequest {
+                items: vec![input("source", "data/a.txt"), input("source", "../escape")],
+            }),
+        )
+        .await;
+        assert!(matches!(response, Err(ServerError::BadRequestMessage(_))));
+    }
+
+    #[tokio::test]
+    async fn keeps_refusal_reason() {
+        let owner = user(2);
+        let (_dir, state, job_id, _helper) = build_node(owner).await;
+        let session = registry_session(&state, job_id).expect("session is live");
+        let quiet = session.snapshot().last_event_id;
+        let response = stage_inputs(
+            State(state),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Json(SessionInputsRequest {
+                items: vec![input("missing", "data/a.txt")],
+            }),
+        )
+        .await;
+        assert!(matches!(response, Err(ServerError::NotFound)));
+        assert_eq!(session.snapshot().last_event_id, quiet);
+    }
+
+    #[tokio::test]
+    async fn reports_failed_items() {
+        let staged = vec![StagedInputResponse {
+            dest_key: "data/a.txt".to_string(),
+            bytes: 4,
+            blake3: String::new(),
+            source_node_id: node().to_string(),
+            version_id: String::new(),
+        }];
+        let failed = vec![FailedInputResponse {
+            dest_key: "data/b.txt".to_string(),
+            error: "Not found".to_string(),
+        }];
+        let response = inputs_outcome(staged, failed, Some(ServerError::NotFound))
+            .expect("a partial result is accepted");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("the body reads");
+        let body: SessionInputsResponse = serde_json::from_slice(&bytes).expect("the body parses");
+        assert_eq!(body.staged.len(), 1);
+        assert_eq!(body.failed[0].dest_key, "data/b.txt");
+    }
+
+    #[test]
+    fn failed_item_redacted() {
+        let failed = failed_input(
+            "data/b.txt".to_string(),
+            &ServerError::InternalError("private backend detail".to_string()),
+        );
+        assert!(!failed.error.contains("private backend detail"));
     }
 
     fn registry_session(state: &Arc<ServerState>, job_id: JobId) -> Option<Arc<Session>> {

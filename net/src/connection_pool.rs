@@ -777,7 +777,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_request_times_out_when_actor_does_not_reply() {
+    async fn lease_actor_timeout() {
         let (tx, _rx) = mpsc::channel(1);
         let pool = ConnectionPool {
             tx,
@@ -1230,7 +1230,7 @@ impl Monitor {
                 let selected_path = paths.iter().find(|path| path.is_selected());
                 let selected_address = selected_path
                     .as_ref()
-                    .map(|path| transport_addr_to_string(path.remote_addr()));
+                    .map(|path| format_transport_addr(path.remote_addr()));
                 let rtt_ms = selected_path
                     .as_ref()
                     .map(|path| path.rtt())
@@ -1261,7 +1261,7 @@ impl Default for Monitor {
     }
 }
 
-fn transport_addr_to_string(addr: &TransportAddr) -> String {
+fn format_transport_addr(addr: &TransportAddr) -> String {
     match addr {
         TransportAddr::Ip(addr) => addr.to_string(),
         TransportAddr::Relay(url) => url.to_string(),

@@ -201,9 +201,8 @@ impl BackendsFile {
                     "backend `{name}` sets quota_bytes = 0; omit the field for an unlimited backend"
                 )));
             }
-            // Without it every UploadPart fails long after regular writes work,
-            // and no default can be synthesized that is certain not to name a
-            // container the operator already uses for something else.
+            // Without it every UploadPart fails long after regular writes work, and no default can be synthesized
+            // that is certain not to name a container the operator already uses for something else.
             if entry
                 .multipart_bucket
                 .as_deref()

@@ -72,7 +72,7 @@ impl UnreadCountOperation {
         smallvec![]
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn storage_error_fails(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -150,7 +150,7 @@ impl Operation for UnreadCountOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.storage_error_fails(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_counts_only_unread() {
+    async fn counts_only_unread() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let mut records = Vec::new();
@@ -231,7 +231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_caps_at_100() {
+    async fn caps_at_limit() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let records: Vec<_> = (0..130).map(|ts| record(recipient, ts, false)).collect();
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_exactly_100_is_not_capped() {
+    async fn limit_not_capped() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let records: Vec<_> = (0..100).map(|ts| record(recipient, ts, false)).collect();
@@ -263,7 +263,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_exactly_100_with_older_read_rows_is_not_capped() {
+    async fn read_rows_uncapped() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let mut records: Vec<_> = (100..200).map(|ts| record(recipient, ts, false)).collect();
@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_scans_across_pages() {
+    async fn scans_across_pages() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let alternating: Vec<_> = (0..250)
@@ -312,7 +312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_scan_work_is_bounded() {
+    async fn scan_work_bounded() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let total = UNREAD_SCAN_MAX_ROWS + 100;

@@ -1,7 +1,6 @@
-//! Durable records behind explicit policy attachment: the idempotency row one
-//! successor mint is keyed by, and the captured bulk run plus its per-object
-//! intents. Attaching a policy never rewrites a stored version, so every record
-//! here describes a successor that is minted instead.
+//! Durable records behind explicit policy attachment: the idempotency row one successor mint is keyed
+//! by, and the captured bulk run plus its per-object intents. Attaching a policy never rewrites a
+//! stored version, so every record here describes a successor that is minted instead.
 
 use crate::errors::ConversionError;
 use crate::structs::blob::checked_refs;

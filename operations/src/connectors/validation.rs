@@ -206,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_public_key() {
+    fn unknown_public_rejected() {
         let err = validate_connector_input(
             "http",
             SourceConnectorKind::Http,
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_required_public_key() {
+    fn missing_public_rejected() {
         let err = validate_connector_input(
             "s3",
             SourceConnectorKind::S3,
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_secret_key() {
+    fn unknown_secret_rejected() {
         let err = validate_connector_input(
             "webdav",
             SourceConnectorKind::Webdav,
@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_aruna_native_connector_kind() {
+    fn unsupported_native_rejected() {
         let err = validate_connector_input(
             "native",
             SourceConnectorKind::ArunaNative,

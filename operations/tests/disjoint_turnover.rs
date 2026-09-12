@@ -1,13 +1,6 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 //! Zero-overlap turnover, twice, in opposite directions (#400).
-//!
-//! A disjoint hand-off is the case that would break a design keyed on holders:
-//! not one node of the old set survives into the new one. Topic identity is
-//! `(realm, strategy, bucket)` and nothing else, so the bucket keeps its single
-//! topic and its whole history across both moves - which is what these
-//! assertions are for: the document written before the first turnover is still
-//! served by a set that shares no node with the one that accepted it.
 
 mod topology;
 
@@ -16,12 +9,8 @@ use aruna_core::StructuredId;
 use aruna_core::document::shard_topic_id;
 use aruna_core::structs::{PlacementRef, TransitionLimits};
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
-};
+use aruna_operations::metadata::create_document::mint_local_document;
 use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
-use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::placement::transition::preview_transition;
 use aruna_operations::realm::mutate_placement::RealmPlacementMutation;
 use ulid::Ulid;
@@ -48,7 +37,9 @@ async fn turnover_keeps_history() -> TestResult<()> {
     let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
-    let placement = create_document(&realm, origin, group_id, document_id, path).await?;
+    let placement = realm
+        .create_document(origin, group_id, document_id, path, "disjoint fixture")
+        .await?;
     let first = realm.assert_holder(origin.node_id(), &placement);
     let topic = shard_topic_id(realm.realm_id, &placement);
     for holder in &first {
@@ -135,34 +126,6 @@ async fn turn_over(
         "preview did not equal outcome"
     );
     Ok(holders)
-}
-
-async fn create_document(
-    realm: &Topology,
-    node: &TestNode,
-    group_id: Ulid,
-    document_id: Ulid,
-    document_path: &str,
-) -> TestResult<PlacementRef> {
-    let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
-            actor: realm.actor(node),
-            group_id,
-            document_id,
-            document_path: document_path.to_string(),
-            public: false,
-            payload: CreateMetadataDocumentPayload::Scaffold {
-                name: document_path.to_string(),
-                description: "disjoint fixture".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: None,
-            },
-        }),
-        node.context.as_ref(),
-    )
-    .await?;
-    replay_metadata_event_log(node.context.as_ref()).await?;
-    Ok(created.record.placement)
 }
 
 async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {

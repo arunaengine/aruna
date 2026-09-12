@@ -17,11 +17,9 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentReducerError, decode_admin_document_reducer_state};
+use aruna_core::reducer::{AdminDocumentReducerError, decode_reducer_state};
 use aruna_core::storage_entries::{
-    admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, notification_outbox_write_entry,
-    stale_admin_document_conflict_delete_entries,
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, NotificationOutboxRecord, Permission,
@@ -153,7 +151,7 @@ impl GroupJoinOperation {
                 (AUTH_KEYSPACE.into(), group_key),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.into(),
-                    admin_document_reducer_state_key(&AdminDocumentTarget::Group {
+                    reducer_state_key(&AdminDocumentTarget::Group {
                         group_id: self.input.group_id
                     })
                 ),
@@ -182,7 +180,7 @@ impl GroupJoinOperation {
         }
         let previous = reducer
             .as_deref()
-            .map(decode_admin_document_reducer_state)
+            .map(decode_reducer_state)
             .transpose()
             .map_err(ConversionError::from)?;
         let mut state = previous.clone().ok_or(GroupJoinError::NotFound)?;
@@ -361,8 +359,7 @@ impl GroupJoinOperation {
             false,
         )
         .fenced_at(self.fence.generation(&group.realm_id, &placement));
-        self.deletes =
-            stale_admin_document_conflict_delete_entries(previous.as_ref(), Some(&state));
+        self.deletes = stale_conflict_deletes(previous.as_ref(), Some(&state));
         self.output = Some(Ok(state
             .join_requests()
             .into_iter()
@@ -374,13 +371,13 @@ impl GroupJoinOperation {
                 self.input.group_id.to_bytes().to_vec().into(),
                 auth.to_bytes(&self.input.actor)?.into(),
             ),
-            admin_document_reducer_state_write_entry(&state)?,
+            reducer_state_entry(&state)?,
             outbox_write_entry(&record).map_err(ConversionError::from)?,
         ];
-        writes.extend(admin_document_conflict_write_entries(&state)?);
+        writes.extend(conflict_write_entries(&state)?);
         self.notifications = !notifications.is_empty();
         for record in notifications {
-            writes.push(notification_outbox_write_entry(
+            writes.push(aruna_core::storage_entries::outbox_write_entry(
                 &NotificationOutboxRecord {
                     outbox_id: record.notification_id,
                     record,
@@ -570,7 +567,7 @@ mod tests {
             ..actor.clone()
         };
         let auth_doc =
-            GroupAuthorizationDocument::new_default_group_doc(actor.user_id, realm_id, group_id);
+            GroupAuthorizationDocument::default_group_doc(actor.user_id, realm_id, group_id);
         let user_role = auth_doc
             .roles
             .values()
@@ -647,12 +644,8 @@ mod tests {
                 Some(auth_doc.to_bytes(&actor).unwrap().into()),
             ),
             (
-                admin_document_reducer_state_key(&reducer.target),
-                Some(
-                    admin_document_reducer_state_write_entry(&reducer)
-                        .unwrap()
-                        .2,
-                ),
+                reducer_state_key(&reducer.target),
+                Some(reducer_state_entry(&reducer).unwrap().2),
             ),
             (
                 realm_id.as_bytes().to_vec().into(),
@@ -756,8 +749,7 @@ mod tests {
                 .assigned_users
                 .contains(&member.user_id)
         );
-        let reducer =
-            decode_admin_document_reducer_state(value(ADMIN_DOCUMENT_STATE_KEYSPACE)).unwrap();
+        let reducer = decode_reducer_state(value(ADMIN_DOCUMENT_STATE_KEYSPACE)).unwrap();
         assert_eq!(
             reducer.join_requests()[0].decision.as_ref().unwrap().kind,
             JoinDecisionKind::Approved

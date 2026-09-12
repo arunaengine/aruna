@@ -1,6 +1,33 @@
-use super::engine::{decode_hit_properties, metadata_search_hit_from_craqle};
-use super::lifecycle::{list_deleted_graph_iris, list_registry_records_for_local_read};
-use super::*;
+use super::effects::warn_slow_call;
+use super::entity_convert::{decode_hit_properties, hit_from_craqle};
+use super::lifecycle::{list_deleted_iris, list_read_records};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Instant;
+
+use aruna_core::metadata::{MetadataError, MetadataSearchHit};
+use aruna_core::structs::{AuthContext, MetadataRegistryRecord};
+use aruna_core::telemetry::{record_duration_ms, record_elapsed_ms};
+use aruna_core::types::GroupId;
+use craqle::{
+    Action as CraqleAction, AuthorizationError as CraqleAuthError, Authorizer as CraqleAuthorizer,
+    CraqleNode, DescribeRequest, GraphId, GraphPolicy, GraphSearchRequest, SearchRequest,
+};
+use futures_util::FutureExt;
+use oxrdf::Term;
+use tracing::{Span, debug_span, field, warn};
+use ulid::Ulid;
+
+use super::effects::{graph_ids, record_error};
+use super::{
+    METADATA_ENRICH_TASKS, METADATA_REGISTRY_CANDIDATE_LIMIT, MetadataHandle, MetadataInner,
+    MetadataVisibilityCache,
+};
+use crate::auth::permission_rules::GroupPermissionRules;
+use crate::driver::DriverContext;
+use crate::metadata::query_cache::ScopeDigest;
+use crate::metadata::search_cursor::{METADATA_SEARCH_MAX_PAGINATION_DEPTH, compare_hits};
+use crate::metadata::search_enrichment::{hit_title, hit_types};
 
 #[tracing::instrument(
     name = "metadata.search.local",
@@ -44,7 +71,7 @@ pub(super) async fn search_local_graphs(
         ));
     }
 
-    let records = list_registry_records_for_local_read(inner.clone(), &span).await?;
+    let records = list_read_records(inner.clone(), &span).await?;
     // Without a candidate filter the request spans the realm, so craqle
     // authorizes the index hits it returns instead of every visible graph.
     let lazy = iri_filter.is_none() && graph_iris.is_none() && group_id.is_none();
@@ -94,7 +121,7 @@ pub(super) fn record_backend_search(
         }
         Err(error) => record_error(search_span, &error.to_string()),
     }
-    warn_if_slow_metadata_backend("search", None, elapsed);
+    warn_slow_call("search", None, elapsed);
 }
 
 async fn search_realm_scope(
@@ -106,7 +133,7 @@ async fn search_realm_scope(
     span: &Span,
 ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
     let authorization_started = Instant::now();
-    let scope = resolve_graph_visibility_scope(&inner, auth_context, records)
+    let scope = resolve_visibility_scope(&inner, auth_context, records)
         .boxed()
         .await?;
     record_elapsed_ms(span, "authorization_ms", authorization_started);
@@ -179,12 +206,7 @@ async fn search_visible_scope(
         .zip(properties)
         .filter_map(|(hit, properties)| {
             let record = scope.record_for_graph(&hit.graph_id)?;
-            Some(metadata_search_hit_from_craqle(
-                hit,
-                record,
-                &properties,
-                &query,
-            ))
+            Some(hit_from_craqle(hit, record, &properties, &query))
         })
         .collect::<Vec<_>>();
     // The unfiltered entry point returns raw index order; the search cursor's
@@ -209,7 +231,7 @@ async fn search_candidate_graphs(
 ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
     let iri_matches = match iri_filter.as_ref() {
         Some((predicate_iri, object_iri)) => Some(
-            super::super::iri_index::lookup_metadata_iri_references(
+            super::super::iri_index::lookup_iri_references(
                 &inner.storage_handle,
                 records.as_ref(),
                 predicate_iri,
@@ -374,12 +396,7 @@ async fn search_allowed_graphs(
         .zip(properties)
         .filter_map(|(hit, properties)| {
             let record = by_graph.get(&hit.graph_id)?;
-            Some(metadata_search_hit_from_craqle(
-                hit,
-                record,
-                &properties,
-                query,
-            ))
+            Some(hit_from_craqle(hit, record, &properties, query))
         })
         .collect())
 }
@@ -476,7 +493,7 @@ pub(super) fn describe_hit_properties(
     .unwrap_or_default()
 }
 
-pub(super) fn clamp_remote_search_graph_limit(limit: usize) -> usize {
+pub(super) fn clamp_remote_limit(limit: usize) -> usize {
     limit.clamp(1, METADATA_SEARCH_MAX_PAGINATION_DEPTH)
 }
 
@@ -600,7 +617,7 @@ async fn select_authorized_records(
 
     // Boxed so the read paths that already resolve a scope do not nest this
     // future again: the combined depth exceeds the auto-trait recursion limit.
-    let scope = resolve_graph_visibility_scope(&inner, auth_context, candidates)
+    let scope = resolve_visibility_scope(&inner, auth_context, candidates)
         .boxed()
         .await?;
     let selection = select_visible_records(&scope, &inner.visibility_cache);
@@ -687,9 +704,7 @@ pub(super) fn select_visible_records(
     selection
 }
 
-// All-metadata reads defer per-graph authorization to evaluation time: the
-// scope is resolved once per query (O(caller's groups)) and the per-graph
-// decision is a cheap synchronous lookup that craqle memoizes per query.
+// All-metadata reads resolve their authorization scope once for query evaluation.
 pub(super) enum LocalReadScope<T> {
     Eager(T),
     Lazy(GraphVisibilityScope),
@@ -708,7 +723,7 @@ pub(super) enum LifecycleVisibility {
 
 impl GraphVisibilityScope {
     fn record_for_graph(&self, graph_iri: &str) -> Option<&MetadataRegistryRecord> {
-        registry_record_for_graph(&self.records, graph_iri)
+        record_for_graph(&self.records, graph_iri)
     }
 
     // A tombstone in the request's own snapshot or in the cache hides the graph.
@@ -732,9 +747,8 @@ impl GraphVisibilityScope {
         visibility_cache: &MetadataVisibilityCache,
         record: &MetadataRegistryRecord,
     ) -> bool {
-        // Rules are collected per group, but every record is decided on its own
-        // permission path, so per-document grants and denials agree with the
-        // decision `can_read_record` makes for the same caller and record.
+        // Rules are collected per group, but every record is decided on its own permission
+        // path, so per-document grants and denials agree with the decision.
         !self.record_deleted(visibility_cache, &record.graph_iri)
             && self.permissions.record_visible(record)
     }
@@ -761,10 +775,9 @@ impl GraphVisibilityScope {
     }
 }
 
-// Canonical graph IRIs embed the document id (graph_iri_for), enabling an
-// O(log n) lookup in the document-id-ordered snapshot; non-canonical IRIs
-// fall back to a scan.
-pub(super) fn registry_record_for_graph<'a>(
+// Canonical graph IRIs embed the document id (graph_iri_for), enabling an O(log n) lookup in
+// the document-id-ordered snapshot; non-canonical IRIs fall back to a scan.
+pub(super) fn record_for_graph<'a>(
     records: &'a [MetadataRegistryRecord],
     graph_iri: &str,
 ) -> Option<&'a MetadataRegistryRecord> {
@@ -780,12 +793,12 @@ pub(super) fn registry_record_for_graph<'a>(
     records.iter().find(|record| record.graph_iri == graph_iri)
 }
 
-pub(super) async fn resolve_graph_visibility_scope(
+pub(super) async fn resolve_visibility_scope(
     inner: &Arc<MetadataInner>,
     auth_context: Option<AuthContext>,
     records: Arc<Vec<MetadataRegistryRecord>>,
 ) -> Result<GraphVisibilityScope, MetadataError> {
-    let lifecycle_refresh = refresh_lifecycle_visibility_for_records(inner, &records).await?;
+    let lifecycle_refresh = refresh_visibility(inner, &records).await?;
     let lifecycle_visibility = if lifecycle_refresh.store_accepted {
         LifecycleVisibility::Cache(lifecycle_refresh.deleted_graphs)
     } else {
@@ -809,9 +822,7 @@ pub(super) async fn resolve_graph_visibility_scope(
             .map(|record| record.group_id),
     )
     .await;
-    // RBAC/public visibility is additionally constrained by the metadata.read
-    // request policies; a policy-denied record is dropped from the scope so the
-    // eager and lazy (SPARQL) paths both fail closed on it.
+    // Request policy removes denied records from both eager and SPARQL paths.
     let evaluators = crate::auth::request_policy::PolicyEvaluator::load_bulk(
         &context,
         records
@@ -846,14 +857,13 @@ pub(super) async fn resolve_graph_visibility_scope(
     })
 }
 
-async fn refresh_lifecycle_visibility_for_records(
+async fn refresh_visibility(
     inner: &Arc<MetadataInner>,
     records: &[MetadataRegistryRecord],
 ) -> Result<LifecycleVisibilityRefresh, MetadataError> {
     let fill_generation = inner.visibility_cache.current_generation();
-    let (deleted_graphs, _) =
-        list_deleted_graph_iris(inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
-    let store_accepted = inner.visibility_cache.refresh_lifecycle_deleted_if_current(
+    let (deleted_graphs, _) = list_deleted_iris(inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
+    let store_accepted = inner.visibility_cache.refresh_lifecycle_deleted(
         records.iter().map(|record| {
             (
                 record.graph_iri.clone(),
@@ -866,4 +876,59 @@ async fn refresh_lifecycle_visibility_for_records(
         deleted_graphs,
         store_accepted,
     })
+}
+
+impl MetadataHandle {
+    #[tracing::instrument(
+        name = "metadata.search.local_authorized",
+        level = "debug",
+        skip(self, auth_context, query),
+        fields(
+            query_len = query.len() as u64,
+            limit = limit as u64,
+            graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
+        )
+    )]
+    pub async fn search_authorized_local(
+        &self,
+        auth_context: Option<AuthContext>,
+        graph_iris: Option<Vec<String>>,
+        query: String,
+        limit: usize,
+        group_id: Option<GroupId>,
+    ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+        search_local_graphs(
+            self.inner.clone(),
+            auth_context,
+            graph_iris,
+            query,
+            limit,
+            group_id,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_local_filtered(
+        &self,
+        auth_context: Option<AuthContext>,
+        graph_iris: Option<Vec<String>>,
+        query: String,
+        limit: usize,
+        predicate_iri: String,
+        object_iri: String,
+        group_id: Option<GroupId>,
+    ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+        search_local_graphs(
+            self.inner.clone(),
+            auth_context,
+            graph_iris,
+            query,
+            limit,
+            group_id,
+            Some((predicate_iri, object_iri)),
+        )
+        .await
+    }
 }

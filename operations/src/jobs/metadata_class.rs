@@ -115,8 +115,8 @@ mod tests {
         MetadataProfileValidationSeverity,
     };
 
-    fn handle() -> aruna_core::identifiers::PlacementHandle {
-        aruna_core::identifiers::PlacementHandle::new(1).expect("handle")
+    fn handle() -> aruna_core::structured_id::PlacementHandle {
+        aruna_core::structured_id::PlacementHandle::new(1).expect("handle")
     }
 
     fn violation() -> Vec<MetadataValidationViolation> {
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_gate_is_permanent_except_for_unavailable_dependencies() {
+    fn profile_gate_exceptions() {
         for code in ["unsupported_constraint", "validation_limit"] {
             let permanent = create(CreateMetadataDocumentError::MetadataError(
                 MetadataError::ProfileValidation(vec![profile_finding(code)]),
@@ -238,7 +238,7 @@ mod tests {
             )),
             create(CreateMetadataDocumentError::PlacementBinding(
                 BindingError::BucketOutOfRange(
-                    aruna_core::identifiers::BucketId::new(9)
+                    aruna_core::structured_id::BucketId::new(9)
                         .expect("bucket")
                         .in_strategy_range(4)
                         .expect_err("out of range"),

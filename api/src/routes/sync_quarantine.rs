@@ -1,8 +1,5 @@
 //! Realm-admin surface over this node's sync-quarantine store (#338).
-//!
-//! Quarantine evidence is node-local: every node keeps the events its own
-//! replication path rejected, so these routes are served by the node that holds
-//! them rather than being restricted to the management node.
+//! Each node serves the events rejected by its own replication path.
 
 use std::sync::Arc;
 
@@ -22,7 +19,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_unrestricted_realm_auth};
+use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 
@@ -110,7 +107,7 @@ async fn authorize_quarantine_admin(
     state: &Arc<ServerState>,
     auth: Option<AuthContext>,
 ) -> ServerResult<AuthContext> {
-    let auth = require_unrestricted_realm_auth(state, auth)?;
+    let auth = require_unrestricted_auth(state, auth)?;
     ensure_permission(
         state,
         &auth,

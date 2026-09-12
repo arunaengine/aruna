@@ -2,12 +2,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use aruna_core::structs::{
-    AuthContext, Permission, StoragePurgeScope, StoragePurgeSpec, blob_bucket_permission_path,
-    blob_object_permission_path,
+    AuthContext, Permission, StoragePurgeScope, StoragePurgeSpec, bucket_permission_path,
+    object_permission_path,
 };
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JOB_RETENTION_MS;
-use aruna_operations::jobs::service::submit_storage_purge_job;
+use aruna_operations::jobs::service::submit_purge_job;
 use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::list_uploads::{
     ListMultipartUploadsInput, ListMultipartUploadsOperation,
@@ -330,7 +330,7 @@ pub async fn deletion_preflight(
     }
     let truncated = versions_truncated || uploads_truncated;
     let sync_relationships = if scope.is_bucket() {
-        list_sync_side_effects(&state, scope.bucket()).await?
+        list_sync_effects(&state, scope.bucket()).await?
     } else {
         Vec::new()
     };
@@ -453,7 +453,7 @@ pub async fn submit_purge(
     if !permission_granted(&state, &auth, path, Permission::WRITE).await? {
         return Err(ServerError::Forbidden);
     }
-    let result = submit_storage_purge_job(
+    let result = submit_purge_job(
         &state.get_ctx(),
         StoragePurgeSpec {
             scope,
@@ -502,9 +502,9 @@ pub(crate) async fn bucket_info(
 fn scope_permission_path(state: &ServerState, group_id: Ulid, scope: &StoragePurgeScope) -> String {
     match scope {
         StoragePurgeScope::Bucket { bucket } | StoragePurgeScope::Prefix { bucket, .. } => {
-            blob_bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket)
+            bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket)
         }
-        StoragePurgeScope::File { bucket, key } => blob_object_permission_path(
+        StoragePurgeScope::File { bucket, key } => object_permission_path(
             state.get_realm_id(),
             group_id,
             state.get_node_id(),
@@ -565,7 +565,7 @@ fn scoped_multipart_page(
     (uploads, truncated, key_marker, upload_marker)
 }
 
-async fn list_sync_side_effects(
+async fn list_sync_effects(
     state: &ServerState,
     bucket: &str,
 ) -> ServerResult<Vec<SyncDeletionSideEffectResponse>> {
@@ -614,7 +614,7 @@ mod tests {
     use std::time::SystemTime;
 
     #[tokio::test]
-    async fn bucket_preflight_discloses_sync_cleanup_as_a_non_blocker() {
+    async fn preflight_discloses_cleanup() {
         let storage_dir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let realm_id = RealmId::from_bytes(
@@ -666,7 +666,7 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
 
-        let disclosed = list_sync_side_effects(&state, "bucket").await.unwrap();
+        let disclosed = list_sync_effects(&state, "bucket").await.unwrap();
 
         assert_eq!(disclosed.len(), 1);
         assert_eq!(disclosed[0].relationship_id, relationship.id.to_string());

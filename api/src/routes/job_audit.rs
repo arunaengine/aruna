@@ -1,11 +1,6 @@
-//! Paginated audit of one external job's immutable records.
-//!
-//! Every alternative execution, output and cancellation observation stays
-//! visible after convergence, so a caller can see exactly what ran, not only
-//! what the canonical projection selected. The projection redacts the record
-//! internals: identities, signatures and raw envelopes never leave the node,
-//! and a caller that did not submit the job is answered 404 like any other
-//! unknown id.
+//! Paginated audit of one external job's immutable records and alternative outcomes.
+//! Responses redact identities, signatures, and envelopes while preserving execution evidence.
+//! Callers that did not submit the job receive the same 404 as an unknown id.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -26,7 +21,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::jobs::{JobOutputResponse, hex32, map_job_route, output_response, parse_job_id};
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 
@@ -323,7 +318,7 @@ pub async fn get_job_audit(
     Path(job_id): Path<String>,
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<(StatusCode, Json<JobAuditResponse>)> {
-    let auth: AuthContext = require_unrestricted_realm_auth(&state, auth)?;
+    let auth: AuthContext = require_unrestricted_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
     let (range, scope) = parse_range(query.scope.as_deref())?;
     let paging = parse_paging(&query)?;

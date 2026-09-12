@@ -6,8 +6,8 @@ use aruna_core::alpn::Alpn;
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{AuthContext, JobFamilyId, JobId, JobPayload, RealmId};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::UserId;
-use aruna_core::util::unix_timestamp_millis;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -454,9 +454,8 @@ async fn prepare_cancel(
         Ok(holds) => holds,
         Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
     };
-    // A cancel that already reached this node is never forwarded again: two
-    // divergent holder views would bounce it between the same two nodes. A
-    // non-holder answers for its own executions only.
+    // A cancel that already reached this node is never forwarded again: divergent
+    // holder views would bounce it. A non-holder answers only for its executions.
     if !holds {
         let reservations =
             match crate::jobs::lifecycle::reservation::held_reservations(context).await {

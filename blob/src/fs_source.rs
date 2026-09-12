@@ -1,14 +1,6 @@
-//! Read-only access to a directory the owner offers or syncs from their own
-//! device. The guarded write half lives in `fs_write`.
-//!
-//! Jail guarantee: the offered root and every requested entry are fully
-//! resolved with `canonicalize`, and an entry is refused unless its resolved
-//! path is inside the resolved root. A symlink is therefore followed only while
-//! it stays inside the offered directory; a link, or a link component, leaving
-//! it is refused. The check is not atomic with the open that follows it, so
-//! this is a resolve-and-verify guarantee, not a kernel-enforced no-follow
-//! open: only regular files are opened.
-//!
+//! Read-only access to a directory the owner offers; the write half is in
+//! `fs_write`. Resolved entries must stay inside the canonicalized root, but
+//! the check is resolve-and-verify, not a kernel-enforced no-follow open.
 use aruna_core::errors::StagingSourceError;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
@@ -117,9 +109,8 @@ pub(crate) async fn list_local(
             let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
                 continue;
             };
-            // This node's own bookkeeping lives in the reserved directory and
-            // nowhere else, so a file the owner named `.aruna-notes` stays
-            // theirs whatever it is called.
+            // This node's bookkeeping lives only in the reserved directory,
+            // so a file the owner named `.aruna-notes` stays theirs.
             if name == RESERVED_DIR {
                 continue;
             }

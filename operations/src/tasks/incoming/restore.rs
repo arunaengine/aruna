@@ -28,17 +28,13 @@ async fn durable_rearm_loop(
         ticks = ticks.saturating_add(1);
         restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
-        restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
-        restore_intake_timer(&context.storage_handle, &task_handle).await;
+        restore_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_publish_timer(&context.storage_handle, &task_handle).await;
         restore_sync_timers(&context, &task_handle).await;
-        restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
-        restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
-        crate::node::node_info::restore_node_info_publish_timer(
-            &context.storage_handle,
-            &task_handle,
-        )
-        .await;
-        restore_notification_outbox_timer_if_idle(
+        restore_usage_timer(&context.storage_handle, &task_handle).await;
+        restore_publish_timer(&context.storage_handle, &task_handle).await;
+        crate::node::node_info::restore_info_timer(&context.storage_handle, &task_handle).await;
+        restore_idle_timer(
             &context.storage_handle,
             &task_handle,
             NOTIFICATION_DELIVERY_RETRY_AFTER,
@@ -52,9 +48,9 @@ async fn durable_rearm_loop(
         }
         restore_metadata_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
         restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
-        restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
-        restore_job_queue_timer(&context.storage_handle, &task_handle).await;
-        restore_job_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_drain_timer(&context.storage_handle, &task_handle).await;
+        restore_prune_timer(&context.storage_handle, &task_handle).await;
         restore_mirror_timer(&context.storage_handle, &task_handle).await;
     }
 }
@@ -128,7 +124,7 @@ async fn install_task_handler(
     // Prime the origin-side watch interest cache from any digests already in
     // local storage so matching works before the first reconcile.
     if let Some(net_handle) = context.net_handle.as_ref() {
-        let table = rebuild_watch_interest_table(&context.storage_handle).await;
+        let table = rebuild_interest_table(&context.storage_handle).await;
         net_handle.replace_watch_interest(table);
     }
     TaskQueues {
@@ -150,30 +146,25 @@ impl TaskQueues {
             refresh_holders,
         } = self;
         spawn_queue_rearm(&context, &task_handle, shutdown);
-        restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
-        restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
-        restore_intake_timer(&context.storage_handle, &task_handle).await;
+        restore_task_timers(&context.storage_handle, &task_handle).await;
+        restore_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_publish_timer(&context.storage_handle, &task_handle).await;
         // Before the first refresh: a queued edit is the one local change no
         // holder would hand back.
         crate::device::edit::replay_queued_edits(&context).await;
         restore_sync_timers(&context, &task_handle).await;
-        restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
-        restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
-        crate::node::node_info::restore_node_info_publish_timer(
-            &context.storage_handle,
-            &task_handle,
-        )
-        .await;
-        restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO)
-            .await;
+        restore_usage_timer(&context.storage_handle, &task_handle).await;
+        restore_publish_timer(&context.storage_handle, &task_handle).await;
+        crate::node::node_info::restore_info_timer(&context.storage_handle, &task_handle).await;
+        restore_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
         restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
         sweep_dead_letters(&context.storage_handle).await;
         restore_metadata_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
         restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
-        restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_prune_timer(&context.storage_handle, &task_handle).await;
         restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
-        restore_job_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_prune_timer(&context.storage_handle, &task_handle).await;
         restore_mirror_timer(&context.storage_handle, &task_handle).await;
         if context.blob_handle.is_some() {
             restore_hidden_sweep(&context.storage_handle, &task_handle).await;
@@ -198,7 +189,7 @@ impl OperationsTaskHandler {
         };
         let node_id = net_handle.node_id();
         let realm_id = *net_handle.realm_id();
-        match crate::node::usage_stats::publish_and_refresh_usage_snapshots(
+        match crate::node::usage_stats::publish_refresh_snapshots(
             &self.context,
             node_id,
             realm_id,
@@ -222,12 +213,9 @@ impl OperationsTaskHandler {
         if let Some(net_handle) = self.context.net_handle.as_ref() {
             let node_id = net_handle.node_id();
             let realm_id = *net_handle.realm_id();
-            if let Err(error) = crate::node::node_info::refresh_node_info_heartbeat(
-                &self.context,
-                node_id,
-                realm_id,
-            )
-            .await
+            if let Err(error) =
+                crate::node::node_info::refresh_info_heartbeat(&self.context, node_id, realm_id)
+                    .await
             {
                 warn!(task_id = ?TaskKey::PublishNodeInfo, error = %error, "Failed to publish node info heartbeat");
             }
@@ -255,7 +243,7 @@ impl OperationsTaskHandler {
             // Fold this node's freshly written digest into the origin-side cache;
             // the local write bypasses the reconcile path that refreshes remotes.
             Ok(true) => {
-                let table = crate::notifications::watch::interest::rebuild_watch_interest_table(
+                let table = crate::notifications::watch::interest::rebuild_interest_table(
                     &self.context.storage_handle,
                 )
                 .await;
@@ -285,7 +273,7 @@ impl OperationsTaskHandler {
         context
     }
 
-    pub(super) async fn drain_metadata_materialization_queue(&self) {
+    pub(super) async fn drain_materialization_queue(&self) {
         let bulk = self.bulk_context();
         match process_metadata_materialization_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
@@ -333,7 +321,7 @@ impl OperationsTaskHandler {
         }
     }
 
-    pub(super) async fn drain_metadata_graph_prune_queue(&self) {
+    pub(super) async fn drain_graph_queue(&self) {
         let bulk = self.bulk_context();
         match process_metadata_graph_prune_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
@@ -383,7 +371,7 @@ impl OperationsTaskHandler {
 }
 
 impl OperationsTaskHandler {
-    pub(super) async fn drain_metadata_projection_queue(&self) {
+    pub(super) async fn drain_projection_queue(&self) {
         match drain_pending_metadata_projection_queue(&self.context).await {
             Ok(result) if result.has_more => {
                 self.reschedule_timer(
@@ -414,7 +402,7 @@ impl OperationsTaskHandler {
         }
     }
 
-    pub(super) async fn drain_blob_replication_queue(&self) {
+    pub(super) async fn drain_replication_queue(&self) {
         match process_blob_replication_batch(&self.context).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainBlobReplicationQueue, Duration::ZERO)
@@ -462,7 +450,7 @@ impl OperationsTaskHandler {
         }
     }
 
-    pub(super) async fn drain_reference_metadata_refresh_queue(&self) {
+    pub(super) async fn drain_refresh_queue(&self) {
         match process_reference_metadata_refresh_batch(&self.context).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainReferenceMetadataRefreshQueue, Duration::ZERO)
@@ -488,7 +476,7 @@ impl OperationsTaskHandler {
 
 impl OperationsTaskHandler {
     /// Runs every witness round whose persisted deadline has elapsed.
-    pub(super) async fn drain_job_witness_queue(&self) {
+    pub(super) async fn drain_witness_queue(&self) {
         let now_ms = unix_timestamp_millis();
         if drain_witness_deadlines(self.context.as_ref(), now_ms).await {
             self.reschedule_timer(TaskKey::DrainJobWitnessQueue, WITNESS_RETRY_AFTER)
@@ -519,7 +507,7 @@ impl OperationsTaskHandler {
 impl OperationsTaskHandler {
     /// Replicates locally published job-family records to the other holders.
     /// The pass is bounded, so a large backlog re-arms instead of blocking.
-    pub(super) async fn drain_job_family_outbox(&self) {
+    pub(super) async fn drain_family_outbox(&self) {
         if drain_family_outbox(self.context.as_ref()).await {
             self.reschedule_timer(TaskKey::DrainJobFamilyOutbox, OUTBOX_RETRY_AFTER)
                 .await;
@@ -529,7 +517,7 @@ impl OperationsTaskHandler {
 
 impl OperationsTaskHandler {
     pub(super) async fn prune_notifications(&self) {
-        let after = match process_notification_prune_batch(&self.context).await {
+        let after = match process_prune_batch(&self.context).await {
             Ok(outcome) if outcome.has_more => Duration::ZERO,
             Ok(outcome) => outcome
                 .next_due_after
@@ -617,7 +605,7 @@ impl OperationsTaskHandler {
         // Scan the snapshot in full so a dead holder cannot hide healthy records
         // behind it, while rows appended during this run wait for the next run.
         loop {
-            let batch = match read_notification_outbox_batch(
+            let batch = match read_outbox_batch(
                 &self.context.storage_handle,
                 start_after.clone(),
                 NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
@@ -654,11 +642,8 @@ impl OperationsTaskHandler {
                     unix_timestamp_millis().saturating_sub(outbox_record.outbox_id.timestamp_ms());
                 if age_ms > NOTIFICATION_OUTBOX_RETENTION_MS {
                     warn!(task_id = ?retry_key, outbox_id = %outbox_record.outbox_id, age_ms, "Dropping expired notification outbox record");
-                    if let Err(error) = delete_notification_outbox_records(
-                        &self.context.storage_handle,
-                        vec![record_key],
-                    )
-                    .await
+                    if let Err(error) =
+                        delete_outbox_records(&self.context.storage_handle, vec![record_key]).await
                     {
                         warn!(task_id = ?retry_key, error = %error, "Failed to delete expired notification outbox record");
                         retry_needed = true;
@@ -714,11 +699,8 @@ impl OperationsTaskHandler {
                         for recipient in &outcome.recipients {
                             net_handle.notify_inbox_activity(*recipient);
                         }
-                        if let Err(error) = delete_notification_outbox_records(
-                            &self.context.storage_handle,
-                            local_keys,
-                        )
-                        .await
+                        if let Err(error) =
+                            delete_outbox_records(&self.context.storage_handle, local_keys).await
                         {
                             warn!(task_id = ?retry_key, error = %error, "Failed to delete delivered notification outbox records");
                             retry_needed = true;
@@ -735,8 +717,7 @@ impl OperationsTaskHandler {
                 match deliver_remote(net_handle, holder, records).await {
                     Ok(_) => {
                         if let Err(error) =
-                            delete_notification_outbox_records(&self.context.storage_handle, keys)
-                                .await
+                            delete_outbox_records(&self.context.storage_handle, keys).await
                         {
                             warn!(task_id = ?retry_key, error = %error, "Failed to delete delivered notification outbox records");
                             retry_needed = true;
@@ -791,8 +772,7 @@ impl OperationsTaskHandler {
             self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
                 .await;
         } else {
-            match read_notification_outbox_batch(&self.context.storage_handle, None, 1, None).await
-            {
+            match read_outbox_batch(&self.context.storage_handle, None, 1, None).await {
                 Ok(batch) if !batch.records.is_empty() || batch.has_more => {
                     self.reschedule_timer(retry_key, Duration::ZERO).await;
                 }
@@ -833,7 +813,7 @@ impl OperationsTaskHandler {
         };
 
         let reconciler = self.jobs_runtime.reconciler();
-        let result = match process_job_queue_batch(
+        let result = match drain_job_batch(
             &self.context.storage_handle,
             owner_node_id,
             budget,
@@ -899,7 +879,7 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn prune_jobs(&self) {
-        let after = match process_job_prune_batch(&self.context).await {
+        let after = match prune_job_batch(&self.context).await {
             Ok(outcome) if outcome.has_more => Duration::ZERO,
             Ok(outcome) => outcome
                 .next_due_after
@@ -933,9 +913,8 @@ impl OperationsTaskHandler {
 
     pub(super) async fn drain_blob_reclaim(&self) {
         let key = TaskKey::DrainBlobReclaimQueue;
-        // A failed candidate earns the fast retry, then doubles up to the normal
-        // interval, so a permanently failing one cannot hold a one-minute rescan
-        // of the whole queue forever.
+        // A failed candidate earns the fast retry, then doubles up to the normal interval, so a permanently
+        // failing one cannot hold a one-minute rescan of the whole queue forever.
         let (after, drained) =
             match process_reclaim_batch(&self.context, self.reclaim_start()).await {
                 Ok(outcome) => {

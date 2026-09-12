@@ -171,7 +171,7 @@ fn completion_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
 
 fn transition_config(state: &AdminDocumentReducerState) -> RealmConfigDocument {
     let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-    overlay_realm_config_placement_reducer_materialization(&mut config, state, 0);
+    overlay_placement(&mut config, state, 0);
     config
 }
 
@@ -246,9 +246,8 @@ fn foreign_reports_dropped() {
 
 #[test]
 fn concurrent_plans_gated() {
-    // Two complete plans derived from one activation base: only the
-    // ULID-first one advances the bucket, in either delivery order, and
-    // the other can never replay as its successor.
+    // Two complete plans derived from one activation base: only the ULID-first one advances the bucket, in
+    // either delivery order, and the other can never replay as its successor.
     let plan_a = transition_plan(&[1, 2], &[3, 4]);
     let mut plan_b = transition_plan(&[1, 2], &[3, 4]);
     plan_b.transition_id = Ulid::from_bytes([32; 16]);
@@ -320,7 +319,7 @@ fn concurrent_plans_gated() {
 }
 
 #[test]
-fn map_conflict_fails_closed() {
+fn map_conflict_closed() {
     // Two divergent maps at one epoch keep the epoch unusable, both retained.
     let mut state = realm_config_state();
     for (event_seed, origin, seeds) in [(60u8, node(1), &[1u8, 2][..]), (61, node(2), &[3][..])] {
@@ -344,7 +343,7 @@ fn map_conflict_fails_closed() {
 }
 
 #[test]
-fn activation_init_covers_buckets() {
+fn activation_init_buckets() {
     let plan = transition_plan(&[1, 2], &[3, 4]);
     let mut state = realm_config_state();
     for event in transition_events(&plan).iter().take(4) {
@@ -364,7 +363,7 @@ fn activation_init_covers_buckets() {
 }
 
 #[test]
-fn proof_admission_rejects_forgery() {
+fn proof_admission_forgery() {
     let plan = transition_plan(&[1, 2], &[3, 4]);
     let mut state = realm_config_state();
     for event in transition_events(&plan) {
@@ -409,7 +408,7 @@ fn proof_admission_rejects_forgery() {
 }
 
 #[test]
-fn duplicate_proof_is_idempotent() {
+fn duplicate_proof_idempotent() {
     let plan = transition_plan(&[1, 2], &[3, 4]);
     let mut state = realm_config_state();
     for event in transition_events(&plan) {
@@ -439,7 +438,7 @@ fn duplicate_proof_is_idempotent() {
 }
 
 #[test]
-fn activation_advances_on_completion() {
+fn activation_advances_completion() {
     let plan = transition_plan(&[1, 2], &[3, 4]);
     let mut state = realm_config_state();
     for event in transition_events(&plan)
@@ -473,7 +472,7 @@ fn activation_advances_on_completion() {
 }
 
 #[test]
-fn advance_ignores_event_order() {
+fn advance_ignores_order() {
     // Every replica reduces the same set into the same activations, whatever
     // order the events arrive in.
     let plan = transition_plan(&[1, 2], &[3, 4]);
@@ -498,7 +497,7 @@ fn advance_ignores_event_order() {
 }
 
 #[test]
-fn abort_keeps_cut_buckets() {
+fn abort_keeps_buckets() {
     let plan = transition_plan(&[1, 2], &[3, 4]);
     let mut state = realm_config_state();
     for event in transition_events(&plan)
@@ -549,9 +548,8 @@ fn abort_keeps_cut_buckets() {
 
 #[test]
 fn late_proof_completes() {
-    // A proof that lands after the abort completes its bucket anyway:
-    // reduction cannot depend on arrival order, so an abort stops the
-    // executors rather than un-making a hand-off every target proved.
+    // A proof that lands after the abort completes its bucket anyway: reduction cannot depend on arrival
+    // order, so an abort stops the executors rather than un-making a hand-off every target proved.
     let plan = transition_plan(&[1, 2], &[3, 4]);
     let abort = realm_config_event(
         81,
@@ -607,9 +605,8 @@ fn late_proof_completes() {
 
 #[test]
 fn prune_keeps_advances() {
-    // Dropping a released record must not drop what it moved: activations
-    // are replayed from the whole reduced chain, so a fold that skipped the
-    // pruned record would silently regress the bucket to its old map.
+    // Released records must remain in the reduced chain so replay preserves their cutovers
+    // instead of regressing buckets to the old map.
     let plan = transition_plan(&[1, 2], &[3, 4]);
     let mut state = realm_config_state();
     for event in transition_events(&plan)
@@ -691,14 +688,14 @@ fn prune_keeps_advances() {
     assert!(live.placement_transitions[0].is_terminal());
 
     let mut pruned = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-    overlay_realm_config_placement_reducer_materialization(&mut pruned, &state, u64::MAX);
+    overlay_placement(&mut pruned, &state, u64::MAX);
     assert!(pruned.placement_transitions.is_empty());
     assert_eq!(pruned.placement_activations, live.placement_activations);
 
     // Re-materializing from scratch reproduces the pruned view exactly, so
     // the record's absence is stable rather than a one-time loss.
     let mut again = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-    overlay_realm_config_placement_reducer_materialization(&mut again, &state, u64::MAX);
+    overlay_placement(&mut again, &state, u64::MAX);
     assert_eq!(again, pruned);
     // The bucket that cut over still names its target map, and that map
     // survives the prune because an activation references it.
@@ -714,9 +711,8 @@ fn prune_keeps_advances() {
 
 #[test]
 fn drops_unreferenced_maps() {
-    // A map no activation selects from and no retained transition targets
-    // is unreachable - unless it is the newest, which the next transition
-    // would name.
+    // A map no activation selects from and no retained transition targets is unreachable - unless it is
+    // the newest, which the next transition would name.
     let plan = transition_plan(&[1, 2], &[3, 4]);
     let mut state = realm_config_state();
     for event in transition_events(&plan) {

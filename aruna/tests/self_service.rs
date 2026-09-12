@@ -20,7 +20,7 @@ async fn post_group(base_url: &str, token: &str, name: &str) -> TestResult<reqwe
 }
 
 #[tokio::test]
-async fn fresh_user_creates_groups_up_to_the_cap() -> TestResult<()> {
+async fn fresh_user_cap() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let member_token = create_bearer_token(
         seed.context.as_ref(),
@@ -56,7 +56,7 @@ async fn fresh_user_creates_groups_up_to_the_cap() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn concurrent_creates_cannot_slip_past_the_cap() -> TestResult<()> {
+async fn concurrent_group_cap() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let member_token = create_bearer_token(
         seed.context.as_ref(),

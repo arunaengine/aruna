@@ -1,4 +1,4 @@
-use aruna_api::s3::s3_server::S3ServerTimeouts;
+use aruna_api::s3::server::S3ServerTimeouts;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -8,8 +8,8 @@ use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingPhase,
-    OnboardingSecret, OnboardingSecretError, OnboardingSyncTicket, bootstrap_issuer_proof_message,
-    bootstrap_node_proof_message,
+    OnboardingSecret, OnboardingSecretError, OnboardingSyncTicket, issuer_proof_message,
+    node_proof_message,
 };
 use aruna_core::structs::{
     Backend, BackendConfig, BackendsFile, BlobTimeoutConfig, DynamicDiscoveryMethod,
@@ -18,9 +18,9 @@ use aruna_core::structs::{
     STORAGE_CLASS_LABEL_PREFIX, StaticRealmEndpoint,
 };
 use aruna_core::types::UserId;
-use aruna_core::util::unix_timestamp_secs;
+use aruna_core::time::unix_timestamp_secs;
 use aruna_net::{
-    DiscoveryMethod, IrohRuntimeConfig, RelayMethod, endpoint_addr_from_config_string,
+    DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_config,
 };
 use aruna_operations::metadata::MetadataSearchStorage;
 use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle, errors::StorageLibError};
@@ -421,12 +421,12 @@ pub fn read_settings() -> Result<Settings, SetupError> {
     let storage_path = dotenvy::var("STORAGE_PATH")?;
     let metadata_storage_path =
         dotenvy::var("CRAQLE_STORAGE_PATH").unwrap_or_else(|_| format!("{storage_path}/craqle"));
-    let metadata_search_storage = metadata_search_storage_env()?;
-    let fjall_persist_policy = fjall_persist_policy_env()?;
+    let metadata_search_storage = search_storage_env()?;
+    let fjall_persist_policy = persist_policy_env()?;
     let document_sync_storage_path = dotenvy::var("DOCUMENT_SYNC_STORAGE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(format!("{storage_path}/document-sync")));
-    let document_sync_runtime = load_document_sync_runtime_config()?;
+    let document_sync_runtime = load_sync_config()?;
     let blob_root =
         dotenvy::var("BLOB_ROOT").unwrap_or_else(|_| format!("{storage_path}/blobstore"));
     let blob_bucket_prefix = dotenvy::var("BLOB_BUCKET_PREFIX").ok();
@@ -530,14 +530,13 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         .transpose()?
         .unwrap_or(3)
         .max(1);
-    let api_public_url = optional_public_url_env("API_PUBLIC_URL")?;
-    let s3_public_url = optional_public_url_env("S3_PUBLIC_URL")?;
+    let api_public_url = optional_public_url("API_PUBLIC_URL")?;
+    let s3_public_url = optional_public_url("S3_PUBLIC_URL")?;
     let trusted_proxies = trusted_proxies_env()?;
     let rocrate_limits = rocrate_limits_env()?;
     let rate_limits = rate_limits_env()?;
-    // A device profile runs without an S3 listener: unset or empty disables it,
-    // and half a pair is a misconfiguration. Which profile this is only becomes
-    // knowable with the node identity, so it is validated again there.
+    // Devices may omit both S3 values, but supplying only one is always invalid.
+    // The node identity later decides whether the listener is required.
     let (s3_host, s3_address) = match (
         optional_nonempty_env("S3_HOST")?,
         optional_nonempty_env("S3_ADDRESS")?,
@@ -550,7 +549,7 @@ pub fn read_settings() -> Result<Settings, SetupError> {
         (Some(_), None) => return Err(SetupError::MissingConfigValue("S3_ADDRESS")),
         (None, Some(_)) => return Err(SetupError::MissingConfigValue("S3_HOST")),
     };
-    let node_labels = parse_node_labels_env()?;
+    let node_labels = parse_node_labels()?;
     let node_location = dotenvy::var("ARUNA_NODE_LOCATION")
         .ok()
         .map(|value| value.trim().to_string())
@@ -567,7 +566,7 @@ pub fn read_settings() -> Result<Settings, SetupError> {
     let onboarding_secret = dotenvy::var("ONBOARDING_SECRET")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let oidc_providers = load_oidc_providers_from_env()?;
+    let oidc_providers = load_oidc_providers()?;
     let portal = portal_config_env()?;
     let assistant_proxy = assistant_proxy_env()?;
     // The SPA is served from another origin than the API, so it cannot reach a
@@ -679,15 +678,15 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
     } = settings;
     let bootstrap_timeout = Duration::from_secs(onboarding_bootstrap_timeout_secs);
     let storage_handle =
-        FjallStorage::open_with_persist_policy(&storage_path, fjall_persist_policy)?;
+        FjallStorage::open_with_policy(&storage_path, fjall_persist_policy)?;
     let mut temporary_bootstrap_endpoint = None;
     let mut enrollment_endpoints = Vec::new();
-    let node_state = match load_persisted_node_state(&storage_handle).await? {
+    let node_state = match load_node_state(&storage_handle).await? {
         Some(state) => state,
         None => {
             let state = match onboarding_secret.as_deref() {
                 Some(onboarding_secret) => {
-                    let bootstrapped = bootstrap_onboarded_node_state(
+                    let bootstrapped = bootstrap_node_state(
                         onboarding_secret,
                         node_location.clone(),
                         node_weight,
@@ -699,7 +698,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
                     enrollment_endpoints = bootstrapped.realm_endpoints;
                     bootstrapped.node_state
                 }
-                None => generate_initialized_node_state()?,
+                None => generate_node_state()?,
             };
             persist_node_state(&storage_handle, &state).await?;
             state
@@ -708,7 +707,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
 
     let net_secret_key = iroh::SecretKey::from_bytes(&node_state.net_secret_key);
     let node_id = net_secret_key.public();
-    let (realm_id, node_capabilities) = node_capabilities_from_state(&node_state)?;
+    let (realm_id, node_capabilities) = node_capabilities(&node_state)?;
     if realm_id != node_state.realm_id {
         return Err(SetupError::PersistedNodeStateMismatch);
     }
@@ -754,7 +753,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
         PersistedNodeStatus::Complete => StartupMode::Provisioned,
     };
 
-    let realm_config = load_realm_config_document(&storage_handle, &realm_id).await?;
+    let realm_config = load_realm_config(&storage_handle, &realm_id).await?;
     let (peer_nodes, mut peer_endpoints, discovery_method, relay_method) =
         realm_network_config(realm_config.as_ref(), node_id)?;
     let relay_method = relay_method.with_additional_relays(additional_relay_urls);
@@ -762,9 +761,8 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
     if let Some(endpoint) = temporary_bootstrap_endpoint {
         peer_endpoints.push(endpoint);
     }
-    // Appended after the bootstrap endpoint: the onboarding fetch keeps dialing
-    // the node that finalized the join, while the realm stays reachable without
-    // a discovery read once that endpoint goes away.
+    // Keep the bootstrap endpoint first for onboarding reads. Enrollment endpoints retain
+    // realm reachability after it disappears and before discovery completes.
     peer_endpoints.extend(enrollment_endpoints);
 
     Ok((
@@ -850,7 +848,7 @@ fn invalid_config_value(
     }
 }
 
-fn metadata_search_storage_env() -> Result<MetadataSearchStorage, SetupError> {
+fn search_storage_env() -> Result<MetadataSearchStorage, SetupError> {
     const KEY: &str = "CRAQLE_SEARCH_STORAGE";
     let Some(value) = dotenvy::var(KEY).ok() else {
         return Ok(MetadataSearchStorage::Disk);
@@ -867,7 +865,7 @@ fn metadata_search_storage_env() -> Result<MetadataSearchStorage, SetupError> {
     }
 }
 
-fn fjall_persist_policy_env() -> Result<FjallPersistPolicy, SetupError> {
+fn persist_policy_env() -> Result<FjallPersistPolicy, SetupError> {
     const KEY: &str = "ARUNA_FJALL_PERSIST_MODE";
     let Some(value) = dotenvy::var(KEY).ok() else {
         return Ok(FjallPersistPolicy::default());
@@ -1050,7 +1048,7 @@ fn trusted_proxies_env() -> Result<Vec<ipnet::IpNet>, SetupError> {
         .collect()
 }
 
-fn optional_public_url_env(key: &'static str) -> Result<Option<String>, SetupError> {
+fn optional_public_url(key: &'static str) -> Result<Option<String>, SetupError> {
     let value = optional_nonempty_env(key)?;
     if let Some(url) = &value {
         validate_public_url(key, url)?;
@@ -1137,7 +1135,7 @@ fn mcp_env() -> Result<bool, SetupError> {
 /// Parses the placement-map initialization/onboarding input `ARUNA_NODE_LABELS`
 /// in `k=v,k2=v2` form. Rejects malformed pairs and every derived-only label,
 /// which the owning node stamps for itself.
-fn parse_node_labels_env() -> Result<BTreeMap<String, String>, SetupError> {
+fn parse_node_labels() -> Result<BTreeMap<String, String>, SetupError> {
     const KEY: &str = "ARUNA_NODE_LABELS";
     let raw = dotenvy::var(KEY).unwrap_or_default();
     let mut labels = BTreeMap::new();
@@ -1180,7 +1178,7 @@ fn parse_node_labels_env() -> Result<BTreeMap<String, String>, SetupError> {
     Ok(labels)
 }
 
-fn load_document_sync_runtime_config() -> Result<IrohRuntimeConfig, SetupError> {
+fn load_sync_config() -> Result<IrohRuntimeConfig, SetupError> {
     let default = IrohRuntimeConfig::default();
     Ok(IrohRuntimeConfig {
         connect_timeout: duration_secs_env(
@@ -1224,7 +1222,7 @@ fn duration_secs_env(key: &'static str, default: Duration) -> Result<Duration, S
     Ok(Duration::from_secs(seconds))
 }
 
-fn load_oidc_providers_from_env() -> Result<Vec<OidcProviderConfig>, SetupError> {
+fn load_oidc_providers() -> Result<Vec<OidcProviderConfig>, SetupError> {
     let Some(provider_ids) = dotenvy::var("OIDC_PROVIDER_IDS").ok() else {
         return Ok(Vec::new());
     };
@@ -1245,7 +1243,7 @@ fn load_oidc_providers_from_env() -> Result<Vec<OidcProviderConfig>, SetupError>
         .collect()
 }
 
-pub async fn mark_node_state_complete(
+pub async fn mark_state_complete(
     storage: &StorageHandle,
     node_state: &PersistedNodeState,
 ) -> Result<(), SetupError> {
@@ -1338,9 +1336,8 @@ pub fn outermost_roots(roots: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> 
 /// so a relative root or a link cannot hide what it covers.
 fn normalize_root(path: &std::path::Path) -> std::path::PathBuf {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    // `absolute` keeps `..` on POSIX and a path that does not exist yet cannot
-    // be canonicalized, so the components are folded here first: without it a
-    // root that climbs out of itself would be judged as the path that hid it.
+    // POSIX absolute paths retain `..`, and nonexistent paths cannot be canonicalized.
+    // Fold components first so a root cannot hide the parent it would erase.
     let folded = fold_components(&absolute);
     std::fs::canonicalize(&folded).unwrap_or(folded)
 }
@@ -1363,7 +1360,7 @@ fn fold_components(path: &std::path::Path) -> std::path::PathBuf {
     folded
 }
 
-fn node_capabilities_from_state(
+fn node_capabilities(
     node_state: &PersistedNodeState,
 ) -> Result<(RealmId, NodeCapabilities), SetupError> {
     match &node_state.identity {
@@ -1409,7 +1406,7 @@ fn node_capabilities_from_state(
     }
 }
 
-fn generate_initialized_node_state() -> Result<PersistedNodeState, SetupError> {
+fn generate_node_state() -> Result<PersistedNodeState, SetupError> {
     let realm_signing_key = generate_signing_key();
     let node_signing_key = generate_signing_key();
 
@@ -1441,7 +1438,7 @@ fn onboarding_realm_endpoints(endpoints: &[StaticRealmEndpoint]) -> Vec<Endpoint
     endpoints
         .iter()
         .filter_map(
-            |endpoint| match endpoint_addr_from_config_string(&endpoint.endpoint_addr) {
+            |endpoint| match parse_endpoint_config(&endpoint.endpoint_addr) {
                 Ok(endpoint_addr) if endpoint_addr.id.to_string() == endpoint.node_id => {
                     Some(endpoint_addr)
                 }
@@ -1465,7 +1462,7 @@ fn onboarding_realm_endpoints(endpoints: &[StaticRealmEndpoint]) -> Vec<Endpoint
         .collect()
 }
 
-async fn bootstrap_onboarded_node_state(
+async fn bootstrap_node_state(
     onboarding_secret: &str,
     node_location: Option<String>,
     node_weight: Option<u32>,
@@ -1497,7 +1494,7 @@ async fn bootstrap_onboarded_node_state(
     });
     let node_id_string = node_id.to_string();
     let node_proof = node_signing_key
-        .sign(&bootstrap_node_proof_message(
+        .sign(&node_proof_message(
             onboarding_secret,
             &node_id_string,
             transport_public_key.as_deref(),
@@ -1508,7 +1505,7 @@ async fn bootstrap_onboarded_node_state(
         .zip(issuer_public_key.as_ref())
         .map(|(issuer_signing_key, issuer_public_key)| {
             issuer_signing_key
-                .sign(&bootstrap_issuer_proof_message(
+                .sign(&issuer_proof_message(
                     onboarding_secret,
                     &node_id_string,
                     issuer_public_key,
@@ -1606,10 +1603,8 @@ async fn bootstrap_onboarded_node_state(
                     SetupError::MissingOnboardingMaterial(OnboardingMode::Server),
                 )?,
             },
-            // A device holds no realm or issuer key material: its authority is
-            // its owner's, carried by the membership record written at finalize.
-            // The owner is kept so the device can name it before that record
-            // reaches it.
+            // Devices carry no issuer keys. Their finalized membership grants owner authority,
+            // and the saved owner identifies that authority before the record arrives.
             OnboardingMode::User { owner } => PersistedNodeIdentity::User { owner },
         };
 
@@ -1672,7 +1667,7 @@ async fn refresh_onboarding_bootstrap(
     });
     let node_id_string = node_id.to_string();
     let node_proof = node_signing_key
-        .sign(&bootstrap_node_proof_message(
+        .sign(&node_proof_message(
             onboarding_secret,
             &node_id_string,
             transport_public_key.as_deref(),
@@ -1683,7 +1678,7 @@ async fn refresh_onboarding_bootstrap(
         .zip(issuer_public_key.as_ref())
         .map(|(issuer_signing_key, issuer_public_key)| {
             issuer_signing_key
-                .sign(&bootstrap_issuer_proof_message(
+                .sign(&issuer_proof_message(
                     onboarding_secret,
                     &node_id_string,
                     issuer_public_key,
@@ -1777,7 +1772,7 @@ fn validate_bootstrap_response(
     Ok(())
 }
 
-async fn load_realm_config_document(
+async fn load_realm_config(
     storage: &StorageHandle,
     realm_id: &RealmId,
 ) -> Result<Option<RealmConfigDocument>, SetupError> {
@@ -1840,7 +1835,7 @@ fn realm_network_config(
                             error,
                         )
                     })?;
-                let endpoint_addr = endpoint_addr_from_config_string(&endpoint.endpoint_addr)
+                let endpoint_addr = parse_endpoint_config(&endpoint.endpoint_addr)
                     .map_err(|message| {
                         invalid_config_value(
                             "realm_static_endpoint",
@@ -1872,7 +1867,7 @@ fn realm_network_config(
                 .map(|method| -> Result<DiscoveryMethod, SetupError> {
                     Ok(match method {
                         DynamicDiscoveryMethod::IrohDns { origins, .. } => {
-                            discovery_method_from_dns_origins(origins)?
+                            dns_discovery_method(origins)?
                         }
                         DynamicDiscoveryMethod::DhtSigned {
                             ttl_secs,
@@ -1888,7 +1883,7 @@ fn realm_network_config(
             let mut relay_method = RelayMethod::None;
             for method in methods {
                 if let DynamicDiscoveryMethod::IrohDns { relay_policy, .. } = method {
-                    relay_method = relay_method_from_policy(relay_policy)?;
+                    relay_method = policy_relay_method(relay_policy)?;
                     break;
                 }
             }
@@ -1897,7 +1892,7 @@ fn realm_network_config(
     }
 }
 
-fn discovery_method_from_dns_origins(origins: &[String]) -> Result<DiscoveryMethod, SetupError> {
+fn dns_discovery_method(origins: &[String]) -> Result<DiscoveryMethod, SetupError> {
     if origins.is_empty() {
         return Err(invalid_config_value(
             "realm_discovery_origins",
@@ -1938,7 +1933,7 @@ fn discovery_method_from_dns_origins(origins: &[String]) -> Result<DiscoveryMeth
     Ok(DiscoveryMethod::CustomDns(custom))
 }
 
-fn relay_method_from_policy(policy: &RelayPolicy) -> Result<RelayMethod, SetupError> {
+fn policy_relay_method(policy: &RelayPolicy) -> Result<RelayMethod, SetupError> {
     match policy {
         RelayPolicy::Disabled => Ok(RelayMethod::None),
         RelayPolicy::Default => Ok(RelayMethod::N0),
@@ -1958,7 +1953,7 @@ fn validate_relay_urls(key: &'static str, relays: &[String]) -> Result<(), Setup
     Ok(())
 }
 
-async fn load_persisted_node_state(
+async fn load_node_state(
     storage: &StorageHandle,
 ) -> Result<Option<PersistedNodeState>, SetupError> {
     match storage
@@ -2004,8 +1999,8 @@ async fn persist_node_state(
 mod tests {
     use super::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
-        S3ServerTimeouts, SetupError, assistant_proxy_env, fjall_persist_policy_env, load,
-        load_oidc_providers_from_env, normalize_root, outermost_roots, parse_node_labels_env,
+        S3ServerTimeouts, SetupError, assistant_proxy_env, load, load_oidc_providers,
+        normalize_root, outermost_roots, parse_node_labels, persist_policy_env,
         persist_node_state, portal_config_env, read_settings, rocrate_limits_env,
         validate_public_url, validate_s3_profile, validate_wipe_roots,
     };
@@ -2014,16 +2009,14 @@ mod tests {
         DynamicDiscoveryMethod, NodeCapabilities, RealmConfigDocument, RealmDiscoveryConfig,
         RealmId, RelayPolicy, RoCrateLimits, StaticRealmEndpoint,
     };
-    use aruna_net::{DiscoveryMethod, RelayMethod, endpoint_addr_to_config_string};
+    use aruna_net::{DiscoveryMethod, RelayMethod, format_endpoint_config};
     use aruna_storage::{FjallPersistPolicy, FjallStorage};
     use std::sync::OnceLock;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
 
-    // A wipe erases the contents of every root it is given, so a root that
-    // holds the owner's home, another root, or the whole filesystem must fail
-    // the start instead of the erasure. The paths are deliberately ones no test
-    // machine has: the judgement may not depend on what exists.
+    // Wipe roots cannot contain the owner's home, another root, or the filesystem.
+    // These paths deliberately do not exist because safety must not depend on presence.
     #[test]
     fn folds_nested_roots() {
         // The blob store defaults to a directory under the storage path; the
@@ -2336,7 +2329,7 @@ mod tests {
     }
 
     #[test]
-    fn public_url_accepts_absolute_http_and_https_urls() {
+    fn public_url_schemes() {
         for value in [
             "http://localhost:1337",
             "https://s3.example.test/base/path/",
@@ -2346,7 +2339,7 @@ mod tests {
     }
 
     #[test]
-    fn public_url_rejects_invalid_values_with_the_requested_env_key() {
+    fn public_url_invalid() {
         for key in ["API_PUBLIC_URL", "S3_PUBLIC_URL"] {
             for value in [
                 "file:///tmp/s3",
@@ -2368,14 +2361,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fjall_persist_policy_env_defaults_to_buffer() {
+    async fn persist_defaults_buffer() {
         let _guard = env_lock().lock().await;
         let key = "ARUNA_FJALL_PERSIST_MODE";
         let previous = vec![(key.to_string(), std::env::var(key).ok())];
         unsafe { std::env::remove_var(key) };
 
         assert_eq!(
-            fjall_persist_policy_env().unwrap(),
+            persist_policy_env().unwrap(),
             FjallPersistPolicy::Buffer
         );
 
@@ -2383,14 +2376,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fjall_persist_policy_env_accepts_sync_all() {
+    async fn persist_accepts_sync() {
         let _guard = env_lock().lock().await;
         let key = "ARUNA_FJALL_PERSIST_MODE";
         let previous = vec![(key.to_string(), std::env::var(key).ok())];
         unsafe { std::env::set_var(key, "sync_all") };
 
         assert_eq!(
-            fjall_persist_policy_env().unwrap(),
+            persist_policy_env().unwrap(),
             FjallPersistPolicy::SyncAll
         );
 
@@ -2398,13 +2391,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fjall_persist_policy_env_rejects_invalid_value() {
+    async fn persist_rejects_invalid() {
         let _guard = env_lock().lock().await;
         let key = "ARUNA_FJALL_PERSIST_MODE";
         let previous = vec![(key.to_string(), std::env::var(key).ok())];
         unsafe { std::env::set_var(key, "always") };
 
-        let error = fjall_persist_policy_env().expect_err("invalid policy should fail");
+        let error = persist_policy_env().expect_err("invalid policy should fail");
         assert!(matches!(
             error,
             super::SetupError::InvalidConfigValue {
@@ -2444,25 +2437,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_labels_env_defaults_to_empty() {
+    async fn labels_default_empty() {
         let _guard = env_lock().lock().await;
         let key = "ARUNA_NODE_LABELS";
         let previous = vec![(key.to_string(), std::env::var(key).ok())];
         unsafe { std::env::remove_var(key) };
 
-        assert!(parse_node_labels_env().unwrap().is_empty());
+        assert!(parse_node_labels().unwrap().is_empty());
 
         restore_env(previous);
     }
 
     #[tokio::test]
-    async fn node_labels_env_parses_comma_separated_pairs() {
+    async fn labels_parse_pairs() {
         let _guard = env_lock().lock().await;
         let key = "ARUNA_NODE_LABELS";
         let previous = vec![(key.to_string(), std::env::var(key).ok())];
         unsafe { std::env::set_var(key, "tier=hot, zone = eu-west ") };
 
-        let labels = parse_node_labels_env().unwrap();
+        let labels = parse_node_labels().unwrap();
         assert_eq!(labels.get("tier"), Some(&"hot".to_string()));
         assert_eq!(labels.get("zone"), Some(&"eu-west".to_string()));
         assert_eq!(labels.len(), 2);
@@ -2471,13 +2464,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_labels_env_rejects_reserved_kind_key() {
+    async fn labels_reject_reserved() {
         let _guard = env_lock().lock().await;
         let key = "ARUNA_NODE_LABELS";
         let previous = vec![(key.to_string(), std::env::var(key).ok())];
         unsafe { std::env::set_var(key, "aruna-engine.org/kind=Server") };
 
-        let error = parse_node_labels_env().expect_err("reserved key should fail");
+        let error = parse_node_labels().expect_err("reserved key should fail");
         assert!(matches!(
             error,
             super::SetupError::InvalidConfigValue {
@@ -2497,7 +2490,7 @@ mod tests {
         let previous = vec![(key.to_string(), std::env::var(key).ok())];
         unsafe { std::env::set_var(key, "aruna-engine.org/storage-class/cold=true") };
 
-        let error = parse_node_labels_env().expect_err("derived class label should fail");
+        let error = parse_node_labels().expect_err("derived class label should fail");
         assert!(matches!(
             error,
             super::SetupError::InvalidConfigValue {
@@ -2517,7 +2510,7 @@ mod tests {
         let previous = vec![(key.to_string(), std::env::var(key).ok())];
         unsafe { std::env::set_var(key, "aruna-engine.org/location=eu-west") };
 
-        let error = parse_node_labels_env().expect_err("derived location label should fail");
+        let error = parse_node_labels().expect_err("derived location label should fail");
         assert!(matches!(
             error,
             super::SetupError::InvalidConfigValue {
@@ -2548,13 +2541,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_labels_env_rejects_malformed_pair() {
+    async fn labels_reject_malformed() {
         let _guard = env_lock().lock().await;
         let key = "ARUNA_NODE_LABELS";
         let previous = vec![(key.to_string(), std::env::var(key).ok())];
         unsafe { std::env::set_var(key, "tier") };
 
-        let error = parse_node_labels_env().expect_err("missing '=' should fail");
+        let error = parse_node_labels().expect_err("missing '=' should fail");
         assert!(matches!(
             error,
             super::SetupError::InvalidConfigValue {
@@ -2567,7 +2560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loads_oidc_providers_from_env() {
+    async fn loads_oidc_providers() {
         let _guard = env_lock().lock().await;
         let vars = [
             ("OIDC_PROVIDER_IDS", "main,internal".to_string()),
@@ -2596,7 +2589,7 @@ mod tests {
             unsafe { std::env::set_var(key, value) };
         }
 
-        let providers = load_oidc_providers_from_env().unwrap();
+        let providers = load_oidc_providers().unwrap();
         assert_eq!(providers.len(), 2);
         assert_eq!(providers[0].id, "main");
         assert_eq!(providers[0].issuer, "https://issuer.example");
@@ -2607,7 +2600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oidc_provider_env_requires_all_fields() {
+    async fn oidc_requires_fields() {
         let _guard = env_lock().lock().await;
         let vars = [
             ("OIDC_PROVIDER_IDS", "main".to_string()),
@@ -2630,13 +2623,13 @@ mod tests {
             unsafe { std::env::set_var(key, value) };
         }
 
-        assert!(load_oidc_providers_from_env().is_err());
+        assert!(load_oidc_providers().is_err());
 
         restore_env(previous);
     }
 
     #[tokio::test]
-    async fn load_includes_oidc_providers_in_config() {
+    async fn load_includes_oidc() {
         let _guard = env_lock().lock().await;
         let tempdir = tempdir().unwrap();
         let vars = [
@@ -2704,7 +2697,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_config_defaults_to_disabled() {
+    async fn portal_defaults_disabled() {
         let _guard = env_lock().lock().await;
         let previous: Vec<_> = portal_env_keys()
             .iter()
@@ -2721,7 +2714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_config_accepts_artifact_mode() {
+    async fn portal_accepts_artifact() {
         let _guard = env_lock().lock().await;
         let previous: Vec<_> = portal_env_keys()
             .iter()
@@ -2761,7 +2754,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_config_requires_portal_dir() {
+    async fn portal_requires_dir() {
         let _guard = env_lock().lock().await;
         let previous: Vec<_> = portal_env_keys()
             .iter()
@@ -2805,7 +2798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_config_allows_existing_portal_without_download_fields() {
+    async fn portal_allows_existing() {
         let _guard = env_lock().lock().await;
         let previous: Vec<_> = portal_env_keys()
             .iter()
@@ -2833,7 +2826,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_config_rejects_invalid_mode() {
+    async fn portal_rejects_mode() {
         let _guard = env_lock().lock().await;
         let previous: Vec<_> = portal_env_keys()
             .iter()
@@ -2870,7 +2863,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_discovery_rejects_invalid_dns_origins() {
+    fn discovery_rejects_origins() {
         let realm_id = RealmId::from_bytes([43u8; 32]);
         let local_node_id = iroh::SecretKey::from_bytes(&[44u8; 32]).public();
         let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -2893,7 +2886,7 @@ mod tests {
     }
 
     #[test]
-    fn static_realm_endpoint_validates_declared_node_id() {
+    fn endpoint_validates_node() {
         let realm_id = RealmId::from_bytes([45u8; 32]);
         let local_node_id = iroh::SecretKey::from_bytes(&[46u8; 32]).public();
         let declared_node = iroh::SecretKey::from_bytes(&[47u8; 32]).public();
@@ -2904,7 +2897,7 @@ mod tests {
         realm_config.discovery = RealmDiscoveryConfig::Static {
             endpoints: vec![StaticRealmEndpoint {
                 node_id: declared_node.to_string(),
-                endpoint_addr: endpoint_addr_to_config_string(&endpoint_addr),
+                endpoint_addr: format_endpoint_config(&endpoint_addr),
             }],
         };
 
@@ -2922,11 +2915,11 @@ mod tests {
         let endpoints = vec![
             StaticRealmEndpoint {
                 node_id: endpoint_node.to_string(),
-                endpoint_addr: endpoint_addr_to_config_string(&endpoint_addr),
+                endpoint_addr: format_endpoint_config(&endpoint_addr),
             },
             StaticRealmEndpoint {
                 node_id: other_node.to_string(),
-                endpoint_addr: endpoint_addr_to_config_string(&endpoint_addr),
+                endpoint_addr: format_endpoint_config(&endpoint_addr),
             },
             StaticRealmEndpoint {
                 node_id: endpoint_node.to_string(),
@@ -2991,7 +2984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ignores_onboarding_secret_when_node_state_exists() {
+    async fn existing_ignores_secret() {
         let _guard = env_lock().lock().await;
         let tempdir = tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
@@ -3059,7 +3052,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_core_documents_fetched_does_not_require_onboarding_secret() {
+    async fn pending_ignores_secret() {
         let _guard = env_lock().lock().await;
         let tempdir = tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();

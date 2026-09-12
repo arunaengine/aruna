@@ -38,10 +38,9 @@ impl SyncQuarantineFamily {
     }
 }
 
-/// Immutable transport identity of a rejected operation: the topic it arrived
-/// on, the signed publisher actor, and that actor's sequence. No payload field
-/// takes part, so two publishers reusing one `event_id` keep distinct rows and
-/// a redelivery replaces exactly its own row.
+/// Immutable transport identity of a rejected operation: the topic it arrived on, the signed publisher
+/// actor, and that actor's sequence. No payload field takes part, so two publishers reusing one
+/// `event_id` keep distinct rows and a redelivery replaces exactly its own row.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SyncQuarantineIdentity {
     pub topic: TopicId,
@@ -105,10 +104,9 @@ impl SyncQuarantineEvidence {
     }
 }
 
-/// A replicated sync event that failed permanent validation, retained for
-/// inspection instead of being silently dropped (#338). Evidence is committed in
-/// the same transaction as the cursor that advances past it, so a topic never
-/// moves ahead of an unpersisted rejection.
+/// A replicated sync event that failed permanent validation, retained for inspection instead of being
+/// silently dropped (#338). Evidence is committed in the same transaction as the cursor that advances
+/// past it, so a topic never moves ahead of an unpersisted rejection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncQuarantineRecord {
     pub identity: SyncQuarantineIdentity,

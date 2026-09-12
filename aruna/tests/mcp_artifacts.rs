@@ -1,9 +1,7 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "512"]
-//! End-to-end artifact contract over MCP: a script run captures a PNG, the
-//! compute tools report it with its content type and exact version, and the S3
-//! surface serves those bytes. Skips with a message when no Docker daemon is
-//! reachable.
+//! End-to-end MCP artifact contract: compute reports a captured PNG with its exact
+//! content type and version, and S3 serves those bytes. Skips when Docker is unavailable.
 #![cfg(feature = "docker")]
 
 mod shared;
@@ -23,8 +21,8 @@ use rmcp::transport::{
 use rmcp::{ClientLifecycleMode, ClientServiceExt, RoleClient};
 use serde_json::{Value, json};
 use shared::{
-    S3Credentials, TestResult, create_bearer_token, create_group_via_http,
-    create_s3_credentials_via_http, s3_client, spawn_compute_seed, wait_for_group_via_http,
+    S3Credentials, TestResult, create_bearer_token, create_group_http,
+    create_s3_credentials, s3_client, spawn_compute_seed, wait_group_http,
 };
 use ulid::Ulid;
 
@@ -79,10 +77,10 @@ async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
         seed.capabilities.clone(),
     )
     .await?;
-    let group = create_group_via_http(&seed.base_url, &bearer, "mcp-artifacts").await?;
-    wait_for_group_via_http(&seed.base_url, &bearer, &group.group_id).await?;
+    let group = create_group_http(&seed.base_url, &bearer, "mcp-artifacts").await?;
+    wait_group_http(&seed.base_url, &bearer, &group.group_id).await?;
     let group_id = Ulid::from_string(&group.group_id)?;
-    let creds = create_s3_credentials_via_http(&seed.base_url, &bearer, &group.group_id).await?;
+    let creds = create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
 
     let bucket = format!("work-{}", Ulid::generate().to_string().to_lowercase());
     let client = s3_client(&endpoint, &creds);

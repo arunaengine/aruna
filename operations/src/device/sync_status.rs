@@ -1,6 +1,6 @@
 //! What this device still owes the realm, and how to make it run now.
-//! Derived only from local state (replica ledger, intake, folder rows), so the
-//! Sync view answers while the realm is out of reach.
+//! Derived only from local state (replica ledger, publish queue, folder rows), so
+//! the Sync view answers while the realm is out of reach.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{DEVICE_SYNC_STATE_KEYSPACE, SYNC_BASE_KEYSPACE};
 use aruna_core::structs::{EntryState, FolderState, SyncBase, SyncedFolder};
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::types::{GroupId, Key};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -21,7 +21,7 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 
 use super::drain::claim_state;
-use super::intake::{IntakeEntry, IntakeState, scan_intake};
+use super::publish_queue::{PublishEntry, PublishState, scan_publish_queue};
 use super::replica::{DocumentState, ReplicaRecord, ReplicaState, document_state, list_replicas};
 use super::sync::folders::{list_folders, list_transfers};
 use super::sync::repository::{scan_folder, scan_page};
@@ -96,12 +96,12 @@ pub struct SyncStatus {
     pub datasets: Vec<DatasetRow>,
 }
 
-/// Joins the replica ledger with the intake queue. Both are already read; this
+/// Joins the replica ledger with the publish queue. Both are already read; this
 /// is the whole derivation, so it is testable without a device.
-pub fn document_rows(replicas: Vec<ReplicaRecord>, intake: &[IntakeEntry]) -> Vec<DocumentRow> {
-    let mut queued: BTreeMap<Ulid, Vec<&IntakeEntry>> = BTreeMap::new();
-    let mut unminted: Vec<&IntakeEntry> = Vec::new();
-    for entry in intake {
+pub fn document_rows(replicas: Vec<ReplicaRecord>, entries: &[PublishEntry]) -> Vec<DocumentRow> {
+    let mut queued: BTreeMap<Ulid, Vec<&PublishEntry>> = BTreeMap::new();
+    let mut unminted: Vec<&PublishEntry> = Vec::new();
+    for entry in entries {
         match entry.document_id() {
             Some(document_id) => queued.entry(document_id).or_default().push(entry),
             None => unminted.push(entry),
@@ -132,19 +132,19 @@ pub fn document_rows(replicas: Vec<ReplicaRecord>, intake: &[IntakeEntry]) -> Ve
 }
 
 /// One queued create that no replica covers yet.
-fn queued_row(entry: &IntakeEntry) -> DocumentRow {
+fn queued_row(entry: &PublishEntry) -> DocumentRow {
     DocumentRow {
         document_id: entry.document_id().unwrap_or(entry.draft_id),
         document_path: entry.document_path.clone(),
         group_id: entry.group_id,
         state: match &entry.state {
-            IntakeState::Pending { .. } => DocumentState::Pending,
-            IntakeState::Publishing { .. } => DocumentState::Publishing,
-            IntakeState::Published { .. } => DocumentState::Synced,
-            IntakeState::Failed { .. } => DocumentState::Failed,
+            PublishState::Pending { .. } => DocumentState::Pending,
+            PublishState::Publishing { .. } => DocumentState::Publishing,
+            PublishState::Published { .. } => DocumentState::Synced,
+            PublishState::Failed { .. } => DocumentState::Failed,
         },
         pending_edits: 0,
-        local_only: !matches!(entry.state, IntakeState::Published { .. }),
+        local_only: !matches!(entry.state, PublishState::Published { .. }),
         validation_findings: 0,
         last_error: entry_error(&[entry]),
         last_synced_ms: None,
@@ -152,10 +152,10 @@ fn queued_row(entry: &IntakeEntry) -> DocumentRow {
 }
 
 /// What the last attempt on this document said, if anything did.
-fn entry_error(entries: &[&IntakeEntry]) -> Option<String> {
+fn entry_error(entries: &[&PublishEntry]) -> Option<String> {
     entries.iter().rev().find_map(|entry| match &entry.state {
-        IntakeState::Failed { reason, .. } => Some(reason.clone()),
-        IntakeState::Pending { last_error, .. } => last_error.clone(),
+        PublishState::Failed { reason, .. } => Some(reason.clone()),
+        PublishState::Pending { last_error, .. } => last_error.clone(),
         _ => None,
     })
 }
@@ -225,8 +225,8 @@ pub async fn sync_status(context: &Arc<DriverContext>) -> SyncStatus {
     let now = unix_timestamp_millis();
     let state = read_sync_state(context).await;
     let replicas = list_replicas(context).await.unwrap_or_default();
-    let intake = read_intake_entries(context).await;
-    let documents = document_rows(replicas, &intake);
+    let entries = read_publish_entries(context).await;
+    let documents = document_rows(replicas, &entries);
     let datasets = read_datasets(context).await;
     SyncStatus {
         realm_reachable: state.realm_reachable(now),
@@ -237,15 +237,15 @@ pub async fn sync_status(context: &Arc<DriverContext>) -> SyncStatus {
     }
 }
 
-/// Starts one sync pass: drain the intake, drain the upload outbox, refresh
-/// every selected replica. Idempotent while a pass is still in flight.
+/// Starts one sync pass: drain the publish queue, drain the upload outbox,
+/// refresh every selected replica. Idempotent while a pass is still in flight.
 pub async fn start_sync_run(context: &Arc<DriverContext>) -> bool {
     let now = unix_timestamp_millis();
     let mut state = read_sync_state(context).await;
     if state.run_active(now) {
         return false;
     }
-    requeue_intake(context, now).await;
+    requeue_publish(context, now).await;
     state.run_started_ms = Some(now);
     write_sync_state(context, &state).await;
     for key in [
@@ -259,8 +259,8 @@ pub async fn start_sync_run(context: &Arc<DriverContext>) -> bool {
     true
 }
 
-async fn requeue_intake(context: &Arc<DriverContext>, now_ms: u64) {
-    for entry in read_intake_entries(context).await {
+async fn requeue_publish(context: &Arc<DriverContext>, now_ms: u64) {
+    for entry in read_publish_entries(context).await {
         let Some(state) = entry.retry_failed(now_ms) else {
             continue;
         };
@@ -273,7 +273,7 @@ async fn arm(context: &Arc<DriverContext>, key: TaskKey) {
         return;
     };
     if let TaskEvent::Error { message, .. } = task_handle
-        .schedule_timer_if_idle(key, Duration::ZERO)
+        .schedule_idle_timer(key, Duration::ZERO)
         .await
     {
         warn!(message = %message, "Failed to arm a device sync timer");
@@ -336,17 +336,18 @@ fn sync_state_key() -> Key {
     ByteView::from(SYNC_STATE_KEY.to_vec())
 }
 
-pub(crate) async fn read_intake_entries(context: &Arc<DriverContext>) -> Vec<IntakeEntry> {
+pub(crate) async fn read_publish_entries(context: &Arc<DriverContext>) -> Vec<PublishEntry> {
     let mut entries = Vec::new();
     let mut cursor: Option<Key> = None;
     loop {
-        let Some((values, next)) = scan_page(context, scan_intake(cursor, None)).await else {
+        let Some((values, next)) = scan_page(context, scan_publish_queue(cursor, None)).await
+        else {
             return entries;
         };
         entries.extend(
             values
                 .into_iter()
-                .filter_map(|(_, bytes)| IntakeEntry::from_bytes(&bytes).ok()),
+                .filter_map(|(_, bytes)| PublishEntry::from_bytes(&bytes).ok()),
         );
         match next {
             Some(next) => cursor = Some(next),
@@ -399,7 +400,7 @@ async fn read_bases(context: &Arc<DriverContext>, folder_id: Ulid) -> Vec<SyncBa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::intake::intake_entry;
+    use crate::device::publish_queue::publish_entry;
     use crate::device::replica::ReplicaOrigin;
     use aruna_core::structs::{FolderMode, RealmId, RemoteBinding};
     use aruna_core::types::UserId;
@@ -415,8 +416,8 @@ mod tests {
         replica
     }
 
-    fn draft(state: IntakeState) -> IntakeEntry {
-        let mut entry = IntakeEntry::new(
+    fn draft(state: PublishState) -> PublishEntry {
+        let mut entry = PublishEntry::new(
             Ulid::generate(),
             UserId::local(Ulid::generate(), RealmId::from_bytes([5u8; 32])),
             Ulid::from_bytes([1u8; 16]),
@@ -473,7 +474,7 @@ mod tests {
     fn joins_queued_documents() {
         // A queued create is what the owner sees, not the ledger's own state.
         let replica = replica(ReplicaState::LocalOnly);
-        let entry = draft(IntakeState::Publishing {
+        let entry = draft(PublishState::Publishing {
             document_id: replica.document_id,
             due_at_ms: 0,
             attempts: 1,
@@ -488,7 +489,7 @@ mod tests {
     fn lists_unpublished_creates() {
         // A draft the realm has never seen has no replica, and must still be
         // what the owner sees as waiting.
-        let entry = draft(IntakeState::Pending {
+        let entry = draft(PublishState::Pending {
             due_at_ms: 0,
             attempts: 1,
             last_error: Some("unreachable".to_string()),
@@ -566,18 +567,18 @@ mod tests {
             compute_handle: None,
         });
         let document_id = Ulid::generate();
-        let retryable = draft(IntakeState::Failed {
+        let retryable = draft(PublishState::Failed {
             reason: "unreachable".to_string(),
             retryable: true,
             document_id: Some(document_id),
         });
-        let permanent = draft(IntakeState::Failed {
+        let permanent = draft(PublishState::Failed {
             reason: "denied".to_string(),
             retryable: false,
             document_id: None,
         });
         for entry in [&retryable, &permanent] {
-            let (key_space, key, value) = intake_entry(entry).unwrap();
+            let (key_space, key, value) = publish_entry(entry).unwrap();
             assert!(matches!(
                 context
                     .storage_handle
@@ -593,10 +594,10 @@ mod tests {
         }
 
         assert!(start_sync_run(&context).await);
-        let entries = read_intake_entries(&context).await;
+        let entries = read_publish_entries(&context).await;
         assert!(entries.iter().any(|entry| matches!(
             entry.state,
-            IntakeState::Publishing {
+            PublishState::Publishing {
                 document_id: retried,
                 attempts: 0,
                 ..

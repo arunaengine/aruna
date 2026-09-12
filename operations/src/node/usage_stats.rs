@@ -1,6 +1,6 @@
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -15,11 +15,11 @@ use aruna_core::structs::{
     NODE_USAGE_GLOBAL_PREFIX, NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY,
     NODE_USAGE_SUMMARY_GROUP_PREFIX, NodeUsageSnapshot, RealmConfigDocument, RealmId,
     USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta,
-    VersionKey, node_usage_dirty_group_id, node_usage_dirty_group_key, node_usage_global_key,
-    node_usage_group_key, node_usage_group_key_group_id, node_usage_group_prefix,
-    node_usage_key_node_id, node_usage_summary_group_key, shard_for_hash, usage_backend_key,
-    usage_global_key_for_group, usage_global_shard_index, usage_global_shard_key,
-    usage_global_shard_keys, usage_group_key, usage_hash_key,
+    VersionKey, dirty_group_id, dirty_group_key, usage_global_key,
+    usage_group_key, usage_group_id, usage_group_prefix,
+    usage_node_id, usage_summary_key, shard_for_hash, usage_backend_key,
+    global_group_key, global_shard_index, global_shard_key,
+    global_shard_keys, usage_group_key, usage_hash_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -33,6 +33,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::driver::{DriverContext, drive};
+use crate::storage_read::scan_all;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 #[derive(Debug, Error, PartialEq)]
@@ -135,7 +136,7 @@ impl UsageCounterUpdate {
     pub fn for_group(group_id: GroupId, delta: UsageDelta) -> Self {
         Self {
             entries: vec![
-                (usage_global_key_for_group(group_id), delta),
+                (global_group_key(group_id), delta),
                 (usage_group_key(group_id), delta),
             ],
             dirty_group: Some(group_id),
@@ -148,7 +149,7 @@ impl UsageCounterUpdate {
     /// it, never against the writing group's shard.
     pub fn with_stored(group_id: GroupId, group_delta: UsageDelta, stored: StoredDelta) -> Self {
         let mut entries = vec![
-            (usage_global_key_for_group(group_id), group_delta),
+            (global_group_key(group_id), group_delta),
             (usage_group_key(group_id), group_delta),
         ];
         for (key, delta) in stored.entries() {
@@ -183,7 +184,7 @@ impl UsageCounterUpdate {
         if let Some(group_id) = self.dirty_group {
             writes.push((
                 USAGE_NODE_STATS_KEYSPACE.to_string(),
-                ByteView::from(node_usage_dirty_group_key(group_id)),
+                ByteView::from(dirty_group_key(group_id)),
                 generation,
             ));
         }
@@ -306,7 +307,7 @@ impl QuotaGate {
             ceiling,
             delta_logical_bytes,
             group_key: usage_group_key(group_id),
-            remote_prefix: node_usage_group_prefix(group_id),
+            remote_prefix: usage_group_prefix(group_id),
             local_node_id,
             realm_id: None,
             active_node_ids: None,
@@ -370,7 +371,7 @@ impl QuotaGate {
                 if let Some(bytes) = value {
                     let document = RealmConfigDocument::from_bytes(bytes.as_ref())?;
                     self.active_node_ids =
-                        Some(document.sync_eligible_node_ids()?.into_iter().collect());
+                        Some(document.sync_eligible_nodes()?.into_iter().collect());
                 }
                 Ok(Some(self.read_local_effect(txn_id)))
             }
@@ -390,10 +391,9 @@ impl QuotaGate {
                 }),
             ) => {
                 for (key, value) in values {
-                    // Skip our own snapshot: the live local counter already accounts
-                    // for it. Mirror `sum_remote_snapshots`: never trust a snapshot
-                    // whose embedded node id disagrees with its storage key.
-                    let key_node_id = node_usage_key_node_id(key.as_ref());
+                    // Live counters already include our snapshot. Remote snapshots must also
+                    // bind their embedded node id to the storage key.
+                    let key_node_id = usage_node_id(key.as_ref());
                     if key_node_id == Some(self.local_node_id) {
                         continue;
                     }
@@ -516,7 +516,7 @@ impl LoadUsageCountersOperation {
     fn handle_global_read(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                self.finish(sum_global_usage_counters(values))
+                self.finish(sum_global_usage(values))
             }
             Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
             other => self.unexpected_event("storage batch read result", other),
@@ -531,7 +531,7 @@ impl Operation for LoadUsageCountersOperation {
     fn start(&mut self) -> Effects {
         if self.key.as_slice() == USAGE_GLOBAL_KEY {
             self.state = LoadUsageCountersState::ReadGlobal;
-            let reads = usage_global_shard_keys()
+            let reads = global_shard_keys()
                 .into_iter()
                 .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.into()))
                 .collect::<Vec<_>>();
@@ -575,7 +575,7 @@ impl Operation for LoadUsageCountersOperation {
     }
 }
 
-fn sum_global_usage_counters(
+fn sum_global_usage(
     values: Vec<(Key, Option<Value>)>,
 ) -> Result<UsageCounters, LoadUsageCountersError> {
     let mut total = UsageCounters::default();
@@ -706,7 +706,7 @@ impl RebuildUsageStatsOperation {
     }
 
     fn global_shard_entry(&mut self, group_id: GroupId) -> &mut UsageCounters {
-        &mut self.global_shards[usage_global_shard_index(group_id)]
+        &mut self.global_shards[global_shard_index(group_id)]
     }
 
     fn backend_entry(&mut self, backend: &BackendRef, shard: usize) -> &mut UsageCounters {
@@ -883,7 +883,7 @@ impl RebuildUsageStatsOperation {
         self.next_scan()
     }
 
-    fn handle_write_transaction_started(&mut self, event: Event) -> Effects {
+    fn handle_write_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.emit_error(RebuildUsageStatsError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -896,7 +896,7 @@ impl RebuildUsageStatsOperation {
         let mut writes = Vec::with_capacity(USAGE_GLOBAL_SHARD_COUNT + self.groups.len());
         let mut write_keys = HashSet::with_capacity(USAGE_GLOBAL_SHARD_COUNT + self.groups.len());
         for (shard, counters) in self.global_shards.iter().enumerate() {
-            let key = usage_global_shard_key(shard);
+            let key = global_shard_key(shard);
             let bytes = match counters.to_bytes() {
                 Ok(bytes) => bytes,
                 Err(err) => return self.emit_error(err.into()),
@@ -961,7 +961,7 @@ impl RebuildUsageStatsOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
-    fn handle_stale_counters_deleted(&mut self, event: Event) -> Effects {
+    fn handle_stale_deleted(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.emit_error(RebuildUsageStatsError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -1012,11 +1012,11 @@ impl Operation for RebuildUsageStatsOperation {
             | RebuildUsageStatsState::ScanVersions
             | RebuildUsageStatsState::ScanCounters => self.handle_page(event),
             RebuildUsageStatsState::StartWriteTransaction => {
-                self.handle_write_transaction_started(event)
+                self.handle_write_started(event)
             }
             RebuildUsageStatsState::WriteCounters => self.handle_counters_written(event),
             RebuildUsageStatsState::DeleteStaleCounters => {
-                self.handle_stale_counters_deleted(event)
+                self.handle_stale_deleted(event)
             }
             RebuildUsageStatsState::CommitTransaction => self.handle_transaction_committed(event),
             RebuildUsageStatsState::Finish | RebuildUsageStatsState::Error => {
@@ -1060,7 +1060,7 @@ impl Operation for RebuildUsageStatsOperation {
 pub const USAGE_SNAPSHOT_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Schedules (or shortens toward) the debounced snapshot publish task.
-pub fn schedule_usage_snapshot_publish_effect() -> Effect {
+pub fn schedule_snapshot_publish() -> Effect {
     Effect::Task(TaskEffect::ShortenTimer {
         key: TaskKey::PublishUsageSnapshots,
         after: USAGE_SNAPSHOT_PUBLISH_DEBOUNCE,
@@ -1107,43 +1107,8 @@ pub enum RealmUsageScope {
     Group(GroupId),
 }
 
-async fn iter_all(
-    storage: &StorageHandle,
-    key_space: &str,
-    prefix: Option<Key>,
-) -> Result<Vec<(Key, Value)>, String> {
-    let mut collected = Vec::new();
-    let mut start = None;
-    loop {
-        match storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: key_space.to_string(),
-                prefix: prefix.clone(),
-                start: start.map(IterStart::After),
-                limit: 1_000,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => {
-                collected.extend(values);
-                match next_start_after {
-                    Some(next) => start = Some(next),
-                    None => break,
-                }
-            }
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected iter event: {other:?}")),
-        }
-    }
-    Ok(collected)
-}
-
 pub(crate) async fn read_local_global(storage: &StorageHandle) -> Result<UsageCounters, String> {
-    let reads = usage_global_shard_keys()
+    let reads = global_shard_keys()
         .into_iter()
         .map(|key| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
         .collect();
@@ -1201,10 +1166,10 @@ async fn sum_remote_snapshots(
     local_node_id: NodeId,
     active_node_ids: Option<&HashSet<NodeId>>,
 ) -> Result<UsageCounters, String> {
-    let entries = iter_all(storage, USAGE_NODE_STATS_KEYSPACE, Some(Key::from(prefix))).await?;
+    let entries = scan_all(storage, USAGE_NODE_STATS_KEYSPACE, Some(Key::from(prefix))).await?;
     let mut total = UsageCounters::default();
     for (key, value) in entries {
-        let key_node_id = node_usage_key_node_id(key.as_ref());
+        let key_node_id = usage_node_id(key.as_ref());
         if key_node_id == Some(local_node_id) {
             continue;
         }
@@ -1214,9 +1179,7 @@ async fn sum_remote_snapshots(
             continue;
         }
         let snapshot = NodeUsageSnapshot::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
-        // Defensive: ingest ties a snapshot's node id to its storage key, but
-        // never sum one whose embedded node id disagrees with its key so a
-        // misattributed snapshot can never inflate the realm aggregate.
+        // Reject snapshots whose embedded node differs from the storage key.
         if key_node_id != Some(snapshot.node_id) {
             continue;
         }
@@ -1235,12 +1198,12 @@ pub async fn publish_usage_snapshots(
     full: bool,
 ) -> Result<PublishedUsage, String> {
     let (published, observed_markers) =
-        publish_usage_snapshots_retaining_markers(ctx, node_id, realm_id, full).await?;
+        publish_retaining_markers(ctx, node_id, realm_id, full).await?;
     clear_consumed_markers(&ctx.storage_handle, observed_markers).await?;
     Ok(published)
 }
 
-async fn publish_usage_snapshots_retaining_markers(
+async fn publish_retaining_markers(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
@@ -1248,7 +1211,7 @@ async fn publish_usage_snapshots_retaining_markers(
 ) -> Result<(PublishedUsage, Vec<(Key, Value)>), String> {
     let storage = &ctx.storage_handle;
 
-    let observed_markers = iter_all(
+    let observed_markers = scan_all(
         storage,
         USAGE_NODE_STATS_KEYSPACE,
         Some(Key::from(NODE_USAGE_DIRTY_PREFIX.to_vec())),
@@ -1260,14 +1223,14 @@ async fn publish_usage_snapshots_retaining_markers(
     for (key, _) in &observed_markers {
         if key.as_ref() == NODE_USAGE_DIRTY_GLOBAL_KEY {
             global = true;
-        } else if let Some(group_id) = node_usage_dirty_group_id(key.as_ref()) {
+        } else if let Some(group_id) = dirty_group_id(key.as_ref()) {
             groups.insert(group_id);
         }
     }
 
     if full {
         global = true;
-        for (key, _) in iter_all(
+        for (key, _) in scan_all(
             storage,
             USAGE_STATS_KEYSPACE,
             Some(Key::from(b"group/".to_vec())),
@@ -1280,18 +1243,16 @@ async fn publish_usage_snapshots_retaining_markers(
                 groups.insert(GroupId::from_bytes(bytes));
             }
         }
-        // Re-publish groups with a snapshot but no live counter (e.g. pruned by a
-        // rebuild): a missing counter reads as zero, overwriting the stale snapshot
-        // so peers stop summing it.
-        for (key, _) in iter_all(
+        // Republish snapshots missing a live counter as zero so peers stop summing stale data.
+        for (key, _) in scan_all(
             storage,
             USAGE_NODE_STATS_KEYSPACE,
             Some(Key::from(NODE_USAGE_GROUP_PREFIX.to_vec())),
         )
         .await?
         {
-            if node_usage_key_node_id(key.as_ref()) == Some(node_id)
-                && let Some(group_id) = node_usage_group_key_group_id(key.as_ref())
+            if usage_node_id(key.as_ref()) == Some(node_id)
+                && let Some(group_id) = usage_group_id(key.as_ref())
             {
                 groups.insert(group_id);
             }
@@ -1308,7 +1269,7 @@ async fn publish_usage_snapshots_retaining_markers(
         let snapshot = NodeUsageSnapshot { node_id, counters };
         writes.push((
             USAGE_NODE_STATS_KEYSPACE.to_string(),
-            Key::from(node_usage_global_key(node_id)),
+            Key::from(usage_global_key(node_id)),
             Value::from(snapshot.to_bytes().map_err(|e| e.to_string())?),
         ));
     }
@@ -1318,7 +1279,7 @@ async fn publish_usage_snapshots_retaining_markers(
         let snapshot = NodeUsageSnapshot { node_id, counters };
         writes.push((
             USAGE_NODE_STATS_KEYSPACE.to_string(),
-            Key::from(node_usage_group_key(*group_id, node_id)),
+            Key::from(usage_group_key(*group_id, node_id)),
             Value::from(snapshot.to_bytes().map_err(|e| e.to_string())?),
         ));
     }
@@ -1348,7 +1309,7 @@ async fn publish_usage_snapshots_retaining_markers(
     .map_err(|error| format!("node usage snapshot replication failed: {error}"))
     {
         if let Err(retry_error) =
-            signal_usage_snapshot_retry(ctx, &published, &observed_markers).await
+            signal_snapshot_retry(ctx, &published, &observed_markers).await
         {
             return Err(format!(
                 "{error}; additionally failed to mark usage snapshot retry: {retry_error}"
@@ -1360,21 +1321,21 @@ async fn publish_usage_snapshots_retaining_markers(
     Ok((published, observed_markers))
 }
 
-pub async fn publish_and_refresh_usage_snapshots(
+pub async fn publish_refresh_snapshots(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
     full: bool,
 ) -> Result<PublishedUsage, String> {
     let (published, observed_markers) =
-        publish_usage_snapshots_retaining_markers(ctx, node_id, realm_id, full).await?;
+        publish_retaining_markers(ctx, node_id, realm_id, full).await?;
     if !published.is_empty()
         && let Err(error) =
-            recompute_realm_usage_summary(ctx, node_id, published.global, published.groups.clone())
+            recompute_usage_summary(ctx, node_id, published.global, published.groups.clone())
                 .await
     {
         if let Err(retry_error) =
-            signal_usage_snapshot_retry(ctx, &published, &observed_markers).await
+            signal_snapshot_retry(ctx, &published, &observed_markers).await
         {
             return Err(format!(
                 "{error}; additionally failed to mark usage snapshot retry: {retry_error}"
@@ -1388,18 +1349,18 @@ pub async fn publish_and_refresh_usage_snapshots(
     Ok(published)
 }
 
-async fn signal_usage_snapshot_retry(
+async fn signal_snapshot_retry(
     ctx: &DriverContext,
     published: &PublishedUsage,
     observed_markers: &[(Key, Value)],
 ) -> Result<(), String> {
-    write_usage_snapshot_retry_markers(&ctx.storage_handle, published, observed_markers).await?;
+    write_retry_markers(&ctx.storage_handle, published, observed_markers).await?;
 
     let Some(task_handle) = ctx.task_handle.as_ref() else {
         return Ok(());
     };
     match task_handle
-        .send_effect(schedule_usage_snapshot_publish_effect())
+        .send_effect(schedule_snapshot_publish())
         .await
     {
         Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(()),
@@ -1414,7 +1375,7 @@ async fn signal_usage_snapshot_retry(
     }
 }
 
-async fn write_usage_snapshot_retry_markers(
+async fn write_retry_markers(
     storage: &StorageHandle,
     published: &PublishedUsage,
     observed_markers: &[(Key, Value)],
@@ -1438,7 +1399,7 @@ async fn write_usage_snapshot_retry_markers(
         ));
     }
     for group_id in &published.groups {
-        let marker_key = node_usage_dirty_group_key(*group_id);
+        let marker_key = dirty_group_key(*group_id);
         if observed_keys.contains(&marker_key) {
             continue;
         }
@@ -1569,7 +1530,7 @@ async fn clear_consumed_markers(
     }
 }
 
-async fn active_usage_node_ids(ctx: &DriverContext) -> Result<Option<HashSet<NodeId>>, String> {
+async fn active_usage_nodes(ctx: &DriverContext) -> Result<Option<HashSet<NodeId>>, String> {
     let Some(net_handle) = ctx.net_handle.as_ref() else {
         return Ok(None);
     };
@@ -1591,7 +1552,7 @@ async fn active_usage_node_ids(ctx: &DriverContext) -> Result<Option<HashSet<Nod
                 .map_err(|error| error.to_string())?;
             Ok(Some(
                 document
-                    .sync_eligible_node_ids()
+                    .sync_eligible_nodes()
                     .map_err(|error| error.to_string())?
                     .into_iter()
                     .collect(),
@@ -1603,12 +1564,12 @@ async fn active_usage_node_ids(ctx: &DriverContext) -> Result<Option<HashSet<Nod
     }
 }
 
-async fn clear_realm_usage_summary_cache(ctx: &DriverContext) -> Result<(), String> {
+async fn clear_usage_cache(ctx: &DriverContext) -> Result<(), String> {
     let mut deletes = vec![(
         USAGE_NODE_STATS_KEYSPACE.to_string(),
         Key::from(NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec()),
     )];
-    for (key, _) in iter_all(
+    for (key, _) in scan_all(
         &ctx.storage_handle,
         USAGE_NODE_STATS_KEYSPACE,
         Some(Key::from(NODE_USAGE_SUMMARY_GROUP_PREFIX.to_vec())),
@@ -1633,14 +1594,14 @@ async fn clear_realm_usage_summary_cache(ctx: &DriverContext) -> Result<(), Stri
 
 /// Recomputes the persisted realm-wide summed cache for the requested scopes:
 /// realm total = live local counters + every remote node's snapshot.
-pub async fn recompute_realm_usage_summary(
+pub async fn recompute_usage_summary(
     ctx: &DriverContext,
     local_node_id: NodeId,
     include_global: bool,
     groups: Vec<GroupId>,
 ) -> Result<(), String> {
     let storage = &ctx.storage_handle;
-    let active_node_ids = active_usage_node_ids(ctx).await?;
+    let active_node_ids = active_usage_nodes(ctx).await?;
     let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(groups.len() + 1);
 
     if include_global {
@@ -1656,7 +1617,7 @@ pub async fn recompute_realm_usage_summary(
             realm_group_usage(storage, local_node_id, group_id, active_node_ids.as_ref()).await?;
         writes.push((
             USAGE_NODE_STATS_KEYSPACE.to_string(),
-            Key::from(node_usage_summary_group_key(group_id)),
+            Key::from(usage_summary_key(group_id)),
             Value::from(total.to_bytes().map_err(|e| e.to_string())?),
         ));
     }
@@ -1680,7 +1641,7 @@ pub async fn recompute_realm_usage_summary(
 /// Refreshes the persisted realm usage sum cache for exactly the `NodeUsage` scopes
 /// touched by a document-sync reconcile. Shared by all reconcile handlers so remote
 /// snapshots update the realm aggregate on every path.
-pub async fn refresh_realm_usage_summary_for_targets(
+pub async fn refresh_usage_targets(
     ctx: &DriverContext,
     local_node_id: NodeId,
     targets: &[DocumentSyncTarget],
@@ -1702,13 +1663,13 @@ pub async fn refresh_realm_usage_summary_for_targets(
             _ => {}
         }
     }
-    if realm_config_changed && let Err(error) = clear_realm_usage_summary_cache(ctx).await {
+    if realm_config_changed && let Err(error) = clear_usage_cache(ctx).await {
         warn!(error = %error, "Failed to clear realm usage summary after realm config change");
     }
     if !include_global && groups.is_empty() {
         return;
     }
-    if let Err(error) = recompute_realm_usage_summary(
+    if let Err(error) = recompute_usage_summary(
         ctx,
         local_node_id,
         include_global,
@@ -1746,7 +1707,7 @@ async fn realm_group_usage(
     let mut total = read_local_group(storage, group_id).await?;
     let remote = sum_remote_snapshots(
         storage,
-        node_usage_group_prefix(group_id),
+        usage_group_prefix(group_id),
         local_node_id,
         active_node_ids,
     )
@@ -1765,7 +1726,7 @@ pub async fn load_realm_usage(
     let storage = &ctx.storage_handle;
     let cache_key = match scope {
         RealmUsageScope::Global => Key::from(NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec()),
-        RealmUsageScope::Group(group_id) => Key::from(node_usage_summary_group_key(group_id)),
+        RealmUsageScope::Group(group_id) => Key::from(usage_summary_key(group_id)),
     };
     match storage
         .send_storage_effect(StorageEffect::Read {
@@ -1780,11 +1741,11 @@ pub async fn load_realm_usage(
         }) => UsageCounters::from_bytes(bytes.as_ref()).map_err(|e| e.to_string()),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => match scope {
             RealmUsageScope::Global => {
-                let active_node_ids = active_usage_node_ids(ctx).await?;
+                let active_node_ids = active_usage_nodes(ctx).await?;
                 realm_global_usage(storage, local_node_id, active_node_ids.as_ref()).await
             }
             RealmUsageScope::Group(group_id) => {
-                let active_node_ids = active_usage_node_ids(ctx).await?;
+                let active_node_ids = active_usage_nodes(ctx).await?;
                 realm_group_usage(storage, local_node_id, group_id, active_node_ids.as_ref()).await
             }
         },
@@ -1794,7 +1755,7 @@ pub async fn load_realm_usage(
 }
 
 /// Re-arms the debounced publish task when dirty markers survived a restart.
-pub async fn restore_usage_snapshot_publish_timer(
+pub async fn restore_usage_timer(
     storage: &StorageHandle,
     task_handle: &TaskHandle,
 ) {
@@ -1820,7 +1781,7 @@ pub async fn restore_usage_snapshot_publish_timer(
     };
     if has_markers
         && let Event::Task(TaskEvent::Error { message, .. }) = task_handle
-            .send_effect(schedule_usage_snapshot_publish_effect())
+            .send_effect(schedule_snapshot_publish())
             .await
     {
         warn!(message = %message, "Failed to restore node usage publish timer");
@@ -1835,7 +1796,7 @@ mod tests {
     use aruna_core::structs::{
         BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer, PortableSourceDescriptor,
         SourceConnectorKind, SourceMetadata, StagingStrategy, VersionSourceBinding,
-        usage_global_shard_keys,
+        global_shard_keys,
     };
     use std::time::SystemTime;
     use tempfile::tempdir;
@@ -1882,7 +1843,7 @@ mod tests {
         // Stored bytes belong to the hash's shard and the holding backend's row,
         // never to the writing group's shard.
         let group_id = Ulid::from_bytes([1u8; 16]);
-        let blake3 = hash_on_shard((usage_global_shard_index(group_id) + 1) % 64);
+        let blake3 = hash_on_shard((global_shard_index(group_id) + 1) % 64);
         let backend = BackendRef::Node("cold".to_string());
 
         let update = UsageCounterUpdate::with_stored(
@@ -1900,7 +1861,7 @@ mod tests {
         for (key, expected) in [
             (usage_hash_key(&blake3), (1, 10)),
             (usage_backend_key(&backend, shard), (0, 10)),
-            (usage_global_key_for_group(group_id), (0, 0)),
+            (global_group_key(group_id), (0, 0)),
         ] {
             let (_, delta) = update
                 .entries
@@ -1913,11 +1874,10 @@ mod tests {
 
     #[test]
     fn credit_skips_group() {
-        // A copy is shared by every group referencing it and both the reclaim
-        // debit and the rebuild recount key it by hash, so the group row that
-        // feeds the group usage endpoint stays logical-only.
+        // Reclaim and rebuild account shared copies by hash.
+        // The group usage row therefore remains logical-only.
         let group_id = Ulid::from_bytes([2u8; 16]);
-        let blake3 = hash_on_shard((usage_global_shard_index(group_id) + 1) % 64);
+        let blake3 = hash_on_shard((global_shard_index(group_id) + 1) % 64);
 
         let update = UsageCounterUpdate::with_stored(
             group_id,
@@ -1942,7 +1902,7 @@ mod tests {
     fn credit_merges_shard() {
         // One key must carry both halves when the hash shard is the group shard.
         let group_id = Ulid::from_bytes([1u8; 16]);
-        let blake3 = hash_on_shard(usage_global_shard_index(group_id));
+        let blake3 = hash_on_shard(global_shard_index(group_id));
 
         let update = UsageCounterUpdate::with_stored(
             group_id,
@@ -2003,7 +1963,7 @@ mod tests {
 
     async fn read_global_counters(ctx: &DriverContext) -> UsageCounters {
         let mut total = UsageCounters::default();
-        for key in usage_global_shard_keys() {
+        for key in global_shard_keys() {
             total.add(&read_counters(ctx, key).await).unwrap();
         }
         total
@@ -2026,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn counter_update_applies_deltas_with_synthetic_events() {
+    fn update_applies_deltas() {
         let group_id = Ulid::generate();
         let txn_id = Ulid::generate();
         let mut update = UsageCounterUpdate::for_group(
@@ -2054,7 +2014,7 @@ mod tests {
                 Event::Storage(StorageEvent::BatchReadResult {
                     values: vec![
                         (
-                            usage_global_key_for_group(group_id).into(),
+                            global_group_key(group_id).into(),
                             Some(existing.to_bytes().unwrap().into()),
                         ),
                         (usage_group_key(group_id).into(), None),
@@ -2088,7 +2048,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_bucket_maintains_usage_counters() {
+    async fn bucket_maintains_usage() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let group_id = Ulid::generate();
@@ -2120,7 +2080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_usage_counters_reads_group_and_global_counters() {
+    async fn load_reads_counters() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let group_id = Ulid::generate();
@@ -2150,8 +2110,8 @@ mod tests {
             logical_bytes: 7,
             ..Default::default()
         };
-        write_counters(&ctx, usage_global_shard_key(0), shard_zero).await;
-        write_counters(&ctx, usage_global_shard_key(1), shard_one).await;
+        write_counters(&ctx, global_shard_key(0), shard_zero).await;
+        write_counters(&ctx, global_shard_key(1), shard_one).await;
 
         let loaded = drive(
             LoadUsageCountersOperation::new(USAGE_GLOBAL_KEY.to_vec()),
@@ -2185,7 +2145,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_counts_live_objects_logical_and_stored_bytes() {
+    async fn rebuild_counts_bytes() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let group_a = Ulid::generate();
@@ -2239,9 +2199,7 @@ mod tests {
                 .await;
         }
 
-        // alpha/live.txt live; alpha/gone.txt superseded by a delete marker;
-        // alpha/ref.txt reference version live; beta/shared.bin has two materialized
-        // versions.
+        // Fixtures cover a live object, deletion, reference, and two materialized versions.
         let write_version = async |bucket: &str, key: &str, version: BlobVersion| {
             let version_id = Ulid::generate();
             ctx.storage_handle
@@ -2423,7 +2381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_removes_stale_usage_counter_keys() {
+    async fn rebuild_removes_stale() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let stale_group = Ulid::generate();
@@ -2472,7 +2430,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            read_optional_counters(&ctx, usage_global_shard_key(0))
+            read_optional_counters(&ctx, global_shard_key(0))
                 .await
                 .is_some()
         );
@@ -2514,7 +2472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usage_update_writes_dirty_markers_in_transaction() {
+    async fn update_writes_markers() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let group_id = Ulid::generate();
@@ -2545,14 +2503,14 @@ mod tests {
                 .is_some()
         );
         assert!(
-            read_node_stat(&ctx, node_usage_dirty_group_key(group_id))
+            read_node_stat(&ctx, dirty_group_key(group_id))
                 .await
                 .is_some()
         );
     }
 
     #[tokio::test]
-    async fn publish_consumes_markers_and_writes_snapshots() {
+    async fn publish_consumes_markers() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let node_id = node(1);
@@ -2564,10 +2522,10 @@ mod tests {
             logical_bytes: 10,
             ..Default::default()
         };
-        write_counters(&ctx, usage_global_key_for_group(group_id), counters).await;
+        write_counters(&ctx, global_group_key(group_id), counters).await;
         write_counters(&ctx, usage_group_key(group_id), counters).await;
         write_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec(), Vec::new()).await;
-        write_node_stat(&ctx, node_usage_dirty_group_key(group_id), Vec::new()).await;
+        write_node_stat(&ctx, dirty_group_key(group_id), Vec::new()).await;
 
         let published = publish_usage_snapshots(&ctx, node_id, realm_id, false)
             .await
@@ -2582,14 +2540,14 @@ mod tests {
                 .is_none()
         );
         assert!(
-            read_node_stat(&ctx, node_usage_dirty_group_key(group_id))
+            read_node_stat(&ctx, dirty_group_key(group_id))
                 .await
                 .is_none()
         );
 
         // Snapshot documents were written under this node's keys.
         let global = NodeUsageSnapshot::from_bytes(
-            &read_node_stat(&ctx, node_usage_global_key(node_id))
+            &read_node_stat(&ctx, usage_global_key(node_id))
                 .await
                 .expect("global snapshot written"),
         )
@@ -2597,7 +2555,7 @@ mod tests {
         assert_eq!(global.node_id, node_id);
         assert_eq!(global.counters.logical_bytes, 10);
         let group = NodeUsageSnapshot::from_bytes(
-            &read_node_stat(&ctx, node_usage_group_key(group_id, node_id))
+            &read_node_stat(&ctx, usage_group_key(group_id, node_id))
                 .await
                 .expect("group snapshot written"),
         )
@@ -2606,7 +2564,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_summary_sums_local_and_remote_excluding_own_snapshot() {
+    async fn summary_excludes_own() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let local = node(1);
@@ -2618,7 +2576,7 @@ mod tests {
             objects: 1,
             ..Default::default()
         };
-        write_counters(&ctx, usage_global_key_for_group(group_id), local_counters).await;
+        write_counters(&ctx, global_group_key(group_id), local_counters).await;
         write_counters(&ctx, usage_group_key(group_id), local_counters).await;
 
         let remote_snapshot = |counters| NodeUsageSnapshot {
@@ -2632,20 +2590,20 @@ mod tests {
         };
         write_node_stat(
             &ctx,
-            node_usage_global_key(remote),
+            usage_global_key(remote),
             remote_snapshot(remote_counters).to_bytes().unwrap(),
         )
         .await;
         write_node_stat(
             &ctx,
-            node_usage_group_key(group_id, remote),
+            usage_group_key(group_id, remote),
             remote_snapshot(remote_counters).to_bytes().unwrap(),
         )
         .await;
         // This node's own stale snapshot must be ignored in favor of live counters.
         write_node_stat(
             &ctx,
-            node_usage_global_key(local),
+            usage_global_key(local),
             NodeUsageSnapshot {
                 node_id: local,
                 counters: UsageCounters {
@@ -2658,7 +2616,7 @@ mod tests {
         )
         .await;
 
-        recompute_realm_usage_summary(&ctx, local, true, vec![group_id])
+        recompute_usage_summary(&ctx, local, true, vec![group_id])
             .await
             .unwrap();
 
@@ -2675,7 +2633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_realm_usage_falls_back_to_on_the_fly_recompute() {
+    async fn load_recomputes_usage() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let local = node(1);
@@ -2683,7 +2641,7 @@ mod tests {
 
         write_counters(
             &ctx,
-            usage_global_shard_key(0),
+            global_shard_key(0),
             UsageCounters {
                 logical_bytes: 3,
                 ..Default::default()
@@ -2692,7 +2650,7 @@ mod tests {
         .await;
         write_node_stat(
             &ctx,
-            node_usage_global_key(remote),
+            usage_global_key(remote),
             NodeUsageSnapshot {
                 node_id: remote,
                 counters: UsageCounters {
@@ -2713,11 +2671,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_leaves_node_usage_keyspace_intact() {
+    async fn rebuild_preserves_snapshots() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let remote = node(2);
-        let snapshot_key = node_usage_global_key(remote);
+        let snapshot_key = usage_global_key(remote);
         let snapshot = NodeUsageSnapshot {
             node_id: remote,
             counters: UsageCounters {
@@ -2746,7 +2704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_consumed_markers_keeps_regenerated_markers() {
+    async fn clear_keeps_regenerated() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let generation_one = Ulid::generate().to_bytes().to_vec();
@@ -2799,7 +2757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_failure_preserves_dirty_markers() {
+    async fn failure_preserves_markers() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let node_id = node(1);
@@ -2811,7 +2769,7 @@ mod tests {
             buckets: 1,
             ..Default::default()
         };
-        write_counters(&ctx, usage_global_key_for_group(group_id), counters).await;
+        write_counters(&ctx, global_group_key(group_id), counters).await;
         write_counters(&ctx, usage_group_key(group_id), counters).await;
         write_node_stat(
             &ctx,
@@ -2819,7 +2777,7 @@ mod tests {
             generation.clone(),
         )
         .await;
-        write_node_stat(&ctx, node_usage_dirty_group_key(group_id), generation).await;
+        write_node_stat(&ctx, dirty_group_key(group_id), generation).await;
 
         // Corrupt the realm config document so replication fails hard.
         let config_key = DocumentSyncTarget::RealmConfig { realm_id }.storage_key();
@@ -2850,14 +2808,14 @@ mod tests {
                 .is_some()
         );
         assert!(
-            read_node_stat(&ctx, node_usage_dirty_group_key(group_id))
+            read_node_stat(&ctx, dirty_group_key(group_id))
                 .await
                 .is_some()
         );
     }
 
     #[tokio::test]
-    async fn full_publish_replication_failure_marks_published_scopes_dirty() {
+    async fn replication_failure_redirties() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let node_id = node(1);
@@ -2868,7 +2826,7 @@ mod tests {
             buckets: 1,
             ..Default::default()
         };
-        write_counters(&ctx, usage_global_key_for_group(group_id), counters).await;
+        write_counters(&ctx, global_group_key(group_id), counters).await;
         write_counters(&ctx, usage_group_key(group_id), counters).await;
         assert!(
             read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
@@ -2876,7 +2834,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            read_node_stat(&ctx, node_usage_dirty_group_key(group_id))
+            read_node_stat(&ctx, dirty_group_key(group_id))
                 .await
                 .is_none()
         );
@@ -2896,19 +2854,19 @@ mod tests {
             other => panic!("unexpected write event: {other:?}"),
         }
 
-        let result = publish_and_refresh_usage_snapshots(&ctx, node_id, realm_id, true).await;
+        let result = publish_refresh_snapshots(&ctx, node_id, realm_id, true).await;
         assert!(
             result.is_err(),
             "replication failure must surface as an error, got {result:?}"
         );
 
         assert!(
-            read_node_stat(&ctx, node_usage_global_key(node_id))
+            read_node_stat(&ctx, usage_global_key(node_id))
                 .await
                 .is_some()
         );
         assert!(
-            read_node_stat(&ctx, node_usage_group_key(group_id, node_id))
+            read_node_stat(&ctx, usage_group_key(group_id, node_id))
                 .await
                 .is_some()
         );
@@ -2918,14 +2876,14 @@ mod tests {
                 .is_some()
         );
         assert!(
-            read_node_stat(&ctx, node_usage_dirty_group_key(group_id))
+            read_node_stat(&ctx, dirty_group_key(group_id))
                 .await
                 .is_some()
         );
     }
 
     #[tokio::test]
-    async fn summary_refresh_failure_preserves_dirty_markers() {
+    async fn summary_failure_preserves() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let node_id = node(1);
@@ -2938,7 +2896,7 @@ mod tests {
             buckets: 1,
             ..Default::default()
         };
-        write_counters(&ctx, usage_global_key_for_group(group_id), counters).await;
+        write_counters(&ctx, global_group_key(group_id), counters).await;
         write_counters(&ctx, usage_group_key(group_id), counters).await;
         write_node_stat(
             &ctx,
@@ -2948,13 +2906,13 @@ mod tests {
         .await;
         write_node_stat(
             &ctx,
-            node_usage_dirty_group_key(group_id),
+            dirty_group_key(group_id),
             generation.clone(),
         )
         .await;
-        write_node_stat(&ctx, node_usage_global_key(remote), b"corrupt".to_vec()).await;
+        write_node_stat(&ctx, usage_global_key(remote), b"corrupt".to_vec()).await;
 
-        let result = publish_and_refresh_usage_snapshots(&ctx, node_id, realm_id, false).await;
+        let result = publish_refresh_snapshots(&ctx, node_id, realm_id, false).await;
         assert!(
             result.is_err(),
             "summary recompute failure must surface as an error, got {result:?}"
@@ -2963,7 +2921,7 @@ mod tests {
         // The snapshots were published, but the markers survive so the debounced
         // publisher retries and refreshes the realm summary cache later.
         assert!(
-            read_node_stat(&ctx, node_usage_global_key(node_id))
+            read_node_stat(&ctx, usage_global_key(node_id))
                 .await
                 .is_some()
         );
@@ -2972,13 +2930,13 @@ mod tests {
             Some(generation.clone())
         );
         assert_eq!(
-            read_node_stat(&ctx, node_usage_dirty_group_key(group_id)).await,
+            read_node_stat(&ctx, dirty_group_key(group_id)).await,
             Some(generation)
         );
     }
 
     #[tokio::test]
-    async fn full_publish_summary_refresh_failure_marks_published_scopes_dirty() {
+    async fn summary_failure_redirties() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let node_id = node(1);
@@ -2991,9 +2949,9 @@ mod tests {
             logical_bytes: 10,
             ..Default::default()
         };
-        write_counters(&ctx, usage_global_key_for_group(group_id), counters).await;
+        write_counters(&ctx, global_group_key(group_id), counters).await;
         write_counters(&ctx, usage_group_key(group_id), counters).await;
-        write_node_stat(&ctx, node_usage_global_key(remote), b"corrupt".to_vec()).await;
+        write_node_stat(&ctx, usage_global_key(remote), b"corrupt".to_vec()).await;
 
         assert!(
             read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
@@ -3001,27 +2959,26 @@ mod tests {
                 .is_none()
         );
         assert!(
-            read_node_stat(&ctx, node_usage_dirty_group_key(group_id))
+            read_node_stat(&ctx, dirty_group_key(group_id))
                 .await
                 .is_none()
         );
 
-        let result = publish_and_refresh_usage_snapshots(&ctx, node_id, realm_id, true).await;
+        let result = publish_refresh_snapshots(&ctx, node_id, realm_id, true).await;
         assert!(
             result.is_err(),
             "summary recompute failure must surface as an error, got {result:?}"
         );
 
-        // Full startup publishes can start with no dirty markers. Once snapshots
-        // were published, a summary refresh failure must create retry markers for
-        // every published scope so the debounced publisher can refresh later.
+        // Full startup may publish without markers. A later summary failure must mark every
+        // published scope so the debounced publisher retries.
         assert!(
-            read_node_stat(&ctx, node_usage_global_key(node_id))
+            read_node_stat(&ctx, usage_global_key(node_id))
                 .await
                 .is_some()
         );
         assert!(
-            read_node_stat(&ctx, node_usage_group_key(group_id, node_id))
+            read_node_stat(&ctx, usage_group_key(group_id, node_id))
                 .await
                 .is_some()
         );
@@ -3031,14 +2988,14 @@ mod tests {
                 .is_some()
         );
         assert!(
-            read_node_stat(&ctx, node_usage_dirty_group_key(group_id))
+            read_node_stat(&ctx, dirty_group_key(group_id))
                 .await
                 .is_some()
         );
     }
 
     #[tokio::test]
-    async fn full_publish_zeros_stale_group_snapshots() {
+    async fn publish_zeros_stale() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let node_id = node(1);
@@ -3054,11 +3011,10 @@ mod tests {
         };
         write_counters(&ctx, usage_group_key(live_group), counters).await;
 
-        // A group this node published before, whose counter key no longer exists
-        // (e.g. pruned by a rebuild), leaves a stale snapshot behind.
+        // Removing a previously published group's counter leaves a stale snapshot.
         write_node_stat(
             &ctx,
-            node_usage_group_key(stale_group, node_id),
+            usage_group_key(stale_group, node_id),
             NodeUsageSnapshot {
                 node_id,
                 counters: UsageCounters {
@@ -3080,7 +3036,7 @@ mod tests {
 
         // The stale snapshot is overwritten with a zero total.
         let stale = NodeUsageSnapshot::from_bytes(
-            &read_node_stat(&ctx, node_usage_group_key(stale_group, node_id))
+            &read_node_stat(&ctx, usage_group_key(stale_group, node_id))
                 .await
                 .expect("stale snapshot present"),
         )
@@ -3089,7 +3045,7 @@ mod tests {
 
         // The live group keeps its real total.
         let live = NodeUsageSnapshot::from_bytes(
-            &read_node_stat(&ctx, node_usage_group_key(live_group, node_id))
+            &read_node_stat(&ctx, usage_group_key(live_group, node_id))
                 .await
                 .expect("live snapshot present"),
         )
@@ -3098,7 +3054,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_summary_from_targets_recomputes_touched_scopes() {
+    async fn refresh_recomputes_targets() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let local = node(1);
@@ -3109,7 +3065,7 @@ mod tests {
             logical_bytes: 10,
             ..Default::default()
         };
-        write_counters(&ctx, usage_global_key_for_group(group_id), local_counters).await;
+        write_counters(&ctx, global_group_key(group_id), local_counters).await;
         write_counters(&ctx, usage_group_key(group_id), local_counters).await;
 
         let remote_counters = UsageCounters {
@@ -3118,7 +3074,7 @@ mod tests {
         };
         write_node_stat(
             &ctx,
-            node_usage_global_key(remote),
+            usage_global_key(remote),
             NodeUsageSnapshot {
                 node_id: remote,
                 counters: remote_counters,
@@ -3129,7 +3085,7 @@ mod tests {
         .await;
         write_node_stat(
             &ctx,
-            node_usage_group_key(group_id, remote),
+            usage_group_key(group_id, remote),
             NodeUsageSnapshot {
                 node_id: remote,
                 counters: remote_counters,
@@ -3139,7 +3095,7 @@ mod tests {
         )
         .await;
 
-        refresh_realm_usage_summary_for_targets(
+        refresh_usage_targets(
             &ctx,
             local,
             &[
@@ -3165,7 +3121,7 @@ mod tests {
             Some(15)
         );
         assert_eq!(
-            read_node_stat(&ctx, node_usage_summary_group_key(group_id))
+            read_node_stat(&ctx, usage_summary_key(group_id))
                 .await
                 .map(|bytes| UsageCounters::from_bytes(&bytes).unwrap().logical_bytes),
             Some(15)

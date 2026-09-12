@@ -14,9 +14,8 @@ use aruna_core::structs::{
     HashPathIndexKey, InputMode, InputSelection, InputSource, JobError, JobRecord,
     MAX_EXECUTION_OUTPUTS, OBJECT_CONTENT_TYPE_KEY, OutputDestination, OutputObject,
     OutputSelection, PathRestriction, Permission, PlacementPolicyRef, RealmId, UserAccess,
-    VersionedObjectArn, blob_bucket_permission_path, blob_group_permission_path,
-    blob_object_permission_path, ensure_confined_relative_path, key_content_type,
-    workspace_credential_id,
+    VersionedObjectArn, bucket_permission_path, ensure_confined_path, group_permission_path,
+    key_content_type, object_permission_path, workspace_credential_id,
 };
 use aruna_core::types::NodeId;
 use futures_util::StreamExt;
@@ -79,7 +78,7 @@ pub async fn ensure_group_write(
                 path_restrictions: None,
                 session: None,
             },
-            path: blob_group_permission_path(record.created_by.realm_id, spec.group_id, node_id),
+            path: group_permission_path(record.created_by.realm_id, spec.group_id, node_id),
             required_permission: Permission::WRITE,
         }),
         context,
@@ -131,7 +130,7 @@ pub async fn check_workspace_bucket(
                 path_restrictions: None,
                 session: None,
             },
-            path: blob_bucket_permission_path(
+            path: bucket_permission_path(
                 record.created_by.realm_id,
                 spec.group_id,
                 node_id,
@@ -162,7 +161,7 @@ pub async fn mint_workspace_credential(
     ensure_group_write(context, spec, record, node_id).await?;
     let realm_id = record.created_by.realm_id;
     // WRITE on the bucket and its subtree also satisfies READ without matching siblings.
-    let bucket_path = blob_bucket_permission_path(realm_id, spec.group_id, node_id, bucket);
+    let bucket_path = bucket_permission_path(realm_id, spec.group_id, node_id, bucket);
     let restrictions = vec![
         PathRestriction {
             pattern: bucket_path.clone(),
@@ -188,7 +187,7 @@ pub async fn mint_input_credential(
     let restrictions = buckets
         .iter()
         .flat_map(|bucket| {
-            let path = blob_bucket_permission_path(realm_id, spec.group_id, node_id, bucket);
+            let path = bucket_permission_path(realm_id, spec.group_id, node_id, bucket);
             [
                 PathRestriction {
                     pattern: path.clone(),
@@ -346,7 +345,7 @@ fn source_object(input: &InputSelection) -> Result<SourceObject, JobError> {
         key,
         version_id,
     } = &input.source;
-    ensure_confined_relative_path(Path::new(key))
+    ensure_confined_path(Path::new(key))
         .map_err(|error| JobError::permanent(format!("invalid input key: {error}")))?;
     let path = input
         .container_path
@@ -395,7 +394,7 @@ async fn authorize_source(
                 path_restrictions: None,
                 session: None,
             },
-            path: blob_object_permission_path(
+            path: object_permission_path(
                 record.created_by.realm_id,
                 spec.group_id,
                 node_id,
@@ -869,7 +868,7 @@ async fn put_file_output(
                     path_restrictions: None,
                     session: None,
                 },
-                path: blob_object_permission_path(
+                path: object_permission_path(
                     record.created_by.realm_id,
                     spec.group_id,
                     node_id,
@@ -1218,9 +1217,8 @@ async fn remote_source(
             .transpose()
             .map_err(|_| JobError::permanent("input version is invalid".to_string()))?,
     };
-    // The record's own source is the holder the plan picked. It may be any node
-    // with a registered copy, so only the pinned version has to match here; the
-    // hash and size below bind the bytes.
+    // The record's source is the holder the plan picked, possibly any node with a
+    // registered copy: only the pinned version must match; hash and size bind.
     if version != Some(captured.version_id) {
         return Err(JobError::permanent(
             "captured remote input does not match the physical input".to_string(),
@@ -1668,7 +1666,7 @@ mod tests {
     // Both input mappings must retry only transient drift: a job that waits on a
     // rebind or a dropped observation would burn its whole attempt budget.
     #[test]
-    fn device_read_fails_fast() {
+    fn device_read_fails() {
         // A governed or missing realm input must not burn every attempt.
         for error in [
             BaoReadError::GovernedUnavailable,
@@ -1898,9 +1896,9 @@ mod tests {
             user_id,
             realm_id,
         };
-        let realm_doc = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let realm_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let group_doc =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, spec.group_id);
+            GroupAuthorizationDocument::default_group_doc(user_id, realm_id, spec.group_id);
         // Policy loading fails closed without the realm config and group record.
         let realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         let group = Group {
@@ -2094,7 +2092,7 @@ mod tests {
         .unwrap();
         assert!(!renewed_access.is_expired(SystemTime::now()));
         let restrictions = renewed_access.path_restrictions.unwrap();
-        let bucket_path = blob_bucket_permission_path(realm_id, spec.group_id, node_id, &bucket);
+        let bucket_path = bucket_permission_path(realm_id, spec.group_id, node_id, &bucket);
         let permits = |path: &str| {
             restrictions.iter().any(|restriction| {
                 globset::Glob::new(&restriction.pattern)
@@ -2180,7 +2178,7 @@ mod tests {
             bucket,
             mut spec,
         } = credential_fixture().await;
-        let bearer_ms = aruna_core::util::unix_timestamp_millis() + 60_000;
+        let bearer_ms = aruna_core::time::unix_timestamp_millis() + 60_000;
         spec.resources.max_walltime_ms = Some(24 * 60 * 60 * 1000);
         spec.tags
             .insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());

@@ -126,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn source_connector_roundtrip_preserves_public_config() {
+    fn source_connector_config() {
         let connector = SourceConnector::new(
             Ulid::from_bytes([1u8; 16]),
             Ulid::from_bytes([2u8; 16]),
@@ -149,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_secret_config_does_not_create_secret_record() {
+    fn empty_secret_record() {
         let secret = SourceConnectorSecret::new(
             Ulid::from_bytes([4u8; 16]),
             HashMap::new(),
@@ -160,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn public_record_serialization_stays_redacted() {
+    fn public_record_redacted() {
         let connector = SourceConnector::new(
             Ulid::from_bytes([5u8; 16]),
             Ulid::from_bytes([6u8; 16]),

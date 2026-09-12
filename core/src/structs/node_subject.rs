@@ -1,10 +1,5 @@
-//! The placement subject this node advertises for the governed data it holds.
-//!
-//! The subject is the destination every write and every internal serve is
-//! evaluated against. Its generation is a runtime rule the pure contract cannot
-//! enforce, so it lives here: the record advances the generation exactly when
-//! the digest changes, and blocks serving until the local inventory has been
-//! revalidated under the new generation.
+//! Advertised placement subject governing local writes and serves. A digest change advances its
+//! generation and blocks serving until local inventory is revalidated for that generation.
 
 use crate::errors::ConversionError;
 use crate::structs::{NodePlacementEntry, PlacementPolicyError, PlacementSubject};

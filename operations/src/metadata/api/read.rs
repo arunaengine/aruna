@@ -1,5 +1,5 @@
 use super::distributed::{run_query_distributed, run_search_distributed};
-use super::fanout::ensure_supported_query_form;
+use super::fanout::ensure_query_form;
 use super::*;
 use crate::metadata::search_cursor::{
     METADATA_SEARCH_DEFAULT_PAGE_SIZE, METADATA_SEARCH_MAX_PAGE_SIZE,
@@ -11,19 +11,19 @@ pub async fn query_metadata_document(
     local_node_id: NodeId,
     request: MetadataDocumentQueryRequest,
 ) -> Result<MetadataQueryExecution, MetadataApiError> {
-    ensure_supported_query_form(&request.query)?;
-    let record = load_record_by_document(context, request.document_id).await?;
+    ensure_query_form(&request.query)?;
+    let record = load_document_record(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record, None).await?;
     let metadata = context
         .metadata_handle
         .as_ref()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
     if request.mode == Some(MetadataApiQueryMode::Local) {
-        ensure_record_materialized_for_graph_read(context, &record).await?;
+        ensure_record_materialized(context, &record).await?;
         let results = metadata
             .query_authorized_local(request.auth, Some(vec![record.graph_iri]), request.query)
             .await
-            .map_err(map_metadata_query_error)?;
+            .map_err(map_query_error)?;
         return Ok(MetadataQueryExecution {
             results,
             fanout_stats: MetadataFanoutStats {
@@ -37,11 +37,11 @@ pub async fn query_metadata_document(
         if !request.allow_partial {
             return Err(MetadataApiError::ServiceUnavailable);
         }
-        ensure_record_materialized_for_graph_read(context, &record).await?;
+        ensure_record_materialized(context, &record).await?;
         let results = metadata
             .query_authorized_local(request.auth, Some(vec![record.graph_iri]), request.query)
             .await
-            .map_err(map_metadata_query_error)?;
+            .map_err(map_query_error)?;
         return Ok(MetadataQueryExecution {
             results,
             fanout_stats: MetadataFanoutStats {
@@ -55,7 +55,7 @@ pub async fn query_metadata_document(
     let config_digest = config
         .digest()
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let mut holders = document_replica_query_nodes(Some(&config), &record, local_node_id);
+    let mut holders = replica_query_nodes(Some(&config), &record, local_node_id);
     if let Some(index) = holders.iter().position(|holder| *holder == local_node_id) {
         holders.swap(0, index);
     }
@@ -70,7 +70,7 @@ pub async fn query_metadata_document(
     for holder in holders {
         fanout_stats.nodes_queried += 1;
         let result: Result<MetadataQueryResults, MetadataReadError> = if holder == local_node_id {
-            match ensure_record_materialized_for_graph_read(context, &record).await {
+            match ensure_record_materialized(context, &record).await {
                 Ok(()) => metadata
                     .query_authorized_local(
                         request.auth.clone(),
@@ -130,7 +130,7 @@ pub async fn query_metadata(
     request: MetadataQueryRequest,
 ) -> Result<MetadataQueryExecution, MetadataApiError> {
     let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
-    ensure_supported_query_form(&request.query)?;
+    ensure_query_form(&request.query)?;
     let subject = query_fingerprint(
         &request.query,
         request.graph_iris.as_deref(),
@@ -194,9 +194,7 @@ pub async fn search_metadata(
     let mut cursor_discovery = None;
     let (watermark, resume) = match request.cursor.as_deref() {
         Some(raw) => {
-            // Cursor signers are authorized against the full realm node set:
-            // the serving node's capped fan-out selection may exclude the node
-            // that legitimately signed the previous page.
+            // Check the full realm because capped fan-out may omit the cursor's signer.
             let signer_nodes = match request.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
                 MetadataApiQueryMode::Local => vec![local_node_id],
                 MetadataApiQueryMode::Distributed => match request.target_nodes.as_ref() {
@@ -346,9 +344,9 @@ pub async fn references_metadata(
         .clone()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
     let registry = handle
-        .list_cached_registry_records()
+        .list_cached_records()
         .await
-        .map_err(map_metadata_internal_error)?;
+        .map_err(map_internal_error)?;
     let registry = filter_live_records(&context.storage_handle, registry.as_ref()).await?;
 
     if request.resolve {
@@ -496,11 +494,11 @@ pub(crate) async fn filter_live_records(
     for record in records {
         reads.push((
             METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            metadata_graph_lifecycle_key(&record.graph_iri),
+            graph_lifecycle_key(&record.graph_iri),
         ));
         reads.push((
             METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
-            metadata_document_lifecycle_key(record.document_id),
+            document_lifecycle_key(record.document_id),
         ));
     }
     let values = match storage
@@ -527,7 +525,7 @@ pub(crate) async fn filter_live_records(
     let mut live = Vec::with_capacity(records.len());
     for (record, pair) in records.iter().zip(values.as_chunks::<2>().0) {
         let (graph_key, graph_value) = &pair[0];
-        if graph_key != &metadata_graph_lifecycle_key(&record.graph_iri) {
+        if graph_key != &graph_lifecycle_key(&record.graph_iri) {
             return Err(MetadataApiError::Internal(
                 "metadata graph lifecycle batch key mismatch".to_string(),
             ));
@@ -539,7 +537,7 @@ pub(crate) async fn filter_live_records(
             .unwrap_or(false);
 
         let (document_key, document_value) = &pair[1];
-        if document_key != &metadata_document_lifecycle_key(record.document_id) {
+        if document_key != &document_lifecycle_key(record.document_id) {
             return Err(MetadataApiError::Internal(
                 "metadata document lifecycle batch key mismatch".to_string(),
             ));
@@ -629,7 +627,7 @@ pub(super) async fn load_claim_records(
         let remaining = METADATA_REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());
         let mut group_records = load_group_records(context, group_id, remaining).await?;
         if let Some(pending_records) = pending.remove(&group_id) {
-            merge_pending_metadata_records(&mut group_records, pending_records);
+            merge_pending_records(&mut group_records, pending_records);
             if group_records.len() > remaining {
                 return Err(MetadataApiError::ServiceUnavailable);
             }
@@ -686,7 +684,7 @@ pub(super) async fn load_pending_records(
         targets.extend(
             values
                 .into_iter()
-                .filter_map(|(key, _)| metadata_pending_projection_target(key.as_ref())),
+                .filter_map(|(key, _)| pending_projection_target(key.as_ref())),
         );
 
         if next_start_after.is_none() {
@@ -704,7 +702,7 @@ pub(super) async fn load_pending_records(
         .map(|(document_id, event_id)| {
             (
                 METADATA_EVENT_LOG_KEYSPACE.to_string(),
-                metadata_event_log_key(*document_id, *event_id),
+                event_log_key(*document_id, *event_id),
             )
         })
         .collect::<Vec<_>>();
@@ -736,7 +734,7 @@ pub(super) async fn load_pending_records(
 
     let mut pending = Vec::with_capacity(event_values.len());
     for ((document_id, event_id), (key, value)) in targets.into_iter().zip(event_values) {
-        if key != metadata_event_log_key(document_id, event_id) {
+        if key != event_log_key(document_id, event_id) {
             return Err(MetadataApiError::Internal(
                 "metadata pending event batch key mismatch".to_string(),
             ));
@@ -772,7 +770,7 @@ pub(super) async fn load_pending_records(
     Ok(records)
 }
 
-pub(super) async fn metadata_graph_is_deleted(
+pub(super) async fn is_deleted(
     context: &DriverContext,
     graph_iri: &str,
 ) -> Result<bool, MetadataApiError> {
@@ -780,7 +778,7 @@ pub(super) async fn metadata_graph_is_deleted(
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_graph_lifecycle_key(graph_iri),
+            key: graph_lifecycle_key(graph_iri),
             txn_id: None,
         })
         .await
@@ -805,7 +803,7 @@ pub(super) async fn metadata_graph_is_deleted(
     }
 }
 
-pub(super) fn merge_pending_metadata_records(
+pub(super) fn merge_pending_records(
     records: &mut Vec<MetadataRegistryRecord>,
     pending_records: Vec<MetadataRegistryRecord>,
 ) {
@@ -830,11 +828,11 @@ pub(super) fn merge_pending_metadata_records(
     }
 }
 
-pub(crate) async fn load_record_by_document(
+pub(crate) async fn load_document_record(
     context: &DriverContext,
     document_id: Ulid,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
-    match load_metadata_record_by_document(context, document_id).await {
+    match load_document_record(context, document_id).await {
         Ok(Some(record)) => {
             filter_live_records(&context.storage_handle, std::slice::from_ref(&record))
                 .await?
@@ -857,7 +855,7 @@ pub(super) async fn load_record_txn(
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
     let event = context
         .storage_handle
-        .send_effect(read_registry_by_document_effect(document_id, Some(txn_id)))
+        .send_effect(read_document_registry(document_id, Some(txn_id)))
         .await;
     match parse_registry_read(event) {
         Ok(Some(record)) => {
@@ -893,7 +891,7 @@ async fn graph_deleted_txn(
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_graph_lifecycle_key(&record.graph_iri),
+            key: graph_lifecycle_key(&record.graph_iri),
             txn_id: Some(txn_id),
         })
         .await
@@ -918,7 +916,7 @@ async fn document_deleted_txn(
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_document_lifecycle_key(record.document_id),
+            key: document_lifecycle_key(record.document_id),
             txn_id: Some(txn_id),
         })
         .await
@@ -934,11 +932,11 @@ async fn document_deleted_txn(
     }
 }
 
-pub(super) async fn ensure_record_materialized_for_graph_read(
+pub(super) async fn ensure_record_materialized(
     context: &DriverContext,
     record: &MetadataRegistryRecord,
 ) -> Result<(), MetadataApiError> {
-    match is_metadata_record_materialized_for_graph_read(context, record).await {
+    match record_materialized_read(context, record).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(MetadataApiError::ServiceUnavailable),
         Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
@@ -993,9 +991,7 @@ pub(crate) async fn ensure_record_readable(
         };
         return result.map_err(|_| MetadataApiError::NotFound);
     }
-    // Read-by-id must not distinguish an unreadable record from an absent one:
-    // present-but-unreadable, including anonymous callers, maps to NotFound so
-    // existence cannot be probed (anonymous returns NotFound, never 401).
+    // Unreadable and absent records both return NotFound to prevent existence probing.
     let Some(auth) = auth.cloned() else {
         return Err(MetadataApiError::NotFound);
     };
@@ -1119,16 +1115,16 @@ pub(super) async fn ensure_permission(
     Ok(())
 }
 
-pub(super) fn metadata_record_matches_filters(
+pub(super) fn record_matches_filters(
     record: &MetadataRegistryRecord,
     path_prefix: Option<&str>,
 ) -> bool {
     path_prefix
-        .map(|path_prefix| metadata_path_matches_prefix(&record.document_path, path_prefix))
+        .map(|path_prefix| path_matches_prefix(&record.document_path, path_prefix))
         .unwrap_or(true)
 }
 
-fn metadata_path_matches_prefix(document_path: &str, path_prefix: &str) -> bool {
+fn path_matches_prefix(document_path: &str, path_prefix: &str) -> bool {
     let normalized_path = MetadataRegistryRecord::normalize_document_path(document_path);
     crate::placement::resolver::path_prefix_match(&normalized_path, path_prefix).is_some()
 }

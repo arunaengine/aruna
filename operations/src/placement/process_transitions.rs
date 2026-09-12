@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::document::shard_topic_id;
+use aruna_core::errors::StorageError;
 use aruna_core::structs::{
     Actor, PlacementRef, PlacementTransition, ProofClaim, RealmConfigDocument, RealmId,
     TransitionStatus,
@@ -19,8 +20,8 @@ use crate::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
 };
 use crate::realm::mutate_placement::{
-    MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
-    is_management,
+    CONFLICT_ATTEMPTS, MutateRealmPlacementConfig, MutateRealmPlacementError,
+    MutateRealmPlacementOperation, RealmPlacementMutation, drive_placement_mutation, is_management,
 };
 use crate::shard::verify::converge_with_barrier;
 use crate::shard::{assemble_shard_manifest, frontier_root};
@@ -42,9 +43,7 @@ pub async fn process_placement_transitions(
     let mut pending = ensure_strategy_activations(context, realm_id, local_node_id, config).await;
     pending |= ensure_expansions(context, realm_id, local_node_id, config).await;
     let mut departed = false;
-    // Steps are gathered and committed as one batch: per-bucket commits on a
-    // realm-scale transition would grind the config document through hundreds
-    // of serialized, conflict-prone transactions (one per bucket per node).
+    // Batch all steps to avoid one conflict-prone realm-config transaction per bucket and node.
     let mut steps: Vec<RealmPlacementMutation> = Vec::new();
     for transition in &config.placement_transitions {
         if transition_stale(config, transition) {
@@ -71,7 +70,7 @@ pub async fn process_placement_transitions(
                 departed |= departing;
                 // Past the bucket's grace, a departing holder owes a drain
                 // report before its retention may end (F7).
-                let grace_passed = aruna_core::util::unix_timestamp_millis()
+                let grace_passed = aruna_core::time::unix_timestamp_millis()
                     >= completion
                         .completed_at_ms
                         .saturating_add(transition.plan.limits.grace_ms);
@@ -140,11 +139,9 @@ pub async fn process_placement_transitions(
     if !steps.is_empty() {
         pending |= submit_steps(context, realm_id, local_node_id, steps).await;
     }
-    // Flush-then-leave (DECISIONS K3): a bucket this node just handed over
-    // leaves it a member only until the grace elapses, so whatever it accepted
-    // before the cutover has to reach the topic inside that window.
+    // Flush before grace ends so writes accepted before cutover reach the topic (DECISIONS K3).
     if departed {
-        crate::tasks::incoming::drive_document_sync_outbox_drain(context.clone()).await;
+        crate::tasks::incoming::drive_sync_drain(context.clone()).await;
     }
     pending
 }
@@ -348,11 +345,7 @@ async fn completion_step(
         .collect();
 
     let topic = shard_topic_id(realm_id, placement);
-    if !sources.is_empty()
-        && !net_handle
-            .document_sync_topic_exists(topic)
-            .unwrap_or(false)
-    {
+    if !sources.is_empty() && !net_handle.sync_topic_exists(topic).unwrap_or(false) {
         // Join-only: this adopts an existing genesis and can never mint one.
         let event = net_handle
             .sync_document_topics(vec![topic], sources.clone())
@@ -388,9 +381,7 @@ async fn completion_step(
             }
         }
     } else {
-        // The proof must cover every old holder's fenced writes, so the local
-        // cursor has to dominate the join of all reported frontiers even when
-        // some holders are unreachable for pulling (F5).
+        // Proofs dominate all reported fenced frontiers, including unreachable pull sources.
         match converge_with_barrier(
             context,
             &net_handle,
@@ -471,11 +462,29 @@ async fn submit_steps(
         user_id: UserId::nil(realm_id),
         realm_id,
     };
-    match drive(MutateRealmPlacementOperation::batch(actor, steps), context).await {
-        Ok(_) => false,
-        Err(error) => {
-            warn!(error = %error, "Placement transition steps did not apply");
-            true
+    let mut attempts = 0;
+    loop {
+        match drive(
+            MutateRealmPlacementOperation::batch(actor.clone(), steps.clone()),
+            context,
+        )
+        .await
+        {
+            Ok(_) => return false,
+            Err(MutateRealmPlacementError::StorageError(StorageError::TransactionConflict))
+                if attempts < CONFLICT_ATTEMPTS =>
+            {
+                tokio::time::sleep(crate::tasks::queue_backoff::conflict_backoff(
+                    attempts,
+                    local_node_id.as_bytes(),
+                ))
+                .await;
+                attempts += 1;
+            }
+            Err(error) => {
+                warn!(error = %error, "Placement transition steps did not apply");
+                return true;
+            }
         }
     }
 }
@@ -507,9 +516,7 @@ async fn ensure_expansions(
         }) {
             continue;
         }
-        // Successors only: the first expansion is onboarding's, so a record for
-        // the strategy must already exist. This stops a lagging node from
-        // double-issuing inside the publish-to-start window.
+        // Onboarding owns the first expansion; requiring its record prevents duplicate issuance.
         if !config
             .placement_transitions
             .iter()
@@ -547,7 +554,7 @@ async fn ensure_expansions(
                     ..Default::default()
                 },
                 created_by: local_node_id,
-                created_at_ms: aruna_core::util::unix_timestamp_millis(),
+                created_at_ms: aruna_core::time::unix_timestamp_millis(),
             },
         ) {
             Ok(plan) => {
@@ -586,9 +593,7 @@ async fn ensure_strategy_activations(
     if !publish_successor_map(context, realm_id, local_node_id, config, epoch).await {
         return pending;
     }
-    // The successor map is durable in the local config the moment it commits,
-    // so the activations it unblocks resolve in this pass. Deferring them to
-    // the retry interval leaves the node owing work after it reports quiet.
+    // Resolve activations in this pass because the committed successor map is already durable.
     if let Some(published) =
         crate::placement::process_placements::load_realm_config(context, realm_id).await
     {
@@ -710,7 +715,7 @@ async fn submit_mutation(
         },
         mutation,
     };
-    match drive(MutateRealmPlacementOperation::new(config), context).await {
+    match drive_placement_mutation(config, None, context).await {
         Ok(_) => false,
         Err(error) => {
             warn!(error = %error, "Placement transition step did not apply");
@@ -724,9 +729,7 @@ mod tests {
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
-    use aruna_core::reducer::{
-        AdminDocumentReducerState, overlay_realm_config_placement_reducer_materialization,
-    };
+    use aruna_core::reducer::{AdminDocumentReducerState, overlay_placement};
     use std::path::Path;
 
     use aruna_core::document::DocumentSyncTarget;
@@ -884,7 +887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_strategy_gets_map() {
+    async fn late_strategy_mapped() {
         // One pass publishes the successor map and activates from it: leaving
         // the activation to the retry interval strands the work for a restart.
         let directory = tempdir().unwrap();
@@ -1149,7 +1152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_fences_then_reports() {
+    async fn drain_fences_first() {
         // The close comes first, a predecessor-generation row blocks the
         // report, and a successor-generation row never does.
         let directory = tempdir().unwrap();
@@ -1235,7 +1238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dead_holder_stays_retained() {
+    async fn dead_holder_retained() {
         // Removing a dead holder from the realm must never stand in for its
         // drain report: the record keeps retaining it.
         let realm_id = RealmId::from_bytes([65; 32]);
@@ -1300,7 +1303,7 @@ mod tests {
         };
         let materialize = |state: &AdminDocumentReducerState| {
             let mut materialized = document.clone();
-            overlay_realm_config_placement_reducer_materialization(&mut materialized, state, 0);
+            overlay_placement(&mut materialized, state, 0);
             materialized
         };
 

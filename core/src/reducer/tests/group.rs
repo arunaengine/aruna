@@ -23,26 +23,26 @@ fn group_policies_materialize() {
 }
 
 #[test]
-fn group_created_materializes_display_name_realm_id_and_owner() {
+fn group_created_owner() {
     let mut state = group_state();
     let realm_id = realm_id();
-    let owner = user_id_with_seed(5);
+    let owner = user_id_seed(5);
 
     state
         .apply(&create_group(1, 1, "Engineering", realm_id))
         .unwrap();
 
     assert_eq!(
-        state.materialized_group_display_name().as_deref(),
+        state.materialized_group_name().as_deref(),
         Some("Engineering")
     );
-    assert_eq!(state.materialized_group_realm_id(), Some(realm_id));
+    assert_eq!(state.materialized_group_realm(), Some(realm_id));
     assert_eq!(state.materialized_group_owner(), Some(owner));
     assert!(state.conflicts.is_empty());
 }
 
 #[test]
-fn group_created_display_name_conflict_withholds_only_display_name() {
+fn group_created_name() {
     let mut state = group_state();
     let realm_id = realm_id();
 
@@ -53,8 +53,8 @@ fn group_created_display_name_conflict_withholds_only_display_name() {
         .apply(&create_group(2, 2, "Research", realm_id))
         .unwrap();
 
-    assert_eq!(state.materialized_group_display_name(), None);
-    assert_eq!(state.materialized_group_realm_id(), Some(realm_id));
+    assert_eq!(state.materialized_group_name(), None);
+    assert_eq!(state.materialized_group_realm(), Some(realm_id));
     assert!(!state.conflicts.contains_key(GROUP_REALM_ID_PATH));
 
     let conflict = state
@@ -84,10 +84,7 @@ fn rename_replaces_name() {
         .unwrap();
     state.apply(&rename_group(2, 1, 2, "Platform")).unwrap();
 
-    assert_eq!(
-        state.materialized_group_display_name().as_deref(),
-        Some("Platform")
-    );
+    assert_eq!(state.materialized_group_name().as_deref(), Some("Platform"));
     assert!(state.conflicts.is_empty());
 }
 
@@ -104,7 +101,7 @@ fn older_rename_stale() {
     state.apply(&first).unwrap();
 
     assert_eq!(
-        state.materialized_group_display_name().as_deref(),
+        state.materialized_group_name().as_deref(),
         Some("Infrastructure")
     );
 }
@@ -118,7 +115,7 @@ fn concurrent_renames_conflict() {
     state.apply(&rename_group(2, 2, 1, "Platform")).unwrap();
     state.apply(&rename_group(3, 3, 1, "Research")).unwrap();
 
-    assert_eq!(state.materialized_group_display_name(), None);
+    assert_eq!(state.materialized_group_name(), None);
     let conflict = state
         .conflicts
         .get(GROUP_DISPLAY_NAME_PATH)
@@ -127,10 +124,10 @@ fn concurrent_renames_conflict() {
 }
 
 #[test]
-fn group_created_realm_id_conflict_withholds_only_realm_id() {
+fn group_created_id() {
     let mut state = group_state();
-    let first_realm_id = realm_id_with_seed(9);
-    let second_realm_id = realm_id_with_seed(10);
+    let first_realm_id = realm_id_seed(9);
+    let second_realm_id = realm_id_seed(10);
     let first_realm_value = first_realm_id.to_string();
     let second_realm_value = second_realm_id.to_string();
 
@@ -142,10 +139,10 @@ fn group_created_realm_id_conflict_withholds_only_realm_id() {
         .unwrap();
 
     assert_eq!(
-        state.materialized_group_display_name().as_deref(),
+        state.materialized_group_name().as_deref(),
         Some("Engineering")
     );
-    assert_eq!(state.materialized_group_realm_id(), None);
+    assert_eq!(state.materialized_group_realm(), None);
     assert!(!state.conflicts.contains_key(GROUP_DISPLAY_NAME_PATH));
 
     let conflict = state
@@ -168,7 +165,7 @@ fn group_created_realm_id_conflict_withholds_only_realm_id() {
 }
 
 #[test]
-fn group_created_operation_is_rejected_for_non_group_target_without_state_change() {
+fn group_created_change() {
     let mut state = user_state();
     let before = state.clone();
     let event = event(
@@ -179,7 +176,7 @@ fn group_created_operation_is_rejected_for_non_group_target_without_state_change
         AdminDocumentOperation::GroupCreated {
             realm_id: realm_id(),
             display_name: "Engineering".to_string(),
-            owner: user_id_with_seed(5),
+            owner: user_id_seed(5),
         },
     );
 

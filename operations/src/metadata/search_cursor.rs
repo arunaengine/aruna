@@ -87,7 +87,7 @@ impl<P: Serialize> SignedCursor<P> {
 }
 
 impl<P: Serialize + DeserializeOwned> SignedCursor<P> {
-    pub(crate) fn decode_envelope<F>(
+    pub(crate) fn decode_verified<F>(
         raw: &str,
         context: &[u8],
         authorized_signers: &[NodeId],
@@ -150,7 +150,7 @@ pub(crate) struct SearchCursorPayload {
     pub(crate) resume: Vec<([u8; 32], u32)>,
 }
 
-pub type SearchCursor = SignedCursor<SearchCursorPayload>;
+pub(crate) type SearchCursor = SignedCursor<SearchCursorPayload>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SearchCursorError {
@@ -198,7 +198,7 @@ impl SignedCursor<SearchCursorPayload> {
     }
 
     pub fn decode(raw: &str, authorized_signers: &[NodeId]) -> Result<Self, SearchCursorError> {
-        Self::decode_envelope(
+        Self::decode_verified(
             raw,
             SEARCH_CURSOR_SIGNATURE_CONTEXT,
             authorized_signers,
@@ -341,9 +341,8 @@ pub fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit>
     hits
 }
 
-// Must mirror craqle's limit_search_hits ordering (quantized score, then IRIs)
-// or watermarks can permanently skip hits at fetch boundaries. Accepted gap:
-// BM25 ties truncated inside Tantivy's per-graph top-k may resurface later.
+// Must mirror craqle's quantized-score ordering or watermarks can skip hits
+// at fetch boundaries; truncated BM25 ties may resurface later.
 fn score_key(score: f32) -> i64 {
     (score as f64 * 1_000_000.0) as i64
 }
@@ -398,9 +397,8 @@ pub fn paginate(
                 let resume: Vec<(NodeId, u32)> = node_results
                     .iter()
                     .map(|node| {
-                        // Count hits at or above the watermark, plus a saturated
-                        // node's below-watermark duplicates that will not re-emit,
-                        // so a duplicate-only prefix advances instead of stalling.
+                        // Count hits at or above the watermark plus saturated below-watermark
+                        // duplicates that will not re-emit, so a duplicate-only prefix advances.
                         let position = node
                             .hits
                             .iter()
@@ -515,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_roundtrips_with_node_keys_and_exact_scores() {
+    fn cursor_roundtrips() {
         let signer = node_id(9);
         let cursor = signed_cursor(
             [7u8; 32],
@@ -536,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_decode_rejects_garbage_and_wrong_version() {
+    fn decode_rejects_garbage() {
         assert_eq!(
             SearchCursor::decode("not*base64", &[node_id(1)]),
             Err(SearchCursorError::Invalid)
@@ -564,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_decode_rejects_tampering_and_untrusted_signers() {
+    fn decode_rejects_tampering() {
         let signer = node_id(1);
         let cursor = signed_cursor(
             [0u8; 32],
@@ -591,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_decode_caps_resume_entries() {
+    fn decode_caps_resume() {
         let watermark = || SearchWatermark {
             score: 1.0,
             graph_iri: "g".to_string(),
@@ -658,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_binds_query_graphs_and_mode() {
+    fn fingerprint_binds_query() {
         let base = query_fingerprint(
             "alpha",
             None,
@@ -740,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_keeps_max_score_and_enriched_snippet() {
+    fn merge_keeps_snippet() {
         let mut bare = hit("01A", "./file.txt", 0.5);
         bare.snippet = None;
         let mut enriched = hit("01A", "./file.txt", 0.8);
@@ -762,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_keeps_subject_types() {
+    fn merge_keeps_types() {
         // Only the node that described the subject knows its rdf:type IRIs.
         let types = vec!["http://schema.org/MediaObject".to_string()];
         let bare = hit("01A", "./file.txt", 0.9);
@@ -784,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_orders_by_score_then_keys() {
+    fn merge_orders_keys() {
         let merged = merge_search_hits(vec![
             hit("01B", "./file-b.txt", 0.7),
             hit("01A", "./file-b.txt", 0.7),
@@ -807,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_retains_deterministic_copy_on_quantized_ties() {
+    fn merge_quantized_ties() {
         let make = |document_id: &str, score: f32, title: &str| {
             let mut copy = hit("01A", "./file.txt", score);
             copy.document_id = document_id.to_string();
@@ -828,10 +826,9 @@ mod tests {
     }
 
     #[test]
-    fn paginate_does_not_skip_hits_within_a_score_quantization_bucket() {
-        // Raw f32 order (b above a) opposes the IRI tie-break inside one 1e-6
-        // score bucket; the coordinator must follow craqle's quantized ordering
-        // or page one's watermark would silently drop b forever.
+    fn paginate_keeps_bucket() {
+        // Raw f32 order opposes the IRI tie-break inside one 1e-6 score bucket;
+        // the coordinator must follow craqle's quantized ordering or page one drops b.
         let a = hit("01A", "./a", 0.100_000_1);
         let b = hit("01B", "./b", 0.100_000_4);
         assert_eq!(score_key(a.score), score_key(b.score));
@@ -872,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn paginate_first_page_sets_watermark_and_resume() {
+    fn paginate_first_page() {
         let node = NodeSearchResult {
             node_id: node_id(1),
             hits: vec![
@@ -893,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn paginate_second_page_drops_already_emitted_and_terminates() {
+    fn paginate_second_page() {
         let hits = vec![
             hit("01A", "./a", 0.9),
             hit("01B", "./b", 0.8),
@@ -921,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn paginate_dedups_hit_present_on_two_nodes() {
+    fn paginate_dedups_hits() {
         let left = NodeSearchResult {
             node_id: node_id(1),
             hits: vec![hit("01A", "./shared", 0.9), hit("01B", "./l", 0.6)],
@@ -943,15 +940,14 @@ mod tests {
         assert_eq!(page.hits[0].score, 0.9);
         let next = page.next.unwrap();
         let resume: HashMap<_, _> = next.resume.into_iter().collect();
-        // Resume counts each node's raw hits at or above the watermark by their
-        // local score. Node 1 owns the winning 0.9 copy, so it resumes past it;
-        // node 2's 0.5 copy sorts below the merged 0.9 watermark and counts zero.
+        // Resume counts each node's raw hits at or above the watermark by local
+        // score: node 1 owns the 0.9 copy, node 2's 0.5 sorts below and counts zero.
         assert_eq!(resume.get(&node_id(1)), Some(&1));
         assert_eq!(resume.get(&node_id(2)), Some(&0));
     }
 
     #[test]
-    fn paginate_continues_when_a_node_is_saturated_without_new_hits() {
+    fn paginate_saturated_node() {
         let watermark = SearchWatermark {
             score: 0.9,
             graph_iri: "https://w3id.org/aruna/01A".to_string(),
@@ -1024,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn paginate_churn_does_not_re_emit_or_duplicate() {
+    fn paginate_churn() {
         let watermark = SearchWatermark {
             score: 0.8,
             graph_iri: "https://w3id.org/aruna/01B".to_string(),
@@ -1052,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn paginate_stops_at_depth_cap() {
+    fn paginate_stops_depth() {
         let node = NodeSearchResult {
             node_id: node_id(1),
             hits: vec![hit("01A", "./a", 0.9), hit("01B", "./b", 0.8)],
@@ -1067,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_fetch_limit_defaults_unknown_nodes_to_deepest() {
+    fn resume_defaults_deepest() {
         let mut resume = HashMap::new();
         resume.insert(node_id(1), 4);
         resume.insert(node_id(2), 7);

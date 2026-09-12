@@ -1,11 +1,6 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 //! Driven two-node remote (Bao read) RO-Crate export integration.
-//!
-//! The exporter node holds only the metadata document; the payload version lives
-//! solely on a remote holder. `run_export_job` must resolve the File entity to
-//! the holder, fetch the bytes over the real net stack, and stream them into the
-//! artifact without ever registering the fetched blob locally.
 
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
@@ -29,8 +24,8 @@ use aruna_core::structs::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode,
     RoCrateLimits, VersionKey, VersionedObjectArn,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, UserId};
-use aruna_core::util::unix_timestamp_millis;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
@@ -45,8 +40,8 @@ use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
-use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::metadata::materialization_queue::process_materialization_batch;
+use aruna_operations::metadata::projector::replay_event_log;
 use aruna_operations::sync::incoming::initialize_net_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -57,7 +52,7 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use aruna_core::StructuredId;
-use aruna_core::identifiers::{BucketId, PlacementHandle};
+use aruna_core::structured_id::{BucketId, PlacementHandle};
 
 const BUCKET: &str = "remote";
 const KEY: &str = "payload";
@@ -244,7 +239,7 @@ async fn setup_remote(
     };
     let document_id = mint_local_document(&config, &exporter_actor, group_id, DOC_PATH)?.as_ulid();
     let arn = VersionedObjectArn::new(realm_id, holder.net.node_id(), BUCKET, KEY, version_id)?;
-    let jsonld = remote_crate_json(&arn.to_w3id(), &content_hash_w3id(hash));
+    let jsonld = remote_crate_json(&arn.to_w3id(), &content_hash_iri(hash));
     create_document(&exporter, owner, group_id, realm_id, document_id, jsonld).await?;
     Ok((holder, exporter, document_id))
 }
@@ -361,8 +356,8 @@ async fn seed_holder(
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.ensure_node(node.net.node_id(), RealmNodeKind::Server);
     config.ensure_node(peer, RealmNodeKind::Server);
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
     let bucket = BucketInfo {
         group_id,
         created_at: SystemTime::UNIX_EPOCH,
@@ -458,8 +453,8 @@ async fn seed_exporter(
     config.seed_job_control(node.net.node_id(), 0);
     config.ensure_node(peer, RealmNodeKind::Server);
     config.seed_job_control(peer, 1);
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
     let writes = vec![
         (
             REALM_CONFIG_KEYSPACE.to_string(),
@@ -539,8 +534,8 @@ async fn create_document(
         node.context.as_ref(),
     )
     .await?;
-    replay_metadata_event_log(node.context.as_ref()).await?;
-    process_metadata_materialization_batch(node.context.as_ref()).await?;
+    replay_event_log(node.context.as_ref()).await?;
+    process_materialization_batch(node.context.as_ref()).await?;
     Ok(())
 }
 
@@ -625,7 +620,7 @@ fn remote_crate_json(arn_w3id: &str, hash_w3id: &str) -> String {
     .to_string()
 }
 
-fn content_hash_w3id(hash: [u8; 32]) -> String {
+fn content_hash_iri(hash: [u8; 32]) -> String {
     format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash))
 }
 

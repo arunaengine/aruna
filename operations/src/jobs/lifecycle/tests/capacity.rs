@@ -334,9 +334,8 @@ fn declines_after_failure() {
 
 #[test]
 fn accepts_copy_pin() {
-    // A registered copy on any node may be the pinned source, but the captured
-    // version, hash and size still bind the bytes, and a pin naming this target
-    // itself is never a remote read.
+    // Any node's registered copy may be the pinned source, but captured version,
+    // hash and size bind the bytes; a pin naming this target is never remote.
     let family = Family::new([3u8; 32]);
     let ingress = family.holder.public();
     let local = family.target.public();

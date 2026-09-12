@@ -8,8 +8,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::connectors::repository::{
-    StorageReadError, parse_connector_read, parse_connector_secret_read, read_connector_effect,
-    read_connector_secret_effect,
+    StorageReadError, parse_connector_read, parse_secret_read, read_connector_effect,
+    read_secret_effect,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,7 +94,7 @@ impl GetSourceConnectorOperation {
             Ok(Some(connector)) => {
                 self.connector = Some(connector);
                 self.state = GetSourceConnectorState::ReadSecret;
-                smallvec![read_connector_secret_effect(self.input.connector_id, None)]
+                smallvec![read_secret_effect(self.input.connector_id, None)]
             }
             Ok(None) => self.emit_error(GetSourceConnectorError::NotFound),
             Err(error) => self.emit_error(error.into()),
@@ -102,7 +102,7 @@ impl GetSourceConnectorOperation {
     }
 
     fn handle_secret_read(&mut self, event: Event) -> Effects {
-        match parse_connector_secret_read(event) {
+        match parse_secret_read(event) {
             Ok(secret) => {
                 self.has_secret_config = secret.is_some();
                 let Some(connector) = self.connector.clone() else {

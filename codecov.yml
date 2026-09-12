@@ -2,6 +2,7 @@ coverage:
   status:
     project:
       default:
+        # Compare the same compiled src-file set to the merge base; inline tests remain counted.
         target: auto
         threshold: 0.8%
     patch:

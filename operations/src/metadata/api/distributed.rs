@@ -77,7 +77,7 @@ pub(super) fn record_query_result(
     }
 }
 
-pub(super) fn record_search_node_result(
+pub(super) fn record_search_node(
     span: &Span,
     result: &Result<(Vec<MetadataSearchHit>, usize), MetadataReadError>,
 ) {
@@ -92,7 +92,7 @@ pub(super) fn record_search_node_result(
     }
 }
 
-pub(super) fn record_preflight_node_result(
+pub(super) fn record_preflight_node(
     span: &Span,
     result: &Result<MetadataReferencePreflightNodeExecution, MetadataReadError>,
 ) {
@@ -139,7 +139,7 @@ pub(super) async fn run_query_distributed(
     let single_dataset_result = mode == MetadataApiQueryMode::Local || graph_iris.is_some();
     if mode == MetadataApiQueryMode::Distributed
         && graph_iris.is_none()
-        && !distributed_query_is_union_safe(&query)
+        && !query_union_safe(&query)
     {
         return Err(MetadataApiError::BadRequest);
     }
@@ -154,9 +154,8 @@ pub(super) async fn run_query_distributed(
     };
     let remote_auth_token = fanout_bearer(bearer_token.as_deref());
 
-    // Remote partitions authorize on the forwarded credential, so entries are
-    // partitioned by credential digest. The local invalidation signals only
-    // cover the local partition; the TTL bounds remote staleness.
+    // Remote partitions authorize on the forwarded credential, so entries are partitioned
+    // by credential digest.
     let cache_stamp = handle.query_cache().stamp(handle.visibility_generation());
     let cache_key =
         crate::metadata::query_cache::credential_digest(auth.as_ref(), bearer_token.as_deref())
@@ -210,7 +209,7 @@ pub(super) async fn run_query_distributed(
         ),
         |(handle, auth_token, graph_iris, query), node_id| async move {
             handle
-                .request_remote_query_graphs(node_id, auth_token, graph_iris, query)
+                .query_remote_graphs(node_id, auth_token, graph_iris, query)
                 .await
         },
     );
@@ -335,7 +334,7 @@ pub(super) async fn run_search_distributed(
                     {
                         hits.extend(
                             handle
-                                .search_authorized_local_filtered(
+                                .search_local_filtered(
                                     auth.clone(),
                                     graph_iris.clone(),
                                     query.clone(),
@@ -385,7 +384,7 @@ pub(super) async fn run_search_distributed(
                     {
                         hits.extend(
                             handle
-                                .request_remote_filtered_search_graphs(
+                                .search_remote_filtered(
                                     node_id,
                                     auth_token.clone(),
                                     graph_iris.clone(),
@@ -402,7 +401,7 @@ pub(super) async fn run_search_distributed(
                 }
                 None => {
                     handle
-                        .request_remote_search_graphs(
+                        .search_remote_graphs(
                             node_id, auth_token, graph_iris, query, limit, group_id,
                         )
                         .await?
@@ -419,7 +418,7 @@ pub(super) async fn run_search_distributed(
         MetadataFanoutOperation::Search,
         local_call,
         remote_call,
-        record_search_node_result,
+        record_search_node,
         map_read_error,
     )
     .await?;

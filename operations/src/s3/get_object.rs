@@ -1,19 +1,21 @@
-use crate::blob::blob_holders::GetBlobHoldersOperation;
-use crate::blob::blob_storage::blob_location_read;
+use crate::blob::holders::GetBlobHoldersOperation;
+use crate::blob::records::blob_location_read;
 use crate::blob::managed_copy::ManagedCopyError;
 use crate::connectors::{
-    ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
+    ResolveVersionSourceBindingInput, resolve_binding_effect,
 };
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget, ReferenceAdvance};
+use crate::replication::protocol::{
+    BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReferenceAdvance,
+};
 use crate::replication::queue::{
     LiveReplicationObligationRecord, QueueLiveVersionReplicationInput,
     QueueLiveVersionReplicationOperation, live_obligation_entry,
 };
 use crate::s3::object_lookup::{
-    CopyNodeId, LookupError, location_from_read, managed_copy_check, managed_copy_read,
+    ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read, summary_from_read,
 };
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
@@ -21,14 +23,18 @@ use aruna_core::errors::{
     ConversionError, SourceConnectorResolutionError, StagingSourceError, StorageError,
 };
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType,
-    PathRestriction, PlacementPolicyError, PlacementPolicyRef, ResolvedSourceAccess,
-    SourceMetadata, UsageDelta, VersionKey, VersionSourceBinding,
+    MultipartObjectMetadataKey, MultipartObjectSummary, PathRestriction, PlacementPolicyError,
+    PlacementPolicyRef, ResolvedSourceAccess, SourceMetadata, UsageDelta, VersionKey,
+    VersionSourceBinding,
 };
 use aruna_core::types::Effects;
 use aruna_core::{NodeId, UserId};
@@ -129,7 +135,19 @@ pub enum GetObjectError {
         blake3: [u8; 32],
         version_id: Option<Ulid>,
         metadata: HashMap<String, String>,
+        version_created_at: Option<SystemTime>,
+        source_policies: Vec<PlacementPolicyRef>,
     },
+    /// No holder served the bytes and at least one answered with an
+    /// infrastructure failure, so this is a fault, never object absence.
+    #[error("The object bytes are unavailable from every holder.")]
+    HoldersUnavailable,
+    /// At least one holder returned bytes that failed integrity verification.
+    #[error("Object bytes from a holder failed integrity verification.")]
+    HolderIntegrityFailure,
+    /// A holder refused this caller access to the object.
+    #[error("Access to the object was denied by its holder.")]
+    HolderAccessDenied,
     /// Policy-covered content the holders will not serve to a device, which is
     /// never a legal destination for governed data. Terminal: the S3 answer is
     /// an honest 403, not a fault a retry could clear.
@@ -200,20 +218,31 @@ pub struct GetObjectInput {
     pub node_id: NodeId,
 }
 
+/// Authoritative whole-object facts of one read, carried independently of any
+/// physical location. `size` is the whole-object size; a ranged read reports its
+/// response length in `GetObjectResult::resolved_range` instead.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectInfo {
+    pub size: u64,
+    pub version_created_at: Option<SystemTime>,
+    pub etag: Option<String>,
+    pub checksum_type: MultipartChecksumType,
+    pub hashes: HashMap<String, Vec<u8>>,
+    pub composite_hashes: HashMap<String, Vec<u8>>,
+    pub part_count: Option<usize>,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct GetObjectResult {
     pub blob: BackendStream<Result<Bytes, StreamError>>,
     pub location: Option<BackendLocation>,
     pub metadata: HashMap<String, String>,
+    pub info: ObjectInfo,
     pub source_metadata: Option<SourceMetadata>,
     pub source_binding: Option<VersionSourceBinding>,
     pub last_refresh: Option<SystemTime>,
-    pub version_created_at: Option<SystemTime>,
     pub version_id: Option<Ulid>,
     pub resolved_version_id: Option<Ulid>,
-    pub checksum_type: MultipartChecksumType,
-    pub composite_hashes: HashMap<String, Vec<u8>>,
-    pub part_count: Option<usize>,
     pub resolved_range: Option<ResolvedObjectRange>,
     /// Refs stored on the version that was read. A copy unions them with its
     /// destination default, so a copy is never less constrained than its source.
@@ -434,7 +463,7 @@ impl GetObjectOperation {
         self.read_version(version_id, version, self.input.version_id.is_some())
     }
 
-    fn handle_received_current_version(&mut self, event: Event) -> Effects {
+    fn current_version_received(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -502,9 +531,8 @@ impl GetObjectOperation {
                 last_refresh,
                 ..
             } => {
-                // The access-driven successor-on-drift core (#256) lands on this
-                // path. Deferred as enhancements: verified cache + singleflight
-                // (#375), general one-hop origin relay (#380), sync poller (#314).
+                // Access-driven successor-on-drift (#256); verified cache,
+                // origin relay and sync polling stay deferred (#375/#380/#314).
                 self.source_binding = Some(source.clone());
                 self.reference_cached = Some(cached_metadata);
                 self.reference_last_refresh = Some(last_refresh);
@@ -517,7 +545,7 @@ impl GetObjectOperation {
                 self.last_refresh = None;
                 self.version_created_at = None;
                 self.state = GetObjectState::ResolveReferenceAccess;
-                smallvec![resolve_version_source_binding_suboperation(
+                smallvec![resolve_binding_effect(
                     ResolveVersionSourceBindingInput { source },
                 )]
             }
@@ -538,7 +566,7 @@ impl GetObjectOperation {
         blob_hash: [u8; 32],
         backend: BackendRef,
     ) -> Effects {
-        let check = match managed_copy_check(
+        let check = match begin_copy_check(
             &self.input.bucket,
             &self.input.key,
             version_id,
@@ -556,12 +584,12 @@ impl GetObjectOperation {
     }
 
     fn handle_managed_copy(&mut self, event: Event) -> Effects {
-        let key = match managed_copy_read(
+        let key = match finish_copy_check(
             event,
             &mut self.pending_copy,
             &mut self.pending_location,
             &self.source_policies,
-            CopyNodeId::Given(self.input.node_id),
+            ExpectedNode::Exact(self.input.node_id),
         ) {
             Ok(key) => key,
             Err(err) => {
@@ -572,7 +600,7 @@ impl GetObjectOperation {
         self.read_blob_location(key)
     }
 
-    fn handle_blob_location_read(&mut self, event: Event) -> Effects {
+    fn location_read(&mut self, event: Event) -> Effects {
         let location = match location_from_read(event) {
             Ok(Some(location)) => location,
             Ok(None) => {
@@ -581,6 +609,8 @@ impl GetObjectOperation {
                         blake3,
                         version_id: self.resolved_version_id,
                         metadata: self.metadata.clone(),
+                        version_created_at: self.version_created_at,
+                        source_policies: self.source_policies.clone(),
                     }),
                     None => self.emit_error(GetObjectError::GetObjectFailed),
                 };
@@ -594,13 +624,13 @@ impl GetObjectOperation {
         self.read_multipart_summary(location, self.resolved_version_id)
     }
 
-    fn handle_resolved_reference_access(&mut self, event: Event) -> Effects {
+    fn reference_access_resolved(&mut self, event: Event) -> Effects {
         match event {
             Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
                 result: Ok(access),
             }) => {
                 self.reference_access = Some(access);
-                self.commit_and_read_reference()
+                self.read_reference()
             }
             Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
                 result: Err(error),
@@ -626,7 +656,7 @@ impl GetObjectOperation {
         self.resolved_version_id = resolved_version_id;
 
         let Some(version_id) = resolved_version_id else {
-            return self.commit_and_read_blob();
+            return self.read_blob();
         };
 
         let effect = match multipart_summary_read(version_id, Some(txn_id)) {
@@ -638,7 +668,7 @@ impl GetObjectOperation {
         smallvec![effect]
     }
 
-    pub fn handle_multipart_summary_read(&mut self, event: Event) -> Effects {
+    pub fn summary_read(&mut self, event: Event) -> Effects {
         let summary = match summary_from_read(event) {
             Ok(summary) => summary,
             Err(err) => {
@@ -653,10 +683,10 @@ impl GetObjectOperation {
             self.part_count = Some(summary.part_count);
         }
 
-        self.commit_and_read_blob()
+        self.read_blob()
     }
 
-    fn commit_and_read_blob(&mut self) -> Effects {
+    fn read_blob(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(GetObjectError::NoTransactionFound);
         };
@@ -688,7 +718,7 @@ impl GetObjectOperation {
         ]
     }
 
-    fn commit_and_read_reference(&mut self) -> Effects {
+    fn read_reference(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(GetObjectError::NoTransactionFound);
         };
@@ -720,7 +750,7 @@ impl GetObjectOperation {
         }
     }
 
-    pub fn handle_reference_source_head(&mut self, event: Event) -> Effects {
+    pub fn reference_head_received(&mut self, event: Event) -> Effects {
         match event {
             Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
                 let baseline = self
@@ -730,9 +760,8 @@ impl GetObjectOperation {
                 let drifted = baseline != Some(metadata.observation_fingerprint());
 
                 if drifted {
-                    // A pinned historical version whose live observation drifted
-                    // cannot serve current bytes: its bytes were never cached
-                    // (#375 deferred).
+                    // A pinned historical version cannot serve drifted bytes:
+                    // its bytes were never cached (#375 deferred).
                     if self.reference_explicit {
                         return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
                     }
@@ -1136,9 +1165,40 @@ impl GetObjectOperation {
         })]
     }
 
+    /// Authoritative facts of the object this read serves. A local location
+    /// supplies size and MD5; a reference source supplies its observed size and
+    /// ETag. Neither is invented when absent.
+    fn object_info(
+        &self,
+        location: Option<&BackendLocation>,
+        source: Option<&SourceMetadata>,
+    ) -> Option<ObjectInfo> {
+        Some(ObjectInfo {
+            size: location
+                .map(|location| location.blob_size)
+                .or_else(|| source.map(|metadata| metadata.content_length))?,
+            version_created_at: self
+                .version_created_at
+                .or_else(|| source.and_then(|metadata| metadata.last_modified)),
+            etag: location
+                .and_then(|location| location.hashes.get(HASH_MD5))
+                .map(hex::encode)
+                .or_else(|| source.and_then(|metadata| metadata.etag.clone())),
+            checksum_type: self.checksum_type,
+            hashes: location
+                .map(|location| location.hashes.clone())
+                .unwrap_or_default(),
+            composite_hashes: self.composite_hashes.clone(),
+            part_count: self.part_count,
+        })
+    }
+
     pub fn handle_received_blob(&mut self, event: Event) -> Effects {
         if let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = event {
             let Some(location) = self.location.clone() else {
+                return self.emit_error(GetObjectError::GetObjectFailed);
+            };
+            let Some(info) = self.object_info(Some(&location), None) else {
                 return self.emit_error(GetObjectError::GetObjectFailed);
             };
             self.state = GetObjectState::Finish;
@@ -1146,15 +1206,12 @@ impl GetObjectOperation {
                 blob,
                 location: Some(location),
                 metadata: self.metadata.clone(),
+                info,
                 source_metadata: None,
                 source_binding: self.source_binding.clone(),
                 last_refresh: None,
-                version_created_at: self.version_created_at,
                 version_id: self.resolved_version_id.or(self.input.version_id),
                 resolved_version_id: self.resolved_version_id,
-                checksum_type: self.checksum_type,
-                composite_hashes: self.composite_hashes.clone(),
-                part_count: self.part_count,
                 resolved_range: self.resolved_range.clone(),
                 source_policies: self.source_policies.clone(),
             }));
@@ -1168,7 +1225,7 @@ impl GetObjectOperation {
         }
     }
 
-    pub fn handle_received_reference_source(&mut self, event: Event) -> Effects {
+    pub fn reference_source_received(&mut self, event: Event) -> Effects {
         match event {
             Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
                 let Some(head_metadata) = self.source_metadata.as_ref() else {
@@ -1204,21 +1261,21 @@ impl GetObjectOperation {
         let Some(source_metadata) = self.source_metadata.clone() else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
+        let Some(info) = self.object_info(None, Some(&source_metadata)) else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
 
         self.state = GetObjectState::Finish;
         self.output = Some(Ok(GetObjectResult {
             blob,
             location: None,
             metadata: self.metadata.clone(),
+            info,
             source_metadata: Some(source_metadata),
             source_binding: self.source_binding.clone(),
             last_refresh: self.last_refresh,
-            version_created_at: self.version_created_at,
             version_id: self.resolved_version_id.or(self.input.version_id),
             resolved_version_id: self.resolved_version_id,
-            checksum_type: self.checksum_type,
-            composite_hashes: self.composite_hashes.clone(),
-            part_count: self.part_count,
             resolved_range: self.resolved_range.clone(),
             source_policies: self.source_policies.clone(),
         }));
@@ -1240,12 +1297,12 @@ impl Operation for GetObjectOperation {
             GetObjectState::StartTransaction => self.handle_transaction_started(event),
             GetObjectState::GetVersion => self.handle_received_version(event),
             GetObjectState::CheckManagedCopy => self.handle_managed_copy(event),
-            GetObjectState::GetBlobLocation => self.handle_blob_location_read(event),
-            GetObjectState::GetCurrentVersion => self.handle_received_current_version(event),
-            GetObjectState::ResolveReferenceAccess => self.handle_resolved_reference_access(event),
-            GetObjectState::ReadMultipartSummary => self.handle_multipart_summary_read(event),
+            GetObjectState::GetBlobLocation => self.location_read(event),
+            GetObjectState::GetCurrentVersion => self.current_version_received(event),
+            GetObjectState::ResolveReferenceAccess => self.reference_access_resolved(event),
+            GetObjectState::ReadMultipartSummary => self.summary_read(event),
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
-            GetObjectState::HeadReferenceSource => self.handle_reference_source_head(event),
+            GetObjectState::HeadReferenceSource => self.reference_head_received(event),
             GetObjectState::StartAdvanceTransaction => self.handle_advance_started(event),
             GetObjectState::ReadHeadForAdvance => self.handle_advance_head(event),
             GetObjectState::ReadCurrentForAdvance => self.handle_advance_version(event),
@@ -1255,7 +1312,7 @@ impl Operation for GetObjectOperation {
             GetObjectState::QueueSuccessorReplication => self.handle_successor_queued(event),
             GetObjectState::RestartReference => self.handle_restart_reference(event),
             GetObjectState::GetBlob => self.handle_received_blob(event),
-            GetObjectState::ReadReferenceSource => self.handle_received_reference_source(event),
+            GetObjectState::ReadReferenceSource => self.reference_source_received(event),
             GetObjectState::Finish => smallvec![],
             GetObjectState::Error => self.abort(),
         }
@@ -1298,6 +1355,8 @@ pub async fn get_object_routed(
         blake3,
         version_id,
         metadata,
+        version_created_at,
+        source_policies,
     }) = result
     else {
         return result;
@@ -1305,82 +1364,311 @@ pub async fn get_object_routed(
     if ranged || !local_is_user(context, user_id.realm_id).await {
         return Ok(Some(Err(GetObjectError::GetObjectFailed)));
     }
-    Ok(Some(
-        routed_blob(context, user_id, blake3, version_id, metadata, restrictions).await,
-    ))
+    let read = RoutedRead {
+        user_id,
+        blake3,
+        version_id,
+        metadata,
+        version_created_at,
+        source_policies,
+        restrictions,
+    };
+    Ok(Some(routed_blob(context, read).await))
 }
 
-async fn routed_blob(
+/// Resolves complete object facts without transferring holder bytes.
+pub async fn get_object_info(
     context: &DriverContext,
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+) -> Result<ObjectInfo, GetObjectError> {
+    if input.range.is_some() {
+        return Err(GetObjectError::InvalidRange);
+    }
+    let user_id = input.user_identity;
+    let operation = GetObjectOperation::new(input).with_restrictions(restrictions.clone());
+    match drive(operation, context).await? {
+        Some(Ok(result)) => Ok(result.info),
+        Some(Err(GetObjectError::BlobNotLocal {
+            blake3,
+            version_id,
+            metadata,
+            version_created_at,
+            source_policies,
+        })) if local_is_user(context, user_id.realm_id).await => {
+            let read = RoutedRead {
+                user_id,
+                blake3,
+                version_id,
+                metadata,
+                version_created_at,
+                source_policies,
+                restrictions,
+            };
+            routed_metadata(context, read).await
+        }
+        Some(Err(error)) => Err(error),
+        None => Err(GetObjectError::GetObjectFailed),
+    }
+}
+
+/// One holder-backed read: the local version facts plus the caller's scoped
+/// credential, so the routed result is never less constrained than the record.
+struct RoutedRead {
     user_id: UserId,
     blake3: [u8; 32],
     version_id: Option<Ulid>,
     metadata: HashMap<String, String>,
-    path_restrictions: Option<Vec<PathRestriction>>,
+    version_created_at: Option<SystemTime>,
+    source_policies: Vec<PlacementPolicyRef>,
+    restrictions: Option<Vec<PathRestriction>>,
+}
+
+/// How the consulted holders failed, folded so the final answer keeps the most
+/// informative cause. A read where no holder served is absence only when every
+/// holder confirmed absence.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct HolderFailures {
+    /// Whether at least one holder answered at all, so zero holders stay
+    /// distinguishable from every holder confirming absence.
+    contacted: bool,
+    governed: bool,
+    denied: bool,
+    integrity: bool,
+    unavailable: bool,
+    metadata_only: bool,
+}
+
+impl HolderFailures {
+    fn record(&mut self, error: BaoReadError) {
+        self.contacted = true;
+        match error {
+            BaoReadError::Refused(BaoReadRefusal::NotFound) => {}
+            BaoReadError::Refused(BaoReadRefusal::ReadDenied) => self.denied = true,
+            BaoReadError::Refused(BaoReadRefusal::HashMismatch) => self.integrity = true,
+            BaoReadError::Refused(
+                BaoReadRefusal::BackendFailure
+                | BaoReadRefusal::RealmPeerDenied
+                | BaoReadRefusal::InvalidTarget,
+            ) => self.unavailable = true,
+            BaoReadError::GovernedUnavailable
+            | BaoReadError::PolicyRequired { .. }
+            | BaoReadError::PolicyDenied { .. }
+            | BaoReadError::Gate(_)
+            | BaoReadError::NoDestination => self.governed = true,
+            BaoReadError::Blob(_)
+            | BaoReadError::Conversion(_)
+            | BaoReadError::Unexpected { .. }
+            | BaoReadError::NotFinished
+            | BaoReadError::ManagedCopy(_) => self.unavailable = true,
+        }
+    }
+
+    fn into_error(self) -> GetObjectError {
+        if self.governed {
+            GetObjectError::GovernedUnavailable
+        } else if self.integrity {
+            GetObjectError::HolderIntegrityFailure
+        } else if self.denied {
+            GetObjectError::HolderAccessDenied
+        } else if self.unavailable || self.metadata_only || !self.contacted {
+            GetObjectError::HoldersUnavailable
+        } else {
+            GetObjectError::NoSuchKey
+        }
+    }
+
+    fn consider(
+        &mut self,
+        result: Result<BaoReadOutput, BaoReadError>,
+    ) -> Option<BaoReadOutput> {
+        match result {
+            Ok(output @ BaoReadOutput::Stream { .. }) => Some(output),
+            Ok(BaoReadOutput::Metadata { .. }) => {
+                self.contacted = true;
+                self.metadata_only = true;
+                None
+            }
+            Err(error) => {
+                self.record(error);
+                None
+            }
+        }
+    }
+}
+
+async fn routed_blob(
+    context: &DriverContext,
+    read: RoutedRead,
 ) -> Result<GetObjectResult, GetObjectError> {
     let net_handle = context
         .net_handle
         .as_ref()
         .ok_or(GetObjectError::GetObjectFailed)?;
-    let realm_id = user_id.realm_id;
+    let realm_id = read.user_id.realm_id;
     let holders = drive(
-        GetBlobHoldersOperation::new(blake3, realm_id, net_handle.node_id()),
+        GetBlobHoldersOperation::new(read.blake3, realm_id, net_handle.node_id()),
         context,
     )
     .await
     .map_err(|_| GetObjectError::GetObjectFailed)?;
+    let summary = local_multipart_summary(context, read.version_id).await?;
 
-    let mut governed = false;
+    let mut failures = HolderFailures::default();
     for holder in holders {
         let request = BaoReadRequest {
             auth_context: AuthContext {
-                user_id,
+                user_id: read.user_id,
                 realm_id,
-                path_restrictions: path_restrictions.clone(),
+                path_restrictions: read.restrictions.clone(),
                 session: None,
             },
             realm_id,
-            target: BaoReadTarget::Blake3(blake3),
-            expected_blake3: Some(blake3),
+            target: BaoReadTarget::Blake3(read.blake3),
+            expected_blake3: Some(read.blake3),
             metadata_only: false,
             destination: None,
             known_refs: Vec::new(),
         };
-        match managed_read(context, holder, request).await {
-            Ok(BaoReadOutput::Stream { blob, .. }) => {
-                return Ok(routed_result(blob, version_id, metadata));
+        match failures.consider(managed_read(context, holder, request).await) {
+            Some(BaoReadOutput::Stream {
+                blob,
+                size,
+                etag,
+                hashes,
+                ..
+            }) => {
+                return Ok(routed_result(read, blob, size, etag, hashes, summary));
             }
-            Ok(BaoReadOutput::Metadata { .. }) => continue,
-            Err(BaoReadError::GovernedUnavailable) => governed = true,
-            Err(_) => continue,
+            None => {}
+            Some(BaoReadOutput::Metadata { .. }) => unreachable!("metadata does not serve bytes"),
         }
     }
-    Err(match governed {
-        true => GetObjectError::GovernedUnavailable,
-        false => GetObjectError::NoSuchKey,
-    })
+    Err(failures.into_error())
 }
 
+async fn routed_metadata(
+    context: &DriverContext,
+    read: RoutedRead,
+) -> Result<ObjectInfo, GetObjectError> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(GetObjectError::GetObjectFailed)?;
+    let realm_id = read.user_id.realm_id;
+    let holders = drive(
+        GetBlobHoldersOperation::new(read.blake3, realm_id, net_handle.node_id()),
+        context,
+    )
+    .await
+    .map_err(|_| GetObjectError::GetObjectFailed)?;
+    let summary = local_multipart_summary(context, read.version_id).await?;
+    let mut failures = HolderFailures::default();
+
+    for holder in holders {
+        let request = BaoReadRequest {
+            auth_context: AuthContext {
+                user_id: read.user_id,
+                realm_id,
+                path_restrictions: read.restrictions.clone(),
+                session: None,
+            },
+            realm_id,
+            target: BaoReadTarget::Blake3(read.blake3),
+            expected_blake3: Some(read.blake3),
+            metadata_only: true,
+            destination: None,
+            known_refs: Vec::new(),
+        };
+        match managed_read(context, holder, request).await {
+            Ok(BaoReadOutput::Metadata {
+                size, etag, hashes, ..
+            }) => {
+                return Ok(routed_info(&read, size, etag, hashes, summary));
+            }
+            Ok(BaoReadOutput::Stream { .. }) => failures.unavailable = true,
+            Err(error) => failures.record(error),
+        }
+    }
+    Err(failures.into_error())
+}
+
+/// Holder hashes describe the bytes; the local version describes logical multipart facts.
 fn routed_result(
+    read: RoutedRead,
     blob: BackendStream<Result<Bytes, StreamError>>,
-    version_id: Option<Ulid>,
-    metadata: HashMap<String, String>,
+    size: u64,
+    etag: Option<String>,
+    hashes: HashMap<String, Vec<u8>>,
+    summary: Option<MultipartObjectSummary>,
 ) -> GetObjectResult {
+    let info = routed_info(&read, size, etag, hashes, summary);
     GetObjectResult {
         blob,
         location: None,
-        metadata,
+        metadata: read.metadata,
+        info,
         source_metadata: None,
         source_binding: None,
         last_refresh: None,
-        version_created_at: None,
-        version_id,
-        resolved_version_id: version_id,
-        checksum_type: MultipartChecksumType::FullObject,
-        composite_hashes: HashMap::new(),
-        part_count: None,
+        version_id: read.version_id,
+        resolved_version_id: read.version_id,
         resolved_range: None,
-        source_policies: Vec::new(),
+        source_policies: read.source_policies,
+    }
+}
+
+fn routed_info(
+    read: &RoutedRead,
+    size: u64,
+    etag: Option<String>,
+    hashes: HashMap<String, Vec<u8>>,
+    summary: Option<MultipartObjectSummary>,
+) -> ObjectInfo {
+    let (checksum_type, composite_hashes, part_count) = match summary {
+        Some(summary) => (
+            summary.checksum_type,
+            summary.composite_hashes,
+            Some(summary.part_count),
+        ),
+        None => (MultipartChecksumType::FullObject, HashMap::new(), None),
+    };
+    ObjectInfo {
+        size,
+        version_created_at: read.version_created_at,
+        etag,
+        checksum_type,
+        hashes,
+        composite_hashes,
+        part_count,
+    }
+}
+
+/// The local version owns multipart facts even when another holder supplies bytes.
+async fn local_multipart_summary(
+    context: &DriverContext,
+    version_id: Option<Ulid>,
+) -> Result<Option<MultipartObjectSummary>, GetObjectError> {
+    let Some(version_id) = version_id else {
+        return Ok(None);
+    };
+    let key = MultipartObjectMetadataKey::summary(version_id)
+        .to_bytes()
+        .map_err(GetObjectError::ConversionError)?;
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: None,
+        })
+        .await;
+    match event {
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        event => summary_from_read(event).map_err(|error| match error {
+            LookupError::Conversion(error) => GetObjectError::ConversionError(error),
+            _ => GetObjectError::GetObjectFailed,
+        }),
     }
 }
 
@@ -1388,11 +1676,13 @@ fn routed_result(
 mod test {
     use crate::driver::{DriverContext, drive};
     use crate::node::usage_stats::UsageCounterUpdate;
-    use crate::replication::protocol::ReferenceAdvance;
+    use crate::replication::bao_read::BaoReadError;
+    use crate::replication::protocol::{BaoReadRefusal, ReferenceAdvance};
     use crate::replication::queue::LiveReplicationObligationRecord;
     use crate::s3::get_object::{
-        GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, MAX_AUTO_ADVANCES,
-        MAX_DRIFT_ADVANCE_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest, get_object_routed,
+        GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, HolderFailures,
+        MAX_AUTO_ADVANCES, MAX_DRIFT_ADVANCE_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest,
+        RoutedRead, get_object_routed, routed_info,
     };
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::hash::Hasher;
@@ -1406,11 +1696,12 @@ mod test {
         BLOB_VERSIONS_KEYSPACE,
     };
     use aruna_core::operation::Operation;
+    use aruna_core::structs::checksum::{HASH_MD5, HASH_SHA256};
     use aruna_core::structs::{
         Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey,
         BlobVersion, BlobVersionState, CurrentVersionPointer, MultipartChecksumType,
-        PathRestriction, Permission, PortableSourceDescriptor, RealmId, ResolvedSourceAccess,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, UsageDelta, VersionKey,
+        MultipartObjectSummary, PathRestriction, Permission, PortableSourceDescriptor, RealmId,
+        ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy, UsageDelta, VersionKey,
         VersionSourceBinding, usage_group_key,
     };
     use aruna_net::{NetConfig, NetHandle};
@@ -1443,6 +1734,168 @@ mod test {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{}", addr)
+    }
+
+    // A holder-backed read with no serving holder keeps infrastructure failure
+    // and integrity failure distinct from genuine absence.
+    #[test]
+    fn failure_causes_preserved() {
+        let mut unavailable = HolderFailures::default();
+        unavailable.record(BaoReadError::Refused(BaoReadRefusal::BackendFailure));
+        assert_eq!(unavailable.into_error(), GetObjectError::HoldersUnavailable);
+
+        let mut integrity = HolderFailures::default();
+        integrity.record(BaoReadError::Refused(BaoReadRefusal::HashMismatch));
+        assert_eq!(
+            integrity.into_error(),
+            GetObjectError::HolderIntegrityFailure
+        );
+
+        let mut denied = HolderFailures::default();
+        denied.record(BaoReadError::Refused(BaoReadRefusal::ReadDenied));
+        assert_eq!(denied.into_error(), GetObjectError::HolderAccessDenied);
+
+        let mut governed = HolderFailures::default();
+        governed.record(BaoReadError::GovernedUnavailable);
+        assert_eq!(governed.into_error(), GetObjectError::GovernedUnavailable);
+
+        let mut absent = HolderFailures::default();
+        absent.record(BaoReadError::Refused(BaoReadRefusal::NotFound));
+        assert_eq!(absent.into_error(), GetObjectError::NoSuchKey);
+
+        let mut mixed = HolderFailures::default();
+        mixed.record(BaoReadError::Refused(BaoReadRefusal::NotFound));
+        mixed.record(BaoReadError::Refused(BaoReadRefusal::BackendFailure));
+        assert_eq!(mixed.into_error(), GetObjectError::HoldersUnavailable);
+
+        let metadata_only = HolderFailures {
+            contacted: true,
+            metadata_only: true,
+            ..HolderFailures::default()
+        };
+        assert_eq!(
+            metadata_only.into_error(),
+            GetObjectError::HoldersUnavailable
+        );
+
+        assert_eq!(
+            HolderFailures::default().into_error(),
+            GetObjectError::HoldersUnavailable
+        );
+    }
+
+    #[test]
+    fn failure_priority_stable() {
+        let cases = [
+            (
+                vec![
+                    BaoReadError::Refused(BaoReadRefusal::BackendFailure),
+                    BaoReadError::Refused(BaoReadRefusal::ReadDenied),
+                ],
+                GetObjectError::HolderAccessDenied,
+            ),
+            (
+                vec![
+                    BaoReadError::Refused(BaoReadRefusal::ReadDenied),
+                    BaoReadError::Refused(BaoReadRefusal::HashMismatch),
+                ],
+                GetObjectError::HolderIntegrityFailure,
+            ),
+            (
+                vec![
+                    BaoReadError::Refused(BaoReadRefusal::HashMismatch),
+                    BaoReadError::GovernedUnavailable,
+                ],
+                GetObjectError::GovernedUnavailable,
+            ),
+        ];
+
+        for (errors, expected) in cases {
+            let mut failures = HolderFailures::default();
+            for error in errors {
+                failures.record(error);
+            }
+            assert_eq!(failures.into_error(), expected);
+        }
+    }
+
+    #[test]
+    fn transient_then_success() {
+        let mut failures = HolderFailures::default();
+        assert!(
+            failures
+                .consider(Err(BaoReadError::Refused(
+                    BaoReadRefusal::BackendFailure
+                )))
+                .is_none()
+        );
+        let served = failures.consider(Ok(crate::replication::bao_read::BaoReadOutput::Stream {
+            blob: BackendStream::new(stream::iter(Vec::<Result<Bytes, std::io::Error>>::new())),
+            size: 0,
+            blake3: [9u8; 32],
+            etag: None,
+            hashes: HashMap::new(),
+        }));
+
+        assert!(matches!(served, Some(crate::replication::bao_read::BaoReadOutput::Stream { .. })));
+    }
+
+    #[test]
+    fn routed_facts_preserved() {
+        let version_created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(12);
+        let read = RoutedRead {
+            user_id: UserId::nil(RealmId::from_bytes([3u8; 32])),
+            blake3: [9u8; 32],
+            version_id: Some(Ulid::from(7u128)),
+            metadata: HashMap::new(),
+            version_created_at: Some(version_created_at),
+            source_policies: Vec::new(),
+            restrictions: None,
+        };
+        let hashes = HashMap::from([
+            (HASH_MD5.to_string(), vec![4u8; 16]),
+            (HASH_SHA256.to_string(), vec![5u8; 32]),
+        ]);
+        let composite_hashes = HashMap::from([(HASH_SHA256.to_string(), vec![6u8; 32])]);
+        let summary = MultipartObjectSummary {
+            checksum_type: MultipartChecksumType::Composite,
+            part_count: 3,
+            composite_hashes: composite_hashes.clone(),
+        };
+
+        let etag = Some(hex::encode(&hashes[HASH_MD5]));
+        let info = routed_info(&read, 42, etag.clone(), hashes.clone(), Some(summary));
+
+        assert_eq!(info.size, 42);
+        assert_eq!(info.version_created_at, Some(version_created_at));
+        assert_eq!(info.etag, etag);
+        assert_eq!(info.hashes, hashes);
+        assert_eq!(info.checksum_type, MultipartChecksumType::Composite);
+        assert_eq!(info.composite_hashes, composite_hashes);
+        assert_eq!(info.part_count, Some(3));
+    }
+
+    #[test]
+    fn routed_empty_preserved() {
+        let read = RoutedRead {
+            user_id: UserId::nil(RealmId::from_bytes([3u8; 32])),
+            blake3: [9u8; 32],
+            version_id: Some(Ulid::from(7u128)),
+            metadata: HashMap::new(),
+            version_created_at: Some(SystemTime::UNIX_EPOCH),
+            source_policies: Vec::new(),
+            restrictions: None,
+        };
+        let hashes = HashMap::from([(HASH_MD5.to_string(), vec![0u8; 16])]);
+
+        let etag = Some(hex::encode(&hashes[HASH_MD5]));
+        let info = routed_info(&read, 0, etag.clone(), hashes.clone(), None);
+
+        assert_eq!(info.size, 0);
+        assert_eq!(info.etag, etag);
+        assert_eq!(info.hashes, hashes);
+        assert_eq!(info.checksum_type, MultipartChecksumType::FullObject);
+        assert_eq!(info.part_count, None);
     }
 
     // A version this node knows without its bytes must name the blob a routed
@@ -1487,7 +1940,7 @@ mod test {
     }
 
     #[test]
-    fn resolves_explicit_object_range() {
+    fn explicit_range_resolves() {
         let resolved = ObjectRangeRequest::StartEnd { start: 2, end: 5 }
             .resolve(10)
             .unwrap();
@@ -1498,7 +1951,7 @@ mod test {
     }
 
     #[test]
-    fn resolves_suffix_object_range() {
+    fn suffix_range_resolves() {
         let resolved = ObjectRangeRequest::Suffix { length: 3 }
             .resolve(10)
             .unwrap();
@@ -1509,7 +1962,7 @@ mod test {
     }
 
     #[test]
-    fn resolves_open_ended_object_range() {
+    fn open_range_resolves() {
         let resolved = ObjectRangeRequest::Start { start: 4 }.resolve(10).unwrap();
 
         assert_eq!(resolved.range, 4..10);
@@ -1518,7 +1971,7 @@ mod test {
     }
 
     #[test]
-    fn rejects_invalid_object_ranges() {
+    fn invalid_ranges_rejected() {
         assert_eq!(
             ObjectRangeRequest::Suffix { length: 1 }.resolve(0),
             Err(GetObjectError::InvalidRange)
@@ -1534,7 +1987,7 @@ mod test {
     }
 
     #[test]
-    fn materialized_range_read_emits_blob_read_range() {
+    fn materialized_range_reads() {
         let mut operation = GetObjectOperation::new(GetObjectInput {
             bucket: "s3test".to_string(),
             key: "range.txt".to_string(),
@@ -1564,7 +2017,7 @@ mod test {
         operation.txn_id = Some(txn_id);
         operation.location = Some(location.clone());
 
-        let effects = operation.commit_and_read_blob();
+        let effects = operation.read_blob();
 
         assert!(matches!(
             effects.as_slice(),
@@ -1576,7 +2029,7 @@ mod test {
     }
 
     #[test]
-    fn reference_range_read_heads_then_reads_resolved_range() {
+    fn reference_range_reads() {
         let mut operation = GetObjectOperation::new(GetObjectInput {
             bucket: "s3test".to_string(),
             key: "range.txt".to_string(),
@@ -1596,7 +2049,7 @@ mod test {
         operation.txn_id = Some(txn_id);
         operation.reference_access = Some(access.clone());
 
-        let effects = operation.commit_and_read_reference();
+        let effects = operation.read_reference();
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { txn_id: committed_txn_id })]
@@ -1843,7 +2296,15 @@ mod test {
         assert!(blob_result.source_metadata.is_none());
         assert!(blob_result.source_binding.is_none());
         assert!(blob_result.last_refresh.is_none());
-        assert_eq!(blob_result.checksum_type, MultipartChecksumType::FullObject);
+        assert_eq!(blob_result.info.checksum_type, MultipartChecksumType::FullObject);
+        let info = &blob_result.info;
+        assert_eq!(info.size, content.len() as u64);
+        assert_eq!(
+            info.etag,
+            location.hashes.get(HASH_MD5).map(hex::encode)
+        );
+        assert_eq!(info.version_created_at, Some(location.created_at));
+        assert_eq!(info.hashes, location.hashes);
         let mut blob_stream = blob_result.blob;
         let mut read_buffer = Vec::new();
         while let Some(Ok(bytes)) = blob_stream.next().await {
@@ -1956,7 +2417,7 @@ mod test {
     }
 
     #[tokio::test]
-    pub async fn test_get_object_hash_mismatch() {
+    pub async fn hash_mismatch_rejected() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
@@ -2111,7 +2572,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_get_reference_object_uses_exact_bound_connector() {
+    async fn bound_connector_used() {
         let endpoint = spawn_reference_server(b"hello reference").await;
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
@@ -2246,6 +2707,11 @@ mod test {
             Some(StagingStrategy::Reference)
         );
         assert!(result.last_refresh.is_some());
+        let info = &result.info;
+        assert_eq!(info.size, 15);
+        assert_eq!(info.etag.as_deref(), Some("etag-123"));
+        assert_eq!(info.version_created_at, None);
+        assert!(info.hashes.is_empty());
         let mut stream = result.blob;
         let mut read_buffer = Vec::new();
         while let Some(Ok(bytes)) = stream.next().await {
@@ -2280,9 +2746,8 @@ mod test {
         assert_eq!(last_refresh, SystemTime::UNIX_EPOCH);
     }
 
-    // A drifted current-version reference read records a same-binding successor
-    // (spec REQ-S3-DATA-MODEL-001) rather than silently floating, and the prior
-    // version stays immutable.
+    // A drifted current-version read records a same-binding successor
+    // (spec REQ-S3-DATA-MODEL-001); the prior version stays immutable.
     #[tokio::test]
     async fn drift_creates_successor() {
         let endpoint = spawn_reference_server(b"hello reference").await;
@@ -2614,9 +3079,8 @@ mod test {
         })
     }
 
-    // CAS guard: if the head advanced under a drifted read (a concurrent reader
-    // already wrote the successor), this read must not write a second one; it
-    // aborts and restarts against the winner.
+    // CAS: only the reader whose head still matches may write the successor;
+    // a concurrent winner makes this read abort and restart.
     #[test]
     fn advance_conflict_restarts() {
         let mut operation = drifted_operation();
@@ -2975,9 +3439,8 @@ mod test {
         cached_metadata
     }
 
-    // A pinned historical reference version whose live source has drifted from
-    // its recorded observation cannot serve current bytes: #375 caching is
-    // deferred, so there are no historical bytes to return.
+    // A pinned historical version whose source drifted has no cached bytes
+    // (#375 deferred), so it cannot serve current content.
     #[tokio::test]
     async fn historical_drift_fails() {
         let endpoint = spawn_reference_server(b"hello reference").await;

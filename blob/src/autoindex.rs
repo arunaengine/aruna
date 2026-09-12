@@ -1,10 +1,6 @@
-//! Directory listing support for http staging sources.
-//!
-//! opendal's Http service only supports `stat` and `read`, so listing an
-//! http connector walks classic autoindex pages (nginx, Apache, NCBI style)
-//! instead: the directory URL is fetched and its anchor rows are parsed into
-//! source entries. Responses that do not look like a directory index are
-//! rejected with a clear error instead of being guessed at.
+//! Directory listing for http staging sources.
+//! opendal's Http service lacks listing, so the directory URL is fetched and
+//! its anchors are parsed into entries; non-index responses are rejected.
 
 use crate::egress::EgressGuard;
 use aruna_core::errors::StagingSourceError;
@@ -236,11 +232,8 @@ fn encode_segment(segment: &str) -> String {
     encoded
 }
 
-/// Parses an autoindex-style HTML document into directory entries.
-///
-/// `base_path` is the server-absolute URL path of the listed directory and is
-/// used to resolve absolute-path hrefs. Returns `None` when the document does
-/// not look like a directory index.
+/// Parses an autoindex HTML document into directory entries.
+/// `base_path` resolves absolute-path hrefs; `None` means not a directory index.
 pub(crate) fn parse_autoindex(base_path: &str, html: &str) -> Option<Vec<AutoindexEntry>> {
     let lower = html.to_ascii_lowercase();
     let anchors = collect_anchors(html, &lower);
@@ -529,13 +522,13 @@ fn parse_trailing(trailing: &str) -> (Option<u64>, Option<SystemTime>) {
                 tokens
                     .get(index + 2)
                     .and_then(|size| parse_size_token(size)),
-                civil_to_system_time(year, month, day, hour, minute, second),
+                convert_civil_time(year, month, day, hour, minute, second),
             ),
             None => (
                 tokens
                     .get(index + 1)
                     .and_then(|size| parse_size_token(size)),
-                civil_to_system_time(year, month, day, 0, 0, 0),
+                convert_civil_time(year, month, day, 0, 0, 0),
             ),
         };
     }
@@ -612,7 +605,7 @@ fn parse_size_token(token: &str) -> Option<u64> {
 
 /// Converts a civil date and time to a `SystemTime` (days-from-civil
 /// algorithm), avoiding a calendar dependency for best-effort timestamps.
-fn civil_to_system_time(
+fn convert_civil_time(
     year: i64,
     month: u32,
     day: u32,
@@ -646,10 +639,8 @@ mod tests {
     }
 
     const NGINX_FIXTURE: &str = include_str!("../tests/fixtures/data/autoindex_nginx.html");
-    const APACHE_PRE_FIXTURE: &str =
-        include_str!("../tests/fixtures/data/autoindex_apache_pre.html");
-    const APACHE_TABLE_FIXTURE: &str =
-        include_str!("../tests/fixtures/data/autoindex_apache_table.html");
+    const APACHE_PRE_FIXTURE: &str = include_str!("../tests/fixtures/data/apache_pre.html");
+    const APACHE_TABLE_FIXTURE: &str = include_str!("../tests/fixtures/data/apache_table.html");
     const NON_INDEX_FIXTURE: &str = include_str!("../tests/fixtures/data/non_index.html");
 
     fn epoch(seconds: u64) -> SystemTime {
@@ -673,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_apache_pre_autoindex() {
+    fn parses_apache_pre() {
         let entries = parse_autoindex("/refseq/release/", APACHE_PRE_FIXTURE).unwrap();
 
         // The parent link and the absolute footer URL are not index rows.
@@ -701,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_apache_table_autoindex() {
+    fn parses_apache_table() {
         let entries = parse_autoindex("/pub/data/", APACHE_TABLE_FIXTURE).unwrap();
 
         // Sort links (?C=N;O=D) and the parent row are skipped.
@@ -717,12 +708,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_index_html() {
+    fn rejects_non_index() {
         assert_eq!(parse_autoindex("/", NON_INDEX_FIXTURE), None);
     }
 
     #[test]
-    fn normalizes_hrefs_and_rejects_traversal() {
+    fn sanitizes_listing_hrefs() {
         let html = r##"<html><head><title>Index of /base/dir</title></head><body><pre>
 <a href="../">../</a>
 <a href="../evil.txt">../evil.txt</a>
@@ -810,7 +801,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lists_http_autoindex_with_limit() {
+    async fn lists_limited_autoindex() {
         let rows = concat!(
             "<a href=\"sub/\">sub/</a>                 19-Jul-2026 10:00       -\n",
             "<a href=\"a.txt\">a.txt</a>               19-Jul-2026 10:01       10\n",
@@ -853,7 +844,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lists_http_autoindex_recursively() {
+    async fn lists_autoindex_recursively() {
         let root_rows = concat!(
             "<a href=\"sub/\">sub/</a>                 19-Jul-2026 10:00       -\n",
             "<a href=\"a.txt\">a.txt</a>               19-Jul-2026 10:01       10\n",
@@ -883,7 +874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_non_html_listing_response() {
+    async fn rejects_json_content() {
         let (server, endpoint) = spawn_index_server(vec![(
             "/",
             "application/json",
@@ -920,7 +911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maps_missing_directory_to_not_found() {
+    async fn maps_missing_directory() {
         let (server, endpoint) = spawn_index_server(Vec::new()).await;
         let config = HashMap::from([("endpoint".to_string(), endpoint)]);
 

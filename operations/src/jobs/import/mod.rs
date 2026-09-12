@@ -28,7 +28,7 @@ use aruna_core::structs::{
     ImportReportRow, ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec,
     JOB_SYSTEM_ENTRY_PREFIX, JobError, JobResultPayload, MetadataRegistryRecord,
     OBJECT_CONTENT_TYPE_KEY, Permission, ReasonCode, RoCrateCheckpointRefs, RoCrateMediaType,
-    VersionedObjectArn, blob_bucket_permission_path, blob_object_permission_path, job_entry_key,
+    VersionedObjectArn, bucket_permission_path, job_entry_key, object_permission_path,
     rocrate_plan_key,
 };
 use bytes::Bytes;
@@ -367,7 +367,7 @@ async fn acquire_source(
                 *upload_id,
                 spec.auth_context.user_id,
                 ctx.job_id,
-                aruna_core::util::unix_timestamp_millis(),
+                aruna_core::time::unix_timestamp_millis(),
             )
             .await
             .map_err(|error| match error {
@@ -391,7 +391,7 @@ async fn acquire_source(
             ensure_permission(
                 ctx,
                 &spec.auth_context,
-                blob_object_permission_path(
+                object_permission_path(
                     spec.auth_context.realm_id,
                     bucket_info.group_id,
                     ctx.owner_node_id,
@@ -800,7 +800,7 @@ async fn write_next(
     ensure_permission(
         ctx,
         &spec.auth_context,
-        blob_object_permission_path(
+        object_permission_path(
             spec.auth_context.realm_id,
             bucket_info.group_id,
             ctx.owner_node_id,
@@ -1182,7 +1182,7 @@ async fn ensure_targets(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<()
     ensure_permission(
         ctx,
         &spec.auth_context,
-        blob_bucket_permission_path(
+        bucket_permission_path(
             spec.auth_context.realm_id,
             bucket.group_id,
             ctx.owner_node_id,
@@ -1968,7 +1968,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn import_path_keeps_profile_gate_rejections_permanent() {
+    fn profile_rejections_permanent() {
         let finding = aruna_core::metadata::MetadataProfileValidationFinding {
             code: "unsupported_constraint".to_string(),
             severity: aruna_core::metadata::MetadataProfileValidationSeverity::Violation,

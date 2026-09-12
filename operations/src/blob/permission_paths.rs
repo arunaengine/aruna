@@ -1,4 +1,4 @@
-use crate::blob::blob_storage::iter_hash_page;
+use crate::blob::records::iter_hash_page;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -59,7 +59,7 @@ impl ResolveBlobPermissionPathsOperation {
         }
     }
 
-    fn emit_read_hash_aliases(&mut self) -> Result<Effects, ResolveBlobPermissionPathsError> {
+    fn emit_read_aliases(&mut self) -> Result<Effects, ResolveBlobPermissionPathsError> {
         Ok(smallvec![iter_hash_page(
             &self.blake3_hash,
             None,
@@ -127,7 +127,7 @@ impl ResolveBlobPermissionPathsOperation {
         )
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn reject_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -147,13 +147,13 @@ impl ResolveBlobPermissionPathsOperation {
 
         self.state = ResolveBlobPermissionPathsState::ReadHashAliases;
         self.txn_id = Some(txn_id);
-        match self.emit_read_hash_aliases() {
+        match self.emit_read_aliases() {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn handle_read_hash_aliases(&mut self, event: Event) -> Effects {
+    fn handle_read_aliases(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::IterResult {
             values,
@@ -206,7 +206,7 @@ impl Operation for ResolveBlobPermissionPathsOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.reject_storage_error(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
@@ -215,9 +215,7 @@ impl Operation for ResolveBlobPermissionPathsOperation {
             ResolveBlobPermissionPathsState::StartTransaction => {
                 self.handle_start_transaction(event)
             }
-            ResolveBlobPermissionPathsState::ReadHashAliases => {
-                self.handle_read_hash_aliases(event)
-            }
+            ResolveBlobPermissionPathsState::ReadHashAliases => self.handle_read_aliases(event),
             ResolveBlobPermissionPathsState::CommitTransaction => {
                 self.handle_commit_transaction(event)
             }
@@ -253,7 +251,7 @@ mod tests {
         MAX_HASH_ALIASES, ResolveBlobPermissionPathsError, ResolveBlobPermissionPathsOperation,
         ResolveBlobPermissionPathsState,
     };
-    use crate::blob::blob_storage::add_hash_path_index_effect;
+    use crate::blob::records::add_index_effect;
     use crate::driver::{DriverContext, drive};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
@@ -278,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn start_reads_hash_aliases_in_hash_index_keyspace() {
+    fn starts_alias_reads() {
         let mut op = ResolveBlobPermissionPathsOperation::new([7u8; 32]);
 
         let effects = op.start();
@@ -307,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn read_hash_aliases_sorts_candidates_by_permission_path_and_version_id() {
+    fn sorts_alias_candidates() {
         let hash = [9u8; 32];
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_a = Ulid::from_bytes([2u8; 16]);
@@ -427,7 +425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_empty_hash_to_empty_candidate_list() {
+    async fn resolves_empty_hash() {
         let random_path = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
@@ -450,7 +448,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_existing_hash_aliases_to_candidates() {
+    async fn resolves_existing_aliases() {
         let random_path = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
@@ -473,8 +471,8 @@ mod tests {
             "bucket",
             "path/file.txt",
         );
-        let effect = add_hash_path_index_effect(
-            &crate::blob::blob_storage::HeadAliasContext::new(
+        let effect = add_index_effect(
+            &crate::blob::records::HeadAliasContext::new(
                 alias.realm_id,
                 alias.group_id,
                 alias.node_id,

@@ -86,7 +86,7 @@ impl EnsureCanonicalUserTokenSubjectOperation {
         })
     }
 
-    fn read_subject_index_effect(&self) -> Result<Effect, EnsureCanonicalUserTokenSubjectError> {
+    fn read_subject_effect(&self) -> Result<Effect, EnsureCanonicalUserTokenSubjectError> {
         let subject_id = self
             .subject_ids
             .get(self.subject_index)
@@ -123,13 +123,13 @@ impl EnsureCanonicalUserTokenSubjectOperation {
         }
 
         self.state = EnsureCanonicalUserTokenSubjectState::ReadSubjectIndex;
-        match self.read_subject_index_effect() {
+        match self.read_subject_effect() {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(error),
         }
     }
 
-    fn handle_subject_index_read(&mut self, event: Event) -> Effects {
+    fn handle_subject_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return match event {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
@@ -152,7 +152,7 @@ impl EnsureCanonicalUserTokenSubjectOperation {
             return self.finish();
         }
 
-        match self.read_subject_index_effect() {
+        match self.read_subject_effect() {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(error),
         }
@@ -172,7 +172,7 @@ impl Operation for EnsureCanonicalUserTokenSubjectOperation {
         match self.state {
             EnsureCanonicalUserTokenSubjectState::ReadUser => self.handle_user_read(event),
             EnsureCanonicalUserTokenSubjectState::ReadSubjectIndex => {
-                self.handle_subject_index_read(event)
+                self.handle_subject_read(event)
             }
             EnsureCanonicalUserTokenSubjectState::Init
             | EnsureCanonicalUserTokenSubjectState::Finish

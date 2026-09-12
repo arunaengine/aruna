@@ -1,7 +1,6 @@
-//! Re-encodes stored rows written before a field was added: job-family rows
-//! that embed a physical execution result without stdout and stderr tails, and
-//! realm configuration documents without the compute catch-up wait. Safe to
-//! repeat: a row already in the current shape is left untouched.
+//! Re-encodes legacy job results and realm configs missing current fields.
+//! Current rows remain unchanged and the derived projection cache is cleared.
+//! The migration is safe to repeat.
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
@@ -531,9 +530,8 @@ mod tests {
 
     #[test]
     fn rewrites_realm_configs() {
-        // A document stored before the catch-up wait or before the session idle
-        // timeout must decode again with the defaults, and a current document
-        // must stay byte-identical.
+        // Legacy documents decode with defaults for catch-up and session idle timeouts.
+        // Current documents remain byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let document = RealmConfigDocument::new(REALM, Vec::new(), 3);

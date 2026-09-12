@@ -14,7 +14,7 @@ pub enum UserAttributeValidationError {
     TooManyAttributes,
 }
 
-pub fn validate_user_attribute_key(key: &str) -> Result<(), UserAttributeValidationError> {
+pub fn validate_attribute_key(key: &str) -> Result<(), UserAttributeValidationError> {
     if key.is_empty()
         || key.len() > MAX_USER_ATTRIBUTE_KEY_BYTES
         || !key
@@ -27,7 +27,7 @@ pub fn validate_user_attribute_key(key: &str) -> Result<(), UserAttributeValidat
     Ok(())
 }
 
-pub fn validate_user_attribute_value(
+pub fn validate_attribute_value(
     key: &str,
     value: &str,
 ) -> Result<(), UserAttributeValidationError> {
@@ -42,7 +42,7 @@ pub fn validate_user_attribute_value(
     Ok(())
 }
 
-pub fn validate_user_attribute_count(count: usize) -> Result<(), UserAttributeValidationError> {
+pub fn validate_attribute_count(count: usize) -> Result<(), UserAttributeValidationError> {
     if count > MAX_USER_ATTRIBUTES {
         return Err(UserAttributeValidationError::TooManyAttributes);
     }
@@ -54,12 +54,12 @@ pub fn validate_user_attribute_count(count: usize) -> Result<(), UserAttributeVa
 mod tests {
     use super::{
         MAX_USER_ATTRIBUTE_KEY_BYTES, MAX_USER_ATTRIBUTE_VALUE_BYTES, MAX_USER_ATTRIBUTES,
-        UserAttributeValidationError, validate_user_attribute_count, validate_user_attribute_key,
-        validate_user_attribute_value,
+        UserAttributeValidationError, validate_attribute_count, validate_attribute_key,
+        validate_attribute_value,
     };
 
     #[test]
-    fn user_attribute_keys_allow_supported_ascii_separators() {
+    fn user_attribute_separators() {
         for key in [
             "orcid",
             "profile.department",
@@ -68,46 +68,46 @@ mod tests {
             "team_name",
             "a1",
         ] {
-            assert_eq!(validate_user_attribute_key(key), Ok(()));
+            assert_eq!(validate_attribute_key(key), Ok(()));
         }
     }
 
     #[test]
-    fn user_attribute_keys_reject_empty_long_or_unsupported_bytes() {
+    fn user_attribute_bytes() {
         for key in ["", "display name", "\u{fc}mlaut", "owner/slash"] {
             assert_eq!(
-                validate_user_attribute_key(key),
+                validate_attribute_key(key),
                 Err(UserAttributeValidationError::InvalidKey(key.to_string()))
             );
         }
 
         let key = "a".repeat(MAX_USER_ATTRIBUTE_KEY_BYTES + 1);
         assert_eq!(
-            validate_user_attribute_key(&key),
+            validate_attribute_key(&key),
             Err(UserAttributeValidationError::InvalidKey(key))
         );
     }
 
     #[test]
-    fn user_attribute_values_allow_empty_and_printable_text() {
-        assert_eq!(validate_user_attribute_value("department", ""), Ok(()));
+    fn user_attribute_text() {
+        assert_eq!(validate_attribute_value("department", ""), Ok(()));
         assert_eq!(
-            validate_user_attribute_value("department", "biology and medicine"),
+            validate_attribute_value("department", "biology and medicine"),
             Ok(())
         );
     }
 
     #[test]
-    fn user_attribute_values_reject_long_or_control_text() {
+    fn user_values_text() {
         assert_eq!(
-            validate_user_attribute_value("department", "bio\nmedicine"),
+            validate_attribute_value("department", "bio\nmedicine"),
             Err(UserAttributeValidationError::InvalidValue(
                 "department".to_string()
             ))
         );
 
         assert_eq!(
-            validate_user_attribute_value(
+            validate_attribute_value(
                 "department",
                 &"a".repeat(MAX_USER_ATTRIBUTE_VALUE_BYTES + 1)
             ),
@@ -118,10 +118,10 @@ mod tests {
     }
 
     #[test]
-    fn user_attribute_count_rejects_more_than_limit() {
-        assert_eq!(validate_user_attribute_count(MAX_USER_ATTRIBUTES), Ok(()));
+    fn user_attribute_limit() {
+        assert_eq!(validate_attribute_count(MAX_USER_ATTRIBUTES), Ok(()));
         assert_eq!(
-            validate_user_attribute_count(MAX_USER_ATTRIBUTES + 1),
+            validate_attribute_count(MAX_USER_ATTRIBUTES + 1),
             Err(UserAttributeValidationError::TooManyAttributes)
         );
     }

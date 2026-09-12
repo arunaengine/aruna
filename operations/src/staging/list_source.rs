@@ -1,4 +1,4 @@
-use crate::connectors::{ResolveSourceConnectorInput, resolve_source_connector_suboperation};
+use crate::connectors::{ResolveSourceConnectorInput, resolve_connector_effect};
 use crate::staging::describe_event;
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
@@ -82,7 +82,7 @@ impl Operation for ListStagingSourceOperation {
 
     fn start(&mut self) -> Effects {
         self.state = ListStagingSourceState::Resolve;
-        smallvec![resolve_source_connector_suboperation(
+        smallvec![resolve_connector_effect(
             ResolveSourceConnectorInput {
                 group_id: self.input.group_id,
                 connector_id: self.input.connector_id,

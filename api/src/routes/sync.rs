@@ -1,6 +1,6 @@
 use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission, ensure_permission_with,
-    require_unrestricted_realm_auth,
+    require_unrestricted_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
@@ -8,9 +8,9 @@ use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{
     ArunaArn, AuthContext, BucketInfo, Permission, ReferenceHandling, SyncMode, SyncRelationship,
-    SyncState, SyncStatusSnapshot, blob_bucket_permission_path, ensure_confined_relative_path,
+    SyncState, SyncStatusSnapshot, bucket_permission_path, ensure_confined_path,
 };
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::MetadataAuthToken;
@@ -325,7 +325,7 @@ pub async fn create_sync(
     Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<CreateSyncRequest>,
 ) -> ServerResult<(StatusCode, Json<SyncRelationshipResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     validate_endpoint(&request.source.bucket, request.source.prefix.as_deref())?;
     validate_endpoint(&request.target.bucket, request.target.prefix.as_deref())?;
@@ -354,7 +354,7 @@ pub async fn create_sync(
     ensure_permission(
         &state,
         &auth,
-        blob_bucket_permission_path(
+        bucket_permission_path(
             state.get_realm_id(),
             source_info.group_id,
             state.get_node_id(),
@@ -522,7 +522,7 @@ pub async fn list_sync(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(params): Query<SyncListParams>,
 ) -> ServerResult<Json<SyncListResponse>> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     if params.bucket.as_deref().is_some_and(str::is_empty)
         || params.prefix.as_deref().is_some_and(str::is_empty)
     {
@@ -632,7 +632,7 @@ pub async fn get_sync(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
 ) -> ServerResult<Json<SyncDetailResponse>> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let (relationship, _) = load_relationship(&state, id).await?;
     ensure_creator(&auth, &relationship)?;
@@ -740,7 +740,7 @@ pub async fn update_sync(
     Path(id): Path<String>,
     Json(request): Json<UpdateSyncRequest>,
 ) -> ServerResult<Json<SyncRelationshipResponse>> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let id = parse_id(&id)?;
     let mut relationship =
@@ -861,7 +861,7 @@ pub async fn run_sync(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<SyncRunResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let mut relationship =
         get_relationship(&state, id, SyncRelationshipDirection::Outgoing).await?;
@@ -925,7 +925,7 @@ pub async fn delete_sync(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let (relationship, direction) = load_relationship(&state, id).await?;
     ensure_creator(&auth, &relationship)?;
@@ -936,9 +936,7 @@ pub async fn delete_sync(
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
     match direction {
-        // Reference relationships leave a detached serving stub behind so
-        // that data retained by the target stays readable; other modes are
-        // removed outright.
+        // References retain a serving stub for target-held data; other modes are removed.
         SyncRelationshipDirection::Outgoing => {
             remove_outgoing_relationship(&context, relationship.clone())
                 .await
@@ -973,10 +971,8 @@ fn validate_endpoint(bucket: &str, prefix: Option<&str>) -> ServerResult<()> {
                 "prefix must be non-empty when provided".to_string(),
             ));
         }
-        // Replicated keys inherit the prefix via the sync key mapping, so the
-        // same confinement rules as object keys must hold here; otherwise
-        // replication produces keys that normal S3 operations reject.
-        ensure_confined_relative_path(StdPath::new(prefix))
+        // Replicated prefixes must obey object-key confinement to remain readable through S3.
+        ensure_confined_path(StdPath::new(prefix))
             .map_err(|error| ServerError::BadRequestReason(format!("invalid prefix: {error}")))?;
     }
     Ok(())
@@ -1022,7 +1018,7 @@ async fn ensure_source_read(
     ensure_permission(
         state,
         auth,
-        blob_bucket_permission_path(
+        bucket_permission_path(
             state.get_realm_id(),
             bucket_info.group_id,
             state.get_node_id(),
@@ -1048,7 +1044,7 @@ async fn ensure_sync_write(
     ensure_permission_with(
         state,
         auth,
-        blob_bucket_permission_path(
+        bucket_permission_path(
             state.get_realm_id(),
             bucket_info.group_id,
             state.get_node_id(),
@@ -1076,7 +1072,7 @@ async fn create_mirror(
         ensure_permission_with(
             state,
             auth,
-            blob_bucket_permission_path(
+            bucket_permission_path(
                 state.get_realm_id(),
                 bucket_info.group_id,
                 state.get_node_id(),
@@ -1858,7 +1854,7 @@ mod tests {
             user_id: auth.user_id,
             realm_id: auth.realm_id,
         };
-        let mut group_auth = GroupAuthorizationDocument::new_default_group_doc(
+        let mut group_auth = GroupAuthorizationDocument::default_group_doc(
             auth.user_id,
             auth.realm_id,
             test_group(),
@@ -2013,7 +2009,7 @@ mod tests {
             user_id: auth.user_id,
             realm_id: auth.realm_id,
         };
-        let mut group_auth = GroupAuthorizationDocument::new_default_group_doc(
+        let mut group_auth = GroupAuthorizationDocument::default_group_doc(
             auth.user_id,
             auth.realm_id,
             test_group(),

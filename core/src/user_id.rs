@@ -124,13 +124,13 @@ mod tests {
     use ulid::Ulid;
 
     #[test]
-    fn user_id_roundtrips_through_string() {
+    fn user_id_string() {
         let user_id = UserId::new(Ulid::generate(), RealmId([7u8; 32]));
         assert_eq!(UserId::from_str(&user_id.to_string()).unwrap(), user_id);
     }
 
     #[test]
-    fn user_id_roundtrips_through_storage_key() {
+    fn user_id_key() {
         let user_id = UserId::new(Ulid::generate(), RealmId([9u8; 32]));
         assert_eq!(
             UserId::from_storage_key(&user_id.to_storage_key()).unwrap(),
@@ -139,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn nil_user_id_is_realm_scoped() {
+    fn nil_user_scoped() {
         let realm_id = RealmId([1u8; 32]);
         let other_realm_id = RealmId([2u8; 32]);
         let user_id = UserId::nil(realm_id);

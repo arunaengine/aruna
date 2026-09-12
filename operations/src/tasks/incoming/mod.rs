@@ -15,8 +15,8 @@ use aruna_core::structs::{
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
-use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
@@ -39,18 +39,18 @@ impl Drop for OutboxBarrier {
     }
 }
 
-use crate::blob::blob_holders::RefreshBlobHoldersOperation;
 use crate::blob::cleanup::{
     BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, process_cleanup_batch, sweep_stale_uploads,
 };
 use crate::blob::hidden::{
     HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, process_hidden_sweep, restore_hidden_sweep,
 };
+use crate::blob::holders::RefreshBlobHoldersOperation;
 use crate::blob::reclaim::{
     RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, process_reclaim_batch, restore_reclaim_sweep,
 };
 use crate::device::drain::{
-    DrainOutcome, INTAKE_CONTINUE_AFTER, INTAKE_DEFER_RETRY_AFTER, restore_intake_timer,
+    DrainOutcome, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_RETRY_AFTER, restore_publish_timer,
 };
 use crate::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
@@ -58,11 +58,11 @@ use crate::device::sync::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::remove::remove_drained_backends;
-use crate::jobs::drain::{JobClassBudget, process_job_queue_batch, restore_job_queue_timer};
+use crate::jobs::drain::{JobClassBudget, drain_job_batch, restore_drain_timer};
 use crate::jobs::lifecycle::outbox::{OUTBOX_RETRY_AFTER, drain_family_outbox};
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, settle_terminals};
 use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, drain_witness_deadlines};
-use crate::jobs::prune::{process_job_prune_batch, restore_job_prune_timer};
+use crate::jobs::prune::{prune_job_batch, restore_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
 use crate::jobs::store::release_job;
 use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_AFTER};
@@ -83,25 +83,22 @@ use crate::metadata::prune_queue::{
     process_metadata_graph_tombstones, restore_metadata_graph_prune_timer,
 };
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
-use crate::node::usage_stats::{
-    refresh_realm_usage_summary_for_targets, restore_usage_snapshot_publish_timer,
-};
+use crate::node::usage_stats::{refresh_usage_targets, restore_usage_timer};
 use crate::notifications::client::deliver_remote;
 use crate::notifications::inbox::upsert_inbox_records_reporting;
 use crate::notifications::outbox::{
     NOTIFICATION_DELIVERY_RETRY_AFTER, NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
-    NOTIFICATION_OUTBOX_RETENTION_MS, delete_notification_outbox_records,
-    read_notification_outbox_batch, restore_notification_outbox_timer,
-    restore_notification_outbox_timer_if_idle,
+    NOTIFICATION_OUTBOX_RETENTION_MS, delete_outbox_records, read_outbox_batch, restore_idle_timer,
+    restore_outbox_timer,
 };
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::prune::{
-    NOTIFICATION_PRUNE_POLL_AFTER, NOTIFICATION_PRUNE_RETRY_AFTER,
-    process_notification_prune_batch, restore_notification_prune_timer,
+    NOTIFICATION_PRUNE_POLL_AFTER, NOTIFICATION_PRUNE_RETRY_AFTER, process_prune_batch,
+    restore_prune_timer,
 };
 use crate::notifications::watch::interest::{
-    WATCH_INTEREST_PUBLISH_DEBOUNCE, rebuild_watch_interest_table,
-    refresh_watch_interest_for_targets, restore_watch_interest_publish_timer,
+    WATCH_INTEREST_PUBLISH_DEBOUNCE, rebuild_interest_table, refresh_watch_interest_for_targets,
+    restore_publish_timer,
 };
 use crate::placement::policy::observe_placement;
 use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};
@@ -117,7 +114,7 @@ use crate::s3::refresh_metadata::{
 };
 use crate::sync::document_outbox::{
     OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records, read_outbox_tails,
-    restore_document_sync_outbox_timers,
+    restore_outbox_timers,
 };
 use crate::sync::mirror_repair::{
     MIRROR_REPAIR_RETRY_AFTER, process_mirror_repairs, restore_mirror_timer,
@@ -126,15 +123,15 @@ use crate::sync::shard_placement::{
     DOCUMENT_SYNC_DEFER_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_MAX,
     SYNC_PLACEMENT_RETRY_AFTER,
 };
-use crate::tasks::queue_backoff::{queue_retry_after_ms, retry_after_ms};
+use crate::tasks::queue_backoff::{retry_after_ms, retry_delay_ms};
 use crate::tasks::task_persistence::{
-    delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
+    delete_persisted_timer, persist_task_effect, restore_task_timers,
 };
 
 mod outbox;
 mod restore;
 
-pub use outbox::drive_document_sync_outbox_drain;
+pub use outbox::drive_sync_drain;
 pub use restore::{drain_notification_outbox, initialize_task_holder, initialize_task_incoming};
 
 /// Process-wide tally of document sync outbox records ever classified
@@ -535,7 +532,7 @@ impl OperationsTaskHandler {
             .get(key)
             .copied()
             .unwrap_or(0);
-        Duration::from_millis(queue_retry_after_ms(attempts))
+        Duration::from_millis(retry_delay_ms(attempts))
     }
 
     fn note_retry_backoff(&self, key: &TaskKey) {
@@ -571,7 +568,7 @@ impl OperationsTaskHandler {
     /// Keeps the first missing-topic pull retry prompt, then doubles each subsequent
     /// full placement scan up to the placement interval. New holders only need their
     /// co-holders to apply the same config, so the ladder must not cliff to 30s.
-    fn placement_pull_retry_after(&self, key: &TaskKey) -> Duration {
+    fn placement_retry_after(&self, key: &TaskKey) -> Duration {
         self.retry_ladder(
             key,
             SHARD_TOPIC_PULL_RETRY_AFTER,
@@ -686,7 +683,7 @@ impl OperationsTaskHandler {
         };
         let after = match fetched {
             true => REALM_DOCUMENTS_AFTER.as_millis() as u64,
-            false => queue_retry_after_ms(attempts),
+            false => retry_delay_ms(attempts),
         };
         *state = (attempts, now.saturating_add(after));
     }
@@ -746,9 +743,8 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::SyncPlacements { realm_id, node_id } => {
                 let key = TaskKey::SyncPlacements { realm_id, node_id };
-                // The same observation that reconciles shards reconciles this
-                // node's placement subject: a moved, draining or removed node
-                // stops admitting governed data and revalidates its inventory.
+                // The same observation that reconciles shards reconciles this node's placement subject: a moved,
+                // draining or removed node stops admitting governed data and revalidates its inventory.
                 if let Err(error) =
                     observe_placement(&self.context, realm_id, node_id, unix_timestamp_millis())
                         .await
@@ -759,7 +755,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 match outcome.status {
                     PlacementReconcileStatus::Clean => self.reset_backoff(&key),
                     PlacementReconcileStatus::RetryScheduled if outcome.pull_pending => {
-                        let after = self.placement_pull_retry_after(&key);
+                        let after = self.placement_retry_after(&key);
                         self.reschedule_timer(key, after).await;
                     }
                     PlacementReconcileStatus::RetryScheduled => {}
@@ -769,7 +765,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 }
             }
             TaskKey::DrainDocumentSyncOutbox => {
-                self.drain_document_sync_outbox().await;
+                self.drain_sync_outbox().await;
             }
             TaskKey::PublishUsageSnapshots => {
                 self.publish_usage_snapshots().await;
@@ -778,19 +774,19 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 self.publish_node_info().await;
             }
             TaskKey::DrainMetadataProjectionQueue => {
-                self.drain_metadata_projection_queue().await;
+                self.drain_projection_queue().await;
             }
             TaskKey::DrainMetadataMaterializationQueue => {
-                self.drain_metadata_materialization_queue().await;
+                self.drain_materialization_queue().await;
             }
             TaskKey::DrainMetadataGraphPruneQueue => {
-                self.drain_metadata_graph_prune_queue().await;
+                self.drain_graph_queue().await;
             }
             TaskKey::DrainBlobReplicationQueue => {
-                self.drain_blob_replication_queue().await;
+                self.drain_replication_queue().await;
             }
             TaskKey::DrainReferenceMetadataRefreshQueue => {
-                self.drain_reference_metadata_refresh_queue().await;
+                self.drain_refresh_queue().await;
             }
             TaskKey::DrainNotificationOutbox => {
                 self.drain_notification_outbox().await;
@@ -823,10 +819,10 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 self.refresh_blob_holders().await;
             }
             TaskKey::DrainJobFamilyOutbox => {
-                self.drain_job_family_outbox().await;
+                self.drain_family_outbox().await;
             }
             TaskKey::DrainJobWitnessQueue => {
-                self.drain_job_witness_queue().await;
+                self.drain_witness_queue().await;
             }
             TaskKey::SettleJobTerminals => {
                 self.settle_job_terminals().await;
@@ -834,7 +830,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
             TaskKey::ReconcileSyncedFolders => {
                 let after = match crate::device::sync::reconcile_folders(&self.context).await {
                     DrainOutcome::Deferred => RECONCILE_RETRY_AFTER,
-                    DrainOutcome::More => RECONCILE_CONTINUE_AFTER,
+                    DrainOutcome::Recheck => RECONCILE_CONTINUE_AFTER,
                     DrainOutcome::Idle => RECONCILE_IDLE_AFTER,
                 };
                 self.reschedule_timer(TaskKey::ReconcileSyncedFolders, after)
@@ -847,7 +843,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
             TaskKey::DrainSyncUploadOutbox => {
                 let after = match crate::device::sync::drain_sync_outbox(&self.context).await {
                     DrainOutcome::Deferred => Some(UPLOAD_DEFER_RETRY_AFTER),
-                    DrainOutcome::More => Some(UPLOAD_CONTINUE_AFTER),
+                    DrainOutcome::Recheck => Some(UPLOAD_CONTINUE_AFTER),
                     DrainOutcome::Idle => None,
                 };
                 if let Some(after) = after {
@@ -856,9 +852,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 }
             }
             TaskKey::DrainDeviceIntake => {
-                let after = match crate::device::drain::drain_intake(&self.context).await {
-                    DrainOutcome::Deferred => Some(INTAKE_DEFER_RETRY_AFTER),
-                    DrainOutcome::More => Some(INTAKE_CONTINUE_AFTER),
+                let after = match crate::device::drain::drain_publish_queue(&self.context).await {
+                    DrainOutcome::Deferred => Some(PUBLISH_DEFER_RETRY_AFTER),
+                    DrainOutcome::Recheck => Some(PUBLISH_CONTINUE_AFTER),
                     DrainOutcome::Idle => None,
                 };
                 if let Some(after) = after {

@@ -1,6 +1,5 @@
-use crate::s3::write_cleanup::{
-    UploadTargetError, WriteCleanup, delete_records_effect, validate_upload_target,
-};
+use crate::s3::upload_target::{StatusCheck, UploadTargetError, validate_upload};
+use crate::s3::write_cleanup::{WriteCleanup, delete_records_effect};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -87,7 +86,7 @@ pub struct AbortMultipartUploadOperation {
     upload_record: Option<MultipartUpload>,
     upload_parts: Vec<MultipartUploadPart>,
     cleanup_index: usize,
-    allow_in_progress: bool,
+    skip_status_check: bool,
     cleanup: WriteCleanup<AbortMultipartUploadError>,
     output: Option<Result<(), AbortMultipartUploadError>>,
 }
@@ -101,17 +100,15 @@ impl AbortMultipartUploadOperation {
             upload_record: None,
             upload_parts: Vec::new(),
             cleanup_index: 0,
-            allow_in_progress: false,
+            skip_status_check: false,
             cleanup: WriteCleanup::default(),
             output: None,
         }
     }
 
-    /// A purge owns the destination write fence, so it may recover uploads
-    /// stranded by a crashed completion or abort. Ordinary S3 aborts retain the
-    /// Open-only behavior.
+    /// A purge may skip status checks after it owns the destination write fence.
     pub fn including_in_progress(mut self) -> Self {
-        self.allow_in_progress = true;
+        self.skip_status_check = true;
         self
     }
 
@@ -150,7 +147,7 @@ impl AbortMultipartUploadOperation {
         })]
     }
 
-    fn handle_mark_transaction_started(&mut self, event: Event) -> Effects {
+    fn mark_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.emit_error(AbortMultipartUploadError::InvalidOperationState);
         };
@@ -163,7 +160,7 @@ impl AbortMultipartUploadOperation {
         })]
     }
 
-    fn handle_upload_read_for_mark(&mut self, event: Event) -> Effects {
+    fn mark_upload_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(AbortMultipartUploadError::InvalidOperationState);
         };
@@ -174,12 +171,17 @@ impl AbortMultipartUploadOperation {
             Ok(record) => record,
             Err(err) => return self.emit_error(err.into()),
         };
-        if let Err(err) = validate_upload_target(
+        if let Err(err) = validate_upload(
             &record,
             &self.input.bucket,
             &self.input.key,
-            self.allow_in_progress,
-            Some(self.input.now_ms),
+            if self.skip_status_check {
+                StatusCheck::Skip
+            } else {
+                StatusCheck::Takeover {
+                    now_ms: self.input.now_ms,
+                }
+            },
         ) {
             return self.emit_error(err.into());
         }
@@ -240,7 +242,7 @@ impl AbortMultipartUploadOperation {
         }
     }
 
-    fn handle_upload_parts_read(&mut self, event: Event) -> Effects {
+    fn upload_parts_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             return self.schedule_error(AbortMultipartUploadError::InvalidOperationState);
         };
@@ -255,7 +257,7 @@ impl AbortMultipartUploadOperation {
         })]
     }
 
-    fn handle_delete_transaction_started(&mut self, event: Event) -> Effects {
+    fn delete_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.schedule_error(AbortMultipartUploadError::InvalidOperationState);
         };
@@ -273,7 +275,7 @@ impl AbortMultipartUploadOperation {
         smallvec![effect]
     }
 
-    fn handle_upload_records_deleted(&mut self, event: Event) -> Effects {
+    fn records_deleted(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.write_cleanup_records(),
             Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
@@ -327,10 +329,10 @@ impl AbortMultipartUploadOperation {
         self.upload_record = None;
         self.cleanup_index = 0;
         self.state = AbortMultipartUploadState::CleanupPartBlobs;
-        self.cleanup_next_part_blob()
+        self.next_blob()
     }
 
-    fn cleanup_next_part_blob(&mut self) -> Effects {
+    fn next_blob(&mut self) -> Effects {
         let Some(part) = self.upload_parts.get(self.cleanup_index) else {
             self.state = AbortMultipartUploadState::Finish;
             self.output = Some(Ok(()));
@@ -343,17 +345,17 @@ impl AbortMultipartUploadOperation {
         })]
     }
 
-    fn handle_cleanup_part_blob(&mut self, event: Event) -> Effects {
+    fn blob_cleaned(&mut self, event: Event) -> Effects {
         match event {
             Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
                 self.cleanup_index += 1;
-                self.cleanup_next_part_blob()
+                self.next_blob()
             }
             _ => self.emit_error(AbortMultipartUploadError::InvalidOperationState),
         }
     }
 
-    fn handle_reset_transaction_started(&mut self, event: Event) -> Effects {
+    fn reset_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.emit_error(AbortMultipartUploadError::InvalidOperationState);
         };
@@ -366,7 +368,7 @@ impl AbortMultipartUploadOperation {
         })]
     }
 
-    fn handle_upload_read_for_reset(&mut self, event: Event) -> Effects {
+    fn reset_upload_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(AbortMultipartUploadError::InvalidOperationState);
         };
@@ -395,7 +397,7 @@ impl AbortMultipartUploadOperation {
         })]
     }
 
-    fn handle_upload_reset_written(&mut self, event: Event) -> Effects {
+    fn upload_reset(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.emit_error(AbortMultipartUploadError::InvalidOperationState);
         };
@@ -427,30 +429,30 @@ impl Operation for AbortMultipartUploadOperation {
         match self.state {
             AbortMultipartUploadState::Init => self.handle_init(),
             AbortMultipartUploadState::StartMarkTransaction => {
-                self.handle_mark_transaction_started(event)
+                self.mark_started(event)
             }
-            AbortMultipartUploadState::ReadUploadForMark => self.handle_upload_read_for_mark(event),
+            AbortMultipartUploadState::ReadUploadForMark => self.mark_upload_read(event),
             AbortMultipartUploadState::WriteUploadAborting => self.handle_upload_marked(event),
             AbortMultipartUploadState::CommitMarkTransaction => self.handle_mark_committed(event),
-            AbortMultipartUploadState::ReadUploadParts => self.handle_upload_parts_read(event),
+            AbortMultipartUploadState::ReadUploadParts => self.upload_parts_read(event),
             AbortMultipartUploadState::StartDeleteTransaction => {
-                self.handle_delete_transaction_started(event)
+                self.delete_started(event)
             }
             AbortMultipartUploadState::DeleteUploadRecords => {
-                self.handle_upload_records_deleted(event)
+                self.records_deleted(event)
             }
             AbortMultipartUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             AbortMultipartUploadState::CommitDeleteTransaction => {
                 self.handle_delete_committed(event)
             }
-            AbortMultipartUploadState::CleanupPartBlobs => self.handle_cleanup_part_blob(event),
+            AbortMultipartUploadState::CleanupPartBlobs => self.blob_cleaned(event),
             AbortMultipartUploadState::ResetUploadTransaction => {
-                self.handle_reset_transaction_started(event)
+                self.reset_started(event)
             }
             AbortMultipartUploadState::ReadUploadForReset => {
-                self.handle_upload_read_for_reset(event)
+                self.reset_upload_read(event)
             }
-            AbortMultipartUploadState::WriteUploadReset => self.handle_upload_reset_written(event),
+            AbortMultipartUploadState::WriteUploadReset => self.upload_reset(event),
             AbortMultipartUploadState::CommitResetTransaction => self.handle_reset_committed(event),
             AbortMultipartUploadState::Finish => smallvec![],
             AbortMultipartUploadState::Error => self.abort(),
@@ -558,7 +560,7 @@ mod tests {
         );
         assert_eq!(operation.txn_id, None);
         assert_eq!(
-            operation.cleanup.pending_error,
+            operation.cleanup.take_error(),
             Some(AbortMultipartUploadError::StorageError(
                 StorageError::CommitFailed
             ))

@@ -2,7 +2,7 @@ use super::{
     PROXY_BODY_LIMIT, ProviderModel, ensure_enabled, forbidden_header, load_provider,
     validate_base_url,
 };
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{AssistantProvider, AssistantProviderKind, AuthContext};
@@ -189,7 +189,7 @@ async fn proxy_request(
     request: Request,
 ) -> ServerResult<Response> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let mut provider = load_provider(&state, auth.user_id, provider_id).await?;
     if !allowed_path(provider.kind, request.method(), &path) {
         return Err(ServerError::NotFound);
@@ -464,9 +464,9 @@ mod tests {
             secret: EncryptedS3Secret::empty(),
             models: Vec::new(),
             default_model: None,
-            created_at: aruna_core::util::unix_timestamp_secs(),
+            created_at: aruna_core::time::unix_timestamp_secs(),
             status: AssistantProviderStatus::Ready,
-            token_obtained_at: Some(aruna_core::util::unix_timestamp_secs()),
+            token_obtained_at: Some(aruna_core::time::unix_timestamp_secs()),
             login_expires_at: None,
             login_interval_seconds: None,
         };

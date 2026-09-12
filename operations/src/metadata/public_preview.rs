@@ -1,13 +1,13 @@
 use std::collections::BTreeSet;
 
 use aruna_core::metadata::MetadataError;
-use aruna_core::structs::{AuthContext, Permission, RealmId, blob_object_permission_path};
+use aruna_core::structs::{AuthContext, Permission, RealmId, object_permission_path};
 use aruna_core::types::{GroupId, NodeId};
 use serde_json::Value as JsonValue;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::blob::blob_holders::GetBlobHoldersOperation;
+use crate::blob::holders::GetBlobHoldersOperation;
 use crate::blob::permission_paths::ResolveBlobPermissionPathsOperation;
 use crate::driver::{DriverContext, drive, drive_until};
 use crate::jobs::export::{EntityIdentity, entity_identity};
@@ -191,13 +191,8 @@ async fn entity_paths(
                 && summary.summary.blob_size.is_some()
                 && let Some(group_id) = summary.summary.group_id
             {
-                let path = blob_object_permission_path(
-                    realm_id,
-                    group_id,
-                    node_id,
-                    &exact.bucket,
-                    &exact.key,
-                );
+                let path =
+                    object_permission_path(realm_id, group_id, node_id, &exact.bucket, &exact.key);
                 seen.insert(path.clone());
                 paths.push(ObjectPath {
                     group_id,
@@ -369,7 +364,7 @@ mod tests {
         };
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.ensure_node(node_id, RealmNodeKind::Server);
-        let mut realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let mut realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
         if anonymous_read {
             let role_id = Ulid::from_bytes([67; 16]);
             realm_auth.roles.insert(
@@ -385,8 +380,7 @@ mod tests {
                 },
             );
         }
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
         let group = Group {
             display_name: "preview".to_string(),
             group_id,
@@ -458,7 +452,7 @@ mod tests {
                 session: None,
             },
             hash,
-            permission_path: blob_object_permission_path(realm_id, group_id, node_id, BUCKET, KEY),
+            permission_path: object_permission_path(realm_id, group_id, node_id, BUCKET, KEY),
             _tempdir: staging._tempdir,
         }
     }

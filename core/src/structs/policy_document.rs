@@ -107,10 +107,9 @@ impl PolicyPublicationClaim {
     }
 }
 
-/// Token-free evidence that one node published this definition after checking
-/// the authorizing user's realm-admin permission. A relay that restates the
-/// document cannot become its author: the signature names the original
-/// publisher and covers the realm, policy id, and digest.
+/// Token-free evidence that one node published this definition after checking the authorizing user's
+/// realm-admin permission. A relay that restates the document cannot become its author: the signature
+/// names the original publisher and covers the realm, policy id, and digest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyPublication {
     pub publisher: NodeId,
@@ -178,14 +177,8 @@ pub fn policy_authority_path(realm_id: RealmId, owner_group_id: Option<GroupId>)
     }
 }
 
-/// Publication authority behind one document: the original publisher must be a
-/// permitted realm node, and the authorizing user must still hold write on the
-/// path the rule's ownership names, in the verifier's own replicated view. A
-/// realm-wide rule needs realm-configuration write; a group-owned rule needs
-/// admin write on its owning group, decided over the realm and group roles
-/// together, exactly as the creating operation decided it. Neither a relay nor
-/// a current holder can supply that authority for someone else, and a group
-/// whose authorization state is missing fails closed.
+/// Publication requires a permitted origin node and current write authority for the owned path.
+/// Relays and holders cannot substitute authority; missing group authorization fails closed.
 pub fn verify_policy_authority(
     document: &PlacementPolicyDocument,
     config: &RealmConfigDocument,
@@ -200,7 +193,7 @@ pub fn verify_policy_authority(
         .verify(document.realm_id, document.policy_ref()?)?;
     let publisher = document.publication.publisher;
     if !config
-        .sync_eligible_node_ids()
+        .sync_eligible_nodes()
         .is_ok_and(|eligible| eligible.contains(&publisher))
     {
         return Err(PolicyAuthorityError::Publisher);
@@ -259,10 +252,8 @@ pub fn holds_admin_write<'a>(
     allowed
 }
 
-/// STATE-PLACEMENT-POLICY: one immutable residency rule replicated to the holders
-/// its policy id resolves to. Identity is `(policy_id, digest)`, so a known id with
-/// different bytes is refused as reuse; the publication proves who published it
-/// under whose realm-admin authority and stays outside the digest.
+/// Immutable placement policy keyed by `(policy_id, digest)`; reuse with different bytes is rejected.
+/// Publication records its realm-admin authority outside the content digest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementPolicyDocument {
     pub realm_id: RealmId,
@@ -351,10 +342,9 @@ pub fn placement_policy_target(policy_id: Ulid) -> DocumentSyncTarget {
     DocumentSyncTarget::PlacementPolicy { policy_id }
 }
 
-/// Sync change a policy row publishes and records. Derived purely from the row,
-/// so two holders of one document write byte-identical manifest entries. The
-/// definition is immutable, so the generation is fixed: a provenance merge must
-/// not look like a regression to a peer that already holds the rule.
+/// Sync change a policy row publishes and records. Derived purely from the row, so two holders of one
+/// document write byte-identical manifest entries. The definition is immutable, so the generation is
+/// fixed: a provenance merge must not look like a regression to a peer that already holds the rule.
 pub fn placement_policy_change(
     document: &PlacementPolicyDocument,
     placement: PlacementRef,

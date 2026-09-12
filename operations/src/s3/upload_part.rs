@@ -1,9 +1,8 @@
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement::policy::PolicyGateError;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::s3::write_cleanup::{
-    CleanupEvent, UploadTargetError, WriteCleanup, validate_upload_target,
-};
+use crate::s3::upload_target::{StatusCheck, UploadTargetError, validate_upload};
+use crate::s3::write_cleanup::{CleanupStep, WriteCleanup};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -163,7 +162,7 @@ impl UploadPartOperation {
         smallvec![write_fence_read(&self.input.bucket, None)]
     }
 
-    fn handle_purge_fence_before_write(&mut self, event: Event) -> Effects {
+    fn check_write_fence(&mut self, event: Event) -> Effects {
         if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
             return self.emit_error(error.into());
         }
@@ -210,7 +209,7 @@ impl UploadPartOperation {
             Err(err) => return self.emit_error(err.into()),
         };
         if let Err(err) =
-            validate_upload_target(&record, &self.input.bucket, &self.input.key, false, None)
+            validate_upload(&record, &self.input.bucket, &self.input.key, StatusCheck::Open)
         {
             return self.emit_error(err.into());
         }
@@ -296,7 +295,7 @@ impl UploadPartOperation {
         }
     }
 
-    fn handle_failed_write_cleanup(&mut self, event: Event) -> Effects {
+    fn write_cleanup_failed(&mut self, event: Event) -> Effects {
         match event {
             Event::Blob(BlobEvent::DeleteFinished) => {
                 self.rollback_location = None;
@@ -336,15 +335,15 @@ impl UploadPartOperation {
 
     fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
         match self.cleanup.handle_queued(event) {
-            CleanupEvent::Effect(effect) => smallvec![effect],
-            CleanupEvent::Accepted => {
+            CleanupStep::Retry(effect) => smallvec![effect],
+            CleanupStep::Accepted => {
                 if self.rollback_location.is_some() || self.written_location.is_some() {
                     return self.abort();
                 }
                 self.release_or_error()
             }
-            CleanupEvent::Exhausted | CleanupEvent::Closed => self.release_or_error(),
-            CleanupEvent::Invalid => self.emit_error(UploadPartError::InvalidOperationState),
+            CleanupStep::Exhausted | CleanupStep::Closed => self.release_or_error(),
+            CleanupStep::Invalid => self.emit_error(UploadPartError::InvalidOperationState),
         }
     }
 
@@ -415,7 +414,7 @@ impl UploadPartOperation {
         smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
     }
 
-    fn handle_purge_fence_checked(&mut self, event: Event) -> Effects {
+    fn fence_checked(&mut self, event: Event) -> Effects {
         if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
             return self.cleanup_failed_write(error.into());
         }
@@ -463,7 +462,7 @@ impl UploadPartOperation {
             Err(err) => return self.cleanup_failed_write(err.into()),
         };
         if let Err(err) =
-            validate_upload_target(&record, &self.input.bucket, &self.input.key, false, None)
+            validate_upload(&record, &self.input.bucket, &self.input.key, StatusCheck::Open)
         {
             return self.cleanup_failed_write(err.into());
         }
@@ -482,7 +481,7 @@ impl UploadPartOperation {
         })]
     }
 
-    fn handle_existing_part_read(&mut self, event: Event) -> Effects {
+    fn existing_part_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(UploadPartError::InvalidOperationState);
         };
@@ -523,7 +522,7 @@ impl UploadPartOperation {
         })]
     }
 
-    fn handle_part_record_written(&mut self, event: Event) -> Effects {
+    fn part_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.emit_error(UploadPartError::InvalidOperationState);
         };
@@ -693,19 +692,19 @@ impl Operation for UploadPartOperation {
         match self.state {
             UploadPartState::Init => self.handle_init(),
             UploadPartState::CheckPurgeFenceBeforeWrite => {
-                self.handle_purge_fence_before_write(event)
+                self.check_write_fence(event)
             }
             UploadPartState::ReadUpload => self.handle_upload_read(event),
             UploadPartState::WritePart => self.handle_write_finished(event),
-            UploadPartState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
+            UploadPartState::CleanupFailedWrite => self.write_cleanup_failed(event),
             UploadPartState::QueueCleanupRow => self.handle_cleanup_queued(event),
             UploadPartState::WriteCleanupRow => self.handle_cleanup_row(event),
             UploadPartState::StartTransaction => self.handle_transaction_started(event),
-            UploadPartState::CheckPurgeFence => self.handle_purge_fence_checked(event),
+            UploadPartState::CheckPurgeFence => self.fence_checked(event),
             UploadPartState::FenceBackend => self.handle_backend_fenced(event),
             UploadPartState::ReReadUpload => self.handle_upload_reread(event),
-            UploadPartState::ReadExistingPart => self.handle_existing_part_read(event),
-            UploadPartState::WritePartRecord => self.handle_part_record_written(event),
+            UploadPartState::ReadExistingPart => self.existing_part_read(event),
+            UploadPartState::WritePartRecord => self.part_written(event),
             UploadPartState::WriteReplacedRow => self.handle_replaced_row(event),
             UploadPartState::CommitTransaction => self.handle_transaction_committed(event),
             UploadPartState::ReleaseReservation => self.handle_release(event),
@@ -1085,9 +1084,8 @@ mod test {
 
     #[test]
     fn unknown_keeps_part() {
-        // Only a proven refusal rolls the part back; every other commit failure
-        // may already have committed the record that names these bytes, so the
-        // copy is handed to reconciliation instead of deleted or forgotten.
+        // Only a proven refusal rolls the part back; any other commit failure
+        // may already own the record, so the copy goes to reconciliation.
         for error in [
             StorageError::CommitFailed,
             StorageError::PersistError("journal".to_string()),
@@ -1292,9 +1290,8 @@ mod test {
 
     #[test]
     fn release_failure_succeeds() {
-        // A refused release runs after the part is durably committed, so it must
-        // not report the committed part as failed; the reconciliation row that
-        // committed with it clears the reservation.
+        // A refused release runs after the part is committed, so it must not
+        // report failure; the reconciliation row clears the reservation.
         let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
         let location = op.written_location.clone().unwrap();
         op.state = UploadPartState::CommitTransaction;
@@ -1438,7 +1435,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn drive_upload_part_missing_upload_returns_no_such_upload() {
+    async fn missing_upload_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
