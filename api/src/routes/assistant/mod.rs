@@ -769,7 +769,6 @@ pub async fn test_provider(
 
 #[cfg(test)]
 mod tests {
-    pub(crate) mod fixtures;
 
     use super::*;
     use aruna_core::credential_encryption::CredentialEncryptionKey;
