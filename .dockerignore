@@ -1,6 +1,8 @@
 .git
 target
-.env
 **/.env
+# The startup guard embeds the tracked demonstration profile at build time.
+# Only the built binaries are copied into the final stage, so it never ships.
+!.env
 .compose-data
 docker/
