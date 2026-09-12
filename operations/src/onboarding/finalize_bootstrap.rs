@@ -7,8 +7,8 @@ use aruna_core::structs::{
     Actor, DEFAULT_METADATA_REPLICATION_FACTOR, NodePlacementEntry, RealmId, RealmNodeKind,
     ResourceEvent, normalize_placement_input, reserved_label,
 };
-use aruna_core::types::UserId;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::UserId;
 use ed25519_dalek::SigningKey;
 use thiserror::Error;
 use tracing::warn;
@@ -174,11 +174,7 @@ pub async fn bootstrap_onboarding_finalize(
     })
 }
 
-async fn emit_onboarded_notification(
-    realm_id: RealmId,
-    node_id: NodeId,
-    context: &DriverContext,
-) {
+async fn emit_onboarded_notification(realm_id: RealmId, node_id: NodeId, context: &DriverContext) {
     let realm_auth = match drive(ReadRealmAuthorizationOperation::new(realm_id), context).await {
         Ok(Some(doc)) => doc,
         Ok(None) => {
@@ -578,11 +574,7 @@ mod tests {
         assert_eq!(entry.weight, weight);
     }
 
-    async fn assert_realm_excludes(
-        context: &DriverContext,
-        realm_id: RealmId,
-        node_id: NodeId,
-    ) {
+    async fn assert_realm_excludes(context: &DriverContext, realm_id: RealmId, node_id: NodeId) {
         let document = drive(GetRealmConfigOperation::new(realm_id), context)
             .await
             .unwrap();

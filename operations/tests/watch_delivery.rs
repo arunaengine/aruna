@@ -30,8 +30,7 @@ use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::watch::emit::emit_watch_event;
 use aruna_operations::notifications::watch::interest::{
-    ensure_local_watch_interest_digest, mark_watch_interest_dirty,
-    refresh_target_interest,
+    ensure_local_watch_interest_digest, mark_watch_interest_dirty, refresh_target_interest,
 };
 use aruna_operations::notifications::watch::subscriptions::list_watch_subscriptions;
 use aruna_operations::sync::incoming::initialize_net_incoming;

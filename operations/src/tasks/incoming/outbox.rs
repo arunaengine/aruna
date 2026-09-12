@@ -571,9 +571,11 @@ impl OperationsTaskHandler {
             .await;
         invocation.undeliverable += undeliverable.len().saturating_sub(relayed.len());
         if !relayed.is_empty()
-            && let Err(error) =
-                crate::sync::document_outbox::delete_outbox_records(&self.context.storage_handle, relayed)
-                    .await
+            && let Err(error) = crate::sync::document_outbox::delete_outbox_records(
+                &self.context.storage_handle,
+                relayed,
+            )
+            .await
         {
             warn!(%error, "Failed to delete relayed admin outbox records");
         }
@@ -1047,8 +1049,7 @@ impl OperationsTaskHandler {
         if !metadata_create_events.is_empty() {
             let local_node_id = self.context.net_handle.as_ref().map(|net| net.node_id());
             if let Err(error) =
-                project_create_events(&self.context, metadata_create_events, local_node_id)
-                    .await
+                project_create_events(&self.context, metadata_create_events, local_node_id).await
             {
                 warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch after document sync");
                 return Err(());
@@ -1068,9 +1069,7 @@ impl OperationsTaskHandler {
             };
             create_event_targets.push((document_id, event_id));
         }
-        if let Err(error) =
-            project_logged_events(&self.context, create_event_targets).await
-        {
+        if let Err(error) = project_logged_events(&self.context, create_event_targets).await {
             warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch from log after document sync");
             return Err(());
         }
@@ -1094,8 +1093,7 @@ impl OperationsTaskHandler {
                 metadata_graph_tombstones,
                 ..
             })) => {
-                process_graph_tombstones(self.context.as_ref(), metadata_graph_tombstones)
-                    .await;
+                process_graph_tombstones(self.context.as_ref(), metadata_graph_tombstones).await;
                 let mut refresh_targets = targets.clone();
                 refresh_targets.extend(requested_targets);
                 if let Some(net_handle) = self.context.net_handle.as_ref() {

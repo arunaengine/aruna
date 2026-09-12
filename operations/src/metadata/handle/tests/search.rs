@@ -1,11 +1,11 @@
 use super::visibility::{group_record, read_rules, registry_record};
 use super::*;
-use aruna_core::structs::Permission;
-use craqle::{Action as CraqleAction, Authorizer as CraqleAuthorizer};
-use craqle::GraphPolicy;
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::metadata::handle::search::clamp_remote_limit;
 use crate::metadata::search_cursor::METADATA_SEARCH_MAX_PAGINATION_DEPTH;
+use aruna_core::structs::Permission;
+use craqle::GraphPolicy;
+use craqle::{Action as CraqleAction, Authorizer as CraqleAuthorizer};
 use oxrdf::Literal;
 use tracing::Span;
 #[test]

@@ -154,16 +154,14 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
     let jsonld = build_crate_jsonld(&parent, spec, document_id);
 
     let (status, resource) = match route_metadata_create(
-        CreateMetadataDocumentOperation::new_generated_id(
-            CreateMetadataDocumentConfig {
-                actor,
-                group_id: spec.group_id,
-                document_id,
-                document_path,
-                public: false,
-                payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
-            },
-        ),
+        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+            actor,
+            group_id: spec.group_id,
+            document_id,
+            document_path,
+            public: false,
+            payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
+        }),
         ctx.driver.clone(),
         Some(MetadataAuthToken::internal(AuthContext {
             user_id: parent.created_by,

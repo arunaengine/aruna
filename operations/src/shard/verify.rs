@@ -7,8 +7,8 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SHARD_VERIFICATION_KEYSPACE;
 use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
-use aruna_core::types::Key;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::Key;
 use aruna_net::NetHandle;
 use byteview::ByteView;
 use futures_util::{StreamExt, stream};
@@ -148,10 +148,7 @@ async fn verify_one_shard(
     // A sole holder converges only after its genesis exists.
     // A genesis-less topic has an empty fingerprint, so the digest alone is insufficient.
     if co_holders.is_empty() {
-        if !net_handle
-            .sync_topic_exists(topic)
-            .unwrap_or(false)
-        {
+        if !net_handle.sync_topic_exists(topic).unwrap_or(false) {
             debug!(
                 strategy = %placement.strategy_id,
                 shard = placement.shard,
@@ -259,9 +256,7 @@ pub async fn converge_with_barrier(
             };
             // Genesis-less holders share the empty fingerprint.
             // Require a local genesis before comparing manifests.
-            if net_handle
-                .sync_topic_exists(topic)
-                .unwrap_or(false)
+            if net_handle.sync_topic_exists(topic).unwrap_or(false)
                 && manifests_converged(&local, &remote)
                 && dominates_required(&local.cursor, required)
             {

@@ -37,8 +37,7 @@ use crate::metadata::create_document::{
     CreateMetadataDocumentPayload, mint_job_document,
 };
 use crate::metadata::forward::{
-    MetadataWriteError, route_metadata_create, route_metadata_delete,
-    route_metadata_update,
+    MetadataWriteError, route_metadata_create, route_metadata_delete, route_metadata_update,
 };
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::update_document::UpdateMetadataDocumentMutation;
@@ -463,18 +462,16 @@ async fn create_document(
 ) -> Result<(), HarvestFailure> {
     let document_path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
     let created = route_metadata_create(
-        CreateMetadataDocumentOperation::new_generated_id(
-            CreateMetadataDocumentConfig {
-                actor: actor.clone(),
-                group_id: source.group_id,
-                document_id,
-                document_path: document_path.clone(),
-                public: false,
-                payload: CreateMetadataDocumentPayload::RoCrate {
-                    jsonld: dc_to_jsonld(record),
-                },
+        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+            actor: actor.clone(),
+            group_id: source.group_id,
+            document_id,
+            document_path: document_path.clone(),
+            public: false,
+            payload: CreateMetadataDocumentPayload::RoCrate {
+                jsonld: dc_to_jsonld(record),
             },
-        ),
+        }),
         ctx.driver.clone(),
         Some(internal_token(source.created_by, realm_id)),
     )

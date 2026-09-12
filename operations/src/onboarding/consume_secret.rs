@@ -11,9 +11,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::onboarding::create_secret::secret_record_key;
-use crate::onboarding::secret_state::{
-    resolve_secret_state, secret_state_key, secret_state_entry,
-};
+use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry, secret_state_key};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsumeOnboardingSecretInput {

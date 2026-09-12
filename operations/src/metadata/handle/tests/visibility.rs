@@ -1,6 +1,6 @@
 use super::*;
-use aruna_core::structs::Permission;
 use crate::auth::permission_rules::GroupPermissionRules;
+use aruna_core::structs::Permission;
 pub(super) fn registry_record(document_path: &str) -> MetadataRegistryRecord {
     let document_id = Ulid::generate();
     MetadataRegistryRecord {

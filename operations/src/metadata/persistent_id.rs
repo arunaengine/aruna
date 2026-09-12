@@ -24,9 +24,7 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::repository::{metadata_audit_key, read_document_registry};
 use crate::placement::resolve_shard_holders;
-use crate::sync::document_outbox::{
-    new_outbox_record, outbox_write_entry, schedule_drain_effect,
-};
+use crate::sync::document_outbox::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 
 /// Storage conflicts are optimistic and short-lived; a caller that exhausts these
 /// gets a retryable error rather than a lost transition.
@@ -636,9 +634,7 @@ async fn abort_transaction(ctx: &DriverContext, txn_id: TxnId) {
 
 async fn schedule_drain(ctx: &DriverContext) {
     if let Some(task_handle) = ctx.task_handle.as_ref() {
-        task_handle
-            .send_effect(schedule_drain_effect())
-            .await;
+        task_handle.send_effect(schedule_drain_effect()).await;
     }
 }
 
