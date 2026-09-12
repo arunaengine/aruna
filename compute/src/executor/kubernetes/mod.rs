@@ -49,10 +49,10 @@ use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned};
 mod manifest;
 
 use manifest::{
-    HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, helper_pod, job_manifest,
-    marker_manifest, marker_name, mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest,
-    needs_workspace, network_policies, policy_manifests, pvc_manifest, secret_manifest,
-    secret_name, workspace_name,
+    HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, data_pv_manifest, data_pvc_manifest,
+    helper_pod, job_manifest, marker_manifest, marker_name, mount_buckets, mount_pv_manifest,
+    mount_pvc_manifest, mounts_data, needs_workspace, network_policies, policy_manifests,
+    pvc_manifest, secret_manifest, secret_name, workspace_name,
 };
 
 pub const EPOCH_ANNOTATION: &str = "aruna-engine.org/attempt-epoch";
@@ -209,69 +209,95 @@ impl KubernetesBackend {
         context: &FenceContext,
         layout: &StageLayout,
     ) -> Result<(), BackendError> {
+        for (index, bucket) in mount_buckets(layout).iter().enumerate() {
+            let pv = mount_pv_manifest(context, &self.config, index, bucket)?;
+            let pvc = mount_pvc_manifest(context, &self.config, index)?;
+            self.ensure_volume(context, bucket, pv, pvc).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_data(
+        &self,
+        context: &FenceContext,
+        spec: &TaskSpec,
+    ) -> Result<(), BackendError> {
+        let Some(workspace) = spec.workspace.as_ref() else {
+            return Ok(());
+        };
+        let pv = data_pv_manifest(context, &self.config, &workspace.bucket_name)?;
+        let pvc = data_pvc_manifest(context, &self.config)?;
+        self.ensure_volume(context, &workspace.bucket_name, pv, pvc)
+            .await
+    }
+
+    async fn ensure_volume(
+        &self,
+        context: &FenceContext,
+        bucket: &str,
+        pv: PersistentVolume,
+        pvc: PersistentVolumeClaim,
+    ) -> Result<(), BackendError> {
         let driver = self.config.s3_mount_driver.as_deref().ok_or_else(|| {
             BackendError::InvalidSpec("S3 mounts are disabled on this backend".to_string())
         })?;
-        for (index, bucket) in mount_buckets(layout).iter().enumerate() {
-            let name = mount_name(&context.attempt.external_name(), index);
-            let pv = mount_pv_manifest(context, &self.config, index, bucket)?;
-            match self.pvs().create(&PostParams::default(), &pv).await {
-                Ok(_) => {}
-                Err(error) if api_code(&error) == Some(409) => {
-                    let existing = self.pvs().get(&name).await.map_err(kube_error)?;
-                    let valid = existing
-                        .metadata
-                        .annotations
+        let name = pv.name_any();
+        match self.pvs().create(&PostParams::default(), &pv).await {
+            Ok(_) => {}
+            Err(error) if api_code(&error) == Some(409) => {
+                let existing = self.pvs().get(&name).await.map_err(kube_error)?;
+                let valid = existing
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.get(EPOCH_ANNOTATION))
+                    .and_then(|epoch| epoch.parse::<u64>().ok())
+                    == Some(context.attempt_epoch)
+                    && existing
+                        .spec
                         .as_ref()
-                        .and_then(|annotations| annotations.get(EPOCH_ANNOTATION))
-                        .and_then(|epoch| epoch.parse::<u64>().ok())
-                        == Some(context.attempt_epoch)
-                        && existing
-                            .spec
-                            .as_ref()
-                            .and_then(|spec| spec.csi.as_ref())
-                            .is_some_and(|csi| {
-                                csi.driver == driver
-                                    && csi.volume_handle == name
-                                    && csi
-                                        .volume_attributes
-                                        .as_ref()
-                                        .and_then(|attributes| attributes.get("bucketName"))
-                                        == Some(bucket)
-                            });
-                    if !valid {
-                        return Err(BackendError::Conflict(format!(
-                            "S3 PersistentVolume `{name}` belongs to another attempt"
-                        )));
-                    }
+                        .and_then(|spec| spec.csi.as_ref())
+                        .is_some_and(|csi| {
+                            csi.driver == driver
+                                && csi.volume_handle == name
+                                && csi
+                                    .volume_attributes
+                                    .as_ref()
+                                    .and_then(|attributes| attributes.get("bucketName"))
+                                    .map(String::as_str)
+                                    == Some(bucket)
+                        });
+                if !valid {
+                    return Err(BackendError::Conflict(format!(
+                        "S3 PersistentVolume `{name}` belongs to another attempt"
+                    )));
                 }
-                Err(error) => return Err(kube_error(error)),
             }
-            let pvc = mount_pvc_manifest(context, &self.config, index)?;
-            match self.pvcs().create(&PostParams::default(), &pvc).await {
-                Ok(_) => {}
-                Err(error) if api_code(&error) == Some(409) => {
-                    let existing = self.pvcs().get(&name).await.map_err(kube_error)?;
-                    let valid = existing
-                        .metadata
-                        .annotations
+            Err(error) => return Err(kube_error(error)),
+        }
+        match self.pvcs().create(&PostParams::default(), &pvc).await {
+            Ok(_) => {}
+            Err(error) if api_code(&error) == Some(409) => {
+                let existing = self.pvcs().get(&name).await.map_err(kube_error)?;
+                let valid = existing
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.get(EPOCH_ANNOTATION))
+                    .and_then(|epoch| epoch.parse::<u64>().ok())
+                    == Some(context.attempt_epoch)
+                    && existing
+                        .spec
                         .as_ref()
-                        .and_then(|annotations| annotations.get(EPOCH_ANNOTATION))
-                        .and_then(|epoch| epoch.parse::<u64>().ok())
-                        == Some(context.attempt_epoch)
-                        && existing
-                            .spec
-                            .as_ref()
-                            .and_then(|spec| spec.volume_name.as_deref())
-                            == Some(name.as_str());
-                    if !valid {
-                        return Err(BackendError::Conflict(format!(
-                            "S3 PersistentVolumeClaim `{name}` belongs to another attempt"
-                        )));
-                    }
+                        .and_then(|spec| spec.volume_name.as_deref())
+                        == Some(name.as_str());
+                if !valid {
+                    return Err(BackendError::Conflict(format!(
+                        "S3 PersistentVolumeClaim `{name}` belongs to another attempt"
+                    )));
                 }
-                Err(error) => return Err(kube_error(error)),
             }
+            Err(error) => return Err(kube_error(error)),
         }
         Ok(())
     }
@@ -996,6 +1022,9 @@ impl ExecutorBackend for KubernetesBackend {
         self.remove_marker(context).await?;
         if spec.session {
             self.ensure_secret(context, spec).await?;
+            if mounts_data(spec, &self.config) {
+                self.ensure_data(context, spec).await?;
+            }
         }
         match spec.staging_mode {
             StagingMode::Files => {

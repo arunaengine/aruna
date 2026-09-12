@@ -21,6 +21,7 @@ pub const MARKER_PATH: &str = "/aruna-marker/marker";
 pub const SENTINEL_PATH: &str = "/workspace/.aruna-stage";
 pub const TASK_SENTINEL: &str = "/aruna-workspace/.aruna-stage";
 pub const HELPER_PATH: &str = "/aruna-compute-helper";
+pub const DATA_DIR: &str = "data";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageMarker {
@@ -129,6 +130,18 @@ pub fn job_manifest(
             };
             volumes.push(json!({"name":"scratch","emptyDir":empty_dir}));
             mounts.push(json!({"name":"scratch","mountPath":scratch}));
+        }
+        if mounts_data(spec, config) {
+            let volume = data_name(&name);
+            volumes.push(json!({
+                "name":volume,
+                "persistentVolumeClaim":{"claimName":volume}
+            }));
+            mounts.push(json!({
+                "name":volume,
+                "mountPath":scratch.join(DATA_DIR),
+                "readOnly":false
+            }));
         }
     }
     // The credential Secret rides `envFrom`, which any inline entry of the same
@@ -246,9 +259,64 @@ pub fn mount_pv_manifest(
     bucket: &str,
 ) -> Result<PersistentVolume, BackendError> {
     let name = mount_name(&context.attempt.external_name(), index);
+    let options = ["file-mode=0444", "dir-mode=0555"];
+    s3_pv_manifest(context, config, &name, bucket, &options, true)
+}
+
+pub fn mount_pvc_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    index: usize,
+) -> Result<PersistentVolumeClaim, BackendError> {
+    s3_pvc_manifest(
+        context,
+        config,
+        &mount_name(&context.attempt.external_name(), index),
+    )
+}
+
+/// The session's writable view of the workspace bucket's `data/` prefix.
+pub fn data_pv_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    bucket: &str,
+) -> Result<PersistentVolume, BackendError> {
+    let name = data_name(&context.attempt.external_name());
+    let prefix = format!("prefix={DATA_DIR}/");
+    let options = [
+        prefix.as_str(),
+        "allow-delete",
+        "allow-overwrite",
+        "file-mode=0644",
+        "dir-mode=0755",
+    ];
+    s3_pv_manifest(context, config, &name, bucket, &options, false)
+}
+
+pub fn data_pvc_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+) -> Result<PersistentVolumeClaim, BackendError> {
+    s3_pvc_manifest(
+        context,
+        config,
+        &data_name(&context.attempt.external_name()),
+    )
+}
+
+fn s3_pv_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    name: &str,
+    bucket: &str,
+    options: &[&str],
+    read_only: bool,
+) -> Result<PersistentVolume, BackendError> {
     let driver = config.s3_mount_driver.as_deref().ok_or_else(|| {
         BackendError::InvalidSpec("S3 mounts are disabled on this backend".to_string())
     })?;
+    let mut mount_options = vec!["uid=65534", "gid=65534", "allow-other"];
+    mount_options.extend_from_slice(options);
     serde_json::from_value(json!({
         "apiVersion":"v1",
         "kind":"PersistentVolume",
@@ -263,13 +331,11 @@ pub fn mount_pv_manifest(
             "persistentVolumeReclaimPolicy":"Retain",
             "storageClassName":"",
             "claimRef":{"namespace":config.namespace,"name":name},
-            "mountOptions":[
-                "uid=65534","gid=65534","allow-other","file-mode=0444","dir-mode=0555"
-            ],
+            "mountOptions":mount_options,
             "csi":{
                 "driver":driver,
                 "volumeHandle":name,
-                "readOnly":true,
+                "readOnly":read_only,
                 "volumeAttributes":{
                     "bucketName":bucket,
                     "authenticationSource":"secret"
@@ -284,12 +350,11 @@ pub fn mount_pv_manifest(
     .map_err(manifest_error)
 }
 
-pub fn mount_pvc_manifest(
+fn s3_pvc_manifest(
     context: &FenceContext,
     config: &KubernetesConfig,
-    index: usize,
+    name: &str,
 ) -> Result<PersistentVolumeClaim, BackendError> {
-    let name = mount_name(&context.attempt.external_name(), index);
     serde_json::from_value(json!({
         "apiVersion":"v1",
         "kind":"PersistentVolumeClaim",
@@ -374,11 +439,22 @@ pub fn secret_manifest(
     config: &KubernetesConfig,
     spec: &TaskSpec,
 ) -> Result<Secret, BackendError> {
-    let values = spec
+    let mut values = spec
         .secret_env
         .iter()
         .map(|(key, value)| (key.clone(), value.expose().to_string()))
         .collect::<BTreeMap<_, _>>();
+    // The CSI driver reads the data mount credential under its own key names.
+    if mounts_data(spec, config) {
+        for (env, key) in [
+            ("AWS_ACCESS_KEY_ID", "access_key_id"),
+            ("AWS_SECRET_ACCESS_KEY", "secret_access_key"),
+        ] {
+            if let Some(value) = values.get(env).cloned() {
+                values.entry(key.to_string()).or_insert(value);
+            }
+        }
+    }
     serde_json::from_value(json!({
         "apiVersion":"v1",
         "kind":"Secret",
@@ -522,6 +598,18 @@ pub fn workspace_name(name: &str) -> String {
 
 pub fn mount_name(name: &str, index: usize) -> String {
     format!("{name}-s3-{index}")
+}
+
+pub fn data_name(name: &str) -> String {
+    format!("{name}-data")
+}
+
+/// A session with a workspace sees the bucket's `data/` prefix below its workdir.
+pub fn mounts_data(spec: &TaskSpec, config: &KubernetesConfig) -> bool {
+    spec.session
+        && spec.workspace.is_some()
+        && spec.workdir.is_some()
+        && config.s3_mount_driver.is_some()
 }
 
 pub fn mount_buckets(layout: &StageLayout) -> Vec<String> {
@@ -690,7 +778,7 @@ fn manifest_error(error: serde_json::Error) -> BackendError {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::compute::{AttemptRef, S3Mount, Secret, TaskInput};
+    use aruna_core::compute::{AttemptRef, S3Mount, Secret, TaskInput, WorkspaceBinding};
 
     use super::*;
 
