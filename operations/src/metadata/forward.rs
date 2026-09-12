@@ -52,7 +52,7 @@ use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
     MetadataApiError, MetadataRoCrateExportView, ensure_record_readable, export_metadata_rocrate,
-    get_visible_document, load_document_record,
+    get_visible_document, load_live_record,
 };
 use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
@@ -86,7 +86,7 @@ use crate::realm::peer_trust::{PeerTrust, ensure_peer_trust};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::get_bucket::GetBucketInfoOperation;
 use crate::sync::document_outbox::{
-    new_outbox_record, schedule_outbox_drain_effect, write_outbox_effect,
+    new_outbox_record, schedule_drain_effect, write_outbox_effect,
 };
 
 /// Where a metadata write must be applied: topic membership equals the bucket's
@@ -571,7 +571,7 @@ pub async fn route_profile_status(
     auth_token: Option<MetadataAuthToken>,
     revalidate: bool,
 ) -> Result<MetadataProfileValidationStatus, MetadataApiError> {
-    let registry = load_document_record(context.as_ref(), request.document_id).await?;
+    let registry = load_live_record(context.as_ref(), request.document_id).await?;
     if context.net_handle.is_none() {
         ensure_record_readable(
             context.as_ref(),
@@ -610,7 +610,7 @@ pub async fn route_profile_status(
         let auth_token = auth_token.clone();
         Box::pin(async move {
             if Some(holder) == local_node {
-                let record = load_document_record(context.as_ref(), request.document_id)
+                let record = load_live_record(context.as_ref(), request.document_id)
                     .await
                     .map_err(read_error)?;
                 ensure_record_readable(
@@ -1022,7 +1022,7 @@ pub async fn export_profile_local(
     profile_id: Ulid,
     expected_revision: Ulid,
 ) -> Result<ExportMetadataRoCrateResult, MetadataReadError> {
-    let record = load_document_record(context, profile_id)
+    let record = load_live_record(context, profile_id)
         .await
         .map_err(read_error)?;
     if record.realm_id != realm_id
@@ -1771,7 +1771,7 @@ pub(crate) async fn apply_forwarded_write(
                 Ok(auth)
                     if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
                 {
-                    let record = match load_document_record(context.as_ref(), *document_id).await {
+                    let record = match load_live_record(context.as_ref(), *document_id).await {
                         Ok(record) => record,
                         Err(error) => {
                             return MetadataTransportMessage::ForwardedProfileValidationStatus {
@@ -2930,7 +2930,7 @@ async fn read_graph_state(
     if auth.realm_id != realm_id || !peer_acts_for(&config, peer, auth.user_id) {
         return Err(SyncRefusal::Unauthorized);
     }
-    let record = load_document_record(context.as_ref(), document_id)
+    let record = load_live_record(context.as_ref(), document_id)
         .await
         .map_err(sync_refusal)?;
     ensure_record_readable(context.as_ref(), realm_id, Some(&auth), &record, None)
@@ -3384,7 +3384,7 @@ pub(crate) async fn apply_admin_relay(
     }
     if let Some(task_handle) = context.task_handle.as_ref()
         && let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = task_handle
-            .send_effect(schedule_outbox_drain_effect())
+            .send_effect(schedule_drain_effect())
             .await
     {
         warn!(%message, "Failed to schedule the drain for a relayed admin event");

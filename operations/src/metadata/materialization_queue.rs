@@ -40,7 +40,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
-use crate::tasks::queue_backoff::{due_after, retry_after_ms};
+use crate::tasks::queue_backoff::{due_after, retry_delay_ms};
 
 use super::iri_index::MetadataIriIndexError;
 use super::profile_validation::{assess_render, violation_count};
@@ -734,7 +734,7 @@ async fn plan_finish_chunk(
                 let next_job = MetadataMaterializationJobRecord {
                     document_id: job.document_id,
                     event_id: job.event_id,
-                    due_at_ms: unix_timestamp_millis().saturating_add(retry_after_ms(attempts)),
+                    due_at_ms: unix_timestamp_millis().saturating_add(retry_delay_ms(attempts)),
                     attempts,
                     failures: status.failures,
                     parks: job.parks,
