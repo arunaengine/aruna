@@ -1434,9 +1434,13 @@ async fn build_kubernetes(
             storage_class,
             helper_image,
             pull_deadline: env_duration("ARUNA_COMPUTE_K8S_PULL_DEADLINE", 300)?,
-            s3_cidrs,
+            s3_cidrs: if workspace.is_some() {
+                s3_cidrs
+            } else {
+                Vec::new()
+            },
             s3_port,
-            s3_mount_driver,
+            s3_mount_driver: s3_mount_driver.filter(|_| workspace.is_some()),
             policy_manifests,
             service_account: dotenvy::var("ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT")
                 .unwrap_or_else(|_| aruna_compute::DEFAULT_WORKLOAD_SA.to_string()),
