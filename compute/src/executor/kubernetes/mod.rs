@@ -3336,6 +3336,32 @@ mod tests {
     }
 
     #[test]
+    fn classifies_registry_refusals() {
+        // The message is external kubelet/registry evidence, so only the
+        // published refusal texts refuse an attempt; anything unknown stays
+        // retryable instead of being inferred into a failure.
+        for message in [
+            "401 Unauthorized",
+            "403 Forbidden",
+            "404 Not Found",
+            "manifest unknown",
+            "name unknown",
+            "pull access denied",
+            "repository does not exist",
+        ] {
+            let lower = message.to_ascii_lowercase();
+            assert!(pull_refused("ErrImagePull", Some(message)), "{message}");
+            assert!(pull_refused("ImagePullBackOff", Some(&lower)), "{message}");
+        }
+        assert!(!pull_refused(
+            "ErrImagePull",
+            Some("connection reset by peer")
+        ));
+        assert!(!pull_refused("ErrImagePull", None));
+        assert!(!pull_refused("InvalidImageName", Some("401 Unauthorized")));
+    }
+
+    #[test]
     fn waits_pull_backoff() {
         // A registry blip inside the deadline must stay Running.
         let pod = waiting_pod("ImagePullBackOff", POD_START);
