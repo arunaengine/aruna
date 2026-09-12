@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
@@ -19,7 +19,7 @@ use fjall::{
     KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode, Readable,
 };
 use tokio::sync::{Notify, oneshot};
-use tracing::{Span, debug, debug_span, field, warn};
+use tracing::{Span, debug_span, field, warn};
 use ulid::Ulid;
 
 use crate::compaction::Compactor;
@@ -117,12 +117,6 @@ fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
         | StorageEffect::SyncAll => None,
     }
 }
-// Deletes leave tombstones that every later read walks. Small keyspaces never
-// fill a memtable, so compaction has to be triggered by the delete count.
-const COMPACT_AFTER_DELETES: u64 = 5_000;
-// A major compaction rewrites the whole keyspace and rotates its memtable under
-// the database-wide journal lock, so only a small keyspace is compacted here.
-const COMPACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_GROUP_COMMIT: usize = 256;
 const READ_POOL_THREADS: usize = 4;
 const BULK_READ_POOL_THREADS: usize = 2;
@@ -201,132 +195,6 @@ impl Store {
             }
             Err(error) => Err(StorageError::KeyspaceError(error.to_string())),
         }
-    }
-}
-
-struct CompactionJob {
-    key_space: String,
-    deletes: u64,
-    run: Box<dyn FnOnce() -> fjall::Result<()> + Send>,
-}
-
-/// Runs keyspace compactions on one background thread, so compaction never
-/// blocks the write worker and never holds a lock the read pool needs.
-struct Compactor {
-    sender: Option<std::sync::mpsc::Sender<CompactionJob>>,
-    thread: Option<thread::JoinHandle<()>>,
-    active: Arc<Mutex<HashSet<String>>>,
-    stopping: Arc<AtomicBool>,
-}
-
-impl Compactor {
-    fn spawn() -> Self {
-        let (sender, receiver) = std::sync::mpsc::channel::<CompactionJob>();
-        let active: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let stopping = Arc::new(AtomicBool::new(false));
-        let running = active.clone();
-        let stop = stopping.clone();
-        let thread = thread::spawn(move || {
-            // A queued job holds a keyspace handle, so the backlog is dropped
-            // on shutdown instead of keeping the database open job by job.
-            while let Ok(job) = receiver.recv() {
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
-                run_compaction(job, &running);
-            }
-        });
-        Self {
-            sender: Some(sender),
-            thread: Some(thread),
-            active,
-            stopping,
-        }
-    }
-
-    /// Keeps at most one queued compaction per keyspace, including while one runs.
-    fn submit(&self, key_space: &str, deletes: u64, keyspace: OptimisticTxKeyspace) {
-        let Some(sender) = self.sender.as_ref() else {
-            return;
-        };
-        if !self
-            .active
-            .lock()
-            .expect("storage compaction mutex poisoned")
-            .insert(key_space.to_string())
-        {
-            return;
-        }
-        let job = CompactionJob {
-            key_space: key_space.to_string(),
-            deletes,
-            run: Box::new(move || {
-                // fjall 3.1.10 hides both calls from its docs; a version bump
-                // has to recheck that they still exist and still block here.
-                let keyspace: &fjall::Keyspace = keyspace.as_ref();
-                keyspace.rotate_memtable_and_wait()?;
-                keyspace.major_compact()
-            }),
-        };
-        if sender.send(job).is_err() {
-            self.release(key_space);
-        }
-    }
-
-    fn release(&self, key_space: &str) {
-        self.active
-            .lock()
-            .expect("storage compaction mutex poisoned")
-            .remove(key_space);
-    }
-
-    /// Waits for a running compaction so no keyspace handle outlives the store.
-    fn shutdown(&mut self) {
-        self.stopping.store(true, Ordering::Release);
-        self.sender = None;
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl Drop for Compactor {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-/// Whether a keyspace is small enough for a delete-triggered major compaction.
-fn compactable(disk_space: u64) -> bool {
-    disk_space <= COMPACT_MAX_BYTES
-}
-
-fn run_compaction(job: CompactionJob, active: &Arc<Mutex<HashSet<String>>>) {
-    let CompactionJob {
-        key_space,
-        deletes,
-        run,
-    } = job;
-    active
-        .lock()
-        .expect("storage compaction mutex poisoned")
-        .remove(&key_space);
-    let started = Instant::now();
-    match run() {
-        Ok(()) => debug!(
-            event = "storage.keyspace.compacted",
-            key_space = %key_space,
-            deletes,
-            elapsed_ms = duration_ms(started.elapsed()),
-            "Compacted a delete-heavy keyspace"
-        ),
-        Err(error) => warn!(
-            event = "storage.keyspace.compact_failed",
-            key_space = %key_space,
-            deletes,
-            error = %error,
-            "Keyspace compaction failed"
-        ),
     }
 }
 
@@ -3385,17 +3253,6 @@ mod tests {
         ));
     }
 
-    /// Compactor that accepts no job, for workers built without a background
-    /// thread.
-    fn idle_compactor() -> super::Compactor {
-        super::Compactor {
-            sender: None,
-            thread: None,
-            active: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            stopping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-
     /// Worker sharing the handle's channels, cleanup map and fence, driven by
     /// the test thread so effect order is exact.
     fn worker(dir: &tempfile::TempDir, handle: &StorageHandle) -> FjallStorage {
@@ -4964,8 +4821,8 @@ mod tests {
         );
     }
 
-        /// Replaces the worker's compactor with a channel the test owns, so queued
-        /// compactions are observable without running one.
+    /// Replaces the worker's compactor with a channel the test owns, so queued
+    /// compactions are observable without running one.
     fn stub_compactor(
         storage: &mut FjallStorage,
     ) -> std::sync::mpsc::Receiver<crate::compaction::CompactionJob> {

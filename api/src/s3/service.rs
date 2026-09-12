@@ -24,7 +24,7 @@ use crate::s3::error::{IntoS3Error, gate_context_error, routing_inputs_error};
 use crate::s3::multipart_join::{
     CompletionFailure, CompletionRegistry, await_completion, completion_registry,
 };
-use crate::s3::scope::{SubpathScope, resolve_scope};
+use crate::s3::scope::SubpathScope;
 use crate::s3::server::DeleteObjectsBody;
 use crate::s3::util::{
     checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
@@ -469,7 +469,6 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
-        let scope = listing_scope(&req.extensions, req.input.prefix.as_deref())?;
         let requested_continuation_token = req.input.continuation_token.clone();
         let continuation_token = Self::decode_list_token(requested_continuation_token.as_deref())?;
         let max_keys = match req.input.max_keys {
@@ -579,7 +578,6 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
-        let scope = listing_scope(&req.extensions, req.input.prefix.as_deref())?;
         let max_keys = match req.input.max_keys {
             None => ListObjectsV2Operation::DEFAULT_MAX_KEYS,
             Some(max_keys) => usize::try_from(max_keys)
@@ -1690,9 +1688,14 @@ impl S3 for ArunaS3Service {
                         checksum_crc32: encoded.checksum_crc32,
                         checksum_crc32c: encoded.checksum_crc32c,
                         checksum_crc64nvme: encoded.checksum_crc64nvme,
+                        checksum_md5: None,
                         checksum_sha1: encoded.checksum_sha1,
                         checksum_sha256: encoded.checksum_sha256,
+                        checksum_sha512: None,
                         checksum_type: encoded.checksum_type,
+                        checksum_xxhash128: None,
+                        checksum_xxhash3: None,
+                        checksum_xxhash64: None,
                     }
                 })
                 .or_else(|| {
@@ -1711,9 +1714,14 @@ impl S3 for ArunaS3Service {
                             checksum_crc32: encoded.checksum_crc32,
                             checksum_crc32c: encoded.checksum_crc32c,
                             checksum_crc64nvme: encoded.checksum_crc64nvme,
+                            checksum_md5: None,
                             checksum_sha1: encoded.checksum_sha1,
                             checksum_sha256: encoded.checksum_sha256,
+                            checksum_sha512: None,
                             checksum_type: encoded.checksum_type,
+                            checksum_xxhash128: None,
+                            checksum_xxhash3: None,
+                            checksum_xxhash64: None,
                         }
                     })
                 })
@@ -2722,6 +2730,7 @@ mod tests {
     use super::object::next_marker_of;
     use super::*;
     use crate::s3::checksum::UploadChecksumRequest;
+    use crate::s3::scope::resolve_scope;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -3927,7 +3936,7 @@ mod tests {
                     permissions: HashMap::from([(
                         format!(
                             "{}/imaging/**",
-                            blob_bucket_permission_path(realm_id, group_id, node_id, "study")
+                            bucket_permission_path(realm_id, group_id, node_id, "study")
                         ),
                         Permission::READ,
                     )]),
@@ -3948,7 +3957,7 @@ mod tests {
             &service.state.storage_handle,
             AUTH_KEYSPACE,
             realm_id.as_bytes().to_vec(),
-            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+            RealmAuthorizationDocument::default_realm_doc(realm_id)
                 .to_bytes(&actor)
                 .unwrap(),
         )
@@ -4004,7 +4013,7 @@ mod tests {
         let scope = resolve_scope(
             &service.state,
             user_access,
-            &blob_bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
+            &bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
         )
         .await
         .unwrap();
@@ -4013,7 +4022,7 @@ mod tests {
         extensions.insert(user_access.clone());
         extensions.insert(test_bucket_info(group_id, user_access.user_identity));
         extensions.insert(scope);
-        test_list_objects_v2_request(
+        list_request(
             extensions,
             ListObjectsV2Input {
                 bucket: "study".to_string(),
@@ -4064,7 +4073,7 @@ mod tests {
             user_id: user_access.user_identity,
             realm_id,
         };
-        let mut realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let mut realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let role_id = Ulid::generate();
         realm_auth.roles.insert(
             role_id,
@@ -4148,7 +4157,7 @@ mod tests {
         let scope = resolve_scope(
             &service.state,
             &user_access,
-            &blob_bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
+            &bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
         )
         .await
         .unwrap();
@@ -4168,7 +4177,7 @@ mod tests {
             &service.state.storage_handle,
             AUTH_KEYSPACE,
             group_id.to_bytes().to_vec(),
-            GroupAuthorizationDocument::new_default_group_doc(
+            GroupAuthorizationDocument::default_group_doc(
                 user_access.user_identity,
                 service.realm_id,
                 group_id,
@@ -4227,7 +4236,7 @@ mod tests {
         let scope = resolve_scope(
             &service.state,
             user_access,
-            &blob_bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
+            &bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
         )
         .await
         .unwrap();
@@ -4235,7 +4244,7 @@ mod tests {
         extensions.insert(user_access.clone());
         extensions.insert(test_bucket_info(group_id, user_access.user_identity));
         extensions.insert(scope);
-        test_list_objects_v2_request(
+        list_request(
             extensions,
             ListObjectsV2Input {
                 bucket: "study".to_string(),
@@ -4269,7 +4278,7 @@ mod tests {
             let Some(encoded) = token.clone() else {
                 break;
             };
-            let decoded = ArunaS3Service::decode_list_objects_v2_continuation_token(Some(&encoded))
+            let decoded = ArunaS3Service::decode_list_token(Some(&encoded))
                 .unwrap()
                 .unwrap();
             let head = BlobHeadKey::from_bytes(&decoded.last_key).unwrap();
@@ -4292,8 +4301,7 @@ mod tests {
             UNIX_EPOCH,
         )
         .await;
-        let root =
-            blob_bucket_permission_path(service.realm_id, group_id, service.node_id, "study");
+        let root = bucket_permission_path(service.realm_id, group_id, service.node_id, "study");
         for (suffix, expected) in [("/imaging", vec!["imaging"]), ("", vec![])] {
             user_access.path_restrictions = Some(vec![PathRestriction {
                 pattern: format!("{root}{suffix}"),
@@ -4331,8 +4339,7 @@ mod tests {
             UNIX_EPOCH,
         )
         .await;
-        let root =
-            blob_bucket_permission_path(service.realm_id, group_id, service.node_id, "study");
+        let root = bucket_permission_path(service.realm_id, group_id, service.node_id, "study");
         user_access.path_restrictions = Some(
             [
                 ("imaging/**", Permission::READ),
@@ -4453,9 +4460,10 @@ mod tests {
         .await;
         let mut request = subpath_request(&service, &user_access, group_id, Some("imaging/")).await;
         request.input.start_after = Some("imaging/z".to_string());
-        let token = scoped_marker("study", Some("imaging/0"), None).unwrap();
+        let token =
+            crate::s3::service::object::scoped_marker("study", Some("imaging/0"), None).unwrap();
         request.input.continuation_token =
-            ArunaS3Service::encode_list_objects_v2_continuation_token(token.as_ref()).unwrap();
+            ArunaS3Service::encode_list_token(token.as_ref()).unwrap();
         let output = service.list_objects_v2(request).await.unwrap().output;
         let prefixes: Vec<_> = output
             .common_prefixes
@@ -4487,7 +4495,7 @@ mod tests {
             session: None,
         };
         let object_path = |key: &str| {
-            aruna_core::structs::blob_object_permission_path(
+            aruna_core::structs::object_permission_path(
                 service.realm_id,
                 group_id,
                 service.node_id,
