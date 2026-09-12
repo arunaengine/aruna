@@ -85,10 +85,9 @@ async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketIn
         &state.get_ctx(),
     )
     .await
-    .and_then(|result| result.transpose())
     {
-        Ok(Some(bucket_info)) => Ok(bucket_info),
-        Ok(None) | Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Ok(bucket_info) => Ok(bucket_info),
+        Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
 }

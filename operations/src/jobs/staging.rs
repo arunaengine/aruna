@@ -423,11 +423,11 @@ async fn load_live_bucket(
     bucket: &str,
 ) -> Result<aruna_core::structs::BucketInfo, ItemFailure> {
     match drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver).await {
-        Ok(Some(Ok(bucket_info))) => Ok(bucket_info),
-        Ok(Some(Err(GetBucketInfoError::NotFound))) | Ok(None) => Err(ItemFailure::Stage(
+        Ok(bucket_info) => Ok(bucket_info),
+        Err(GetBucketInfoError::NotFound) => Err(ItemFailure::Stage(
             "destination bucket no longer exists".to_string(),
         )),
-        Ok(Some(Err(error))) | Err(error) => Err(ItemFailure::System(error.to_string())),
+        Err(error) => Err(ItemFailure::System(error.to_string())),
     }
 }
 

@@ -1760,12 +1760,9 @@ async fn load_bucket_cors(
         return Ok(None);
     };
 
-    match drive(GetBucketInfoOperation::new(bucket), driver_ctx.as_ref())
-        .await
-        .and_then(|result| result.transpose())
-    {
-        Ok(Some(bucket_info)) => Ok(bucket_info.cors_configuration),
-        Ok(None) | Err(GetBucketInfoError::NotFound) => Ok(None),
+    match drive(GetBucketInfoOperation::new(bucket), driver_ctx.as_ref()).await {
+        Ok(bucket_info) => Ok(bucket_info.cors_configuration),
+        Err(GetBucketInfoError::NotFound) => Ok(None),
         Err(error) => Err(error),
     }
 }

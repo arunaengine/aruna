@@ -457,15 +457,14 @@ async fn canonicalize_watch_path(
         &state.get_ctx(),
     )
     .await
-    .and_then(|output| output.transpose())
     {
-        Ok(Some(info)) => Ok(watch_resource_path(
+        Ok(info) => Ok(watch_resource_path(
             info.group_id,
             node_id,
             &bucket,
             &key_prefix,
         )),
-        Ok(None) | Err(GetBucketInfoError::NotFound) => Ok(path_prefix),
+        Err(GetBucketInfoError::NotFound) => Ok(path_prefix),
         Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
 }

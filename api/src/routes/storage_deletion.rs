@@ -491,10 +491,9 @@ pub(crate) async fn bucket_info(
         &state.get_ctx(),
     )
     .await
-    .and_then(|result| result.transpose())
     {
-        Ok(Some(info)) => Ok(info),
-        Ok(None) | Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Ok(info) => Ok(info),
+        Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
         Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
 }

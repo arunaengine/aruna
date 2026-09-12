@@ -899,11 +899,9 @@ async fn resolve_versioned(
     )
     .await
     {
-        Ok(Some(Ok(info))) => info,
-        Ok(Some(Err(GetBucketInfoError::NotFound)))
-        | Err(GetBucketInfoError::NotFound)
-        | Ok(None) => return Ok(ResolveOutcome::NotFound),
-        Ok(Some(Err(error))) | Err(error) => {
+        Ok(info) => info,
+        Err(GetBucketInfoError::NotFound) => return Ok(ResolveOutcome::NotFound),
+        Err(error) => {
             return Err(DrsError::internal(error.to_string()));
         }
     };

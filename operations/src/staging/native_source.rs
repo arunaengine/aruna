@@ -327,17 +327,12 @@ async fn prepare_reference(
     validate_relationship(net_handle, peer, &relationship, request)?;
     let bucket_info =
         match drive(GetBucketInfoOperation::new(request.bucket.clone()), context).await {
-            Ok(Some(Ok(info))) => info,
-            Ok(Some(Err(GetBucketInfoError::NotFound))) => {
+            Ok(info) => info,
+            Err(GetBucketInfoError::NotFound) => {
                 return Err(NativeReferenceReject::NotFound);
             }
-            Ok(Some(Err(error))) | Err(error) => {
+            Err(error) => {
                 return Err(NativeReferenceReject::Unavailable(error.to_string()));
-            }
-            Ok(None) => {
-                return Err(NativeReferenceReject::Unavailable(
-                    "source bucket lookup did not finish".to_string(),
-                ));
             }
         };
     let auth_context = AuthContext {

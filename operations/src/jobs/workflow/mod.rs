@@ -2534,8 +2534,8 @@ mod tests {
                     context.as_ref()
                 )
                 .await
-                .unwrap(),
-                Some(Err(GetBucketInfoError::NotFound))
+                .unwrap_err(),
+                GetBucketInfoError::NotFound
             ),
             "a run never creates the bucket it names"
         );

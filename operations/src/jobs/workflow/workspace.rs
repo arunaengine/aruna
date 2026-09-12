@@ -114,9 +114,7 @@ pub async fn check_workspace_bucket(
         context,
     ))
     .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| bucket_lookup_error("workspace", error))?
-    .ok_or_else(|| JobError::permanent("existing workspace bucket not found"))?;
+    .map_err(|error| bucket_lookup_error("workspace", error))?;
     if info.group_id != spec.group_id {
         return Err(JobError::permanent(
             "existing workspace bucket is outside the execution group",
@@ -378,9 +376,7 @@ async fn authorize_source(
         context,
     ))
     .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| bucket_lookup_error("input", error))?
-    .ok_or_else(|| JobError::permanent(format!("input bucket {} not found", source.bucket)))?;
+    .map_err(|error| bucket_lookup_error("input", error))?;
     if bucket_info.group_id != spec.group_id {
         return Err(JobError::permanent(
             "input bucket is outside the execution group",
@@ -852,9 +848,7 @@ async fn put_file_output(
     } else {
         let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
             .await
-            .and_then(|result| result.transpose())
-            .map_err(|error| bucket_lookup_error("output", error))?
-            .ok_or_else(|| JobError::permanent(format!("output bucket {bucket} not found")))?;
+            .map_err(|error| bucket_lookup_error("output", error))?;
         if bucket_info.group_id != spec.group_id {
             return Err(JobError::permanent(
                 "output bucket is outside the execution group",

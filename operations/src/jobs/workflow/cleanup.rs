@@ -430,10 +430,9 @@ mod tests {
     }
 
     async fn bucket_exists(ctx: &JobContext, bucket: &str) -> bool {
-        matches!(
-            drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver).await,
-            Ok(Some(Ok(_)))
-        )
+        drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver)
+            .await
+            .is_ok()
     }
 
     async fn write_access(storage: &StorageHandle, access: &UserAccess) {

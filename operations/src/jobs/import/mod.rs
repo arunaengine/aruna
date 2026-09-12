@@ -1239,11 +1239,11 @@ async fn ensure_permission(
 
 async fn load_bucket(ctx: &JobContext, bucket: &str) -> Result<BucketInfo, ImportFailure> {
     match drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver).await {
-        Ok(Some(Ok(info))) => Ok(info),
-        Ok(Some(Err(GetBucketInfoError::NotFound))) | Ok(None) => Err(ImportFailure::Permanent(
-            format!("bucket `{bucket}` does not exist"),
-        )),
-        Ok(Some(Err(error))) | Err(error) => Err(ImportFailure::Retryable(error.to_string())),
+        Ok(info) => Ok(info),
+        Err(GetBucketInfoError::NotFound) => Err(ImportFailure::Permanent(format!(
+            "bucket `{bucket}` does not exist"
+        ))),
+        Err(error) => Err(ImportFailure::Retryable(error.to_string())),
     }
 }
 

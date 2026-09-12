@@ -634,9 +634,9 @@ async fn load_bucket(
     )
     .await
     {
-        Ok(Some(Ok(info))) => Ok(info),
-        Ok(Some(Err(GetBucketInfoError::NotFound))) | Ok(None) => Err(ServerError::NotFound),
-        Ok(Some(Err(error))) | Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Ok(info) => Ok(info),
+        Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
 }
 

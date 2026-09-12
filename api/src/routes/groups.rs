@@ -1936,10 +1936,9 @@ pub(crate) async fn get_bucket_group(
         &state.get_ctx(),
     )
     .await
-    .and_then(|output| output.transpose())
     {
-        Ok(Some(info)) => Ok(Some(info.group_id)),
-        Ok(None) | Err(GetBucketInfoError::NotFound) => Ok(None),
+        Ok(info) => Ok(Some(info.group_id)),
+        Err(GetBucketInfoError::NotFound) => Ok(None),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
 }

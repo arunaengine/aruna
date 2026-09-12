@@ -736,9 +736,7 @@ impl McpServer {
             &self.state.get_ctx(),
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(map_bucket_error)?
-        .ok_or_else(|| internal_error("bucket lookup did not finish"))
+        .map_err(map_bucket_error)
     }
 }
 
@@ -1155,7 +1153,7 @@ fn map_bucket_error(error: GetBucketInfoError) -> CallToolResult {
         } => internal_error(format!(
             "unexpected bucket lookup event in {state:?}: expected {expected}, got {received:?}"
         )),
-        GetBucketInfoError::GetBucketInfoFailed => internal_error("bucket lookup failed"),
+        GetBucketInfoError::Incomplete => internal_error("bucket lookup failed"),
     }
 }
 
@@ -1338,7 +1336,7 @@ mod tests {
                 .contains("list_buckets")
         );
         assert_eq!(
-            body(map_bucket_error(GetBucketInfoError::GetBucketInfoFailed))["code"],
+            body(map_bucket_error(GetBucketInfoError::Incomplete))["code"],
             "Internal error"
         );
     }

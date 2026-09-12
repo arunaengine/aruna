@@ -1200,21 +1200,7 @@ async fn load_source_authorization(
     bucket: &str,
 ) -> Result<SourceAuthorization, (SourceAuthorizationError, Option<GroupId>)> {
     let bucket_info = match drive(GetBucketInfoOperation::new(bucket.to_string()), context).await {
-        Ok(Some(Ok(bucket_info))) => bucket_info,
-        Ok(Some(Err(error))) => {
-            return Err((
-                SourceAuthorizationError::Unavailable(error.to_string()),
-                None,
-            ));
-        }
-        Ok(None) => {
-            return Err((
-                SourceAuthorizationError::Unavailable(
-                    "source bucket lookup produced no result".to_string(),
-                ),
-                None,
-            ));
-        }
+        Ok(bucket_info) => bucket_info,
         Err(error) => {
             return Err((
                 SourceAuthorizationError::Unavailable(error.to_string()),
