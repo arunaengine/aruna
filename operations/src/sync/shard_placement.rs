@@ -7,8 +7,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::structs::{PLACEMENT_EPOCH_PAD, PlacementRef, RealmId};
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::Key;
 use aruna_core::time::unix_timestamp_secs;
+use aruna_core::types::Key;
 use byteview::ByteView;
 
 pub const DOCUMENT_SYNC_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -114,11 +114,7 @@ pub fn schedule_placement_deadline(
     })
 }
 
-pub fn schedule_retry_after(
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    after: Duration,
-) -> Effect {
+pub fn schedule_retry_after(realm_id: RealmId, local_node_id: NodeId, after: Duration) -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::SyncPlacements {
             realm_id,

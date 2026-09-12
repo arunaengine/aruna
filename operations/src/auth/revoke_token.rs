@@ -505,10 +505,8 @@ impl RevokeTokenOperation {
         let admin_event = admin_event.transpose()?;
         revocation_index.compact(&mut reducer_state);
         document.merge_revocation_index(&revocation_index, self.config.now);
-        let stale_conflict_deletes = stale_conflict_deletes(
-            Some(&previous_reducer_state),
-            Some(&reducer_state),
-        );
+        let stale_conflict_deletes =
+            stale_conflict_deletes(Some(&previous_reducer_state), Some(&reducer_state));
 
         let document_target = self.document_ref();
         let placement = target_placement_ref(&document, &document_target, Default::default());
@@ -1474,8 +1472,7 @@ mod tests {
         {
             Event::Storage(StorageEvent::ReadResult {
                 value: Some(bytes), ..
-            }) => aruna_core::reducer::decode_reducer_state(&bytes)
-                .expect("reducer state decodes"),
+            }) => aruna_core::reducer::decode_reducer_state(&bytes).expect("reducer state decodes"),
             other => panic!("unexpected reducer state read: {other:?}"),
         }
     }

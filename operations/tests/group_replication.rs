@@ -17,7 +17,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::placement::{
-    PlacementResolutionContext, target_placement_ref, resolve_shard_holders,
+    PlacementResolutionContext, resolve_shard_holders, target_placement_ref,
 };
 use aruna_operations::sync::incoming::initialize_net_incoming;
 use aruna_operations::tasks::incoming::initialize_task_incoming;

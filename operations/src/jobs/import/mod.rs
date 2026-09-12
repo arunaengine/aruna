@@ -1009,16 +1009,14 @@ async fn create_document(
         realm_id: spec.auth_context.realm_id,
     };
     match route_metadata_create(
-        CreateMetadataDocumentOperation::new_generated_id(
-            CreateMetadataDocumentConfig {
-                actor,
-                group_id: spec.metadata.group_id,
-                document_id: spec.document_id,
-                document_path: spec.metadata.path.clone(),
-                public: spec.metadata.public,
-                payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
-            },
-        ),
+        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+            actor,
+            group_id: spec.metadata.group_id,
+            document_id: spec.document_id,
+            document_path: spec.metadata.path.clone(),
+            public: spec.metadata.public,
+            payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
+        }),
         ctx.driver.clone(),
         Some(MetadataAuthToken::internal(spec.auth_context.clone())),
     )

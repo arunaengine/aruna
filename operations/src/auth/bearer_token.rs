@@ -218,9 +218,7 @@ fn verify_realm_delegation(
     Ok(())
 }
 
-pub fn bearer_decoding_key(
-    issuer_pubkey: &str,
-) -> Result<DecodingKey, ArunaBearerTokenError> {
+pub fn bearer_decoding_key(issuer_pubkey: &str) -> Result<DecodingKey, ArunaBearerTokenError> {
     let issuer_pubkey: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(issuer_pubkey)?
         .try_into()
@@ -477,8 +475,7 @@ mod tests {
         let skewed = FIXED_NOW + aruna_core::auth::REVOCATION_GRACE_SECS + 60;
 
         assert!(matches!(
-            validate_bearer_claims(&state, &lifetime_claims(skewed, skewed + 600))
-                .await,
+            validate_bearer_claims(&state, &lifetime_claims(skewed, skewed + 600)).await,
             Err(ArunaBearerTokenError::LifetimeTooLong)
         ));
     }
