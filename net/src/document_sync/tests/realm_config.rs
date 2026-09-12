@@ -102,7 +102,7 @@ async fn settings_materialize_config() {
     .await
     .expect("realm config settings apply");
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert_eq!(config.metadata_replication, metadata_replication);
     assert_eq!(config.discovery, discovery);
     assert_eq!(config.oidc_providers, vec![existing_provider]);
@@ -171,7 +171,7 @@ async fn description_materializes_config() {
     .await
     .expect("realm config description applies");
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert_eq!(config.description, "Replicated Realm");
     let state_value = read_storage_value(
         &storage,
@@ -276,7 +276,7 @@ async fn placement_materializes_config() {
         .expect("placement op applies");
     }
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert_eq!(config.placement_map, vec![entry]);
     assert_eq!(config.strategies, vec![strategy.clone()]);
     assert_eq!(config.default_strategy_id, Some(strategy.strategy_id));
@@ -461,7 +461,7 @@ async fn dangling_strategy_materializes() {
             .expect("concurrent placement operation applies");
     }
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert!(config.strategies.is_empty());
     assert_eq!(config.default_strategy_id, None);
     assert!(config.strategy_bindings.is_empty());
@@ -518,7 +518,7 @@ async fn settings_create_config() {
     .await
     .expect("realm config settings op bootstraps config doc");
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert_eq!(config.metadata_replication, metadata_replication);
     assert_eq!(config.discovery, discovery);
     assert!(config.nodes.is_empty());
@@ -597,7 +597,7 @@ async fn realm_policies_replicate() {
     .await
     .expect("policy event replicates and applies");
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert_eq!(config.request_policies, policies);
 }
 
@@ -671,7 +671,7 @@ async fn replicated_revocation_applies() {
         .expect("revocation replicates and applies");
     }
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert!(config.token_revoked(&token_hash, unix_timestamp_secs()));
     assert_eq!(config.revoked_tokens.len(), 1);
 }
@@ -843,7 +843,7 @@ async fn accepts_onboarded_origin() {
     apply_admin_operation(&storage, config_target.clone(), user_event)
         .await
         .expect("onboarded revocation applies");
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert!(config.token_revoked(
         &aruna_core::auth::bearer_token_hash("owned-token"),
         unix_timestamp_secs()
@@ -1308,7 +1308,7 @@ async fn replicated_revocation_compacts() {
             .keys()
             .any(|path| path.contains(&expired))
     );
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert!(!config.token_revoked(&expired, now));
     assert_eq!(config.revoked_tokens.len(), 1);
 
@@ -1815,7 +1815,7 @@ async fn quota_survives_materialization() {
     .await
     .expect("realm config settings op bootstraps config doc");
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert_eq!(config.quota, quota);
     assert_eq!(config.metadata_replication, metadata_replication);
 }
@@ -1892,7 +1892,7 @@ async fn settings_bootstrap_config() {
     .await
     .expect("realm config settings op bootstraps full config doc");
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert_eq!(config.metadata_replication, metadata_replication);
     assert_eq!(config.discovery, discovery);
     assert_eq!(
@@ -1953,7 +1953,7 @@ async fn drops_evicted_node() {
         .expect("device enrollment applies");
     }
     assert!(
-        realm_config_nodes(&read_realm_config(&storage, realm_id).await)
+        realm_config_nodes(&stored_realm_config(&storage, realm_id).await)
             .contains_key(&device.to_string())
     );
 
@@ -1971,7 +1971,7 @@ async fn drops_evicted_node() {
     .await
     .expect("device removal applies");
 
-    assert!(realm_config_nodes(&read_realm_config(&storage, realm_id).await).is_empty());
+    assert!(realm_config_nodes(&stored_realm_config(&storage, realm_id).await).is_empty());
 }
 
 #[tokio::test]
@@ -2040,7 +2040,10 @@ async fn replicates_compute_config() {
     .await
     .expect("replicated compute config applies");
 
-    assert_eq!(read_realm_config(&storage, realm_id).await.compute, compute);
+    assert_eq!(
+        stored_realm_config(&storage, realm_id).await.compute,
+        compute
+    );
 }
 
 #[tokio::test]
@@ -2109,7 +2112,7 @@ async fn settings_conflict_withholds() {
     .await
     .expect("conflicting realm config settings op applies");
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert_eq!(config.metadata_replication, first_metadata);
     assert_ne!(config.metadata_replication, second_metadata);
     assert_eq!(config.discovery, discovery);
@@ -2189,7 +2192,7 @@ async fn retries_config_conflict() {
     first_result.expect("first concurrent config operation applies");
     second_result.expect("second concurrent config operation retries");
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     let state = read_reducer_state(&storage, &target)
         .await
         .expect("reducer state reads")
@@ -2265,7 +2268,7 @@ async fn keeps_stale_config() {
     .expect("stale config operation persists clock");
 
     assert_eq!(
-        read_realm_config(&storage, realm_id).await.description,
+        stored_realm_config(&storage, realm_id).await.description,
         "new"
     );
     let state = read_reducer_state(&storage, &target)
@@ -2326,7 +2329,7 @@ async fn node_ensure_merges() {
         .expect("realm config node ensure applies");
     }
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert_eq!(
         realm_config_nodes(&config),
         BTreeMap::from([
@@ -2409,7 +2412,7 @@ async fn oidc_updates_merge() {
         .expect("realm config OIDC provider op applies");
     }
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert_eq!(
         config.metadata_replication,
         seed_config.metadata_replication
@@ -2493,7 +2496,7 @@ async fn oidc_conflict_withholds() {
     .await
     .expect("conflicting realm config OIDC provider upsert applies");
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     let providers = config_oidc_providers(&config);
     assert!(!providers.contains_key("default"));
     assert_eq!(providers.get("untouched"), Some(&untouched));
@@ -2627,7 +2630,7 @@ async fn kind_conflict_withholds() {
     .await
     .expect("conflicting realm config node ensure applies");
 
-    let config = read_realm_config(&storage, realm_id).await;
+    let config = stored_realm_config(&storage, realm_id).await;
     assert!(!realm_config_nodes(&config).contains_key(&conflicted_node.to_string()));
     let path = config_node_path(&conflicted_node);
     assert!(

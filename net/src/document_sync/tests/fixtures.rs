@@ -281,7 +281,7 @@ pub(super) async fn read_realm_auth(
     RealmAuthorizationDocument::from_bytes(&value).expect("realm auth doc decodes")
 }
 
-pub(super) async fn read_realm_config(
+pub(super) async fn stored_realm_config(
     storage: &StorageHandle,
     realm_id: RealmId,
 ) -> RealmConfigDocument {
