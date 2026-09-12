@@ -51,14 +51,14 @@ pub fn usage_group_prefix(group_id: GroupId) -> Vec<u8> {
     key
 }
 
-pub fn usage_group_key(group_id: GroupId, node_id: NodeId) -> Vec<u8> {
+pub fn usage_snapshot_key(group_id: GroupId, node_id: NodeId) -> Vec<u8> {
     let mut key = usage_group_prefix(group_id);
     key.extend_from_slice(node_id.as_bytes());
     key
 }
 
 /// Recovers the owning node id from a snapshot key produced by
-/// [`usage_global_key`] or [`usage_group_key`].
+/// [`usage_global_key`] or [`usage_snapshot_key`].
 pub fn usage_node_id(key: &[u8]) -> Option<NodeId> {
     let tail = match key.strip_prefix(NODE_USAGE_GLOBAL_PREFIX) {
         Some(rest) => rest,
@@ -498,7 +498,7 @@ mod tests {
         assert!(global_key.starts_with(NODE_USAGE_GLOBAL_PREFIX));
         assert_eq!(usage_node_id(&global_key), Some(node_id));
 
-        let group_key = usage_group_key(group_id, node_id);
+        let group_key = usage_snapshot_key(group_id, node_id);
         assert!(group_key.starts_with(&usage_group_prefix(group_id)));
         assert_eq!(usage_node_id(&group_key), Some(node_id));
         assert_eq!(usage_group_id(&group_key), Some(group_id));

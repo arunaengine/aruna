@@ -1,6 +1,6 @@
 use super::*;
 
-impl AdminDocumentReducer {
+impl AdminDocumentReducerState {
     pub(super) fn apply_group(
         &mut self,
         event: &AdminDocumentEvent,

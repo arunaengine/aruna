@@ -263,7 +263,7 @@ pub(in crate::document_sync) async fn group_reducer_entries(
         ),
         (
             GROUP_OWNER_INDEX_KEYSPACE.to_string(),
-            owner_index_key(group.owner, group.group_id).into(),
+            owner_group_key(group.owner, group.group_id).into(),
             ByteView::from(Vec::new()),
         ),
     ])

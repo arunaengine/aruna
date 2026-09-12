@@ -16,7 +16,7 @@ use crate::metadata::{MetadataCreateEventRecord, MetadataGraphLifecycleRecord};
 use crate::storage_entries::{document_lifecycle_key, event_log_key, graph_lifecycle_key};
 use crate::structs::{
     PLACEMENT_EPOCH_PAD, PlacementRef, RealmId, interest_node_key, node_info_key,
-    persistent_id_key, placement_policy_key, usage_global_key, usage_group_key,
+    persistent_id_key, placement_policy_key, usage_global_key, usage_snapshot_key,
     watch_subscription_key,
 };
 use crate::types::{GroupId, Key, UserId};
@@ -433,7 +433,7 @@ impl DocumentSyncTarget {
             Self::NodeUsage {
                 node_id, group_id, ..
             } => match group_id {
-                Some(group_id) => ByteView::from(usage_group_key(*group_id, *node_id)),
+                Some(group_id) => ByteView::from(usage_snapshot_key(*group_id, *node_id)),
                 None => ByteView::from(usage_global_key(*node_id)),
             },
             Self::WatchInterest { realm_id, node_id } => {
@@ -953,7 +953,7 @@ mod tests {
     #[test]
     fn node_usage_keys() {
         use crate::keyspaces::USAGE_NODE_STATS_KEYSPACE;
-        use crate::structs::{usage_global_key, usage_group_key};
+        use crate::structs::{usage_global_key, usage_snapshot_key};
 
         let realm_id = test_realm(2);
         let node_id = test_node(1);
@@ -1002,7 +1002,7 @@ mod tests {
         );
         assert_eq!(
             group.storage_key().as_ref(),
-            usage_group_key(group_id, node_id).as_slice()
+            usage_snapshot_key(group_id, node_id).as_slice()
         );
     }
 

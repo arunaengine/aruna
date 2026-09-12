@@ -1,6 +1,6 @@
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -15,11 +15,10 @@ use aruna_core::structs::{
     NODE_USAGE_GLOBAL_PREFIX, NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY,
     NODE_USAGE_SUMMARY_GROUP_PREFIX, NodeUsageSnapshot, RealmConfigDocument, RealmId,
     USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta,
-    VersionKey, dirty_group_id, dirty_group_key, usage_global_key,
-    usage_group_key, usage_group_id, usage_group_prefix,
-    usage_node_id, usage_summary_key, shard_for_hash, usage_backend_key,
-    global_group_key, global_shard_index, global_shard_key,
-    global_shard_keys, usage_group_key, usage_hash_key,
+    VersionKey, dirty_group_id, dirty_group_key, global_group_key, global_shard_index,
+    global_shard_key, global_shard_keys, shard_for_hash, usage_backend_key, usage_global_key,
+    usage_group_id, usage_group_key, usage_group_prefix, usage_hash_key, usage_node_id,
+    usage_snapshot_key, usage_summary_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -1279,7 +1278,7 @@ async fn publish_retaining_markers(
         let snapshot = NodeUsageSnapshot { node_id, counters };
         writes.push((
             USAGE_NODE_STATS_KEYSPACE.to_string(),
-            Key::from(usage_group_key(*group_id, node_id)),
+            Key::from(usage_snapshot_key(*group_id, node_id)),
             Value::from(snapshot.to_bytes().map_err(|e| e.to_string())?),
         ));
     }
@@ -2555,7 +2554,7 @@ mod tests {
         assert_eq!(global.node_id, node_id);
         assert_eq!(global.counters.logical_bytes, 10);
         let group = NodeUsageSnapshot::from_bytes(
-            &read_node_stat(&ctx, usage_group_key(group_id, node_id))
+            &read_node_stat(&ctx, usage_snapshot_key(group_id, node_id))
                 .await
                 .expect("group snapshot written"),
         )
@@ -2596,7 +2595,7 @@ mod tests {
         .await;
         write_node_stat(
             &ctx,
-            usage_group_key(group_id, remote),
+            usage_snapshot_key(group_id, remote),
             remote_snapshot(remote_counters).to_bytes().unwrap(),
         )
         .await;
@@ -2866,7 +2865,7 @@ mod tests {
                 .is_some()
         );
         assert!(
-            read_node_stat(&ctx, usage_group_key(group_id, node_id))
+            read_node_stat(&ctx, usage_snapshot_key(group_id, node_id))
                 .await
                 .is_some()
         );
@@ -2978,7 +2977,7 @@ mod tests {
                 .is_some()
         );
         assert!(
-            read_node_stat(&ctx, usage_group_key(group_id, node_id))
+            read_node_stat(&ctx, usage_snapshot_key(group_id, node_id))
                 .await
                 .is_some()
         );
@@ -3014,7 +3013,7 @@ mod tests {
         // Removing a previously published group's counter leaves a stale snapshot.
         write_node_stat(
             &ctx,
-            usage_group_key(stale_group, node_id),
+            usage_snapshot_key(stale_group, node_id),
             NodeUsageSnapshot {
                 node_id,
                 counters: UsageCounters {
@@ -3036,7 +3035,7 @@ mod tests {
 
         // The stale snapshot is overwritten with a zero total.
         let stale = NodeUsageSnapshot::from_bytes(
-            &read_node_stat(&ctx, usage_group_key(stale_group, node_id))
+            &read_node_stat(&ctx, usage_snapshot_key(stale_group, node_id))
                 .await
                 .expect("stale snapshot present"),
         )
@@ -3045,7 +3044,7 @@ mod tests {
 
         // The live group keeps its real total.
         let live = NodeUsageSnapshot::from_bytes(
-            &read_node_stat(&ctx, usage_group_key(live_group, node_id))
+            &read_node_stat(&ctx, usage_snapshot_key(live_group, node_id))
                 .await
                 .expect("live snapshot present"),
         )
@@ -3085,7 +3084,7 @@ mod tests {
         .await;
         write_node_stat(
             &ctx,
-            usage_group_key(group_id, remote),
+            usage_snapshot_key(group_id, remote),
             NodeUsageSnapshot {
                 node_id: remote,
                 counters: remote_counters,
