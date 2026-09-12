@@ -32,7 +32,7 @@ pub(super) fn selected_backend(selected: &str) -> Result<SelectedBackend, Comput
         "docker" => Ok(SelectedBackend::Docker),
         "apptainer" => Ok(SelectedBackend::Apptainer),
         "kubernetes" => Ok(SelectedBackend::Kubernetes),
-        other => Err(ComputeBuildError::Config(format!(
+        other => Err(ComputeBuildError::Invalid(format!(
             "unknown ARUNA_COMPUTE_EXECUTOR `{other}`"
         ))),
     }
@@ -52,9 +52,9 @@ pub(super) fn collect() -> Result<ComputeSettings, ComputeBuildError> {
     let has_backend = !matches!(backend, BackendSettings::None);
     Ok(ComputeSettings {
         backend,
-        optional: env_true("ARUNA_COMPUTE_OPTIONAL"),
-        local_only: env_true("ARUNA_COMPUTE_LOCAL_ONLY"),
-        s3_url: env_nonempty("ARUNA_COMPUTE_S3_URL"),
+        optional: parse_bool(dotenvy::var("ARUNA_COMPUTE_OPTIONAL").ok().as_deref()),
+        local_only: parse_bool(dotenvy::var("ARUNA_COMPUTE_LOCAL_ONLY").ok().as_deref()),
+        s3_url: parse_nonempty(dotenvy::var("ARUNA_COMPUTE_S3_URL").ok().as_deref()),
         envelope: match has_backend {
             true => Some(compute_envelope()?),
             false => None,
@@ -70,9 +70,15 @@ fn collect_docker() -> Result<super::DockerSettings, ComputeBuildError> {
                 .as_deref(),
         )?,
         session_subnet: session_subnet(),
-        pull_deadline: env_duration("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE", 300)?,
-        keep_failed: env_true("ARUNA_COMPUTE_KEEP_FAILED"),
-        state_root: env_path("ARUNA_COMPUTE_STATE_ROOT"),
+        pull_deadline: parse_duration(
+            "ARUNA_COMPUTE_DOCKER_PULL_DEADLINE",
+            dotenvy::var("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE")
+                .ok()
+                .as_deref(),
+            300,
+        )?,
+        keep_failed: parse_bool(dotenvy::var("ARUNA_COMPUTE_KEEP_FAILED").ok().as_deref()),
+        state_root: parse_path(dotenvy::var("ARUNA_COMPUTE_STATE_ROOT").ok().as_deref()),
     })
 }
 
@@ -80,7 +86,7 @@ fn collect_apptainer() -> Result<super::ApptainerSettings, ComputeBuildError> {
     let cgroup_root = dotenvy::var("ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT")
         .map(PathBuf::from)
         .map_err(|_| {
-            ComputeBuildError::Config(
+            ComputeBuildError::Invalid(
                 "Apptainer executor requires ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT".to_string(),
             )
         })?;
@@ -94,19 +100,29 @@ fn collect_apptainer() -> Result<super::ApptainerSettings, ComputeBuildError> {
         cgroup_root,
         state_root,
         sif_cache,
-        stop_grace: env_duration("ARUNA_COMPUTE_STOP_GRACE", 10)?,
-        pull_deadline: env_duration("ARUNA_COMPUTE_APPTAINER_PULL_DEADLINE", 300)?,
+        stop_grace: parse_duration(
+            "ARUNA_COMPUTE_STOP_GRACE",
+            dotenvy::var("ARUNA_COMPUTE_STOP_GRACE").ok().as_deref(),
+            10,
+        )?,
+        pull_deadline: parse_duration(
+            "ARUNA_COMPUTE_APPTAINER_PULL_DEADLINE",
+            dotenvy::var("ARUNA_COMPUTE_APPTAINER_PULL_DEADLINE")
+                .ok()
+                .as_deref(),
+            300,
+        )?,
     })
 }
 
 fn collect_kubernetes() -> Result<super::KubernetesSettings, ComputeBuildError> {
     let storage_class = dotenvy::var("ARUNA_COMPUTE_K8S_STORAGE_CLASS").map_err(|_| {
-        ComputeBuildError::Config(
+        ComputeBuildError::Invalid(
             "Kubernetes executor requires ARUNA_COMPUTE_K8S_STORAGE_CLASS".to_string(),
         )
     })?;
     let helper_image = dotenvy::var("ARUNA_COMPUTE_K8S_HELPER_IMAGE").map_err(|_| {
-        ComputeBuildError::Config(
+        ComputeBuildError::Invalid(
             "Kubernetes executor requires ARUNA_COMPUTE_K8S_HELPER_IMAGE".to_string(),
         )
     })?;
@@ -126,16 +142,36 @@ fn collect_kubernetes() -> Result<super::KubernetesSettings, ComputeBuildError> 
         storage_class,
         helper_image,
         s3_cidrs,
-        s3_port: env_nonempty("ARUNA_COMPUTE_K8S_S3_PORT"),
-        mount_driver: env_nonempty("ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER"),
+        s3_port: parse_nonempty(dotenvy::var("ARUNA_COMPUTE_K8S_S3_PORT").ok().as_deref()),
+        mount_driver: parse_nonempty(
+            dotenvy::var("ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER")
+                .ok()
+                .as_deref(),
+        ),
         policy_manifests,
         service_account: dotenvy::var("ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT")
             .unwrap_or_else(|_| aruna_compute::DEFAULT_WORKLOAD_SA.to_string()),
         execution_location: dotenvy::var("ARUNA_COMPUTE_K8S_EXECUTION_LOCATION")
             .unwrap_or_default(),
-        execution_labels: env_labels("ARUNA_COMPUTE_K8S_EXECUTION_LABELS")?,
-        node_selector: env_labels("ARUNA_COMPUTE_K8S_NODE_SELECTOR")?,
-        pull_deadline: env_duration("ARUNA_COMPUTE_K8S_PULL_DEADLINE", 300)?,
+        execution_labels: parse_labels(
+            "ARUNA_COMPUTE_K8S_EXECUTION_LABELS",
+            dotenvy::var("ARUNA_COMPUTE_K8S_EXECUTION_LABELS")
+                .ok()
+                .as_deref(),
+        )?,
+        node_selector: parse_labels(
+            "ARUNA_COMPUTE_K8S_NODE_SELECTOR",
+            dotenvy::var("ARUNA_COMPUTE_K8S_NODE_SELECTOR")
+                .ok()
+                .as_deref(),
+        )?,
+        pull_deadline: parse_duration(
+            "ARUNA_COMPUTE_K8S_PULL_DEADLINE",
+            dotenvy::var("ARUNA_COMPUTE_K8S_PULL_DEADLINE")
+                .ok()
+                .as_deref(),
+            300,
+        )?,
     })
 }
 
@@ -187,31 +223,53 @@ pub(super) fn compute_s3_endpoint(settings: &ComputeSettings, config: &Config) -
         .or_else(|| config.s3_public_url.clone())
 }
 
-fn env_nonempty(name: &str) -> Option<String> {
-    dotenvy::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
+/// A configured string; blank and absent both mean unset. The value is trimmed.
+pub(super) fn parse_nonempty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
         .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
-fn env_true(name: &str) -> bool {
-    dotenvy::var(name)
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+/// The accepted boolean spellings are exact and case-sensitive; use `1`, `true`
+/// or `yes`. `` `TRUE` ``, `1 ` and an absent value are all false.
+pub(super) fn parse_bool(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "yes"))
+}
+
+/// A configured path; blank and absent both mean unset.
+pub(super) fn parse_path(value: Option<&str>) -> Option<PathBuf> {
+    parse_nonempty(value).map(PathBuf::from)
 }
 
 fn compute_envelope() -> Result<ResourceEnvelope, String> {
     Ok(ResourceEnvelope {
-        max_cpu_cores: env_number::<u32>("ARUNA_COMPUTE_MAX_CPU_CORES")?,
-        max_ram_bytes: env_number::<u64>("ARUNA_COMPUTE_MAX_RAM_BYTES")?,
-        max_disk_bytes: env_number::<u64>("ARUNA_COMPUTE_MAX_DISK_BYTES")?,
-        max_concurrent: env_number::<u32>("ARUNA_COMPUTE_MAX_CONCURRENT")?,
+        max_cpu_cores: parse_number(
+            "ARUNA_COMPUTE_MAX_CPU_CORES",
+            dotenvy::var("ARUNA_COMPUTE_MAX_CPU_CORES").ok().as_deref(),
+        )?,
+        max_ram_bytes: parse_number(
+            "ARUNA_COMPUTE_MAX_RAM_BYTES",
+            dotenvy::var("ARUNA_COMPUTE_MAX_RAM_BYTES").ok().as_deref(),
+        )?,
+        max_disk_bytes: parse_number(
+            "ARUNA_COMPUTE_MAX_DISK_BYTES",
+            dotenvy::var("ARUNA_COMPUTE_MAX_DISK_BYTES").ok().as_deref(),
+        )?,
+        max_concurrent: parse_number(
+            "ARUNA_COMPUTE_MAX_CONCURRENT",
+            dotenvy::var("ARUNA_COMPUTE_MAX_CONCURRENT").ok().as_deref(),
+        )?,
     })
 }
 
-fn env_number<T: std::str::FromStr + Default + PartialEq>(name: &str) -> Result<Option<T>, String> {
-    dotenvy::var(name)
-        .ok()
+/// An unset value stays unmeasured; a set value is trimmed and must parse and
+/// be non-zero.
+pub(super) fn parse_number<T: std::str::FromStr + Default + PartialEq>(
+    name: &str,
+    value: Option<&str>,
+) -> Result<Option<T>, String> {
+    value
         .map(|value| parse_positive(name, value.trim()))
         .transpose()
 }
@@ -231,10 +289,18 @@ pub(super) fn parse_positive<T: std::str::FromStr + Default + PartialEq>(
     }
 }
 
-fn env_duration(name: &str, default: u64) -> Result<Duration, String> {
-    let seconds = dotenvy::var(name)
-        .map(|value| value.parse::<u64>())
-        .unwrap_or(Ok(default))
+/// A duration in whole seconds. Absent means the default; a present value is
+/// parsed exactly, so surrounding whitespace is an error rather than a trim.
+pub(super) fn parse_duration(
+    name: &str,
+    value: Option<&str>,
+    default: u64,
+) -> Result<Duration, String> {
+    let Some(value) = value else {
+        return Ok(Duration::from_secs(default));
+    };
+    let seconds = value
+        .parse::<u64>()
         .map_err(|_| format!("{name} must be a positive integer"))?;
     if seconds == 0 {
         return Err(format!("{name} must be greater than zero"));
@@ -242,9 +308,13 @@ fn env_duration(name: &str, default: u64) -> Result<Duration, String> {
     Ok(Duration::from_secs(seconds))
 }
 
-/// Parses a bounded `key=value,key2=value2` label or selector list.
-pub(super) fn env_labels(name: &str) -> Result<BTreeMap<String, String>, String> {
-    let Ok(value) = dotenvy::var(name) else {
+/// Parses a bounded `key=value,key2=value2` label or selector list. Entries and
+/// keys are trimmed; absent means an empty map.
+pub(super) fn parse_labels(
+    name: &str,
+    value: Option<&str>,
+) -> Result<BTreeMap<String, String>, String> {
+    let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
     value
@@ -335,11 +405,6 @@ pub(super) fn parse_disk_limit(value: Option<&str>) -> Result<Option<u64>, &'sta
         return Err("disk ceiling must be greater than zero");
     }
     Ok(Some(bytes))
-}
-
-/// A configured filesystem path; an empty value is treated as unset.
-pub(super) fn env_path(name: &str) -> Option<PathBuf> {
-    env_nonempty(name).map(PathBuf::from)
 }
 
 pub(super) fn container_local_endpoint(endpoint: &str) -> bool {
@@ -457,9 +522,54 @@ mod pure_tests {
         );
         let error = selected_backend("podman").unwrap_err();
         assert!(
-            matches!(&error, ComputeBuildError::Config(message) if message.contains("podman")),
+            matches!(&error, ComputeBuildError::Invalid(message) if message.contains("podman")),
             "unknown backend must be a configuration error: {error:?}"
         );
+    }
+
+    // The accepted spellings are fixed: case-sensitive booleans, exact
+    // durations, trimmed numbers and labels, blank means unset.
+    #[test]
+    fn documents_parser_conventions() {
+        assert!(parse_bool(Some("1")));
+        assert!(parse_bool(Some("true")));
+        assert!(parse_bool(Some("yes")));
+        assert!(!parse_bool(Some("TRUE")));
+        assert!(!parse_bool(Some(" true")));
+        assert!(!parse_bool(Some("")));
+        assert!(!parse_bool(None));
+
+        assert_eq!(parse_nonempty(Some(" x ")), Some("x".to_string()));
+        assert_eq!(parse_nonempty(Some("   ")), None);
+        assert_eq!(parse_nonempty(None), None);
+
+        assert_eq!(parse_path(Some(" /tmp/x ")), Some(PathBuf::from("/tmp/x")));
+        assert_eq!(parse_path(Some("")), None);
+
+        assert_eq!(parse_duration("K", None, 7), Ok(Duration::from_secs(7)));
+        assert_eq!(
+            parse_duration("K", Some("10"), 7),
+            Ok(Duration::from_secs(10))
+        );
+        assert!(parse_duration("K", Some(" 10 "), 7).is_err());
+        assert!(parse_duration("K", Some("0"), 7).is_err());
+        assert!(parse_duration("K", Some(""), 7).is_err());
+
+        assert_eq!(parse_number::<u32>("K", None), Ok(None));
+        assert_eq!(parse_number::<u32>("K", Some(" 4 ")), Ok(Some(4)));
+        assert!(parse_number::<u32>("K", Some("0")).is_err());
+        assert!(parse_number::<u32>("K", Some("")).is_err());
+
+        assert_eq!(parse_labels("K", None), Ok(BTreeMap::new()));
+        assert_eq!(
+            parse_labels("K", Some(" a = 1 , b=2 ")),
+            Ok(BTreeMap::from([
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string())
+            ]))
+        );
+        assert!(parse_labels("K", Some("=x")).is_err());
+        assert!(parse_labels("K", Some("a")).is_err());
     }
 
     #[test]
