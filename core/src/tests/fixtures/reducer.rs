@@ -1,26 +1,38 @@
-use super::*;
+use crate::admin_documents::{
+    AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition,
+    AdminDocumentTarget,
+};
+use crate::reducer::*;
+use crate::structs::{
+    Actor, MetadataReplicationConfig, OidcProviderConfig, Permission, RealmDiscoveryConfig,
+    RealmId, RealmNodeKind,
+};
+use crate::types::{GroupId, RoleId};
+use crate::{NodeId, UserId};
+use std::collections::BTreeMap;
+use ulid::Ulid;
 
-pub(super) fn node(seed: u8) -> NodeId {
+pub(crate) fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-pub(super) fn realm_id_seed(seed: u8) -> RealmId {
+pub(crate) fn realm_id_seed(seed: u8) -> RealmId {
     RealmId::from_bytes([seed; 32])
 }
 
-pub(super) fn realm_id() -> RealmId {
+pub(crate) fn realm_id() -> RealmId {
     realm_id_seed(9)
 }
 
-pub(super) fn group_id() -> GroupId {
+pub(crate) fn group_id() -> GroupId {
     Ulid::from_bytes([7u8; 16])
 }
 
-pub(super) fn role_id(seed: u8) -> RoleId {
+pub(crate) fn role_id(seed: u8) -> RoleId {
     Ulid::from_bytes([seed; 16])
 }
 
-pub(super) fn role_definition(role_id: RoleId, name: &str) -> AdminDocumentRoleDefinition {
+pub(crate) fn role_definition(role_id: RoleId, name: &str) -> AdminDocumentRoleDefinition {
     AdminDocumentRoleDefinition {
         role_id,
         name: name.to_string(),
@@ -31,7 +43,7 @@ pub(super) fn role_definition(role_id: RoleId, name: &str) -> AdminDocumentRoleD
     }
 }
 
-pub(super) fn oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig {
+pub(crate) fn oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig {
     OidcProviderConfig {
         id: id.to_string(),
         issuer: format!("https://issuer.example/{issuer_suffix}"),
@@ -42,15 +54,15 @@ pub(super) fn oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig
     }
 }
 
-pub(super) fn user_id_seed(seed: u8) -> UserId {
+pub(crate) fn user_id_seed(seed: u8) -> UserId {
     UserId::local(Ulid::from_bytes([seed; 16]), realm_id())
 }
 
-pub(super) fn user_id() -> UserId {
+pub(crate) fn user_id() -> UserId {
     user_id_seed(8)
 }
 
-pub(super) fn actor(origin_node_id: NodeId) -> Actor {
+pub(crate) fn actor(origin_node_id: NodeId) -> Actor {
     Actor {
         node_id: origin_node_id,
         user_id: user_id(),
@@ -58,29 +70,29 @@ pub(super) fn actor(origin_node_id: NodeId) -> Actor {
     }
 }
 
-pub(super) fn user_state() -> AdminDocumentReducerState {
+pub(crate) fn user_state() -> AdminDocumentReducerState {
     AdminDocumentReducerState::new(AdminDocumentTarget::User { user_id: user_id() })
 }
 
-pub(super) fn group_state() -> AdminDocumentReducerState {
+pub(crate) fn group_state() -> AdminDocumentReducerState {
     AdminDocumentReducerState::new(AdminDocumentTarget::Group {
         group_id: group_id(),
     })
 }
 
-pub(super) fn realm_state() -> AdminDocumentReducerState {
+pub(crate) fn realm_state() -> AdminDocumentReducerState {
     AdminDocumentReducerState::new(AdminDocumentTarget::Realm {
         realm_id: realm_id(),
     })
 }
 
-pub(super) fn realm_config_state() -> AdminDocumentReducerState {
+pub(crate) fn realm_config_state() -> AdminDocumentReducerState {
     AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig {
         realm_id: realm_id(),
     })
 }
 
-pub(super) fn event(
+pub(crate) fn event(
     event_seed: u8,
     origin_node_id: NodeId,
     origin_seq: u64,
@@ -98,7 +110,7 @@ pub(super) fn event(
     }
 }
 
-pub(super) fn group_event(
+pub(crate) fn group_event(
     event_seed: u8,
     origin_node_id: NodeId,
     origin_seq: u64,
@@ -118,7 +130,7 @@ pub(super) fn group_event(
     }
 }
 
-pub(super) fn realm_event(
+pub(crate) fn realm_event(
     event_seed: u8,
     origin_node_id: NodeId,
     origin_seq: u64,
@@ -138,7 +150,7 @@ pub(super) fn realm_event(
     }
 }
 
-pub(super) fn realm_config_event(
+pub(crate) fn realm_config_event(
     event_seed: u8,
     origin_node_id: NodeId,
     origin_seq: u64,
@@ -158,7 +170,7 @@ pub(super) fn realm_config_event(
     }
 }
 
-pub(super) fn set_attr(
+pub(crate) fn set_attr(
     event_seed: u8,
     origin_seed: u8,
     key: &str,
@@ -176,7 +188,7 @@ pub(super) fn set_attr(
     )
 }
 
-pub(super) fn set_name(event_seed: u8, origin_seed: u8, name: &str) -> AdminDocumentEvent {
+pub(crate) fn set_name(event_seed: u8, origin_seed: u8, name: &str) -> AdminDocumentEvent {
     event(
         event_seed,
         node(origin_seed),
@@ -188,7 +200,7 @@ pub(super) fn set_name(event_seed: u8, origin_seed: u8, name: &str) -> AdminDocu
     )
 }
 
-pub(super) fn add_subject(event_seed: u8, origin_seed: u8, subject_id: &str) -> AdminDocumentEvent {
+pub(crate) fn add_subject(event_seed: u8, origin_seed: u8, subject_id: &str) -> AdminDocumentEvent {
     event(
         event_seed,
         node(origin_seed),
@@ -200,7 +212,7 @@ pub(super) fn add_subject(event_seed: u8, origin_seed: u8, subject_id: &str) -> 
     )
 }
 
-pub(super) fn remove_subject(
+pub(crate) fn remove_subject(
     event_seed: u8,
     origin_seed: u8,
     subject_id: &str,
@@ -216,7 +228,7 @@ pub(super) fn remove_subject(
     )
 }
 
-pub(super) fn create_group(
+pub(crate) fn create_group(
     event_seed: u8,
     origin_seed: u8,
     display_name: &str,
@@ -235,7 +247,7 @@ pub(super) fn create_group(
     )
 }
 
-pub(super) fn rename_group(
+pub(crate) fn rename_group(
     event_seed: u8,
     origin_seed: u8,
     origin_seq: u64,
@@ -258,7 +270,7 @@ pub(super) fn rename_group(
     )
 }
 
-pub(super) fn add_group_role(
+pub(crate) fn add_group_role(
     event_seed: u8,
     origin_seed: u8,
     role_id: RoleId,
@@ -272,7 +284,7 @@ pub(super) fn add_group_role(
     )
 }
 
-pub(super) fn create_group_role(
+pub(crate) fn create_group_role(
     event_seed: u8,
     origin_seed: u8,
     role: AdminDocumentRoleDefinition,
@@ -286,7 +298,7 @@ pub(super) fn create_group_role(
     )
 }
 
-pub(super) fn remove_group_role(
+pub(crate) fn remove_group_role(
     event_seed: u8,
     origin_seed: u8,
     role_id: RoleId,
@@ -300,7 +312,7 @@ pub(super) fn remove_group_role(
     )
 }
 
-pub(super) fn assign_group_user(
+pub(crate) fn assign_group_user(
     event_seed: u8,
     origin_seed: u8,
     role_id: RoleId,
@@ -315,7 +327,7 @@ pub(super) fn assign_group_user(
     )
 }
 
-pub(super) fn remove_group_assignment(
+pub(crate) fn remove_group_assignment(
     event_seed: u8,
     origin_seed: u8,
     role_id: RoleId,
@@ -330,7 +342,7 @@ pub(super) fn remove_group_assignment(
     )
 }
 
-pub(super) fn add_realm_role(
+pub(crate) fn add_realm_role(
     event_seed: u8,
     origin_seed: u8,
     role_id: RoleId,
@@ -344,7 +356,7 @@ pub(super) fn add_realm_role(
     )
 }
 
-pub(super) fn create_realm_role(
+pub(crate) fn create_realm_role(
     event_seed: u8,
     origin_seed: u8,
     role: AdminDocumentRoleDefinition,
@@ -358,7 +370,7 @@ pub(super) fn create_realm_role(
     )
 }
 
-pub(super) fn assign_realm_user(
+pub(crate) fn assign_realm_user(
     event_seed: u8,
     origin_seed: u8,
     role_id: RoleId,
@@ -373,7 +385,7 @@ pub(super) fn assign_realm_user(
     )
 }
 
-pub(super) fn remove_realm_assignment(
+pub(crate) fn remove_realm_assignment(
     event_seed: u8,
     origin_seed: u8,
     role_id: RoleId,
@@ -388,7 +400,7 @@ pub(super) fn remove_realm_assignment(
     )
 }
 
-pub(super) fn ensure_realm_node(
+pub(crate) fn ensure_realm_node(
     event_seed: u8,
     origin_seed: u8,
     node_id: NodeId,
@@ -403,7 +415,7 @@ pub(super) fn ensure_realm_node(
     )
 }
 
-pub(super) fn upsert_oidc_provider(
+pub(crate) fn upsert_oidc_provider(
     event_seed: u8,
     origin_seed: u8,
     provider: OidcProviderConfig,
@@ -417,7 +429,7 @@ pub(super) fn upsert_oidc_provider(
     )
 }
 
-pub(super) fn set_realm_settings(
+pub(crate) fn set_realm_settings(
     event_seed: u8,
     origin_seed: u8,
     metadata_replication: MetadataReplicationConfig,
@@ -435,7 +447,7 @@ pub(super) fn set_realm_settings(
     )
 }
 
-pub(super) fn set_realm_description(
+pub(crate) fn set_realm_description(
     event_seed: u8,
     origin_seed: u8,
     description: &str,

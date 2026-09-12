@@ -749,8 +749,7 @@ pub enum StreamEffect {
 pub(crate) mod tests {
     use super::*;
 
-    pub(crate) mod fixtures;
-    use fixtures::*;
+    use crate::tests::fixtures::effects::*;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()

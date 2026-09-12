@@ -40,6 +40,9 @@ pub mod user_id;
 pub mod user_profile;
 pub mod user_validation;
 
+#[cfg(test)]
+mod tests;
+
 pub use document::{
     DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEffect,
     DocumentSyncEvent, DocumentSyncEvictedDocument, DocumentSyncNetEvent, DocumentSyncRevision,
