@@ -99,6 +99,12 @@ The default example configuration exposes:
 - the REST API and Swagger UI on `http://127.0.0.1:3000/swagger-ui`
 - the S3 endpoint on `http://127.0.0.1:1337`
 
+The repository also tracks a `.env` holding a demonstration profile whose keys are
+published. A node refuses to start when it still finds one of those keys, and names
+it. Replace them with your own, or pass `--dangerously-use-default-env` (or set
+`ARUNA_DANGEROUSLY_USE_DEFAULT_ENV=1`) to start anyway, which logs a warning per key.
+A non-secret shipped value, such as a bind address, is only warned about.
+
 ### Evaluate a local cluster
 
 For a quick end-to-end evaluation, run:

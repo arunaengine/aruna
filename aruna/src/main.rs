@@ -9,6 +9,7 @@ use aruna::bootstrap::{
 use aruna::config::{
     Config, PortalConfig, StartupMode, load, mark_onboarding_phase, mark_state_complete,
 };
+use aruna::default_env;
 use aruna::portal;
 use aruna::shutdown::{NodeShutdown, arm_signal_exit, shutdown_grace_env, wait_for_signal};
 use aruna::telemetry::{init_tracing, shutdown_tracing};
@@ -204,10 +205,36 @@ fn main() {
     async_main();
 }
 
+/// Reports shipped demonstration values still in the environment. Key material
+/// refuses the start; a plain value is only named, because a deployment may pick
+/// the same bind address or bucket name on its own.
+fn report_default_env() -> Result<(), default_env::DefaultEnvError> {
+    let shipped = default_env::shipped_values();
+    let in_use = default_env::guard(&shipped, |key| std::env::var(key).ok(), std::env::args())?;
+    for entry in in_use {
+        if entry.secret {
+            warn!(
+                key = %entry.key,
+                "Serving with a published demonstration key, admitted by {}",
+                default_env::OVERRIDE_FLAG
+            );
+        } else {
+            warn!(key = %entry.key, "Environment still holds the shipped demonstration value");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn async_main() {
     dotenv_optional(dotenvy::dotenv()).expect("Failed to load .env file");
     init_tracing();
+
+    if let Err(error) = report_default_env() {
+        eprintln!("{error}");
+        shutdown_tracing();
+        std::process::exit(1);
+    }
 
     let result = run().await;
     shutdown_tracing();
