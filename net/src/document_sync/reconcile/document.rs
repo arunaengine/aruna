@@ -6,7 +6,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{
     DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, METADATA_CREATE_ACCEPTANCE_KEYSPACE,
 };
-use aruna_core::metadata::{MetadataCreateEventRecord, MetadataGraphLifecycleRecord};
+use aruna_core::metadata::MetadataCreateEventRecord;
 use aruna_core::storage_entries::{
     create_acceptance_entry, create_acceptance_key, create_projection_entries,
     shard_manifest_entry, sync_revision_entry,
@@ -21,7 +21,7 @@ use crate::document_sync::storage::{
     replace_batch_in, start_storage_transaction, transaction_read,
 };
 use crate::document_sync::{
-    DOCUMENT_SYNC_FRAME_LEN_LIMIT, DeferredTopicRegistrationOutcome, DocumentEventBatch,
+    DOCUMENT_SYNC_FRAME_LEN_LIMIT, DeferredTopicRegistrationOutcome,
     DocumentSyncDependency, DocumentSyncService, MetadataPlacementFence, MetadataPlacementOutcome,
     PendingMetadataCreateApply, SyncRejection,
 };

@@ -88,13 +88,13 @@ pub(in crate::document_sync) fn overlay_group_state(
 
 fn overlay_group_roles(group: &mut Group, reducer_state: &AdminDocumentReducerState) {
     for path in reducer_state.conflicts.keys() {
-        if let Some(role_id) = group_role_from_path(path) {
+        if let Some(role_id) = parse_group_role(path) {
             group.roles.remove(&role_id);
         }
     }
 
     for (path, version) in &reducer_state.user_subject_ids {
-        let Some(role_id) = group_role_from_path(path) else {
+        let Some(role_id) = parse_group_role(path) else {
             continue;
         };
         group.roles.remove(&role_id);
@@ -146,7 +146,7 @@ fn overlay_group_assignments(
     only_role_id: Option<RoleId>,
 ) {
     for path in reducer_state.conflicts.keys() {
-        if let Some((role_id, user_id)) = group_assignment_from_path(path)
+        if let Some((role_id, user_id)) = parse_group_assignment(path)
             && only_role_id.is_none_or(|only_role_id| only_role_id == role_id)
             && let Some(role) = auth_doc.roles.get_mut(&role_id)
         {
@@ -155,7 +155,7 @@ fn overlay_group_assignments(
     }
 
     for (path, version) in &reducer_state.user_subject_ids {
-        let Some((role_id, user_id)) = group_assignment_from_path(path) else {
+        let Some((role_id, user_id)) = parse_group_assignment(path) else {
             continue;
         };
         if only_role_id.is_some_and(|only_role_id| only_role_id != role_id) {
@@ -193,7 +193,7 @@ fn overlay_realm_assignments(
     only_role_id: Option<RoleId>,
 ) {
     for path in reducer_state.conflicts.keys() {
-        if let Some((role_id, user_id)) = realm_assignment_from_path(path)
+        if let Some((role_id, user_id)) = parse_realm_assignment(path)
             && only_role_id.is_none_or(|only_role_id| only_role_id == role_id)
             && let Some(role) = auth_doc.roles.get_mut(&role_id)
         {
@@ -202,7 +202,7 @@ fn overlay_realm_assignments(
     }
 
     for (path, version) in &reducer_state.user_subject_ids {
-        let Some((role_id, user_id)) = realm_assignment_from_path(path) else {
+        let Some((role_id, user_id)) = parse_realm_assignment(path) else {
             continue;
         };
         if only_role_id.is_some_and(|only_role_id| only_role_id != role_id) {
@@ -290,7 +290,7 @@ pub(in crate::document_sync) fn overlay_realm_config(
     }
 
     for path in reducer_state.conflicts.keys() {
-        if let Some(node_id) = config_node_from_path(path) {
+        if let Some(node_id) = parse_config_node(path) {
             remove_config_node(config, &node_id);
         }
     }
@@ -310,13 +310,13 @@ pub(in crate::document_sync) fn overlay_realm_config(
 
     let materialized_providers = reducer_state.materialized_oidc_providers();
     for path in reducer_state.conflicts.keys() {
-        if let Some(provider_id) = config_oidc_from_path(path) {
+        if let Some(provider_id) = parse_config_oidc(path) {
             remove_oidc_provider(config, provider_id);
         }
     }
 
     for path in reducer_state.user_subject_ids.keys() {
-        let Some(provider_id) = config_oidc_from_path(path) else {
+        let Some(provider_id) = parse_config_oidc(path) else {
             continue;
         };
         remove_oidc_provider(config, provider_id);

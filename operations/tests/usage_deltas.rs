@@ -15,7 +15,7 @@ use aruna_core::structs::{
     AuthContext, Backend, BackendConfig, BlobHeadKey, BucketInfo, CurrentVersionPointer,
     GroupQuotaOverride, MultipartChecksumType, NODE_SUBJECT_KEY, NodeSubjectRecord,
     NodeUsageSnapshot, PlacementSubject, PolicyRefMode, QuotaConfig, RealmId, RoutingSnapshot,
-    UsageCounters, global_shard_keys, usage_group_key,
+    UsageCounters, global_shard_keys, usage_group_key, usage_snapshot_key,
 };
 use aruna_core::types::NodeId;
 use aruna_net::{NetConfig, NetHandle};
@@ -671,7 +671,7 @@ async fn inject_group_snapshot(h: &Harness, group_id: Ulid, node_id: NodeId, log
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
             key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
-            key: usage_group_key(group_id, node_id).into(),
+            key: usage_snapshot_key(group_id, node_id).into(),
             value: snapshot.to_bytes().unwrap().into(),
             txn_id: None,
         })

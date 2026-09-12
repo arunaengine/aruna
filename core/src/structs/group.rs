@@ -27,13 +27,13 @@ impl Group {
 
 /// Key in GROUP_OWNER_INDEX_KEYSPACE: owner storage key (realm + user ulid)
 /// followed by the group id, so a prefix scan counts a user's owned groups.
-pub fn owner_index_key(owner: UserId, group_id: GroupId) -> Vec<u8> {
+pub fn owner_group_key(owner: UserId, group_id: GroupId) -> Vec<u8> {
     let mut bytes = owner.to_storage_key();
     bytes.extend_from_slice(&group_id.to_bytes());
     bytes
 }
 
-pub fn owner_index_prefix(owner: UserId) -> Vec<u8> {
+pub fn owner_group_prefix(owner: UserId) -> Vec<u8> {
     owner.to_storage_key()
 }
 

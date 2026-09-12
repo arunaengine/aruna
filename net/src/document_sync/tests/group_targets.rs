@@ -107,7 +107,7 @@ async fn created_group_bootstraps() {
         read_storage_value(
             &storage,
             GROUP_OWNER_INDEX_KEYSPACE,
-            owner_index_key(actor.user_id, group_id).into(),
+            owner_group_key(actor.user_id, group_id).into(),
         )
         .await
         .is_some()
