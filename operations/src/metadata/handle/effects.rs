@@ -155,7 +155,7 @@ impl MetadataHandle {
                             exists: false,
                         }));
                     }
-                    _ if effect_rejects_deleted(&effect) => {
+                    _ if effect_rejects_deleted(effect) => {
                         return Some(Event::Metadata(MetadataEvent::Error {
                             graph_iri: Some(graph_iri.to_string()),
                             error: MetadataError::InvalidInput(format!(
@@ -594,7 +594,7 @@ fn entity_effect(
                 batch_ops = field::Empty,
             );
             let started = Instant::now();
-            let result = call_span.in_scope(|| upsert_data_entity(&node, auth, request));
+            let result = call_span.in_scope(|| upsert_data_entity(node, auth, request));
             let converted = result.map(|batch| {
                 call_span.record("batch_ops", batch.ops.len() as u64);
                 MetadataEvent::EntityUpsertResult {
@@ -624,7 +624,7 @@ fn entity_effect(
                 batch_ops = field::Empty,
             );
             let started = Instant::now();
-            let result = call_span.in_scope(|| upsert_contextual_entity(&node, auth, request));
+            let result = call_span.in_scope(|| upsert_contextual_entity(node, auth, request));
             let converted = result.map(|batch| {
                 call_span.record("batch_ops", batch.ops.len() as u64);
                 MetadataEvent::EntityUpsertResult {
@@ -1001,7 +1001,7 @@ fn sync_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| plan_batch(&node, auth, &graph_iri, actor, &source))
+                .in_scope(|| plan_batch(node, auth, &graph_iri, actor, &source))
                 .map(|batch| {
                     call_span.record("batch_ops", batch.ops.len() as u64);
                     MetadataEvent::BatchPlanned {

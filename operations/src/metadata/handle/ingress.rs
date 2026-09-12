@@ -253,7 +253,7 @@ impl MetadataHandle {
         peer: NodeId,
         message: MetadataTransportMessage,
     ) -> MetadataTransportMessage {
-        let response = match message {
+        match message {
             MetadataTransportMessage::QueryGraphs {
                 auth_token,
                 graph_iris,
@@ -354,8 +354,7 @@ impl MetadataHandle {
                 .await
             }
             _ => unreachable!("request family routed incorrectly"),
-        };
-        response
+        }
     }
 
     async fn preflight_request(
@@ -364,7 +363,7 @@ impl MetadataHandle {
         peer: NodeId,
         message: MetadataTransportMessage,
     ) -> MetadataTransportMessage {
-        let response = match message {
+        match message {
             MetadataTransportMessage::ReferencePreflight {
                 auth_token,
                 request,
@@ -402,8 +401,7 @@ impl MetadataHandle {
                 .await
             }
             _ => unreachable!("request family routed incorrectly"),
-        };
-        response
+        }
     }
 
     async fn bucket_request(
@@ -412,7 +410,7 @@ impl MetadataHandle {
         peer: NodeId,
         message: MetadataTransportMessage,
     ) -> MetadataTransportMessage {
-        let response = match message {
+        match message {
             MetadataTransportMessage::SearchBuckets {
                 auth_token,
                 query,
@@ -515,8 +513,7 @@ impl MetadataHandle {
                 .await
             }
             _ => unreachable!("request family routed incorrectly"),
-        };
-        response
+        }
     }
 
     async fn mirror_request(
@@ -525,7 +522,7 @@ impl MetadataHandle {
         peer: NodeId,
         message: MetadataTransportMessage,
     ) -> MetadataTransportMessage {
-        let response = match message {
+        match message {
             MetadataTransportMessage::CreateSyncMirror {
                 auth_token,
                 source_group_id,
@@ -566,8 +563,7 @@ impl MetadataHandle {
                 .await
             }
             _ => unreachable!("request family routed incorrectly"),
-        };
-        response
+        }
     }
 
     async fn path_request(
@@ -576,7 +572,7 @@ impl MetadataHandle {
         peer: NodeId,
         message: MetadataTransportMessage,
     ) -> MetadataTransportMessage {
-        let response = match message {
+        match message {
             query @ MetadataTransportMessage::QueryDocument { .. } => {
                 Box::pin(async {
                     let result =
@@ -694,8 +690,7 @@ impl MetadataHandle {
                 .await
             }
             _ => unreachable!("request family routed incorrectly"),
-        };
-        response
+        }
     }
 
     async fn export_request(
@@ -785,7 +780,7 @@ impl MetadataHandle {
         audit_deadline: tokio::time::Instant,
         message: MetadataTransportMessage,
     ) -> MetadataTransportMessage {
-        let response = match message {
+        match message {
             forward @ (MetadataTransportMessage::ForwardCreateDocument { .. }
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
             | MetadataTransportMessage::ForwardDeleteDocument { .. }
@@ -906,8 +901,7 @@ impl MetadataHandle {
                 .await
             }
             _ => unreachable!("request family routed incorrectly"),
-        };
-        response
+        }
     }
 
     #[tracing::instrument(
