@@ -21,6 +21,7 @@ pub const MARKER_PATH: &str = "/aruna-marker/marker";
 pub const SENTINEL_PATH: &str = "/workspace/.aruna-stage";
 pub const TASK_SENTINEL: &str = "/aruna-workspace/.aruna-stage";
 pub const HELPER_PATH: &str = "/aruna-compute-helper";
+pub const DATA_DIR: &str = "data";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageMarker {
@@ -129,6 +130,18 @@ pub fn job_manifest(
             };
             volumes.push(json!({"name":"scratch","emptyDir":empty_dir}));
             mounts.push(json!({"name":"scratch","mountPath":scratch}));
+        }
+        if mounts_data(spec, config) {
+            let volume = data_name(&name);
+            volumes.push(json!({
+                "name":volume,
+                "persistentVolumeClaim":{"claimName":volume}
+            }));
+            mounts.push(json!({
+                "name":volume,
+                "mountPath":scratch.join(DATA_DIR),
+                "readOnly":false
+            }));
         }
     }
     // The credential Secret rides `envFrom`, which any inline entry of the same
@@ -246,9 +259,64 @@ pub fn mount_pv_manifest(
     bucket: &str,
 ) -> Result<PersistentVolume, BackendError> {
     let name = mount_name(&context.attempt.external_name(), index);
+    let options = ["file-mode=0444", "dir-mode=0555"];
+    s3_pv_manifest(context, config, &name, bucket, &options, true)
+}
+
+pub fn mount_pvc_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    index: usize,
+) -> Result<PersistentVolumeClaim, BackendError> {
+    s3_pvc_manifest(
+        context,
+        config,
+        &mount_name(&context.attempt.external_name(), index),
+    )
+}
+
+/// The session's writable view of the workspace bucket's `data/` prefix.
+pub fn data_pv_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    bucket: &str,
+) -> Result<PersistentVolume, BackendError> {
+    let name = data_name(&context.attempt.external_name());
+    let prefix = format!("prefix={DATA_DIR}/");
+    let options = [
+        prefix.as_str(),
+        "allow-delete",
+        "allow-overwrite",
+        "file-mode=0644",
+        "dir-mode=0755",
+    ];
+    s3_pv_manifest(context, config, &name, bucket, &options, false)
+}
+
+pub fn data_pvc_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+) -> Result<PersistentVolumeClaim, BackendError> {
+    s3_pvc_manifest(
+        context,
+        config,
+        &data_name(&context.attempt.external_name()),
+    )
+}
+
+fn s3_pv_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    name: &str,
+    bucket: &str,
+    options: &[&str],
+    read_only: bool,
+) -> Result<PersistentVolume, BackendError> {
     let driver = config.s3_mount_driver.as_deref().ok_or_else(|| {
         BackendError::InvalidSpec("S3 mounts are disabled on this backend".to_string())
     })?;
+    let mut mount_options = vec!["uid=65534", "gid=65534", "allow-other"];
+    mount_options.extend_from_slice(options);
     serde_json::from_value(json!({
         "apiVersion":"v1",
         "kind":"PersistentVolume",
@@ -263,13 +331,11 @@ pub fn mount_pv_manifest(
             "persistentVolumeReclaimPolicy":"Retain",
             "storageClassName":"",
             "claimRef":{"namespace":config.namespace,"name":name},
-            "mountOptions":[
-                "uid=65534","gid=65534","allow-other","file-mode=0444","dir-mode=0555"
-            ],
+            "mountOptions":mount_options,
             "csi":{
                 "driver":driver,
                 "volumeHandle":name,
-                "readOnly":true,
+                "readOnly":read_only,
                 "volumeAttributes":{
                     "bucketName":bucket,
                     "authenticationSource":"secret"
@@ -284,12 +350,11 @@ pub fn mount_pv_manifest(
     .map_err(manifest_error)
 }
 
-pub fn mount_pvc_manifest(
+fn s3_pvc_manifest(
     context: &FenceContext,
     config: &KubernetesConfig,
-    index: usize,
+    name: &str,
 ) -> Result<PersistentVolumeClaim, BackendError> {
-    let name = mount_name(&context.attempt.external_name(), index);
     serde_json::from_value(json!({
         "apiVersion":"v1",
         "kind":"PersistentVolumeClaim",
@@ -374,11 +439,22 @@ pub fn secret_manifest(
     config: &KubernetesConfig,
     spec: &TaskSpec,
 ) -> Result<Secret, BackendError> {
-    let values = spec
+    let mut values = spec
         .secret_env
         .iter()
         .map(|(key, value)| (key.clone(), value.expose().to_string()))
         .collect::<BTreeMap<_, _>>();
+    // The CSI driver reads the data mount credential under its own key names.
+    if mounts_data(spec, config) {
+        for (env, key) in [
+            ("AWS_ACCESS_KEY_ID", "access_key_id"),
+            ("AWS_SECRET_ACCESS_KEY", "secret_access_key"),
+        ] {
+            if let Some(value) = values.get(env).cloned() {
+                values.entry(key.to_string()).or_insert(value);
+            }
+        }
+    }
     serde_json::from_value(json!({
         "apiVersion":"v1",
         "kind":"Secret",
@@ -522,6 +598,18 @@ pub fn workspace_name(name: &str) -> String {
 
 pub fn mount_name(name: &str, index: usize) -> String {
     format!("{name}-s3-{index}")
+}
+
+pub fn data_name(name: &str) -> String {
+    format!("{name}-data")
+}
+
+/// A session with a workspace sees the bucket's `data/` prefix below its workdir.
+pub fn mounts_data(spec: &TaskSpec, config: &KubernetesConfig) -> bool {
+    spec.session
+        && spec.workspace.is_some()
+        && spec.workdir.is_some()
+        && config.s3_mount_driver.is_some()
 }
 
 pub fn mount_buckets(layout: &StageLayout) -> Vec<String> {
@@ -690,7 +778,7 @@ fn manifest_error(error: serde_json::Error) -> BackendError {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::compute::{AttemptRef, S3Mount, Secret, TaskInput};
+    use aruna_core::compute::{AttemptRef, S3Mount, Secret, TaskInput, WorkspaceBinding};
 
     use super::*;
 
@@ -967,6 +1055,115 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pv["spec"]["csi"]["driver"], "s3.csi.example.org");
+    }
+
+    fn session_spec() -> TaskSpec {
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/session:latest");
+        spec.session = true;
+        spec.workdir = Some("/work".to_string());
+        spec.workspace = Some(WorkspaceBinding {
+            s3_endpoint: "https://s3.example".to_string(),
+            bucket_name: "workspace-bucket".to_string(),
+            region: "us-east-1".to_string(),
+        });
+        spec.secret_env.insert(
+            "AWS_ACCESS_KEY_ID".to_string(),
+            Secret::new("session-access"),
+        );
+        spec.secret_env.insert(
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            Secret::new("session-secret"),
+        );
+        spec
+    }
+
+    #[test]
+    fn mounts_session_data() {
+        // The workspace bucket's data prefix shows up writable below the workdir.
+        let spec = session_spec();
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        let mounts = pod.containers[0].volume_mounts.clone().unwrap();
+        assert!(mounts.iter().any(|mount| mount.mount_path == "/work"));
+        let data = mounts
+            .iter()
+            .find(|mount| mount.mount_path == "/work/data")
+            .unwrap();
+        assert_eq!(data.name, "aruna-job-a1-data");
+        assert_eq!(data.read_only, Some(false));
+        let volume = pod
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|volume| volume.name == "aruna-job-a1-data")
+            .unwrap();
+        assert_eq!(
+            volume.persistent_volume_claim.unwrap().claim_name,
+            "aruna-job-a1-data"
+        );
+
+        let pv = serde_json::to_value(
+            data_pv_manifest(&context(), &config(), "workspace-bucket").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pv["metadata"]["name"], "aruna-job-a1-data");
+        assert_eq!(pv["metadata"]["labels"][ROLE_LABEL], "s3-mount");
+        assert_eq!(pv["metadata"]["annotations"][EPOCH_ANNOTATION], "7");
+        assert_eq!(
+            pv["spec"]["mountOptions"],
+            json!([
+                "uid=65534",
+                "gid=65534",
+                "allow-other",
+                "prefix=data/",
+                "allow-delete",
+                "allow-overwrite",
+                "file-mode=0644",
+                "dir-mode=0755"
+            ])
+        );
+        assert_eq!(pv["spec"]["csi"]["readOnly"], false);
+        assert_eq!(
+            pv["spec"]["csi"]["volumeAttributes"]["bucketName"],
+            "workspace-bucket"
+        );
+        assert_eq!(
+            pv["spec"]["csi"]["nodePublishSecretRef"]["name"],
+            "aruna-job-a1-env"
+        );
+        let pvc = serde_json::to_value(data_pvc_manifest(&context(), &config()).unwrap()).unwrap();
+        assert_eq!(pvc["metadata"]["labels"][ROLE_LABEL], "s3-mount");
+        assert_eq!(pvc["metadata"]["annotations"][EPOCH_ANNOTATION], "7");
+        assert_eq!(pvc["spec"]["volumeName"], "aruna-job-a1-data");
+
+        let secret = secret_manifest(&context(), &config(), &spec).unwrap();
+        let data = secret.string_data.unwrap();
+        assert_eq!(data["access_key_id"], "session-access");
+        assert_eq!(data["secret_access_key"], "session-secret");
+        assert_eq!(data["AWS_ACCESS_KEY_ID"], "session-access");
+    }
+
+    #[test]
+    fn skips_data_mount() {
+        // Without a CSI driver a session keeps its plain scratch workdir.
+        let spec = session_spec();
+        let mut config = config();
+        config.s3_mount_driver = None;
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config, &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        let mounts = pod.containers[0].volume_mounts.clone().unwrap();
+        assert!(mounts.iter().any(|mount| mount.mount_path == "/work"));
+        assert!(mounts.iter().all(|mount| mount.mount_path != "/work/data"));
+        assert!(
+            pod.volumes
+                .unwrap()
+                .iter()
+                .all(|volume| volume.name != "aruna-job-a1-data")
+        );
+        let secret = secret_manifest(&context(), &config, &spec).unwrap();
+        assert!(!secret.string_data.unwrap().contains_key("access_key_id"));
     }
 
     #[test]
