@@ -570,6 +570,7 @@ async fn replay_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Res
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn query_cache_invalidates() -> Result<(), BoxError> {
     // Replaying a durable write invalidates cached results through the apply counter.
+    let harness = build_harness(None).await?;
     let graphs = [0usize, 1]
         .map(|index| format!("https://w3id.org/aruna/bench-{index:04}"))
         .to_vec();
@@ -835,6 +836,8 @@ async fn concurrent_mutation_profile() -> Result<(), BoxError> {
 
     // Sustained heavy mutation load saturating the mutation permit pool, mirroring the
     // materialization queue draining apply batches in the cluster while reads arrive.
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut writers = Vec::new();
     for writer in 0..writer_tasks {
         let harness = harness.clone();
         let stop = stop.clone();

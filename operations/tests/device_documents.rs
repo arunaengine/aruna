@@ -132,6 +132,8 @@ async fn device_fetches_owner() -> TestResult<()> {
 async fn device_fetches_groups() -> TestResult<()> {
     // Group documents replicate on a plane devices are excluded from, so the fetch is the only
     // way the owner's groups reach a device.
+    let realm = Topology::spawn(MANAGEMENT_NODES, 0, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
     let device = join_device(&realm).await?;
     assert!(read_group_record(&device, group_id).await?.is_none());
     assert!(read_group_auth(&device, group_id).await?.is_none());
