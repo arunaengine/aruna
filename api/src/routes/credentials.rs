@@ -1,12 +1,10 @@
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, PathRestriction, Permission, UserAccess, group_permission_path,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::auth::permission_rules::reachable_roots;
 use aruna_operations::s3::create_access::{
     CreateUserAccessConfig, CreateUserAccessError, CreateUserAccessOperation,
     DEFAULT_CREDENTIAL_TTL,
@@ -352,7 +350,6 @@ pub async fn create_s3_credentials(
     {
         return Err(ServerError::BadRequest);
     }
-    let group_root = group_permission_path(realm_id, group_id, state.get_node_id());
     let path_restrictions =
         build_credential_restrictions(&auth, &state, group_id, request.path_restrictions.clone())
             .await?;
@@ -686,8 +683,7 @@ async fn authorize_credential_issuance(
     group_id: Ulid,
     effective_restrictions: Option<&[NormalizedRestriction]>,
 ) -> ServerResult<()> {
-    let group_root =
-        blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
+    let group_root = group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
     let effective_auth = AuthContext {
         path_restrictions: effective_restrictions.map(serialize_restrictions),
         ..auth.clone()
@@ -711,7 +707,7 @@ async fn authorize_credential_issuance(
         let roots = aruna_operations::auth::permission_rules::reachable_roots(
             &state.get_ctx(),
             &effective_auth,
-            group_root,
+            &group_root,
         )
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
