@@ -223,12 +223,13 @@ fn record_metadata(outcome: MetadataOutcome, state: &mut BatchState) {
             state.add_target(target);
         }
         MetadataOutcome::Deferred(dependency) => state.add_dependency(dependency),
-        MetadataOutcome::Pending(pending) => state.add_pending(pending),
+        MetadataOutcome::Pending(pending) => state.add_pending(*pending),
         MetadataOutcome::Rejected(rejection) => state.add_rejection(rejection),
         MetadataOutcome::Skipped => {}
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn apply_admin_event(
     service: &DocumentSyncService,
     topic_id: ::irokle::TopicId,
