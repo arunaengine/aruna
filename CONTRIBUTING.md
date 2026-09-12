@@ -7,6 +7,9 @@ In any case please also acknowledge our [Code of Conduct](CODE_OF_CONDUCT.md)
 
 ## Developer Contributions Guidance
 
+Where new behavior belongs, and the request and startup paths end to end, are
+described in [docs/source-guide.md](docs/source-guide.md).
+
 During local work, use focused checks for the changed behavior and run
 `just lint` (the same formatting and Clippy commands as CI). The lint recipe
 pins `nightly-2026-08-23`; install it with

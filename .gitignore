@@ -1,5 +1,7 @@
 target/
-docs/
+# Internal docs stay untracked; the contributor source guide is tracked.
+docs/*
+!docs/source-guide.md
 docker/
 .compose-data/
 .idea
