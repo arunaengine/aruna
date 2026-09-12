@@ -874,7 +874,7 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
     let event_id = Ulid::generate();
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
     let lifecycle_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-    let placement = aruna_operations::placement::placement_ref_for_target(
+    let placement = aruna_operations::placement::target_placement_ref(
         &realm_config,
         &lifecycle_target,
         Default::default(),

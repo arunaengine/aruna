@@ -618,7 +618,7 @@ async fn seed_config_topic(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let target = DocumentSyncTarget::RealmConfig { realm_id };
     let placement =
-        aruna_operations::placement::placement_ref_for_target(config, &target, Default::default());
+        aruna_operations::placement::target_placement_ref(config, &target, Default::default());
     let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: nodes[1].net.node_id(),

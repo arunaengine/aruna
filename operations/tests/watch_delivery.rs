@@ -28,10 +28,10 @@ use aruna_operations::notifications::dispatch::{
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
-use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
+use aruna_operations::notifications::watch::emit::emit_watch_event;
 use aruna_operations::notifications::watch::interest::{
     ensure_local_watch_interest_digest, mark_watch_interest_dirty,
-    refresh_watch_interest_for_targets,
+    refresh_target_interest,
 };
 use aruna_operations::notifications::watch::subscriptions::list_watch_subscriptions;
 use aruna_operations::sync::incoming::initialize_net_incoming;
@@ -114,7 +114,7 @@ async fn watch_crosses_nodes() -> Result<(), Box<dyn std::error::Error>> {
         },
         occurred_at_ms,
     );
-    emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
+    emit_watch_event(nodes[1].context.as_ref(), event).await;
 
     let expected_id = watch_notification_id(event_id, subscription.watch_id);
     wait_for(|| {
@@ -230,7 +230,7 @@ async fn same_node_delivery() -> Result<(), Box<dyn std::error::Error>> {
         },
         occurred_at_ms,
     );
-    emit_resource_watch_event(nodes[0].context.as_ref(), event).await;
+    emit_watch_event(nodes[0].context.as_ref(), event).await;
 
     let expected_id = watch_notification_id(event_id, subscription.watch_id);
     wait_for(|| async {
@@ -308,7 +308,7 @@ async fn unmatched_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
         },
         unix_timestamp_millis(),
     );
-    emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
+    emit_watch_event(nodes[1].context.as_ref(), event).await;
 
     for node in &nodes {
         assert_eq!(
@@ -362,7 +362,7 @@ async fn self_event_delivers() -> Result<(), Box<dyn std::error::Error>> {
         },
         unix_timestamp_millis(),
     );
-    emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
+    emit_watch_event(nodes[1].context.as_ref(), event).await;
 
     let expected_id = watch_notification_id(event_id, subscription.watch_id);
     wait_for(|| async {
@@ -530,7 +530,7 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
     )
     .await?;
     let before_event_id = Ulid::generate();
-    emit_resource_watch_event(
+    emit_watch_event(
         nodes[1].context.as_ref(),
         upload_event(
             before_event_id,
@@ -577,7 +577,7 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
         })) => targets,
         other => return Err(format!("unexpected subscription history sync: {other:?}").into()),
     };
-    refresh_watch_interest_for_targets(new_holder_node.context.as_ref(), &reconciled).await;
+    refresh_target_interest(new_holder_node.context.as_ref(), &reconciled).await;
     for node in &nodes {
         mark_watch_interest_dirty(node.context.as_ref(), realm_id).await?;
     }
@@ -602,7 +602,7 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
     );
 
     let event_id = Ulid::generate();
-    emit_resource_watch_event(
+    emit_watch_event(
         nodes[1].context.as_ref(),
         upload_event(
             event_id,
