@@ -772,6 +772,18 @@ fn digest_covers_inputs() {
     let compute = config(vec![link("us", "eu", 1_000)]);
     let base = selected(&plan_request, scan.clone(), &compute).plan_digest;
 
+    let mut capable = scan.clone();
+    capable[0].capability.session = true;
+    let capable_digest = selected(&plan_request, capable.clone(), &compute).plan_digest;
+    assert_ne!(capable_digest, base);
+
+    let mut session = plan_request.clone();
+    session.session = true;
+    assert_ne!(
+        selected(&session, capable, &compute).plan_digest,
+        capable_digest
+    );
+
     let mut resized = plan_request.clone();
     resized.inputs[0].bytes += 1;
     assert_ne!(selected(&resized, scan.clone(), &compute).plan_digest, base);

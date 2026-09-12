@@ -35,6 +35,7 @@ pub fn plan_digest(
         field(&mut hasher, Some(&label.value));
     }
     hasher.update(&[request.staging as u8, request.network as u8]);
+    flag(&mut hasher, request.session);
 
     count(&mut hasher, request.inputs.len());
     for (input, route) in request.inputs.iter().zip(routes) {
@@ -80,6 +81,7 @@ pub fn plan_digest(
         capability.direct_s3,
         capability.s3_mount,
         capability.network_policy,
+        capability.session,
         capability.policy_draining,
     ] {
         flag(&mut hasher, value);
