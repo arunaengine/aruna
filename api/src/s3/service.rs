@@ -4036,10 +4036,19 @@ mod tests {
 
     #[tokio::test]
     async fn subpath_sees_bucket() {
-        // Only the bucket holding the granted folder may appear.
-        let (_storage_dir, service, user_access, _group_id) = subpath_node().await;
+        // Only the bucket holding the granted folder may appear. The access hook
+        // resolves the scope for a listing, so the request carries it here too.
+        let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+        let scope = resolve_scope(
+            &service.state,
+            &user_access,
+            &bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
+        )
+        .await
+        .unwrap();
         let mut extensions = Extensions::new();
         extensions.insert(user_access);
+        extensions.insert(scope);
         extensions.insert(PolicyRequestExtras::operation("s3.ListBuckets"));
         let request = S3Request {
             input: ListBucketsInput::default(),
