@@ -2824,7 +2824,7 @@ mod tests {
         }
     }
 
-    fn version_request(version_id: Ulid, mode: ReplicationMode) -> VersionReplicationRequest {
+    fn request_with_mode(version_id: Ulid, mode: ReplicationMode) -> VersionReplicationRequest {
         VersionReplicationRequest {
             bucket: "bucket".to_string(),
             key: "dir/file.txt".to_string(),
@@ -2837,7 +2837,7 @@ mod tests {
     }
 
     fn version_request(version_id: Ulid) -> VersionReplicationRequest {
-        version_request(version_id, ReplicationMode::Live)
+        request_with_mode(version_id, ReplicationMode::Live)
     }
 
     fn reference_sync() -> SyncTransferContext {
@@ -3691,7 +3691,7 @@ mod tests {
     fn preserves_reference_source() {
         let version_id = Ulid::generate();
         let cached_metadata = reference_cached_metadata();
-        let mut op = ReplicateObjectVersionOperation::new(version_request(
+        let mut op = ReplicateObjectVersionOperation::new(request_with_mode(
             version_id,
             ReplicationMode::OnDemand,
         ))
@@ -3734,7 +3734,7 @@ mod tests {
         let version_id = Ulid::generate();
         let mut sync = reference_sync();
         sync.reference_intent = false;
-        let mut op = ReplicateObjectVersionOperation::new(version_request(
+        let mut op = ReplicateObjectVersionOperation::new(request_with_mode(
             version_id,
             ReplicationMode::OnDemand,
         ))
@@ -3773,7 +3773,7 @@ mod tests {
         let version_id = Ulid::generate();
         let mut sync = reference_sync();
         sync.reference_intent = false;
-        let mut op = ReplicateObjectVersionOperation::new(version_request(
+        let mut op = ReplicateObjectVersionOperation::new(request_with_mode(
             version_id,
             ReplicationMode::OnDemand,
         ))
@@ -3841,7 +3841,7 @@ mod tests {
     fn fails_unreadable_rules() {
         // A storage failure reading the bucket record must fail the write, not
         // reroute it to the node default.
-        let mut op = ReplicateObjectVersionOperation::new(version_request(
+        let mut op = ReplicateObjectVersionOperation::new(request_with_mode(
             Ulid::generate(),
             ReplicationMode::OnDemand,
         ));
@@ -3878,7 +3878,7 @@ mod tests {
     fn reference_materializes_first() {
         let version_id = Ulid::generate();
         let original_source = Some(reference_source_binding());
-        let mut op = ReplicateObjectVersionOperation::new(version_request(
+        let mut op = ReplicateObjectVersionOperation::new(request_with_mode(
             version_id,
             ReplicationMode::OnDemand,
         ));
@@ -3946,7 +3946,7 @@ mod tests {
     fn cleanup_deletes_blob() {
         // A materialization that fails after the backend wrote data must still
         // surrender that location, or the partial blob leaks.
-        let mut op = ReplicateObjectVersionOperation::new(version_request(
+        let mut op = ReplicateObjectVersionOperation::new(request_with_mode(
             Ulid::generate(),
             ReplicationMode::OnDemand,
         ));
@@ -3996,7 +3996,7 @@ mod tests {
     #[test]
     fn reference_cleans_blob() {
         let version_id = Ulid::generate();
-        let mut op = ReplicateObjectVersionOperation::new(version_request(
+        let mut op = ReplicateObjectVersionOperation::new(request_with_mode(
             version_id,
             ReplicationMode::OnDemand,
         ));

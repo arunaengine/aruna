@@ -6,7 +6,7 @@ use crate::blob::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
 use crate::node::usage_stats::{
     UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
-use crate::replication::queue::write_live_replication_obligation_effect;
+use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -444,7 +444,7 @@ impl DeleteObjectOperation {
                 })];
             }
             self.live_before_marker = false;
-            self.write_tombstone(version_id, existing.as_ref())
+            self.write_tombstone_pointer(version_id, existing.as_ref())
         }
     }
 
@@ -461,7 +461,7 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
         let existing = self.existing_pointer.clone();
-        self.write_tombstone(version_id, existing.as_ref())
+        self.write_tombstone_pointer(version_id, existing.as_ref())
     }
 
     fn delete_lookup_read(
@@ -819,7 +819,7 @@ impl DeleteObjectOperation {
         self.read_current_lookup(version_id)
     }
 
-    fn write_tombstone(
+    fn write_tombstone_pointer(
         &mut self,
         version_id: Ulid,
         existing: Option<&CurrentVersionPointer>,
@@ -862,7 +862,7 @@ impl DeleteObjectOperation {
         let Some(version_id) = self.version_id else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
-        let effect = match write_live_replication_obligation_effect(
+        let effect = match build_live_obligation(
             self.input.node_id,
             AuthContext {
                 user_id: self.input.deleted_by,

@@ -1356,4 +1356,4 @@ pub(super) fn permanent(message: impl Into<String>) -> JobRunOutcome {
 
 /// 2026-02-03T04:05:06Z: a fixed moment keeps fixture archives byte-identical.
 #[cfg(test)]
-const FIXTURE_MOMENT_MS: u64 = 1_770_091_506_000;
+pub(super) const FIXTURE_MOMENT_MS: u64 = 1_770_091_506_000;

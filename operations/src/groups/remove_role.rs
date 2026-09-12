@@ -25,9 +25,9 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::placement_ref_for_target;
+use crate::placement::target_placement_ref;
 use crate::sync::document_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::structs::Permission;
 
@@ -358,7 +358,7 @@ impl RemoveGroupRoleOperation {
             .transpose()?;
         let placement = realm_config
             .as_ref()
-            .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
+            .map(|config| target_placement_ref(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
         let realm_id = self.input.actor.realm_id;
         if let Some(config) = realm_config.as_ref() {
@@ -366,7 +366,7 @@ impl RemoveGroupRoleOperation {
         }
         let generation = self.fence.generation(&realm_id, &placement);
         for event in &admin_events {
-            let record = new_outbox_record_with_id(
+            let record = new_identified_record(
                 event.event_id,
                 self.input.actor.node_id,
                 document_target.clone(),
@@ -530,7 +530,7 @@ impl RemoveGroupRoleOperation {
         };
         if admin_outbox_written {
             self.state = RemoveGroupRoleState::ScheduleAdminDocumentOutboxDrain { group, auth_doc };
-            return smallvec![schedule_outbox_drain_effect()];
+            return smallvec![schedule_drain_effect()];
         }
 
         self.state = RemoveGroupRoleState::Finish;

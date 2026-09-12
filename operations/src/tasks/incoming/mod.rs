@@ -69,23 +69,22 @@ use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_A
 use crate::metadata::materialization_queue::{
     METADATA_MATERIALIZATION_NEXT_BATCH_AFTER, METADATA_MATERIALIZATION_POLL_AFTER,
     METADATA_MATERIALIZATION_RETRY_AFTER, MetadataMaterializationDrainResult,
-    metadata_materialization_jobs_exist, process_metadata_materialization_batch,
-    requeue_dead_letters, restore_metadata_materialization_timer,
+    materialization_jobs_exist, process_materialization_batch,
+    requeue_dead_letters, restore_materialization_timer,
 };
 use crate::metadata::projector::{
-    METADATA_PROJECTION_RETRY_AFTER, drain_pending_metadata_projection_queue,
-    project_metadata_create_events, project_metadata_create_events_from_log,
-    replay_metadata_event_log, restore_pending_metadata_projection_timer,
+    METADATA_PROJECTION_RETRY_AFTER, drain_projection_queue,
+    project_create_events, project_logged_events,
+    replay_event_log, restore_projection_timer,
 };
 use crate::metadata::prune_queue::{
-    METADATA_GRAPH_PRUNE_POLL_AFTER, METADATA_GRAPH_PRUNE_RETRY_AFTER,
-    metadata_graph_prune_jobs_exist, process_metadata_graph_prune_batch,
-    process_metadata_graph_tombstones, restore_metadata_graph_prune_timer,
+    METADATA_GRAPH_PRUNE_POLL_AFTER, METADATA_GRAPH_PRUNE_RETRY_AFTER, process_graph_tombstones,
+    prune_jobs_exist,
 };
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::node::usage_stats::{refresh_usage_targets, restore_usage_timer};
 use crate::notifications::client::deliver_remote;
-use crate::notifications::inbox::upsert_inbox_records_reporting;
+use crate::notifications::inbox::upsert_with_report;
 use crate::notifications::outbox::{
     NOTIFICATION_DELIVERY_RETRY_AFTER, NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
     NOTIFICATION_OUTBOX_RETENTION_MS, delete_outbox_records, read_outbox_batch, restore_idle_timer,
@@ -94,11 +93,9 @@ use crate::notifications::outbox::{
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::prune::{
     NOTIFICATION_PRUNE_POLL_AFTER, NOTIFICATION_PRUNE_RETRY_AFTER, process_prune_batch,
-    restore_prune_timer,
 };
 use crate::notifications::watch::interest::{
-    WATCH_INTEREST_PUBLISH_DEBOUNCE, rebuild_interest_table, refresh_watch_interest_for_targets,
-    restore_publish_timer,
+    WATCH_INTEREST_PUBLISH_DEBOUNCE, rebuild_interest_table, refresh_target_interest,
 };
 use crate::placement::policy::observe_placement;
 use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};
@@ -106,15 +103,11 @@ use crate::realm::announce_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
 };
 use crate::replication::queue::{
-    BLOB_REPLICATION_RETRY_AFTER, process_blob_replication_batch, restore_blob_replication_timer,
+    BLOB_REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer,
 };
-use crate::s3::refresh_metadata::{
-    REFERENCE_METADATA_REFRESH_RETRY_AFTER, process_reference_metadata_refresh_batch,
-    restore_reference_metadata_refresh_timer,
-};
+use crate::s3::refresh_metadata::REFERENCE_METADATA_REFRESH_RETRY_AFTER;
 use crate::sync::document_outbox::{
-    OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records, read_outbox_tails,
-    restore_outbox_timers,
+    OUTBOX_DRAIN_BATCH_SIZE, read_outbox_records, read_outbox_tails, restore_outbox_timers,
 };
 use crate::sync::mirror_repair::{
     MIRROR_REPAIR_RETRY_AFTER, process_mirror_repairs, restore_mirror_timer,

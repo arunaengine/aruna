@@ -1,9 +1,8 @@
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::notifications::outbox::schedule_notification_outbox_drain_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
-use crate::placement::placement_ref_for_target;
+use crate::placement::target_placement_ref;
 use crate::sync::document_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
@@ -347,9 +346,9 @@ impl GroupJoinOperation {
         let target = DocumentSyncTarget::GroupAuthorization {
             group_id: self.input.group_id,
         };
-        let placement = placement_ref_for_target(&config, &target, Default::default());
+        let placement = target_placement_ref(&config, &target, Default::default());
         self.fence.add(group.realm_id, &config, [placement]);
-        let record = new_outbox_record_with_id(
+        let record = new_identified_record(
             event.event_id,
             self.input.actor.node_id,
             target,
@@ -497,7 +496,7 @@ impl Operation for GroupJoinOperation {
                 self.txn_id = None;
                 if self.changed {
                     self.state = State::Schedule;
-                    smallvec![schedule_outbox_drain_effect()]
+                    smallvec![schedule_drain_effect()]
                 } else {
                     self.state = State::Done;
                     smallvec![]
@@ -509,7 +508,7 @@ impl Operation for GroupJoinOperation {
             ) => {
                 if self.notifications {
                     self.state = State::Notify;
-                    smallvec![schedule_notification_outbox_drain_effect()]
+                    smallvec![crate::notifications::outbox::schedule_drain_effect()]
                 } else {
                     self.state = State::Done;
                     smallvec![]

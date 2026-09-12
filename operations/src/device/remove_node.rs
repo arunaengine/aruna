@@ -24,7 +24,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::placement::target_placement_ref;
-use crate::realm::ensure_config::overlay_realm_config_reducer_materialization;
+use crate::realm::ensure_config::overlay_reducer_state;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::document_outbox::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
@@ -205,7 +205,7 @@ impl RemoveDeviceNodeOperation {
         )?;
         // The stored document is derived from the reducer, exactly as the
         // replicated overlay derives it on every other node.
-        overlay_realm_config_reducer_materialization(
+        overlay_reducer_state(
             &mut document,
             &reducer_state,
             unix_timestamp_millis(),

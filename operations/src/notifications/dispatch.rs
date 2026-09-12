@@ -415,7 +415,7 @@ pub async fn create_for_user(
     // The creator knows the holder before its interest digest propagates.
     // Register locally so events in that window still reach the holder.
     if let Some(net_handle) = context.net_handle.as_ref() {
-        net_handle.register_local_watch_interest(
+        net_handle.register_local_interest(
             subscription.watch_id,
             owner.realm_id,
             holder,
@@ -456,7 +456,7 @@ pub async fn delete_for_user(
             .map_err(WatchDispatchError::Remote)?;
     }
     if let Some(net_handle) = context.net_handle.as_ref() {
-        net_handle.retract_local_watch_interest(watch_id);
+        net_handle.retract_local_interest(watch_id);
     }
     Ok(())
 }

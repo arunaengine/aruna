@@ -39,7 +39,7 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
-use crate::metadata::get_document::load_metadata_record_by_document;
+use crate::metadata::get_document::load_document_record;
 use crate::metadata::repository::StorageReadError;
 
 use super::lifecycle::cancel::cancel_family;
@@ -670,7 +670,7 @@ async fn joined_pid_job(
     let JobPayload::MintPersistentId(spec) = &record.payload else {
         return Ok(None);
     };
-    let Some(document) = load_metadata_record_by_document(context, spec.document_id)
+    let Some(document) = load_document_record(context, spec.document_id)
         .await
         .map_err(|error| format!("{error:?}"))?
     else {
@@ -970,7 +970,7 @@ pub async fn read_owned_artifact(
         return Err("artifact record does not match its blob location".to_string());
     }
     let document_path =
-        crate::metadata::get_document::load_metadata_record_by_document(context, spec.document_id)
+        crate::metadata::get_document::load_document_record(context, spec.document_id)
             .await
             .map_err(|error| match error {
                 StorageReadError::Storage(error) => error.to_string(),

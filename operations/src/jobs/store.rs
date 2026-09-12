@@ -620,7 +620,7 @@ where
             let settled = !old.is_settled() && record.is_settled();
             let mut terminal_deletes = Vec::new();
             if settled && let JobPayload::StoragePurge(spec) = &record.payload {
-                if let Some(delete) = crate::s3::purge_fence::owned_terminal_fence_delete(
+                if let Some(delete) = crate::s3::purge_fence::delete_owned_terminal(
                     storage,
                     txn_id,
                     record.job_id,

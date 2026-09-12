@@ -16,7 +16,7 @@ use crate::placement::policy::{
     split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::dht_registration::dht_registration_effect;
-use crate::replication::queue::write_live_replication_obligation_effect;
+use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -969,7 +969,7 @@ impl PutObjectOperation {
         let Some(version_id) = self.version_id else {
             return self.emit_error(PutObjectError::PutObjectFailed);
         };
-        let effect = match write_live_replication_obligation_effect(
+        let effect = match build_live_obligation(
             self.config.node_id,
             AuthContext {
                 user_id: self.config.user_id,

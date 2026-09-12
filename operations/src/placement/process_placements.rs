@@ -146,7 +146,7 @@ async fn ensure_held_topics(
         let (mut known, missing): (Vec<::irokle::TopicId>, Vec<::irokle::TopicId>) =
             topics.into_iter().partition(|topic| {
                 net_handle
-                    .document_sync_topic_exists(*topic)
+                    .sync_topic_exists(*topic)
                     .unwrap_or(false)
             });
         if !missing.is_empty() {
@@ -162,7 +162,7 @@ async fn ensure_held_topics(
             crate::node::startup::apply_restored_reconcile(context, local_node_id, event).await;
             for topic in missing {
                 if net_handle
-                    .document_sync_topic_exists(topic)
+                    .sync_topic_exists(topic)
                     .unwrap_or(false)
                 {
                     known.push(topic);
@@ -203,7 +203,7 @@ pub(crate) async fn resolve_creatable_topics(
     let mut missing: Vec<::irokle::TopicId> = Vec::new();
     for topic in topics {
         if net_handle
-            .document_sync_topic_exists(topic)
+            .sync_topic_exists(topic)
             .unwrap_or(false)
         {
             to_ensure.push(topic);
@@ -260,7 +260,7 @@ pub(crate) async fn resolve_creatable_topics(
         // must not fall through to a fresh create - retry it on the next pass.
         for topic in to_adopt {
             if net_handle
-                .document_sync_topic_exists(topic)
+                .sync_topic_exists(topic)
                 .unwrap_or(false)
             {
                 to_ensure.push(topic);
@@ -579,7 +579,7 @@ async fn reconcile_placements(
             let topic = shard_topic_id(realm_id, &record.placement);
             // This loop tops up known topics and retains missing genesis records for another pass.
             if !net_handle
-                .document_sync_topic_exists(topic)
+                .sync_topic_exists(topic)
                 .unwrap_or(false)
             {
                 debug!(
@@ -814,7 +814,7 @@ async fn prune_released_transitions(
         return false;
     };
     let before = stored.placement_transitions.len();
-    crate::realm::ensure_config::overlay_realm_config_reducer_materialization(
+    crate::realm::ensure_config::overlay_reducer_state(
         &mut stored,
         &state,
         now_ms,

@@ -31,7 +31,7 @@ use crate::sync::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
 };
-use crate::tasks::queue_backoff::retry_after_ms;
+use crate::tasks::queue_backoff::retry_delay_ms;
 
 const REPAIR_PAGE_SIZE: usize = 128;
 const REPAIR_BATCH_SIZE: usize = 64;
@@ -683,7 +683,7 @@ async fn reschedule_repair_record(
     let next = SyncMirrorRepairRecord {
         relationship: record.relationship.clone(),
         intent: record.intent,
-        due_at_ms: unix_timestamp_millis().saturating_add(retry_after_ms(attempts)),
+        due_at_ms: unix_timestamp_millis().saturating_add(retry_delay_ms(attempts)),
         attempts,
         last_error: Some(error),
     };

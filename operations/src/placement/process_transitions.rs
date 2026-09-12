@@ -1121,7 +1121,7 @@ mod tests {
             kind: aruna_core::document::DocumentSyncChangeKind::Delete,
             placement,
         };
-        let record = crate::sync::document_outbox::new_outbox_record_with_id(
+        let record = crate::sync::document_outbox::new_identified_record(
             Ulid::from_bytes([seed; 16]),
             node(1),
             DocumentSyncTarget::MetadataDocumentLifecycle {

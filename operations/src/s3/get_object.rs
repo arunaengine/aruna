@@ -1696,6 +1696,7 @@ mod test {
         BLOB_VERSIONS_KEYSPACE,
     };
     use aruna_core::operation::Operation;
+    use aruna_core::stream::BackendStream;
     use aruna_core::structs::checksum::{HASH_MD5, HASH_SHA256};
     use aruna_core::structs::{
         Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey,

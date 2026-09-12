@@ -1,7 +1,6 @@
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::types::{Key, Value};
 use aruna_storage::StorageHandle;
 use thiserror::Error;

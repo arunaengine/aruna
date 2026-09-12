@@ -34,11 +34,11 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::placement_ref_for_target;
+use crate::placement::target_placement_ref;
 use crate::sync::document_outbox::{
-    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
-use crate::sync::shard_placement::schedule_placement_revalidation_effect;
+use crate::sync::shard_placement::schedule_revalidation;
 
 pub(crate) const CONFLICT_ATTEMPTS: usize = 10;
 
@@ -920,14 +920,14 @@ impl MutateRealmPlacementOperation {
         }
 
         if let Some((node_id, placement)) =
-            crate::placement::first_draining_holder_set_change(&pre_document, &document)
+            crate::placement::first_draining_change(&pre_document, &document)
         {
             return Err(MutateRealmPlacementError::InvalidInput(format!(
                 "placement change alters drain-time holder set for node {node_id}, strategy {} shard {}",
                 placement.strategy_id, placement.shard
             )));
         }
-        if let Some(placement) = crate::placement::first_empty_referenced_shard(&document) {
+        if let Some(placement) = crate::placement::first_empty_shard(&document) {
             return Err(MutateRealmPlacementError::EmptyShardHolders {
                 strategy_id: placement.strategy_id,
                 shard: placement.shard,
@@ -937,7 +937,7 @@ impl MutateRealmPlacementOperation {
         let stale_conflict_deletes =
             stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let document_target = self.document_ref();
-        let placement = placement_ref_for_target(&document, &document_target, Default::default());
+        let placement = target_placement_ref(&document, &document_target, Default::default());
         let mut writes = vec![
             (
                 document_target.storage_keyspace().to_string(),
@@ -947,7 +947,7 @@ impl MutateRealmPlacementOperation {
             reducer_state_entry(&reducer_state)?,
         ];
         for admin_event in admin_events {
-            let record = new_outbox_record_with_id(
+            let record = new_identified_record(
                 admin_event.event_id,
                 self.actor.node_id,
                 document_target.clone(),
@@ -1303,7 +1303,7 @@ impl Operation for MutateRealmPlacementOperation {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.state = MutateRealmPlacementState::ScheduleDocumentSyncOutboxDrain;
-                    smallvec![schedule_outbox_drain_effect()]
+                    smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
@@ -1314,7 +1314,7 @@ impl Operation for MutateRealmPlacementOperation {
             MutateRealmPlacementState::ScheduleDocumentSyncOutboxDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = MutateRealmPlacementState::SchedulePlacementRevalidation;
-                    smallvec![schedule_placement_revalidation_effect(
+                    smallvec![schedule_revalidation(
                         self.actor.realm_id,
                         self.actor.node_id,
                     )]
@@ -1322,7 +1322,7 @@ impl Operation for MutateRealmPlacementOperation {
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
                     self.state = MutateRealmPlacementState::SchedulePlacementRevalidation;
-                    smallvec![schedule_placement_revalidation_effect(
+                    smallvec![schedule_revalidation(
                         self.actor.realm_id,
                         self.actor.node_id,
                     )]

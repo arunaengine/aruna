@@ -1475,7 +1475,7 @@ mod tests {
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::checksum::HASH_BLAKE3;
+    use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
     use aruna_core::structs::{
         AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, PlacementPolicyRef,
         RealmConfigDocument, RealmId, RealmNodeKind, VersionedObjectArn,

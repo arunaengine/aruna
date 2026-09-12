@@ -11,7 +11,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_tasks::TaskHandle;
 use tracing::warn;
 
-use crate::tasks::queue_backoff::retry_after_ms;
+use crate::tasks::queue_backoff::retry_delay_ms;
 
 use super::drain::DrainOutcome;
 use super::publish_queue::{PublishEntry, PublishState};
@@ -87,7 +87,7 @@ impl RetryView for SyncUpload {
 
 /// Due time for the next attempt after `attempts` failures.
 pub(crate) fn retry_due_ms(attempts: u32) -> u64 {
-    unix_timestamp_millis().saturating_add(retry_after_ms(attempts))
+    unix_timestamp_millis().saturating_add(retry_delay_ms(attempts))
 }
 
 /// Whether `attempts` spent exhausts `max_attempts` and parks the row.
