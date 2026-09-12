@@ -8,41 +8,28 @@ use aruna_core::NodeId;
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::effects::StoragePriority;
 use aruna_core::events::Event;
-use aruna_core::metadata::{
-    MetadataEffect,
-    MetadataError, MetadataEvent, MetadataRoCratePage,
-};
-use aruna_core::structs::{
-    BucketInfo, MetadataRegistryRecord, RealmId,
-    SyncRelationship,
-};
+use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, MetadataRoCratePage};
+use aruna_core::structs::{BucketInfo, MetadataRegistryRecord, RealmId, SyncRelationship};
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::NetHandle;
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use async_trait::async_trait;
 use craqle::{
-    ActorId,
-    CraqleIrokleOptions, CraqleNode, CraqleOptions, CrateViolation, GraphId, SearchStorage,
+    ActorId, CraqleIrokleOptions, CraqleNode, CraqleOptions, CrateViolation, GraphId, SearchStorage,
 };
-use futures_util::FutureExt;
 use jsonwebtoken::DecodingKey;
 use oxrdf::Term;
 use tracing::warn;
 use ulid::Ulid;
 
-use self::entity_convert::{
-    error_from_craqle, fjall_persist_mode,
-};
+use self::entity_convert::{error_from_craqle, fjall_persist_mode};
 use self::lifecycle::{
-    fill_visibility_caches,
-    list_group_records, list_local_group, list_local_records,
+    fill_visibility_caches, list_group_records, list_local_group, list_local_records,
 };
 use self::peer_auth::load_auth_state;
 use self::persist::flush_metadata_persistence;
 use self::query::snapshot_iri_references;
-use self::search::{
-    AllowedGraphAuthorizer, describe_hit_properties,
-};
+use self::search::{AllowedGraphAuthorizer, describe_hit_properties};
 use super::contact::PeerContacts;
 use super::materialization_queue::metadata_graph_fence;
 use super::profile_cache::ProfileCache;
@@ -52,8 +39,7 @@ use super::profile_shacl::{
 use super::query_cache::MetadataQueryCache;
 use super::summary_cache::summary_cache;
 use crate::auth::bearer_token::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
-    realm_token_revoked,
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache, realm_token_revoked,
 };
 use crate::driver::{DriverContext, drive};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};

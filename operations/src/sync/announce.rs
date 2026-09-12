@@ -26,9 +26,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::document_repository;
-use crate::sync::document_outbox::{
-    new_outbox_record, schedule_drain_effect, write_outbox_effect,
-};
+use crate::sync::document_outbox::{new_outbox_record, schedule_drain_effect, write_outbox_effect};
 
 const USER_SYNC_PAGE_SIZE: usize = 256;
 
@@ -201,19 +199,12 @@ impl AnnounceTopicOperation {
         }
     }
 
-    fn write_outbox(
-        &mut self,
-        document: DocumentSyncTarget,
-        bytes: Vec<u8>,
-    ) -> Effects {
+    fn write_outbox(&mut self, document: DocumentSyncTarget, bytes: Vec<u8>) -> Effects {
         let change = match self.document_upsert_change(&document, &bytes) {
             Ok(change) => change,
             Err(error) => return self.fail(error),
         };
-        self.write_outbox_event(
-            document,
-            DocumentSyncOutboxEvent::Upsert { bytes, change },
-        )
+        self.write_outbox_event(document, DocumentSyncOutboxEvent::Upsert { bytes, change })
     }
 
     fn write_outbox_event(

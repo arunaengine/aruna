@@ -85,9 +85,7 @@ use crate::placement::{holds_placement, read_holder_sets, resolve_shard_holders}
 use crate::realm::peer_trust::{PeerTrust, ensure_peer_trust};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::get_bucket::GetBucketInfoOperation;
-use crate::sync::document_outbox::{
-    new_outbox_record, schedule_drain_effect, write_outbox_effect,
-};
+use crate::sync::document_outbox::{new_outbox_record, schedule_drain_effect, write_outbox_effect};
 
 /// Where a metadata write must be applied: topic membership equals the bucket's
 /// holder set, so a non-holder cannot publish and the mutation goes to a holder.
@@ -3383,9 +3381,8 @@ pub(crate) async fn apply_admin_relay(
         }
     }
     if let Some(task_handle) = context.task_handle.as_ref()
-        && let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = task_handle
-            .send_effect(schedule_drain_effect())
-            .await
+        && let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) =
+            task_handle.send_effect(schedule_drain_effect()).await
     {
         warn!(%message, "Failed to schedule the drain for a relayed admin event");
     }

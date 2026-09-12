@@ -10,8 +10,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Key, TxnId, Value};
 use aruna_core::time::unix_timestamp_secs;
+use aruna_core::types::{Key, TxnId, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -375,10 +375,7 @@ async fn read_index_value(storage: &StorageHandle, key: &[u8]) -> Result<Option<
     }
 }
 
-pub async fn restore_outbox_timers(
-    storage: &StorageHandle,
-    task_handle: &TaskHandle,
-) {
+pub async fn restore_outbox_timers(storage: &StorageHandle, task_handle: &TaskHandle) {
     let event = storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),

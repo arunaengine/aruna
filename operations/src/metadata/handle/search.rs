@@ -20,7 +20,8 @@ use ulid::Ulid;
 
 use super::effects::{graph_ids, record_error};
 use super::{
-    LifecycleVisibilityRefresh, METADATA_ENRICH_TASKS, METADATA_REGISTRY_CANDIDATE_LIMIT, MetadataHandle, MetadataInner, MetadataVisibilityCache,
+    LifecycleVisibilityRefresh, METADATA_ENRICH_TASKS, METADATA_REGISTRY_CANDIDATE_LIMIT,
+    MetadataHandle, MetadataInner, MetadataVisibilityCache,
 };
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::driver::DriverContext;

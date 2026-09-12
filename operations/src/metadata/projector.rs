@@ -1115,10 +1115,7 @@ async fn schedule_outbox_drain(context: &DriverContext) -> Result<(), MetadataPr
     let Some(task_handle) = context.task_handle.as_ref() else {
         return Ok(());
     };
-    match task_handle
-        .send_effect(schedule_drain_effect())
-        .await
-    {
+    match task_handle.send_effect(schedule_drain_effect()).await {
         Event::Task(aruna_core::task::TaskEvent::TimerScheduled { .. }) => Ok(()),
         Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) => {
             Err(MetadataProjectionError::UnexpectedEvent(message))

@@ -9,9 +9,7 @@ use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use serde::de::DeserializeOwned;
 
-use super::{
-    MetadataHandle, MetadataWritePeerError, RevocationBlindValidation,
-};
+use super::{MetadataHandle, MetadataWritePeerError, RevocationBlindValidation};
 use crate::auth::bearer_token::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_bearer_token,
     validate_bearer_token,

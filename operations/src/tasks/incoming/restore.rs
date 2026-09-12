@@ -704,9 +704,7 @@ impl OperationsTaskHandler {
             }
 
             if !local_records.is_empty() {
-                match upsert_with_report(&self.context.storage_handle, &local_records)
-                    .await
-                {
+                match upsert_with_report(&self.context.storage_handle, &local_records).await {
                     Ok(outcome) => {
                         for recipient in &outcome.recipients {
                             net_handle.notify_inbox_activity(*recipient);

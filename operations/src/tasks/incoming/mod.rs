@@ -69,13 +69,12 @@ use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_A
 use crate::metadata::materialization_queue::{
     METADATA_MATERIALIZATION_NEXT_BATCH_AFTER, METADATA_MATERIALIZATION_POLL_AFTER,
     METADATA_MATERIALIZATION_RETRY_AFTER, MetadataMaterializationDrainResult,
-    materialization_jobs_exist, process_materialization_batch,
-    requeue_dead_letters, restore_materialization_timer,
+    materialization_jobs_exist, process_materialization_batch, requeue_dead_letters,
+    restore_materialization_timer,
 };
 use crate::metadata::projector::{
-    METADATA_PROJECTION_RETRY_AFTER, drain_projection_queue,
-    project_create_events, project_logged_events,
-    replay_event_log, restore_projection_timer,
+    METADATA_PROJECTION_RETRY_AFTER, drain_projection_queue, project_create_events,
+    project_logged_events, replay_event_log, restore_projection_timer,
 };
 use crate::metadata::prune_queue::{
     METADATA_GRAPH_PRUNE_POLL_AFTER, METADATA_GRAPH_PRUNE_RETRY_AFTER, process_graph_tombstones,
