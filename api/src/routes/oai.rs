@@ -1503,7 +1503,7 @@ mod tests {
         let fixture = fixture(RoCrateLimits::default()).await;
         fixture
             .state
-            .register_rest_interface(
+            .register_rest_public(
                 "127.0.0.1:8080".parse().unwrap(),
                 Some("https://public.test"),
             )

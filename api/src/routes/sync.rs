@@ -22,7 +22,7 @@ use aruna_operations::replication::version_replication::{
 use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::sync::mirror_repair::{
     SyncMirrorRepairIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
-    request_sync_mirror_create, stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
+    request_mirror_create, stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
 };
 use aruna_operations::sync::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, ListSyncRelationshipsOperation,
@@ -1089,7 +1089,7 @@ async fn create_mirror(
 
     let auth_token = MetadataAuthToken::bearer(bearer.as_str().to_string())
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
-    request_sync_mirror_create(
+    request_mirror_create(
         &state.get_ctx(),
         relationship.target.node_id,
         auth_token,
