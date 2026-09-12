@@ -8,8 +8,9 @@ use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::{
     BackendLocation, GroupRoutingInputs, HiddenBlobEntry, MAX_POLICY_REF_INPUT, PlacementDecision,
-    PlacementPolicyDocument, PolicyPublication, RealmId, ReplicationSuboperationResult,
-    ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
+    PlacementPolicyDocument, PolicyPublication, RealmId, ReplicationItemError,
+    ReplicationSuboperationResult, ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry,
+    SourceMetadata,
 };
 use crate::{
     document::DocumentSyncNetEvent,
@@ -58,7 +59,7 @@ pub enum SubOperationEvent {
         result: Result<ResolvedSourceAccess, SourceConnectorResolutionError>,
     },
     ReplicationItemResult {
-        result: Result<ReplicationSuboperationResult, String>,
+        result: Result<ReplicationSuboperationResult, ReplicationItemError>,
     },
     ReplicationTransferResult {
         result: Result<(), String>,

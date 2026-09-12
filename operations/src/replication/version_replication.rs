@@ -31,10 +31,11 @@ use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs, ManagedCopyKey,
     MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, Permission,
-    PlacementPolicyRef, PortableSourceDescriptor, ReferenceHandling, ReplicationItemKind,
-    ReplicationNegotiationResult, ReplicationSuboperationResult, ResolvedSourceAccess,
-    RoutingError, SourceConnectorKind, SourceMetadata, StagingStrategy, SyncMode, SyncRelationship,
-    VersionKey, VersionSourceBinding, object_permission_path, sync_state_key,
+    PlacementPolicyRef, PortableSourceDescriptor, ReferenceHandling, ReplicationFailure,
+    ReplicationItemError, ReplicationItemKind, ReplicationNegotiationResult,
+    ReplicationSuboperationResult, ResolvedSourceAccess, RoutingError, SourceConnectorKind,
+    SourceMetadata, StagingStrategy, SyncMode, SyncRelationship, VersionKey, VersionSourceBinding,
+    object_permission_path, sync_state_key,
 };
 use aruna_core::structs::{NodeRouting, StorageRoutingRule, resolve_backend};
 use aruna_core::types::{Effects, GroupId, Key, NodeId, UserId};
@@ -253,7 +254,10 @@ pub struct ReplicateScopeResult {
     pub replicated_bytes: u64,
     pub skipped: u64,
     pub failed: u64,
+    /// Human-readable reason of the last failed item, for the external boundary.
     pub last_error: Option<String>,
+    /// Stable category of the last failed item, for retry/terminal policy.
+    pub failure: Option<ReplicationFailure>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -337,6 +341,7 @@ impl ReplicateScopeOperation {
                 skipped: 0,
                 failed: 0,
                 last_error: None,
+                failure: None,
             },
             output: None,
         }
@@ -577,6 +582,7 @@ impl ReplicateScopeOperation {
             && let Err(error) = authorization.allows(&version_key.bucket, &version_key.key)
         {
             self.result.failed = self.result.failed.saturating_add(1);
+            self.result.failure = Some(ReplicationFailure::AccessDenied);
             self.result.last_error = Some(error.to_string());
             return Ok(());
         }
@@ -677,9 +683,13 @@ impl ReplicateScopeOperation {
         smallvec![Effect::SubOperation(boxed_suboperation(
             operation,
             |result| Event::SubOperation(SubOperationEvent::ReplicationItemResult {
-                result: result
-                    .map_err(|err| err.to_string())
-                    .and_then(|inner| inner.map_err(|err| err.to_string())),
+                result: match result {
+                    Ok(Ok(value)) => Ok(value),
+                    Ok(Err(error)) | Err(error) => Err(ReplicationItemError {
+                        failure: error.failure_category(),
+                        message: error.to_string(),
+                    }),
+                },
             }),
         ))]
     }
@@ -906,7 +916,8 @@ impl Operation for ReplicateScopeOperation {
                     }
                     Err(error) => {
                         self.result.failed += 1;
-                        self.result.last_error = Some(error.clone());
+                        self.result.failure = Some(error.failure);
+                        self.result.last_error = Some(error.message.clone());
                     }
                 }
 
@@ -984,6 +995,20 @@ pub enum ReplicateObjectVersionError {
         expected: &'static str,
         received: Event,
     },
+}
+
+impl ReplicateObjectVersionError {
+    /// The stable failure category this item reports. A peer rejection is
+    /// classified from its published reason at this boundary; every local
+    /// failure is `Other`, so nothing local can fake a permission outcome.
+    pub(crate) fn failure_category(&self) -> ReplicationFailure {
+        match self {
+            Self::ReplicationError(ReplicationError::ReplicationRejected(reason)) => {
+                ReplicationItemError::from_peer_reason(reason).failure
+            }
+            _ => ReplicationFailure::Other,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2544,7 +2569,7 @@ mod tests {
     use super::{
         MAX_SCOPE_VERSIONS, ReplicateObjectVersionError, ReplicateObjectVersionOperation,
         ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
-        ReplicationVersion, SourceAuthorization, SyncTransferContext,
+        ReplicationFailure, ReplicationVersion, SourceAuthorization, SyncTransferContext,
     };
     use crate::driver::DriverContext;
     use crate::replication::protocol::{
@@ -3156,6 +3181,7 @@ mod tests {
         let mut denied = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket))
             .with_reference_advance(advance);
         denied.result.failed = 1;
+        denied.result.failure = Some(ReplicationFailure::AccessDenied);
         denied.result.last_error = Some("source access denied".to_string());
 
         let effects = denied.run_next_replication();

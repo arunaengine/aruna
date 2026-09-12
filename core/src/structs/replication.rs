@@ -353,6 +353,94 @@ pub enum ReplicationSuboperationResult {
     ReplicatedBytes(u64),
 }
 
+/// Stable failure category of one replication item. Retry and terminal policy
+/// uses this instead of parsing the human message, which crosses node
+/// boundaries as text and may be reworded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReplicationFailure {
+    /// The source refused the caller's access; the relationship is recorded as
+    /// failed with reason `access_denied`.
+    AccessDenied,
+    /// The destination writer refused; terminal without a relationship update.
+    WriterDenied,
+    /// Anything else, which is retryable.
+    Other,
+}
+
+impl ReplicationFailure {
+    pub fn is_access_denied(self) -> bool {
+        matches!(self, Self::AccessDenied)
+    }
+
+    pub fn is_writer_denied(self) -> bool {
+        matches!(self, Self::WriterDenied)
+    }
+
+    pub fn is_denied(self) -> bool {
+        matches!(self, Self::AccessDenied | Self::WriterDenied)
+    }
+}
+
+/// One failed replication item: the stable category plus the message the
+/// external boundary reports.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplicationItemError {
+    pub failure: ReplicationFailure,
+    pub message: String,
+}
+
+impl ReplicationItemError {
+    /// Classifies a peer rejection reason once, at the wire boundary.
+    ///
+    /// The recognized values are the receiving node's published refusal texts.
+    /// `writer_access_denied` was and stays its own category; every other
+    /// `*access_denied` value took the legacy access-denied path and keeps it.
+    /// Unknown reasons stay `Other`, so a reworded peer message can never
+    /// escalate into a permission failure or a destructive cleanup.
+    pub fn from_peer_reason(reason: &str) -> Self {
+        let failure = match reason {
+            "writer_access_denied" => ReplicationFailure::WriterDenied,
+            "manifest_access_denied" | "access_denied" | "source access denied" => {
+                ReplicationFailure::AccessDenied
+            }
+            _ => ReplicationFailure::Other,
+        };
+        Self {
+            failure,
+            message: reason.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::{ReplicationFailure, ReplicationItemError};
+
+    #[test]
+    fn peer_reason_classification_is_fixed() {
+        let cases = [
+            ("writer_access_denied", ReplicationFailure::WriterDenied),
+            ("manifest_access_denied", ReplicationFailure::AccessDenied),
+            ("access_denied", ReplicationFailure::AccessDenied),
+            ("source access denied", ReplicationFailure::AccessDenied),
+            ("quota", ReplicationFailure::Other),
+            ("some future refusal", ReplicationFailure::Other),
+        ];
+        for (reason, expected) in cases {
+            let error = ReplicationItemError::from_peer_reason(reason);
+            assert_eq!(error.failure, expected, "reason: {reason}");
+            assert_eq!(error.message, reason);
+        }
+    }
+
+    #[test]
+    fn unknown_reasons_stay_retryable() {
+        let error = ReplicationItemError::from_peer_reason("writer access denied");
+        assert_eq!(error.failure, ReplicationFailure::Other);
+        assert!(!error.failure.is_denied());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
