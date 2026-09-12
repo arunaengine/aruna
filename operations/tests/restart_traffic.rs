@@ -269,7 +269,9 @@ fn make_runtime() -> Result<tokio::runtime::Runtime, BoxError> {
 }
 
 // Owns the auxiliary node-2 runtime and always tears it down off the async
-// context.
+// context. Dropping a runtime inside an async task panics, so every drop goes
+// through `spawn_blocking` and an early `?` yields the real error.
+struct AuxRuntime(Option<tokio::runtime::Runtime>);
 
 impl AuxRuntime {
     fn new() -> Result<Self, BoxError> {
