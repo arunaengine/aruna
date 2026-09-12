@@ -990,7 +990,7 @@ impl RebuildUsageStatsOperation {
 }
 
 impl Operation for RebuildUsageStatsOperation {
-    type Output = Option<Result<UsageCounters, RebuildUsageStatsError>>;
+    type Output = UsageCounters;
     type Error = RebuildUsageStatsError;
 
     fn start(&mut self) -> Effects {
@@ -1032,13 +1032,11 @@ impl Operation for RebuildUsageStatsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == RebuildUsageStatsState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(RebuildUsageStatsError::RebuildFailed);
+        match self.output {
+            Some(Ok(counters)) => Ok(counters),
+            Some(Err(error)) => Err(error),
+            None => Err(RebuildUsageStatsError::RebuildFailed),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -2281,8 +2279,6 @@ mod tests {
 
         let global = drive(RebuildUsageStatsOperation::new(), &ctx)
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
 
         // live.txt, ref.txt, and shared.bin are live; gone.txt ends on a delete marker.
@@ -2402,8 +2398,6 @@ mod tests {
 
         drive(RebuildUsageStatsOperation::new(), &ctx)
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
 
         assert!(read_optional_counters(&ctx, stale_key).await.is_none());
@@ -2671,8 +2665,6 @@ mod tests {
 
         drive(RebuildUsageStatsOperation::new(), &ctx)
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
 
         assert_eq!(

@@ -174,6 +174,8 @@ pub enum PutGroupRoutingError {
     InvalidTarget(#[from] RoutingError),
     #[error("could not load the group's storage backends: {0}")]
     InputsUnavailable(String),
+    #[error("group routing write did not finish")]
+    NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -237,7 +239,7 @@ impl PutGroupRoutingOperation {
 }
 
 impl Operation for PutGroupRoutingOperation {
-    type Output = Option<Result<GroupStorageRouting, PutGroupRoutingError>>;
+    type Output = GroupStorageRouting;
     type Error = PutGroupRoutingError;
 
     fn start(&mut self) -> Effects {
@@ -294,12 +296,11 @@ impl Operation for PutGroupRoutingOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == PutGroupRoutingState::Error
-            && let Some(Err(err)) = self.output
-        {
-            return Err(err);
+        match self.output {
+            Some(Ok(record)) => Ok(record),
+            Some(Err(error)) => Err(error),
+            None => Err(PutGroupRoutingError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -321,6 +322,8 @@ pub enum GetGroupRoutingError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error("group routing read did not finish")]
+    NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -355,7 +358,7 @@ impl GetGroupRoutingOperation {
 }
 
 impl Operation for GetGroupRoutingOperation {
-    type Output = Option<Result<Option<GroupStorageRouting>, GetGroupRoutingError>>;
+    type Output = Option<GroupStorageRouting>;
     type Error = GetGroupRoutingError;
 
     fn start(&mut self) -> Effects {
@@ -407,12 +410,8 @@ impl Operation for GetGroupRoutingOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == GetGroupRoutingState::Error
-            && let Some(Err(err)) = self.output
-        {
-            return Err(err);
-        }
-        Ok(self.output)
+        self.output
+            .unwrap_or(Err(GetGroupRoutingError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -645,7 +644,7 @@ mod tests {
             value: None,
         }));
 
-        assert_eq!(operation.finalize().unwrap(), Some(Ok(None)));
+        assert_eq!(operation.finalize().unwrap(), None);
     }
 
     #[test]
@@ -659,7 +658,7 @@ mod tests {
             value: Some(stored.to_bytes().unwrap().into()),
         }));
 
-        assert_eq!(operation.finalize().unwrap(), Some(Ok(Some(stored))));
+        assert_eq!(operation.finalize().unwrap(), Some(stored));
     }
 
     // A state that expects no event must reject one instead of ignoring it.

@@ -456,10 +456,7 @@ pub async fn get_group_routing(
 
     let record = drive(GetGroupRoutingOperation::new(group_id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
-        .transpose()
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
-        .flatten();
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
 
     let target = record.and_then(|record| record.default_target);
     let warnings = warnings_for(&state, group_id, target.iter()).await;
@@ -539,11 +536,9 @@ pub async fn put_group_routing(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_group_error)?
-    .transpose()
     .map_err(map_group_error)?;
 
-    let target = record.and_then(|record| record.default_target);
+    let target = record.default_target;
     let warnings = warnings_for(&state, group_id, target.iter()).await;
     Ok(Json(GroupRoutingResponse {
         group_id: group_id.to_string(),

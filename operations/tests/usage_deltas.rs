@@ -346,11 +346,7 @@ async fn read_global(ctx: &DriverContext) -> UsageCounters {
 /// incremental bookkeeping produced.
 async fn assert_matches_rebuild(ctx: &DriverContext) {
     let before = effective_usage(ctx).await;
-    drive(RebuildUsageStatsOperation::new(), ctx)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    drive(RebuildUsageStatsOperation::new(), ctx).await.unwrap();
     let after = effective_usage(ctx).await;
     assert_eq!(
         before, after,
