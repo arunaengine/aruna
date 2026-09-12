@@ -183,8 +183,9 @@ async fn broader_request_than_auth_scope_is_rejected() -> TestResult<()> {
     Ok(())
 }
 
+// A read-only request narrows a write scope: the credential is issued as READ.
 #[tokio::test]
-async fn read_only_effective_scope_is_rejected() -> TestResult<()> {
+async fn readonly_scope_stored() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
@@ -206,18 +207,25 @@ async fn read_only_effective_scope_is_rejected() -> TestResult<()> {
         }],
     )?;
 
-    let response = post_credentials(
+    let credentials = create_s3_credentials_with_restrictions_via_http(
         &seed.base_url,
         &scoped_token,
         &group.group_id,
         Some(vec![create_request_restriction(
-            auth_scope,
+            auth_scope.clone(),
             Permission::READ,
         )]),
     )
     .await?;
+    let access = get_user_access(seed.context.as_ref(), &credentials.access_key_id).await?;
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        access.path_restrictions,
+        Some(vec![PathRestriction {
+            pattern: auth_scope,
+            permission: Permission::READ,
+        }])
+    );
 
     seed.shutdown().await;
     Ok(())

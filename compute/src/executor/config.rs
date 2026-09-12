@@ -97,6 +97,9 @@ pub struct KubernetesConfig {
     pub s3_port: u16,
     /// CSI driver name for S3 mounts; `None` disables the feature.
     pub s3_mount_driver: Option<String>,
+    /// Manifest files the operator adds to the compute namespace, such as a
+    /// network policy for a cluster the standard policies cannot express.
+    pub policy_manifests: Vec<PathBuf>,
     /// Placement location of the worker nodes, which are not the controller's
     /// site. Empty means the operator has not declared it, so this backend
     /// advertises no location or labels at all instead of the controller's.
@@ -126,6 +129,7 @@ impl Default for KubernetesConfig {
             s3_cidrs: Vec::new(),
             s3_port: 443,
             s3_mount_driver: None,
+            policy_manifests: Vec::new(),
             execution_location: String::new(),
             execution_labels: BTreeMap::new(),
             node_selector: BTreeMap::new(),

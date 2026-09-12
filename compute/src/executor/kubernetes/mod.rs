@@ -31,6 +31,8 @@ use kube::api::{
     Api, AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
     Preconditions,
 };
+use kube::api::{DynamicObject, GroupVersionKind};
+use kube::discovery::Scope;
 use kube::{Client, ResourceExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -47,9 +49,10 @@ use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned};
 mod manifest;
 
 use manifest::{
-    HELPER_PATH, StageMarker, WORKSPACE_PATH, helper_pod, job_manifest, marker_manifest,
-    marker_name, mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest, needs_workspace,
-    network_policies, pvc_manifest, secret_manifest, secret_name, workspace_name,
+    HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, helper_pod, job_manifest,
+    marker_manifest, marker_name, mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest,
+    needs_workspace, network_policies, policy_manifests, pvc_manifest, secret_manifest,
+    secret_name, workspace_name,
 };
 
 pub const EPOCH_ANNOTATION: &str = "aruna-engine.org/attempt-epoch";
@@ -72,6 +75,7 @@ const MAX_TERMINATION_DETAIL: usize = 2048;
 pub struct KubernetesBackend {
     client: Client,
     config: KubernetesConfig,
+    policies: Vec<PolicyManifest>,
 }
 
 impl KubernetesBackend {
@@ -82,7 +86,12 @@ impl KubernetesBackend {
 
     pub fn from_client(client: Client, config: KubernetesConfig) -> Result<Self, BackendError> {
         validate_config(&config)?;
-        Ok(Self { client, config })
+        let policies = policy_manifests(&config)?;
+        Ok(Self {
+            client,
+            config,
+            policies,
+        })
     }
 
     pub fn config(&self) -> &KubernetesConfig {
@@ -288,13 +297,57 @@ impl KubernetesBackend {
         Ok(())
     }
 
-    async fn apply_network(&self) -> Result<(), BackendError> {
+    /// Creates or patches both network policies. Running pods keep the policy
+    /// they were started with, so a node applies them at startup too.
+    pub async fn apply_network(&self) -> Result<(), BackendError> {
         let policies: Api<NetworkPolicy> =
             Api::namespaced(self.client.clone(), &self.config.namespace);
         let params = PatchParams::apply("aruna-compute");
         for policy in network_policies(&self.config)? {
             policies
                 .patch(&policy.name_any(), &params, &Patch::Apply(&policy))
+                .await
+                .map_err(kube_error)?;
+        }
+        self.apply_manifests().await
+    }
+
+    /// Applies the operator's own manifests in the compute namespace. The
+    /// operator listed them deliberately, so an unknown kind is an error.
+    async fn apply_manifests(&self) -> Result<(), BackendError> {
+        let params = PatchParams::apply("aruna-compute").force();
+        for manifest in &self.policies {
+            let source = manifest.source.display();
+            let gvk = manifest
+                .object
+                .types
+                .as_ref()
+                .and_then(|types| GroupVersionKind::try_from(types).ok())
+                .ok_or_else(|| {
+                    BackendError::InvalidSpec(format!("policy manifest `{source}` has no kind"))
+                })?;
+            let (resource, capabilities) = kube::discovery::pinned_kind(&self.client, &gvk)
+                .await
+                .map_err(|error| {
+                BackendError::Api(format!(
+                    "policy manifest `{source}` kind {} is not served: {error}",
+                    gvk.kind
+                ))
+            })?;
+            if capabilities.scope != Scope::Namespaced {
+                return Err(BackendError::InvalidSpec(format!(
+                    "policy manifest `{source}` kind {} is not namespaced",
+                    gvk.kind
+                )));
+            }
+            let objects: Api<DynamicObject> =
+                Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource);
+            objects
+                .patch(
+                    &manifest.object.name_any(),
+                    &params,
+                    &Patch::Apply(&manifest.object),
+                )
                 .await
                 .map_err(kube_error)?;
         }
@@ -850,7 +903,7 @@ impl ExecutorBackend for KubernetesBackend {
             local_site: false,
             worker_site,
             limits: self.config.envelope,
-            session: true,
+            session: !self.config.s3_cidrs.is_empty(),
         }
     }
 
@@ -1678,10 +1731,30 @@ fn repeated_wait(reason: &str) -> bool {
     )
 }
 
+/// A registry that refuses the reference outright (unknown name, no access)
+/// answers the same on every retry, so waiting out the deadline gains nothing.
+fn pull_refused(reason: &str, message: Option<&str>) -> bool {
+    if !matches!(reason, "ErrImagePull" | "ImagePullBackOff") {
+        return false;
+    }
+    let message = message.unwrap_or_default().to_ascii_lowercase();
+    [
+        "401 unauthorized",
+        "403 forbidden",
+        "404 not found",
+        "manifest unknown",
+        "name unknown",
+        "pull access denied",
+        "repository does not exist",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 /// Kubernetes retries a failing image pull forever, so the Job counts such a
-/// Pod as active and never reports a terminal condition. A malformed reference
-/// fails at once; a repeated failure fails once it outlives `deadline`, which
-/// is anchored at the Pod start and so also covers scheduling.
+/// Pod as active and never reports a terminal condition. A malformed or refused
+/// reference fails at once; a repeated failure fails once it outlives
+/// `deadline`, which is anchored at the Pod start and so also covers scheduling.
 fn pod_stuck_reason(pod: &Pod, deadline: Duration, now: Timestamp) -> Option<String> {
     let status = pod.status.as_ref()?;
     let waited = status
@@ -1698,7 +1771,10 @@ fn pod_stuck_reason(pod: &Pod, deadline: Duration, now: Timestamp) -> Option<Str
         .find_map(|container| {
             let waiting = container.state.as_ref()?.waiting.as_ref()?;
             let reason = waiting.reason.as_deref()?;
-            if reason != "InvalidImageName" && !(repeated_wait(reason) && waited > deadline) {
+            if reason != "InvalidImageName"
+                && !pull_refused(reason, waiting.message.as_deref())
+                && !(repeated_wait(reason) && waited > deadline)
+            {
                 return None;
             }
             let detail = waiting.message.as_deref().unwrap_or("no detail reported");
@@ -2422,6 +2498,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: fake_client(|_, _| (404, status_json(404))),
             config: test_config(),
+            policies: Vec::new(),
         };
 
         let evidence = backend
@@ -2479,6 +2556,7 @@ mod tests {
         let backend = KubernetesBackend {
             client,
             config: test_config(),
+            policies: Vec::new(),
         };
 
         backend.cleanup(&context()).await.unwrap();
@@ -2519,6 +2597,7 @@ mod tests {
         let backend = KubernetesBackend {
             client,
             config: test_config(),
+            policies: Vec::new(),
         };
 
         let evidence = backend.cancel(&context()).await.unwrap();
@@ -2593,6 +2672,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: fake_client(|_, _| (404, status_json(404))),
             config: test_config(),
+            policies: Vec::new(),
         };
         let cancel = CancellationToken::new();
 
@@ -2685,6 +2765,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: probe_client(disabled.clone()),
             config: test_config(),
+            policies: Vec::new(),
         };
         backend.health().await.unwrap();
         assert!(
@@ -2701,6 +2782,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: probe_client(enabled.clone()),
             config,
+            policies: Vec::new(),
         };
         backend.health().await.unwrap();
         assert!(
@@ -2710,6 +2792,128 @@ mod tests {
                 .iter()
                 .any(|path| path.contains("csidrivers"))
         );
+    }
+
+    #[tokio::test]
+    async fn advertises_session_egress() {
+        // Without S3 CIDRs an isolated session is refused at submit, so the
+        // node must not advertise one the planner could still pick.
+        let backend = KubernetesBackend {
+            client: fake_client(|_, _| (200, json!({}))),
+            config: test_config(),
+            policies: Vec::new(),
+        };
+        assert!(!backend.capabilities().session);
+
+        let mut config = test_config();
+        config.s3_cidrs.push("10.0.0.0/8".to_string());
+        let backend = KubernetesBackend {
+            client: fake_client(|_, _| (200, json!({}))),
+            config,
+            policies: Vec::new(),
+        };
+        assert!(backend.capabilities().session);
+    }
+
+    #[tokio::test]
+    async fn applies_startup_policies() {
+        // A pod keeps the policy it started with, so an upgraded node must
+        // patch both of them before it serves an already running session.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let client = fake_client(move |method, path| {
+            recorder
+                .lock()
+                .expect("record requests")
+                .push(format!("{method} {path}"));
+            (
+                200,
+                json!({
+                    "apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy",
+                    "metadata":{"name":"aruna-compute-deny","namespace":"compute"}
+                }),
+            )
+        });
+        let mut config = test_config();
+        config.s3_cidrs.push("10.0.0.0/8".to_string());
+        let backend = KubernetesBackend {
+            client,
+            config,
+            policies: Vec::new(),
+        };
+
+        backend.apply_network().await.expect("the policies apply");
+
+        let seen = seen.lock().expect("read requests").clone();
+        let patched: Vec<&String> = seen
+            .iter()
+            .filter(|entry| entry.starts_with("PATCH"))
+            .collect();
+        assert_eq!(patched.len(), 2);
+        assert!(
+            patched
+                .iter()
+                .all(|entry| entry.contains("networkpolicies"))
+        );
+        assert!(patched[1].contains("aruna-compute-s3"));
+    }
+
+    #[tokio::test]
+    async fn patches_policy_manifest() {
+        // The kind comes from discovery, so the apply must reach the plural
+        // path of the operator's own kind in the compute namespace.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let client = fake_client(move |method, path| {
+            recorder
+                .lock()
+                .expect("record requests")
+                .push(format!("{method} {path}"));
+            if path == "/apis/cilium.io/v2" {
+                return (
+                    200,
+                    json!({
+                        "kind":"APIResourceList","apiVersion":"v1",
+                        "groupVersion":"cilium.io/v2",
+                        "resources":[{
+                            "name":"ciliumnetworkpolicies",
+                            "singularName":"ciliumnetworkpolicy",
+                            "namespaced":true,"kind":"CiliumNetworkPolicy",
+                            "verbs":["create","get","patch"]
+                        }]
+                    }),
+                );
+            }
+            (
+                200,
+                json!({
+                    "apiVersion":"cilium.io/v2","kind":"CiliumNetworkPolicy",
+                    "metadata":{"name":"s3-ingress","namespace":"compute"}
+                }),
+            )
+        });
+        let object = serde_json::from_value(json!({
+            "apiVersion":"cilium.io/v2","kind":"CiliumNetworkPolicy",
+            "metadata":{"name":"s3-ingress","namespace":"compute"}
+        }))
+        .expect("build the manifest");
+        let backend = KubernetesBackend {
+            client,
+            config: test_config(),
+            policies: vec![PolicyManifest {
+                source: std::path::PathBuf::from("policies.yaml"),
+                object,
+            }],
+        };
+
+        backend
+            .apply_manifests()
+            .await
+            .expect("the manifest applies");
+
+        let seen = seen.lock().expect("read requests").clone();
+        assert!(seen.iter().any(|entry| entry
+            == "PATCH /apis/cilium.io/v2/namespaces/compute/ciliumnetworkpolicies/s3-ingress"));
     }
 
     const POD_START: &str = "2027-01-01T00:00:00Z";
@@ -2751,6 +2955,24 @@ mod tests {
         let reason = pod_stuck_reason(&pod, Duration::from_secs(300), probe_now(1))
             .expect("reject invalid image");
         assert!(reason.contains("InvalidImageName"), "{reason}");
+    }
+
+    #[test]
+    fn fails_refused_pull() {
+        // A registry refusal is final, so a single try already ends the attempt.
+        let pod = task_pod(
+            json!({"waiting":{"reason":"ErrImagePull","message":
+                "failed to authorize: unexpected status from GET request: 403 Forbidden"}}),
+            POD_START,
+        );
+        let reason = pod_stuck_reason(&pod, Duration::from_secs(300), probe_now(1))
+            .expect("reject refused pull");
+        assert!(reason.contains("403 Forbidden"), "{reason}");
+        let pod = task_pod(
+            json!({"waiting":{"reason":"ErrImagePull","message":"rpc error: manifest unknown"}}),
+            POD_START,
+        );
+        assert!(pod_stuck_reason(&pod, Duration::from_secs(300), probe_now(1)).is_some());
     }
 
     #[test]
@@ -2881,6 +3103,7 @@ mod tests {
         let backend = KubernetesBackend {
             client,
             config: test_config(),
+            policies: Vec::new(),
         };
 
         let status = backend.status(&context()).await.unwrap();
@@ -2916,6 +3139,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: stuck_client(),
             config: test_config(),
+            policies: Vec::new(),
         };
 
         let status = backend.status(&context()).await.unwrap();
@@ -2935,6 +3159,7 @@ mod tests {
         let backend = KubernetesBackend {
             client: stuck_client(),
             config: test_config(),
+            policies: Vec::new(),
         };
 
         let tails = backend

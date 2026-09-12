@@ -118,6 +118,7 @@ impl ExecutorRegistry {
                 capability.direct_s3 = caps.direct_s3;
                 capability.s3_mount = caps.s3_mount;
                 capability.network_policy = caps.network_policy;
+                capability.session = caps.session;
                 capability.limits = caps.limits;
                 capability.policy_draining = policy_draining;
                 Ok(capability)

@@ -86,6 +86,10 @@ pub struct ExecutorCapability {
     /// The backend proves worker placement and enforces network isolation,
     /// which protected data requires before open networking is allowed.
     pub network_policy: bool,
+    /// The backend can open a session channel that reaches S3 without the open
+    /// network.
+    #[serde(default)]
+    pub session: bool,
     /// Execution site this backend runs on, carrying its own generation.
     pub subject: PlacementSubject,
     /// Digest of `subject`; a mismatch is drift and never eligible.
@@ -113,6 +117,7 @@ impl ExecutorCapability {
             direct_s3: false,
             s3_mount: false,
             network_policy: false,
+            session: false,
             subject,
             subject_digest,
             policy_draining: false,

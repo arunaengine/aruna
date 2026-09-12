@@ -83,7 +83,8 @@ pub(super) fn config(
     execution: u8,
     envelope: ResourceEnvelope,
 ) -> ReserveExecutionConfig {
-    let receipt = family.receipt(launch, execution);
+    let mut receipt = family.receipt(launch, execution);
+    receipt.physical_job_id = physical(execution);
     let frame = JobRecordFrame::new(family.sign(
         &family.target,
         JobFamilyRecord::Receipt(Box::new(receipt.clone())),

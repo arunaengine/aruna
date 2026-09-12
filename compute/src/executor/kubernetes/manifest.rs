@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aruna_core::compute::{
     BackendError, FenceContext, NetworkAccess, StagingMode, TaskSpec, normalize_container_path,
@@ -7,6 +7,7 @@ use aruna_core::compute::{
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolume, PersistentVolumeClaim, Pod, Secret};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use kube::api::DynamicObject;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -424,16 +425,91 @@ pub fn network_policies(config: &KubernetesConfig) -> Result<Vec<NetworkPolicy>,
             "ingress":[],
             "egress":[
                 {"to":cidrs,"ports":[{"protocol":"TCP","port":config.s3_port}]},
-                {"to":[{"namespaceSelector":{"matchLabels":{
-                    "kubernetes.io/metadata.name":"kube-system"
-                }}}],"ports":[
-                    {"protocol":"UDP","port":53},{"protocol":"TCP","port":53}
-                ]}
+                {"ports":[{"protocol":"UDP","port":53},{"protocol":"TCP","port":53}]}
             ]
         }
     }))
     .map_err(manifest_error)?;
     Ok(vec![deny, s3])
+}
+
+/// An operator manifest with the file it was read from, so a later discovery
+/// or apply failure can name that file.
+#[derive(Clone, Debug)]
+pub struct PolicyManifest {
+    pub source: PathBuf,
+    pub object: DynamicObject,
+}
+
+/// Reads the configured manifest files, including multi-document files. The
+/// node applies these objects itself, so a broken document is refused here.
+pub fn policy_manifests(config: &KubernetesConfig) -> Result<Vec<PolicyManifest>, BackendError> {
+    let mut manifests = Vec::new();
+    for path in &config.policy_manifests {
+        let text = std::fs::read_to_string(path).map_err(|error| {
+            BackendError::InvalidSpec(format!(
+                "policy manifest `{}` is unreadable: {error}",
+                path.display()
+            ))
+        })?;
+        let documents: Vec<serde_json::Value> = serde_saphyr::from_multiple(&text)
+            .map_err(|error| policy_error(path, 0, &error.to_string()))?;
+        for (index, value) in documents.into_iter().enumerate() {
+            if value.is_null() {
+                continue;
+            }
+            manifests.push(PolicyManifest {
+                source: path.clone(),
+                object: policy_object(config, path, index, value)?,
+            });
+        }
+    }
+    Ok(manifests)
+}
+
+/// Namespaced objects only: the node applies them in its compute namespace.
+fn policy_object(
+    config: &KubernetesConfig,
+    path: &Path,
+    index: usize,
+    mut value: serde_json::Value,
+) -> Result<DynamicObject, BackendError> {
+    for field in ["apiVersion", "kind"] {
+        if named_field(&value, field).is_none() {
+            return Err(policy_error(path, index, &format!("has no {field}")));
+        }
+    }
+    if named_field(&value["metadata"], "name").is_none() {
+        return Err(policy_error(path, index, "has no metadata.name"));
+    }
+    match value["metadata"].get("namespace") {
+        None | Some(serde_json::Value::Null) => {
+            value["metadata"]["namespace"] = json!(config.namespace);
+        }
+        Some(namespace) if namespace.as_str() == Some(config.namespace.as_str()) => {}
+        Some(_) => {
+            return Err(policy_error(
+                path,
+                index,
+                &format!("is not in namespace `{}`", config.namespace),
+            ));
+        }
+    }
+    serde_json::from_value(value).map_err(|error| policy_error(path, index, &error.to_string()))
+}
+
+fn named_field<'a>(value: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn policy_error(path: &Path, index: usize, detail: &str) -> BackendError {
+    BackendError::InvalidSpec(format!(
+        "policy manifest `{}` document {index} {detail}",
+        path.display()
+    ))
 }
 
 pub fn marker_name(name: &str) -> String {
@@ -983,18 +1059,112 @@ mod tests {
     }
 
     #[test]
-    fn restricts_dns_egress() {
+    fn allows_dns_port() {
+        // A host-network resolver such as node-local DNS is neither a kube-system
+        // pod nor a CIDR peer under Cilium, so the DNS rule carries no peer.
         let mut config = config();
         config.s3_cidrs.push("10.0.0.0/8".to_string());
 
         let policies = network_policies(&config).unwrap();
         let policy = serde_json::to_value(&policies[1]).unwrap();
-        let peer = &policy["spec"]["egress"][1]["to"][0];
+        let s3 = &policy["spec"]["egress"][0];
+        let dns = &policy["spec"]["egress"][1];
 
-        assert_eq!(
-            peer["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
-            "kube-system"
+        assert_eq!(s3["to"][0]["ipBlock"]["cidr"], "10.0.0.0/8");
+        assert_eq!(s3["ports"][0]["port"], 443);
+        assert!(dns.get("to").is_none());
+        assert_eq!(dns["ports"][0]["protocol"], "UDP");
+        assert_eq!(dns["ports"][0]["port"], 53);
+        assert_eq!(dns["ports"][1]["protocol"], "TCP");
+        assert_eq!(dns["ports"][1]["port"], 53);
+    }
+
+    fn policy_file(dir: &Path, name: &str, text: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, text).expect("write manifest");
+        path
+    }
+
+    #[test]
+    fn loads_policy_documents() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = policy_file(
+            dir.path(),
+            "policies.yaml",
+            "---\napiVersion: cilium.io/v2\nkind: CiliumNetworkPolicy\nmetadata:\n  name: s3-ingress\n---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: extra\n  namespace: compute\n",
         );
-        assert!(peer.get("ipBlock").is_none());
+        let mut config = config();
+        config.policy_manifests = vec![path.clone()];
+
+        let manifests = policy_manifests(&config).expect("the documents load");
+
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0].source, path);
+        assert_eq!(
+            manifests[0].object.types.as_ref().expect("types").kind,
+            "CiliumNetworkPolicy"
+        );
+        assert_eq!(
+            manifests[0].object.metadata.namespace.as_deref(),
+            Some("compute")
+        );
+        assert_eq!(manifests[1].object.metadata.name.as_deref(), Some("extra"));
+    }
+
+    #[test]
+    fn refuses_foreign_namespace() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = policy_file(
+            dir.path(),
+            "foreign.yaml",
+            "apiVersion: cilium.io/v2\nkind: CiliumNetworkPolicy\nmetadata:\n  name: s3\n  namespace: other\n",
+        );
+        let mut config = config();
+        config.policy_manifests = vec![path];
+
+        let error = policy_manifests(&config).expect_err("a foreign namespace is refused");
+
+        let message = error.to_string();
+        assert!(message.contains("foreign.yaml"), "{message}");
+        assert!(message.contains("document 0"), "{message}");
+        assert!(message.contains("namespace `compute`"), "{message}");
+    }
+
+    #[test]
+    fn refuses_broken_document() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing_kind = policy_file(
+            dir.path(),
+            "kindless.yaml",
+            "apiVersion: cilium.io/v2\nmetadata:\n  name: s3\n",
+        );
+        let missing_name = policy_file(
+            dir.path(),
+            "nameless.yaml",
+            "apiVersion: cilium.io/v2\nkind: CiliumNetworkPolicy\nmetadata: {}\n",
+        );
+        let mut config = config();
+        config.policy_manifests = vec![missing_kind];
+        let kind_error =
+            policy_manifests(&config).expect_err("a document without a kind is refused");
+        config.policy_manifests = vec![missing_name];
+        let name_error =
+            policy_manifests(&config).expect_err("a document without a name is refused");
+
+        let kind_error = kind_error.to_string();
+        let name_error = name_error.to_string();
+        assert!(kind_error.contains("kindless.yaml") && kind_error.contains("has no kind"));
+        assert!(name_error.contains("nameless.yaml") && name_error.contains("metadata.name"));
+    }
+
+    #[test]
+    fn refuses_unreadable_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut config = config();
+        config.policy_manifests = vec![dir.path().join("missing.yaml")];
+
+        let error = policy_manifests(&config).expect_err("a missing file is refused");
+
+        assert!(error.to_string().contains("missing.yaml"), "{error}");
     }
 }

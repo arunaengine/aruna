@@ -17,7 +17,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.78"
+version = "3.0.0-alpha.79"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -37,7 +37,7 @@ aruna-tasks = { path = "tasks" }
 
 # Third-party crates
 ahash = "0.8.12"
-async-compression = { version = "0.4.44", default-features = false, features = [
+async-compression = { version = "0.4.46", default-features = false, features = [
     "tokio",
     "deflate",
 ] }
@@ -50,7 +50,7 @@ aws-config = { version = "1.12.0", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ] }
-aws-sdk-s3 = { version = "1.145.0", default-features = false, features = [
+aws-sdk-s3 = { version = "1.146.0", default-features = false, features = [
     "default-https-client",
     "http-1x",
     "rt-tokio",
@@ -63,17 +63,19 @@ bollard = "0.21.1"
 byteview = "0.10.2"
 bytes = "1.12.1"
 cel-interpreter = "0.10.0"
-chacha20poly1305 = "0.10.1"
+chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
-craqle = { git = "https://github.com/arunaengine/craqle", branch = "main", features = [
+# Pinned to the craqle revision carrying the merged irokle sync fixes with the
+# relaxed smallvec requirement, which the kube serde-saphyr cap needs.
+craqle = { git = "https://github.com/arunaengine/craqle", rev = "1803d8ba1376cc2a3285ab009738ed7194c610ec", features = [
     "iroh",
     "shacl-core",
 ] }
 crc-fast = "1.10.0"
 crossfire = "3.1.20"
 crypto_box = "0.9.1"
-dirs = "6.0.0"
+dirs = "7.0.0"
 dotenvy = "0.15.7"
 ed25519-dalek = { version = "3.0.0", features = ["pem"] }
 fjall = "3.1.10"
@@ -95,10 +97,10 @@ hyper-util = { version = "0.1.20", features = [
     "tokio",
     "service",
 ] }
-ipnet = "2.12.1"
-iroh = "1.1.0"
+ipnet = "2.12.2"
+iroh = "1.2.0"
 # Pinned to the exact revision craqle uses so one irokle crate is resolved.
-irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "ebd4abd142f66816a16492c615525809f6c8b663", features = [
+irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "dcce9593adf21b14c8c8214c7ad7c180777be303", features = [
     "fjall",
     "iroh",
 ] }
@@ -138,18 +140,18 @@ prometheus-client = "0.25"
 proptest = "1.11.0"
 quick-xml = "0.42.0"
 rand = "0.10.2"
-reqwest = { version = "0.13.4", default-features = false, features = [
+reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
     "rustls",
     "stream",
 ] }
-rmcp = { version = "3.2.0", default-features = false, features = [
+rmcp = { version = "3.3.0", default-features = false, features = [
     "server",
     "macros",
     "transport-streamable-http-server",
 ] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
-rustls = { version = "0.23.43", features = ["ring"] }
+rustls = { version = "0.23.44", features = ["ring"] }
 kube = { version = "4.2.0", default-features = false, features = [
     "client",
     "jsonpatch",
@@ -158,9 +160,10 @@ kube = { version = "4.2.0", default-features = false, features = [
     "ws",
 ] }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
-s3s = "0.14.1"
+s3s = "0.15.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
+serde-saphyr = "0.0.29"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 smallvec = "1.15.2"
@@ -173,7 +176,7 @@ tar = "0.4.46"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full", "tracing"] }
-toml = "1.1.5"
+toml = "1.1.6"
 tokio-util = { version = "0.7.19", features = ["compat", "io-util", "rt"] }
 tower = { version = "0.5.3", features = ["limit"] }
 tower-http = { version = "0.7.1", features = ["compression-br", "compression-gzip", "cors", "fs", "timeout"] }
@@ -189,7 +192,7 @@ tracing-subscriber = { version = "0.3.23", features = [
 ulid = { version = "3.0.0", features = ["serde"] }
 unicode-normalization = "0.1.25"
 url = "2.5.8"
-uuid = { version = "1.26.0", features = ["v4"] }
+uuid = { version = "1.26.1", features = ["v4"] }
 utoipa = { version = "5.5.0", features = [
     "chrono",
     "axum_extras",

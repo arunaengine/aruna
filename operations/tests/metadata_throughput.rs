@@ -40,7 +40,7 @@ use ulid::Ulid;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 mod convergence;
-use convergence::{NO_PROGRESS_TIMEOUT, wait_for_convergence};
+use convergence::{NO_PROGRESS_TIMEOUT, wait_for_convergence, wait_storage_released};
 
 const PROJECTION_BATCH: usize = 32;
 const TOTAL_CREATES: usize = 2000;
@@ -333,8 +333,10 @@ async fn churn_convergence_body() -> Result<f64, BoxError> {
     node2.net.clear_inbound_handler();
     node2.task_handle.clear_inbound_handler().await;
     node2.net.shutdown().await;
+    let storage = node2.context.storage_handle.clone();
     drop(node2);
     tokio::task::spawn_blocking(move || aux.shutdown_timeout(Duration::from_secs(10))).await?;
+    wait_storage_released(storage).await?;
     println!("node 2 shut down");
 
     let created = run_writer(realm_id, group_id, "churn", 0, 200, targets0).await?;

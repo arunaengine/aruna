@@ -29,7 +29,7 @@ const TOKEN: Ulid = Ulid(0x7E12);
 
 /// The local physical row a target mints for an admitted launch. It is never
 /// the logical job id the family records are keyed by.
-fn physical() -> JobId {
+pub(super) fn physical() -> JobId {
     JobId::from_bytes([31u8; 16])
 }
 
@@ -43,14 +43,17 @@ fn resources() -> EffectiveResources {
     }
 }
 
-/// The execution target itself, with a live net handle so it can sign the
-/// records only the receipted executor may publish.
-async fn target_context(family: &Family) -> (TempDir, DriverContext) {
+/// One node of the family with a live net handle, so it can sign the records
+/// only that node may publish.
+pub(super) async fn node_context(
+    family: &Family,
+    key: &iroh::SecretKey,
+) -> (TempDir, DriverContext) {
     let (dir, ctx) = context(&family.config, family.holder.public()).await;
     let net_handle = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("loopback address"),
-            secret_key: Some(family.target.clone()),
+            secret_key: Some(key.clone()),
             realm_id: REALM,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
@@ -71,7 +74,7 @@ async fn target_context(family: &Family) -> (TempDir, DriverContext) {
 
 /// Stores every family record the receipt chains to, exactly as replication
 /// delivers them to the target before it admits the launch.
-async fn seed_family(ctx: &DriverContext, family: &Family) -> ExecutionReceipt {
+pub(super) async fn seed_family(ctx: &DriverContext, family: &Family) -> ExecutionReceipt {
     let spec = family.spec();
     let launch = family.launch(&spec, family.holder.public(), 0);
     for record in [
@@ -101,7 +104,7 @@ async fn seed_family(ctx: &DriverContext, family: &Family) -> ExecutionReceipt {
 
 /// Commits the receipt with the reservation that binds the local physical row
 /// to the logical job the family knows.
-async fn reserve_execution(
+pub(super) async fn reserve_execution(
     ctx: &DriverContext,
     family: &Family,
     receipt: &ExecutionReceipt,
@@ -156,7 +159,7 @@ async fn publishes_terminal_success() {
     // The whole terminal path of one receipted execution: the local physical
     // job id must never be read as the logical alias the family is keyed by.
     let family = Family::new([21u8; 32]);
-    let (_dir, ctx) = target_context(&family).await;
+    let (_dir, ctx) = node_context(&family, &family.target).await;
     let receipt = seed_family(&ctx, &family).await;
     let record = reserve_execution(&ctx, &family, &receipt).await;
     let intent = AttemptIntent {
@@ -243,7 +246,7 @@ async fn publishes_terminal_success() {
 async fn bumps_dashboard_once() {
     // A new state advances the dashboard revision; a replay of it does not.
     let family = Family::new([22u8; 32]);
-    let (_dir, ctx) = target_context(&family).await;
+    let (_dir, ctx) = node_context(&family, &family.target).await;
     let receipt = seed_family(&ctx, &family).await;
     let mut terminal = reserve_execution(&ctx, &family, &receipt).await;
     let chain = execution_chain(&ctx, physical())

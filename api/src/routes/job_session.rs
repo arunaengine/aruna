@@ -189,11 +189,21 @@ pub struct PendingInputResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct FailedInputResponse {
+    pub dest_key: String,
+    /// Why this item did not land, so the caller can retry or drop it.
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct SessionInputsResponse {
     pub staged: Vec<StagedInputResponse>,
     /// Sources that need a staging job of their own. Empty today: a source on
     /// another node is refused instead, and the caller imports it first.
     pub pending: Vec<PendingInputResponse>,
+    /// Items that did not land, named so a partial result stays reconcilable.
+    #[serde(default)]
+    pub failed: Vec<FailedInputResponse>,
 }
 
 /// The caller's session job on this node. Absence and foreign ownership are
@@ -763,6 +773,8 @@ like cancel, and each source additionally needs the caller's read permission on 
 - Every staged object is recorded in the session inventory and listed in the job report at the end,
   with the node, version and hash it came from.
 - Staging resets the session's idle timer.
+- Destination keys are checked before anything is copied. Once one object landed the answer stays
+  202 and every item that failed after it is named in `failed`.
 
 **Limits** (refused with 400)
 - At most 64 items per call, and a `dest_key` that is relative and traversal-free.
@@ -772,9 +784,9 @@ like cancel, and each source additionally needs the caller's read permission on 
         "items": [{"bucket": "source-data", "key": "input.txt", "dest_key": "data/input.txt"}]
     })),
     responses(
-        (status = 202, description = "The objects were staged", body = SessionInputsResponse, example = json!({
+        (status = 202, description = "The objects that landed, with every later failure in `failed`", body = SessionInputsResponse, example = json!({
             "staged": [{"dest_key": "data/input.txt", "bytes": 12, "blake3": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
-                "source_node_id": "node-1", "version_id": "01JJRSVERSION0123456789ABC"}], "pending": []
+                "source_node_id": "node-1", "version_id": "01JJRSVERSION0123456789ABC"}], "pending": [], "failed": []
         })),
         (status = 400, description = "An invalid destination key, too many items, or a source on another node", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
@@ -804,24 +816,85 @@ pub async fn stage_inputs(
     let bucket = record.workspace_bucket.clone().ok_or_else(|| {
         ServerError::InternalError("a session has no workspace bucket".to_string())
     })?;
-    let mut staged = Vec::with_capacity(request.items.len());
+    let node_id = state.get_node_id().to_string();
+    let mut items = Vec::with_capacity(request.items.len());
     for item in request.items {
-        let entry = stage_one(&state, &auth, &bucket, item).await?;
-        session.record_input(StagedInput {
-            dest_key: entry.dest_key.clone(),
-            bytes: entry.bytes,
-            blake3: entry.blake3.clone(),
-            source_node_id: entry.source_node_id.clone(),
-            version_id: entry.version_id.clone(),
-        });
-        staged.push(entry);
+        let dest_key = check_item(&item, &node_id)?;
+        items.push((item, dest_key));
+    }
+    let mut staged = Vec::with_capacity(items.len());
+    let mut failed = Vec::new();
+    let mut refusal = None;
+    for (item, dest_key) in items {
+        match stage_one(&state, &auth, &bucket, item, &dest_key).await {
+            Ok(entry) => {
+                session.record_input(StagedInput {
+                    dest_key: entry.dest_key.clone(),
+                    bytes: entry.bytes,
+                    blake3: entry.blake3.clone(),
+                    source_node_id: entry.source_node_id.clone(),
+                    version_id: entry.version_id.clone(),
+                });
+                staged.push(entry);
+            }
+            Err(error) => {
+                failed.push(FailedInputResponse {
+                    dest_key,
+                    error: error.public_message(),
+                });
+                refusal = refusal.or(Some(error));
+            }
+        }
+    }
+    // A call that staged nothing made no progress, so it must not keep the
+    // session alive.
+    if !staged.is_empty() {
         session.touch();
+    }
+    inputs_outcome(staged, failed, refusal)
+}
+
+/// Transport checks every item must pass before the first copy, so a refused
+/// key never leaves part of a call staged.
+fn check_item(item: &SessionInputRequest, node_id: &str) -> ServerResult<String> {
+    let dest_key = item.dest_key.trim();
+    if dest_key.is_empty()
+        || dest_key.starts_with('/')
+        || dest_key.split('/').any(|part| part == "..")
+    {
+        return Err(ServerError::BadRequestMessage(
+            "a destination key is relative and carries no `..`".to_string(),
+        ));
+    }
+    if let Some(source) = item.source_node_id.as_deref()
+        && source != node_id
+    {
+        return Err(ServerError::BadRequestMessage(
+            "a source on another node must be imported into a bucket of this node first"
+                .to_string(),
+        ));
+    }
+    Ok(dest_key.to_string())
+}
+
+/// A call that staged something answers 202 and names what failed after it. A
+/// call that staged nothing keeps the refusal its first item earned.
+fn inputs_outcome(
+    staged: Vec<StagedInputResponse>,
+    failed: Vec<FailedInputResponse>,
+    refusal: Option<ServerError>,
+) -> ServerResult<Response> {
+    if staged.is_empty()
+        && let Some(error) = refusal
+    {
+        return Err(error);
     }
     Ok((
         StatusCode::ACCEPTED,
         Json(SessionInputsResponse {
             staged,
             pending: Vec::new(),
+            failed,
         }),
     )
         .into_response())
@@ -846,25 +919,9 @@ async fn stage_one(
     auth: &AuthContext,
     bucket: &str,
     item: SessionInputRequest,
+    dest_key: &str,
 ) -> ServerResult<StagedInputResponse> {
-    let dest_key = item.dest_key.trim();
-    if dest_key.is_empty()
-        || dest_key.starts_with('/')
-        || dest_key.split('/').any(|part| part == "..")
-    {
-        return Err(ServerError::BadRequestMessage(
-            "a destination key is relative and carries no `..`".to_string(),
-        ));
-    }
     let node_id = state.get_node_id();
-    if let Some(source) = item.source_node_id.as_deref()
-        && source != node_id.to_string()
-    {
-        return Err(ServerError::BadRequestMessage(
-            "a source on another node must be imported into a bucket of this node first"
-                .to_string(),
-        ));
-    }
     let context = state.get_ctx();
     let source_info = bucket_info(&context, &item.bucket).await?;
     let dest_info = bucket_info(&context, bucket).await?;
@@ -1612,6 +1669,81 @@ mod tests {
         if let Some(session) = registry_session(state, job_id) {
             session.end(EndReason::Ended);
         }
+    }
+
+    fn input(bucket: &str, dest_key: &str) -> SessionInputRequest {
+        SessionInputRequest {
+            bucket: bucket.to_string(),
+            key: "input.txt".to_string(),
+            version_id: None,
+            source_node_id: None,
+            dest_key: dest_key.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn checks_keys_first() {
+        // A traversing key in a later item must refuse the whole call, before
+        // the first source is even looked up.
+        let owner = user(2);
+        let (_dir, state, job_id, _helper) = build_node(owner).await;
+        let response = stage_inputs(
+            State(state),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Json(SessionInputsRequest {
+                items: vec![input("source", "data/a.txt"), input("source", "../escape")],
+            }),
+        )
+        .await;
+        assert!(matches!(response, Err(ServerError::BadRequestMessage(_))));
+    }
+
+    #[tokio::test]
+    async fn keeps_refusal_reason() {
+        // Nothing landed, so the caller keeps the coded refusal instead of a
+        // 202 that claims a partial result, and the session is not kept alive.
+        let owner = user(2);
+        let (_dir, state, job_id, _helper) = build_node(owner).await;
+        let session = registry_session(&state, job_id).expect("session is live");
+        let quiet = session.snapshot().last_event_id;
+
+        let response = stage_inputs(
+            State(state.clone()),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Json(SessionInputsRequest {
+                items: vec![input("missing", "data/a.txt")],
+            }),
+        )
+        .await;
+
+        assert!(matches!(response, Err(ServerError::NotFound)));
+        assert_eq!(session.snapshot().last_event_id, quiet);
+    }
+
+    #[tokio::test]
+    async fn reports_failed_items() {
+        let staged = vec![StagedInputResponse {
+            dest_key: "data/a.txt".to_string(),
+            bytes: 4,
+            blake3: String::new(),
+            source_node_id: node().to_string(),
+            version_id: String::new(),
+        }];
+        let failed = vec![FailedInputResponse {
+            dest_key: "data/b.txt".to_string(),
+            error: "Not found".to_string(),
+        }];
+        let response = inputs_outcome(staged, failed, Some(ServerError::NotFound))
+            .expect("a partial result is accepted");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("the body reads");
+        let body: SessionInputsResponse = serde_json::from_slice(&bytes).expect("the body parses");
+        assert_eq!(body.staged.len(), 1);
+        assert_eq!(body.failed[0].dest_key, "data/b.txt");
     }
 
     /// The parsed body of a session read.

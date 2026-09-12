@@ -99,6 +99,7 @@ pub(crate) fn request(inputs: Vec<ResolvedInput>) -> PlanRequest {
         required_labels: Vec::new(),
         staging: StagingMode::Files,
         network: NetworkAccess::Isolated,
+        session: false,
         inputs,
         output_policies: Vec::new(),
         policies: BTreeMap::new(),
@@ -592,6 +593,39 @@ fn filters_request_constraints() {
 }
 
 #[test]
+fn screens_session_support() {
+    // A session needs a backend that can open a channel to the attempt, so a
+    // site without one must leave the scan instead of taking the job.
+    let target = node(2);
+    let mut plan_request = request(Vec::new());
+    plan_request.session = true;
+
+    let outcome = plan(
+        &plan_request,
+        vec![candidate(target, "docker")],
+        &config(Vec::new()),
+    );
+    assert!(outcome.selected.is_none());
+    assert_eq!(verdict(&outcome, target), RejectionVerdict::Session);
+
+    let mut capable = candidate(target, "docker");
+    capable.capability.session = true;
+    let outcome = plan(&plan_request, vec![capable], &config(Vec::new()));
+    assert!(outcome.selected.is_some());
+
+    // An open-network session needs no S3 reachability of its own, so a
+    // backend without the capability may still take it.
+    let mut open = plan_request.clone();
+    open.network = NetworkAccess::Open;
+    let outcome = plan(
+        &open,
+        vec![candidate(target, "docker")],
+        &config(Vec::new()),
+    );
+    assert!(outcome.selected.is_some());
+}
+
+#[test]
 fn guards_open_network() {
     // Protected data may only run with open networking where the site enforces
     // network policy; unprotected data is unaffected.
@@ -737,6 +771,18 @@ fn digest_covers_inputs() {
     let scan = vec![candidate(target, "docker")];
     let compute = config(vec![link("us", "eu", 1_000)]);
     let base = selected(&plan_request, scan.clone(), &compute).plan_digest;
+
+    let mut capable = scan.clone();
+    capable[0].capability.session = true;
+    let capable_digest = selected(&plan_request, capable.clone(), &compute).plan_digest;
+    assert_ne!(capable_digest, base);
+
+    let mut session = plan_request.clone();
+    session.session = true;
+    assert_ne!(
+        selected(&session, capable, &compute).plan_digest,
+        capable_digest
+    );
 
     let mut resized = plan_request.clone();
     resized.inputs[0].bytes += 1;

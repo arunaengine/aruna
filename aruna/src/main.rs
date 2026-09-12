@@ -1363,6 +1363,43 @@ async fn build_apptainer(
         .into())
 }
 
+/// The pod-facing S3 endpoint sessions and direct-S3 tasks read, or `None` in
+/// the local-only profile, which exposes no S3 listener for them at all.
+#[cfg(any(feature = "kubernetes", test))]
+fn kubernetes_workspace(
+    local_only: bool,
+    endpoint: Option<&str>,
+) -> Result<Option<String>, ComputeBuildError> {
+    if local_only {
+        return Ok(None);
+    }
+    let endpoint = endpoint.ok_or_else(|| {
+        "Kubernetes executor requires ARUNA_COMPUTE_S3_URL or S3_PUBLIC_URL".to_string()
+    })?;
+    if container_local_endpoint(endpoint) {
+        return Err("Kubernetes executor requires a pod-reachable S3_PUBLIC_URL"
+            .to_string()
+            .into());
+    }
+    Ok(Some(endpoint.to_string()))
+}
+
+/// The port the S3 network policy opens. Without an explicit setting it follows
+/// the endpoint pods actually connect to, so policy and endpoint cannot drift.
+#[cfg(any(feature = "kubernetes", test))]
+fn session_s3_port(setting: Option<&str>, endpoint: Option<&str>) -> Result<u16, String> {
+    if let Some(value) = setting {
+        return value
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| "ARUNA_COMPUTE_K8S_S3_PORT must be a valid port".to_string());
+    }
+    Ok(endpoint
+        .and_then(|value| reqwest::Url::parse(value).ok())
+        .and_then(|url| url.port_or_known_default())
+        .unwrap_or(443))
+}
+
 #[cfg(feature = "kubernetes")]
 async fn build_kubernetes(
     config: &Config,
@@ -1376,11 +1413,20 @@ async fn build_kubernetes(
         .map(|value| parse_s3_cidrs(&value))
         .transpose()?
         .unwrap_or_default();
-    let s3_port = dotenvy::var("ARUNA_COMPUTE_K8S_S3_PORT")
-        .map(|value| value.parse::<u16>())
-        .unwrap_or(Ok(443))
-        .map_err(|_| "ARUNA_COMPUTE_K8S_S3_PORT must be a valid port".to_string())?;
+    let workspace = kubernetes_workspace(
+        env_true("ARUNA_COMPUTE_LOCAL_ONLY"),
+        compute_s3_endpoint(config).as_deref(),
+    )?;
+    let s3_port = session_s3_port(
+        dotenvy::var("ARUNA_COMPUTE_K8S_S3_PORT").ok().as_deref(),
+        workspace.as_deref(),
+    )?;
     let s3_mount_driver = read_mount_driver();
+    let policy_manifests = dotenvy::var("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS")
+        .ok()
+        .map(|value| policy_paths(&value))
+        .transpose()?
+        .unwrap_or_default();
     let backend = aruna_compute::executor::kubernetes::KubernetesBackend::with_config(
         aruna_compute::KubernetesConfig {
             namespace: dotenvy::var("ARUNA_COMPUTE_K8S_NAMESPACE")
@@ -1388,9 +1434,14 @@ async fn build_kubernetes(
             storage_class,
             helper_image,
             pull_deadline: env_duration("ARUNA_COMPUTE_K8S_PULL_DEADLINE", 300)?,
-            s3_cidrs,
+            s3_cidrs: if workspace.is_some() {
+                s3_cidrs
+            } else {
+                Vec::new()
+            },
             s3_port,
-            s3_mount_driver,
+            s3_mount_driver: s3_mount_driver.filter(|_| workspace.is_some()),
+            policy_manifests,
             service_account: dotenvy::var("ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT")
                 .unwrap_or_else(|_| aruna_compute::DEFAULT_WORKLOAD_SA.to_string()),
             execution_location: dotenvy::var("ARUNA_COMPUTE_K8S_EXECUTION_LOCATION")
@@ -1406,10 +1457,19 @@ async fn build_kubernetes(
     aruna_compute::ExecutorBackend::health(&backend)
         .await
         .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
-    info!("Kubernetes executor backend enabled");
+    // Pods keep the policy they started with, so already running sessions only
+    // get a repaired one once the node applies it again.
+    backend
+        .apply_network()
+        .await
+        .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
+    info!(
+        local_only = workspace.is_none(),
+        "Kubernetes executor backend enabled"
+    );
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
-        .with_workspace_endpoint(compute_s3_endpoint(config), "eu-central-1".to_string()))
+        .with_workspace_endpoint(workspace, "eu-central-1".to_string()))
 }
 
 #[cfg(not(feature = "kubernetes"))]
@@ -1425,6 +1485,46 @@ fn env_true(name: &str) -> bool {
     dotenvy::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
+}
+
+/// Expands a comma-separated list of manifest files and directories. A
+/// directory contributes its YAML files in name order.
+#[cfg(feature = "kubernetes")]
+fn policy_paths(value: &str) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut paths = Vec::new();
+    for entry in value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let path = std::path::PathBuf::from(entry);
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            format!("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS entry `{entry}` is unreadable: {error}")
+        })?;
+        if !metadata.is_dir() {
+            paths.push(path);
+            continue;
+        }
+        let mut found = Vec::new();
+        for file in std::fs::read_dir(&path).map_err(|error| {
+            format!("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS entry `{entry}` is unreadable: {error}")
+        })? {
+            let file = file
+                .map_err(|error| {
+                    format!("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS entry `{entry}`: {error}")
+                })?
+                .path();
+            if file
+                .extension()
+                .is_some_and(|suffix| suffix == "yaml" || suffix == "yml")
+            {
+                found.push(file);
+            }
+        }
+        found.sort();
+        paths.append(&mut found);
+    }
+    Ok(paths)
 }
 
 #[cfg(feature = "kubernetes")]
@@ -1593,7 +1693,7 @@ fn env_path(name: &str) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-#[cfg(any(feature = "docker", test))]
+#[cfg(any(feature = "docker", feature = "kubernetes", test))]
 fn container_local_endpoint(endpoint: &str) -> bool {
     let Some(host) = reqwest::Url::parse(endpoint)
         .ok()
@@ -1763,6 +1863,46 @@ mod tests {
     }
 
     #[test]
+    fn derives_s3_port() {
+        // An explicit setting stays authoritative; otherwise the policy port is
+        // the one pods reach the endpoint on.
+        assert_eq!(session_s3_port(Some("9000"), None), Ok(9000));
+        assert_eq!(
+            session_s3_port(Some("9000"), Some("https://s3.example.test")),
+            Ok(9000)
+        );
+        assert!(session_s3_port(Some("no"), None).is_err());
+        assert_eq!(session_s3_port(None, None), Ok(443));
+        assert_eq!(
+            session_s3_port(None, Some("https://s3.example.test")),
+            Ok(443)
+        );
+        assert_eq!(
+            session_s3_port(None, Some("http://s3.example.test")),
+            Ok(80)
+        );
+        assert_eq!(
+            session_s3_port(None, Some("https://s3.example.test:9000/")),
+            Ok(9000)
+        );
+    }
+
+    #[test]
+    fn guards_pod_endpoint() {
+        // A pod cannot reach the controller's loopback, so an unreachable
+        // endpoint must refuse startup instead of staging unreadable data.
+        assert_eq!(kubernetes_workspace(true, None).unwrap(), None);
+        assert_eq!(
+            kubernetes_workspace(false, Some("https://s3.example.test")).unwrap(),
+            Some("https://s3.example.test".to_string())
+        );
+        assert!(kubernetes_workspace(false, None).is_err());
+        assert!(kubernetes_workspace(false, Some("http://127.0.0.1:9000")).is_err());
+        assert!(kubernetes_workspace(false, Some("http://0.0.0.0:9000")).is_err());
+        assert!(kubernetes_workspace(false, Some("http://localhost:9000")).is_err());
+    }
+
+    #[test]
     fn rejects_zero_ceiling() {
         // A zero ceiling would silently make this node ineligible for every
         // execution instead of leaving the dimension unmeasured.
@@ -1830,6 +1970,25 @@ mod tests {
         assert!(parse_s3_cidrs("10.0.0.0/33").is_err());
         assert!(parse_s3_cidrs("2001:db8::/129").is_err());
         assert!(parse_s3_cidrs("invalid/8").is_err());
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn expands_policy_paths() {
+        let dir = tempdir().expect("temp dir");
+        for name in ["b.yaml", "a.yml", "notes.txt"] {
+            std::fs::write(dir.path().join(name), "").expect("write entry");
+        }
+        let single = dir.path().join("b.yaml");
+
+        let paths = policy_paths(&format!(" {}, {} ", dir.path().display(), single.display()))
+            .expect("the paths expand");
+
+        assert_eq!(
+            paths,
+            [dir.path().join("a.yml"), dir.path().join("b.yaml"), single]
+        );
+        assert!(policy_paths(&dir.path().join("missing").display().to_string()).is_err());
     }
 
     #[tokio::test]

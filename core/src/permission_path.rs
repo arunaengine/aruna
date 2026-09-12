@@ -1,4 +1,4 @@
-use crate::structs::PathRestriction;
+use crate::structs::{PathRestriction, Permission};
 use globset::GlobMatcher;
 use thiserror::Error;
 
@@ -45,6 +45,98 @@ pub fn role_path_confined(pattern: &str, subtree_root: &str) -> bool {
     pattern == subtree_root || pattern.starts_with(&format!("{subtree_root}/"))
 }
 
+/// Whether a concrete path is a root itself or lies below it.
+pub fn path_within(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// The literal subtree a pattern grants on: the pattern itself when it holds no
+/// wildcard, the parent of a trailing `/**`, and nothing otherwise, so an
+/// unsupported wildcard never widens a derived scope.
+fn pattern_root(pattern: &str) -> Option<&str> {
+    if let Some(root) = pattern.strip_suffix("/**") {
+        return (!root.is_empty() && !root.contains(['*', '?', '[', ']', '{', '}']))
+            .then_some(root);
+    }
+    (!pattern.contains(['*', '?', '[', ']', '{', '}'])).then_some(pattern)
+}
+
+/// Splits patterns into the allowed and denied roots at or below `root`. A
+/// pattern that covers `root` itself contributes `root`.
+fn split_roots<'a>(
+    patterns: impl IntoIterator<Item = (&'a str, &'a Permission)>,
+    root: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut allowed = Vec::new();
+    let mut denied = Vec::new();
+    for (pattern, permission) in patterns {
+        let covered = if permission_pattern_matches(pattern, root) {
+            Some(root.to_string())
+        } else {
+            pattern_root(pattern)
+                .filter(|candidate| path_within(candidate, root))
+                .map(str::to_string)
+        };
+        let Some(covered) = covered else {
+            continue;
+        };
+        match permission {
+            Permission::DENY => denied.push(covered),
+            _ => allowed.push(covered),
+        }
+    }
+    (allowed, denied)
+}
+
+/// The subtrees at or below `root` a caller may reach, from its role patterns
+/// and narrowed by a credential's restrictions. Whether a concrete path inside
+/// one is readable stays with the ordinary permission check.
+pub fn readable_roots(
+    granted: &[(String, Permission)],
+    restrictions: Option<&[PathRestriction]>,
+    root: &str,
+) -> Vec<String> {
+    let (mut allowed, mut denied) = split_roots(
+        granted
+            .iter()
+            .map(|(pattern, permission)| (pattern.as_str(), permission)),
+        root,
+    );
+    if let Some(restrictions) = restrictions {
+        let (restricted, restricted_denied) = split_roots(
+            restrictions
+                .iter()
+                .map(|restriction| (restriction.pattern.as_str(), &restriction.permission)),
+            root,
+        );
+        allowed = narrow_roots(&allowed, &restricted);
+        denied.extend(restricted_denied);
+    }
+    allowed.retain(|candidate| !denied.iter().any(|deny| path_within(candidate, deny)));
+    allowed.sort();
+    allowed.dedup();
+    allowed
+}
+
+/// Keeps the deeper root of every overlapping pair, so a narrowing set can only
+/// shrink the reachable subtrees.
+fn narrow_roots(granted: &[String], narrowing: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    for candidate in granted {
+        for other in narrowing {
+            if path_within(candidate, other) {
+                kept.push(candidate.clone());
+            } else if path_within(other, candidate) {
+                kept.push(other.clone());
+            }
+        }
+    }
+    kept
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RestrictionLimitError {
     #[error("too many path restrictions ({count})")]
@@ -84,7 +176,7 @@ pub fn validate_restriction_limits(
 mod tests {
     use super::{
         MAX_RESTRICTION_PATTERN_BYTES, MAX_TOKEN_RESTRICTIONS, RestrictionLimitError,
-        permission_pattern_matches, validate_restriction_limits,
+        permission_pattern_matches, readable_roots, validate_restriction_limits,
     };
     use crate::structs::{PathRestriction, Permission};
 
@@ -174,5 +266,79 @@ mod tests {
                 bytes: MAX_RESTRICTION_PATTERN_BYTES + 1
             })
         );
+    }
+
+    fn granted(patterns: &[(&str, Permission)]) -> Vec<(String, Permission)> {
+        patterns
+            .iter()
+            .map(|(pattern, permission)| (pattern.to_string(), permission.clone()))
+            .collect()
+    }
+
+    const BUCKET: &str = "/realm/g/group/data/node/study";
+
+    #[test]
+    fn pattern_covers_root() {
+        let granted = granted(&[("/realm/g/group/data/**", Permission::READ)]);
+        assert_eq!(readable_roots(&granted, None, BUCKET), vec![BUCKET]);
+    }
+
+    #[test]
+    fn pattern_yields_subpath() {
+        let granted = granted(&[
+            (
+                "/realm/g/group/data/node/study/imaging/**",
+                Permission::READ,
+            ),
+            ("/realm/g/group/meta/**", Permission::WRITE),
+        ]);
+        assert_eq!(
+            readable_roots(&granted, None, BUCKET),
+            vec![format!("{BUCKET}/imaging")]
+        );
+    }
+
+    #[test]
+    fn unrelated_yields_nothing() {
+        let granted = granted(&[("/realm/g/other/data/**", Permission::WRITE)]);
+        assert!(readable_roots(&granted, None, BUCKET).is_empty());
+    }
+
+    #[test]
+    fn deny_removes_root() {
+        let granted = granted(&[
+            (
+                "/realm/g/group/data/node/study/imaging/**",
+                Permission::READ,
+            ),
+            ("/realm/g/group/data/node/study/**", Permission::DENY),
+        ]);
+        assert!(readable_roots(&granted, None, BUCKET).is_empty());
+    }
+
+    #[test]
+    fn restrictions_narrow_roots() {
+        // A credential restricted deeper than the role keeps only its own scope.
+        let granted = granted(&[("/realm/g/group/data/**", Permission::READ)]);
+        let restrictions = vec![PathRestriction {
+            pattern: format!("{BUCKET}/imaging/**"),
+            permission: Permission::READ,
+        }];
+        assert_eq!(
+            readable_roots(&granted, Some(&restrictions), BUCKET),
+            vec![format!("{BUCKET}/imaging")]
+        );
+
+        let elsewhere = vec![PathRestriction {
+            pattern: "/realm/g/group/data/node/other/**".to_string(),
+            permission: Permission::READ,
+        }];
+        assert!(readable_roots(&granted, Some(&elsewhere), BUCKET).is_empty());
+    }
+
+    #[test]
+    fn wildcard_grants_nothing() {
+        let granted = granted(&[("/realm/g/group/data/node/study/*/imaging", Permission::READ)]);
+        assert!(readable_roots(&granted, None, BUCKET).is_empty());
     }
 }

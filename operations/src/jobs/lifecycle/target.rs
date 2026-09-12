@@ -37,6 +37,7 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use super::LifecycleError;
+use super::cancel::cancel_local_run;
 use super::ids::{self, workspace_of};
 use super::plan::{REALM_STAGING, network_access};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
@@ -106,7 +107,7 @@ pub async fn admit_launch(
     // A replayed offer re-arms the wakeups the first acceptance may have lost,
     // so the receipt still replicates and the execution still starts.
     if let Some(decision) = existing_receipt(&records, &intent) {
-        return Some(accepted(context.as_ref(), decision).await);
+        return accepted(context, decision).await;
     }
     if cancelled(family, &records) {
         return Some(Err(LaunchDecline::Cancelled));
@@ -361,7 +362,7 @@ where
             Ok(_) => {
                 let frame = ReceiptFrame::new(config.receipt.envelope().clone())
                     .map_err(|_| LaunchDecline::Unauthorized);
-                return Some(accepted(context.as_ref(), frame).await);
+                return accepted(context, frame).await;
             }
             Err(error) => error,
         };
@@ -372,7 +373,7 @@ where
             // is searched for before the reservation is attempted again.
             CommitVerdict::Raced => {
                 if let Some(committed) = committed_receipt(context, family, intent).await {
-                    return Some(accepted(context.as_ref(), committed).await);
+                    return accepted(context, committed).await;
                 }
                 debug!(attempt, "Execution reservation lost a race and retries");
                 tokio::task::yield_now().await;
@@ -387,7 +388,7 @@ where
             CommitVerdict::Uncertain => {
                 warn!(error = %error, "Execution commit outcome is unknown; reconciling");
                 let committed = committed_receipt(context, family, intent).await?;
-                return Some(accepted(context.as_ref(), committed).await);
+                return accepted(context, committed).await;
             }
             CommitVerdict::Drained => return Some(Err(LaunchDecline::Draining)),
             CommitVerdict::Faulted => {
@@ -400,17 +401,24 @@ where
 }
 
 /// Answers one decided offer and, when it was admitted, re-arms the runtime the
-/// acceptance owes: the receipt still has to replicate and the execution still
-/// has to start. A decline wakes nothing.
+/// acceptance owes, after applying any cancellation to the committed physical
+/// row. An incomplete cancellation read leaves the offer undecided.
 async fn accepted(
-    context: &DriverContext,
+    context: &Arc<DriverContext>,
     decision: Result<ReceiptFrame, LaunchDecline>,
-) -> Result<ReceiptFrame, LaunchDecline> {
-    if decision.is_ok() {
+) -> Option<Result<ReceiptFrame, LaunchDecline>> {
+    if let Ok(frame) = &decision {
+        let family = frame.envelope().family();
+        let records = family_records(context, family).await?;
+        if cancelled(family, &records)
+            && let JobFamilyRecord::Receipt(receipt) = &frame.envelope().record
+        {
+            cancel_local_run(context.as_ref(), receipt.physical_job_id).await;
+        }
         super::outbox::kick(context).await;
         schedule_local(context).await;
     }
-    decision
+    Some(decision)
 }
 
 /// The receipt already committed for this exact launch, whoever won the race.
@@ -605,6 +613,9 @@ pub(crate) async fn local_capability(
             .as_deref()
             .is_some_and(|kind| kind.trim() != capability.kind.trim())
         || !capability.supports(REALM_STAGING)
+        || (ids::session_of(&spec.payload).is_some()
+            && network_access(spec) != NetworkAccess::Open
+            && !capability.session)
         || !capability.limits.fits(&spec.resources)
     {
         return Err(LaunchDecline::Unauthorized);

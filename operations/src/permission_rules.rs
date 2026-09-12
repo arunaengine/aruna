@@ -5,7 +5,9 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::permission_path::{compile_permission_matcher, validate_restriction_limits};
+use aruna_core::permission_path::{
+    compile_permission_matcher, readable_roots, validate_restriction_limits,
+};
 use aruna_core::structs::{
     AuthContext, GroupAuthorizationDocument, MetadataRegistryRecord, PathRestriction, Permission,
     RealmAuthorizationDocument, RealmId, Role,
@@ -138,6 +140,21 @@ impl PermissionRules {
         allowed && self.restrictions_allow(path, required)
     }
 
+    /// Patterns of the roles the caller holds directly, for callers that derive
+    /// reachable subtrees instead of deciding one concrete path.
+    pub fn direct_patterns(&self) -> Vec<(String, Permission)> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.direct)
+            .map(|rule| {
+                (
+                    rule.matcher.glob().glob().to_string(),
+                    rule.permission.clone(),
+                )
+            })
+            .collect()
+    }
+
     fn restrictions_allow(&self, path: &str, required: &Permission) -> bool {
         let Some(restrictions) = self.restrictions.as_ref() else {
             return true;
@@ -160,6 +177,29 @@ impl PermissionRules {
         }
         allowed
     }
+}
+
+/// The subtrees at or below `root` the caller reaches, decided from the realm
+/// and group roles together so a realm deny also applies, and narrowed by the
+/// credential's own restrictions. `root` selects the authorization documents.
+pub async fn reachable_roots(
+    context: &DriverContext,
+    auth_context: &AuthContext,
+    root: &str,
+) -> Result<Vec<String>, AuthorizationError> {
+    let rules = drive(
+        PermissionRulesOperation::new(PermissionRulesConfig {
+            auth_context: auth_context.clone(),
+            path: root.to_string(),
+        }),
+        context,
+    )
+    .await?;
+    Ok(readable_roots(
+        &rules.direct_patterns(),
+        auth_context.path_restrictions.as_deref(),
+        root,
+    ))
 }
 
 /// The caller's rules for a set of groups, collected once per request: every

@@ -32,6 +32,8 @@ jobs:
       # nextest runs one process per test, so %m merges each binary's counters
       # into one file instead of writing a profraw per test process.
       LLVM_PROFILE_FILE: cargo-test-%m.profraw
+      # Instrumented frames are larger, so deep async tests overflow the 2 MiB default.
+      RUST_MIN_STACK: 8388608
 
     steps:
       - name: Check out repository

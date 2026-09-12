@@ -188,6 +188,21 @@ Kubernetes the Aruna node's controller service account needs the `create` verb o
 the node talks to a session's kernel through an exec into the running pod. The task workload
 service account stays unprivileged, with its token unmounted.
 
+Some clusters need policies the standard Kubernetes ones cannot express. List those manifests in
+`ARUNA_COMPUTE_K8S_POLICY_MANIFESTS`, a comma-separated list of YAML files and directories; a
+directory contributes its `*.yaml` and `*.yml` files in name order, and a file may hold several
+documents. Every document needs an `apiVersion`, a `kind` and a `metadata.name`, and its namespace
+must be absent or the compute namespace. The node applies them next to its own network policies at
+startup and before each job, so its service account needs `create`, `get` and `patch` on those
+kinds in that namespace. An unreadable file, an invalid document or a kind the cluster does not
+serve stops the node.
+
+A Cilium cluster is the common case: the S3 endpoint often resolves to the ingress load balancer,
+and Cilium treats that traffic as its reserved `ingress` entity, which no `ipBlock` rule matches. A
+CiliumNetworkPolicy with `toEntities: [ingress]` on the S3 port, selecting pods labelled
+`aruna-engine.org/network: s3`, opens it. DNS egress is allowed by port with no peer, because a
+node-local resolver runs on a host address that is neither a pod nor a CIDR peer.
+
 The session images are built from `scripts/session-python` and `scripts/session-deno`, which share
 the helper in `scripts/session-helper`. Build them with their `build.sh`; the runtime catalog names
 `harbor.computational.bio.uni-giessen.de/aruna/aruna-session-python:0.2.0` and `harbor.computational.bio.uni-giessen.de/aruna/aruna-session-deno:0.1.0`.

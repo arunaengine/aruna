@@ -10,7 +10,7 @@ rust-version.workspace = true
 default = ["docker", "apptainer", "kubernetes"]
 docker = ["dep:bollard"]
 apptainer = ["dep:nix", "dep:rustix"]
-kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:json-patch"]
+kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:json-patch", "dep:serde-saphyr"]
 
 [dependencies]
 aruna-core = { workspace = true }
@@ -23,6 +23,7 @@ futures-util = { workspace = true }
 ipnet = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde-saphyr = { workspace = true, optional = true }
 tar = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

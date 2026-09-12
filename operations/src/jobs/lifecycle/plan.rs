@@ -105,6 +105,7 @@ fn plan_request(
         required_labels: ids::required_labels(&spec.payload)?,
         staging: REALM_STAGING,
         network: network_access(spec),
+        session: ids::session_of(&spec.payload).is_some(),
         inputs,
         output_policies,
         policies,
@@ -681,6 +682,21 @@ mod tests {
             name: None,
             description: None,
         });
+    }
+
+    #[test]
+    fn flags_session_request() {
+        // Only a backend that can open a session channel may take a session, so
+        // the tag must reach the request every advertisement is screened by.
+        let family = Family::new([4u8; 32]);
+        let mut spec = family.spec();
+        assert!(!round_request(&spec).session);
+
+        spec.payload.tags.insert(
+            aruna_core::compute::runtimes::SESSION_TAG.to_string(),
+            aruna_core::compute::runtimes::SESSION_TAG_NOTEBOOK.to_string(),
+        );
+        assert!(round_request(&spec).session);
     }
 
     #[test]

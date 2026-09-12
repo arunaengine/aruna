@@ -107,6 +107,9 @@ pub struct PlanRequest {
     pub required_labels: Vec<LabelMatch>,
     pub staging: StagingMode,
     pub network: NetworkAccess,
+    /// An interactive session, which only a backend that can open a session
+    /// channel to the running attempt may take.
+    pub session: bool,
     pub inputs: Vec<ResolvedInput>,
     /// Refs the outputs and workspace inherit.
     pub output_policies: Vec<PlacementPolicyRef>,

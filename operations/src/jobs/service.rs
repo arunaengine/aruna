@@ -1317,7 +1317,7 @@ fn artifact_job_matches(artifact: &OwnedArtifact, user_id: UserId, job_id: JobId
     artifact.job_id == job_id && artifact.created_by == user_id
 }
 
-async fn kick_drain(context: &DriverContext) {
+pub(crate) async fn kick_drain(context: &DriverContext) {
     if let Some(task_handle) = context.task_handle.as_ref()
         && let Event::Task(TaskEvent::Error { message, .. }) =
             task_handle.send_effect(schedule_job_drain_effect()).await
