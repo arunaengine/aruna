@@ -606,8 +606,7 @@ mod tests {
             (public_group, "Public Group", Some("data-public")),
             (private_group, "Private Group", Some("data-private")),
         ] {
-            let mut auth =
-                GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+            let mut auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
             if let Some(bucket) = public_bucket.filter(|_| group_id == public_group) {
                 let role_id = Ulid::generate();
                 auth.roles.insert(

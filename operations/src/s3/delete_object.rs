@@ -1,11 +1,9 @@
-use crate::blob::records::{
-    HeadAliasContext, blob_location_read, build_transition_effects,
-    delete_version_effect, delete_index_effect, write_version_effect,
-};
 use crate::blob::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
-use crate::node::usage_stats::{
-    UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
+use crate::blob::records::{
+    HeadAliasContext, blob_location_read, build_transition_effects, delete_index_effect,
+    delete_version_effect, write_version_effect,
 };
+use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish};
 use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::effects::{Effect, StorageEffect};
@@ -260,9 +258,7 @@ impl DeleteObjectOperation {
     fn head_transition_applied(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::WriteResult { .. })
-            | Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                self.emit_head_transition()
-            }
+            | Event::Storage(StorageEvent::DeleteResult { .. }) => self.emit_head_transition(),
             _ => self.emit_error(DeleteObjectError::InvalidOperationState),
         }
     }
@@ -948,21 +944,15 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::ReadCurrentLookup => self.current_lookup_read(event),
             DeleteObjectState::ReadLivenessVersion => self.liveness_read(event),
             DeleteObjectState::ApplyHeadTransition => self.head_transition_applied(event),
-            DeleteObjectState::DeleteTargetHashPathIndex => {
-                self.target_path_deleted(event)
-            }
+            DeleteObjectState::DeleteTargetHashPathIndex => self.target_path_deleted(event),
             DeleteObjectState::DeleteTargetVersion => self.target_version_deleted(event),
             DeleteObjectState::RemoveManagedCopies => self.handle_copies_removed(event),
-            DeleteObjectState::DeleteMultipartSummary => {
-                self.summary_deleted(event)
-            }
+            DeleteObjectState::DeleteMultipartSummary => self.summary_deleted(event),
             DeleteObjectState::ReadMultipartParts => self.parts_read(event),
             DeleteObjectState::DeleteMultipartPart => self.part_deleted(event),
             DeleteObjectState::WriteReclaimCandidate => self.handle_candidate_written(event),
             DeleteObjectState::WriteBlobVersion => self.version_written(event),
-            DeleteObjectState::WriteLiveReplicationObligation => {
-                self.obligation_written(event)
-            }
+            DeleteObjectState::WriteLiveReplicationObligation => self.obligation_written(event),
             DeleteObjectState::UpdateUsage => self.handle_usage_update(event),
             DeleteObjectState::WriteDeleteAudit => self.handle_delete_audit(event),
             DeleteObjectState::CommitTransaction => self.handle_transaction_committed(event),
@@ -1518,11 +1508,7 @@ mod test {
     fn removes_final_pointer() {
         let user_id = test_user_id();
         let target_version_id = Ulid::from_bytes([1u8; 16]);
-        let mut op = delete_until_lookup(
-            target_version_id,
-            vec![target_version_id],
-            user_id,
-        );
+        let mut op = delete_until_lookup(target_version_id, vec![target_version_id], user_id);
         let current_pointer = CurrentVersionPointer::new_with_generation(target_version_id, 20);
 
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {

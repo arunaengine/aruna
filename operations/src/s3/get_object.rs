@@ -1,9 +1,7 @@
 use crate::blob::holders::GetBlobHoldersOperation;
-use crate::blob::records::blob_location_read;
 use crate::blob::managed_copy::ManagedCopyError;
-use crate::connectors::{
-    ResolveVersionSourceBindingInput, resolve_binding_effect,
-};
+use crate::blob::records::blob_location_read;
+use crate::connectors::{ResolveVersionSourceBindingInput, resolve_binding_effect};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
@@ -545,9 +543,9 @@ impl GetObjectOperation {
                 self.last_refresh = None;
                 self.version_created_at = None;
                 self.state = GetObjectState::ResolveReferenceAccess;
-                smallvec![resolve_binding_effect(
-                    ResolveVersionSourceBindingInput { source },
-                )]
+                smallvec![resolve_binding_effect(ResolveVersionSourceBindingInput {
+                    source
+                },)]
             }
         }
     }
@@ -1478,10 +1476,7 @@ impl HolderFailures {
         }
     }
 
-    fn consider(
-        &mut self,
-        result: Result<BaoReadOutput, BaoReadError>,
-    ) -> Option<BaoReadOutput> {
+    fn consider(&mut self, result: Result<BaoReadOutput, BaoReadError>) -> Option<BaoReadOutput> {
         match result {
             Ok(output @ BaoReadOutput::Stream { .. }) => Some(output),
             Ok(BaoReadOutput::Metadata { .. }) => {
@@ -1702,8 +1697,8 @@ mod test {
         Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey,
         BlobVersion, BlobVersionState, CurrentVersionPointer, MultipartChecksumType,
         MultipartObjectSummary, PathRestriction, Permission, PortableSourceDescriptor, RealmId,
-        ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy, UsageDelta, VersionKey,
-        VersionSourceBinding, usage_group_key,
+        ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy, UsageDelta,
+        VersionKey, VersionSourceBinding, usage_group_key,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -1825,9 +1820,7 @@ mod test {
         let mut failures = HolderFailures::default();
         assert!(
             failures
-                .consider(Err(BaoReadError::Refused(
-                    BaoReadRefusal::BackendFailure
-                )))
+                .consider(Err(BaoReadError::Refused(BaoReadRefusal::BackendFailure)))
                 .is_none()
         );
         let served = failures.consider(Ok(crate::replication::bao_read::BaoReadOutput::Stream {
@@ -1838,7 +1831,10 @@ mod test {
             hashes: HashMap::new(),
         }));
 
-        assert!(matches!(served, Some(crate::replication::bao_read::BaoReadOutput::Stream { .. })));
+        assert!(matches!(
+            served,
+            Some(crate::replication::bao_read::BaoReadOutput::Stream { .. })
+        ));
     }
 
     #[test]
@@ -2297,13 +2293,13 @@ mod test {
         assert!(blob_result.source_metadata.is_none());
         assert!(blob_result.source_binding.is_none());
         assert!(blob_result.last_refresh.is_none());
-        assert_eq!(blob_result.info.checksum_type, MultipartChecksumType::FullObject);
+        assert_eq!(
+            blob_result.info.checksum_type,
+            MultipartChecksumType::FullObject
+        );
         let info = &blob_result.info;
         assert_eq!(info.size, content.len() as u64);
-        assert_eq!(
-            info.etag,
-            location.hashes.get(HASH_MD5).map(hex::encode)
-        );
+        assert_eq!(info.etag, location.hashes.get(HASH_MD5).map(hex::encode));
         assert_eq!(info.version_created_at, Some(location.created_at));
         assert_eq!(info.hashes, location.hashes);
         let mut blob_stream = blob_result.blob;

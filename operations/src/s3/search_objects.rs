@@ -212,8 +212,7 @@ async fn scan_candidate_batch(
         event => return Err(storage_event_error(event)),
     };
 
-    let result =
-        scan_candidates(context, input, start_after, scan_limit, txn_id).await;
+    let result = scan_candidates(context, input, start_after, scan_limit, txn_id).await;
     let completion = if result.is_ok() {
         StorageEffect::CommitTransaction { txn_id }
     } else {
@@ -310,8 +309,8 @@ async fn load_live(
                 &candidate.head.key,
                 candidate.version_id,
             )
-                .to_bytes()
-                .map(|key| (BLOB_VERSIONS_KEYSPACE.to_string(), Key::from(key)))
+            .to_bytes()
+            .map(|key| (BLOB_VERSIONS_KEYSPACE.to_string(), Key::from(key)))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let versions = batch_read(context, version_reads, txn_id).await?;
@@ -570,8 +569,7 @@ mod tests {
             (visible_group, "visible", true),
             (hidden_group, "hidden", false),
         ] {
-            let mut auth =
-                GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+            let mut auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
             if readable {
                 let role_id = Ulid::generate();
                 auth.roles.insert(

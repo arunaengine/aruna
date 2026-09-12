@@ -2,11 +2,11 @@
 //! version: it mints a successor and advances the head from an exact pointer, with
 //! the VersionId durably assigned under `mutation_id` so retries resolve to it.
 
-use crate::blob::records::HeadAliasContext;
 use crate::blob::managed_copy::{
     COPY_PAGE_LIMIT, CopyRegistration, CopyRequest, ManagedCopyError, ManagedCopyPage,
     register_entry, scan_effect, validate_registration, version_scope,
 };
+use crate::blob::records::HeadAliasContext;
 use crate::node::usage_stats::{QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError};
 use crate::placement::policy::{PolicyGateError, drift_reads, split_drift_reads};
 use crate::replication::queue::{LiveReplicationObligationRecord, live_obligation_entry};

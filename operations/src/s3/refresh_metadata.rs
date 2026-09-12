@@ -10,8 +10,8 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{BlobVersion, BlobVersionState, SourceMetadata, VersionKey};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
-use aruna_core::types::{Effects, Key};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::{Effects, Key};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -98,9 +98,7 @@ impl ReferenceMetadataRefreshJobRecord {
     }
 }
 
-pub fn job_key(
-    refresh: &ReferenceMetadataRefresh,
-) -> Result<Key, ConversionError> {
+pub fn job_key(refresh: &ReferenceMetadataRefresh) -> Result<Key, ConversionError> {
     let identity = ReferenceMetadataRefreshJobIdentity {
         bucket: &refresh.bucket,
         key: &refresh.key,
@@ -232,11 +230,7 @@ impl Operation for QueueReferenceMetadataRefreshOperation {
                         unix_timestamp_millis(),
                     );
                     match postcard::from_bytes::<ReferenceMetadataRefreshJobRecord>(&value) {
-                        Ok(existing)
-                            if job_preferred(&existing, &record) =>
-                        {
-                            self.schedule_drain()
-                        }
+                        Ok(existing) if job_preferred(&existing, &record) => self.schedule_drain(),
                         Ok(_) | Err(_) => self.write_job(),
                     }
                 }
@@ -440,10 +434,7 @@ async fn abort_reference_refresh(context: &DriverContext, txn_id: Ulid) {
         .await;
 }
 
-pub async fn restore_timer(
-    storage: &StorageHandle,
-    task_handle: &TaskHandle,
-) {
+pub async fn restore_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     match next_timer(storage).await {
         Ok(None) => {}
         Ok(Some(after)) => {
@@ -501,12 +492,7 @@ pub async fn process_batch(
 ) -> Result<ReferenceMetadataRefreshDrainResult, ReferenceMetadataRefreshQueueError> {
     let batch_started = Instant::now();
     let now_ms = unix_timestamp_millis();
-    let scan = scan_due_jobs(
-        &context.storage_handle,
-        now_ms,
-        REFRESH_BATCH_SIZE,
-    )
-    .await?;
+    let scan = scan_due_jobs(&context.storage_handle, now_ms, REFRESH_BATCH_SIZE).await?;
     let mut next_due_at_ms = scan.next_due_at_ms;
     let has_more_due = scan.has_more_due;
     let scan_elapsed = batch_started.elapsed();
@@ -527,13 +513,8 @@ pub async fn process_batch(
                 succeeded = succeeded.saturating_add(1);
             }
             Err(error) => {
-                let retry_due_at = reschedule_job(
-                    &context.storage_handle,
-                    job_key,
-                    &job,
-                    error,
-                )
-                .await?;
+                let retry_due_at =
+                    reschedule_job(&context.storage_handle, job_key, &job, error).await?;
                 next_due_at_ms = min_due_at(next_due_at_ms, retry_due_at);
                 failed = failed.saturating_add(1);
             }
@@ -611,8 +592,7 @@ async fn scan_due_jobs(
             let canonical_key = job_key(&job.refresh)?.to_vec();
             if canonical_key.as_slice() != key.as_slice() {
                 warn!(key = ?key, "Repairing reference metadata refresh job stored under non-canonical key");
-                if let Some(existing) =
-                    read_job(storage, &canonical_key).await?
+                if let Some(existing) = read_job(storage, &canonical_key).await?
                     && job_preferred(&existing, &job)
                 {
                     delete_job(storage, key).await?;
@@ -635,16 +615,10 @@ async fn scan_due_jobs(
                 key = canonical_key;
             }
             if let Some((existing_key, existing)) =
-                find_duplicate(
-                    storage,
-                    &job,
-                    Some(key.as_slice()),
-                )
-                .await?
+                find_duplicate(storage, &job, Some(key.as_slice())).await?
                 && job_preferred(&existing, &job)
             {
-                let existing_canonical_key =
-                    job_key(&existing.refresh)?.to_vec();
+                let existing_canonical_key = job_key(&existing.refresh)?.to_vec();
                 write_job(storage, &existing).await?;
                 if existing_key.as_slice() != existing_canonical_key.as_slice() {
                     delete_job(storage, existing_key).await?;
@@ -733,15 +707,11 @@ async fn find_duplicate(
             else {
                 continue;
             };
-            if job_key(&candidate.refresh)?.as_ref()
-                != canonical_key.as_slice()
-            {
+            if job_key(&candidate.refresh)?.as_ref() != canonical_key.as_slice() {
                 continue;
             }
             match selected.as_mut() {
-                Some((_, selected_job))
-                    if job_preferred(&candidate, selected_job) =>
-                {
+                Some((_, selected_job)) if job_preferred(&candidate, selected_job) => {
                     selected = Some((key.to_vec(), candidate));
                 }
                 Some(_) => {}
@@ -1066,9 +1036,7 @@ mod tests {
         )
         .await
         .expect("queue succeeds");
-        let result = process_batch(&test.context)
-            .await
-            .expect("drain succeeds");
+        let result = process_batch(&test.context).await.expect("drain succeeds");
 
         assert_eq!(result.succeeded, 1);
         assert!(read_jobs(&test.context.storage_handle).await.is_empty());
@@ -1093,9 +1061,7 @@ mod tests {
         )
         .await
         .expect("queue succeeds");
-        process_batch(&test.context)
-            .await
-            .expect("drain succeeds");
+        process_batch(&test.context).await.expect("drain succeeds");
 
         assert_reference_state(&test, &new_metadata, refreshed_at).await;
     }
@@ -1125,9 +1091,7 @@ mod tests {
         )
         .await
         .expect("queue succeeds");
-        process_batch(&test.context)
-            .await
-            .expect("drain succeeds");
+        process_batch(&test.context).await.expect("drain succeeds");
 
         assert_reference_state(&test, &new_metadata, refreshed_at).await;
         assert_eq!(read_reference(&test).await.advance_count(), Some(7));
@@ -1166,9 +1130,7 @@ mod tests {
         let jobs = read_jobs(&test.context.storage_handle).await;
         assert_eq!(jobs.len(), 2);
 
-        let result = process_batch(&test.context)
-            .await
-            .expect("drain succeeds");
+        let result = process_batch(&test.context).await.expect("drain succeeds");
         assert_eq!(result.succeeded, 2);
         assert_reference_state(&test, &new_metadata, newer).await;
     }
@@ -1184,8 +1146,7 @@ mod tests {
             attempts: 1,
             last_error: Some("transient".to_string()),
         };
-        let (key_space, key, value) =
-            job_entry(&future_job).expect("future job serializes");
+        let (key_space, key, value) = job_entry(&future_job).expect("future job serializes");
         match test
             .context
             .storage_handle
@@ -1263,11 +1224,7 @@ mod tests {
         assert_eq!(result.processed, 0);
         assert!(!result.has_more_due);
         assert!(result.next_due_after.is_none());
-        assert!(
-            !jobs_exist(&test.context.storage_handle)
-                .await
-                .unwrap()
-        );
+        assert!(!jobs_exist(&test.context.storage_handle).await.unwrap());
     }
 
     #[tokio::test]
