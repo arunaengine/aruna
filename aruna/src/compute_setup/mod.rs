@@ -5,6 +5,13 @@
 //! The node keeps running without compute when the operator marks compute
 //! optional.
 
+// Without a compiled backend the parsed settings are only constructed, never
+// read; keep the no-backend feature check warning-free.
+#![cfg_attr(
+    not(any(feature = "docker", feature = "apptainer", feature = "kubernetes")),
+    allow(dead_code)
+)]
+
 mod settings;
 
 #[cfg(feature = "apptainer")]
