@@ -1,4 +1,5 @@
 #![recursion_limit = "256"]
+//! Operator CLI for inspecting, recovering, and maintaining a node.
 use crate::cli::{
     Cli, Commands, ExploreCommands, IrohCommands, PortalCommands, ReclaimCommands, TopicCommands,
     TopicsCommands,

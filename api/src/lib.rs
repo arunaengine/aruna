@@ -1,3 +1,5 @@
+//! The node transports: REST routes, MCP tools, the S3 service, and the
+//! shared server state they run against.
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "512"]
 #![allow(clippy::result_large_err)]

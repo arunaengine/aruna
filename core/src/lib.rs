@@ -1,5 +1,7 @@
 #![allow(clippy::result_large_err)]
 
+//! Domain types, events, effects, keyspaces, and the operation contract
+//! shared by every crate.
 pub mod admin_documents;
 pub mod alpn;
 pub mod audit;

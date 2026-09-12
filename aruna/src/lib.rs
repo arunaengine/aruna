@@ -1,3 +1,5 @@
+//! The node's library: operator settings, persisted identity, startup
+//! phases, shutdown ordering, and telemetry.
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 #![allow(clippy::result_large_err)]

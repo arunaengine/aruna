@@ -1,3 +1,4 @@
+//! Compute executor backends and the interfaces they implement.
 pub mod executor;
 pub mod registry;
 pub mod session;

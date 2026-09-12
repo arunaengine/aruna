@@ -1,3 +1,5 @@
+//! Domain state machines and their adapters: metadata, sync, jobs, S3,
+//! placement, and the effect-driven operation runner.
 // Fresh (non-incremental) builds overflow the default query depth in the
 // deeply nested async state machines; incremental builds mask it.
 #![recursion_limit = "512"]
