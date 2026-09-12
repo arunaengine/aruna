@@ -203,12 +203,8 @@ impl Operation for GetOidcUserOperation {
         };
         match self.state.clone() {
             GetOidcUserState::StartTransaction => self.handle_start_txn(event),
-            GetOidcUserState::ReadSubjectIndex { txn_id } => {
-                self.accept_subject(event, txn_id)
-            }
-            GetOidcUserState::ReadExistingUser { txn_id } => {
-                self.accept_existing(event, txn_id)
-            }
+            GetOidcUserState::ReadSubjectIndex { txn_id } => self.accept_subject(event, txn_id),
+            GetOidcUserState::ReadExistingUser { txn_id } => self.accept_existing(event, txn_id),
             GetOidcUserState::CommitTransaction { user } => {
                 self.handle_commit_transaction(event, user)
             }

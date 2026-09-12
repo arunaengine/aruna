@@ -12,13 +12,12 @@ use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_key,
-    reducer_state_entry, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::{Actor, RealmConfigDocument};
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -205,16 +204,10 @@ impl RemoveDeviceNodeOperation {
         )?;
         // The stored document is derived from the reducer, exactly as the
         // replicated overlay derives it on every other node.
-        overlay_reducer_state(
-            &mut document,
-            &reducer_state,
-            unix_timestamp_millis(),
-        );
+        overlay_reducer_state(&mut document, &reducer_state, unix_timestamp_millis());
 
-        let stale_conflict_deletes = stale_conflict_deletes(
-            previous_reducer_state.as_ref(),
-            Some(&reducer_state),
-        );
+        let stale_conflict_deletes =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let document_target = self.document_ref();
         let placement = target_placement_ref(&document, &document_target, Default::default());
         let mut writes = vec![

@@ -11,8 +11,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DEVICE_SYNC_STATE_KEYSPACE, SYNC_BASE_KEYSPACE};
 use aruna_core::structs::{EntryState, FolderState, SyncBase, SyncedFolder};
 use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_core::types::{GroupId, Key};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::{GroupId, Key};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -272,9 +272,8 @@ async fn arm(context: &Arc<DriverContext>, key: TaskKey) {
     let Some(task_handle) = context.task_handle.as_ref() else {
         return;
     };
-    if let TaskEvent::Error { message, .. } = task_handle
-        .schedule_idle_timer(key, Duration::ZERO)
-        .await
+    if let TaskEvent::Error { message, .. } =
+        task_handle.schedule_idle_timer(key, Duration::ZERO).await
     {
         warn!(message = %message, "Failed to arm a device sync timer");
     }

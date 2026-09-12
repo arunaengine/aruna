@@ -31,12 +31,7 @@ pub fn build_source_binding(
 ) -> VersionSourceBinding {
     VersionSourceBinding {
         strategy,
-        descriptor: build_source_descriptor(
-            connector,
-            metadata,
-            source_path,
-            origin_node_id,
-        ),
+        descriptor: build_source_descriptor(connector, metadata, source_path, origin_node_id),
         connector_id,
     }
 }

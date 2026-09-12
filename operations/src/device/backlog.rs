@@ -6,8 +6,8 @@ use std::future::Future;
 use std::time::Duration;
 
 use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_core::types::Key;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::Key;
 use aruna_tasks::TaskHandle;
 use tracing::warn;
 

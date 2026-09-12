@@ -2,9 +2,7 @@
 //! Objects are reference versions bound to the device-local registration, not a
 //! path; writes are refused and files change only on the owner's filesystem.
 
-use crate::blob::records::{
-    HeadAliasContext, build_transition_effects, write_version_effect,
-};
+use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};

@@ -11,13 +11,11 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
-use aruna_core::storage_entries::{
-    reducer_state_entry, sync_revision_entry,
-};
+use aruna_core::storage_entries::{reducer_state_entry, sync_revision_entry};
 use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, User, oidc_subject_key};
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, TxnId, UserId};
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
+use aruna_core::types::{Effects, TxnId, UserId};
 use aruna_core::{USER_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -158,10 +156,7 @@ impl RegisterOrGetOidcUserOperation {
         }
     }
 
-    fn read_subject(
-        &mut self,
-        txn_id: TxnId,
-    ) -> Result<Effects, RegisterOrGetOidcUserError> {
+    fn read_subject(&mut self, txn_id: TxnId) -> Result<Effects, RegisterOrGetOidcUserError> {
         self.state = RegisterOrGetOidcUserState::ReadSubjectIndex { txn_id };
         let subject_key = ByteView::from(self.subject_key()?.into_bytes());
         Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -561,9 +556,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentReducerState;
-    use aruna_core::storage_entries::{
-        reducer_state_key, sync_revision_key,
-    };
+    use aruna_core::storage_entries::{reducer_state_key, sync_revision_key};
     use aruna_core::structs::{Actor, User, oidc_subject_key};
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_core::types::TxnId;
@@ -645,10 +638,7 @@ mod tests {
                     .iter()
                     .find(|(keyspace, _, _)| keyspace == aruna_core::ADMIN_DOCUMENT_STATE_KEYSPACE)
                     .expect("reducer state write is included");
-                assert_eq!(
-                    reducer_state_write.1,
-                    reducer_state_key(&admin_target)
-                );
+                assert_eq!(reducer_state_write.1, reducer_state_key(&admin_target));
                 let reducer_state: AdminDocumentReducerState =
                     postcard::from_bytes(reducer_state_write.2.as_ref()).unwrap();
                 assert_eq!(reducer_state.target, admin_target);

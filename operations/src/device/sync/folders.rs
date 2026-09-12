@@ -10,8 +10,8 @@ use aruna_core::structs::{
     AuthContext, EntryState, FolderMode, FolderState, RealmId, RemoteBinding, SyncActionRecord,
     SyncBase, SyncPageLimit, SyncRefusal, SyncedFolder,
 };
-use aruna_core::types::{GroupId, Key, NodeId, UserId};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::{GroupId, Key, NodeId, UserId};
 use thiserror::Error;
 use ulid::Ulid;
 

@@ -26,8 +26,8 @@ use aruna_core::structs::{
     STORAGE_CLASS_LABEL_PREFIX, SubmissionId, node_info_key,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Key, TxnId, Value};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::{Key, TxnId, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
@@ -1258,9 +1258,7 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id)
-            .await
-            .unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
 
         assert!(
             read_info_document(&ctx.storage_handle, local)
@@ -1415,9 +1413,7 @@ mod tests {
         let expected_labels = build_view(&config).nodes[0].labels.clone();
         write_realm_config(&ctx, &config).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id)
-            .await
-            .unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
         let second = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
@@ -1457,9 +1453,7 @@ mod tests {
         let local = node(1);
         write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id)
-            .await
-            .unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
         assert!(
             read_info_document(&ctx.storage_handle, local)
                 .await
@@ -2176,9 +2170,7 @@ mod tests {
         .unwrap();
 
         write_operator_drain(&ctx, true).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id)
-            .await
-            .unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
         let drained = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
@@ -2186,9 +2178,7 @@ mod tests {
         assert!(drained.compute_draining && !drained.leaving);
 
         write_operator_drain(&ctx, false).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id)
-            .await
-            .unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
         let released = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
@@ -2219,9 +2209,7 @@ mod tests {
             .await
             .unwrap();
 
-        refresh_info_heartbeat(&ctx, local, realm_id)
-            .await
-            .unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
 
         let stored = read_info_document(&ctx.storage_handle, local)
             .await
@@ -2250,9 +2238,7 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id)
-            .await
-            .unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
 
         let stored = read_info_document(&ctx.storage_handle, local)
             .await

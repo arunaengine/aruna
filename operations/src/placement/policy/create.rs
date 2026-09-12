@@ -22,9 +22,7 @@ use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
-use crate::sync::document_outbox::{
-    new_outbox_record, outbox_write_entry, schedule_drain_effect,
-};
+use crate::sync::document_outbox::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreatePolicyConfig {
