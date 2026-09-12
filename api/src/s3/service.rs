@@ -257,9 +257,7 @@ impl S3 for ArunaS3Service {
 
         drive(GetBucketInfoOperation::new(req.input.bucket), &self.state)
             .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to head bucket"))?;
+            .map_err(IntoS3Error::into_s3_error)?;
 
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
@@ -278,9 +276,7 @@ impl S3 for ArunaS3Service {
 
         drive(GetBucketInfoOperation::new(req.input.bucket), &self.state)
             .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to get bucket location"))?;
+            .map_err(IntoS3Error::into_s3_error)?;
 
         // No region is configured for the node, so report the default location
         // constraint (an empty constraint denotes the us-east-1 default region).
@@ -858,9 +854,7 @@ impl S3 for ArunaS3Service {
             &self.state,
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(NoSuchBucket, "The specified bucket does not exist."))?;
+        .map_err(IntoS3Error::into_s3_error)?;
 
         let source_auth_context = if source_bucket_info.group_id == user_access.group_id {
             AuthContext {
@@ -1214,9 +1208,7 @@ impl S3 for ArunaS3Service {
             &self.state,
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(NoSuchBucket, "The specified bucket does not exist."))?;
+        .map_err(IntoS3Error::into_s3_error)?;
 
         let source_auth_context = if source_bucket_info.group_id == user_access.group_id {
             AuthContext {

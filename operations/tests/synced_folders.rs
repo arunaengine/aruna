@@ -313,8 +313,7 @@ async fn creates_remote_bucket() -> TestResult<()> {
         GetBucketInfoOperation::new(REMOTE_BUCKET.to_string()),
         &server.context,
     )
-    .await?
-    .ok_or("bucket lookup did not finish")??;
+    .await?;
     assert_eq!(bucket.group_id, group_id);
 
     let plan = reconcile_folder(&device.context, &folder).await?;

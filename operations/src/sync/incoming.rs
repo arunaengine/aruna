@@ -215,9 +215,8 @@ async fn manifest_policy(
     )
     .await
     {
-        Ok(Some(Ok(info))) => info.group_id,
-        Ok(None) | Ok(Some(Err(GetBucketInfoError::NotFound))) => manifest.group_id,
-        Ok(Some(Err(error))) => return Err(error.to_string()),
+        Ok(info) => info.group_id,
+        Err(GetBucketInfoError::NotFound) => manifest.group_id,
         Err(error) => return Err(error.to_string()),
     };
     let path = if manifest.key.is_empty() {
@@ -288,11 +287,10 @@ async fn bao_policy(
             }
             let group_id =
                 match drive(GetBucketInfoOperation::new(target.bucket.clone()), context).await {
-                    Ok(Some(Ok(info))) => info.group_id,
-                    Ok(None) | Ok(Some(Err(GetBucketInfoError::NotFound))) => {
+                    Ok(info) => info.group_id,
+                    Err(GetBucketInfoError::NotFound) => {
                         return Ok((paths, Vec::new(), false));
                     }
-                    Ok(Some(Err(error))) => return Err(error.to_string()),
                     Err(error) => return Err(error.to_string()),
                 };
             let path = object_permission_path(

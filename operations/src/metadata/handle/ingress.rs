@@ -114,15 +114,12 @@ impl MetadataHandle {
         )
         .await
         {
-            Ok(Some(Ok(bucket_info))) => (bucket_info.group_id, false),
-            Ok(Some(Err(GetBucketInfoError::NotFound))) | Ok(None) => {
+            Ok(bucket_info) => (bucket_info.group_id, false),
+            Err(GetBucketInfoError::NotFound) => {
                 let Some(source_group_id) = source_group_id else {
                     return MetadataTransportMessage::Reject("invalid_relationship".to_string());
                 };
                 (source_group_id, true)
-            }
-            Ok(Some(Err(_))) => {
-                return MetadataTransportMessage::Reject("mirror_internal".to_string());
             }
             Err(_) => return MetadataTransportMessage::Reject("mirror_internal".to_string()),
         };
@@ -199,7 +196,7 @@ async fn delete_mirror(
     )
     .await
     {
-        Ok(Some(Ok(bucket_info))) => {
+        Ok(bucket_info) => {
             let path = bucket_permission_path(
                 *net_handle.realm_id(),
                 bucket_info.group_id,
@@ -223,8 +220,8 @@ async fn delete_mirror(
                 Err(_) => return MetadataTransportMessage::Reject("access_denied".to_string()),
             }
         }
-        Ok(Some(Err(GetBucketInfoError::NotFound))) | Ok(None) => {}
-        Ok(Some(Err(_))) | Err(_) => {
+        Err(GetBucketInfoError::NotFound) => {}
+        Err(_) => {
             return MetadataTransportMessage::Reject("mirror_internal".to_string());
         }
     }

@@ -502,12 +502,9 @@ impl AuthProvider {
 
     async fn find_bucket_info(&self, bucket: &str) -> S3Result<Option<BucketInfo>> {
         let operation = GetBucketInfoOperation::new(bucket.to_string());
-        match drive(operation, self.driver_ctx.as_ref())
-            .await
-            .and_then(|result| result.transpose())
-        {
-            Ok(Some(bucket_info)) => Ok(Some(bucket_info)),
-            Ok(None) | Err(GetBucketInfoError::NotFound) => Ok(None),
+        match drive(operation, self.driver_ctx.as_ref()).await {
+            Ok(bucket_info) => Ok(Some(bucket_info)),
+            Err(GetBucketInfoError::NotFound) => Ok(None),
             Err(_) => Err(s3_error!(InternalError, "Failed to query bucket")),
         }
     }

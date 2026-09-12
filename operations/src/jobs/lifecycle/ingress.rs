@@ -40,7 +40,7 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::forward::{is_sync_eligible, peer_acts_for};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::{MetadataAuthToken, MetadataWritePeerError};
-use crate::s3::get_bucket::GetBucketInfoOperation;
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
@@ -326,16 +326,27 @@ async fn resolve_inputs(
     }
     let mut output_policies = Vec::new();
     for bucket in buckets {
-        let info = drive(GetBucketInfoOperation::new(bucket.clone()), context)
-            .await
-            .map_err(|error| {
-                SubmitJobError::PlacementUnavailable(format!("s3://{bucket}: {error}"))
-            })?
-            .transpose()
-            .map_err(|error| SubmitJobError::InvalidWorkspace(format!("s3://{bucket}: {error}")))?
-            .ok_or_else(|| {
-                SubmitJobError::InvalidWorkspace(format!("s3://{bucket}: output bucket not found"))
-            })?;
+        let info = match drive(GetBucketInfoOperation::new(bucket.clone()), context).await {
+            Ok(info) => info,
+            Err(GetBucketInfoError::NotFound) => {
+                return Err(SubmitJobError::InvalidWorkspace(format!(
+                    "s3://{bucket}: output bucket not found"
+                )));
+            }
+            Err(
+                error @ (GetBucketInfoError::ConversionError(_)
+                | GetBucketInfoError::InvalidStateEvent { .. }),
+            ) => {
+                return Err(SubmitJobError::InvalidWorkspace(format!(
+                    "s3://{bucket}: {error}"
+                )));
+            }
+            Err(error) => {
+                return Err(SubmitJobError::PlacementUnavailable(format!(
+                    "s3://{bucket}: {error}"
+                )));
+            }
+        };
         if info.group_id != spec.group_id {
             return Err(SubmitJobError::InvalidWorkspace(format!(
                 "s3://{bucket}: output bucket is outside the execution group"

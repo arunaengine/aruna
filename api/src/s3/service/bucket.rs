@@ -324,9 +324,7 @@ impl ArunaS3Service {
                 &self.state,
             )
             .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to load replication target"))?;
+            .map_err(IntoS3Error::into_s3_error)?;
             authorize(
                 &self.state,
                 self.realm_id,

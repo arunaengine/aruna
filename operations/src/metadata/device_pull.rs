@@ -152,9 +152,8 @@ async fn read_bucket(
     bucket: &str,
 ) -> Result<BucketInfo, SyncRefusal> {
     match drive(GetBucketInfoOperation::new(bucket.to_string()), context).await {
-        Ok(Some(Ok(info))) => Ok(info),
-        Ok(None) => Err(SyncRefusal::NotFound),
-        Ok(Some(Err(error))) | Err(error) => {
+        Ok(info) => Ok(info),
+        Err(error) => {
             debug!(error = %error, bucket = %bucket, "A sync pull could not read its target bucket");
             Err(bucket_refusal(error))
         }
@@ -950,7 +949,7 @@ mod tests {
             SyncRefusal::Unavailable
         );
         assert_eq!(
-            bucket_refusal(GetBucketInfoError::GetBucketInfoFailed),
+            bucket_refusal(GetBucketInfoError::Incomplete),
             SyncRefusal::Unavailable
         );
     }

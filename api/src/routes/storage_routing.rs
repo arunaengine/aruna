@@ -186,12 +186,9 @@ async fn group_of_bucket(state: &ServerState, bucket: &str) -> ServerResult<Ulid
     )
     .await
     {
-        Ok(Some(Ok(info))) => Ok(info.group_id),
-        Ok(Some(Err(GetBucketInfoError::NotFound))) | Err(GetBucketInfoError::NotFound) => {
-            Err(ServerError::NotFound)
-        }
-        Ok(Some(Err(err))) | Err(err) => Err(ServerError::InternalError(err.to_string())),
-        Ok(None) => Err(ServerError::NotFound),
+        Ok(info) => Ok(info.group_id),
+        Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
 }
 

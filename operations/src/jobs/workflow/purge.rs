@@ -66,13 +66,12 @@ async fn run_fenced_purge(
         &ctx.driver,
     )
     .await
-    .and_then(|result| result.transpose())
     {
-        Ok(Some(info)) if info.group_id == spec.group_id => true,
-        Ok(Some(_)) => {
+        Ok(info) if info.group_id == spec.group_id => true,
+        Ok(_) => {
             return Err(JobError::permanent("purge bucket is outside the authorized group").into());
         }
-        Ok(None) | Err(GetBucketInfoError::NotFound) => false,
+        Err(GetBucketInfoError::NotFound) => false,
         Err(error) => {
             return Err(JobError::retryable(format!("purge bucket read failed: {error}")).into());
         }
@@ -382,12 +381,9 @@ async fn final_relist(ctx: &JobContext, scope: &StoragePurgeScope) -> Result<(),
 }
 
 async fn prove_bucket_absent(ctx: &JobContext, bucket: &str) -> Result<(), PurgeRunError> {
-    match drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver)
-        .await
-        .and_then(|result| result.transpose())
-    {
-        Ok(None) | Err(GetBucketInfoError::NotFound) => Ok(()),
-        Ok(Some(_)) => Err(JobError::retryable("bucket still exists after purge").into()),
+    match drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver).await {
+        Err(GetBucketInfoError::NotFound) => Ok(()),
+        Ok(_) => Err(JobError::retryable("bucket still exists after purge").into()),
         Err(error) => {
             Err(JobError::retryable(format!("bucket emptiness proof failed: {error}")).into())
         }

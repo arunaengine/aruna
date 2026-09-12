@@ -53,11 +53,11 @@ pub(super) async fn resolve_preflight_targets(
             }
             let bucket_info =
                 match drive(GetBucketInfoOperation::new(bucket.clone()), context).await {
-                    Ok(Some(Ok(info))) => info,
-                    Ok(Some(Err(GetBucketInfoError::NotFound))) => {
+                    Ok(info) => info,
+                    Err(GetBucketInfoError::NotFound) => {
                         return Err(MetadataApiError::NotFound);
                     }
-                    Ok(Some(Err(_))) | Ok(None) | Err(_) => {
+                    Err(_) => {
                         return Err(MetadataApiError::ServiceUnavailable);
                     }
                 };

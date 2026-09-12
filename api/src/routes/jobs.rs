@@ -1044,10 +1044,9 @@ async fn validate_owned_bucket(
         &state.get_ctx(),
     )
     .await
-    .and_then(|result| result.transpose())
     {
-        Ok(Some(info)) => info,
-        Ok(None) | Err(GetBucketInfoError::NotFound) => return Err(ServerError::BadRequest),
+        Ok(info) => info,
+        Err(GetBucketInfoError::NotFound) => return Err(ServerError::BadRequest),
         Err(error) => return Err(ServerError::InternalError(error.to_string())),
     };
     if info.group_id != group_id {

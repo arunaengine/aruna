@@ -3148,13 +3148,12 @@ async fn create_remote_bucket(
                 context.as_ref(),
             )
             .await
-            .and_then(|result| result.transpose())
             {
-                Ok(Some(info)) if info.group_id == group_id => Ok(()),
-                Ok(Some(_)) => Err(SyncRefusal::Invalid(format!(
+                Ok(info) if info.group_id == group_id => Ok(()),
+                Ok(_) => Err(SyncRefusal::Invalid(format!(
                     "bucket \"{bucket}\" belongs to another group"
                 ))),
-                Ok(None) | Err(_) => Err(SyncRefusal::Unavailable),
+                Err(_) => Err(SyncRefusal::Unavailable),
             }
         }
         Ok(None) | Err(_) => Err(SyncRefusal::Unavailable),

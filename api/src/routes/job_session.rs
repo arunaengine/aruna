@@ -23,7 +23,7 @@ use aruna_operations::realm::get_config::GetRealmConfigOperation;
 use aruna_operations::s3::copy_object::{
     CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
-use aruna_operations::s3::get_bucket::GetBucketInfoOperation;
+use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -953,11 +953,11 @@ async fn bucket_info(
     context: &aruna_operations::driver::DriverContext,
     bucket: &str,
 ) -> ServerResult<aruna_core::structs::BucketInfo> {
-    drive(GetBucketInfoOperation::new(bucket.to_string()), context)
-        .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
-        .ok_or(ServerError::NotFound)?
-        .map_err(|_| ServerError::NotFound)
+    match drive(GetBucketInfoOperation::new(bucket.to_string()), context).await {
+        Ok(info) => Ok(info),
+        Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Err(error) => Err(ServerError::InternalError(error.to_string())),
+    }
 }
 
 /// What one item became: an object in the bucket, or a job still bringing it.

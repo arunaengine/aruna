@@ -79,9 +79,6 @@ async fn sync_creates_bucket() {
         .unwrap();
     let bucket = drive(GetBucketInfoOperation::new("foobar".to_string()), &context)
         .await
-        .unwrap()
-        .transpose()
-        .unwrap()
         .unwrap();
 
     assert_eq!(bucket.group_id, group_id);

@@ -26,7 +26,7 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::MetadataAuthToken;
-use crate::s3::get_bucket::GetBucketInfoOperation;
+use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::sync::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
@@ -287,9 +287,8 @@ pub async fn ensure_sync_mirror(
     )
     .await
     {
-        Ok(Some(Ok(bucket_info))) => bucket_info.group_id,
-        Ok(Some(Err(error))) => return Err(SyncMirrorRepairError::Mirror(error.to_string())),
-        Ok(None) => {
+        Ok(bucket_info) => bucket_info.group_id,
+        Err(GetBucketInfoError::NotFound) => {
             return Err(SyncMirrorRepairError::Mirror(
                 "source bucket not found".to_string(),
             ));
@@ -485,9 +484,8 @@ async fn ensure_target_write(
     )
     .await
     {
-        Ok(Some(Ok(bucket_info))) => bucket_info,
-        Ok(Some(Err(error))) => return Err(SyncMirrorRepairError::Mirror(error.to_string())),
-        Ok(None) => {
+        Ok(bucket_info) => bucket_info,
+        Err(GetBucketInfoError::NotFound) => {
             return Err(SyncMirrorRepairError::Mirror(
                 "target bucket not found".to_string(),
             ));
