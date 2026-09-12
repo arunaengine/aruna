@@ -1,18 +1,9 @@
 use super::*;
 use crate::NodeId;
-use crate::compute::{
-    ExecutorAvailability, ExecutorCapability, NetworkAccess, ResourceEnvelope, StagingMode,
-};
-use crate::structs::{
-    EffectiveResources, LabelMatch, LocationLink, PlacementPolicy, PlacementPolicyRef,
-    PlacementSelector, PlacementSubject, PolicyResolution, RealmNodeKind, SubmissionId,
-    VerifiedPolicy, VersionedObjectArn,
-};
-use std::collections::BTreeMap;
-use ulid::Ulid;
+use crate::compute::{ExecutorAvailability, NetworkAccess, ResourceEnvelope, StagingMode};
+use crate::structs::{LabelMatch, PlacementSelector, RealmNodeKind};
 
-pub(crate) mod fixtures;
-use fixtures::*;
+use crate::tests::fixtures::scheduling::*;
 
 /// `count` advertisements, in the canonical order the planner ranks them in.
 fn scanned(count: u8) -> Vec<TargetCandidate> {
