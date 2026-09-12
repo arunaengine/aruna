@@ -8,6 +8,14 @@ test:
 	cargo nextest run --workspace --all-targets --all-features --locked --profile ci
 	cargo test --workspace --all-features --locked --doc
 
+# The fast editing loop: only the audited no-I/O state-machine and pure tests.
+test-fast package="aruna-operations":
+	cargo nextest run -p {{package}} --lib --locked --profile fast
+
+# The same selection across every workspace target; compiles more than it runs.
+test-fast-workspace:
+	cargo nextest run --workspace --all-targets --all-features --locked --profile fast
+
 # Compile every supported feature selection, as the CI feature checks run them.
 check:
 	cargo check --workspace --locked
