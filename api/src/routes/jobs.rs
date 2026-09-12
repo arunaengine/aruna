@@ -3251,7 +3251,7 @@ mod tests {
     async fn urls_are_absolute() {
         let (_dir, state) = build_state().await;
         state
-            .register_rest_interface(
+            .register_rest_public(
                 "127.0.0.1:3000".parse().unwrap(),
                 Some("https://owner.example/"),
             )

@@ -1,6 +1,6 @@
 use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, blob_permission_path, ensure_permission,
-    parse_group_id, parse_connector_id, require_realm_auth,
+    ValidatedArunaBearerTokenCarrier, blob_permission_path, ensure_permission, parse_connector_id,
+    parse_group_id, require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::connectors::ApiSourceConnectorKind;
@@ -1574,7 +1574,7 @@ mod tests {
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::replication::queue::{
-        LiveReplicationObligationRecord, live_replication_obligation_key,
+        LiveReplicationObligationRecord, live_obligation_key,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1770,7 +1770,7 @@ mod tests {
             version_id,
             false,
         );
-        let obligation_key = live_replication_obligation_key(&obligation).unwrap();
+        let obligation_key = live_obligation_key(&obligation).unwrap();
         write_doc(
             &test.state.get_ctx(),
             BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
@@ -2225,19 +2225,11 @@ mod tests {
             .await,
         );
 
-        let target_path = crate::auth::blob_permission_path(
-            state.as_ref(),
-            bucket_group_id,
-            &bucket,
-            &key,
-        );
+        let target_path =
+            crate::auth::blob_permission_path(state.as_ref(), bucket_group_id, &bucket, &key);
         let bucket_path = bucket_permission_path(realm_id, bucket_group_id, node_id, &bucket);
-        let source_path_restriction = connector_permission_path(
-            state.as_ref(),
-            bucket_group_id,
-            connector_id,
-            &source_path,
-        );
+        let source_path_restriction =
+            connector_permission_path(state.as_ref(), bucket_group_id, connector_id, &source_path);
 
         TestState {
             _storage_dir: storage_dir,

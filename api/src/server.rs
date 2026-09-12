@@ -108,7 +108,7 @@ impl Server {
     ) -> Result<(), ServerSetupError> {
         let bound_addr = listener.local_addr()?;
         self.state
-            .register_rest_interface(bound_addr, self.api_public_url.as_deref())
+            .register_rest_public(bound_addr, self.api_public_url.as_deref())
             .await;
         if self.mcp_enabled {
             self.state.register_mcp_interface().await;

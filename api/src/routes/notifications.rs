@@ -14,11 +14,11 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::dashboard::subscribe_dashboard_changes;
+use aruna_operations::notifications::dispatch;
 use aruna_operations::notifications::dispatch::{
-    InboxWakeReceiver, NotificationDispatchError, WatchDispatchError, create_watch_for_user,
-    delete_watch_for_user, list_notifications_for_user, list_watches_for_user, mark_read_for_user,
-    record_watch_creation_denial_metric, resolve_inbox_holder_for_user, subscribe_inbox_wakes,
-    unread_count_for_user,
+    InboxWakeReceiver, NotificationDispatchError, WatchDispatchError, create_for_user,
+    delete_for_user, list_for_user, mark_for_user, resolve_user_holder, subscribe_inbox_wakes,
+    unread_for_user,
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
@@ -193,7 +193,7 @@ fn map_dispatch_error(error: NotificationDispatchError, operation: &str) -> Serv
     }
 }
 
-fn map_dispatch_error(error: WatchDispatchError, operation: &str) -> ServerError {
+fn map_watch_error(error: WatchDispatchError, operation: &str) -> ServerError {
     match error {
         WatchDispatchError::Unavailable => ServerError::ServiceUnavailable,
         WatchDispatchError::CapExceeded => {
@@ -232,7 +232,7 @@ fn watch_authorized(subscription: &WatchSubscription) -> bool {
 }
 
 fn record_watch_denial(state: &ServerState, reason: WatchAuthorizationMetricReason) {
-    record_watch_creation_denial_metric(state.get_ctx().as_ref(), reason);
+    dispatch::record_watch_denial(state.get_ctx().as_ref(), reason);
     warn!(
         parent: None,
         reason = reason.as_str(),
@@ -551,7 +551,7 @@ pub async fn list_notifications(
         .unwrap_or(DEFAULT_LIST_LIMIT)
         .min(LIST_NOTIFICATIONS_MAX_LIMIT);
 
-    let (records, next_cursor) = list_notifications_for_user(
+    let (records, next_cursor) = list_for_user(
         &state.get_ctx(),
         state.get_node_id(),
         auth.user_id,
@@ -611,10 +611,9 @@ pub async fn unread_count(
 ) -> ServerResult<(StatusCode, Json<UnreadCountApiResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
 
-    let (count, capped) =
-        unread_count_for_user(&state.get_ctx(), state.get_node_id(), auth.user_id)
-            .await
-            .map_err(|error| map_dispatch_error(error, "unread"))?;
+    let (count, capped) = unread_for_user(&state.get_ctx(), state.get_node_id(), auth.user_id)
+        .await
+        .map_err(|error| map_dispatch_error(error, "unread"))?;
 
     Ok((
         StatusCode::OK,
@@ -693,7 +692,7 @@ async fn next_local_step(
 }
 
 async fn fetch_unread_count(state: &UnreadStreamState) -> Option<(u64, bool)> {
-    unread_count_for_user(state.context.as_ref(), state.local_node_id, state.recipient)
+    unread_for_user(state.context.as_ref(), state.local_node_id, state.recipient)
         .await
         .ok()
         .map(|(count, capped)| (count as u64, capped))
@@ -771,7 +770,7 @@ fn unread_count_stream(
                         state.next_holder_recheck = Instant::now() + state.local_recheck;
                         let resolved = state
                             .shutdown
-                            .run_until_cancelled(resolve_inbox_holder_for_user(
+                            .run_until_cancelled(resolve_user_holder(
                                 state.context.as_ref(),
                                 state.recipient,
                             ))
@@ -968,7 +967,7 @@ pub async fn stream_notifications(
     let (dashboard_epoch, dashboard_revisions) =
         subscribe_dashboard_changes(context.as_ref()).ok_or(ServerError::ServiceUnavailable)?;
 
-    let holder = resolve_inbox_holder_for_user(context.as_ref(), recipient)
+    let holder = resolve_user_holder(context.as_ref(), recipient)
         .await
         .map_err(|error| map_dispatch_error(error, "stream"))?;
     // Subscribe on both arms: the remote arm needs the net handle to poll the
@@ -1061,7 +1060,7 @@ pub async fn mark_read(
         .map(|id| Ulid::from_str(id).map_err(|_| ServerError::BadRequest))
         .collect::<ServerResult<Vec<Ulid>>>()?;
 
-    let marked = mark_read_for_user(
+    let marked = mark_for_user(
         &state.get_ctx(),
         state.get_node_id(),
         auth.user_id,
@@ -1132,9 +1131,9 @@ pub async fn list_watches(
 ) -> ServerResult<(StatusCode, Json<WatchListResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
 
-    let subscriptions = list_watches_for_user(&state.get_ctx(), state.get_node_id(), auth.user_id)
+    let subscriptions = dispatch::list_watches(&state.get_ctx(), state.get_node_id(), auth.user_id)
         .await
-        .map_err(|error| map_dispatch_error(error, "list_watches"))?;
+        .map_err(|error| map_watch_error(error, "list_watches"))?;
 
     let watches = subscriptions.iter().map(watch_response).collect();
     Ok((StatusCode::OK, Json(WatchListResponse { watches })))
@@ -1229,7 +1228,7 @@ pub async fn create_watch(
         ..Default::default()
     };
 
-    let subscription = create_watch_for_user(
+    let subscription = create_for_user(
         &state.get_ctx(),
         state.get_node_id(),
         auth.user_id,
@@ -1242,7 +1241,7 @@ pub async fn create_watch(
         if let WatchDispatchError::Unauthorized(reason) = &error {
             record_watch_denial(&state, *reason);
         }
-        map_dispatch_error(error, "create_watch")
+        map_watch_error(error, "create_watch")
     })?;
 
     Ok((StatusCode::CREATED, Json(watch_response(&subscription))))
@@ -1284,14 +1283,14 @@ pub async fn delete_watch(
     let auth = require_unrestricted_auth(&state, auth)?;
     let watch_id = Ulid::from_str(&id).map_err(|_| ServerError::BadRequest)?;
 
-    delete_watch_for_user(
+    delete_for_user(
         &state.get_ctx(),
         state.get_node_id(),
         auth.user_id,
         watch_id,
     )
     .await
-    .map_err(|error| map_dispatch_error(error, "delete_watch"))?;
+    .map_err(|error| map_watch_error(error, "delete_watch"))?;
 
     Ok(StatusCode::NO_CONTENT)
 }

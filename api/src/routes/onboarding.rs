@@ -1476,7 +1476,7 @@ mod tests {
         let (state, realm_id, _node_id, user_id, net_handle, _tempdir) =
             setup_management_state().await;
         state
-            .register_rest_interface(
+            .register_rest_public(
                 "0.0.0.0:3000".parse().unwrap(),
                 Some("https://node.example.test"),
             )

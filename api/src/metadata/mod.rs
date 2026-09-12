@@ -2850,7 +2850,7 @@ pub(crate) fn map_query_results(
 }
 
 #[cfg(test)]
-async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
+async fn state_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
     let ctx = state.get_ctx();
     Ok(load_realm_nodes(ctx.as_ref(), state.get_realm_id(), state.get_node_id()).await)
 }
@@ -3887,7 +3887,7 @@ mod tests {
     async fn realm_nodes_fallback() {
         let state = setup_closed_storage().await;
 
-        let nodes = load_realm_nodes(state.as_ref()).await.unwrap();
+        let nodes = state_realm_nodes(state.as_ref()).await.unwrap();
 
         assert_eq!(nodes, vec![state.get_node_id()]);
     }
@@ -3908,7 +3908,7 @@ mod tests {
             .await;
         install_realm_config(&[&coordinator, &remote], realm_id, None).await;
 
-        let initial = load_realm_nodes(coordinator.state.as_ref()).await.unwrap();
+        let initial = state_realm_nodes(coordinator.state.as_ref()).await.unwrap();
         assert_eq!(initial, vec![coordinator.net.node_id()]);
 
         let remote_ctx = remote.state.get_ctx();
@@ -3923,7 +3923,7 @@ mod tests {
         .await
         .unwrap();
 
-        let discovered = load_realm_nodes(coordinator.state.as_ref()).await.unwrap();
+        let discovered = state_realm_nodes(coordinator.state.as_ref()).await.unwrap();
 
         assert!(discovered.contains(&coordinator.net.node_id()));
         assert!(discovered.contains(&remote.net.node_id()));
@@ -6136,10 +6136,7 @@ mod tests {
                 config.to_bytes(&actor).unwrap().into(),
             )
             .await;
-            node.net
-                .refresh_document_peers(&config)
-                .await
-                .unwrap();
+            node.net.refresh_document_peers(&config).await.unwrap();
         }
     }
 

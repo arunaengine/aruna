@@ -1562,7 +1562,7 @@ impl S3 for ArunaS3Service {
             "Received GET OBJECT ATTRIBUTES Request"
         );
 
-        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
@@ -2741,9 +2741,9 @@ mod tests {
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::notifications::watch::subscriptions::create_watch_subscription;
+    use aruna_operations::notifications::watch::subscriptions::create_local_watch;
     use aruna_operations::replication::queue::{
-        LiveReplicationObligationRecord, live_replication_obligation_key,
+        LiveReplicationObligationRecord, live_obligation_key,
     };
     use aruna_operations::s3::get_object::ObjectInfo;
     use aruna_operations::s3::list_objects::ListObjectsV2ContinuationToken;
@@ -3062,7 +3062,7 @@ mod tests {
             version_id,
             false,
         );
-        let obligation_key = live_replication_obligation_key(&obligation).unwrap();
+        let obligation_key = live_obligation_key(&obligation).unwrap();
         write_storage_value(
             &storage_handle,
             BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
@@ -3249,7 +3249,7 @@ mod tests {
             watch_prefix.clone(),
         ));
         install_watch_authorization(&context, realm_id, net.node_id(), group_id, watcher).await;
-        create_watch_subscription(
+        create_local_watch(
             &context.storage_handle,
             watcher,
             watch_prefix,
