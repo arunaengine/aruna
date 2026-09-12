@@ -15,8 +15,8 @@ use aruna_core::events::{
     JobRecordEvent, JobRecordPage, JobRecordRejection, LaunchDecline, LaunchOfferEvent,
 };
 use aruna_core::structs::{
-    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, PhysicalExecutionState,
-    PlacementRef, RealmConfigDocument, RealmId, SubmissionId,
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind,
+    PhysicalExecutionState, PlacementRef, RealmConfigDocument, RealmId, SubmissionId,
 };
 use futures_util::future::join_all;
 use tokio::time::timeout_at;
@@ -25,6 +25,7 @@ use tracing::warn;
 use super::admit::Admission;
 use super::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use super::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
+use super::load_kind_complete;
 use super::rows::PendingNeed;
 use crate::dashboard::notify_dashboard_change;
 use crate::driver::{DriverContext, drive};
@@ -363,7 +364,6 @@ async fn accept_record(
         return Err(ServeError::Refused(JobRecordRejection::Invalid));
     }
     let rearms = rearms_witness(record.envelope());
-    let cancels = matches!(record.envelope().record, JobFamilyRecord::Cancel(_));
     let now_ms = aruna_core::util::unix_timestamp_millis();
     let outcome = drive(
         AppendRecordOperation::new(AppendRecordConfig {
@@ -386,14 +386,18 @@ async fn accept_record(
         if rearms {
             crate::jobs::lifecycle::witness::arm_family(context.as_ref(), family, now_ms).await;
         }
-        // Committed already: a cancel admitted here still has to reach the
-        // local executions this node admitted before it arrived.
-        if cancels {
-            crate::jobs::lifecycle::cancel::cancel_local_runs(context.as_ref(), family).await;
-        }
     }
     match outcome.admission {
-        Admission::Authentic | Admission::Duplicate => Ok(()),
+        Admission::Authentic | Admission::Duplicate => {
+            let cancels = load_kind_complete(context.as_ref(), family, JobRecordKind::Cancel)
+                .await
+                .map_err(|_| ServeError::Unavailable)?;
+            // Admission may promote a pending cancel, and retries must reapply its side effect.
+            if !cancels.is_empty() {
+                crate::jobs::lifecycle::cancel::cancel_local_runs(context.as_ref(), family).await;
+            }
+            Ok(())
+        }
         Admission::Local
         | Admission::Pending(
             PendingNeed::Evidence(_) | PendingNeed::LocalView | PendingNeed::HolderView,

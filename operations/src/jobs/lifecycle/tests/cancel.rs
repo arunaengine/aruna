@@ -3,17 +3,23 @@
 
 use std::sync::Arc;
 
-use aruna_core::effects::JobRecordFrame;
-use aruna_core::structs::{AuthContext, JobFamilyRecord, JobId, JobState};
+use aruna_core::effects::{JobRecordFrame, LaunchFrame};
+use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
+use aruna_core::structs::{
+    AuthContext, JobFamilyRecord, JobId, JobRecordKind, JobState, PhysicalExecutionState,
+};
 use aruna_core::types::UserId;
 
-use super::admission_race::{config, envelope, seed};
+use super::admission_race::{config, envelope, rows, seed};
 use super::terminal::{node_context, physical, reserve_execution, seed_family};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::cancel::cancel_family;
-use crate::jobs::lifecycle::target::commit_receipt;
+use crate::jobs::lifecycle::target::{admit_launch, commit_receipt};
 use crate::jobs::records::tests::fixture::{Family, REALM, user};
 use crate::jobs::records::transport::serve_job_record;
+use crate::jobs::records::{
+    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_kind_complete,
+};
 use crate::jobs::store::read_job_record;
 use crate::metadata::protocol::MetadataTransportMessage;
 
@@ -123,9 +129,159 @@ async fn admitted_cancel_stops() {
     assert!(!flagged(&ctx).await);
     let ctx = Arc::new(ctx);
 
+    let reply = serve_job_record(
+        &ctx,
+        family.holder.public(),
+        MetadataTransportMessage::ForwardJobRecord {
+            placement: family.placement,
+            record: Box::new(
+                JobRecordFrame::new(family.sign(
+                    &family.holder,
+                    JobFamilyRecord::Spec(Box::new(family.spec())),
+                ))
+                .unwrap(),
+            ),
+        },
+    )
+    .await;
+    assert!(matches!(
+        reply,
+        MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) }
+    ));
+    assert!(!flagged(&ctx).await);
+
     admit_cancel(&ctx, &family).await;
 
     assert!(flagged(&ctx).await);
+}
+
+#[tokio::test]
+async fn promoted_cancel_stops() {
+    let family = Family::new([46u8; 32]);
+    let (_dir, ctx) = node_context(&family, &family.target).await;
+    let receipt = seed_family(&ctx, &family).await;
+    reserve_execution(&ctx, &family, &receipt).await;
+    let spec = family.spec_for(JobId::from_bytes([47u8; 16]), family.holder.public());
+    let ctx = Arc::new(ctx);
+
+    for (record, accepted) in [
+        (JobFamilyRecord::Cancel(family.cancel(&spec)), false),
+        (JobFamilyRecord::Spec(Box::new(spec)), true),
+    ] {
+        let reply = serve_job_record(
+            &ctx,
+            family.holder.public(),
+            MetadataTransportMessage::ForwardJobRecord {
+                placement: family.placement,
+                record: Box::new(JobRecordFrame::new(family.sign(&family.holder, record)).unwrap()),
+            },
+        )
+        .await;
+        assert_eq!(
+            matches!(
+                reply,
+                MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) }
+            ),
+            accepted
+        );
+        assert_eq!(flagged(&ctx).await, accepted);
+    }
+}
+
+async fn store_cancel(ctx: &DriverContext, family: &Family) {
+    let outcome = drive(
+        AppendRecordOperation::new(AppendRecordConfig {
+            realm_id: REALM,
+            local_node_id: family.target.public(),
+            record: JobRecordFrame::new(family.sign(
+                &family.holder,
+                JobFamilyRecord::Cancel(family.cancel(&family.spec())),
+            ))
+            .unwrap(),
+            local: None,
+            origin: RecordOrigin::Peer(family.holder.public()),
+            now_ms: 5_000,
+        }),
+        ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.admission, Admission::Authentic);
+}
+
+#[tokio::test]
+async fn duplicate_cancel_recovers() {
+    let family = Family::new([48u8; 32]);
+    let (_dir, ctx) = node_context(&family, &family.target).await;
+    let receipt = seed_family(&ctx, &family).await;
+    reserve_execution(&ctx, &family, &receipt).await;
+    // The record committed, but its physical side effect did not run.
+    store_cancel(&ctx, &family).await;
+    assert!(!flagged(&ctx).await);
+
+    let ctx = Arc::new(ctx);
+    admit_cancel(&ctx, &family).await;
+
+    assert!(flagged(&ctx).await);
+}
+
+#[tokio::test]
+async fn replay_cancel_recovers() {
+    let family = Family::new([49u8; 32]);
+    let (_dir, ctx) = node_context(&family, &family.target).await;
+    let receipt = seed_family(&ctx, &family).await;
+    reserve_execution(&ctx, &family, &receipt).await;
+    store_cancel(&ctx, &family).await;
+    assert!(!flagged(&ctx).await);
+    let launch = family.launch(&family.spec(), family.holder.public(), 0);
+    let ctx = Arc::new(ctx);
+
+    let accepted = admit_launch(
+        &ctx,
+        LaunchFrame::new(family.sign(&family.holder, JobFamilyRecord::Launch(Box::new(launch))))
+            .unwrap(),
+    )
+    .await
+    .expect("replay decides")
+    .expect("stored receipt answers");
+
+    assert!(flagged(&ctx).await);
+    assert!(
+        matches!(&accepted.envelope().record, JobFamilyRecord::Receipt(stored) if stored.execution_id == receipt.execution_id)
+    );
+}
+
+#[tokio::test]
+async fn winner_cancel_recovers() {
+    let family = Family::new([50u8; 32]);
+    let (_dir, ctx) = node_context(&family, &family.target).await;
+    let (launch, _) = seed(&ctx, &family).await;
+    let ctx = Arc::new(ctx);
+    let mut winner = config(&family, &launch, 1, envelope(4));
+    winner.record.state = JobState::Running;
+    let accepted = commit_receipt(&ctx, winner, &launch)
+        .await
+        .unwrap()
+        .unwrap();
+    store_cancel(&ctx, &family).await;
+
+    let raced = commit_receipt(&ctx, config(&family, &launch, 2, envelope(4)), &launch)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(accepted, raced);
+    let record = read_job_record(&ctx.storage_handle, JobId::from_bytes([1u8; 16]), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(record.cancel_requested);
+    assert!(
+        read_job_record(&ctx.storage_handle, JobId::from_bytes([2u8; 16]), None)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -148,6 +304,14 @@ async fn late_cancel_flags() {
         .expect("physical row read")
         .expect("physical row exists");
     assert!(record.cancel_requested);
+    assert_eq!(rows(&ctx, JOB_RESERVATION_KEYSPACE, None).await, 0);
+    let updates = load_kind_complete(&ctx, family.family(), JobRecordKind::Update)
+        .await
+        .unwrap();
+    assert!(updates.iter().any(|envelope| matches!(
+        &envelope.record,
+        JobFamilyRecord::Update(update) if update.state == PhysicalExecutionState::Cancelled
+    )));
 }
 
 #[tokio::test]

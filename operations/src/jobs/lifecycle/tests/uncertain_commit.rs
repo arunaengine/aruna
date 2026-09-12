@@ -207,6 +207,44 @@ async fn recovers_durable_commit() {
 }
 
 #[tokio::test]
+async fn cancellation_read_required() {
+    let family = Family::new([20u8; 32]);
+    let (_dir, ctx, _fired) = wired(&family).await;
+    let (launch, _) = seed(&ctx, &family).await;
+    let config = config(&family, &launch, 1, envelope(4));
+    let driver = ctx.as_ref();
+    let cancel = family.sign(
+        &family.holder,
+        JobFamilyRecord::Cancel(family.cancel(&family.spec())),
+    );
+
+    let decided = commit_with(&ctx, config, &launch, |config| {
+        let key = record_key(&cancel.key());
+        async move {
+            let execution = drive(ReserveExecutionOperation::new(config), driver).await?;
+            let event = driver
+                .storage_handle
+                .send_effect(Effect::Storage(StorageEffect::Write {
+                    key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+                    key,
+                    value: Value::from([0xffu8; 16].as_slice()),
+                    txn_id: None,
+                }))
+                .await;
+            assert!(matches!(
+                event,
+                Event::Storage(StorageEvent::WriteResult { .. })
+            ));
+            Ok(execution)
+        }
+    })
+    .await;
+
+    assert!(decided.is_none());
+    assert_eq!(receipts(&ctx, &family).await, 1);
+}
+
+#[tokio::test]
 async fn undecided_without_receipt() {
     // An unknown commit that left no receipt decides nothing, and the same
     // offer must still be admissible when the scheduler asks again.
@@ -320,6 +358,44 @@ async fn drain_still_drains() {
         local_capability(&open, &family.config, local, &launch, &spec).await,
         Err(LaunchDecline::Draining)
     ));
+}
+
+#[tokio::test]
+async fn session_support_rechecked() {
+    let family = Family::new([19u8; 32]);
+    let local = family.target.public();
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let mut document = advertised(local, false);
+    document.executors[0].file_staging = true;
+    advertise(&ctx, &document).await;
+    let mut spec = family.spec();
+    spec.payload.tags.insert(
+        aruna_core::compute::runtimes::SESSION_TAG.to_string(),
+        aruna_core::compute::runtimes::SESSION_TAG_NOTEBOOK.to_string(),
+    );
+    let launch = family.launch(&spec, family.holder.public(), 0);
+
+    assert!(matches!(
+        local_capability(&ctx, &family.config, local, &launch, &spec).await,
+        Err(LaunchDecline::Unauthorized)
+    ));
+    document.executors[0].session = true;
+    advertise(&ctx, &document).await;
+    assert!(
+        local_capability(&ctx, &family.config, local, &launch, &spec)
+            .await
+            .is_ok()
+    );
+    document.executors[0].session = false;
+    advertise(&ctx, &document).await;
+    spec.payload
+        .tags
+        .insert("aruna-engine.org/network".to_string(), "open".to_string());
+    assert!(
+        local_capability(&ctx, &family.config, local, &launch, &spec)
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]

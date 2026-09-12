@@ -18,6 +18,7 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::routing::{family_of_alias, family_projection};
+use super::updates::{SETTLE_RETRY_AFTER, publish_terminal, schedule_terminal_settle};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::JobRouteError;
 use crate::jobs::protocol::send_job_request;
@@ -289,7 +290,18 @@ pub(crate) async fn cancel_local_run(context: &DriverContext, physical: JobId) {
 /// a no-op, and a repeated request leaves the stored record untouched.
 async fn flag_local_run(context: &DriverContext, physical: JobId) -> bool {
     match set_cancel_requested(&context.storage_handle, physical, unix_timestamp_millis()).await {
-        Ok(CancelRequestOutcome::Cancelled(_) | CancelRequestOutcome::Flagged(_)) => {
+        Ok(CancelRequestOutcome::Cancelled(record)) => {
+            if !publish_terminal(context, &record).await
+                && let Some(task) = context.task_handle.as_ref()
+            {
+                use aruna_core::handle::Handle;
+                let _ = task
+                    .send_effect(schedule_terminal_settle(SETTLE_RETRY_AFTER))
+                    .await;
+            }
+            true
+        }
+        Ok(CancelRequestOutcome::Flagged(_)) => {
             debug!(job_id = %physical, "Local execution cancelled by its family");
             true
         }
