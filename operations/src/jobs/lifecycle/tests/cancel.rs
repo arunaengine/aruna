@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use aruna_core::effects::{JobRecordFrame, LaunchFrame};
+use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
 use aruna_core::structs::{
     AuthContext, JobFamilyRecord, JobId, JobRecordKind, JobState, PhysicalExecutionState,
@@ -13,8 +14,9 @@ use aruna_core::types::UserId;
 use super::admission_race::{config, envelope, rows, seed};
 use super::terminal::{node_context, physical, reserve_execution, seed_family};
 use crate::driver::{DriverContext, drive};
+use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::cancel::cancel_family;
-use crate::jobs::lifecycle::target::{admit_launch, commit_receipt};
+use crate::jobs::lifecycle::target::{admit_launch, commit_receipt, commit_with};
 use crate::jobs::records::tests::fixture::{Family, REALM, user};
 use crate::jobs::records::transport::serve_job_record;
 use crate::jobs::records::{
@@ -265,10 +267,16 @@ async fn winner_cancel_recovers() {
         .unwrap();
     store_cancel(&ctx, &family).await;
 
-    let raced = commit_receipt(&ctx, config(&family, &launch, 2, envelope(4)), &launch)
-        .await
-        .unwrap()
-        .unwrap();
+    // Only a concurrent commit conflicts, so the lost race is injected here.
+    let raced = commit_with(
+        &ctx,
+        config(&family, &launch, 2, envelope(4)),
+        &launch,
+        |_| async { Err(LifecycleError::Storage(StorageError::TransactionConflict)) },
+    )
+    .await
+    .unwrap()
+    .unwrap();
 
     assert_eq!(accepted, raced);
     let record = read_job_record(&ctx.storage_handle, JobId::from_bytes([1u8; 16]), None)
