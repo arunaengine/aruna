@@ -1,6 +1,6 @@
 use crate::error::CliError;
 use aruna_api::routes::info::InfoResponse;
-use aruna_api::server_state::client_base_url_from_bind_address;
+use aruna_api::server_state::client_bind_url;
 use aruna_core::structs::BackendsFile;
 use reqwest::Client;
 use serde::Serialize;
@@ -156,7 +156,7 @@ pub(crate) async fn fetch_info_url(
 }
 
 fn http_base_url(addr: SocketAddr) -> String {
-    client_base_url_from_bind_address(addr)
+    client_bind_url(addr)
 }
 
 fn info_url(addr: SocketAddr) -> String {
