@@ -2,8 +2,8 @@ use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{
-    AuthContext, BackendRef, Permission, RoutingTarget, StorageRoutingRule,
-    bucket_permission_path, target_warnings,
+    AuthContext, BackendRef, Permission, RoutingTarget, StorageRoutingRule, bucket_permission_path,
+    target_warnings,
 };
 use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::groups::storage_routing::{

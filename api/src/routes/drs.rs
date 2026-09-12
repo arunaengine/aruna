@@ -777,10 +777,7 @@ fn require_drs_auth(
 /// Requests without a bearer token resolve as the Everyone principal. Public
 /// roles are then the only grants that can make an object readable; denied
 /// anonymous lookups are mapped to 404 at the route layer.
-fn drs_auth(
-    state: &ServerState,
-    auth: Option<AuthContext>,
-) -> Result<AuthContext, DrsError> {
+fn drs_auth(state: &ServerState, auth: Option<AuthContext>) -> Result<AuthContext, DrsError> {
     match auth {
         Some(_) => require_drs_auth(state, auth),
         None => Ok(AuthContext::anonymous(state.get_realm_id())),
@@ -1192,8 +1189,8 @@ mod tests {
     use super::{
         DrsBulkObjectsRequestBody, GetObjectError, MAX_BULK_OBJECT_IDS, RequestedObjectId,
         ResolveOutcome, ResolvedObject, W3ID_DATA_PREFIX, build_object_response, download_error,
-        drs_denied_error, encode_component, get_authorizations, get_object,
-        parse_object_id, post_objects, resolve_object, routed_deadline,
+        drs_denied_error, encode_component, get_authorizations, get_object, parse_object_id,
+        post_objects, resolve_object, routed_deadline,
     };
     use crate::openapi::ApiDoc;
     use crate::routes::tests::fixtures::{

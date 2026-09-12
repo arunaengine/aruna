@@ -11,8 +11,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest, Sha256};
 use shared::{
-    TestResult, create_bearer_token, create_group_http, create_s3_credentials,
-    s3_client, spawn_complete_seed,
+    TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
+    spawn_complete_seed,
 };
 
 fn sha256_base64(bytes: &[u8]) -> String {
@@ -36,8 +36,7 @@ async fn attributes_report_simple() -> TestResult<()> {
             .s3
             .as_ref()
             .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
-        let credentials =
-            create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
+        let credentials = create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
         let s3 = s3_client(endpoint, &credentials);
 
         let bucket = "s3-attributes-simple";
@@ -96,14 +95,12 @@ async fn attributes_report_multipart() -> TestResult<()> {
             seed.capabilities.clone(),
         )
         .await?;
-        let group =
-            create_group_http(&seed.base_url, &bearer, "s3-attributes-multipart").await?;
+        let group = create_group_http(&seed.base_url, &bearer, "s3-attributes-multipart").await?;
         let endpoint = seed
             .s3
             .as_ref()
             .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
-        let credentials =
-            create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
+        let credentials = create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
         let s3 = s3_client(endpoint, &credentials);
 
         let bucket = "s3-attributes-multipart";
