@@ -1553,7 +1553,7 @@ impl Operation for PutObjectOperation {
 }
 
 #[cfg(test)]
-mod routing_test {
+mod pure_tests {
     use super::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
     use crate::groups::backends::BackendFenceError;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -3636,7 +3636,7 @@ mod test {
 /// F1 acceptance: no byte-materialization effect and no registration may be
 /// emitted before the destination passed the shared placement gate.
 #[cfg(test)]
-mod gate_test {
+mod decision_tests {
     use super::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
     use crate::placement::policy::{GateContext, PolicyCacheEntry, PolicyGateError};
     use aruna_core::UserId;

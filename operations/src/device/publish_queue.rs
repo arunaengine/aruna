@@ -250,7 +250,7 @@ pub fn read_publish_entry(draft_id: Ulid, txn_id: Option<TxnId>) -> Effect {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{PublishEntry, PublishState, publish_key};
     use aruna_core::UserId;
     use aruna_core::metadata::{MetadataBatch, MetadataBatchSource, MetadataDot, MetadataQuadOp};

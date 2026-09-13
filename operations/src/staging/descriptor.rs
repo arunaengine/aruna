@@ -65,7 +65,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use std::collections::HashMap;
     use std::time::SystemTime;

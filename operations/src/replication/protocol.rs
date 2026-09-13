@@ -630,7 +630,7 @@ pub struct VersionReplicationRequest {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         BaoReadRefusal, BaoReadRequest, BaoReadTarget, MAX_REPLICATION_HASH_BYTES,
         MAX_REPLICATION_HASHES, MAX_REPLICATION_PARTS, MAX_REPLICATION_SOURCES,

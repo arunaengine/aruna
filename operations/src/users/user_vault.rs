@@ -443,7 +443,7 @@ impl Operation for DeleteVaultOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::RealmId;
     use ulid::Ulid;

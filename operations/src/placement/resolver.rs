@@ -414,7 +414,7 @@ fn binding_strategy<'a>(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentTarget;

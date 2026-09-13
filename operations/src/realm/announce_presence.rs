@@ -158,7 +158,7 @@ impl Operation for AnnounceRealmPresenceOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     #[test]

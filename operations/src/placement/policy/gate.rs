@@ -434,7 +434,7 @@ impl Operation for PolicyGateOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::super::cache::PolicyCacheEntry;
     use super::*;
     use aruna_core::events::StorageEvent;

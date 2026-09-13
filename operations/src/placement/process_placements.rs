@@ -855,7 +855,7 @@ async fn abort_release_txn(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::{PlacementRef, PlacementStrategy, RealmNodeKind};
     use ulid::Ulid;

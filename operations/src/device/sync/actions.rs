@@ -536,7 +536,7 @@ fn remove_failed(operation: &mut RemoveEntryOperation, error: ActionError) -> Ef
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::queued_upload;
     use aruna_core::structs::{EntrySide, EntryState, SyncBase};
     use ulid::Ulid;

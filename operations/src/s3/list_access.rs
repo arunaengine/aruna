@@ -238,7 +238,7 @@ impl Operation for ListUserAccessOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use crate::s3::access_index::{MAX_ACTIVE_CREDENTIALS, encode_index, owner_key};
     use aruna_core::credential_encryption::EncryptedS3Secret;

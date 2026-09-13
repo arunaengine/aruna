@@ -672,7 +672,7 @@ async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, Str
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::{JobProgress, JobState, WorkspaceMode};
     use ulid::Ulid;

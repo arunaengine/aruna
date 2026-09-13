@@ -90,7 +90,7 @@ fn format_at(datestamp_ms: u64, granularity: HarvestGranularity) -> Option<Strin
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     fn selector() -> HarvestSelector {

@@ -124,7 +124,7 @@ fn entry_size(graph_iri: &str, summary: &str) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     const TTL: Duration = Duration::from_secs(30);

@@ -707,7 +707,7 @@ pub fn choose_origin_bucket(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::reducer::{AdminDocumentReducerState, overlay_placement};

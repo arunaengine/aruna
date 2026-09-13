@@ -1971,7 +1971,7 @@ fn composite_digest(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::{BackendRef, COMPLETION_LEASE_MS, MultipartUploadChecksumHint};
     use aruna_core::task::{TaskEffect, TaskKey};
@@ -3268,8 +3268,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod gate_tests {
-    use super::tests::TEST_NOW_MS;
+mod decision_tests {
+    use super::pure_tests::TEST_NOW_MS;
     use super::*;
     use crate::placement::policy::PolicyCacheEntry;
     use aruna_core::structs::{

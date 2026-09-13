@@ -745,7 +745,7 @@ fn reject_special_entry(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     fn entry(index: usize, path: &str) -> ArchiveEntry {

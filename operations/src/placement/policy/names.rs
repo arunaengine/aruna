@@ -148,7 +148,7 @@ impl Operation for PolicyNamesOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{PolicyName, PolicyNamesOperation};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;

@@ -225,7 +225,7 @@ fn purge_root(root: &Path, failed: &mut Vec<PathBuf>) {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         DeviceWipe, WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation, WipeDeviceState, purge,
     };

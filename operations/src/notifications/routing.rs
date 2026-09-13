@@ -168,7 +168,7 @@ pub fn route_watch_event(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::{RealmId, Role, WatchEventDetail, WatchEventKind, WatchEventMask};
     use std::collections::{HashMap, HashSet};

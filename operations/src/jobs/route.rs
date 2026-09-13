@@ -178,7 +178,7 @@ impl Operation for JobRouteOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;

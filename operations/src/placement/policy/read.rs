@@ -459,7 +459,7 @@ impl Operation for ReadPolicyOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use crate::tests::fixtures::policy::{admin_user, realm_view, signed_document};
     use aruna_core::NodeId;

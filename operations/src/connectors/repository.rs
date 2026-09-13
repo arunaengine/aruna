@@ -122,7 +122,7 @@ pub fn references_connector(version: &BlobVersion, connector_id: Ulid) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::events::StorageEvent;
     use aruna_core::structs::{SourceConnector, SourceConnectorKind};

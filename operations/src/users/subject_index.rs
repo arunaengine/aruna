@@ -431,7 +431,7 @@ pub fn rewrite_subjects(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{ResolveUserSubjectConflictsInput, ResolveUserSubjectConflictsOperation};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};

@@ -909,7 +909,7 @@ impl Operation for FetchFamilyOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use aruna_core::scheduling::PlannedInput;
     use aruna_core::structs::{InputMode, InputSelection, JobId, WorkspaceOutput};
 

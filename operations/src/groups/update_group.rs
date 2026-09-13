@@ -499,7 +499,7 @@ fn overlay_reducer_name(group: &mut Group, reducer_state: &AdminDocumentReducerS
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation};
     use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};

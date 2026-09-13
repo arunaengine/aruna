@@ -354,7 +354,7 @@ impl Operation for GetBucketRoutingOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         GetBucketRoutingError, GetBucketRoutingOperation, PutBucketRoutingError,
         PutBucketRoutingOperation,

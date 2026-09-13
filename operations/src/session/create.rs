@@ -386,7 +386,7 @@ impl Operation for CreateSessionOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::keys::generate_signing_key;
 

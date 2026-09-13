@@ -126,7 +126,7 @@ pub fn rank_weighted<I: AsRef<[u8]>>(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use proptest::prelude::*;
 

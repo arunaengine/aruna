@@ -105,7 +105,7 @@ impl Operation for CheckStagingSourceOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::SourceConnectorKind;
     use std::collections::HashMap;

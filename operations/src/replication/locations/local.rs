@@ -773,7 +773,7 @@ impl Operation for LocationSummaryOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{LocationSummaryError, LocationSummaryOperation};
     use crate::replication::protocol::{CopyCompliance, LocationCopyStorage};
     use crate::tests::fixtures::locations::{node_id, realm_id, request};

@@ -518,7 +518,7 @@ impl Operation for AnnounceTopicOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     use aruna_core::document::DocumentSyncOutboxRecord;

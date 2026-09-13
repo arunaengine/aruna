@@ -124,7 +124,7 @@ pub(crate) fn summary_from_read(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::MultipartChecksumType;
 

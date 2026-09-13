@@ -9,9 +9,12 @@ fail-fast = true
 slow-timeout = { period = "300s", terminate-after = 3 }
 
 # The audited no-I/O selection: operations and decisions that run as plain
-# synchronous tests. The ten-second timeout is a hang detector, not a budget.
+# synchronous tests. `pure_tests` mark fixed-input reducers and decisions,
+# `state_machine_tests` mark full start/step/finalize traces, and
+# `decision_tests` mark the second pure group beside a module's main one. The
+# ten-second timeout is a hang detector, not a budget.
 [profile.fast]
-default-filter = 'test(::state_machine_tests::) | test(::pure_tests::)'
+default-filter = 'test(::state_machine_tests::) | test(::pure_tests::) | test(::decision_tests::)'
 test-threads = "num-cpus"
 retries = 0
 fail-fast = false

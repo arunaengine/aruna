@@ -25,7 +25,7 @@ pub fn prefix_is_blank(prefix: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     // padding and slashes are not part of the prefix

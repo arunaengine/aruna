@@ -675,7 +675,7 @@ impl Operation for PermissionRulesOperation {
 }
 
 #[cfg(test)]
-mod test {
+mod pure_tests {
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::UserId;

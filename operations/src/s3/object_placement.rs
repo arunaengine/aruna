@@ -169,7 +169,7 @@ impl Operation for ObjectPlacementOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{ObjectPlacementError, ObjectPlacementInput, ObjectPlacementOperation};
     use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent};

@@ -985,7 +985,7 @@ impl Operation for MintPolicySuccessorOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         CapturedDefault, MintPolicySuccessorOperation, MintState, SuccessorError, SuccessorMint,
         SuccessorOutcome, SuccessorPlan, successor_version,

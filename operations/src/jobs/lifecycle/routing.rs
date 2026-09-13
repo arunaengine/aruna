@@ -368,7 +368,7 @@ fn local_state(state: LogicalJobState) -> JobState {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use aruna_core::structs::SubmissionId;
 
     use super::*;

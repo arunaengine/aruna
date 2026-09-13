@@ -235,7 +235,7 @@ impl Operation for SetDisabledOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{SetDisabledError, SetDisabledOperation};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};

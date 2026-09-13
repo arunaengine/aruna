@@ -543,7 +543,7 @@ impl Operation for GroupJoinOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentRoleDefinition;

@@ -761,7 +761,7 @@ fn apply_failure(error: MetadataWriteError) -> HarvestFailure {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use crate::harvest::target_path::DIGEST_SEGMENT_BYTES;
 

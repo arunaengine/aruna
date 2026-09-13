@@ -432,7 +432,7 @@ async fn load_realm_config(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::document::{
         DocumentSyncRevision, DocumentSyncTarget, ShardManifest, ShardManifestEntry,

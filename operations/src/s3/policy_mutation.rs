@@ -311,7 +311,7 @@ impl Operation for PolicyMutationOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{PolicyMutationConfig, PolicyMutationError, PolicyMutationOperation};
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};

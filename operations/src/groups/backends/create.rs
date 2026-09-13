@@ -219,7 +219,7 @@ impl Operation for CreateGroupBackendOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{CreateGroupBackendError, CreateGroupBackendInput, CreateGroupBackendOperation};
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::errors::BlobError;

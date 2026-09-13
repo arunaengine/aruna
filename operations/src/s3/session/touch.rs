@@ -223,7 +223,7 @@ impl Operation for TouchS3SessionOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     #[test]

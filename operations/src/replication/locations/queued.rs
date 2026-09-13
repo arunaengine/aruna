@@ -157,7 +157,7 @@ impl Operation for QueuedReplicaNodesOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::QueuedReplicaNodesOperation;
     use crate::replication::queue::BlobReplicationJobRecord;
     use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};

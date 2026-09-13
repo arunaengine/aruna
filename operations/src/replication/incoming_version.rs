@@ -3057,7 +3057,7 @@ impl Operation for IncomingVersionReplicationOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         IncomingVersionReplicationError, IncomingVersionReplicationOperation,
         IncomingVersionReplicationState, ReceivedBlob,
@@ -6367,8 +6367,8 @@ mod tests {
 /// Gate acceptance for an incoming replica: nothing governed is admitted
 /// without a compliant local destination, and a reference registers nothing.
 #[cfg(test)]
-mod gate_tests {
-    use super::tests::{make_manifest, make_reference_manifest};
+mod decision_tests {
+    use super::pure_tests::{make_manifest, make_reference_manifest};
     use super::*;
     use crate::placement::policy::PolicyCacheEntry;
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;

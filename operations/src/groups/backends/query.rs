@@ -187,7 +187,7 @@ impl Operation for ListGroupBackendsOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::super::RecordReadError;
     use super::super::{index_key, index_prefix};
     use super::{GetGroupBackendOperation, GroupBackendQueryError, ListGroupBackendsOperation};

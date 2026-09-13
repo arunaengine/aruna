@@ -368,7 +368,7 @@ impl ManagedCopyRemoval {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         CopyRequest, ManagedCopyError, ManagedCopyPage, ManagedCopyRemoval, check_serveable,
         register_effect, scan_effect, split_serve_reads, transition_effect, validate_registration,
