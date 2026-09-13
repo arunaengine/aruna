@@ -1513,9 +1513,9 @@ async fn finish_blob_job(
     watch_group_id: Option<GroupId>,
     relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
 ) -> Result<BlobReplicationJobOutcome, String> {
-    let mut failure: Option<ReplicationFailure> = None;
+    let failure: Option<ReplicationFailure>;
     let error = match drive(operation, context).await {
-        Ok(Some(Ok(result))) if result.failed == 0 => {
+        Ok(result) if result.failed == 0 => {
             if let Some(relationship) = relationship.as_mut() {
                 mark_success(relationship, result.replicated, result.replicated_bytes);
                 let stored = store_relationship(context, relationship.clone()).await?;
@@ -1526,7 +1526,7 @@ async fn finish_blob_job(
             }
             return Ok(BlobReplicationJobOutcome::Succeeded);
         }
-        Ok(Some(Ok(result))) => {
+        Ok(result) => {
             failure = result.failure;
             if failure.is_some_and(ReplicationFailure::is_writer_denied) {
                 return Ok(BlobReplicationJobOutcome::TerminalFailure);
@@ -1568,11 +1568,6 @@ async fn finish_blob_job(
             }
             error
         }
-        Ok(Some(Err(error))) => {
-            failure = Some(scope_failure(&error));
-            error.to_string()
-        }
-        Ok(None) => "replication produced no result".to_string(),
         Err(error) => {
             failure = Some(scope_failure(&error));
             error.to_string()

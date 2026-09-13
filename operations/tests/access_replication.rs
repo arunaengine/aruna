@@ -50,7 +50,7 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
         CreateUserAccessOperation::new(config, encryption_key),
         nodes[0].context.as_ref(),
     )
-    .await??;
+    .await?;
 
     let local = drive(
         GetUserAccessOperation::new(access_key.clone()),

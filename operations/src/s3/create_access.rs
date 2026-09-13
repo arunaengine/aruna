@@ -387,7 +387,7 @@ impl CreateUserAccessOperation {
 }
 
 impl Operation for CreateUserAccessOperation {
-    type Output = Result<(String, Secret, UserAccess), CreateUserAccessError>;
+    type Output = (String, Secret, UserAccess);
     type Error = CreateUserAccessError;
 
     fn start(&mut self) -> Effects {
@@ -420,11 +420,12 @@ impl Operation for CreateUserAccessOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if CreateUserAccessState::Error == self.state {
-            self.output?;
-            return Err(CreateUserAccessError::CreateUserAccessFailed);
+        // A finished operation carries its success, a failed one its initiating
+        // error; any other state is an explicit premature-finalization failure.
+        match self.state {
+            CreateUserAccessState::Finish | CreateUserAccessState::Error => self.output,
+            _ => Err(CreateUserAccessError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -539,12 +540,9 @@ mod pure_tests {
         assert_eq!(op.state, CreateUserAccessState::Finish);
         assert!(op.is_complete());
 
-        // 4. Finalize -> Should return Ok with (access_key, plaintext, UserAccess)
-        let result = op.finalize();
-        assert!(result.is_ok());
-        let inner = result.unwrap();
-        assert!(inner.is_ok());
-        let (access_key, plaintext, returned_access) = inner.unwrap();
+        // 4. Finalize returns the tuple directly, never a nested result.
+        let (access_key, plaintext, returned_access) =
+            op.finalize().expect("finished operation finalizes");
         assert_eq!(returned_access.user_identity, user_identity);
         assert_eq!(returned_access.group_id, group_id);
         assert_eq!(returned_access.access_key, access_key);
@@ -602,6 +600,21 @@ mod pure_tests {
             [Effect::Storage(StorageEffect::BatchWrite { txn_id: Some(id), .. })]
                 if *id == txn_id
         ));
+    }
+
+    #[test]
+    fn finalize_before_completion_is_not_finished() {
+        let mut op = CreateUserAccessOperation::new(
+            make_config(make_user_identity(), Ulid::from_parts(20, 20)),
+            test_key(),
+        );
+        op.start();
+
+        assert_eq!(
+            op.finalize(),
+            Err(CreateUserAccessError::NotFinished),
+            "premature finalization must be an explicit failure"
+        );
     }
 
     #[test]

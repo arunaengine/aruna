@@ -374,8 +374,7 @@ pub async fn create_s3_credentials(
         ),
         &state.get_ctx(),
     )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .await;
 
     match result {
         Ok((access_key_id, access_secret, _)) => Ok((

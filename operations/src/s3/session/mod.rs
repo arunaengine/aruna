@@ -516,7 +516,6 @@ mod tests {
                 &context,
             )
             .await
-            .unwrap()
             .unwrap();
         }
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
