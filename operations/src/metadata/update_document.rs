@@ -1029,14 +1029,14 @@ mod pure_tests {
         let realm_id = RealmId::from_bytes([9u8; 32]);
         Actor {
             node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
             realm_id,
         }
     }
 
     fn record(actor: &Actor) -> MetadataRegistryRecord {
-        let group_id = Ulid::generate();
-        let document_id = Ulid::generate();
+        let group_id = Ulid::from_parts(2, 2);
+        let document_id = Ulid::from_parts(3, 3);
         let document_path = "datasets/update-atomicity";
         MetadataRegistryRecord {
             realm_id: actor.realm_id,
@@ -1358,7 +1358,7 @@ mod pure_tests {
             strategy_id: Ulid::from_bytes([5u8; 16]),
             shard: 11,
         };
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(4, 4);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor.clone(),
             &record,
@@ -1400,7 +1400,7 @@ mod pure_tests {
             strategy_id: Ulid::from_bytes([6u8; 16]),
             shard: 12,
         };
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(5, 5);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -1531,7 +1531,7 @@ mod pure_tests {
         let actor = actor();
         let mut record = record(&actor);
         let realm_config = activated_config(&mut record);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(6, 6);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -1559,7 +1559,7 @@ mod pure_tests {
         let actor = actor();
         let mut record = record(&actor);
         let realm_config = activated_config(&mut record);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(7, 7);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -1591,7 +1591,7 @@ mod pure_tests {
     fn rejects_raw_limit() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(8, 8);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -1634,7 +1634,7 @@ mod pure_tests {
     fn accepts_raw_history() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(9, 9);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -1670,7 +1670,7 @@ mod pure_tests {
         let actor = actor();
         let record = record(&actor);
         let create = create_event(&record);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(10, 10);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor.clone(),
             &record,
@@ -1732,7 +1732,7 @@ mod pure_tests {
         let mut outsider = creator.clone();
         outsider.node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
         current.holder_node_ids = vec![outsider.node_id];
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(11, 11);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             outsider.clone(),
             &current,
@@ -1763,7 +1763,7 @@ mod pure_tests {
     fn rejects_origin_budget() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(12, 12);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -1799,7 +1799,7 @@ mod pure_tests {
     fn update_fence_missing() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(13, 13);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -1832,7 +1832,7 @@ mod pure_tests {
     fn replace_validates_commits() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(14, 14);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -1873,7 +1873,7 @@ mod pure_tests {
     fn entity_upsert_appends() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(15, 15);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -1907,7 +1907,7 @@ mod pure_tests {
         let actor = actor();
         let mut record = record(&actor);
         record.holder_node_ids.clear();
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(16, 16);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -1965,7 +1965,7 @@ mod pure_tests {
     fn commit_preserves_graph() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(17, 17);
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,

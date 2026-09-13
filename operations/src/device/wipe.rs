@@ -280,7 +280,7 @@ mod pure_tests {
         });
         operation.start();
         operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: ulid::Ulid::generate(),
+            txn_id: ulid::Ulid::from_parts(1, 1),
         }));
         assert_eq!(operation.state, WipeDeviceState::Error);
         assert!(matches!(

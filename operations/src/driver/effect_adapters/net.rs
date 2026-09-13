@@ -73,13 +73,13 @@ mod pure_tests {
         let group_id = GroupId::from_bytes([8u8; 16]);
         let target = DocumentSyncTarget::Group { group_id };
         let publish = DocumentSyncPublish::Delete {
-            event_id: Ulid::generate(),
+            event_id: Ulid::from_parts(1, 1),
             target: target.clone(),
             change: DocumentSyncChange {
                 base: None,
                 current: DocumentSyncRevision {
                     generation: 1,
-                    event_id: Ulid::generate(),
+                    event_id: Ulid::from_parts(2, 2),
                     actor: iroh::SecretKey::from_bytes(&[2u8; 32]).public(),
                     updated_at_ms: 0,
                 },

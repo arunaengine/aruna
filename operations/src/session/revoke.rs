@@ -300,7 +300,7 @@ mod pure_tests {
         };
         let mut operation = RevokeSessionOperation::new(
             Actor {
-                node_id: iroh::SecretKey::generate().public(),
+                node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
                 user_id,
                 realm_id,
             },

@@ -251,7 +251,7 @@ mod pure_tests {
         operation.uploads = Some(uploads);
 
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::generate(),
+            txn_id: Ulid::from_parts(1, 1),
         }));
 
         let usage = operation.finalize().expect("the inventory settles");
@@ -268,7 +268,7 @@ mod pure_tests {
         });
         operation.start();
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::generate(),
+            txn_id: Ulid::from_parts(2, 2),
         }));
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {

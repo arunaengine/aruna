@@ -631,6 +631,8 @@ pub struct VersionReplicationRequest {
 
 #[cfg(test)]
 mod pure_tests {
+    use std::time::Duration;
+
     use super::{
         BaoReadRefusal, BaoReadRequest, BaoReadTarget, MAX_REPLICATION_HASH_BYTES,
         MAX_REPLICATION_HASHES, MAX_REPLICATION_PARTS, MAX_REPLICATION_SOURCES,
@@ -663,10 +665,10 @@ mod pure_tests {
         VersionReplicationManifest {
             bucket: "bucket".to_string(),
             key: "path/file.txt".to_string(),
-            version_id: Ulid::generate(),
-            group_id: Ulid::generate(),
+            version_id: Ulid::from_parts(1, 1),
+            group_id: Ulid::from_parts(2, 2),
             kind: ReplicationItemKind::DeleteMarker,
-            created_at: SystemTime::now(),
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000060),
             created_by: test_user_id(),
             current_version: true,
             current_version_generation: Some(1),
@@ -705,7 +707,7 @@ mod pure_tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
             },
-            connector_id: Some(Ulid::generate()),
+            connector_id: Some(Ulid::from_parts(3, 3)),
         });
         manifest.reference_intent = true;
         manifest.reference_metadata = Some(SourceMetadata {
@@ -716,7 +718,7 @@ mod pure_tests {
             source_version: None,
         });
         manifest.origin = Some(SyncOrigin {
-            relationship_id: Ulid::generate(),
+            relationship_id: Ulid::from_parts(4, 4),
             hop_count: 0,
         });
         manifest.reference_advance = Some(ReferenceAdvance {
@@ -734,11 +736,11 @@ mod pure_tests {
             root: "/data".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "path/file.txt".to_string(),
-            ulid: Ulid::generate(),
+            ulid: Ulid::from_parts(5, 5),
             compressed: false,
             encrypted: false,
             created_by: test_user_id(),
-            created_at: SystemTime::now(),
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000120),
             staging: false,
             partial: false,
             blob_size: 42,

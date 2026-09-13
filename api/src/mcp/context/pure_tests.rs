@@ -18,7 +18,7 @@ fn group_argument_reasons() {
             .unwrap_or_default()
             .contains("list_groups")
     );
-    assert!(group_argument(&Ulid::generate().to_string()).is_ok());
+    assert!(group_argument(&Ulid::from_parts(1, 1).to_string()).is_ok());
 }
 
 #[test]
@@ -41,7 +41,7 @@ fn group_error_maps() {
 
 #[test]
 fn map_role_permissions() {
-    let role_id = Ulid::generate();
+    let role_id = Ulid::from_parts(2, 2);
     let role = Role {
         role_id,
         name: "writer".to_string(),

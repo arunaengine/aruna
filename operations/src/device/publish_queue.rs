@@ -298,9 +298,9 @@ mod pure_tests {
 
     fn entry() -> PublishEntry {
         PublishEntry::new(
-            Ulid::generate(),
-            UserId::local(Ulid::generate(), RealmId::from_bytes([7u8; 32])),
-            Ulid::generate(),
+            Ulid::from_parts(1, 1),
+            UserId::local(Ulid::from_parts(2, 2), RealmId::from_bytes([7u8; 32])),
+            Ulid::from_parts(3, 3),
             "/notes".to_string(),
             false,
             "{}".to_string(),
@@ -329,8 +329,8 @@ mod pure_tests {
         // The batch is the only copy of what the owner changed offline, so it
         // has to survive the store byte for byte.
         let entry = PublishEntry::edit(
-            Ulid::generate(),
-            UserId::local(Ulid::generate(), RealmId::from_bytes([3u8; 32])),
+            Ulid::from_parts(4, 4),
+            UserId::local(Ulid::from_parts(5, 5), RealmId::from_bytes([3u8; 32])),
             &record(),
             batch(),
             MetadataBatchSource::UpsertDataEntity {
@@ -359,7 +359,7 @@ mod pure_tests {
         // A published or parked entry stays visible but is never re-forwarded.
         let mut entry = entry();
         entry.state = PublishState::Published {
-            document_id: Ulid::generate(),
+            document_id: Ulid::from_parts(6, 6),
         };
         assert!(!entry.is_due(u64::MAX));
         entry.state = PublishState::Failed {
@@ -382,7 +382,7 @@ mod pure_tests {
                 ..
             })
         ));
-        let document_id = Ulid::generate();
+        let document_id = Ulid::from_parts(7, 7);
         entry.state = PublishState::Failed {
             reason: "unreachable".to_string(),
             retryable: true,

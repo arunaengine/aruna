@@ -542,7 +542,7 @@ impl McpServer {
     ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("run_script", &input)?;
-        let run_id = Ulid::generate().to_string();
+        let run_id = Ulid::from_parts(7, 7).to_string();
         let plan = build_script(input, &run_id)?;
         write_text(
             self,
