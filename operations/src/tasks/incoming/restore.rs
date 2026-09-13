@@ -79,33 +79,33 @@ async fn sweep_dead_letters(storage: &aruna_storage::StorageHandle) {
     }
 }
 
-pub async fn initialize_task_incoming(
-    context: Arc<DriverContext>,
-    task_handle: TaskHandle,
-    jobs_runtime: Arc<JobsRuntime>,
-) {
-    install_task_handler(
-        context,
-        task_handle,
-        jobs_runtime,
-        RoCrateLimits::default(),
-        false,
-    )
-    .await
-    .start(&Shutdown::new())
-    .await;
-}
-
 /// Installs the inbound task handler without touching durable queues. Handler
 /// installation stays in the serving gate; the expensive durable-queue
-/// restoration behind it is [`TaskQueues::start`].
-pub async fn initialize_task_holder(
+/// restoration behind it is [`TaskQueues::restore_timers_and_start`].
+pub async fn install_task_queues(
     context: Arc<DriverContext>,
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
 ) -> TaskQueues {
     install_task_handler(context, task_handle, jobs_runtime, rocrate_limits, true).await
+}
+
+/// Test convenience: installs the inbound handler, then restores and starts the
+/// durable queues under the caller's shutdown owner. Integration tests own that
+/// owner; production uses [`install_task_queues`] and
+/// [`TaskQueues::restore_timers_and_start`] so it owns the lifecycle.
+#[doc(hidden)]
+pub async fn install_and_start_task_queues(
+    context: Arc<DriverContext>,
+    task_handle: TaskHandle,
+    jobs_runtime: Arc<JobsRuntime>,
+    shutdown: &Shutdown,
+) {
+    install_task_queues(context, task_handle, jobs_runtime, RoCrateLimits::default())
+        .await
+        .restore_timers_and_start(shutdown)
+        .await;
 }
 
 async fn install_task_handler(
@@ -144,7 +144,7 @@ async fn install_task_handler(
 impl TaskQueues {
     /// Restores persisted timers with their stored due time and starts the
     /// recurring re-arm loop, once the node is already serving.
-    pub async fn start(self, shutdown: &Shutdown) {
+    pub async fn restore_timers_and_start(self, shutdown: &Shutdown) {
         let Self {
             context,
             task_handle,

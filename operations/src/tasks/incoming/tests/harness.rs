@@ -94,7 +94,8 @@ async fn paused_runtime_waits() {
     ));
     let runtime = JobsRuntime::new_paused();
 
-    initialize_task_incoming(context, task_handle, runtime.clone()).await;
+    let shutdown = Shutdown::new();
+    install_and_start_task_queues(context, task_handle, runtime.clone(), &shutdown).await;
 
     let stored = read_job_record(&storage, job_id, None)
         .await
@@ -147,7 +148,7 @@ async fn start_keeps_job() {
     ));
     let runtime = JobsRuntime::new_paused();
 
-    let queues = initialize_task_holder(
+    let queues = install_task_queues(
         context,
         task_handle.clone(),
         runtime.clone(),
@@ -155,7 +156,7 @@ async fn start_keeps_job() {
     )
     .await;
     let shutdown = Shutdown::new();
-    queues.start(&shutdown).await;
+    queues.restore_timers_and_start(&shutdown).await;
 
     let stored = read_job_record(&storage, job_id, None)
         .await

@@ -1069,7 +1069,14 @@ async fn draining_a_topics() {
         .await
         .expect("refresh peers");
 
-    initialize_task_incoming(context.clone(), task_handle.clone(), JobsRuntime::new()).await;
+    let shutdown = Shutdown::new();
+    install_and_start_task_queues(
+        context.clone(),
+        task_handle.clone(),
+        JobsRuntime::new(),
+        &shutdown,
+    )
+    .await;
 
     let strategy_id = config.strategies.first().expect("a strategy").strategy_id;
     let topic = aruna_core::document::shard_topic_id(

@@ -23,7 +23,7 @@ use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::realm::get_config::GetRealmConfigOperation;
 use aruna_operations::sync::incoming::initialize_net_incoming;
-use aruna_operations::tasks::incoming::{drain_notification_outbox, initialize_task_incoming};
+use aruna_operations::tasks::incoming::{drain_notification_outbox, install_and_start_task_queues};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -524,10 +524,12 @@ async fn build_node(
     });
 
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    install_and_start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
+        &shutdown,
     )
     .await;
 

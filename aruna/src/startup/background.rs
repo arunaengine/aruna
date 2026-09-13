@@ -140,7 +140,7 @@ pub(crate) async fn start(
             StartupPhase::StartJobRuntime => jobs_runtime.start(),
             StartupPhase::StartTaskQueues => {
                 let task_queues = task_queues.take().expect("task queues start exactly once");
-                task_queues.start(&shutdown).await;
+                task_queues.restore_timers_and_start(&shutdown).await;
             }
             StartupPhase::RestoreDrainTimer => {
                 restore_drain_timer(&driver_ctx.storage_handle, &task_handle).await;
@@ -196,7 +196,7 @@ async fn publish_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_operations::tasks::incoming::initialize_task_holder;
+    use aruna_operations::tasks::incoming::install_task_queues;
 
     async fn test_background() -> (Background, tempfile::TempDir) {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -212,7 +212,7 @@ mod tests {
         });
         let task_handle = TaskHandle::new();
         let jobs_runtime = JobsRuntime::new_paused();
-        let task_queues = initialize_task_holder(
+        let task_queues = install_task_queues(
             driver_ctx.clone(),
             task_handle.clone(),
             jobs_runtime.clone(),

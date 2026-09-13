@@ -21,7 +21,7 @@ use aruna_operations::realm::claim_admin::{
 };
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::sync::incoming::initialize_net_incoming;
-use aruna_operations::tasks::incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::install_and_start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::Json;
@@ -203,10 +203,12 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         compute_handle: None,
     });
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    install_and_start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
+        &shutdown,
     )
     .await;
 

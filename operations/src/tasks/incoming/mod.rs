@@ -124,7 +124,7 @@ mod outbox;
 mod restore;
 
 pub use outbox::drive_sync_drain;
-pub use restore::{drain_notification_outbox, initialize_task_holder, initialize_task_incoming};
+pub use restore::{drain_notification_outbox, install_and_start_task_queues, install_task_queues};
 
 /// Process-wide tally of document sync outbox records ever classified
 /// undeliverable. The drain already error-logs each one; this exposes the count

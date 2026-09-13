@@ -45,7 +45,7 @@ use aruna_operations::metadata::update_document::{
 use aruna_operations::placement::{
     PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes,
 };
-use aruna_operations::tasks::incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::install_and_start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -481,10 +481,12 @@ async fn queue_recovers_create() -> Result<(), Box<dyn std::error::Error>> {
 
     schedule_projection_drain(test.context.as_ref(), Duration::ZERO).await?;
     let task_handle = TaskHandle::new();
-    initialize_task_incoming(
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    install_and_start_task_queues(
         test.context.clone(),
         task_handle.clone(),
         aruna_operations::jobs::runtime::JobsRuntime::new(),
+        &shutdown,
     )
     .await;
 

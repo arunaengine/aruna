@@ -43,7 +43,7 @@ use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperat
 use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
 use aruna_operations::s3::get_access::GetUserAccessOperation;
 use aruna_operations::sync::incoming::initialize_net_incoming;
-use aruna_operations::tasks::incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::install_and_start_task_queues;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use aws_sdk_s3::Client as S3Client;
@@ -915,10 +915,12 @@ async fn initialize_context(
         compute_handle: compute,
     });
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    install_and_start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
+        &shutdown,
     )
     .await;
     Ok(context)
