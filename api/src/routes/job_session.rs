@@ -2068,6 +2068,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn links_reference_across_groups() {
+        // A linked reference is cloned from the source version, so it needs
+        // neither the connector in the workspace's group nor any byte.
+        let owner = user(2);
+        let (_dir, state, job_id, _helper) = build_node(owner).await;
+        let own_group = seed_group(&state, owner, true).await;
+        let shared_group = seed_group(&state, owner, true).await;
+        seed_bucket(&state, "lab-data", own_group, owner).await;
+        seed_bucket(&state, "shared", shared_group, owner).await;
+        seed_reference(&state, "shared", owner).await;
+
+        let mut item = input("shared", "data/genomes/ref.fna");
+        item.strategy = SessionInputStrategy::Reference;
+        let response = stage_inputs(
+            State(state.clone()),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Json(SessionInputsRequest { items: vec![item] }),
+        )
+        .await
+        .expect("the reference is linked");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = inputs_body(response).await;
+        assert!(body.pending.is_empty() && body.failed.is_empty());
+        assert_eq!(body.staged.len(), 1);
+        assert!(body.staged[0].linked);
+        assert_eq!(body.staged[0].bytes, 15);
+        assert!(body.staged[0].blake3.is_empty());
+
+        let head = drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: "lab-data".to_string(),
+                key: "data/genomes/ref.fna".to_string(),
+                version_id: None,
+            }),
+            &state.get_ctx(),
+        )
+        .await
+        .expect("the head drives")
+        .expect("the key exists")
+        .expect("the head succeeds");
+        assert!(head.location.is_none(), "no bytes were stored");
+        let binding = head
+            .source_binding
+            .expect("the workspace holds a reference");
+        assert_eq!(binding.descriptor.source_path, "genomes/ref.fna");
+        let session = registry_session(&state, job_id).expect("session is live");
+        assert_eq!(session.inventory().len(), 1);
+    }
+
+    #[tokio::test]
     async fn refuses_unreadable_source() {
         // The caller's read permission on the source bucket is checked before
         // any lookup of the object, so a foreign group's data never moves.
@@ -2124,6 +2175,7 @@ mod tests {
             blake3: String::new(),
             source_node_id: node().to_string(),
             version_id: String::new(),
+            linked: false,
         }];
         let failed = vec![FailedInputResponse {
             dest_key: "data/b.txt".to_string(),
