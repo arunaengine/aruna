@@ -1045,16 +1045,16 @@ mod pure_tests {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         aruna_core::structs::Actor {
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
             realm_id,
         }
     }
 
     fn record(actor: &aruna_core::structs::Actor) -> MetadataRegistryRecord {
-        let group_id = Ulid::generate();
-        let document_id = Ulid::generate();
+        let group_id = Ulid::from_parts(2, 2);
+        let document_id = Ulid::from_parts(3, 3);
         let document_path = "datasets/delete-lifecycle";
-        let last_event_id = Ulid::generate();
+        let last_event_id = Ulid::from_parts(4, 4);
         MetadataRegistryRecord {
             realm_id: actor.realm_id,
             group_id,
@@ -1128,7 +1128,7 @@ mod pure_tests {
     fn delete_drops_index() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(5, 5);
         let mut operation = DeleteMetadataDocumentOperation::new(
             actor.clone(),
             record.group_id,
@@ -1220,7 +1220,7 @@ mod pure_tests {
             key: ByteView::from(*record.realm_id.as_bytes()),
             value: Some(postcard::to_allocvec(&config).unwrap().into()),
         }));
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(6, 6);
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert!(matches!(
             effects.as_slice(),
@@ -1250,12 +1250,16 @@ mod pure_tests {
             .expect("document lifecycle outbox builds");
         let graph_outbox = outbox_from_effects(
             operation
-                .graph_lifecycle_effect(&record, Ulid::generate(), Ulid::from_bytes([0x62; 16]))
+                .graph_lifecycle_effect(
+                    &record,
+                    Ulid::from_parts(7, 7),
+                    Ulid::from_bytes([0x62; 16]),
+                )
                 .expect("graph lifecycle outbox builds"),
         );
         let registry_outbox = outbox_from_effects(
             operation
-                .delete_outbox_effect(&record, Ulid::generate())
+                .delete_outbox_effect(&record, Ulid::from_parts(8, 8))
                 .expect("registry delete outbox builds"),
         );
         let DocumentSyncOutboxEvent::Upsert {
@@ -1374,7 +1378,13 @@ mod pure_tests {
             record.document_id,
         );
 
-        let effects = step_to_fence(&mut operation, &record, &config, Ulid::generate(), None);
+        let effects = step_to_fence(
+            &mut operation,
+            &record,
+            &config,
+            Ulid::from_parts(9, 9),
+            None,
+        );
         assert!(
             matches!(
                 effects.as_slice(),
@@ -1387,12 +1397,16 @@ mod pure_tests {
             .expect("document lifecycle outbox builds");
         let graph_outbox = outbox_from_effects(
             operation
-                .graph_lifecycle_effect(&record, Ulid::generate(), Ulid::from_bytes([0x62; 16]))
+                .graph_lifecycle_effect(
+                    &record,
+                    Ulid::from_parts(10, 10),
+                    Ulid::from_bytes([0x62; 16]),
+                )
                 .expect("graph lifecycle outbox builds"),
         );
         let registry_outbox = outbox_from_effects(
             operation
-                .delete_outbox_effect(&record, Ulid::generate())
+                .delete_outbox_effect(&record, Ulid::from_parts(11, 11))
                 .expect("registry delete outbox builds"),
         );
         assert_eq!(document_outbox.generation, 1);
@@ -1413,7 +1427,13 @@ mod pure_tests {
             record.document_id,
         );
 
-        let effects = step_to_fence(&mut operation, &record, &config, Ulid::generate(), Some(1));
+        let effects = step_to_fence(
+            &mut operation,
+            &record,
+            &config,
+            Ulid::from_parts(12, 12),
+            Some(1),
+        );
         assert!(
             !effects.iter().any(|effect| matches!(
                 effect,
@@ -1465,7 +1485,7 @@ mod pure_tests {
             })]
         ));
 
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(13, 13);
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert!(matches!(
             effects.as_slice(),
@@ -1560,7 +1580,7 @@ mod pure_tests {
     fn delete_fence_missing() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(14, 14);
         let mut operation =
             DeleteMetadataDocumentOperation::new(actor, record.group_id, record.document_id);
 
@@ -1611,7 +1631,7 @@ mod pure_tests {
     fn delete_skips_unminted() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(15, 15);
         let mut operation =
             DeleteMetadataDocumentOperation::new(actor, record.group_id, record.document_id);
         operation.record = Some(record.clone());
@@ -1651,9 +1671,9 @@ mod pure_tests {
     fn delete_tombstones_minted() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(16, 16);
         let revision = aruna_core::structs::PersistentIdRevision {
-            event_id: Ulid::generate(),
+            event_id: Ulid::from_parts(17, 17),
             actor: actor.node_id,
             occurred_at_ms: 1,
         };
@@ -1710,7 +1730,7 @@ mod pure_tests {
         // must never write a tombstone the row's durable identity cannot back.
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(18, 18);
         let mut operation =
             DeleteMetadataDocumentOperation::new(actor, record.group_id, record.document_id);
         operation.record = Some(record.clone());

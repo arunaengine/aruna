@@ -248,7 +248,7 @@ mod pure_tests {
             .assigned_users
             .extend([u2, u3]);
         let custom_role = Role {
-            role_id: Ulid::generate(),
+            role_id: Ulid::from_parts(1, 1),
             name: "custom-admin-label".to_string(),
             permissions: HashMap::new(),
             assigned_users: HashSet::from([ignored]),

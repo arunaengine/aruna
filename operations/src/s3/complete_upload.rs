@@ -1972,6 +1972,8 @@ fn composite_digest(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod pure_tests {
+    use std::time::Duration;
+
     use super::*;
     use aruna_core::structs::{BackendRef, COMPLETION_LEASE_MS, MultipartUploadChecksumHint};
     use aruna_core::task::{TaskEffect, TaskKey};
@@ -1983,7 +1985,7 @@ mod pure_tests {
         CompleteMultipartUploadInput {
             bucket: "bucket".to_string(),
             key: "object".to_string(),
-            upload_id: Ulid::generate(),
+            upload_id: Ulid::from_parts(1, 1),
             realm_id,
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
             completed_parts: vec![],
@@ -1992,7 +1994,7 @@ mod pure_tests {
             checksum_type: MultipartChecksumType::FullObject,
             checksum_type_explicit: false,
             object_size: Some(10),
-            created_by: UserId::local(Ulid::generate(), realm_id),
+            created_by: UserId::local(Ulid::from_parts(2, 2), realm_id),
             quota_ceiling: Some(30),
             now_ms: TEST_NOW_MS,
         }
@@ -2016,7 +2018,7 @@ mod pure_tests {
         }];
         let mut operation = CompleteMultipartUploadOperation::new(finalize_input())
             .with_restrictions(Some(restrictions.clone()));
-        operation.version_id = Some(Ulid::generate());
+        operation.version_id = Some(Ulid::from_parts(3, 3));
 
         let effects = operation.write_obligation();
 
@@ -2036,9 +2038,9 @@ mod pure_tests {
             upload_id: input.upload_id,
             bucket: input.bucket.clone(),
             key: input.key.clone(),
-            group_id: Ulid::generate(),
+            group_id: Ulid::from_parts(4, 4),
             created_by: input.created_by,
-            created_at: SystemTime::now(),
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000060),
             status: MultipartUploadStatus::Completing,
             checksum_hint: None,
             metadata: HashMap::new(),
@@ -2057,17 +2059,17 @@ mod pure_tests {
                 root: "/tmp".to_string(),
                 storage_bucket: "multipart".to_string(),
                 backend_path: format!("part-{part_number}"),
-                ulid: Ulid::generate(),
+                ulid: Ulid::from_parts(5, 5),
                 compressed: false,
                 encrypted: false,
-                created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([4u8; 32])),
-                created_at: SystemTime::now(),
+                created_by: UserId::local(Ulid::from_parts(6, 6), RealmId::from_bytes([4u8; 32])),
+                created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000120),
                 staging: false,
                 partial: true,
                 blob_size,
                 hashes: HashMap::new(),
             },
-            created_at: SystemTime::now(),
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000180),
         }
     }
 
@@ -2977,11 +2979,11 @@ mod pure_tests {
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "object".to_string(),
-            ulid: Ulid::generate(),
+            ulid: Ulid::from_parts(7, 7),
             compressed: false,
             encrypted: false,
-            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([4u8; 32])),
-            created_at: SystemTime::now(),
+            created_by: UserId::local(Ulid::from_parts(8, 8), RealmId::from_bytes([4u8; 32])),
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000240),
             staging: false,
             partial: false,
             blob_size: 10,
@@ -2993,9 +2995,9 @@ mod pure_tests {
         );
         op.final_location = Some(final_location.clone());
         op.composed_location = Some(final_location.clone());
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(9, 9);
         op.txn_id = Some(txn_id);
-        op.version_id = Some(Ulid::generate());
+        op.version_id = Some(Ulid::from_parts(10, 10));
         op.upload_parts = vec![requested.clone(), omitted.clone()];
         op.resolved_parts = vec![requested.clone()];
 
@@ -3058,11 +3060,11 @@ mod pure_tests {
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "object".to_string(),
-            ulid: Ulid::generate(),
+            ulid: Ulid::from_parts(11, 11),
             compressed: false,
             encrypted: false,
-            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([4u8; 32])),
-            created_at: SystemTime::now(),
+            created_by: UserId::local(Ulid::from_parts(12, 12), RealmId::from_bytes([4u8; 32])),
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000300),
             staging: false,
             partial: false,
             blob_size: 10,
@@ -3070,7 +3072,7 @@ mod pure_tests {
         };
         op.final_location = Some(location.clone());
         op.composed_location = Some(location.clone());
-        op.version_id = Some(Ulid::generate());
+        op.version_id = Some(Ulid::from_parts(13, 13));
         op.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
         op.txn_id = Some(TxnId::generate());
 
@@ -3323,7 +3325,7 @@ mod decision_tests {
         CompleteMultipartUploadInput {
             bucket: "bucket".to_string(),
             key: "object".to_string(),
-            upload_id: Ulid::generate(),
+            upload_id: Ulid::from_parts(1, 1),
             realm_id,
             node_id: node(),
             completed_parts: vec![],
@@ -3332,7 +3334,7 @@ mod decision_tests {
             checksum_type: MultipartChecksumType::FullObject,
             checksum_type_explicit: false,
             object_size: Some(10),
-            created_by: UserId::local(Ulid::generate(), realm_id),
+            created_by: UserId::local(Ulid::from_parts(2, 2), realm_id),
             quota_ceiling: Some(30),
             now_ms: TEST_NOW_MS,
         }
@@ -3345,7 +3347,7 @@ mod decision_tests {
             storage_class: None,
             bucket: input.bucket.clone(),
             key: input.key.clone(),
-            group_id: Ulid::generate(),
+            group_id: Ulid::from_parts(3, 3),
             created_by: input.created_by,
             created_at: std::time::SystemTime::UNIX_EPOCH,
             status: MultipartUploadStatus::Open,

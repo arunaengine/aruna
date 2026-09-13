@@ -95,7 +95,7 @@ mod pure_tests {
     #[test]
     fn vouches_for_owner() {
         // A device's own owner is the one identity it may speak for.
-        let owner = UserId::local(Ulid::generate(), realm());
+        let owner = UserId::local(Ulid::from_parts(1, 1), realm());
         let config = config(RealmNodeKind::User { owner });
         assert_eq!(
             ensure_peer_trust(&config, node(1), realm(), PeerTrust::Vouched(Some(owner))),
@@ -105,8 +105,8 @@ mod pure_tests {
 
     #[test]
     fn vouches_for_nobody() {
-        let owner = UserId::local(Ulid::generate(), realm());
-        let stranger = UserId::local(Ulid::generate(), realm());
+        let owner = UserId::local(Ulid::from_parts(2, 2), realm());
+        let stranger = UserId::local(Ulid::from_parts(3, 3), realm());
         let config = config(RealmNodeKind::User { owner });
         for vouched in [Some(stranger), None] {
             assert_eq!(
@@ -123,7 +123,7 @@ mod pure_tests {
     fn keeps_internal_gate() {
         // Vouching changes nothing for an infrastructure peer, and an unknown
         // peer is still refused before any trust question.
-        let owner = UserId::local(Ulid::generate(), realm());
+        let owner = UserId::local(Ulid::from_parts(4, 4), realm());
         let config = config(RealmNodeKind::User { owner });
         assert_eq!(
             ensure_peer_trust(&config, node(2), realm(), PeerTrust::Vouched(Some(owner))),
@@ -140,7 +140,7 @@ mod pure_tests {
 
     #[test]
     fn member_ignores_kind() {
-        let owner = UserId::local(Ulid::generate(), realm());
+        let owner = UserId::local(Ulid::from_parts(5, 5), realm());
         let config = config(RealmNodeKind::User { owner });
         assert_eq!(
             ensure_peer_trust(&config, node(1), realm(), PeerTrust::Member),

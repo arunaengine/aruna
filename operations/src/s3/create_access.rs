@@ -449,11 +449,17 @@ mod pure_tests {
         CredentialEncryptionKey::derive(&[9u8; 32])
     }
 
+    /// A fixed far-future expiry, so an "active" fixture never depends on the
+    /// wall clock that the production decision reads.
+    fn active_expiry() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000_000)
+    }
+
     fn make_config(user_identity: UserId, group_id: GroupId) -> CreateUserAccessConfig {
         CreateUserAccessConfig {
             user_identity,
             group_id,
-            expiry: SystemTime::now() + DEFAULT_CREDENTIAL_TTL,
+            expiry: active_expiry(),
             path_restrictions: None,
             issued_by: test_issuer(),
         }
@@ -466,7 +472,7 @@ mod pure_tests {
     #[test]
     fn creates_user_access() {
         let user_identity = make_user_identity();
-        let group_id = Ulid::generate();
+        let group_id = Ulid::from_parts(1, 1);
         let mut op =
             CreateUserAccessOperation::new(make_config(user_identity, group_id), test_key());
 
@@ -479,7 +485,7 @@ mod pure_tests {
             Effect::Storage(StorageEffect::StartTransaction { read: false })
         ));
 
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(2, 2);
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let Effect::Storage(StorageEffect::Read {
             key_space,
@@ -554,12 +560,12 @@ mod pure_tests {
         let user_identity = make_user_identity();
         let stale_key = "newkey".to_string();
         let mut op = CreateUserAccessOperation::new_with_key(
-            make_config(user_identity, Ulid::generate()),
+            make_config(user_identity, Ulid::from_parts(3, 3)),
             "newkey".to_string(),
             test_key(),
         );
         op.start();
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(4, 4);
         op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: owner_key(user_identity),
@@ -570,7 +576,7 @@ mod pure_tests {
         let stale = UserAccess {
             access_key: stale_key.clone(),
             user_identity,
-            group_id: Ulid::generate(),
+            group_id: Ulid::from_parts(5, 5),
             secret: EncryptedS3Secret::empty(),
             expiry: SystemTime::UNIX_EPOCH,
             path_restrictions: None,
@@ -602,12 +608,12 @@ mod pure_tests {
     fn rejects_active_collision() {
         let user_identity = make_user_identity();
         let mut op = CreateUserAccessOperation::new_with_key(
-            make_config(user_identity, Ulid::generate()),
+            make_config(user_identity, Ulid::from_parts(6, 6)),
             "newkey".to_string(),
             test_key(),
         );
         op.start();
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(7, 7);
         op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: owner_key(user_identity),
@@ -618,9 +624,9 @@ mod pure_tests {
         let access = UserAccess {
             access_key: "newkey".to_string(),
             user_identity,
-            group_id: Ulid::generate(),
+            group_id: Ulid::from_parts(8, 8),
             secret: EncryptedS3Secret::empty(),
-            expiry: SystemTime::now() + Duration::from_secs(60),
+            expiry: active_expiry(),
             path_restrictions: None,
             issued_by: test_issuer(),
             revoked_at: None,
@@ -649,12 +655,12 @@ mod pure_tests {
             .map(|index| format!("key{index}"))
             .collect::<std::collections::BTreeSet<_>>();
         let mut op = CreateUserAccessOperation::new_with_key(
-            make_config(user_identity, Ulid::generate()),
+            make_config(user_identity, Ulid::from_parts(9, 9)),
             "newkey".to_string(),
             test_key(),
         );
         op.start();
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(10, 10);
         op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: owner_key(user_identity),
@@ -666,9 +672,9 @@ mod pure_tests {
                 let access = UserAccess {
                     access_key: key.clone(),
                     user_identity,
-                    group_id: Ulid::generate(),
+                    group_id: Ulid::from_parts(11, 11),
                     secret: EncryptedS3Secret::empty(),
-                    expiry: SystemTime::now() + Duration::from_secs(60),
+                    expiry: active_expiry(),
                     path_restrictions: None,
                     issued_by: test_issuer(),
                     revoked_at: None,
@@ -699,7 +705,7 @@ mod pure_tests {
                 permission: Permission::READ,
             })
             .collect::<Vec<_>>();
-        let mut config = make_config(make_user_identity(), Ulid::generate());
+        let mut config = make_config(make_user_identity(), Ulid::from_parts(12, 12));
         config.path_restrictions = Some(restrictions);
         let mut op = CreateUserAccessOperation::new(config, test_key());
 
@@ -715,7 +721,7 @@ mod pure_tests {
     #[test]
     fn rejects_invalid_steps() {
         let user_identity = make_user_identity();
-        let group_id = Ulid::generate();
+        let group_id = Ulid::from_parts(13, 13);
 
         // Starting twice does not bypass the transaction state.
         let mut op =
@@ -729,7 +735,7 @@ mod pure_tests {
         let mut op =
             CreateUserAccessOperation::new(make_config(user_identity, group_id), test_key());
         op.start();
-        let key = Ulid::generate().to_bytes().into();
+        let key = Ulid::from_parts(14, 14).to_bytes().into();
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key,
             value: None,

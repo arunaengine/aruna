@@ -1761,7 +1761,7 @@ mod pure_tests {
         let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
         mint.plan.resolved = resolution(&policy);
         drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(1, 1);
         let row = copy_row(Vec::new(), ManagedCopyState::Registered);
         mint.step(copies(vec![row]), Some(txn_id))
             .expect("scan decides");
@@ -1780,7 +1780,7 @@ mod pure_tests {
         let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
         mint.plan.resolved = resolution(&policy);
         drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(2, 2);
         let row = copy_row(Vec::new(), ManagedCopyState::Registered);
         mint.step(copies(vec![row]), Some(txn_id))
             .expect("scan decides");
@@ -1831,7 +1831,7 @@ mod pure_tests {
         mint.plan.resolved = resolution(&policy);
         mint.plan.intent = Some(intent());
         drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(3, 3);
         mint.step(copies(Vec::new()), Some(txn_id))
             .expect("scan decides");
 
@@ -1885,7 +1885,7 @@ mod pure_tests {
         mint.plan.resolved = resolution(&policy);
         drive_to_copy(&mut mint, &reference()).expect("writes follow");
 
-        let counters = group_counters(&mut mint, Ulid::generate());
+        let counters = group_counters(&mut mint, Ulid::from_parts(4, 4));
         assert_eq!(counters.referenced_bytes, REFERENCE_BYTES);
         assert_eq!(counters.logical_bytes, 0);
         assert_eq!(counters.objects, 0);

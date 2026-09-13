@@ -248,7 +248,7 @@ mod pure_tests {
 
     #[test]
     fn lists_indexed() {
-        let user_identity = UserId::local(Ulid::generate(), RealmId([1; 32]));
+        let user_identity = UserId::local(Ulid::from_parts(1, 1), RealmId([1; 32]));
         let keys = (0..MAX_ACTIVE_CREDENTIALS)
             .map(|index| format!("key{index}"))
             .collect::<std::collections::BTreeSet<_>>();
@@ -259,7 +259,7 @@ mod pure_tests {
                 read: true
             })]
         ));
-        let txn_id = Ulid::generate();
+        let txn_id = Ulid::from_parts(2, 2);
         assert!(matches!(
             operation
                 .step(Event::Storage(StorageEvent::TransactionStarted { txn_id }))
@@ -287,9 +287,11 @@ mod pure_tests {
                 let access = UserAccess {
                     access_key: key.clone(),
                     user_identity,
-                    group_id: Ulid::generate(),
+                    group_id: Ulid::from_parts(3, 3),
                     secret: EncryptedS3Secret::empty(),
-                    expiry: SystemTime::now() + Duration::from_secs(60),
+                    expiry: SystemTime::UNIX_EPOCH
+                        + Duration::from_secs(1600000060)
+                        + Duration::from_secs(60),
                     path_restrictions: None,
                     issued_by: [0; 32],
                     revoked_at: None,

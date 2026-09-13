@@ -563,7 +563,7 @@ mod pure_tests {
                 "urn:graph:announce".to_string(),
                 RealmId::from_bytes([2u8; 32]),
                 GroupId::generate(),
-                Ulid::generate(),
+                Ulid::from_parts(1, 1),
                 42,
             );
             let document = DocumentSyncTarget::MetadataGraphLifecycle {
@@ -603,7 +603,7 @@ mod pure_tests {
             "urn:graph:placed-announce".to_string(),
             RealmId::from_bytes([2u8; 32]),
             GroupId::generate(),
-            Ulid::generate(),
+            Ulid::from_parts(2, 2),
             42,
         );
         let document = DocumentSyncTarget::MetadataGraphLifecycle {

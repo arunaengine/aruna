@@ -1591,10 +1591,10 @@ mod pure_tests {
     fn config(snapshot: RoutingSnapshot) -> PutObjectConfig {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
             group_id: snapshot.group_id,
             realm_id,
-            node_id: iroh::SecretKey::generate().public(),
+            node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
             request: PutObjectInput {
                 bucket: "bucket".to_string(),
                 key: "archive/one".to_string(),
@@ -1615,7 +1615,7 @@ mod pure_tests {
 
     fn snapshot() -> RoutingSnapshot {
         RoutingSnapshot::new(
-            Ulid::generate(),
+            Ulid::from_parts(2, 2),
             BackendCatalog::new("default")
                 .with_backend("default", None)
                 .with_backend("tape", Some("archive".to_string())),
@@ -1649,7 +1649,7 @@ mod pure_tests {
         }];
         let mut operation = PutObjectOperation::new(config(snapshot()))
             .with_restrictions(Some(restrictions.clone()));
-        operation.version_id = Some(Ulid::generate());
+        operation.version_id = Some(Ulid::from_parts(3, 3));
 
         let effects = operation.write_obligation();
 

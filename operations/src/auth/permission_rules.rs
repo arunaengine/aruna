@@ -694,7 +694,7 @@ mod pure_tests {
 
     fn role(permissions: HashMap<String, Permission>, assigned: HashSet<UserId>) -> Role {
         Role {
-            role_id: Ulid::generate(),
+            role_id: Ulid::from_parts(1, 1),
             name: "test".to_string(),
             permissions,
             assigned_users: assigned,
@@ -716,7 +716,7 @@ mod pure_tests {
     #[test]
     fn parses_scope_path() {
         let realm_id = RealmId([4u8; 32]);
-        let group_id = Ulid::generate();
+        let group_id = Ulid::from_parts(2, 2);
         let (parsed_realm, parsed_group) =
             PermissionRulesOperation::parse_path(&format!("/{realm_id}/g/{group_id}"))
                 .expect("group path parses");
@@ -736,18 +736,18 @@ mod pure_tests {
     fn deny_wins() {
         // A per-document DENY must beat the group-wide READ it overlaps.
         let realm_id = RealmId([5u8; 32]);
-        let group_id = Ulid::generate();
+        let group_id = Ulid::from_parts(3, 3);
         let secret = MetadataRegistryRecord::permission_path_for(
             &realm_id,
             group_id,
             "datasets/secret",
-            Ulid::generate(),
+            Ulid::from_parts(4, 4),
         );
         let sibling = MetadataRegistryRecord::permission_path_for(
             &realm_id,
             group_id,
             "datasets/open",
-            Ulid::generate(),
+            Ulid::from_parts(5, 5),
         );
         let rules = direct_rules(HashMap::from([
             (
@@ -765,18 +765,18 @@ mod pure_tests {
     fn narrow_grant_matches() {
         // A grant on one document must not open the rest of the group.
         let realm_id = RealmId([6u8; 32]);
-        let group_id = Ulid::generate();
+        let group_id = Ulid::from_parts(6, 6);
         let granted = MetadataRegistryRecord::permission_path_for(
             &realm_id,
             group_id,
             "datasets/shared",
-            Ulid::generate(),
+            Ulid::from_parts(7, 7),
         );
         let other = MetadataRegistryRecord::permission_path_for(
             &realm_id,
             group_id,
             "datasets/private",
-            Ulid::generate(),
+            Ulid::from_parts(8, 8),
         );
         let rules = direct_rules(HashMap::from([(granted.clone(), Permission::READ)]));
 
@@ -790,7 +790,7 @@ mod pure_tests {
         // A single-segment grant must not silently become recursive: `*` and
         // `?` never cross `/`, only `**` spans segments.
         let realm_id = RealmId([11u8; 32]);
-        let group_id = Ulid::generate();
+        let group_id = Ulid::from_parts(9, 9);
         let rules = direct_rules(HashMap::from([(
             format!("/{realm_id}/g/{group_id}/*"),
             Permission::READ,
@@ -807,7 +807,7 @@ mod pure_tests {
     fn malformed_fails_collection() {
         // An uncompilable pattern denies the whole collection, never grants.
         let realm_id = RealmId([12u8; 32]);
-        let group_id = Ulid::generate();
+        let group_id = Ulid::from_parts(10, 10);
         assert!(
             PermissionRules::from_roles(
                 vec![CollectedRole {
@@ -827,7 +827,7 @@ mod pure_tests {
     #[test]
     fn oversized_restrictions_deny() {
         let realm_id = RealmId([13u8; 32]);
-        let group_id = Ulid::generate();
+        let group_id = Ulid::from_parts(11, 11);
         let pattern = format!("/{realm_id}/g/{group_id}/meta/**");
         let restrictions = vec![
             PathRestriction {
@@ -852,7 +852,7 @@ mod pure_tests {
     #[test]
     fn restrictions_gate_access() {
         let realm_id = RealmId([7u8; 32]);
-        let group_id = Ulid::generate();
+        let group_id = Ulid::from_parts(12, 12);
         let pattern = format!("/{realm_id}/g/{group_id}/meta/**");
         let path = format!("/{realm_id}/g/{group_id}/meta/document");
         let granted = HashMap::from([(format!("/{realm_id}/g/{group_id}/**"), Permission::WRITE)]);
@@ -886,7 +886,7 @@ mod pure_tests {
         // Public roles grant READ to everyone but never WRITE, and a direct
         // DENY still wins over a public grant.
         let realm_id = RealmId([8u8; 32]);
-        let group_id = Ulid::generate();
+        let group_id = Ulid::from_parts(13, 13);
         let path = format!("/{realm_id}/g/{group_id}/data/object");
         let public = |permission: Permission| {
             PermissionRules::from_roles(
@@ -971,7 +971,7 @@ mod pure_tests {
         // Only this realm's Everyone principal makes a role public.
         let realm_id = RealmId([9u8; 32]);
         let other_realm = RealmId([10u8; 32]);
-        let group_id = Ulid::generate();
+        let group_id = Ulid::from_parts(14, 14);
         let mut operation = PermissionRulesOperation::new(PermissionRulesConfig {
             auth_context: AuthContext::anonymous(realm_id),
             path: format!("/{realm_id}/g/{group_id}"),

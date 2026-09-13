@@ -306,8 +306,8 @@ mod pure_tests {
 
     fn entry(state: PublishState) -> PublishEntry {
         let mut entry = PublishEntry::new(
-            Ulid::generate(),
-            UserId::local(Ulid::generate(), RealmId::from_bytes([8u8; 32])),
+            Ulid::from_parts(1, 1),
+            UserId::local(Ulid::from_parts(2, 2), RealmId::from_bytes([8u8; 32])),
             Ulid::from_bytes([1u8; 16]),
             "notes".to_string(),
             false,

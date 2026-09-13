@@ -431,7 +431,7 @@ mod pure_tests {
 
     fn snapshot() -> RoutingSnapshot {
         RoutingSnapshot::new(
-            Ulid::generate(),
+            Ulid::from_parts(1, 1),
             BackendCatalog::new("default")
                 .with_backend("default", None)
                 .with_backend("tape", Some("archive".to_string())),

@@ -658,7 +658,7 @@ mod pure_tests {
         // An event this state cannot accept must fail the release and close its
         // transaction instead of being ignored.
         let txn_id = TxnId::generate();
-        let mut operation = ReleaseExecutionOperation::new(Ulid::generate());
+        let mut operation = ReleaseExecutionOperation::new(Ulid::from_parts(1, 1));
         operation.state = ReleaseState::Read { txn_id };
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
@@ -680,7 +680,7 @@ mod pure_tests {
     fn release_aborts_txn() {
         // A dropped release must never leak the write transaction it opened.
         let txn_id = TxnId::generate();
-        let mut operation = ReleaseExecutionOperation::new(Ulid::generate());
+        let mut operation = ReleaseExecutionOperation::new(Ulid::from_parts(2, 2));
         operation.state = ReleaseState::Delete { txn_id };
 
         assert!(matches!(
@@ -689,7 +689,7 @@ mod pure_tests {
                 if *aborted == txn_id
         ));
         assert!(
-            ReleaseExecutionOperation::new(Ulid::generate())
+            ReleaseExecutionOperation::new(Ulid::from_parts(3, 3))
                 .abort()
                 .is_empty()
         );
@@ -699,7 +699,7 @@ mod pure_tests {
     fn rejects_commit_error() {
         // A failed durable release must remain a retryable error.
         let txn_id = TxnId::generate();
-        let mut operation = ReleaseExecutionOperation::new(Ulid::generate());
+        let mut operation = ReleaseExecutionOperation::new(Ulid::from_parts(4, 4));
         operation.state = ReleaseState::Commit { txn_id };
         operation.outcome = Some(Ok(true));
 

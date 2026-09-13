@@ -136,7 +136,7 @@ mod pure_tests {
     #[test]
     fn hit_returns_entry() {
         let cache = cache(4, 1024);
-        let cursor = Ulid::generate();
+        let cursor = Ulid::from_parts(1, 1);
         let now = Instant::now();
         cache.insert("urn:graph:a", cursor, "{\"@graph\":[]}", now);
 
@@ -151,8 +151,8 @@ mod pure_tests {
     fn cursor_advance_misses() {
         // A stale summary must never survive an update of the same document.
         let cache = cache(4, 1024);
-        let first = Ulid::generate();
-        let second = Ulid::generate();
+        let first = Ulid::from_parts(2, 2);
+        let second = Ulid::from_parts(3, 3);
         let now = Instant::now();
         cache.insert("urn:graph:a", first, "stale", now);
 
@@ -169,7 +169,7 @@ mod pure_tests {
     #[test]
     fn budget_evicts_lru() {
         let cache = cache(8, 32);
-        let cursor = Ulid::generate();
+        let cursor = Ulid::from_parts(4, 4);
         let now = Instant::now();
         cache.insert("a", cursor, &"x".repeat(15), now);
         cache.insert("b", cursor, &"y".repeat(15), now);
@@ -185,7 +185,7 @@ mod pure_tests {
     #[test]
     fn oversized_entry_skipped() {
         let cache = cache(4, 16);
-        let cursor = Ulid::generate();
+        let cursor = Ulid::from_parts(5, 5);
         let now = Instant::now();
         cache.insert("a", cursor, &"x".repeat(64), now);
 
@@ -196,7 +196,7 @@ mod pure_tests {
     #[test]
     fn remove_frees_budget() {
         let cache = cache(4, 32);
-        let cursor = Ulid::generate();
+        let cursor = Ulid::from_parts(6, 6);
         let now = Instant::now();
         cache.insert("a", cursor, &"x".repeat(20), now);
         cache.remove("a");
@@ -211,7 +211,7 @@ mod pure_tests {
         // Document sync can land content under a cursor a listing already
         // cached, so only the synced graph loses its entry and its bytes.
         let cache = cache(4, 32);
-        let cursor = Ulid::generate();
+        let cursor = Ulid::from_parts(7, 7);
         let now = Instant::now();
         let kept = "y".repeat(10);
         cache.insert("a", cursor, &"x".repeat(10), now);
@@ -235,7 +235,7 @@ mod pure_tests {
     fn expired_entry_misses() {
         // The TTL bounds any coherence hole the cursor key cannot see.
         let cache = cache(4, 1024);
-        let cursor = Ulid::generate();
+        let cursor = Ulid::from_parts(8, 8);
         let now = Instant::now();
         cache.insert("a", cursor, "summary", now);
         let fresh = now + TTL - Duration::from_secs(1);
