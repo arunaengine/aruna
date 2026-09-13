@@ -690,6 +690,7 @@ impl OperationsTaskHandler {
 }
 
 /// The durable queue work deferred until after the local serving gate.
+#[derive(Clone)]
 pub struct TaskQueues {
     context: Arc<DriverContext>,
     task_handle: TaskHandle,
