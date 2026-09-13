@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};

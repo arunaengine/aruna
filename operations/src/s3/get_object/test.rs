@@ -1,4 +1,3 @@
-
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::UsageCounterUpdate;
 use crate::replication::bao_read::BaoReadError;
