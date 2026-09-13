@@ -440,7 +440,244 @@ impl IncomingVersionReplicationOperation {
         self.clock = EnqueueClock(clock);
         self
     }
+}
 
+impl Operation for IncomingVersionReplicationOperation {
+    type Output = Result<IncomingVersionReplicationResult, IncomingVersionReplicationError>;
+    type Error = IncomingVersionReplicationError;
+
+    fn start(&mut self) -> Effects {
+        if let Err(error) = self.manifest.validate() {
+            return self.reject_negotiation(error.into());
+        }
+        if self.manifest.reference_advance.is_some() && !self.valid_advance_manifest() {
+            return self
+                .reject_negotiation(IncomingVersionReplicationError::InvalidReferenceAdvance);
+        }
+        if self.is_reference_item()
+            && let Err(error) = self.reference_version()
+        {
+            return self.reject_negotiation(error);
+        }
+        if self
+            .manifest
+            .origin
+            .as_ref()
+            .is_some_and(|origin| origin.hop_count > 4)
+        {
+            return self.reject_negotiation(IncomingVersionReplicationError::HopLimitExceeded);
+        }
+        if self.manifest.auth_context.realm_id != self.local_realm_id
+            || self.manifest.auth_context.user_id.realm_id != self.local_realm_id
+        {
+            return self.reject_negotiation(IncomingVersionReplicationError::RealmMismatch);
+        }
+        if self.manifest.writer_auth_context.is_none() && self.manifest.reference_advance.is_none()
+        {
+            return self
+                .reject_negotiation(IncomingVersionReplicationError::WriterPermissionDenied);
+        }
+        if self
+            .manifest
+            .writer_auth_context
+            .as_ref()
+            .is_some_and(|auth| {
+                auth.realm_id != self.local_realm_id || auth.user_id.realm_id != self.local_realm_id
+            })
+        {
+            return self.reject_negotiation(IncomingVersionReplicationError::RealmMismatch);
+        }
+
+        self.read_destination_bucket()
+    }
+
+    /// One accepted event per state, dispatched to the handler named
+    /// after its phase and the accepted result. The phase order is documented
+    /// on [`IncomingVersionReplicationState`].
+    fn step(&mut self, event: Event) -> Effects {
+        match self.state {
+            // Negotiation: decide and send the reply.
+            IncomingVersionReplicationState::Init => self.start(),
+            IncomingVersionReplicationState::ReadDestinationBucket => {
+                self.handle_negotiation_destination_bucket_read(event)
+            }
+            IncomingVersionReplicationState::CreateDestinationBucket => {
+                self.handle_negotiation_bucket_created(event)
+            }
+            IncomingVersionReplicationState::LoadDestinationRouting => {
+                self.handle_negotiation_routing_loaded(event)
+            }
+            IncomingVersionReplicationState::ReadExistingVersion => {
+                self.handle_negotiation_existing_version_read(event)
+            }
+            IncomingVersionReplicationState::ReadReplacedBlob => {
+                self.handle_negotiation_replaced_blob_read(event)
+            }
+            IncomingVersionReplicationState::ReadQuotaConfig => {
+                self.handle_negotiation_quota_config_read(event)
+            }
+            IncomingVersionReplicationState::StartQuotaCheck => {
+                self.handle_negotiation_quota_transaction_started(event)
+            }
+            IncomingVersionReplicationState::EnforceQuota => {
+                self.handle_negotiation_quota_gate_stepped(event)
+            }
+            IncomingVersionReplicationState::FinishQuotaCheck => {
+                self.handle_negotiation_quota_check_aborted(event)
+            }
+            IncomingVersionReplicationState::ReadExistingBlob => {
+                self.handle_negotiation_existing_blob_read(event)
+            }
+            IncomingVersionReplicationState::PolicyGate => {
+                self.handle_negotiation_gate_event(event)
+            }
+            IncomingVersionReplicationState::SendNegotiation => {
+                self.handle_negotiation_reply_sent(event)
+            }
+            // Receiving: accept the bytes and open the apply.
+            IncomingVersionReplicationState::ReceiveBlob => {
+                self.handle_receiving_blob_finished(event)
+            }
+            IncomingVersionReplicationState::StartTransaction => {
+                self.handle_receiving_apply_transaction_started(event)
+            }
+            IncomingVersionReplicationState::CheckPurgeFence => {
+                self.handle_receiving_purge_fence_checked(event)
+            }
+            IncomingVersionReplicationState::CheckDrift => {
+                self.handle_receiving_drift_checked(event)
+            }
+            // Apply/commit: expose the version and settle ownership.
+            IncomingVersionReplicationState::VerifyReplaced => {
+                self.handle_apply_replaced_version_verified(event)
+            }
+            IncomingVersionReplicationState::ReadReplacedMetadata => {
+                self.handle_apply_replaced_metadata_iterated(event)
+            }
+            IncomingVersionReplicationState::DeleteReplacedMetadata => {
+                self.handle_apply_replaced_metadata_deleted(event)
+            }
+            IncomingVersionReplicationState::WriteReclaimCandidate => {
+                self.handle_apply_reclaim_candidate_written(event)
+            }
+            IncomingVersionReplicationState::FenceBackend => {
+                self.handle_apply_backend_fence_checked(event)
+            }
+            IncomingVersionReplicationState::VerifyExistingBlob => {
+                self.handle_apply_existing_blob_verified(event)
+            }
+            IncomingVersionReplicationState::WriteBlobLocation => {
+                self.handle_apply_blob_location_written(event)
+            }
+            IncomingVersionReplicationState::ReadObjectLookup => {
+                self.handle_apply_object_lookup_read(event)
+            }
+            IncomingVersionReplicationState::ReadCurrentVersion => {
+                self.handle_apply_current_version_read(event)
+            }
+            IncomingVersionReplicationState::ApplyHeadTransition => {
+                self.handle_apply_head_transition_progressed(event)
+            }
+            IncomingVersionReplicationState::WriteBlobVersion => {
+                self.handle_apply_blob_version_written(event)
+            }
+            IncomingVersionReplicationState::WriteMultipartMetadata => {
+                self.handle_apply_multipart_metadata_written(event)
+            }
+            IncomingVersionReplicationState::WriteLiveObligation => {
+                self.handle_apply_live_obligation_written(event)
+            }
+            IncomingVersionReplicationState::CheckCommitQuota => {
+                self.handle_apply_commit_quota_checked(event)
+            }
+            IncomingVersionReplicationState::UpdateUsage => self.handle_apply_usage_updated(event),
+            IncomingVersionReplicationState::WriteCleanupRow => {
+                self.handle_apply_cleanup_row_written(event)
+            }
+            IncomingVersionReplicationState::CommitTransaction => {
+                self.handle_apply_transaction_committed(event)
+            }
+            IncomingVersionReplicationState::ReleaseReservation => {
+                self.handle_apply_reservation_released(event)
+            }
+            IncomingVersionReplicationState::ScheduleUsage => {
+                self.handle_apply_usage_scheduled(event)
+            }
+            IncomingVersionReplicationState::ScheduleLiveDrain => {
+                self.handle_apply_live_drain_scheduled(event)
+            }
+            IncomingVersionReplicationState::RegisterBlobInDht => {
+                self.handle_apply_blob_registration_settled(event)
+            }
+            IncomingVersionReplicationState::SendApplyComplete => {
+                self.handle_apply_completion_sent(event)
+            }
+            // Cleanup: reject, abort, delete and close.
+            IncomingVersionReplicationState::SendApplyRejected => {
+                self.handle_cleanup_apply_rejection_sent(event)
+            }
+            IncomingVersionReplicationState::AbortTransaction => {
+                self.handle_cleanup_transaction_aborted(event)
+            }
+            IncomingVersionReplicationState::CleanupReceivedBlob => {
+                self.handle_cleanup_received_blob_cleaned(event)
+            }
+            IncomingVersionReplicationState::CloseConnection => {
+                self.handle_cleanup_connection_closed(event)
+            }
+            IncomingVersionReplicationState::Finish => smallvec![],
+            IncomingVersionReplicationState::Error => smallvec![],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(
+            self.state,
+            IncomingVersionReplicationState::Finish | IncomingVersionReplicationState::Error
+        )
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        let default = self.result(self.apply_committed);
+        let output = self.output.unwrap_or(Ok(default));
+        match (self.state, output) {
+            (IncomingVersionReplicationState::Error, Err(error)) => Err(error),
+            (_, output) => Ok(output),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        let mut effects = smallvec![];
+
+        let cleanup_location = match &self.state {
+            // An unknown commit outcome must preserve the copy: the commit may
+            // have landed, so the reservation is released instead of deleted.
+            IncomingVersionReplicationState::CommitTransaction => {
+                if let Some(received) = self.received_blob.as_mut() {
+                    received.cleanup_on_abort = false;
+                }
+                None
+            }
+            _ => self
+                .received_blob
+                .as_mut()
+                .and_then(ReceivedBlob::take_cleanup),
+        };
+        if let Some(location) = cleanup_location {
+            effects.push(Effect::Blob(BlobEffect::Delete { location }));
+        }
+        if let Some(txn_id) = self.txn_id.take() {
+            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
+        }
+        effects.push(Effect::Blob(BlobEffect::CloseConnection {
+            stream_id: self.stream_id,
+        }));
+
+        effects
+    }
+}
+
+impl IncomingVersionReplicationOperation {
     fn state_name(&self) -> &'static str {
         match self.state {
             IncomingVersionReplicationState::Init => "Init",
@@ -2818,241 +3055,6 @@ impl IncomingVersionReplicationOperation {
             "Closed incoming replication connection"
         );
         smallvec![]
-    }
-}
-
-impl Operation for IncomingVersionReplicationOperation {
-    type Output = Result<IncomingVersionReplicationResult, IncomingVersionReplicationError>;
-    type Error = IncomingVersionReplicationError;
-
-    fn start(&mut self) -> Effects {
-        if let Err(error) = self.manifest.validate() {
-            return self.reject_negotiation(error.into());
-        }
-        if self.manifest.reference_advance.is_some() && !self.valid_advance_manifest() {
-            return self
-                .reject_negotiation(IncomingVersionReplicationError::InvalidReferenceAdvance);
-        }
-        if self.is_reference_item()
-            && let Err(error) = self.reference_version()
-        {
-            return self.reject_negotiation(error);
-        }
-        if self
-            .manifest
-            .origin
-            .as_ref()
-            .is_some_and(|origin| origin.hop_count > 4)
-        {
-            return self.reject_negotiation(IncomingVersionReplicationError::HopLimitExceeded);
-        }
-        if self.manifest.auth_context.realm_id != self.local_realm_id
-            || self.manifest.auth_context.user_id.realm_id != self.local_realm_id
-        {
-            return self.reject_negotiation(IncomingVersionReplicationError::RealmMismatch);
-        }
-        if self.manifest.writer_auth_context.is_none() && self.manifest.reference_advance.is_none()
-        {
-            return self
-                .reject_negotiation(IncomingVersionReplicationError::WriterPermissionDenied);
-        }
-        if self
-            .manifest
-            .writer_auth_context
-            .as_ref()
-            .is_some_and(|auth| {
-                auth.realm_id != self.local_realm_id || auth.user_id.realm_id != self.local_realm_id
-            })
-        {
-            return self.reject_negotiation(IncomingVersionReplicationError::RealmMismatch);
-        }
-
-        self.read_destination_bucket()
-    }
-
-    /// One accepted event per state, dispatched to the handler named
-    /// after its phase and the accepted result. The phase order is documented
-    /// on [`IncomingVersionReplicationState`].
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            // Negotiation: decide and send the reply.
-            IncomingVersionReplicationState::Init => self.start(),
-            IncomingVersionReplicationState::ReadDestinationBucket => {
-                self.handle_negotiation_destination_bucket_read(event)
-            }
-            IncomingVersionReplicationState::CreateDestinationBucket => {
-                self.handle_negotiation_bucket_created(event)
-            }
-            IncomingVersionReplicationState::LoadDestinationRouting => {
-                self.handle_negotiation_routing_loaded(event)
-            }
-            IncomingVersionReplicationState::ReadExistingVersion => {
-                self.handle_negotiation_existing_version_read(event)
-            }
-            IncomingVersionReplicationState::ReadReplacedBlob => {
-                self.handle_negotiation_replaced_blob_read(event)
-            }
-            IncomingVersionReplicationState::ReadQuotaConfig => {
-                self.handle_negotiation_quota_config_read(event)
-            }
-            IncomingVersionReplicationState::StartQuotaCheck => {
-                self.handle_negotiation_quota_transaction_started(event)
-            }
-            IncomingVersionReplicationState::EnforceQuota => {
-                self.handle_negotiation_quota_gate_stepped(event)
-            }
-            IncomingVersionReplicationState::FinishQuotaCheck => {
-                self.handle_negotiation_quota_check_aborted(event)
-            }
-            IncomingVersionReplicationState::ReadExistingBlob => {
-                self.handle_negotiation_existing_blob_read(event)
-            }
-            IncomingVersionReplicationState::PolicyGate => {
-                self.handle_negotiation_gate_event(event)
-            }
-            IncomingVersionReplicationState::SendNegotiation => {
-                self.handle_negotiation_reply_sent(event)
-            }
-            // Receiving: accept the bytes and open the apply.
-            IncomingVersionReplicationState::ReceiveBlob => {
-                self.handle_receiving_blob_finished(event)
-            }
-            IncomingVersionReplicationState::StartTransaction => {
-                self.handle_receiving_apply_transaction_started(event)
-            }
-            IncomingVersionReplicationState::CheckPurgeFence => {
-                self.handle_receiving_purge_fence_checked(event)
-            }
-            IncomingVersionReplicationState::CheckDrift => {
-                self.handle_receiving_drift_checked(event)
-            }
-            // Apply/commit: expose the version and settle ownership.
-            IncomingVersionReplicationState::VerifyReplaced => {
-                self.handle_apply_replaced_version_verified(event)
-            }
-            IncomingVersionReplicationState::ReadReplacedMetadata => {
-                self.handle_apply_replaced_metadata_iterated(event)
-            }
-            IncomingVersionReplicationState::DeleteReplacedMetadata => {
-                self.handle_apply_replaced_metadata_deleted(event)
-            }
-            IncomingVersionReplicationState::WriteReclaimCandidate => {
-                self.handle_apply_reclaim_candidate_written(event)
-            }
-            IncomingVersionReplicationState::FenceBackend => {
-                self.handle_apply_backend_fence_checked(event)
-            }
-            IncomingVersionReplicationState::VerifyExistingBlob => {
-                self.handle_apply_existing_blob_verified(event)
-            }
-            IncomingVersionReplicationState::WriteBlobLocation => {
-                self.handle_apply_blob_location_written(event)
-            }
-            IncomingVersionReplicationState::ReadObjectLookup => {
-                self.handle_apply_object_lookup_read(event)
-            }
-            IncomingVersionReplicationState::ReadCurrentVersion => {
-                self.handle_apply_current_version_read(event)
-            }
-            IncomingVersionReplicationState::ApplyHeadTransition => {
-                self.handle_apply_head_transition_progressed(event)
-            }
-            IncomingVersionReplicationState::WriteBlobVersion => {
-                self.handle_apply_blob_version_written(event)
-            }
-            IncomingVersionReplicationState::WriteMultipartMetadata => {
-                self.handle_apply_multipart_metadata_written(event)
-            }
-            IncomingVersionReplicationState::WriteLiveObligation => {
-                self.handle_apply_live_obligation_written(event)
-            }
-            IncomingVersionReplicationState::CheckCommitQuota => {
-                self.handle_apply_commit_quota_checked(event)
-            }
-            IncomingVersionReplicationState::UpdateUsage => self.handle_apply_usage_updated(event),
-            IncomingVersionReplicationState::WriteCleanupRow => {
-                self.handle_apply_cleanup_row_written(event)
-            }
-            IncomingVersionReplicationState::CommitTransaction => {
-                self.handle_apply_transaction_committed(event)
-            }
-            IncomingVersionReplicationState::ReleaseReservation => {
-                self.handle_apply_reservation_released(event)
-            }
-            IncomingVersionReplicationState::ScheduleUsage => {
-                self.handle_apply_usage_scheduled(event)
-            }
-            IncomingVersionReplicationState::ScheduleLiveDrain => {
-                self.handle_apply_live_drain_scheduled(event)
-            }
-            IncomingVersionReplicationState::RegisterBlobInDht => {
-                self.handle_apply_blob_registration_settled(event)
-            }
-            IncomingVersionReplicationState::SendApplyComplete => {
-                self.handle_apply_completion_sent(event)
-            }
-            // Cleanup: reject, abort, delete and close.
-            IncomingVersionReplicationState::SendApplyRejected => {
-                self.handle_cleanup_apply_rejection_sent(event)
-            }
-            IncomingVersionReplicationState::AbortTransaction => {
-                self.handle_cleanup_transaction_aborted(event)
-            }
-            IncomingVersionReplicationState::CleanupReceivedBlob => {
-                self.handle_cleanup_received_blob_cleaned(event)
-            }
-            IncomingVersionReplicationState::CloseConnection => {
-                self.handle_cleanup_connection_closed(event)
-            }
-            IncomingVersionReplicationState::Finish => smallvec![],
-            IncomingVersionReplicationState::Error => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            IncomingVersionReplicationState::Finish | IncomingVersionReplicationState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        let default = self.result(self.apply_committed);
-        let output = self.output.unwrap_or(Ok(default));
-        match (self.state, output) {
-            (IncomingVersionReplicationState::Error, Err(error)) => Err(error),
-            (_, output) => Ok(output),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        let mut effects = smallvec![];
-
-        let cleanup_location = match &self.state {
-            // An unknown commit outcome must preserve the copy: the commit may
-            // have landed, so the reservation is released instead of deleted.
-            IncomingVersionReplicationState::CommitTransaction => {
-                if let Some(received) = self.received_blob.as_mut() {
-                    received.cleanup_on_abort = false;
-                }
-                None
-            }
-            _ => self
-                .received_blob
-                .as_mut()
-                .and_then(ReceivedBlob::take_cleanup),
-        };
-        if let Some(location) = cleanup_location {
-            effects.push(Effect::Blob(BlobEffect::Delete { location }));
-        }
-        if let Some(txn_id) = self.txn_id.take() {
-            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
-        }
-        effects.push(Effect::Blob(BlobEffect::CloseConnection {
-            stream_id: self.stream_id,
-        }));
-
-        effects
     }
 }
 
