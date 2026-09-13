@@ -276,6 +276,8 @@ pub enum ReplicateScopeError {
     BucketNotFound,
     #[error("replication scope exceeds {limit} versions")]
     ScopeLimit { limit: usize },
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -735,7 +737,7 @@ pub(crate) fn map_sync_key(
 }
 
 impl Operation for ReplicateScopeOperation {
-    type Output = Option<Result<ReplicateScopeResult, ReplicateScopeError>>;
+    type Output = ReplicateScopeResult;
     type Error = ReplicateScopeError;
 
     fn start(&mut self) -> Effects {
@@ -964,12 +966,17 @@ impl Operation for ReplicateScopeOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ReplicateScopeState::Error
-            && let Some(Err(err)) = self.output
-        {
-            return Err(err);
+        // A finished operation carries its result, a failed one its error; any
+        // other state is an explicit premature-finalization failure rather than
+        // a successful absence.
+        if matches!(
+            self.state,
+            ReplicateScopeState::Finish | ReplicateScopeState::Error
+        ) {
+            self.output.unwrap_or(Err(ReplicateScopeError::NotFinished))
+        } else {
+            Err(ReplicateScopeError::NotFinished)
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -2713,9 +2720,9 @@ mod tests {
         MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
         MultipartObjectSummary, PathRestriction, Permission, PortableSourceDescriptor,
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, ReferenceHandling,
-        ReplicationItemKind, ReplicationNegotiationResult, ReplicationSuboperationResult,
-        ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
-        VersionSourceBinding,
+        ReplicationItemError, ReplicationItemKind, ReplicationNegotiationResult,
+        ReplicationSuboperationResult, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
+        StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_core::types::Effects;
     use aruna_storage::FjallStorage;
@@ -3132,6 +3139,51 @@ mod tests {
                 limit: MAX_SCOPE_VERSIONS,
             }))
         );
+    }
+
+    #[test]
+    fn scope_finalize_is_explicit_before_completion() {
+        let op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+        assert_eq!(op.finalize(), Err(ReplicateScopeError::NotFinished));
+    }
+
+    #[test]
+    fn scope_finalize_reports_a_failed_child_item() {
+        // Malformed or refused child output is recorded and still finalizes to
+        // the scope result, never to a successful absence.
+        let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+        op.state = super::ReplicateScopeState::RunVersionReplication;
+
+        let effects = op.step(Event::SubOperation(
+            SubOperationEvent::ReplicationItemResult {
+                result: Err(ReplicationItemError {
+                    failure: ReplicationFailure::AccessDenied,
+                    message: "denied".to_string(),
+                }),
+            },
+        ));
+
+        assert!(effects.is_empty());
+        assert_eq!(op.state, super::ReplicateScopeState::Finish);
+        assert_eq!(op.result.failed, 1);
+        assert_eq!(op.result.failure, Some(ReplicationFailure::AccessDenied));
+        let expected = op.result.clone();
+        assert_eq!(op.finalize(), Ok(expected));
+    }
+
+    #[test]
+    fn scope_counts_bytes_finalizes_success() {
+        let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+        op.state = super::ReplicateScopeState::RunVersionReplication;
+
+        op.step(Event::SubOperation(
+            SubOperationEvent::ReplicationItemResult {
+                result: Ok(ReplicationSuboperationResult::ReplicatedBytes(42)),
+            },
+        ));
+
+        let expected = op.result.clone();
+        assert_eq!(op.finalize(), Ok(expected));
     }
 
     #[test]

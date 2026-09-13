@@ -295,7 +295,6 @@ async fn mint_credential(
         context,
     ))
     .await
-    .map_err(|error| JobError::retryable(format!("workspace credential mint failed: {error}")))?
     .map_err(|error| JobError::retryable(format!("workspace credential mint failed: {error}")))?;
     Ok(WorkspaceCredential {
         access_key: access.access_key,
@@ -1054,9 +1053,7 @@ async fn replicate_output(
     .with_destination(bucket.clone(), key.clone(), record.owner_node_id, auth);
     let result = Box::pin(drive(operation, context))
         .await
-        .and_then(|result| result.transpose())
-        .map_err(|error| output_replication_error(error.failure(), error.to_string()))?
-        .ok_or_else(|| JobError::retryable("output copy returned no result"))?;
+        .map_err(|error| output_replication_error(error.failure(), error.to_string()))?;
     if result.failed > 0 || result.replicated == 0 && result.skipped == 0 {
         return Err(output_replication_error(
             result.failure.unwrap_or(ReplicationFailure::Other),

@@ -87,7 +87,6 @@ async fn revoke_state() -> (TempDir, Arc<ServerState>, AuthContext, String) {
         &state.get_ctx(),
     )
     .await
-    .unwrap()
     .unwrap();
 
     (dir, state, auth, access_key_id)
