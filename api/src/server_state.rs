@@ -37,14 +37,12 @@ use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -56,112 +54,166 @@ pub const INITIAL_LOCAL_ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboardin
 pub(crate) const ROCRATE_UPLOAD_SLOTS: usize = 32;
 pub(crate) const DOWNLOAD_SLOTS: usize = 256;
 
-#[derive(Debug)]
-struct PublicDns;
-
-impl Resolve for PublicDns {
-    fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().to_string();
-        Box::pin(async move {
-            let addresses = tokio::net::lookup_host((host.as_str(), 0))
-                .await
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?
-                .collect::<Vec<_>>();
-            if addresses.is_empty()
-                || addresses
-                    .iter()
-                    .any(|address| !public_address(address.ip()))
-            {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "assistant provider DNS resolved to a non-public address",
-                ))
-                    as Box<dyn std::error::Error + Send + Sync>);
-            }
-            Ok(Box::new(addresses.into_iter()) as Addrs)
-        })
-    }
-}
-
-pub(crate) fn public_address(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => public_ipv4(address),
-        IpAddr::V6(address) => public_ipv6(address),
-    }
-}
-
-fn public_ipv4(address: Ipv4Addr) -> bool {
-    let [a, b, c, d] = address.octets();
-    !(a == 0
-        || address.is_private()
-        || (a == 100 && b & 0xc0 == 0x40)
-        || address.is_loopback()
-        || address.is_link_local()
-        || (a == 192 && b == 0 && c == 0 && d != 9 && d != 10)
-        || address.is_documentation()
-        || (a == 198 && b & 0xfe == 18)
-        || address.is_multicast()
-        || a & 0xf0 == 0xf0)
-}
-
-fn public_ipv6(address: Ipv6Addr) -> bool {
-    let segments = address.segments();
-    // Server-side providers use currently assigned global unicast space only.
-    segments[0] & 0xe000 == 0x2000
-        && !matches!(segments, [0x2001, 0xdb8, ..] | [0x3fff, 0..=0x0fff, ..])
-        && !matches!(segments, [0x2002, ..])
-        && !(matches!(segments, [0x2001, b, ..] if b < 0x200)
-            && !(u128::from_be_bytes(address.octets())
-                == 0x2001_0001_0000_0000_0000_0000_0000_0001
-                || u128::from_be_bytes(address.octets())
-                    == 0x2001_0001_0000_0000_0000_0000_0000_0002
-                || matches!(segments, [0x2001, 3, ..] | [0x2001, 4, 0x112, ..])
-                || matches!(segments, [0x2001, b, ..] if (0x20..=0x3f).contains(&b))))
-}
-
+/// Identity, realm trust roots, and the shared issuer-key cache. The `Arc`
+/// fields are the node's shared owners: cloning the state clones these handles
+/// and never recreates the guarded contents.
 #[derive(Clone, Debug)]
-pub struct ServerState {
-    // Contains neccessary drivers for request handling
-    driver_ctx: Arc<DriverContext>,
-    // Capabilities defined as in spec: Management, Server and User node capabilities
-    node_capabilities: NodeCapabilities,
-    // Bounded TTL + LRU cache of trusted issuer decoding keys
-    issuer_keys: Arc<IssuerKeyCache>,
-    // Contains trusted realms
-    trusted_realms_list: Arc<RwLock<HashSet<RealmId, ahash::RandomState>>>,
-    initial_admin_claim: Option<Arc<AtomicBool>>,
-    // Realm membership
+struct IdentityState {
+    // Realm membership.
     realm_id: RealmId,
-    // Realm membership
+    // Realm membership.
     node_id: NodeId,
+    // Capabilities defined as in spec: Management, Server and User node capabilities.
+    node_capabilities: NodeCapabilities,
     // Issuer-local key that encrypts S3 credential secrets at rest, derived from
     // this node's secret so it matches the S3 verifier on the same node.
     credential_encryption_key: CredentialEncryptionKey,
-    // Contains OIDC config and Client
+    // Contains OIDC config and Client.
     oidc_validator: Option<Arc<OidcValidator>>,
-    jobs_runtime: Arc<JobsRuntime>,
-    interface_state: Arc<RwLock<InterfaceRuntimeState>>,
-    portal: Arc<RwLock<PortalRuntimeState>>,
-    // Per-node Prometheus registry shared with the S3 server and ops listener.
-    metrics: Arc<NodeMetrics>,
+    // Bounded TTL + LRU cache of trusted issuer decoding keys. One cache per
+    // node: every state clone must observe the same cache identity.
+    issuer_keys: Arc<IssuerKeyCache>,
+    // Contains trusted realms. A mutation inserts under the write guard and
+    // persists the snapshot after the guard drops, so no lock crosses I/O.
+    trusted_realms_list: Arc<RwLock<HashSet<RealmId, ahash::RandomState>>>,
+    // One-time initial-admin latch. The claim is persisted after the flag is
+    // set, so a durable claim always implies a latched flag.
+    initial_admin_claim: Option<Arc<AtomicBool>>,
+}
+
+impl IdentityState {
+    async fn add_trusted_realm(&self, driver_ctx: &DriverContext, realm_id: RealmId) {
+        self.trusted_realms_list.write().await.insert(realm_id);
+        self.persist_trusted_realms(driver_ctx).await;
+    }
+
+    async fn persist_trusted_realms(&self, driver_ctx: &DriverContext) {
+        let trusted_realms = self.trusted_realms_list.read().await.clone();
+        persist_state(driver_ctx, TRUSTED_REALMS_LIST_KEY, &trusted_realms).await;
+    }
+
+    async fn claim_initial_admin(
+        &self,
+        driver_ctx: &DriverContext,
+        auth: &AuthContext,
+    ) -> Result<(), ClaimInitialRealmAdminError> {
+        let Some(initial_admin_claim) = &self.initial_admin_claim else {
+            return Ok(());
+        };
+
+        if auth.realm_id != self.realm_id {
+            return Ok(());
+        }
+
+        if initial_admin_claim.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        for _ in 0..3 {
+            let result = drive(
+                ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+                    actor: Actor {
+                        node_id: self.node_id,
+                        user_id: auth.user_id,
+                        realm_id: auth.realm_id,
+                    },
+                }),
+                driver_ctx,
+            )
+            .await;
+
+            match result {
+                Ok(ClaimInitialRealmAdminResult::Claimed(_))
+                | Ok(ClaimInitialRealmAdminResult::AlreadyClaimed) => {
+                    initial_admin_claim.store(true, Ordering::Release);
+                    self.persist_admin_claim(driver_ctx).await;
+                    return Ok(());
+                }
+                Err(ClaimInitialRealmAdminError::StorageError(
+                    StorageError::TransactionConflict,
+                )) => {
+                    if initial_admin_claim.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(ClaimInitialRealmAdminError::StorageError(
+            StorageError::TransactionConflict,
+        ))
+    }
+
+    async fn persist_admin_claim(&self, driver_ctx: &DriverContext) {
+        let Some(initial_admin_claim) = &self.initial_admin_claim else {
+            return;
+        };
+        let claimed = initial_admin_claim.load(Ordering::Acquire);
+        persist_state(driver_ctx, INITIAL_REALM_ADMIN_CLAIMED_KEY, &claimed).await;
+    }
+}
+
+/// Request admission limits: bounded operation slots, proxy trust, and the
+/// operator-configured rate limiter.
+#[derive(Clone, Debug)]
+struct RequestLimits {
     rocrate_limits: RoCrateLimits,
     // Peers allowed to set `x-forwarded-*`; empty means no proxy is trusted.
     trusted_proxies: Vec<ipnet::IpNet>,
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
+    // Semaphore owners are moved into the state, never recreated per clone.
     rocrate_upload_slots: Arc<Semaphore>,
     download_slots: Arc<Semaphore>,
-    // Node shutdown token: long-lived response streams end when it fires, so
-    // the ingress drain does not have to wait for client disconnects.
+}
+
+/// Interface and portal runtime state, the process shutdown token, and the
+/// user-node wipe latch.
+#[derive(Clone, Debug)]
+struct Interfaces {
+    // One lock guards the rest/s3/mcp tuple: the MCP entry is derived from the
+    // registered REST entry, so the three must change together.
+    interface_state: Arc<RwLock<InterfaceRuntimeState>>,
+    // One lock guards `status` and `portal_dir` together: a non-installed
+    // status always clears the directory.
+    portal: Arc<RwLock<PortalRuntimeState>>,
+    // Cached management urls the management-route relay re-issues against.
+    management_urls: Arc<RwLock<ManagementUrlCache>>,
+    // Long-lived response streams end when this fires, so the ingress drain
+    // does not have to wait for client disconnects.
     shutdown_token: CancellationToken,
     // Present only on a user node: the owner's local wipe latch.
     device_wipe: Option<Arc<DeviceWipe>>,
-    // Management api urls the management-route relay re-issues against.
-    management_urls: Arc<RwLock<ManagementUrlCache>>,
-    assistant_proxy: bool,
-    assistant_client: Option<reqwest::Client>,
+}
+
+/// Outbound assistant provider connections. The client is built once with its
+/// egress policy by the route that uses it and shared by every state clone.
+#[derive(Clone, Debug)]
+struct AssistantConnections {
+    proxy_enabled: bool,
+    // `None` when the platform client cannot be built; the proxy answers 500.
+    client: Option<reqwest::Client>,
+    // Guarded map of live per-provider refresh locks. The guard protects only
+    // the map; a refresh runs under the per-provider lock, never under it.
     chatgpt_refresh_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     chatgpt_issuer: String,
     chatgpt_base_url: String,
+}
+
+/// The one server-state entry point. Cloning it shares every underlying owner
+/// (driver context, semaphores, locks, caches) rather than duplicating them.
+#[derive(Clone, Debug)]
+pub struct ServerState {
+    // Contains necessary drivers for request handling.
+    driver_ctx: Arc<DriverContext>,
+    jobs_runtime: Arc<JobsRuntime>,
+    // Per-node Prometheus registry shared with the S3 server and ops listener.
+    metrics: Arc<NodeMetrics>,
+    identity: IdentityState,
+    limits: RequestLimits,
+    interfaces: Interfaces,
+    assistant: AssistantConnections,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -256,64 +308,69 @@ impl ServerState {
             .as_ref()
             .map(|net| net.credential_encryption_key())
             .unwrap_or_else(CredentialEncryptionKey::random);
-        let assistant_client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none());
-        let assistant_client = if matches!(&node_capabilities, NodeCapabilities::User { .. }) {
-            assistant_client
-        } else {
-            assistant_client.no_proxy().dns_resolver(PublicDns)
-        };
+        let assistant_client =
+            crate::routes::assistant::egress::outbound_client(&node_capabilities);
         let state = Self {
             driver_ctx,
-            realm_id,
-            node_id,
-            credential_encryption_key,
-            oidc_validator,
             jobs_runtime,
-            node_capabilities,
-            trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
-            issuer_keys: Arc::new(IssuerKeyCache::new()),
-            initial_admin_claim,
-            interface_state: Arc::new(RwLock::new(InterfaceRuntimeState::default())),
-            portal: Arc::new(RwLock::new(PortalRuntimeState::default())),
             metrics: Arc::new(NodeMetrics::new()),
-            rocrate_limits: RoCrateLimits::default(),
-            trusted_proxies: Vec::new(),
-            rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
-            rocrate_upload_slots: Arc::new(Semaphore::new(ROCRATE_UPLOAD_SLOTS)),
-            download_slots: Arc::new(Semaphore::new(DOWNLOAD_SLOTS)),
-            shutdown_token: CancellationToken::new(),
-            device_wipe: None,
-            management_urls: Arc::new(RwLock::new(ManagementUrlCache::default())),
-            assistant_proxy: true,
-            assistant_client: assistant_client.build().ok(),
-            chatgpt_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
-            chatgpt_issuer: "https://auth.openai.com".to_string(),
-            chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            identity: IdentityState {
+                realm_id,
+                node_id,
+                node_capabilities,
+                credential_encryption_key,
+                oidc_validator,
+                issuer_keys: Arc::new(IssuerKeyCache::new()),
+                trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
+                initial_admin_claim,
+            },
+            limits: RequestLimits {
+                rocrate_limits: RoCrateLimits::default(),
+                trusted_proxies: Vec::new(),
+                rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
+                rocrate_upload_slots: Arc::new(Semaphore::new(ROCRATE_UPLOAD_SLOTS)),
+                download_slots: Arc::new(Semaphore::new(DOWNLOAD_SLOTS)),
+            },
+            interfaces: Interfaces {
+                interface_state: Arc::new(RwLock::new(InterfaceRuntimeState::default())),
+                portal: Arc::new(RwLock::new(PortalRuntimeState::default())),
+                management_urls: Arc::new(RwLock::new(ManagementUrlCache::default())),
+                shutdown_token: CancellationToken::new(),
+                device_wipe: None,
+            },
+            assistant: AssistantConnections {
+                proxy_enabled: true,
+                client: assistant_client,
+                chatgpt_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+                chatgpt_issuer: "https://auth.openai.com".to_string(),
+                chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            },
         };
-        state.persist_trusted_realms().await;
+        state
+            .identity
+            .persist_trusted_realms(state.driver_ctx.as_ref())
+            .await;
         state
     }
 
     pub fn with_shutdown_token(mut self, token: CancellationToken) -> Self {
-        self.shutdown_token = token;
+        self.interfaces.shutdown_token = token;
         self
     }
 
     /// Hands the device plane the wipe latch the process erases through. Only a
     /// user node is given one; without it `POST /device/wipe` is unavailable.
     pub fn with_device_wipe(mut self, wipe: Arc<DeviceWipe>) -> Self {
-        self.device_wipe = Some(wipe);
+        self.interfaces.device_wipe = Some(wipe);
         self
     }
 
     pub fn device_wipe(&self) -> Option<&Arc<DeviceWipe>> {
-        self.device_wipe.as_ref()
+        self.interfaces.device_wipe.as_ref()
     }
 
     pub fn shutdown_token(&self) -> CancellationToken {
-        self.shutdown_token.clone()
+        self.interfaces.shutdown_token.clone()
     }
 
     pub fn get_ctx(&self) -> Arc<DriverContext> {
@@ -332,71 +389,75 @@ impl ServerState {
     }
 
     pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
-        self.rocrate_limits = limits;
+        self.limits.rocrate_limits = limits;
         self
     }
 
     pub fn rocrate_limits(&self) -> &RoCrateLimits {
-        &self.rocrate_limits
+        &self.limits.rocrate_limits
     }
 
     pub fn with_trusted_proxies(mut self, proxies: Vec<ipnet::IpNet>) -> Self {
-        self.trusted_proxies = proxies;
+        self.limits.trusted_proxies = proxies;
         self
     }
 
     pub fn trusted_proxies(&self) -> &[ipnet::IpNet] {
-        &self.trusted_proxies
+        &self.limits.trusted_proxies
     }
 
     /// Installs operator-configured request limiters. Call before serving.
     pub fn with_rate_limits(mut self, limits: crate::rate_limit::ApiRateLimits) -> Self {
-        self.rate_limits = Arc::new(limits);
+        self.limits.rate_limits = Arc::new(limits);
         self
     }
 
     pub fn rate_limits(&self) -> &crate::rate_limit::ApiRateLimits {
-        &self.rate_limits
+        &self.limits.rate_limits
     }
 
     pub(crate) fn try_rocrate_slot(&self) -> Option<OwnedSemaphorePermit> {
-        self.rocrate_upload_slots.clone().try_acquire_owned().ok()
+        self.limits
+            .rocrate_upload_slots
+            .clone()
+            .try_acquire_owned()
+            .ok()
     }
 
     pub(crate) fn try_acquire_download(&self) -> Option<OwnedSemaphorePermit> {
-        self.download_slots.clone().try_acquire_owned().ok()
+        self.limits.download_slots.clone().try_acquire_owned().ok()
     }
 
     pub fn jobs_runtime(&self) -> Arc<JobsRuntime> {
         self.jobs_runtime.clone()
     }
     pub fn get_realm_id(&self) -> RealmId {
-        self.realm_id
+        self.identity.realm_id
     }
 
     pub fn get_node_id(&self) -> NodeId {
-        self.node_id
+        self.identity.node_id
     }
 
     pub fn credential_encryption_key(&self) -> &CredentialEncryptionKey {
-        &self.credential_encryption_key
+        &self.identity.credential_encryption_key
     }
 
     pub fn with_assistant_proxy(mut self, enabled: bool) -> Self {
-        self.assistant_proxy = enabled;
+        self.assistant.proxy_enabled = enabled;
         self
     }
 
     pub fn assistant_proxy(&self) -> bool {
-        self.assistant_proxy
+        self.assistant.proxy_enabled
     }
 
     pub fn assistant_client(&self) -> Option<&reqwest::Client> {
-        self.assistant_client.as_ref()
+        self.assistant.client.as_ref()
     }
 
     pub(crate) async fn chatgpt_lock(&self, provider_id: &str) -> Arc<Mutex<()>> {
-        let mut locks = self.chatgpt_refresh_locks.lock().await;
+        let mut locks = self.assistant.chatgpt_refresh_locks.lock().await;
         locks.retain(|_, lock| lock.strong_count() > 0);
         if let Some(lock) = locks.get(provider_id).and_then(Weak::upgrade) {
             return lock;
@@ -407,26 +468,27 @@ impl ServerState {
     }
 
     pub fn chatgpt_issuer(&self) -> &str {
-        &self.chatgpt_issuer
+        &self.assistant.chatgpt_issuer
     }
 
     pub fn chatgpt_base_url(&self) -> &str {
-        &self.chatgpt_base_url
+        &self.assistant.chatgpt_base_url
     }
 
     #[cfg(test)]
     pub(crate) fn with_chatgpt_urls(mut self, issuer: String, base_url: String) -> Self {
-        self.chatgpt_issuer = issuer;
-        self.chatgpt_base_url = base_url;
+        self.assistant.chatgpt_issuer = issuer;
+        self.assistant.chatgpt_base_url = base_url;
         self
     }
 
     pub fn node_capabilities(&self) -> &NodeCapabilities {
-        &self.node_capabilities
+        &self.identity.node_capabilities
     }
 
     pub fn oidc_validator(&self) -> Result<&OidcValidator, OidcError> {
-        self.oidc_validator
+        self.identity
+            .oidc_validator
             .as_deref()
             .ok_or(OidcError::NotConfigured)
     }
@@ -436,7 +498,7 @@ impl ServerState {
     }
 
     pub async fn register_rest_public(&self, bind_address: SocketAddr, public_url: Option<&str>) {
-        let mut interface_state = self.interface_state.write().await;
+        let mut interface_state = self.interfaces.interface_state.write().await;
         interface_state.rest = Some(RestInterfaceRuntime::from_bind_address(
             bind_address,
             public_url,
@@ -444,7 +506,7 @@ impl ServerState {
     }
 
     pub async fn register_s3_interface(&self, bind_address: SocketAddr, advertised_host: &str) {
-        let mut interface_state = self.interface_state.write().await;
+        let mut interface_state = self.interfaces.interface_state.write().await;
         interface_state.s3 = Some(S3InterfaceRuntime {
             bind_address,
             base_url: client_host_url(advertised_host, bind_address),
@@ -452,7 +514,7 @@ impl ServerState {
     }
 
     pub async fn register_mcp_interface(&self) {
-        let mut interface_state = self.interface_state.write().await;
+        let mut interface_state = self.interfaces.interface_state.write().await;
         interface_state.mcp = interface_state
             .rest
             .as_ref()
@@ -463,19 +525,19 @@ impl ServerState {
     }
 
     pub async fn interface_state(&self) -> InterfaceRuntimeState {
-        self.interface_state.read().await.clone()
+        self.interfaces.interface_state.read().await.clone()
     }
 
     pub async fn portal_status(&self) -> PortalStatus {
-        self.portal.read().await.status.clone()
+        self.interfaces.portal.read().await.status.clone()
     }
 
     pub async fn portal_runtime_state(&self) -> PortalRuntimeState {
-        self.portal.read().await.clone()
+        self.interfaces.portal.read().await.clone()
     }
 
     pub async fn set_portal_status(&self, status: PortalStatus) {
-        let mut portal = self.portal.write().await;
+        let mut portal = self.interfaces.portal.write().await;
         if !status.installed {
             portal.portal_dir = None;
         }
@@ -483,7 +545,7 @@ impl ServerState {
     }
 
     pub async fn set_portal_dir(&self, status: PortalStatus, portal_dir: PathBuf) {
-        let mut portal = self.portal.write().await;
+        let mut portal = self.interfaces.portal.write().await;
         portal.portal_dir = status.installed.then_some(portal_dir);
         portal.status = status;
     }
@@ -491,8 +553,8 @@ impl ServerState {
     pub async fn load_realm_nodes(&self) -> Vec<NodeId> {
         aruna_operations::metadata::api::load_realm_nodes(
             self.driver_ctx.as_ref(),
-            self.realm_id,
-            self.node_id,
+            self.identity.realm_id,
+            self.identity.node_id,
         )
         .await
     }
@@ -502,7 +564,7 @@ impl ServerState {
         selector: &OidcTokenSelector,
     ) -> Result<OidcProviderConfig, OidcError> {
         let config = drive(
-            GetRealmConfigOperation::new(self.realm_id),
+            GetRealmConfigOperation::new(self.identity.realm_id),
             &self.driver_ctx,
         )
         .await
@@ -526,15 +588,21 @@ impl ServerState {
     }
 
     pub fn is_management_node(&self) -> bool {
-        matches!(self.node_capabilities, NodeCapabilities::Management { .. })
+        matches!(
+            self.identity.node_capabilities,
+            NodeCapabilities::Management { .. }
+        )
     }
 
     pub fn is_user_node(&self) -> bool {
-        matches!(self.node_capabilities, NodeCapabilities::User { .. })
+        matches!(
+            self.identity.node_capabilities,
+            NodeCapabilities::User { .. }
+        )
     }
 
     pub(crate) fn management_url_cache(&self) -> &Arc<RwLock<ManagementUrlCache>> {
-        &self.management_urls
+        &self.interfaces.management_urls
     }
 
     pub fn bootstrap_endpoint(&self) -> Option<EndpointAddr> {
@@ -545,7 +613,7 @@ impl ServerState {
     }
 
     pub fn realm_key_pem(&self) -> Option<String> {
-        match &self.node_capabilities {
+        match &self.identity.node_capabilities {
             NodeCapabilities::Management {
                 realm_signing_key, ..
             } => realm_signing_key
@@ -557,7 +625,7 @@ impl ServerState {
     }
 
     pub fn sign_server_delegation(&self, issuer_public_key: &str) -> Option<String> {
-        match &self.node_capabilities {
+        match &self.identity.node_capabilities {
             NodeCapabilities::Management {
                 realm_signing_key, ..
             } => Some(
@@ -573,15 +641,15 @@ impl ServerState {
         &self,
         node_id: NodeId,
     ) -> Result<OnboardingSyncTicket, OnboardingSecretError> {
-        match &self.node_capabilities {
+        match &self.identity.node_capabilities {
             NodeCapabilities::Management {
                 realm_signing_key, ..
             } => drive(
                 IssueOnboardingSyncTicketOperation::new(IssueOnboardingSyncTicketInput {
                     realm_signing_key: realm_signing_key.clone(),
-                    realm_id: self.realm_id,
+                    realm_id: self.identity.realm_id,
                     node_id,
-                    issuer_node_id: self.node_id,
+                    issuer_node_id: self.identity.node_id,
                     now: chrono::Utc::now().timestamp().max(0) as u64,
                     ttl_secs: ONBOARDING_SYNC_TICKET_TTL_SECS,
                 }),
@@ -594,16 +662,18 @@ impl ServerState {
     }
 
     pub async fn issuer_cache_len(&self) -> usize {
-        self.issuer_keys.len().await
+        self.identity.issuer_keys.len().await
     }
 
     pub async fn add_trusted_realm(&self, realm_id: RealmId) {
-        self.trusted_realms_list.write().await.insert(realm_id);
-        self.persist_trusted_realms().await;
+        self.identity
+            .add_trusted_realm(self.driver_ctx.as_ref(), realm_id)
+            .await;
     }
 
     pub async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
-        self.trusted_realms_list
+        self.identity
+            .trusted_realms_list
             .read()
             .await
             .get(realm_id)
@@ -614,76 +684,9 @@ impl ServerState {
         &self,
         auth: &AuthContext,
     ) -> Result<(), ClaimInitialRealmAdminError> {
-        let Some(initial_admin_claim) = &self.initial_admin_claim else {
-            return Ok(());
-        };
-
-        if auth.realm_id != self.realm_id {
-            return Ok(());
-        }
-
-        if initial_admin_claim.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
-        for _ in 0..3 {
-            let result = drive(
-                ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
-                    actor: Actor {
-                        node_id: self.node_id,
-                        user_id: auth.user_id,
-                        realm_id: auth.realm_id,
-                    },
-                }),
-                &self.driver_ctx,
-            )
-            .await;
-
-            match result {
-                Ok(ClaimInitialRealmAdminResult::Claimed(_))
-                | Ok(ClaimInitialRealmAdminResult::AlreadyClaimed) => {
-                    initial_admin_claim.store(true, Ordering::Release);
-                    self.persist_admin_claim().await;
-                    return Ok(());
-                }
-                Err(ClaimInitialRealmAdminError::StorageError(
-                    StorageError::TransactionConflict,
-                )) => {
-                    if initial_admin_claim.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
-                    continue;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        Err(ClaimInitialRealmAdminError::StorageError(
-            StorageError::TransactionConflict,
-        ))
-    }
-
-    async fn persist_trusted_realms(&self) {
-        let trusted_realms = self.trusted_realms_list.read().await.clone();
-        persist_state(
-            self.driver_ctx.as_ref(),
-            TRUSTED_REALMS_LIST_KEY,
-            &trusted_realms,
-        )
-        .await;
-    }
-
-    async fn persist_admin_claim(&self) {
-        let Some(initial_admin_claim) = &self.initial_admin_claim else {
-            return;
-        };
-        let claimed = initial_admin_claim.load(Ordering::Acquire);
-        persist_state(
-            self.driver_ctx.as_ref(),
-            INITIAL_REALM_ADMIN_CLAIMED_KEY,
-            &claimed,
-        )
-        .await;
+        self.identity
+            .claim_initial_admin(self.driver_ctx.as_ref(), auth)
+            .await
     }
 }
 
@@ -700,14 +703,18 @@ impl ArunaBearerTokenValidationState for ServerState {
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
-        self.trusted_realms_list.read().await.contains(realm_id)
+        self.identity
+            .trusted_realms_list
+            .read()
+            .await
+            .contains(realm_id)
     }
 
     async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
     ) -> Result<DecodingKey, ArunaBearerTokenError> {
-        self.issuer_keys.get_or_insert(issuer_pubkey).await
+        self.identity.issuer_keys.get_or_insert(issuer_pubkey).await
     }
 }
 
@@ -828,101 +835,4 @@ fn host_for_ip(ip: std::net::IpAddr) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        PublicDns, RestInterfaceRuntime, client_bind_url, client_host_url, public_address,
-    };
-    use reqwest::dns::Resolve;
-
-    #[test]
-    fn uses_public_url() {
-        let runtime = RestInterfaceRuntime::from_bind_address(
-            "0.0.0.0:3000".parse().unwrap(),
-            Some("https://api.node-1.v3.aruna-engine.org/"),
-        );
-        assert_eq!(
-            runtime.api_base_url,
-            "https://api.node-1.v3.aruna-engine.org/api/v1"
-        );
-    }
-
-    #[test]
-    fn classifies_public_addresses() {
-        assert!(public_address("8.8.8.8".parse().unwrap()));
-        assert!(public_address("2001:4860:4860::8888".parse().unwrap()));
-        for address in [
-            "127.0.0.1",
-            "100.64.0.1",
-            "198.18.0.1",
-            "::1",
-            "fc00::1",
-            "2001:db8::1",
-            "::ffff:127.0.0.1",
-        ] {
-            assert!(!public_address(address.parse().unwrap()), "{address}");
-        }
-    }
-
-    #[tokio::test]
-    async fn dns_rejects_localhost() {
-        assert!(
-            PublicDns
-                .resolve("localhost".parse().unwrap())
-                .await
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn rewrites_ipv6_url() {
-        assert_eq!(
-            client_bind_url("[::]:3000".parse().unwrap()),
-            "http://[::1]:3000"
-        );
-    }
-
-    #[test]
-    fn normalizes_s3_wildcards() {
-        assert_eq!(
-            client_host_url("0.0.0.0", "0.0.0.0:1337".parse().unwrap()),
-            "http://127.0.0.1:1337"
-        );
-        assert_eq!(
-            client_host_url("::", "[::]:1337".parse().unwrap()),
-            "http://[::1]:1337"
-        );
-    }
-
-    #[test]
-    fn preserves_s3_authority() {
-        assert_eq!(
-            client_host_url("127.0.0.1:1337", "0.0.0.0:9999".parse().unwrap()),
-            "http://127.0.0.1:1337"
-        );
-        assert_eq!(
-            client_host_url(
-                "s3.node-1.v3.aruna-engine.org",
-                "0.0.0.0:1337".parse().unwrap()
-            ),
-            "http://s3.node-1.v3.aruna-engine.org"
-        );
-    }
-
-    #[test]
-    fn preserves_s3_scheme() {
-        assert_eq!(
-            client_host_url(
-                "https://s3.node-1.v3.aruna-engine.org",
-                "0.0.0.0:1337".parse().unwrap()
-            ),
-            "https://s3.node-1.v3.aruna-engine.org"
-        );
-        assert_eq!(
-            client_host_url(
-                "https://s3.node-1.v3.aruna-engine.org/",
-                "0.0.0.0:1337".parse().unwrap()
-            ),
-            "https://s3.node-1.v3.aruna-engine.org"
-        );
-    }
-}
+mod pure_tests;

@@ -1,4 +1,6 @@
 use super::*;
+use proptest::prelude::*;
+use proptest::test_runner::RngSeed;
 
 pub(super) fn placement_entry(node_id: NodeId, weight: u32) -> NodePlacementEntry {
     NodePlacementEntry {
@@ -1331,4 +1333,69 @@ fn overlay_retains_conflicts() {
         BTreeSet::from([first.strategy_id, second.strategy_id])
     );
     assert_eq!(config.binding_directory().conflicted(), 1);
+}
+
+// The family strategy is append-once: a denied change must be an exact no-op,
+// never a partial write that a later overlay would materialize.
+#[test]
+fn family_mutation_denial_is_a_no_op() {
+    let mut state = realm_config_state();
+    let accepted = Ulid::from_bytes([0x5e; 16]);
+    state
+        .apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigJobFamilySet {
+                strategy_id: accepted,
+            },
+        ))
+        .unwrap();
+    let before = state.clone();
+
+    let denied = realm_config_event(
+        2,
+        node(1),
+        2,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::RealmConfigJobFamilySet {
+            strategy_id: Ulid::from_bytes([0xde; 16]),
+        },
+    );
+    assert_eq!(
+        state.apply(&denied),
+        Err(AdminDocumentReducerError::JobFamilyChanged)
+    );
+    assert_eq!(state, before);
+}
+
+proptest::proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        rng_seed: RngSeed::Fixed(0x5eed_2026),
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn denied_family_mutation_never_changes_state(
+        requests in proptest::collection::vec(any::<u128>(), 1..8),
+    ) {
+        let mut state = realm_config_state();
+        for (index, raw) in requests.into_iter().enumerate() {
+            let event = realm_config_event(
+                index as u8 + 1,
+                node(1),
+                index as u64 + 1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigJobFamilySet {
+                    strategy_id: Ulid::from_bytes(raw.to_be_bytes()),
+                },
+            );
+            let before = state.clone();
+            if state.apply(&event).is_err() {
+                prop_assert_eq!(&state, &before);
+            }
+        }
+    }
 }

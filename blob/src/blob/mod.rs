@@ -1,3 +1,5 @@
+//! The blob control plane: repository and group handles, staging writers,
+//! replication, and read streams over the configured backends.
 use crate::egress::EgressGuard;
 use aruna_core::NodeId;
 use aruna_net::NetHandle;

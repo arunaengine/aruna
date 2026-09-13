@@ -1,3 +1,5 @@
+//! Persisted and wire records: one module per record family, re-exported from
+//! this root so callers name the record, not its file.
 mod assistant_chat;
 mod assistant_provider;
 mod auth;

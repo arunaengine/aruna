@@ -5,6 +5,7 @@ use super::backend::{
 use super::group::GROUP_WRITE_CHUNK;
 use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -16,7 +17,6 @@ use aruna_core::structs::{
     BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
     HiddenBlobKey, MultipartUploadPartKey, ResolvedBackend,
 };
-use aruna_core::types::UserId;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use opendal::{EntryMode, ErrorKind, Operator};

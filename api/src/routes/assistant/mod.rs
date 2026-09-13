@@ -1,5 +1,6 @@
 mod chatgpt;
 mod chats;
+pub(crate) mod egress;
 mod proxy;
 
 use chatgpt::{__path_poll_login, __path_start_login, poll_login, start_login};
@@ -216,8 +217,8 @@ fn validate_url_mode(input: &str, user_node: bool) -> ServerResult<String> {
                     ));
                 }
             }
-            Some(Host::Ipv4(address)) if crate::server_state::public_address(address.into()) => {}
-            Some(Host::Ipv6(address)) if crate::server_state::public_address(address.into()) => {}
+            Some(Host::Ipv4(address)) if egress::public_address(address.into()) => {}
+            Some(Host::Ipv6(address)) if egress::public_address(address.into()) => {}
             _ => {
                 return Err(ServerError::BadRequestReason(
                     "server nodes require a public base_url host".to_string(),

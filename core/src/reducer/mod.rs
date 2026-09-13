@@ -1,3 +1,6 @@
+//! Admin-document reducer: applies replicated group, realm, user, and
+//! realm-config operations, keeping causal dots and surfacing conflicts
+//! instead of silently picking a winner.
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Included, Unbounded};

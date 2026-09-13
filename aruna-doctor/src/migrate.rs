@@ -4,6 +4,7 @@
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
+use aruna_core::NodeId;
 use aruna_core::keyspaces::{
     JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
     JOB_FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
@@ -15,7 +16,6 @@ use aruna_core::structs::{
     RealmConfigDocument, RealmId, ResultMessage, SubmissionClaim, SubmissionId,
     WitnessBudgetRecord,
 };
-use aruna_core::types::NodeId;
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};

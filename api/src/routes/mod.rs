@@ -452,6 +452,35 @@ pub(crate) mod tests {
         }
     }
 
+    /// Child modules declared behind `#[cfg(test)] mod name;`: their file is
+    /// test code, so the raw-route scan must not read assembly out of them.
+    fn test_modules(file: &Path, source: &str) -> Vec<PathBuf> {
+        let lines = source.lines().collect::<Vec<_>>();
+        let mut modules = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim() != "#[cfg(test)]" {
+                continue;
+            }
+            let Some(declaration) = lines
+                .get(index + 1)
+                .and_then(|line| line.strip_prefix("mod "))
+            else {
+                continue;
+            };
+            let Some(name) = declaration.strip_suffix(';') else {
+                continue;
+            };
+            let directory = file.with_extension("");
+            let candidate = directory.join(format!("{name}.rs"));
+            modules.push(if candidate.exists() {
+                candidate
+            } else {
+                directory.join(name).join("mod.rs")
+            });
+        }
+        modules
+    }
+
     fn raw_gaps(file: &Path, source: &str) -> Vec<&'static str> {
         let source = source.split("#[cfg(test)]").next().unwrap_or_default();
         [".route(", ".route_service(", ".nest(", ".nest_service("]
@@ -509,8 +538,23 @@ pub(crate) mod tests {
         source_files(&source_root.join("src/routes"), &mut files);
         files.push(source_root.join("src/server.rs"));
         assert!(files.len() > 1, "route modules must be discoverable");
-        for file in files {
-            let source = std::fs::read_to_string(&file).expect("readable route module");
+        let sources = files
+            .iter()
+            .map(|file| {
+                (
+                    file.clone(),
+                    std::fs::read_to_string(file).expect("readable route module"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let test_files = sources
+            .iter()
+            .flat_map(|(file, source)| test_modules(file, source))
+            .collect::<BTreeSet<_>>();
+        for (file, source) in sources {
+            if test_files.contains(&file) {
+                continue;
+            }
             if let Some(form) = raw_gaps(&file, &source).first() {
                 panic!(
                     "{} registers {form} outside routes!; use routes! or routes_at",

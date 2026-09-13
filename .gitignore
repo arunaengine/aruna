@@ -2,13 +2,13 @@ target/
 # Internal docs stay untracked; the contributor source guide is tracked.
 docs/*
 !docs/source-guide.md
-docker/
+/docker/
 .compose-data/
 .idea
 .env
 **/.env
 !.env.example
-docker/*
-portal*
+/docker/*
+/portal*
 aruna/compute-state/
 __pycache__/
