@@ -140,6 +140,9 @@ struct NetInner {
     inbound_tasks: TaskTracker,
     // Released with admission, or the inbound stream task never sees the channel close.
     loopback_streams: parking_lot::Mutex<Option<mpsc::Sender<(Alpn, streams::BiStream, NodeId)>>>,
+    /// Accepted effect futures the dispatcher spawned; shutdown waits for these
+    /// as well as for the dispatcher that accepted them.
+    effect_tasks: TaskTracker,
     eviction_shutdown: CancellationToken,
     accept_shutdown: CancellationToken,
     shutdown: CancellationToken,
@@ -770,15 +773,20 @@ impl NetHandle {
 
     /// Stops accepting inbound streams and rejects further inbound handlers,
     /// without waiting for the ones in flight or tearing the endpoint down.
+    /// Closing the trackers only lets their waits finish; it does not reject
+    /// insertions, so the dispatchers still running may add accepted work until
+    /// [`Self::shutdown_with_drain`] joins them.
     pub fn close_admission(&self) {
         self.inner.accept_shutdown.cancel();
         self.inner.loopback_streams.lock().take();
         self.inner.inbound_tasks.close();
+        self.inner.effect_tasks.close();
     }
 
     /// Stops inbound admission, gives handlers that are already running up to
     /// `drain` to finish while the endpoint is still usable, then tears the
-    /// network down and joins every child.
+    /// network down and joins every child, including accepted effect futures.
+    /// Returns whether every tracked child completed before its forced bound.
     pub async fn shutdown_with_drain(&self, drain: Duration) -> bool {
         if self.inner.shutdown.is_cancelled() {
             return false;
@@ -807,23 +815,33 @@ impl NetHandle {
         }
         self.inner.endpoint.close().await;
 
+        // Joining the dispatcher first is the admission barrier: it cannot have
+        // inserted an effect after this returns.
         let mut tasks = self.inner.tasks.lock().await;
         tasks.join_all().await;
         drop(tasks);
 
-        // The endpoint is closed, so surviving handlers now fail their stream IO
-        // instead of blocking; join them before the caller closes storage.
-        let inbound_drained =
-            tokio::time::timeout(FORCED_INBOUND_DRAIN, self.inner.inbound_tasks.wait())
-                .await
-                .is_ok();
+        // The endpoint is closed, so surviving handlers and accepted effects now
+        // fail their stream IO instead of blocking; join both before the caller
+        // closes storage.
+        let (effects_drained, inbound_drained) = tokio::join!(
+            tokio::time::timeout(FORCED_INBOUND_DRAIN, self.inner.effect_tasks.wait()),
+            tokio::time::timeout(FORCED_INBOUND_DRAIN, self.inner.inbound_tasks.wait()),
+        );
+        if effects_drained.is_err() {
+            warn!(
+                pending = self.inner.effect_tasks.len(),
+                "Gave up joining accepted effect futures during shutdown"
+            );
+        }
+        let inbound_drained = inbound_drained.is_ok();
         if !inbound_drained {
             warn!(
                 pending = self.inner.inbound_tasks.len(),
                 "Gave up joining inbound stream handlers during shutdown"
             );
         }
-        inbound_drained
+        effects_drained.is_ok() && inbound_drained
     }
 
     pub async fn get_status(&self) -> NetState {
