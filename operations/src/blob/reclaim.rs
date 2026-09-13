@@ -1097,6 +1097,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn long_operation_candidate_keeps_enqueue_grace() {
+        // A candidate written after a long apply carries its enqueue time, so a
+        // sweep past the operation-start grace but not the enqueue grace must
+        // defer it rather than free the bytes early.
+        let dir = tempdir().unwrap();
+        let context = context(dir.path().to_str().unwrap());
+        seed(&context, 10).await;
+        let started_at = SystemTime::UNIX_EPOCH;
+        let enqueued_at = started_at + Duration::from_secs(6 * 60 * 60);
+        write(
+            &context,
+            BLOB_RECLAIM_KEYSPACE,
+            candidate_key().to_bytes(),
+            ReclaimCandidate { enqueued_at }.to_bytes().unwrap(),
+        )
+        .await;
+
+        let started_grace =
+            started_at + CleanupStrategy::DEFAULT_RECLAIM_AFTER + Duration::from_secs(1);
+        let outcome = sweep_at(&context, started_grace, None).await.unwrap();
+
+        assert_eq!(outcome.not_due, 1);
+        assert_eq!(outcome.freed, 0);
+        assert!(
+            read(&context, BLOB_RECLAIM_KEYSPACE, candidate_key().to_bytes())
+                .await
+                .is_some()
+        );
+
+        let enqueued_grace =
+            enqueued_at + CleanupStrategy::DEFAULT_RECLAIM_AFTER + Duration::from_secs(1);
+        let outcome = sweep_at(&context, enqueued_grace, None).await.unwrap();
+
+        assert_eq!(outcome.freed, 1);
+        assert_eq!(outcome.freed_bytes, 10);
+    }
+
+    #[tokio::test]
     async fn sweep_frees_due() {
         let dir = tempdir().unwrap();
         let context = context(dir.path().to_str().unwrap());

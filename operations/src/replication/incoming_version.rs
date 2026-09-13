@@ -206,6 +206,26 @@ pub struct IncomingVersionReplicationResult {
     pub group_id: Option<GroupId>,
 }
 
+/// The enqueue-phase clock. A function pointer compares by address with the
+/// default lint noise, so equality is explicit; two operations that share the
+/// production clock or the same test clock are equal.
+#[derive(Clone, Copy, Debug)]
+struct EnqueueClock(fn() -> SystemTime);
+
+impl PartialEq for EnqueueClock {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::fn_addr_eq(self.0, other.0)
+    }
+}
+
+impl Eq for EnqueueClock {}
+
+impl EnqueueClock {
+    fn now(self) -> SystemTime {
+        (self.0)()
+    }
+}
+
 /// The bytes accepted from the sender, with the reservation cleanup this node
 /// still owes while the apply transaction is unresolved.
 #[derive(Debug, PartialEq)]
@@ -276,9 +296,10 @@ pub struct IncomingVersionReplicationOperation {
     publisher_node_id: NodeId,
     local_realm_id: RealmId,
     manifest: VersionReplicationManifest,
-    /// One wall-clock sample per operation: records this receiver creates
-    /// (reclaim candidates) carry it instead of a fresh per-phase timestamp.
-    now: SystemTime,
+    /// The clock the enqueue phase samples. A reclaim candidate is stamped when
+    /// it is enqueued, so a long apply still gets its full grace window instead
+    /// of inheriting an operation-start time that may already be stale.
+    clock: EnqueueClock,
     txn_id: Option<Ulid>,
     destination_group_id: Option<GroupId>,
     /// The destination bucket's own rules, so this receiver routes its replica
@@ -340,7 +361,7 @@ impl IncomingVersionReplicationOperation {
             publisher_node_id: local_node_id,
             local_realm_id,
             manifest,
-            now: SystemTime::now(),
+            clock: EnqueueClock(SystemTime::now),
             txn_id: None,
             destination_group_id: None,
             destination_rules: Vec::new(),
@@ -412,10 +433,11 @@ impl IncomingVersionReplicationOperation {
         self
     }
 
-    /// Pins the operation-wide wall clock the receiver stamps generated records
-    /// with. Production samples it once in [`Self::new`]; tests fix it.
-    pub fn with_now(mut self, now: SystemTime) -> Self {
-        self.now = now;
+    /// Replaces the clock the enqueue phase samples. Production keeps the
+    /// default; tests fix it so a long apply can prove the candidate carries
+    /// the enqueue time rather than the construction time.
+    pub fn with_clock(mut self, clock: fn() -> SystemTime) -> Self {
+        self.clock = EnqueueClock(clock);
         self
     }
 
@@ -1153,7 +1175,7 @@ impl IncomingVersionReplicationOperation {
 
     fn write_replaced_candidate(&mut self, key: ReclaimCandidateKey) -> Effects {
         let candidate = ReclaimCandidate {
-            enqueued_at: self.now,
+            enqueued_at: self.clock.now(),
         };
         let value = match candidate.to_bytes() {
             Ok(value) => value,
@@ -3069,6 +3091,7 @@ mod tests {
     };
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::{NodeId, UserId};
+    use std::cell::Cell;
     use std::collections::{BTreeSet, HashMap};
     use std::time::{Duration, SystemTime};
     use ulid::Ulid;
@@ -3085,9 +3108,28 @@ mod tests {
         Ulid::from_parts(7, 7)
     }
 
-    /// Fixed wall clock for the traces; production samples once per operation.
+    /// Fixed wall clock for the traces; the receiver samples its enqueue clock
+    /// when it writes a reclaim candidate.
     fn trace_now() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+
+    fn fixed_trace_clock() -> SystemTime {
+        trace_now()
+    }
+
+    thread_local! {
+        /// The enqueue-phase clock for the reclaim regression: the test advances
+        /// it while the operation is mid-apply to model a long transfer.
+        static CONTROLLED_CLOCK: Cell<SystemTime> = const { Cell::new(SystemTime::UNIX_EPOCH) };
+    }
+
+    fn controlled_clock() -> SystemTime {
+        CONTROLLED_CLOCK.with(Cell::get)
+    }
+
+    fn set_controlled_clock(now: SystemTime) {
+        CONTROLLED_CLOCK.with(|clock| clock.set(now));
     }
 
     /// Named fixed identities, one seed per role, so a persisted value in a
@@ -5914,7 +5956,7 @@ mod tests {
             manifest,
         )
         .with_publisher_node(iroh::SecretKey::from_bytes(&[0x31; 32]).public())
-        .with_now(trace_now());
+        .with_clock(fixed_trace_clock);
         op.manifest_policy = Some(op.target_authorization_path(group_id));
         op.writer_policy = Some(op.target_authorization_path(group_id));
 
@@ -6127,7 +6169,7 @@ mod tests {
             test_realm_id(),
             manifest,
         )
-        .with_now(trace_now());
+        .with_clock(fixed_trace_clock);
         op.manifest_policy = Some(op.target_authorization_path(group_id));
         op.writer_policy = Some(op.target_authorization_path(group_id));
 
@@ -6233,7 +6275,7 @@ mod tests {
             test_realm_id(),
             make_manifest(ReplicationItemKind::Materialized),
         )
-        .with_now(trace_now());
+        .with_clock(fixed_trace_clock);
         op.manifest_policy = Some(op.target_authorization_path(group_id));
         op.writer_policy = Some("/other/path".to_string());
 
@@ -6261,18 +6303,26 @@ mod tests {
         assert_eq!(result.group_id, Some(group_id));
     }
 
-    /// Reclaim-candidate creation carries the one wall clock sampled when the
-    /// operation was constructed, never a fresh per-phase timestamp.
+    /// A long apply must stamp the reclaim candidate when the enqueue phase
+    /// runs, not when the operation was constructed: the grace window starts at
+    /// enqueue, otherwise an operation-start time already older than the grace
+    /// would make the sweep treat the copy as immediately reclaimable.
     #[test]
-    fn reclaim_candidate_pins_operation_time() {
+    fn reclaim_candidate_stamps_enqueue_time_after_long_apply() {
+        let started_at = trace_now();
+        let enqueued_at = started_at + Duration::from_secs(6 * 60 * 60);
+        set_controlled_clock(started_at);
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let version_id = manifest.version_id;
         let mut op = IncomingVersionReplicationOperation::new(
             trace_stream_id(),
             iroh::SecretKey::from_bytes(&[0x30; 32]).public(),
             test_realm_id(),
-            make_manifest(ReplicationItemKind::Materialized),
+            manifest,
         )
-        .with_now(trace_now());
+        .with_clock(controlled_clock);
         op.txn_id = Some(trace_txn_id());
+        op.destination_group_id = Some(test_group_id());
         op.replaced_version = Some(BlobVersion::materialized(
             [9u8; 32],
             BackendRef::node_default(),
@@ -6281,15 +6331,36 @@ mod tests {
             None,
         ));
 
-        let effects = op.write_replaced_candidate(ReclaimCandidateKey::new(
-            BackendRef::node_default(),
-            [9u8; 32],
-        ));
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        op.read_replaced_metadata();
+        let part_key = MultipartObjectMetadataKey::part(version_id, 3)
+            .to_bytes()
+            .unwrap();
+        op.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(part_key.into(), vec![1u8].into())],
+            next_start_after: None,
+        }));
+
+        // The blob transfer and the transactional apply ran for hours.
+        set_controlled_clock(enqueued_at);
+        let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::WriteReclaimCandidate
+        );
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects.as_slice()
+        else {
             panic!("expected reclaim candidate write");
         };
+        assert_eq!(key_space, BLOB_RECLAIM_KEYSPACE);
         let candidate = aruna_core::structs::ReclaimCandidate::from_bytes(value.as_ref()).unwrap();
-        assert_eq!(candidate.enqueued_at, trace_now());
+        assert_eq!(candidate.enqueued_at, enqueued_at);
+        assert_ne!(candidate.enqueued_at, started_at);
     }
 }
 
