@@ -11,20 +11,23 @@ use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{AuthContext, OBJECT_CONTENT_TYPE_KEY};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::complete_upload::CompleteMultipartUploadResult;
-use aruna_operations::s3::delete_object::DeleteObjectResult;
+use aruna_operations::s3::delete_object::{DeleteObjectError, DeleteObjectResult};
+use aruna_operations::s3::delete_objects::DeleteObjectsEntryOutcome;
 use aruna_operations::s3::get_object::{GetObjectResult, ObjectInfo};
 use aruna_operations::s3::put_object::PutObjectResult;
 use aruna_operations::s3::refresh_metadata::{
     QueueReferenceMetadataRefreshOperation, ReferenceMetadataRefresh,
 };
 use s3s::dto::{
-    CompleteMultipartUploadOutput, DeleteObjectOutput, ETag, LastModified, PutObjectOutput,
+    CompleteMultipartUploadOutput, DeleteObjectOutput, DeleteObjectsOutput, DeletedObject, ETag,
+    Error as S3DeleteError, LastModified, PutObjectOutput,
 };
 use s3s::{S3Response, S3Result, s3_error};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{error, warn};
+use ulid::Ulid;
 
 #[derive(Debug)]
 pub(super) struct ObjectResponseFields {
@@ -204,6 +207,60 @@ impl ArunaS3Service {
         }))
     }
 
+    /// Maps one bulk delete's per-entry outcomes into the response. Policy
+    /// refusals collected before the operation keep their place and order, and
+    /// each outcome contributes either a deleted entry or a typed error. Quiet
+    /// mode suppresses only the deleted list; errors are always reported.
+    pub(super) async fn delete_objects_response(
+        &self,
+        quiet: bool,
+        bucket: String,
+        replication_auth: AuthContext,
+        prior_errors: Vec<S3DeleteError>,
+        outcomes: Vec<DeleteObjectsEntryOutcome>,
+    ) -> S3Response<DeleteObjectsOutput> {
+        let mut deleted = Vec::new();
+        let mut errors = prior_errors;
+        for outcome in outcomes {
+            match outcome.result {
+                Ok(result) => {
+                    if outcome.requested_version_id.is_none() {
+                        self.queue_live_replication(
+                            replication_auth.clone(),
+                            bucket.clone(),
+                            outcome.key.clone(),
+                            result.version_id,
+                            result.delete_marker,
+                        )
+                        .await;
+                    }
+                    deleted.push(deleted_object(
+                        outcome.key,
+                        outcome.requested_version_id,
+                        &result,
+                    ));
+                }
+                Err(DeleteObjectError::NoSuchVersion) => errors.push(no_such_version_error(
+                    outcome.key,
+                    outcome.requested_version_id,
+                )),
+                Err(err) => {
+                    warn!(error = %err, key = %outcome.key, "DeleteObjects entry failed");
+                    errors.push(internal_delete_error(
+                        outcome.key,
+                        outcome.requested_version_id,
+                    ));
+                }
+            }
+        }
+
+        S3Response::new(DeleteObjectsOutput {
+            deleted: (!quiet).then_some(deleted),
+            errors: (!errors.is_empty()).then_some(errors),
+            ..Default::default()
+        })
+    }
+
     fn source_metadata_headers(
         &self,
         metadata: &aruna_core::structs::SourceMetadata,
@@ -291,5 +348,205 @@ impl ArunaS3Service {
             },
             metadata: (!response_metadata.is_empty()).then_some(response_metadata),
         }
+    }
+}
+
+/// The deleted entry of one successful bulk delete. An unversioned delete
+/// reports the created delete marker and its marker version; a versioned delete
+/// reports the version and marks the version id as a delete marker only when
+/// the deleted version was one.
+fn deleted_object(
+    key: String,
+    requested_version_id: Option<Ulid>,
+    result: &DeleteObjectResult,
+) -> DeletedObject {
+    if requested_version_id.is_none() {
+        DeletedObject {
+            key: Some(key),
+            delete_marker: Some(result.delete_marker),
+            delete_marker_version_id: Some(result.version_id.to_string()),
+            ..Default::default()
+        }
+    } else {
+        DeletedObject {
+            key: Some(key),
+            version_id: Some(result.version_id.to_string()),
+            delete_marker: Some(result.delete_marker),
+            delete_marker_version_id: result.delete_marker.then(|| result.version_id.to_string()),
+        }
+    }
+}
+
+fn no_such_version_error(key: String, requested_version_id: Option<Ulid>) -> S3DeleteError {
+    S3DeleteError {
+        code: Some("NoSuchVersion".to_string()),
+        key: Some(key),
+        version_id: requested_version_id.map(|id| id.to_string()),
+        message: Some("The specified version does not exist.".to_string()),
+    }
+}
+
+fn internal_delete_error(key: String, requested_version_id: Option<Ulid>) -> S3DeleteError {
+    S3DeleteError {
+        code: Some("InternalError".to_string()),
+        key: Some(key),
+        version_id: requested_version_id.map(|id| id.to_string()),
+        message: Some("We encountered an internal error. Please try again.".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::NodeId;
+    use aruna_core::structs::RealmId;
+
+    async fn test_service() -> (tempfile::TempDir, ArunaS3Service) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage =
+            aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
+        let service = ArunaS3Service::new(context, RealmId([7u8; 32]), node_id).await;
+        (dir, service)
+    }
+
+    fn success(key: &str) -> DeleteObjectsEntryOutcome {
+        let version_id = Ulid::generate();
+        DeleteObjectsEntryOutcome {
+            key: key.to_string(),
+            requested_version_id: Some(version_id),
+            result: Ok(DeleteObjectResult {
+                version_id,
+                delete_marker: false,
+            }),
+        }
+    }
+
+    fn missing(key: &str) -> DeleteObjectsEntryOutcome {
+        DeleteObjectsEntryOutcome {
+            key: key.to_string(),
+            requested_version_id: Some(Ulid::generate()),
+            result: Err(DeleteObjectError::NoSuchVersion),
+        }
+    }
+
+    #[test]
+    fn unversioned_delete_reports_marker() {
+        let result = DeleteObjectResult {
+            version_id: Ulid::generate(),
+            delete_marker: true,
+        };
+        let deleted = deleted_object("key".to_string(), None, &result);
+        assert_eq!(deleted.key.as_deref(), Some("key"));
+        assert_eq!(deleted.version_id, None);
+        assert_eq!(
+            deleted.delete_marker_version_id.as_deref(),
+            Some(result.version_id.to_string().as_str())
+        );
+        assert_eq!(deleted.delete_marker, Some(true));
+    }
+
+    #[test]
+    fn versioned_delete_reports_version() {
+        let result = DeleteObjectResult {
+            version_id: Ulid::generate(),
+            delete_marker: false,
+        };
+        let deleted = deleted_object("key".to_string(), Some(result.version_id), &result);
+        assert_eq!(
+            deleted.version_id.as_deref(),
+            Some(result.version_id.to_string().as_str())
+        );
+        assert_eq!(deleted.delete_marker_version_id, None);
+    }
+
+    #[test]
+    fn bulk_errors_keep_their_shape() {
+        let missing = no_such_version_error("missing".to_string(), Some(Ulid::generate()));
+        assert_eq!(missing.code.as_deref(), Some("NoSuchVersion"));
+        assert!(missing.version_id.is_some());
+        let internal = internal_delete_error("broken".to_string(), None);
+        assert_eq!(internal.code.as_deref(), Some("InternalError"));
+        assert_eq!(internal.version_id, None);
+    }
+
+    #[tokio::test]
+    async fn quiet_bulk_delete_keeps_partial_errors() {
+        let (_dir, service) = test_service().await;
+        let outcomes = vec![success("ok"), missing("missing")];
+        let response = service
+            .delete_objects_response(
+                true,
+                "bucket".to_string(),
+                AuthContext::anonymous(RealmId([7u8; 32])),
+                vec![],
+                outcomes,
+            )
+            .await;
+        let output = response.output;
+        assert_eq!(output.deleted, None);
+        let errors = output.errors.expect("partial errors are reported");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].key.as_deref(), Some("missing"));
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_preserves_result_order() {
+        let (_dir, service) = test_service().await;
+        let outcomes = vec![success("first"), missing("second"), success("third")];
+        let response = service
+            .delete_objects_response(
+                false,
+                "bucket".to_string(),
+                AuthContext::anonymous(RealmId([7u8; 32])),
+                vec![],
+                outcomes,
+            )
+            .await;
+        let output = response.output;
+        let deleted: Vec<String> = output
+            .deleted
+            .expect("deleted list")
+            .into_iter()
+            .filter_map(|object| object.key)
+            .collect();
+        assert_eq!(deleted, vec!["first".to_string(), "third".to_string()]);
+        let errors = output.errors.expect("errors reported");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].key.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_keeps_policy_errors_first() {
+        let (_dir, service) = test_service().await;
+        let prior = vec![S3DeleteError {
+            code: Some("AccessDenied".to_string()),
+            key: Some("denied".to_string()),
+            version_id: None,
+            message: Some("Access Denied".to_string()),
+        }];
+        let response = service
+            .delete_objects_response(
+                false,
+                "bucket".to_string(),
+                AuthContext::anonymous(RealmId([7u8; 32])),
+                prior,
+                vec![missing("after")],
+            )
+            .await;
+        let errors = response.output.errors.expect("errors reported");
+        let keys: Vec<&str> = errors
+            .iter()
+            .filter_map(|error| error.key.as_deref())
+            .collect();
+        assert_eq!(keys, vec!["denied", "after"]);
     }
 }

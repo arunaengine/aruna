@@ -554,6 +554,296 @@ impl UpdateMetadataDocumentOperation {
             encoded_bytes,
         })
     }
+    fn phase_read_current(&mut self, event: Event) -> Effects {
+        match parse_registry_read(event) {
+            Ok(Some(record)) => {
+                self.record = Some(record.clone());
+                self.state = UpdateMetadataDocumentState::ReadRealmConfig;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                    key: ByteView::from(*record.realm_id.as_bytes()),
+                    txn_id: None,
+                })]
+            }
+            Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
+            Err(StorageReadError::Storage(error)) => self.fail(error.into()),
+            Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
+        }
+    }
+
+    fn phase_read_realm_config(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                if let Some(bytes) = value {
+                    match RealmConfigDocument::from_bytes(&bytes) {
+                        Ok(config) => self.realm_config = Some(config),
+                        Err(error) => return self.fail(error.into()),
+                    }
+                }
+                let Some(record) = self.record.clone() else {
+                    return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
+                };
+                match self.plan_batch_effect(&record) {
+                    Ok(Some(effect)) => {
+                        self.state = UpdateMetadataDocumentState::PlanBatch;
+                        smallvec![effect]
+                    }
+                    Ok(None) => self.begin_transaction_effect(),
+                    Err(error) => self.fail(error.into()),
+                }
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            other => self.unexpected_event("realm config read result", format!("{other:?}")),
+        }
+    }
+
+    fn phase_plan_batch(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) => {
+                self.planned_batch = Some(batch);
+                self.begin_transaction_effect()
+            }
+            Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
+            other => self.unexpected_event("metadata batch plan result", format!("{other:?}")),
+        }
+    }
+
+    fn phase_start_transaction(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
+                self.txn_id = Some(txn_id);
+                self.state = UpdateMetadataDocumentState::ReadFence;
+                smallvec![read_registry_effect(
+                    self.config.group_id,
+                    self.config.document_id,
+                    Some(txn_id),
+                )]
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            other => self.unexpected_event("transaction start result", format!("{other:?}")),
+        }
+    }
+
+    fn phase_read_fence(&mut self, event: Event) -> Effects {
+        match parse_registry_read(event) {
+            Ok(Some(record)) => {
+                let record = self.updated_record(record);
+                let update_event = match self.update_event_record(&record) {
+                    Ok(update_event) => update_event,
+                    Err(error) => return self.fail(error),
+                };
+                self.record = Some(update_event.record.clone());
+                self.update_event = Some(update_event);
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                };
+                self.state = UpdateMetadataDocumentState::ReadRawFence;
+                self.fenced = self.fenced_buckets(&record);
+                let mut reads = vec![
+                    (
+                        METADATA_RAW_BUDGET_KEYSPACE.to_string(),
+                        raw_budget_key(self.config.document_id, self.config.actor.node_id),
+                    ),
+                    (
+                        METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+                        create_acceptance_key(self.config.document_id),
+                    ),
+                ];
+                // The fence joins this transaction's read set, so a
+                // departing holder's close conflicts an uncommitted write.
+                reads.extend(self.fenced.iter().map(|(placement, _)| {
+                    crate::placement::fence::fence_read(&record.realm_id, placement)
+                }));
+                smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads,
+                    txn_id: Some(txn_id),
+                })]
+            }
+            Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
+            Err(StorageReadError::Storage(error)) => self.fail(error.into()),
+            Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
+        }
+    }
+
+    fn phase_read_raw_fence(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                let [(_, raw_budget), (_, accepted_create), fences @ ..] = values.as_slice() else {
+                    return self.unexpected_event(
+                        "metadata raw sidecar read",
+                        format!("batch read with {} values", values.len()),
+                    );
+                };
+                if fences.len() != self.fenced.len() {
+                    return self.unexpected_event(
+                        "one fence value per fenced bucket",
+                        format!("batch read with {} values", values.len()),
+                    );
+                }
+                let admitted =
+                    self.fenced
+                        .iter()
+                        .zip(fences)
+                        .all(|((_, generation), (_, value))| {
+                            crate::placement::fence::admits(value.as_ref(), *generation)
+                        });
+                if !admitted {
+                    return self.fail(UpdateMetadataDocumentError::PlacementFenced);
+                }
+                let Some(value) = accepted_create.clone() else {
+                    return self.fail(UpdateMetadataDocumentError::RawLimit);
+                };
+                let create: MetadataCreateEventRecord = match postcard::from_bytes(&value) {
+                    Ok(create) => create,
+                    Err(_) => return self.fail(UpdateMetadataDocumentError::RawLimit),
+                };
+                let quota = match self.origin_quota(&create) {
+                    Ok(quota) => quota,
+                    Err(error) => return self.fail(error),
+                };
+                self.accepted_create = Some(create);
+                let budget = match raw_budget.clone() {
+                    Some(value) => {
+                        let budget: MetadataRawOriginBudget = match postcard::from_bytes(&value) {
+                            Ok(budget) => budget,
+                            Err(_) => {
+                                return self.fail(UpdateMetadataDocumentError::RawLimit);
+                            }
+                        };
+                        if !self.valid_budget(&budget, &quota) {
+                            return self.fail(UpdateMetadataDocumentError::RawLimit);
+                        }
+                        Some(budget)
+                    }
+                    None => None,
+                };
+                self.raw_budget = budget;
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                };
+                self.state = UpdateMetadataDocumentState::ReadRawEvents;
+                smallvec![Effect::Storage(StorageEffect::Iter {
+                    key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+                    prefix: Some(event_log_prefix(self.config.document_id)),
+                    start: None,
+                    limit: RAW_EVENT_LIMIT,
+                    txn_id: Some(txn_id),
+                })]
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            other => self.unexpected_event("raw sidecar read result", format!("{other:?}")),
+        }
+    }
+
+    fn phase_read_raw_events(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => {
+                let (reconstructed, history_events, history_bytes) =
+                    match self.history_budget(&values, next_start_after.as_ref()) {
+                        Ok(history) => history,
+                        Err(error) => return self.fail(error),
+                    };
+                if self
+                    .raw_budget
+                    .as_ref()
+                    .is_some_and(|budget| &reconstructed != budget)
+                {
+                    return self.fail(UpdateMetadataDocumentError::RawLimit);
+                }
+                self.raw_budget = Some(reconstructed);
+                self.next_raw_budget = match self.check_raw_budget(history_events, history_bytes) {
+                    Ok(budget) => Some(budget),
+                    Err(error) => return self.fail(error),
+                };
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                };
+                self.state = UpdateMetadataDocumentState::WriteUpdateBatch;
+                match self.write_update_batch(txn_id) {
+                    Ok(effect) => smallvec![effect],
+                    Err(error) => self.fail(error),
+                }
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            other => self.unexpected_event("raw event iteration result", format!("{other:?}")),
+        }
+    }
+
+    fn phase_write_update_batch(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                };
+                self.state = UpdateMetadataDocumentState::CommitTransaction;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            other => self.unexpected_event("metadata update batch write", format!("{other:?}")),
+        }
+    }
+
+    fn phase_commit_transaction(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                self.txn_id = None;
+                self.state = UpdateMetadataDocumentState::ScheduleMaterializationDrain;
+                smallvec![schedule_materialization()]
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                self.txn_id = None;
+                self.fail(error.into())
+            }
+            other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+        }
+    }
+
+    fn phase_schedule_materialization_drain(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                self.state = UpdateMetadataDocumentState::ScheduleOutboxDrain;
+                smallvec![schedule_drain_effect()]
+            }
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                warn!(message = %message, "Failed to schedule metadata materialization drain after committed update");
+                self.state = UpdateMetadataDocumentState::ScheduleOutboxDrain;
+                smallvec![schedule_drain_effect()]
+            }
+            other => self.unexpected_event(
+                "metadata materialization drain schedule",
+                format!("{other:?}"),
+            ),
+        }
+    }
+
+    fn phase_schedule_outbox_drain(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                let Some(record) = self.record.clone() else {
+                    return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                };
+                self.state = UpdateMetadataDocumentState::Finish;
+                self.output = Some(Ok(record));
+                smallvec![]
+            }
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                warn!(message = %message, "Failed to schedule metadata document outbox drain after committed update");
+                let Some(record) = self.record.clone() else {
+                    return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                };
+                self.state = UpdateMetadataDocumentState::Finish;
+                self.output = Some(Ok(record));
+                smallvec![]
+            }
+            other => self.unexpected_event(
+                "metadata document outbox drain schedule",
+                format!("{other:?}"),
+            ),
+        }
+    }
 }
 
 pub async fn update_metadata_document(
@@ -659,267 +949,21 @@ impl Operation for UpdateMetadataDocumentOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            UpdateMetadataDocumentState::ReadCurrent => match parse_registry_read(event) {
-                Ok(Some(record)) => {
-                    self.record = Some(record.clone());
-                    self.state = UpdateMetadataDocumentState::ReadRealmConfig;
-                    smallvec![Effect::Storage(StorageEffect::Read {
-                        key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                        key: ByteView::from(*record.realm_id.as_bytes()),
-                        txn_id: None,
-                    })]
-                }
-                Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
-                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
-                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
-            },
-            UpdateMetadataDocumentState::ReadRealmConfig => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    if let Some(bytes) = value {
-                        match RealmConfigDocument::from_bytes(&bytes) {
-                            Ok(config) => self.realm_config = Some(config),
-                            Err(error) => return self.fail(error.into()),
-                        }
-                    }
-                    let Some(record) = self.record.clone() else {
-                        return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
-                    };
-                    match self.plan_batch_effect(&record) {
-                        Ok(Some(effect)) => {
-                            self.state = UpdateMetadataDocumentState::PlanBatch;
-                            smallvec![effect]
-                        }
-                        Ok(None) => self.begin_transaction_effect(),
-                        Err(error) => self.fail(error.into()),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("realm config read result", format!("{other:?}")),
-            },
-            UpdateMetadataDocumentState::PlanBatch => match event {
-                Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) => {
-                    self.planned_batch = Some(batch);
-                    self.begin_transaction_effect()
-                }
-                Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
-                other => self.unexpected_event("metadata batch plan result", format!("{other:?}")),
-            },
-            UpdateMetadataDocumentState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.txn_id = Some(txn_id);
-                    self.state = UpdateMetadataDocumentState::ReadFence;
-                    smallvec![read_registry_effect(
-                        self.config.group_id,
-                        self.config.document_id,
-                        Some(txn_id),
-                    )]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
-            },
-            UpdateMetadataDocumentState::ReadFence => match parse_registry_read(event) {
-                Ok(Some(record)) => {
-                    let record = self.updated_record(record);
-                    let update_event = match self.update_event_record(&record) {
-                        Ok(update_event) => update_event,
-                        Err(error) => return self.fail(error),
-                    };
-                    self.record = Some(update_event.record.clone());
-                    self.update_event = Some(update_event);
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
-                    };
-                    self.state = UpdateMetadataDocumentState::ReadRawFence;
-                    self.fenced = self.fenced_buckets(&record);
-                    let mut reads = vec![
-                        (
-                            METADATA_RAW_BUDGET_KEYSPACE.to_string(),
-                            raw_budget_key(self.config.document_id, self.config.actor.node_id),
-                        ),
-                        (
-                            METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
-                            create_acceptance_key(self.config.document_id),
-                        ),
-                    ];
-                    // The fence joins this transaction's read set, so a
-                    // departing holder's close conflicts an uncommitted write.
-                    reads.extend(self.fenced.iter().map(|(placement, _)| {
-                        crate::placement::fence::fence_read(&record.realm_id, placement)
-                    }));
-                    smallvec![Effect::Storage(StorageEffect::BatchRead {
-                        reads,
-                        txn_id: Some(txn_id),
-                    })]
-                }
-                Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
-                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
-                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
-            },
-            UpdateMetadataDocumentState::ReadRawFence => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, raw_budget), (_, accepted_create), fences @ ..] = values.as_slice()
-                    else {
-                        return self.unexpected_event(
-                            "metadata raw sidecar read",
-                            format!("batch read with {} values", values.len()),
-                        );
-                    };
-                    if fences.len() != self.fenced.len() {
-                        return self.unexpected_event(
-                            "one fence value per fenced bucket",
-                            format!("batch read with {} values", values.len()),
-                        );
-                    }
-                    let admitted =
-                        self.fenced
-                            .iter()
-                            .zip(fences)
-                            .all(|((_, generation), (_, value))| {
-                                crate::placement::fence::admits(value.as_ref(), *generation)
-                            });
-                    if !admitted {
-                        return self.fail(UpdateMetadataDocumentError::PlacementFenced);
-                    }
-                    let Some(value) = accepted_create.clone() else {
-                        return self.fail(UpdateMetadataDocumentError::RawLimit);
-                    };
-                    let create: MetadataCreateEventRecord = match postcard::from_bytes(&value) {
-                        Ok(create) => create,
-                        Err(_) => return self.fail(UpdateMetadataDocumentError::RawLimit),
-                    };
-                    let quota = match self.origin_quota(&create) {
-                        Ok(quota) => quota,
-                        Err(error) => return self.fail(error),
-                    };
-                    self.accepted_create = Some(create);
-                    let budget = match raw_budget.clone() {
-                        Some(value) => {
-                            let budget: MetadataRawOriginBudget = match postcard::from_bytes(&value)
-                            {
-                                Ok(budget) => budget,
-                                Err(_) => {
-                                    return self.fail(UpdateMetadataDocumentError::RawLimit);
-                                }
-                            };
-                            if !self.valid_budget(&budget, &quota) {
-                                return self.fail(UpdateMetadataDocumentError::RawLimit);
-                            }
-                            Some(budget)
-                        }
-                        None => None,
-                    };
-                    self.raw_budget = budget;
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
-                    };
-                    self.state = UpdateMetadataDocumentState::ReadRawEvents;
-                    smallvec![Effect::Storage(StorageEffect::Iter {
-                        key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
-                        prefix: Some(event_log_prefix(self.config.document_id)),
-                        start: None,
-                        limit: RAW_EVENT_LIMIT,
-                        txn_id: Some(txn_id),
-                    })]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("raw sidecar read result", format!("{other:?}")),
-            },
-            UpdateMetadataDocumentState::ReadRawEvents => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    let (reconstructed, history_events, history_bytes) =
-                        match self.history_budget(&values, next_start_after.as_ref()) {
-                            Ok(history) => history,
-                            Err(error) => return self.fail(error),
-                        };
-                    if self
-                        .raw_budget
-                        .as_ref()
-                        .is_some_and(|budget| &reconstructed != budget)
-                    {
-                        return self.fail(UpdateMetadataDocumentError::RawLimit);
-                    }
-                    self.raw_budget = Some(reconstructed);
-                    self.next_raw_budget =
-                        match self.check_raw_budget(history_events, history_bytes) {
-                            Ok(budget) => Some(budget),
-                            Err(error) => return self.fail(error),
-                        };
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
-                    };
-                    self.state = UpdateMetadataDocumentState::WriteUpdateBatch;
-                    match self.write_update_batch(txn_id) {
-                        Ok(effect) => smallvec![effect],
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("raw event iteration result", format!("{other:?}")),
-            },
-            UpdateMetadataDocumentState::WriteUpdateBatch => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
-                    };
-                    self.state = UpdateMetadataDocumentState::CommitTransaction;
-                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("metadata update batch write", format!("{other:?}")),
-            },
-            UpdateMetadataDocumentState::CommitTransaction => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = UpdateMetadataDocumentState::ScheduleMaterializationDrain;
-                    smallvec![schedule_materialization()]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
-            },
-            UpdateMetadataDocumentState::ScheduleMaterializationDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = UpdateMetadataDocumentState::ScheduleOutboxDrain;
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(message = %message, "Failed to schedule metadata materialization drain after committed update");
-                    self.state = UpdateMetadataDocumentState::ScheduleOutboxDrain;
-                    smallvec![schedule_drain_effect()]
-                }
-                other => self.unexpected_event(
-                    "metadata materialization drain schedule",
-                    format!("{other:?}"),
-                ),
-            },
-            UpdateMetadataDocumentState::ScheduleOutboxDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    let Some(record) = self.record.clone() else {
-                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
-                    };
-                    self.state = UpdateMetadataDocumentState::Finish;
-                    self.output = Some(Ok(record));
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(message = %message, "Failed to schedule metadata document outbox drain after committed update");
-                    let Some(record) = self.record.clone() else {
-                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
-                    };
-                    self.state = UpdateMetadataDocumentState::Finish;
-                    self.output = Some(Ok(record));
-                    smallvec![]
-                }
-                other => self.unexpected_event(
-                    "metadata document outbox drain schedule",
-                    format!("{other:?}"),
-                ),
-            },
+            UpdateMetadataDocumentState::ReadCurrent => self.phase_read_current(event),
+            UpdateMetadataDocumentState::ReadRealmConfig => self.phase_read_realm_config(event),
+            UpdateMetadataDocumentState::PlanBatch => self.phase_plan_batch(event),
+            UpdateMetadataDocumentState::StartTransaction => self.phase_start_transaction(event),
+            UpdateMetadataDocumentState::ReadFence => self.phase_read_fence(event),
+            UpdateMetadataDocumentState::ReadRawFence => self.phase_read_raw_fence(event),
+            UpdateMetadataDocumentState::ReadRawEvents => self.phase_read_raw_events(event),
+            UpdateMetadataDocumentState::WriteUpdateBatch => self.phase_write_update_batch(event),
+            UpdateMetadataDocumentState::CommitTransaction => self.phase_commit_transaction(event),
+            UpdateMetadataDocumentState::ScheduleMaterializationDrain => {
+                self.phase_schedule_materialization_drain(event)
+            }
+            UpdateMetadataDocumentState::ScheduleOutboxDrain => {
+                self.phase_schedule_outbox_drain(event)
+            }
             UpdateMetadataDocumentState::Finish
             | UpdateMetadataDocumentState::Error
             | UpdateMetadataDocumentState::Init => smallvec![],
@@ -1873,6 +1917,32 @@ mod tests {
         assert_eq!(
             operation.finalize(),
             Err(UpdateMetadataDocumentError::RawLimit)
+        );
+    }
+
+    #[test]
+    fn phase_denial_aborts_without_mutation() {
+        // The realm-config phase is where an invalid entity payload is denied
+        // before the transaction opens: no forbidden mutation effect may escape.
+        let actor = actor();
+        let record = record(&actor);
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"name":"missing identity"}"#.to_string(),
+            },
+        ));
+
+        operation.start();
+        operation.step(registry_read(&record));
+        let effects = operation.phase_read_realm_config(realm_config_read(&record));
+        assert_no_mutation(effects.as_slice());
+        assert_eq!(
+            operation.finalize(),
+            Err(UpdateMetadataDocumentError::MetadataError(
+                MetadataError::InvalidInput("entity payload must define string `@id`".to_string())
+            ))
         );
     }
 

@@ -1,3 +1,43 @@
+//! Persistence policy and the journal/commit durability points that carry
+//! each commit acknowledgement. The policy type stays with the code that
+//! applies it, and commit acknowledgement keeps reporting conflicts
+//! distinctly from unknown commit failures.
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FjallPersistPolicy {
+    #[default]
+    Buffer,
+    SyncAll,
+}
+
+impl FjallPersistPolicy {
+    pub fn as_fjall(self) -> PersistMode {
+        match self {
+            Self::Buffer => PersistMode::Buffer,
+            Self::SyncAll => PersistMode::SyncAll,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Buffer => "buffer",
+            Self::SyncAll => "sync_all",
+        }
+    }
+}
+
+impl std::str::FromStr for FjallPersistPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "buffer" => Ok(Self::Buffer),
+            "sync_all" => Ok(Self::SyncAll),
+            other => Err(format!("unsupported fjall persist policy `{other}`")),
+        }
+    }
+}
+
 use std::time::Instant;
 
 use aruna_core::errors::StorageError;

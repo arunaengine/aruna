@@ -1,9 +1,6 @@
-use super::distributed::{run_query_distributed, run_search_distributed};
+use super::distributed::run_query_distributed;
 use super::fanout::ensure_query_form;
 use super::*;
-use crate::metadata::search_cursor::{
-    METADATA_SEARCH_DEFAULT_PAGE_SIZE, METADATA_SEARCH_MAX_PAGE_SIZE,
-};
 
 pub async fn query_metadata_document(
     context: &DriverContext,
@@ -157,165 +154,6 @@ pub async fn query_metadata(
     })
 }
 
-pub async fn search_metadata(
-    context: &DriverContext,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    mut request: MetadataSearchRequest,
-) -> Result<MetadataSearchExecution, MetadataApiError> {
-    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
-    if request.query.trim().is_empty() && request.conforms_to.is_none() {
-        return Err(MetadataApiError::BadRequest);
-    }
-    if request
-        .conforms_to
-        .as_deref()
-        .is_some_and(|iri| oxrdf::NamedNode::new(iri).is_err())
-    {
-        return Err(MetadataApiError::BadRequest);
-    }
-    if let Some(iri) = request.conforms_to.take() {
-        request.conforms_to = crate::metadata::profile_validation::equivalent_profile_iris(&iri)
-            .into_iter()
-            .next();
-    }
-    let page_size = request
-        .limit
-        .unwrap_or(METADATA_SEARCH_DEFAULT_PAGE_SIZE)
-        .clamp(1, METADATA_SEARCH_MAX_PAGE_SIZE);
-
-    let fingerprint = query_fingerprint(
-        &request.query,
-        request.graph_iris.as_deref(),
-        request.mode,
-        request.conforms_to.as_deref(),
-        request.group_id,
-    );
-    let mut cursor_discovery = None;
-    let (watermark, resume) = match request.cursor.as_deref() {
-        Some(raw) => {
-            // Check the full realm because capped fan-out may omit the cursor's signer.
-            let signer_nodes = match request.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
-                MetadataApiQueryMode::Local => vec![local_node_id],
-                MetadataApiQueryMode::Distributed => match request.target_nodes.as_ref() {
-                    Some(nodes) => {
-                        let mut signers = nodes.clone();
-                        signers.push(local_node_id);
-                        signers
-                    }
-                    None => {
-                        let discovery = tokio::time::timeout_at(
-                            deadline,
-                            discover_realm_nodes(context, realm_id, local_node_id),
-                        )
-                        .await
-                        .unwrap_or(MetadataRealmNodeDiscovery {
-                            nodes: vec![local_node_id],
-                            failed: true,
-                        });
-                        let mut signers = discovery.nodes.clone();
-                        signers.push(local_node_id);
-                        let nodes =
-                            select_fanout_nodes(&discovery.nodes, local_node_id, &fingerprint);
-                        let mut discovery = discovery;
-                        discovery.nodes = nodes;
-                        cursor_discovery = Some(discovery);
-                        signers
-                    }
-                },
-            };
-            let cursor = SearchCursor::decode(raw, &signer_nodes)
-                .map_err(|error| MetadataApiError::InvalidCursor(error.to_string()))?;
-            if cursor.fingerprint != fingerprint {
-                return Err(MetadataApiError::InvalidCursor(
-                    SearchCursorError::QueryMismatch.to_string(),
-                ));
-            }
-            (
-                Some(cursor.payload.watermark.clone()),
-                cursor.resume_positions(),
-            )
-        }
-        None => (None, HashMap::new()),
-    };
-
-    // Keep resumed nodes in the bounded selection so remaining hits are not
-    // silently discarded when discovery changes.
-    let (target_nodes, discovery_failed) = if request.cursor.is_some() {
-        let mut nodes = match request.target_nodes.as_ref() {
-            Some(nodes) => select_fanout_nodes(nodes, local_node_id, &fingerprint),
-            None => match request.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
-                MetadataApiQueryMode::Local => vec![local_node_id],
-                MetadataApiQueryMode::Distributed => cursor_discovery
-                    .as_ref()
-                    .map(|discovery| discovery.nodes.clone())
-                    .unwrap_or_else(|| vec![local_node_id]),
-            },
-        };
-        for node_id in resume.keys() {
-            if !nodes.contains(node_id) {
-                nodes.push(*node_id);
-            }
-        }
-        (
-            Some(deduplicate_fanout_nodes(nodes)),
-            cursor_discovery
-                .as_ref()
-                .is_some_and(|discovery| discovery.failed),
-        )
-    } else {
-        (request.target_nodes.take(), false)
-    };
-
-    let (hits, next, truncated, fanout_stats) = run_search_distributed(
-        context,
-        realm_id,
-        local_node_id,
-        request.auth,
-        request.bearer_token,
-        request.graph_iris,
-        request.query,
-        request.conforms_to,
-        request.group_id,
-        resume,
-        watermark,
-        page_size,
-        MetadataFanoutScope::new(request.mode, target_nodes, true)
-            .with_subject(fingerprint)
-            .with_discovery_failed(discovery_failed)
-            .with_deadline(deadline),
-    )
-    .await?;
-    let next_cursor = match next {
-        Some(cursor) => {
-            let net = context.net_handle.as_ref().ok_or_else(|| {
-                MetadataApiError::Internal(
-                    "net handle unavailable for search cursor signing".to_string(),
-                )
-            })?;
-            Some(
-                SearchCursor::new_signed(
-                    fingerprint,
-                    cursor.watermark,
-                    cursor.resume,
-                    net.node_id(),
-                    |bytes| net.sign(bytes),
-                )
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?
-                .encode()
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?,
-            )
-        }
-        None => None,
-    };
-    Ok(MetadataSearchExecution {
-        hits,
-        next_cursor,
-        truncated,
-        fanout_stats,
-    })
-}
-
 /// Backlink lookup: scans the local IRI reference index for documents naming
 /// `iri` as an object, joins and filters by read access. Empty scans for known
 /// graph IRIs or `resolve` return one predicate-less summary. Local-node-only in v1.
@@ -419,64 +257,6 @@ pub async fn references_metadata(
     }
 
     Ok(MetadataReferencesExecution { references })
-}
-
-pub(super) fn effective_list_limit(requested: Option<usize>, anonymous: bool) -> usize {
-    let maximum = if anonymous {
-        ANONYMOUS_LIST_METADATA_LIMIT
-    } else {
-        MAX_LIST_METADATA_LIMIT
-    };
-    requested
-        .unwrap_or(DEFAULT_LIST_METADATA_LIMIT)
-        .clamp(1, maximum)
-}
-
-pub(super) fn check_policy_limit(
-    group_ids: Vec<GroupId>,
-) -> Result<Vec<GroupId>, MetadataApiError> {
-    if group_ids.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    Ok(group_ids)
-}
-
-pub(super) async fn load_group_records(
-    context: &DriverContext,
-    group_id: GroupId,
-    limit: usize,
-) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
-    let records = if let Some(metadata_handle) = context.metadata_handle.as_ref() {
-        // Listing remains eventually consistent: the handle-owned visibility
-        // cache serves stale snapshots while one refill updates the read path.
-        metadata_handle
-            .list_group_records(group_id, limit)
-            .await
-            .map_err(|_| MetadataApiError::ServiceUnavailable)?
-            .as_ref()
-            .clone()
-    } else {
-        let mut records = Vec::new();
-        let mut start_after = None;
-        loop {
-            let event = context
-                .storage_handle
-                .send_effect(iter_registry_effect(group_id, start_after, None))
-                .await;
-            let (page, next_start_after) =
-                parse_registry_iter(event).map_err(|_| MetadataApiError::ServiceUnavailable)?;
-            if records.len().saturating_add(page.len()) > limit {
-                return Err(MetadataApiError::ServiceUnavailable);
-            }
-            records.extend(page);
-            match next_start_after {
-                Some(cursor) => start_after = Some(cursor),
-                None => break,
-            }
-        }
-        records
-    };
-    filter_live_records(&context.storage_handle, &records).await
 }
 
 pub(crate) async fn filter_live_records(
@@ -645,131 +425,6 @@ pub(super) async fn load_claim_records(
     Ok(records)
 }
 
-pub(super) async fn load_pending_records(
-    context: &DriverContext,
-    group_filter: Option<GroupId>,
-    limit: usize,
-) -> Result<HashMap<GroupId, Vec<MetadataRegistryRecord>>, MetadataApiError> {
-    let limit = limit.min(METADATA_REGISTRY_CANDIDATE_LIMIT);
-    let mut targets = Vec::with_capacity(limit);
-    let mut start_after = None;
-    let mut scanned = 0usize;
-
-    loop {
-        let page = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.take().map(IterStart::After),
-                limit: LIST_METADATA_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start_after) = match page {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(MetadataApiError::Internal(error.to_string()));
-            }
-            other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
-        };
-        scanned = scanned.saturating_add(values.len());
-        if scanned > limit {
-            return Err(MetadataApiError::ServiceUnavailable);
-        }
-
-        targets.extend(
-            values
-                .into_iter()
-                .filter_map(|(key, _)| pending_projection_target(key.as_ref())),
-        );
-
-        if next_start_after.is_none() {
-            break;
-        }
-        start_after = next_start_after;
-    }
-
-    if targets.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let event_reads = targets
-        .iter()
-        .map(|(document_id, event_id)| {
-            (
-                METADATA_EVENT_LOG_KEYSPACE.to_string(),
-                event_log_key(*document_id, *event_id),
-            )
-        })
-        .collect::<Vec<_>>();
-    let event_values = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads: event_reads,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values })
-            if values.len() == targets.len() =>
-        {
-            values
-        }
-        Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            return Err(MetadataApiError::Internal(format!(
-                "metadata pending event batch returned {} values for {} targets",
-                values.len(),
-                targets.len()
-            )));
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(MetadataApiError::Internal(error.to_string()));
-        }
-        other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
-    };
-
-    let mut pending = Vec::with_capacity(event_values.len());
-    for ((document_id, event_id), (key, value)) in targets.into_iter().zip(event_values) {
-        if key != event_log_key(document_id, event_id) {
-            return Err(MetadataApiError::Internal(
-                "metadata pending event batch key mismatch".to_string(),
-            ));
-        }
-        let Some(value) = value else {
-            continue;
-        };
-        let event: MetadataCreateEventRecord = postcard::from_bytes(&value)
-            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-        if event.record.document_id != document_id || event.event_id != event_id {
-            return Err(MetadataApiError::Internal(format!(
-                "metadata create event log target {document_id}/{event_id} did not match payload {}/{}",
-                event.record.document_id, event.event_id
-            )));
-        }
-        if group_filter.is_none_or(|group_id| event.record.group_id == group_id) {
-            pending.push(event.record);
-        }
-    }
-
-    if pending.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let pending = filter_live_records(&context.storage_handle, &pending).await?;
-    let mut records: HashMap<GroupId, Vec<MetadataRegistryRecord>> = HashMap::new();
-    for (count, record) in pending.into_iter().enumerate() {
-        if count >= limit {
-            return Err(MetadataApiError::ServiceUnavailable);
-        }
-        records.entry(record.group_id).or_default().push(record);
-    }
-    Ok(records)
-}
-
 pub(super) async fn is_deleted(
     context: &DriverContext,
     graph_iri: &str,
@@ -800,31 +455,6 @@ pub(super) async fn is_deleted(
             Err(MetadataApiError::Internal(error.to_string()))
         }
         other => Err(MetadataApiError::Internal(format!("{other:?}"))),
-    }
-}
-
-pub(super) fn merge_pending_records(
-    records: &mut Vec<MetadataRegistryRecord>,
-    pending_records: Vec<MetadataRegistryRecord>,
-) {
-    let mut positions = records
-        .iter()
-        .enumerate()
-        .map(|(index, record)| (record.document_id, index))
-        .collect::<HashMap<_, _>>();
-
-    for pending_record in pending_records {
-        if let Some(&index) = positions.get(&pending_record.document_id) {
-            let existing_record = &records[index];
-            if (pending_record.updated_at_ms, pending_record.last_event_id)
-                > (existing_record.updated_at_ms, existing_record.last_event_id)
-            {
-                records[index] = pending_record;
-            }
-        } else {
-            positions.insert(pending_record.document_id, records.len());
-            records.push(pending_record);
-        }
     }
 }
 
@@ -1115,16 +745,60 @@ pub(super) async fn ensure_permission(
     Ok(())
 }
 
-pub(super) fn record_matches_filters(
-    record: &MetadataRegistryRecord,
-    path_prefix: Option<&str>,
-) -> bool {
-    path_prefix
-        .map(|path_prefix| path_matches_prefix(&record.document_path, path_prefix))
-        .unwrap_or(true)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataApiQueryMode {
+    Local,
+    Distributed,
 }
 
-fn path_matches_prefix(document_path: &str, path_prefix: &str) -> bool {
-    let normalized_path = MetadataRegistryRecord::normalize_document_path(document_path);
-    crate::placement::resolver::path_prefix_match(&normalized_path, path_prefix).is_some()
+#[derive(Debug, Clone)]
+pub struct MetadataDocumentQueryRequest {
+    pub document_id: Ulid,
+    pub auth: Option<AuthContext>,
+    pub bearer_token: Option<String>,
+    pub query: String,
+    pub mode: Option<MetadataApiQueryMode>,
+    pub allow_partial: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataQueryRequest {
+    pub auth: Option<AuthContext>,
+    pub bearer_token: Option<String>,
+    pub graph_iris: Option<Vec<String>>,
+    pub query: String,
+    pub mode: Option<MetadataApiQueryMode>,
+    pub target_nodes: Option<Vec<NodeId>>,
+    pub allow_partial: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataQueryExecution {
+    pub results: MetadataQueryResults,
+    pub fanout_stats: MetadataFanoutStats,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataReferencesRequest {
+    pub auth: Option<AuthContext>,
+    pub iri: String,
+    pub predicate: Option<String>,
+    pub limit: Option<usize>,
+    pub resolve: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataReferenceEntry {
+    pub document_id: String,
+    pub group_id: String,
+    pub document_path: String,
+    pub graph_iri: String,
+    pub predicate: Option<String>,
+    pub subject_iris: Vec<String>,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataReferencesExecution {
+    pub references: Vec<MetadataReferenceEntry>,
 }

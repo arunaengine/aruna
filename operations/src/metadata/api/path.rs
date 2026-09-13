@@ -627,3 +627,202 @@ pub(super) fn sanitize_path_winner(
         updated_at_ms: record.updated_at_ms,
     })
 }
+
+#[derive(Debug, Clone)]
+pub struct MetadataPathLookupRequest {
+    pub group_id: GroupId,
+    pub document_path: String,
+    pub auth: Option<AuthContext>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataPathLookupResult {
+    pub winner: MetadataPathWinner,
+    pub conflicts: Vec<Ulid>,
+}
+
+#[derive(Debug)]
+pub(super) struct PathHolderSelection {
+    pub(super) node_id: NodeId,
+    pub(super) shards: Vec<u32>,
+}
+
+pub async fn lookup_metadata_path(
+    context: &DriverContext,
+    realm_id: RealmId,
+    request: MetadataPathLookupRequest,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<MetadataPathLookupResult, MetadataApiError> {
+    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let normalized = MetadataRegistryRecord::normalize_document_path(&request.document_path);
+    if normalized.is_empty() {
+        return Err(MetadataApiError::BadRequest);
+    }
+    if context.net_handle.is_none() {
+        return resolve_local_path(context, realm_id, request).await;
+    }
+    let config = tokio::time::timeout_at(deadline, load_realm_config(context, realm_id))
+        .await
+        .ok()
+        .flatten()
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let local_node = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let trusted_origin = config
+        .nodes
+        .iter()
+        .any(|node| node.node_id == local_node.to_string() && node.kind.is_sync_eligible());
+    if !trusted_origin {
+        let config_digest = config
+            .digest()
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+        return forward_path_resolution(
+            context,
+            realm_id,
+            &config,
+            request,
+            auth_token,
+            config_digest,
+            deadline,
+        )
+        .await;
+    }
+    let strategy = registry_strategy(&config).ok_or(MetadataApiError::ServiceUnavailable)?;
+    if strategy.shard_count == 0 {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let shard_count = strategy.shard_count;
+    let auth_token = auth_token.or_else(|| request.auth.clone().map(MetadataAuthToken::internal));
+    let group_id = request.group_id;
+    let auth = request.auth.as_ref();
+    let (holders, replica_counts) = select_path_holders(
+        &config,
+        realm_id,
+        group_id,
+        &normalized,
+        strategy.strategy_id,
+        shard_count,
+        strategy.replica_count,
+        local_node,
+        deadline,
+    )?;
+    let requests = stream::iter(holders.into_iter().map(|selection| {
+        let holder = selection.node_id;
+        let shards = selection.shards;
+        let auth_token = auth_token.clone();
+        let normalized = normalized.clone();
+        async move {
+            let result = if holder == local_node {
+                match tokio::time::timeout_at(
+                    deadline,
+                    local_path_candidates(context, realm_id, group_id, &normalized, auth),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(MetadataApiError::ServiceUnavailable),
+                }
+            } else {
+                load_path_holder(
+                    context,
+                    group_id,
+                    &normalized,
+                    holder,
+                    auth_token,
+                    config_digest,
+                    deadline,
+                )
+                .await
+            };
+            (holder, shards, result)
+        }
+    }))
+    .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT)
+    .collect::<Vec<_>>();
+    let responses = tokio::time::timeout_at(deadline, requests)
+        .await
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let mut views = Vec::new();
+    let mut auth_error = None;
+    let mut failed = false;
+    let mut only_auth = true;
+    let mut candidate_count = 0usize;
+    for (_holder, shards, response) in responses {
+        match response {
+            Ok(returned) => {
+                candidate_count = candidate_count.saturating_add(returned.len());
+                if candidate_count > METADATA_REGISTRY_CANDIDATE_LIMIT {
+                    return Err(MetadataApiError::ServiceUnavailable);
+                }
+                only_auth = false;
+                let mut partitions = shards.iter().map(|_| Vec::new()).collect::<Vec<_>>();
+                for candidate in returned {
+                    let placement = validate_path_candidate(
+                        &config,
+                        realm_id,
+                        group_id,
+                        &normalized,
+                        &candidate,
+                    )?;
+                    let index = shards
+                        .binary_search(&placement.shard)
+                        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+                    partitions[index].push(candidate);
+                }
+                views.extend(
+                    shards
+                        .into_iter()
+                        .zip(partitions)
+                        .map(|(shard, candidates)| PathShardView { shard, candidates }),
+                );
+            }
+            Err(error @ (MetadataApiError::Unauthorized | MetadataApiError::Forbidden)) => {
+                failed = true;
+                auth_error.get_or_insert(error);
+            }
+            Err(_) => {
+                failed = true;
+                only_auth = false;
+            }
+        }
+    }
+    if failed {
+        if only_auth && let Some(error) = auth_error {
+            return Err(error);
+        }
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let candidates = merge_path_views(&replica_counts, views)?;
+    reduce_path_candidates(candidates)
+}
+
+pub(crate) async fn resolve_local_path(
+    context: &DriverContext,
+    realm_id: RealmId,
+    request: MetadataPathLookupRequest,
+) -> Result<MetadataPathLookupResult, MetadataApiError> {
+    let normalized = MetadataRegistryRecord::normalize_document_path(&request.document_path);
+    if normalized.is_empty() {
+        return Err(MetadataApiError::BadRequest);
+    }
+    let candidates = local_path_candidates(
+        context,
+        realm_id,
+        request.group_id,
+        &normalized,
+        request.auth.as_ref(),
+    )
+    .await?;
+    reduce_path_candidates(candidates)
+}
+
+pub(super) struct PathShardView {
+    pub(super) shard: u32,
+    pub(super) candidates: Vec<MetadataPathCandidate>,
+}

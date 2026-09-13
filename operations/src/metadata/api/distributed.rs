@@ -510,3 +510,9 @@ pub fn query_form(query: &str) -> Option<MetadataQueryForm> {
         _ => None,
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataQueryForm {
+    Select,
+    Ask,
+}
