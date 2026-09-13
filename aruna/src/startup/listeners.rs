@@ -25,11 +25,37 @@ pub(crate) struct ServerBindings {
     pub(crate) rest_handle: tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSetupError>>,
     pub(crate) s3_handle: Option<tokio::task::JoinHandle<()>>,
     pub(crate) portal_handle: Option<tokio::task::JoinHandle<()>>,
+    /// The optional session bridge listener, joined with the other ingress
+    /// listeners instead of being left to its cancellation token.
+    pub(crate) session_s3_handle: Option<tokio::task::JoinHandle<()>>,
     pub(crate) realm_id: aruna_core::structs::RealmId,
     pub(crate) node_id: iroh::PublicKey,
     pub(crate) is_initial_boot: bool,
     /// Present on a user node only: the owner's local wipe latch.
     pub(crate) device_wipe: Option<Arc<DeviceWipe>>,
+}
+
+/// The listener tasks started so far. `bind` registers each one here before the
+/// next fallible step, so a partial bind aborts and awaits exactly the tasks it
+/// started instead of leaking them into a failed startup.
+#[derive(Default)]
+struct StartedListeners {
+    portal: Option<tokio::task::JoinHandle<()>>,
+    s3: Option<tokio::task::JoinHandle<()>>,
+    session_s3: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StartedListeners {
+    /// Aborts and awaits every started listener in reverse start order.
+    async fn abort_all(&mut self) {
+        for handle in [self.session_s3.take(), self.s3.take(), self.portal.take()]
+            .into_iter()
+            .flatten()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
 }
 
 /// Everything a wipe erases: the store root, every derived root, and every
@@ -85,7 +111,9 @@ struct SessionS3 {
 }
 
 /// Serves the node's S3 plane on the session bridge gateway too. A bind failure
-/// is not fatal: only sessions lose their endpoint, the node keeps serving.
+/// is not fatal: only sessions lose their endpoint, the node keeps serving. The
+/// returned handle is retained by the caller's ingress owner, which joins it on
+/// shutdown; the cancellation token only asks it to stop.
 async fn bind_session_s3(
     session: Option<SessionS3>,
     s3_host: &str,
@@ -94,10 +122,8 @@ async fn bind_session_s3(
     metrics: Arc<NodeMetrics>,
     s3_timeouts: S3ServerTimeouts,
     shutdown: &Shutdown,
-) {
-    let Some(session) = session else {
-        return;
-    };
+) -> Option<tokio::task::JoinHandle<()>> {
+    let session = session?;
     let address = session.address;
     let server = match S3Server::new(
         &address.to_string(),
@@ -115,29 +141,63 @@ async fn bind_session_s3(
         Ok(server) => server.with_timeouts(s3_timeouts),
         Err(error) => {
             warn!(address = %address, error = %error, "Session S3 endpoint unavailable");
-            return;
+            return None;
         }
     };
     let listener = match TcpListener::bind(address).await {
         Ok(listener) => listener,
         Err(error) => {
             warn!(address = %address, error = %error, "Session S3 endpoint could not bind");
-            return;
+            return None;
         }
     };
-    // The shutdown token stops it, so the handle needs no separate join.
     match server.run_with_listener(listener, shutdown.token()) {
-        Ok(_) => info!(address = %address, "Session S3 endpoint listening"),
-        Err(error) => warn!(address = %address, error = %error, "Session S3 endpoint failed"),
+        Ok((_, handle)) => {
+            info!(address = %address, "Session S3 endpoint listening");
+            Some(handle)
+        }
+        Err(error) => {
+            warn!(address = %address, error = %error, "Session S3 endpoint failed");
+            None
+        }
     }
 }
 
 pub(crate) async fn bind(
-    config: Config,
+    config: &Config,
     driver_ctx: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
     metrics: Arc<NodeMetrics>,
     shutdown: &Shutdown,
+) -> Result<ServerBindings, Box<dyn std::error::Error>> {
+    let mut started = StartedListeners::default();
+    match bind_all(
+        config,
+        driver_ctx,
+        jobs_runtime,
+        metrics,
+        shutdown,
+        &mut started,
+    )
+    .await
+    {
+        Ok(bindings) => Ok(bindings),
+        Err(error) => {
+            started.abort_all().await;
+            Err(error)
+        }
+    }
+}
+
+/// Binds every configured listener in order, registering each started task on
+/// `started` before the next fallible step.
+async fn bind_all(
+    config: &Config,
+    driver_ctx: Arc<DriverContext>,
+    jobs_runtime: Arc<JobsRuntime>,
+    metrics: Arc<NodeMetrics>,
+    shutdown: &Shutdown,
+    started: &mut StartedListeners,
 ) -> Result<ServerBindings, Box<dyn std::error::Error>> {
     let is_initial_node = config.is_initial_node();
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
@@ -149,7 +209,7 @@ pub(crate) async fn bind(
         .as_deref()
         .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
         .is_some_and(|address| address.ip().is_unspecified());
-    let mut session_s3 = session_s3_address(&config, &session_subnet())
+    let session_s3 = session_s3_address(config, &session_subnet())
         .filter(|_| !wildcard_s3)
         .map(|address| SessionS3 {
             address,
@@ -162,7 +222,7 @@ pub(crate) async fn bind(
         });
     let device_wipe = match matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
         true => {
-            let (roots, unsupported) = wipe_plan(&config);
+            let (roots, unsupported) = wipe_plan(config);
             // Reject unsafe wipe roots before startup and erase only their normalized paths.
             let roots = crate::config::validate_wipe_roots(&roots, dirs::home_dir().as_deref())?;
             Some(Arc::new(DeviceWipe::new(roots, unsupported)))
@@ -173,7 +233,7 @@ pub(crate) async fn bind(
         driver_ctx.clone(),
         config.realm_id,
         config.node_id,
-        config.node_capabilities,
+        config.node_capabilities.clone(),
         is_initial_node,
         Some(Arc::new(OidcValidator::new()?)),
         jobs_runtime,
@@ -207,7 +267,7 @@ pub(crate) async fn bind(
         .with_public_url(config.api_public_url.clone())
         .with_mcp_enabled(config.mcp_enabled);
 
-    let portal_handle = bind_portal(
+    started.portal = bind_portal(
         &config.portal,
         config.api_public_url.as_deref(),
         PortalCspConfig::new(config.portal_csp_extra_origins.clone()),
@@ -221,68 +281,66 @@ pub(crate) async fn bind(
     let driver_ctx_for_sessions = driver_ctx.clone();
     let cors_for_sessions = cors.clone();
     let metrics_for_sessions = metrics.clone();
-    let session_s3 = session_s3.take();
-    let s3_handle = match (config.s3_address.as_deref(), config.s3_host.as_deref()) {
-        (Some(s3_address), Some(s3_host)) => {
-            let s3_server = S3Server::new(
-                s3_address,
-                s3_host,
-                driver_ctx,
-                config.realm_id,
-                config.node_id,
-                aruna_core::credential_encryption::CredentialEncryptionKey::derive(
-                    &config.node_state.net_secret_key,
-                ),
-                config.rocrate_limits.clone(),
-                cors,
-                metrics,
-            )
-            .await?
-            .with_concurrency_limits(
-                config.rate_limits.s3_max_connections as usize,
-                config.rate_limits.s3_max_requests as usize,
-            )
-            .with_timeouts(s3_timeouts)
-            .with_trusted_proxies(config.trusted_proxies.clone())
-            .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
-                config.rate_limits.ip_per_minute,
-                config.rate_limits.ip_burst,
-                config.rate_limits.principal_per_minute,
-                config.rate_limits.principal_burst,
-            ))?;
+    if let (Some(s3_address), Some(s3_host)) =
+        (config.s3_address.as_deref(), config.s3_host.as_deref())
+    {
+        let s3_server = S3Server::new(
+            s3_address,
+            s3_host,
+            driver_ctx,
+            config.realm_id,
+            config.node_id,
+            aruna_core::credential_encryption::CredentialEncryptionKey::derive(
+                &config.node_state.net_secret_key,
+            ),
+            config.rocrate_limits.clone(),
+            cors,
+            metrics,
+        )
+        .await?
+        .with_concurrency_limits(
+            config.rate_limits.s3_max_connections as usize,
+            config.rate_limits.s3_max_requests as usize,
+        )
+        .with_timeouts(s3_timeouts)
+        .with_trusted_proxies(config.trusted_proxies.clone())
+        .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
+            config.rate_limits.ip_per_minute,
+            config.rate_limits.ip_burst,
+            config.rate_limits.principal_per_minute,
+            config.rate_limits.principal_burst,
+        ))?;
 
-            let s3_listener = TcpListener::bind(s3_address).await?;
-            let s3_bound_addr = s3_listener.local_addr()?;
-            state
-                .register_s3_interface(
-                    s3_bound_addr,
-                    config.s3_public_url.as_deref().unwrap_or(s3_host),
-                )
-                .await;
-            let (_s3_addr, s3_handle) =
-                s3_server.run_with_listener(s3_listener, shutdown.token())?;
-            bind_session_s3(
-                session_s3,
-                s3_host,
-                driver_ctx_for_sessions,
-                cors_for_sessions,
-                metrics_for_sessions,
-                s3_timeouts,
-                shutdown,
+        let s3_listener = TcpListener::bind(s3_address).await?;
+        let s3_bound_addr = s3_listener.local_addr()?;
+        state
+            .register_s3_interface(
+                s3_bound_addr,
+                config.s3_public_url.as_deref().unwrap_or(s3_host),
             )
             .await;
-            Some(s3_handle)
-        }
-        _ => None,
-    };
+        let (_s3_addr, s3_handle) = s3_server.run_with_listener(s3_listener, shutdown.token())?;
+        started.s3 = Some(s3_handle);
+        started.session_s3 = bind_session_s3(
+            session_s3,
+            s3_host,
+            driver_ctx_for_sessions,
+            cors_for_sessions,
+            metrics_for_sessions,
+            s3_timeouts,
+            shutdown,
+        )
+        .await;
+    }
 
     let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
     let rest_handle = tokio::spawn(server.run_with_listener(rest_listener, shutdown.token()));
 
     Ok(ServerBindings {
         rest_handle,
-        s3_handle,
-        portal_handle,
+        s3_handle: started.s3.take(),
+        portal_handle: started.portal.take(),
+        session_s3_handle: started.session_s3.take(),
         realm_id: config.realm_id,
         node_id: config.node_id,
         is_initial_boot,
@@ -381,6 +439,185 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Increments on drop, so the test can observe that an aborted start task
+    /// really stopped and that `abort_all` waited for it.
+    struct DropCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_bind_aborts_and_awaits_started_listeners() {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut started = StartedListeners::default();
+        for slot in 0..3 {
+            let counter = DropCounter(dropped.clone());
+            let handle = tokio::spawn(async move {
+                let _counter = counter;
+                std::future::pending::<()>().await;
+            });
+            match slot {
+                0 => started.portal = Some(handle),
+                1 => started.s3 = Some(handle),
+                _ => started.session_s3 = Some(handle),
+            }
+        }
+
+        started.abort_all().await;
+
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "every started listener task must be aborted and awaited"
+        );
+        assert!(started.portal.is_none());
+        assert!(started.s3.is_none());
+        assert!(started.session_s3.is_none());
+    }
+
+    // A failure after the S3 listener started but before the REST listener did
+    // must release the S3 port instead of leaving a half-bound server behind.
+    #[tokio::test]
+    async fn later_bind_failure_releases_the_started_s3_listener() {
+        use aruna_core::metrics::NodeMetrics;
+        use aruna_core::shutdown::Shutdown;
+        use aruna_operations::jobs::runtime::JobsRuntime;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupied port");
+        let rest_addr = occupied.local_addr().expect("occupied addr");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("s3 port probe");
+        let s3_addr = probe.local_addr().expect("s3 addr");
+        drop(probe);
+
+        let map: std::collections::BTreeMap<String, String> = [
+            (
+                "STORAGE_PATH".to_string(),
+                temp.path().to_str().expect("utf8 path").to_string(),
+            ),
+            ("SOCKET_ADDRESS".to_string(), rest_addr.to_string()),
+            ("P2P_SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("S3_HOST".to_string(), "127.0.0.1".to_string()),
+            ("S3_ADDRESS".to_string(), s3_addr.to_string()),
+            ("PORTAL_MODE".to_string(), "disabled".to_string()),
+            ("ARUNA_FJALL_PERSIST_MODE".to_string(), "buffer".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let (config, storage) = crate::config::resolve_settings(
+            crate::settings::read_settings_from(&map).expect("settings parse"),
+        )
+        .await
+        .expect("settings resolve");
+        let driver_ctx = std::sync::Arc::new(aruna_operations::driver::DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+
+        let error = match bind(
+            &config,
+            driver_ctx,
+            JobsRuntime::new_paused(),
+            std::sync::Arc::new(NodeMetrics::new()),
+            &Shutdown::new(),
+        )
+        .await
+        {
+            Ok(_) => panic!("the occupied REST port must fail the bind"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("Address already in use")
+                || error.to_string().contains("address already in use"),
+            "expected a bind failure, got {error}"
+        );
+        // The aborted S3 listener dropped its socket, so the port binds again.
+        let rebound =
+            std::net::TcpListener::bind(s3_addr).expect("the failed bind must release the port");
+        drop(rebound);
+        drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn absent_session_listener_binds_nothing() {
+        let started = bind_session_s3(
+            None,
+            "127.0.0.1",
+            std::sync::Arc::new(aruna_operations::driver::DriverContext {
+                storage_handle: aruna_storage::StorageHandle::new().0,
+                net_handle: None,
+                blob_handle: None,
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            }),
+            CorsConfig::default(),
+            std::sync::Arc::new(aruna_core::metrics::NodeMetrics::new()),
+            S3ServerTimeouts::default(),
+            &aruna_core::shutdown::Shutdown::new(),
+        )
+        .await;
+
+        assert!(started.is_none());
+    }
+
+    // A successful optional bind returns a retained owner whose task completes
+    // once the shutdown token fires, so a later drain can await it.
+    #[tokio::test]
+    async fn session_listener_binds_and_completes_on_shutdown() {
+        use aruna_core::metrics::NodeMetrics;
+        use aruna_core::shutdown::Shutdown;
+        use aruna_core::structs::{RealmId, RoCrateLimits};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
+            .expect("storage opens");
+        let driver_ctx = std::sync::Arc::new(aruna_operations::driver::DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let secret = iroh::SecretKey::from_bytes(&[0x44; 32]);
+        let session = SessionS3 {
+            address: "127.0.0.1:0".parse().expect("loopback address"),
+            realm_id: RealmId::from_bytes([7u8; 32]),
+            node_id: secret.public(),
+            key: aruna_core::credential_encryption::CredentialEncryptionKey::derive(
+                &secret.to_bytes(),
+            ),
+            rocrate_limits: RoCrateLimits::default(),
+        };
+        let shutdown = Shutdown::new();
+        let handle = bind_session_s3(
+            Some(session),
+            "127.0.0.1",
+            driver_ctx,
+            CorsConfig::default(),
+            std::sync::Arc::new(NodeMetrics::new()),
+            S3ServerTimeouts::default(),
+            &shutdown,
+        )
+        .await
+        .expect("the session S3 listener binds on an ephemeral loopback port");
+
+        shutdown.trigger();
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("the retained session listener must stop on the shutdown token")
+            .expect("the session listener must not panic");
     }
 }
 

@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aruna_api::error::ServerSetupError;
-use aruna_api::monitoring::Readiness;
+use aruna_api::monitoring::{MonitoringState, Readiness};
 use aruna_blob::blob::BlobHandle;
 use aruna_core::shutdown::Shutdown;
 use aruna_net::{FORCED_INBOUND_DRAIN, NetHandle};
@@ -106,6 +106,11 @@ pub struct NodeShutdown {
     /// Portal SPA listener; drains with the other ingress listeners and is
     /// absent when no portal is configured.
     pub portal: Option<JoinHandle<()>>,
+    /// Optional session bridge listener; joined with the other ingress tasks.
+    pub session_s3: Option<JoinHandle<()>>,
+    /// The monitoring refresher owner. Its sampler is cancelled and awaited
+    /// before storage closes; the ops HTTP task above stays separate.
+    pub monitoring: Option<Arc<MonitoringState>>,
     pub task_handle: TaskHandle,
     pub jobs_runtime: Arc<JobsRuntime>,
     pub net_handle: Option<NetHandle>,
@@ -134,6 +139,7 @@ impl NodeShutdown {
         let mut rest = self.rest;
         let mut s3 = self.s3;
         let mut portal = self.portal;
+        let mut session_s3 = self.session_s3;
         let mut ingress_complete = false;
         phase("ingress", ingress, async {
             if let Some(rest) = rest.as_mut() {
@@ -148,6 +154,10 @@ impl NodeShutdown {
                 let _ = portal.await;
             }
             portal = None;
+            if let Some(session_s3) = session_s3.as_mut() {
+                let _ = session_s3.await;
+            }
+            session_s3 = None;
             ingress_complete = true;
         })
         .await;
@@ -161,6 +171,9 @@ impl NodeShutdown {
             if let Some(portal) = portal.as_ref() {
                 portal.abort();
             }
+            if let Some(session_s3) = session_s3.as_ref() {
+                session_s3.abort();
+            }
             if let Some(rest) = rest {
                 let _ = rest.await;
             }
@@ -169,6 +182,9 @@ impl NodeShutdown {
             }
             if let Some(portal) = portal {
                 let _ = portal.await;
+            }
+            if let Some(session_s3) = session_s3 {
+                let _ = session_s3.await;
             }
         }
 
@@ -214,7 +230,14 @@ impl NodeShutdown {
             info!(?job_report, "Shutdown: job runtime drained");
         }
 
-        // 6. Background children write metadata and storage: join them.
+        // 6. Stop the queue-lag sampler and await it before storage closes: its
+        //    sample task holds the driver context and must not outlive the store.
+        //    The ops HTTP task keeps serving; it is aborted only at the end.
+        if let Some(monitoring) = self.monitoring.as_ref() {
+            monitoring.stop_queue_refresher().await;
+        }
+
+        // 6b. Background children write metadata and storage: join them.
         let mut background_drained = false;
         let background_budget = writer_budget(budget.remaining());
         phase("background", background_budget, async {
@@ -461,6 +484,8 @@ mod tests {
             rest: None,
             s3: None,
             portal: None,
+            session_s3: None,
+            monitoring: None,
             task_handle: TaskHandle::new(),
             jobs_runtime: JobsRuntime::new(),
             net_handle: None,
@@ -669,6 +694,30 @@ mod tests {
         assert!(stopped.load(Ordering::SeqCst));
         assert_eq!(shutdown.tracked_children(), 0);
         assert_eq!(storage_handle.rejected_writes(), 0);
+    }
+
+    // The optional session listener is joined with the other ingress tasks
+    // instead of being left to its cancellation token.
+    #[tokio::test]
+    async fn session_listener_joined_on_shutdown() {
+        let dir = tempdir().expect("temp dir");
+        let storage_handle = open_storage(&dir);
+        let shutdown = Shutdown::new();
+        let stopped = Arc::new(AtomicBool::new(false));
+
+        let child_shutdown = shutdown.clone();
+        let child_stopped = stopped.clone();
+        let handle = tokio::spawn(async move {
+            child_shutdown.cancelled().await;
+            child_stopped.store(true, Ordering::SeqCst);
+        });
+
+        let mut sequence = node_shutdown(shutdown.clone(), storage_handle.clone());
+        sequence.session_s3 = Some(handle);
+
+        sequence.run().await;
+
+        assert!(stopped.load(Ordering::SeqCst));
     }
 
     // An ingress response that never finishes may burn at most its capped slice,
