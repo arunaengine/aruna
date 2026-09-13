@@ -636,22 +636,21 @@ impl TaskHandle {
         })
     }
 
-    /// Convenience constructor for tests and deliberate inactive handles:
-    /// starts the scheduler when a runtime is active, else returns an unstarted
-    /// handle and logs why. Production paths use [`TaskHandle::try_new`].
+    /// Test convenience for a running scheduler. A missing runtime is a
+    /// concrete panic, never a handle that only looks started; use
+    /// [`TaskHandle::try_new`] where the failure must be handled.
     pub fn new() -> Self {
-        match Self::try_new() {
-            Ok(handle) => handle,
-            Err(unavailable) => {
-                warn!(
-                    "TaskHandle created without an active Tokio runtime; task scheduler unavailable: {unavailable}"
-                );
-                let (command_tx, _command_rx) = mpsc::channel(TASK_COMMAND_BUFFER);
-                Self {
-                    command_tx,
-                    admission_closed: Arc::new(AtomicBool::new(false)),
-                }
-            }
+        Self::try_new().expect("task scheduler requires an active Tokio runtime")
+    }
+
+    /// An explicitly inactive handle: no scheduler runs, so every effect
+    /// reports the scheduler as unavailable. Only tests of that behavior use
+    /// this mode; production constructs through [`TaskHandle::try_new`].
+    pub fn inactive() -> Self {
+        let (command_tx, _command_rx) = mpsc::channel(TASK_COMMAND_BUFFER);
+        Self {
+            command_tx,
+            admission_closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1003,6 +1002,14 @@ mod tests {
         assert!(TaskHandle::try_new().is_ok());
     }
 
+    // The ambiguous fallback is gone: without a runtime construction panics
+    // instead of handing back an inactive scheduler.
+    #[test]
+    #[should_panic(expected = "task scheduler requires an active Tokio runtime")]
+    fn new_without_a_runtime_panics() {
+        let _ = TaskHandle::new();
+    }
+
     #[tokio::test]
     async fn reset_keeps_reschedule() {
         let handle = TaskHandle::new();
@@ -1303,7 +1310,7 @@ mod tests {
 
     #[test]
     fn shutdown_reports_unavailable() {
-        let handle = TaskHandle::new();
+        let handle = TaskHandle::inactive();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime should build");
