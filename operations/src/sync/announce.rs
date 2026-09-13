@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use aruna_core::UserId;
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
     DocumentSyncTarget,
@@ -19,7 +20,7 @@ use aruna_core::structs::PlacementRef;
 use aruna_core::structs::RealmId;
 use aruna_core::structs::{PlacementPolicyDocument, persistent_id_change, placement_policy_change};
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, UserId};
+use aruna_core::types::{Effects, Key};
 use aruna_core::{NodeId, TopicId, USER_KEYSPACE};
 use smallvec::smallvec;
 use thiserror::Error;

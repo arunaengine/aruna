@@ -2,6 +2,7 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::UserId;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncConflict, DocumentSyncRevision,
@@ -36,7 +37,7 @@ use crate::structs::{
     PlacementRef, RealmId, User, WatchSubscription, notification_inbox_key,
     notification_outbox_key, notification_prune_key, watch_subscription_key,
 };
-use crate::types::{GroupId, Key, KeySpace, UserId, Value};
+use crate::types::{GroupId, Key, KeySpace, Value};
 
 pub fn subject_index_key(subject_id: &str) -> Key {
     ByteView::from(subject_id.as_bytes().to_vec())

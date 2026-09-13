@@ -1,7 +1,7 @@
+use crate::UserId;
 use crate::compute::Secret;
 use crate::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret, EncryptionError};
 use crate::errors::ConversionError;
-use crate::types::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;

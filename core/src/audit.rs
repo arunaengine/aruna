@@ -7,9 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::id::NodeId;
 use crate::metadata::MetadataAuthToken;
 use crate::structs::{MetadataAuditRecord, RealmId};
-use crate::types::{GroupId, NodeId};
+use crate::types::GroupId;
 
 pub const AUDIT_KEY_BYTES: usize = 48;
 pub const MAX_AUDIT_RECORDS: usize = 200;
@@ -505,8 +506,8 @@ fn key_document(key: &[u8]) -> Option<Ulid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UserId;
     use crate::structs::MetadataAuditOperation;
-    use crate::types::UserId;
 
     fn key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) -> Vec<u8> {
         let mut key = Vec::with_capacity(AUDIT_KEY_BYTES);

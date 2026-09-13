@@ -736,6 +736,7 @@ fn remove_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) {
 
 #[cfg(test)]
 mod tests {
+    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentTarget,
@@ -762,7 +763,7 @@ mod tests {
         coordinator_spans,
     };
     use aruna_core::task::{TaskEvent, TaskKey};
-    use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId, Value};
+    use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
     use std::collections::BTreeMap;
     use ulid::Ulid;
 

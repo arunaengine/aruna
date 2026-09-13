@@ -1,7 +1,7 @@
+use aruna_core::UserId;
 use aruna_core::auth::valid_token_lifetime;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{NodeCapabilities, RealmId, SessionRef, TokenClaims};
-use aruna_core::types::UserId;
 use base64::Engine;
 use chrono::Months;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};

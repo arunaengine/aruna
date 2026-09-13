@@ -4,6 +4,7 @@
 
 use aruna_core::compute::ExecutionTargetId;
 use aruna_core::effects::{FetchCursor, PageLimit};
+use aruna_core::id::NodeId;
 use aruna_core::jobs::JobStatusView;
 use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE};
 use aruna_core::scheduling::{PlanCandidate, PlannedInput};
@@ -12,7 +13,7 @@ use aruna_core::structs::{
     JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
     PhysicalExecutionResult, PhysicalExecutionState, ProjectedExecution, SubmissionId,
 };
-use aruna_core::types::{Key, NodeId};
+use aruna_core::types::Key;
 use std::collections::BTreeMap;
 use tracing::debug;
 

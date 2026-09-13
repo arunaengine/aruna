@@ -1,8 +1,8 @@
 use crate::NodeId;
+use crate::UserId;
 use crate::auth::credential_hash;
 use crate::document::DocumentSyncTarget;
 use crate::structs::{RealmId, StaticRealmEndpoint};
-use crate::types::UserId;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::EndpointAddr;

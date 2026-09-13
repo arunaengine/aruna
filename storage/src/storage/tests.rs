@@ -7,14 +7,10 @@ use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
 use std::future::{Future, poll_fn};
 use std::sync::atomic::Ordering;
 use std::task::Poll;
+use std::thread;
 use std::time::{Duration, Instant};
-use std::{env, process::Command, thread};
 use tempfile::tempdir;
 use ulid::Ulid;
-
-const RESTART_CHILD_PATH_ENV: &str = "ARUNA_STORAGE_RESTART_CHILD_PATH";
-const RESTART_CHILD_MODE_ENV: &str = "ARUNA_STORAGE_RESTART_CHILD_MODE";
-const RESTART_CHILD_TEST: &str = "storage::tests::persistence_restart_child";
 
 fn small_handle(capacity: usize) -> (StorageHandle, super::StorageReceivers) {
     let (sender, foreground) = crossfire::mpsc::bounded_blocking(capacity);
@@ -370,7 +366,7 @@ fn bulk_full_rejects() {
     }
 }
 
-fn assert_write_result(event: Event, expected_key: &[u8]) {
+pub(super) fn assert_write_result(event: Event, expected_key: &[u8]) {
     match event {
         Event::Storage(StorageEvent::WriteResult { key }) => {
             assert_eq!(key.as_ref(), expected_key);
@@ -405,7 +401,7 @@ fn assert_batch_delete(event: Event, expected: &[(&str, &[u8])]) {
     }
 }
 
-fn assert_read_result(event: Event, expected_key: &[u8], expected_value: &[u8]) {
+pub(super) fn assert_read_result(event: Event, expected_key: &[u8], expected_value: &[u8]) {
     match event {
         Event::Storage(StorageEvent::ReadResult {
             key,
@@ -930,7 +926,7 @@ async fn sync_surfaces_errors() {
     assert_eq!(handle.get_errors(), 1);
 }
 
-async fn start_write_transaction(handle: &StorageHandle) -> Ulid {
+pub(super) async fn start_write_transaction(handle: &StorageHandle) -> Ulid {
     match handle
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
@@ -1511,7 +1507,7 @@ async fn transaction_cap() {
     assert!(handle.start_transaction(true).await.is_ok());
 }
 
-async fn commit_transaction(handle: &StorageHandle, txn_id: Ulid) {
+pub(super) async fn commit_transaction(handle: &StorageHandle, txn_id: Ulid) {
     match handle
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
@@ -1533,112 +1529,6 @@ async fn abort_transaction(handle: &StorageHandle, txn_id: Ulid) {
         }
         other => panic!("unexpected storage event: {other:?}"),
     }
-}
-
-fn run_restart_child(mode: &str, path: &str) {
-    let status = Command::new(env::current_exe().expect("test binary path"))
-        .arg(RESTART_CHILD_TEST)
-        .arg("--exact")
-        .arg("--nocapture")
-        .env(RESTART_CHILD_PATH_ENV, path)
-        .env(RESTART_CHILD_MODE_ENV, mode)
-        .status()
-        .expect("restart child process should run");
-
-    assert!(status.success(), "restart child process failed: {status}");
-}
-
-#[test]
-fn persistence_restart_child() {
-    let Ok(mode) = env::var(RESTART_CHILD_MODE_ENV) else {
-        return;
-    };
-    let path = env::var(RESTART_CHILD_PATH_ENV).expect("restart child path");
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-
-    runtime.block_on(async {
-        let handle = FjallStorage::open_with_policy(&path, FjallPersistPolicy::Buffer)
-            .expect("storage opens in restart child");
-
-        match mode.as_str() {
-            "write" => {
-                assert_write_result(
-                    handle
-                        .send_storage_effect(StorageEffect::Write {
-                            key_space: "restart_write".to_string(),
-                            key: b"key".to_vec().into(),
-                            value: b"value".to_vec().into(),
-                            txn_id: None,
-                        })
-                        .await,
-                    b"key",
-                );
-            }
-            "transaction" => {
-                let txn_id = start_write_transaction(&handle).await;
-                assert_write_result(
-                    handle
-                        .send_storage_effect(StorageEffect::Write {
-                            key_space: "restart_transaction".to_string(),
-                            key: b"key".to_vec().into(),
-                            value: b"transaction".to_vec().into(),
-                            txn_id: Some(txn_id),
-                        })
-                        .await,
-                    b"key",
-                );
-                commit_transaction(&handle, txn_id).await;
-            }
-            other => panic!("unsupported restart child mode: {other}"),
-        }
-    });
-
-    // Skip Rust destructors so the parent verifies the restart contract, not shutdown cleanup.
-    std::process::exit(0);
-}
-
-#[tokio::test]
-async fn buffered_write_survives() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().to_str().unwrap();
-
-    run_restart_child("write", path);
-    let handle = FjallStorage::open_with_policy(path, FjallPersistPolicy::Buffer)
-        .expect("storage reopens after restart");
-
-    assert_read_result(
-        handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: "restart_write".to_string(),
-                key: b"key".to_vec().into(),
-                txn_id: None,
-            })
-            .await,
-        b"key",
-        b"value",
-    );
-}
-
-#[tokio::test]
-async fn buffered_commit_survives() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().to_str().unwrap();
-
-    run_restart_child("transaction", path);
-    let handle = FjallStorage::open_with_policy(path, FjallPersistPolicy::Buffer)
-        .expect("storage reopens after restart");
-
-    assert_read_result(
-        handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: "restart_transaction".to_string(),
-                key: b"key".to_vec().into(),
-                txn_id: None,
-            })
-            .await,
-        b"key",
-        b"transaction",
-    );
 }
 
 #[tokio::test]

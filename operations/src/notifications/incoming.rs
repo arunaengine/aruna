@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
@@ -9,7 +10,6 @@ use aruna_core::structs::{
     WatchEvent, WatchEventDetail, WatchEventKind, parse_watch_path, watch_resource_path,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::UserId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use byteview::ByteView;
@@ -773,6 +773,7 @@ mod tests {
         WATCH_SUBSCRIPTION_UNAUTHORIZED, create_local_watch, list_watch_subscriptions,
     };
     use crate::sync::incoming::initialize_net_incoming;
+    use aruna_core::UserId;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
         NOTIFICATION_WATCH_INTEREST_KEYSPACE,
@@ -784,7 +785,6 @@ mod tests {
         TokenRevocation, WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind,
         WatchEventMask, interest_dirty_key, object_permission_path, watch_resource_path,
     };
-    use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
     use std::sync::Arc;

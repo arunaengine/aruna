@@ -1,3 +1,4 @@
+use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -17,7 +18,7 @@ use aruna_core::structs::{
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, GroupId, Key, KeySpace, RoleId, TxnId, UserId};
+use aruna_core::types::{Effects, GroupId, Key, KeySpace, RoleId, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::HashSet;

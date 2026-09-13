@@ -1633,12 +1633,12 @@ async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect};
     use aruna_core::events::{DhtEntry, DhtEvent, NetEvent};
     use aruna_core::structs::{
         Actor, PlacementOverride, PlacementStrategy, RealmNode, RealmNodeKind,
     };
-    use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;

@@ -126,6 +126,7 @@ mod tests {
 
     use aruna_compute::ExecutorBackend;
     use aruna_compute::ExecutorRegistry;
+    use aruna_core::UserId;
     use aruna_core::compute::{
         AttemptRef, AttemptStatus, CancelEvidence, FenceContext, LogLimits, LogTails, NOBODY,
         ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, UserSpec,
@@ -137,7 +138,6 @@ mod tests {
         ExecutionSpec, JobClaim, JobPayload, JobProgress, JobRecord, JobState, RealmId, UserAccess,
         VersionKey, WorkspaceMode,
     };
-    use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;

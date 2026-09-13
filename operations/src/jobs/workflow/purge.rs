@@ -596,11 +596,11 @@ fn fence_error(error: PurgeFenceError) -> JobError {
 #[cfg(test)]
 mod tests {
     use super::purge_audit_record;
+    use aruna_core::UserId;
     use aruna_core::structs::RealmId;
     use aruna_core::structs::{
         AuthContext, BlobDeleteAuditKind, BlobPurgeScopeKind, StoragePurgeScope, StoragePurgeSpec,
     };
-    use aruna_core::types::UserId;
     use ulid::Ulid;
 
     fn spec(scope: StoragePurgeScope) -> StoragePurgeSpec {

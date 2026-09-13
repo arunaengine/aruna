@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
@@ -14,7 +15,7 @@ use aruna_core::structs::{
     WriteGuard,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, Key, TxnId, UserId, Value};
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;

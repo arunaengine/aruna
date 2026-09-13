@@ -512,9 +512,9 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::metadata::forward::MetadataWriteError;
     use crate::tests::fixtures::device::context;
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::RealmId;
-    use aruna_core::types::UserId;
     use std::sync::Arc;
     use ulid::Ulid;
 

@@ -2,6 +2,7 @@
 //! through `Processing` to `Active`; each step is a compare-and-set txn that
 //! also enqueues its sync publish, so replay cannot mint twice.
 
+use aruna_core::UserId;
 use aruna_core::document::DocumentSyncOutboxEvent;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -14,7 +15,7 @@ use aruna_core::structs::{
     PersistentIdMapping, PersistentIdRevision, PlacementRef, RealmConfigDocument, RealmId,
     persistent_id_change, persistent_id_key, persistent_id_target,
 };
-use aruna_core::types::{TxnId, UserId};
+use aruna_core::types::TxnId;
 use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
@@ -89,7 +90,7 @@ pub async fn mint_persistent_id(
     ctx: &DriverContext,
     realm_id: RealmId,
     document_id: Ulid,
-    minted_by: aruna_core::types::UserId,
+    minted_by: aruna_core::UserId,
     minted_at_ms: u64,
 ) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
     let route = mapping_route(ctx, realm_id, document_id).await?;
@@ -329,7 +330,7 @@ async fn mint_in_txn(
     ctx: &DriverContext,
     route: &Option<MappingRoute>,
     document_id: Ulid,
-    minted_by: aruna_core::types::UserId,
+    minted_by: aruna_core::UserId,
     minted_at_ms: u64,
     txn_id: TxnId,
 ) -> Result<Option<(PersistentIdMapping, bool)>, PersistentIdError> {
@@ -669,8 +670,8 @@ mod tests {
         RealmId([3; 32])
     }
 
-    fn user() -> aruna_core::types::UserId {
-        aruna_core::types::UserId::local(Ulid::from_bytes([2; 16]), realm())
+    fn user() -> aruna_core::UserId {
+        aruna_core::UserId::local(Ulid::from_bytes([2; 16]), realm())
     }
 
     fn record(document_id: Ulid) -> MetadataRegistryRecord {

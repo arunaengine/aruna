@@ -1,6 +1,6 @@
+use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::Actor;
-use crate::types::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 

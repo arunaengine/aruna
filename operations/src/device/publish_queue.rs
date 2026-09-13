@@ -1,12 +1,13 @@
 //! Storage shape of the device-local publish queue.
 
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
 use aruna_core::metadata::{MetadataBatch, MetadataBatchSource};
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{GroupId, Key, TxnId, UserId, Value};
+use aruna_core::types::{GroupId, Key, TxnId, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -251,9 +252,9 @@ pub fn read_publish_entry(draft_id: Ulid, txn_id: Option<TxnId>) -> Effect {
 #[cfg(test)]
 mod tests {
     use super::{PublishEntry, PublishState, publish_key};
+    use aruna_core::UserId;
     use aruna_core::metadata::{MetadataBatch, MetadataBatchSource, MetadataDot, MetadataQuadOp};
     use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
-    use aruna_core::types::UserId;
     use craqle::VectorClock;
     use ulid::Ulid;
 

@@ -419,6 +419,7 @@ mod tests {
     use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
     use aruna_compute::ExecutorRegistry;
     use aruna_compute::session::{EndReason, Session};
+    use aruna_core::UserId;
     use aruna_core::compute::{
         AttemptPhase, AttemptStatus, CancelEvidence, LogLimits, LogTails, NOBODY, NetworkAccess,
         ReconcileEvidence, StagingMode, TaskOutput, TaskSpec, UserSpec,
@@ -429,7 +430,6 @@ mod tests {
         WorkspaceMode,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
-    use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
     use std::collections::BTreeMap;

@@ -1,10 +1,10 @@
 use crate::NodeId;
+use crate::UserId;
 use crate::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
 };
 use crate::errors::ConversionError;
 use crate::structs::{JobId, MetadataRegistryRecord, PlacementRef};
-use crate::types::UserId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 

@@ -305,12 +305,12 @@ fn provision_lock() -> &'static tokio::sync::Mutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::Event;
     use aruna_core::structs::{
         FIRST_GRANTABLE_HANDLE, HandleRange, RealmConfigDocument, RealmNodeKind,
     };
-    use aruna_core::types::UserId;
     use tempfile::tempdir;
 
     fn node(seed: u8) -> NodeId {

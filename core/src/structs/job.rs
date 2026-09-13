@@ -8,6 +8,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::UserId;
 use crate::compute::ExecutionTargetId;
 use crate::compute::runtimes::{SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK};
 use crate::errors::ConversionError;
@@ -20,7 +21,7 @@ use crate::structs::{
 use crate::structured_id::{
     BucketId, FieldError, JobId as RoutableJobId, PlacementHandle, StructuredId,
 };
-use crate::types::{GroupId, Key, UserId};
+use crate::types::{GroupId, Key};
 
 mod family;
 mod identity;

@@ -458,13 +458,13 @@ mod tests {
     use super::{CLEANUP_PAGE_SIZE, MAX_CLEANUP_RETRIES, PendingCleanup, process_cleanup_batch};
     use crate::driver::DriverContext;
     use crate::jobs::store::iter_prefix_page;
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
     use aruna_core::structs::{
         BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, RoCrateLimits, WriteOwner,
     };
-    use aruna_core::types::UserId;
     use aruna_storage::storage::{FjallStorage, StorageHandle};
     use std::collections::HashMap;
     use std::time::SystemTime;

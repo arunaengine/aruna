@@ -1361,7 +1361,7 @@ fn admin_outbox(
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
-    let user_id = aruna_core::types::UserId::nil(realm_id);
+    let user_id = aruna_core::UserId::nil(realm_id);
     crate::sync::document_outbox::new_outbox_record(
         node(1),
         target,

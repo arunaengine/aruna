@@ -3,6 +3,7 @@
 //! answer where governed data may live. Neither set is derived from the other.
 
 use crate::NodeId;
+use crate::UserId;
 use crate::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
 };
@@ -13,7 +14,7 @@ use crate::structs::{
     PlacementPolicyRef, PlacementRef, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     Role, VerifiedPolicy,
 };
-use crate::types::{GroupId, UserId};
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;

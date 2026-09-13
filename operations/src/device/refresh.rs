@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::events::Event;
 use aruna_core::metadata::{
     MetadataAuthToken, MetadataClockRelation, MetadataEffect, MetadataEvent,
@@ -13,7 +14,6 @@ use aruna_core::metadata::{
 };
 use aruna_core::structs::{AuthContext, RealmConfigDocument, RealmId, SyncRefusal};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::UserId;
 use rand::seq::SliceRandom;
 use tracing::{debug, warn};
 use ulid::Ulid;

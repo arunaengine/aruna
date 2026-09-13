@@ -4,13 +4,14 @@
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState, NODE_SUBJECT_KEY,
     NodeSubjectRecord, PlacementSubject, RealmConfigDocument, RealmId, storage_subject,
 };
-use aruna_core::types::{Effects, Key, NodeId, TxnId};
+use aruna_core::types::{Effects, Key, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -516,13 +517,13 @@ mod tests {
     use super::{SubjectScanConfig, SubjectScanMode, SubjectScanOperation};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
         BackendLocation, BackendRef, ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
         NodeSubjectRecord, PlacementPolicyRef, PlacementSubject, RealmId, VersionKey,
     };
-    use aruna_core::types::NodeId;
     use std::collections::{BTreeMap, HashMap};
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;

@@ -7,12 +7,12 @@ use crate::blob::managed_copy::{
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::S3_MULTIPART_OBJECT_METADATA_KEYSPACE;
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobLocationKey, ManagedCopyKey, MultipartObjectMetadataKey,
     MultipartObjectSummary, PlacementPolicyRef, VersionKey,
 };
-use aruna_core::types::NodeId;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]

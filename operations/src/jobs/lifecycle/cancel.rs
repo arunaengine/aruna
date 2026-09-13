@@ -3,13 +3,13 @@
 //! asked to stop. A partitioned execution may finish with `cancel_requested` set.
 
 use aruna_core::effects::JobRecordFrame;
+use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::structs::{
     AuthContext, CancelAuthority, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobId,
     JobRecordEnvelope, JobRecordKind, LogicalJobSpec, Permission, group_permission_path,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::NodeId;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -217,7 +217,7 @@ async fn publish_cancel(
 /// an unreachable executor keeps running and converges through the record.
 async fn stop_execution(
     context: &DriverContext,
-    executor: aruna_core::types::NodeId,
+    executor: aruna_core::id::NodeId,
     job_id: JobId,
     auth_token: &MetadataAuthToken,
 ) {

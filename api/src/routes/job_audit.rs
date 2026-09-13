@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use aruna_core::id::NodeId;
 use aruna_core::structs::{AuthContext, JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope};
-use aruna_core::types::NodeId;
 use aruna_operations::jobs::lifecycle::{
     AuditPaging, AuditRange, audit_endpoints, family_audit, family_report,
 };

@@ -1890,11 +1890,11 @@ fn classify_gate(error: GateContextError) -> ImportFailure {
 pub(crate) mod tests {
 
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::structs::{
         ImportMetadataTarget, ImportRoCrateTarget, JobClaim, JobId, JobPayload, JobRecord,
         JobState, RealmId, RoCrateUploadRecord,
     };
-    use aruna_core::types::UserId;
     use tokio_util::sync::CancellationToken;
 
     use crate::jobs::executor::ProgressReporter;

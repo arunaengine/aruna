@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecretError};
 use aruna_core::structs::{
@@ -8,7 +9,6 @@ use aruna_core::structs::{
     ResourceEvent, normalize_placement_input, reserved_label,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::UserId;
 use ed25519_dalek::SigningKey;
 use thiserror::Error;
 use tracing::warn;
@@ -387,6 +387,7 @@ mod tests {
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
     use aruna_core::NodeId;
+    use aruna_core::UserId;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -399,7 +400,6 @@ mod tests {
         Actor, BindingScope, DocumentClass, KIND_LABEL_KEY, NotificationKind,
         NotificationOutboxRecord, RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
-    use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;

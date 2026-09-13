@@ -340,8 +340,8 @@ async fn batch_delete(
 mod tests {
     use super::*;
     use crate::tests::fixtures::notifications::{context, record, temp_storage, user};
+    use aruna_core::UserId;
     use aruna_core::storage_entries::{inbox_update_entry, inbox_write_entries};
-    use aruna_core::types::UserId;
     use aruna_tasks::InboundTaskHandler;
     use async_trait::async_trait;
     use std::sync::Arc;

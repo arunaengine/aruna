@@ -171,10 +171,10 @@ impl Operation for ObjectPlacementOperation {
 #[cfg(test)]
 mod tests {
     use super::{ObjectPlacementError, ObjectPlacementInput, ObjectPlacementOperation};
+    use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{BackendRef, BlobVersion, CurrentVersionPointer, PlacementPolicyRef};
-    use aruna_core::types::UserId;
     use std::time::SystemTime;
     use ulid::Ulid;
 

@@ -197,7 +197,7 @@ async fn complete_upload(
     key: &str,
     upload_id: Ulid,
     realm_id: RealmId,
-    node_id: aruna_core::types::NodeId,
+    node_id: aruna_core::id::NodeId,
     uploaded_parts: &[aruna_operations::s3::upload_part::UploadPartResult],
     checksum_type: MultipartChecksumType,
     object_size: Option<u64>,
@@ -1504,7 +1504,7 @@ fn completion_input(
     upload_id: Ulid,
     part: &aruna_operations::s3::upload_part::UploadPartResult,
     realm_id: RealmId,
-    node_id: aruna_core::types::NodeId,
+    node_id: aruna_core::id::NodeId,
     created_by: UserId,
     now: u64,
 ) -> CompleteMultipartUploadInput {

@@ -4,6 +4,7 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::UserId;
 use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
@@ -19,7 +20,7 @@ use crate::structs::{
     persistent_id_key, placement_policy_key, usage_global_key, usage_snapshot_key,
     watch_subscription_key,
 };
-use crate::types::{GroupId, Key, UserId};
+use crate::types::{GroupId, Key};
 use crate::{NodeId, TopicId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

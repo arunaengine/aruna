@@ -1,4 +1,5 @@
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -7,7 +8,7 @@ use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
 use aruna_core::operation::Operation;
 use aruna_core::structs::RealmId;
-use aruna_core::types::{Effects, Key, UserId};
+use aruna_core::types::{Effects, Key};
 use ed25519_dalek::SigningKey;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -200,13 +201,13 @@ mod tests {
         ONBOARDING_SYNC_TICKET_TTL_SECS,
     };
     use crate::driver::{DriverContext, drive};
+    use aruna_core::UserId;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USER_KEYSPACE;
     use aruna_core::operation::Operation;
     use aruna_core::structs::RealmId;
-    use aruna_core::types::UserId;
     use aruna_storage::storage;
     use byteview::ByteView;
     use ed25519_dalek::SigningKey;

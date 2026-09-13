@@ -1,10 +1,11 @@
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{NotificationRecord, notification_inbox_prefix};
-use aruna_core::types::{Effects, Key, UserId};
+use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 

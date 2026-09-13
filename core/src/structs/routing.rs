@@ -1,6 +1,7 @@
+use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::{BackendRef, CleanupStrategy, ResolvedBackend};
-use crate::types::{GroupId, UserId};
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};

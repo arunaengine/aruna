@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::structs::{
@@ -9,7 +10,6 @@ use aruna_core::structs::{
     WatchSubscription, bucket_permission_path, object_permission_path, parse_watch_path,
     watch_path_matches, watch_resource_path,
 };
-use aruna_core::types::UserId;
 use tracing::warn;
 use ulid::Ulid;
 

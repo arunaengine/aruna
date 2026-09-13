@@ -313,15 +313,17 @@ impl Operation for PolicyMutationOperation {
 #[cfg(test)]
 mod tests {
     use super::{PolicyMutationConfig, PolicyMutationError, PolicyMutationOperation};
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
         AuthContext, CurrentVersionPointer, PlacementPolicy, PlacementSelector, PlacementSubject,
         RealmId, VerifiedPolicy,
     };
-    use aruna_core::types::{Key, NodeId, UserId};
+    use aruna_core::types::Key;
     use std::collections::BTreeMap;
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;

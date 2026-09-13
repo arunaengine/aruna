@@ -750,11 +750,11 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::structs::{
         ArtifactRef, AuthContext, BackendRef, ExportRoCrateResult, ExportRoCrateSpec, JobPayload,
         JobState, RealmId, RoCrateCheckpointRefs, RoCrateLimits, RoCrateMediaType,
     };
-    use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use serde::Serialize;
     use std::collections::HashMap;

@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use aruna_core::audit::{AuditPageBatch, MAX_AUDIT_PEERS};
 use aruna_core::effects::AuditPageEffect;
 use aruna_core::events::{Event, NetEvent};
-use aruna_core::types::NodeId;
+use aruna_core::id::NodeId;
 use futures_util::{StreamExt, stream};
 use std::time::Duration;
 use tracing::trace;

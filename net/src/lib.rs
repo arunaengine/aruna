@@ -36,6 +36,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
     DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
@@ -49,7 +50,6 @@ use aruna_core::structs::{
     NetState, NetworkDiagnosticsState, PlacementRef, RealmConfigDocument, RealmId,
     WatchInterestEntry, WatchInterestTable,
 };
-use aruna_core::types::UserId;
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use iroh::address_lookup::memory::MemoryLookup;

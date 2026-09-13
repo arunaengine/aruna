@@ -1,3 +1,4 @@
+use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -20,7 +21,7 @@ use aruna_core::structs::{
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId};
+use aruna_core::types::{Effects, Key, KeySpace, TxnId};
 use aruna_core::user_validation::{
     UserAttributeValidationError, validate_attribute_count, validate_attribute_key,
     validate_attribute_value,
@@ -745,6 +746,7 @@ fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateU
 #[cfg(test)]
 mod tests {
     use super::{UpdateUserError, UpdateUserInput, UpdateUserOperation};
+    use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
     use aruna_core::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
@@ -760,7 +762,7 @@ mod tests {
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key, sync_revision_key};
     use aruna_core::structs::{Actor, AuthContext, PlacementRef, RealmId, User};
     use aruna_core::task::{TaskEvent, TaskKey};
-    use aruna_core::types::{TxnId, UserId};
+    use aruna_core::types::TxnId;
     use aruna_core::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE,

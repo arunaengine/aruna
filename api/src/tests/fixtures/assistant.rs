@@ -1,7 +1,7 @@
 use crate::server_state::ServerState;
 use crate::tests::fixtures::routes::{test_context, test_state, test_storage};
+use aruna_core::UserId;
 use aruna_core::structs::{AuthContext, NodeCapabilities, RealmId};
-use aruna_core::types::UserId;
 use axum::Router;
 use std::sync::Arc;
 use tempfile::TempDir;

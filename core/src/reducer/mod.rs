@@ -11,6 +11,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::UserId;
 use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
     AdminDocumentRoleDefinition, AdminDocumentTarget,
@@ -26,7 +27,7 @@ use crate::structs::{
     TransitionStatus, reserved_label,
 };
 use crate::structured_id::PlacementHandle;
-use crate::types::{RoleId, UserId};
+use crate::types::RoleId;
 use crate::user_validation::{
     UserAttributeValidationError, validate_attribute_key, validate_attribute_value,
 };

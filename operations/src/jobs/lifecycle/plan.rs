@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 
 use aruna_core::compute::{ExecutionTargetId, ExecutorCapability, NetworkAccess, StagingMode};
+use aruna_core::id::NodeId;
 use aruna_core::scheduling::{
     ExecutionPlan, InputHolder, MAX_INPUT_HOLDERS, MAX_TARGET_SCAN, PlanRequest, Planner,
     ResolvedInput, TargetCandidate,
@@ -15,7 +16,6 @@ use aruna_core::structs::{
     RealmConfigDocument, RealmNodeKind, VersionKey, VersionedObjectArn, WorkspaceMode,
     group_permission_path, storage_subject,
 };
-use aruna_core::types::NodeId;
 use thiserror::Error;
 use tracing::{debug, warn};
 use ulid::Ulid;

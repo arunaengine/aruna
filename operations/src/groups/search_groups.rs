@@ -220,11 +220,12 @@ impl Operation for SearchGroupsOperation {
 #[cfg(test)]
 mod tests {
     use super::{SearchGroupsInput, SearchGroupsMatch, SearchGroupsOperation, SearchGroupsOutput};
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, Group, RealmId};
-    use aruna_core::types::{Key, UserId, Value};
+    use aruna_core::types::{Key, Value};
     use std::collections::HashSet;
     use ulid::Ulid;
 

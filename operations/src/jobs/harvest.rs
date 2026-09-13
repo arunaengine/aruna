@@ -524,7 +524,7 @@ async fn update_document(
 
 /// Harvest writes run as the source owner, unrestricted: the source record is
 /// the authorization decision, made when an operator created it.
-fn internal_token(created_by: aruna_core::types::UserId, realm_id: RealmId) -> MetadataAuthToken {
+fn internal_token(created_by: aruna_core::UserId, realm_id: RealmId) -> MetadataAuthToken {
     MetadataAuthToken::internal(AuthContext {
         user_id: created_by,
         realm_id,

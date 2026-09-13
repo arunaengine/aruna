@@ -204,6 +204,8 @@ mod tests {
     use crate::jobs::store::{
         ClaimOutcome, claim_job, complete_job, insert_job, put_job_entry, transition_to_running,
     };
+    use aruna_core::UserId;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         JOB_ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE,
     };
@@ -212,7 +214,6 @@ mod tests {
         ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload,
         JobProgress, JobRecord, JobResultPayload, JobState, RealmId, RoCrateLimits,
     };
-    use aruna_core::types::{NodeId, UserId};
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
     use ulid::Ulid;

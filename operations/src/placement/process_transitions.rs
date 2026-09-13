@@ -5,13 +5,13 @@
 use std::sync::Arc;
 
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::document::shard_topic_id;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{
     Actor, PlacementRef, PlacementTransition, ProofClaim, RealmConfigDocument, RealmId,
     TransitionStatus,
 };
-use aruna_core::types::UserId;
 use tracing::{debug, warn};
 
 use crate::driver::{DriverContext, drive};

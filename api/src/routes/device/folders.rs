@@ -16,11 +16,12 @@ use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::StagingSourceError;
+use aruna_core::id::NodeId;
 use aruna_core::structs::{
     ActionKind, ActionOutcome, ActionScope, AuthContext, FolderMode, FolderState, RemoteBinding,
     SyncRefusal,
 };
-use aruna_core::types::{Key, NodeId};
+use aruna_core::types::Key;
 use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{
     ActionError, ApplyActionInput, ExpectedEntry, apply_action,

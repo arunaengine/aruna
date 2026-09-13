@@ -1,3 +1,4 @@
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -7,7 +8,7 @@ use aruna_core::storage_entries::inbox_update_entry;
 use aruna_core::structs::{
     NotificationRecord, invert_timestamp_ms, notification_inbox_prefix, parse_inbox_key,
 };
-use aruna_core::types::{Effects, Key, KeySpace, UserId, Value};
+use aruna_core::types::{Effects, Key, KeySpace, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;

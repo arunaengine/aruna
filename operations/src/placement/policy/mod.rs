@@ -73,12 +73,12 @@ pub fn foreign_owner(
 #[cfg(test)]
 pub(crate) mod tests {
     use aruna_core::NodeId;
+    use aruna_core::UserId;
     use aruna_core::structs::{
         DEFAULT_NODE_WEIGHT, NodePlacementEntry, Permission, PlacementDecision, PlacementPolicy,
         PlacementSelector, PlacementSubject, PolicyResolution, RealmAuthorizationDocument,
         RealmConfigDocument, RealmId, RealmNodeKind, Role, VerifiedPolicy, evaluate_placement,
     };
-    use aruna_core::types::UserId;
     use std::collections::{BTreeMap, HashMap, HashSet};
     use ulid::Ulid;
 

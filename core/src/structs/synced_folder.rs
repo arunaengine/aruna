@@ -1,10 +1,11 @@
 //! Device folder sync adds absent or conflict copies and replaces only an unchanged recorded base.
 //! Deletion or replacement of other local bytes requires the owner.
 
+use crate::UserId;
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::FileStat;
-use crate::types::{GroupId, UserId};
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 

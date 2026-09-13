@@ -939,6 +939,7 @@ async fn delete_repair_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
@@ -947,7 +948,6 @@ mod tests {
         Actor, ArunaArn, BucketInfo, Group, GroupAuthorizationDocument, RealmAuthorizationDocument,
         RealmConfigDocument, RealmId, ReferenceHandling, SyncMode, SyncState, SyncStatusSnapshot,
     };
-    use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use std::time::SystemTime;
     use ulid::Ulid;

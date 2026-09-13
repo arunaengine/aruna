@@ -1,5 +1,5 @@
+use crate::UserId;
 use crate::errors::ConversionError;
-use crate::types::UserId;
 use serde::{Deserialize, Serialize};
 
 /// Live chats one user may keep on the node.

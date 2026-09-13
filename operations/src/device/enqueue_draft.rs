@@ -232,9 +232,9 @@ mod tests {
     use crate::device::publish_queue::{MAX_PUBLISH_ENTRIES, PublishEntry, publish_entry};
     use crate::driver::{DriverContext, drive};
     use crate::tests::fixtures::device::context;
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::RealmId;
-    use aruna_core::types::UserId;
     use ulid::Ulid;
 
     fn owner() -> UserId {

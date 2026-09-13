@@ -1,4 +1,5 @@
 use super::*;
+use aruna_core::UserId;
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, ImportMetadataTarget,
     ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
@@ -6,7 +7,6 @@ use aruna_core::structs::{
     MintPersistentIdSpec, RealmId, ReasonCode, RoCrateLimits, parse_schedule_key, pid_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_core::types::UserId;
 use aruna_storage::FjallStorage;
 use tempfile::tempdir;
 

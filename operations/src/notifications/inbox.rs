@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use aruna_core::UserId;
 use aruna_core::effects::IterStart;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
@@ -10,7 +11,7 @@ use aruna_core::structs::{
     NOTIFICATION_TRANSIENT_PER_USER_CAP, NotificationClass, NotificationRecord,
     notification_inbox_key, notification_inbox_prefix,
 };
-use aruna_core::types::{Key, KeySpace, TxnId, UserId, Value};
+use aruna_core::types::{Key, KeySpace, TxnId, Value};
 use aruna_storage::StorageHandle;
 
 #[derive(Debug)]

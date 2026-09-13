@@ -1,5 +1,6 @@
 use super::index::{MAX_USER_SESSIONS, decode_index, encode_index, owner_key};
 use crate::auth::create_token::{CreateTokenConfig, CreateTokenError, mint_token};
+use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::compute::Secret;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -8,7 +9,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{USER_SESSION_KEYSPACE, USER_SESSION_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{NodeCapabilities, RealmId, SessionKind, SessionRef, UserSession};
-use aruna_core::types::{Effects, TxnId, UserId};
+use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
 use thiserror::Error;

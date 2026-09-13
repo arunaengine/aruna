@@ -257,8 +257,8 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::s3::access_index::{decode_index, encode_index, owner_key};
+    use aruna_core::UserId;
     use aruna_core::structs::{RealmId, UserAccess};
-    use aruna_core::types::UserId;
     use aruna_storage::storage;
     use std::time::Duration;
     use tempfile::tempdir;

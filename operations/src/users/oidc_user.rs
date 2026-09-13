@@ -1,3 +1,4 @@
+use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -15,7 +16,7 @@ use aruna_core::storage_entries::{reducer_state_entry, sync_revision_entry};
 use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, User, oidc_subject_key};
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
-use aruna_core::types::{Effects, TxnId, UserId};
+use aruna_core::types::{Effects, TxnId};
 use aruna_core::{USER_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;

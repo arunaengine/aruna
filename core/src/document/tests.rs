@@ -7,6 +7,7 @@ use super::{
 };
 use crate::NodeId;
 use crate::TopicId;
+use crate::UserId;
 use crate::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
     METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
@@ -14,7 +15,6 @@ use crate::keyspaces::{
 };
 use crate::structs::PlacementRef;
 use crate::structs::RealmId;
-use crate::types::UserId;
 use ulid::Ulid;
 
 fn test_ulid(seed: u8) -> Ulid {

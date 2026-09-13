@@ -1,11 +1,12 @@
 use super::access_index::{decode_index, owner_key};
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::UserAccess;
-use aruna_core::types::{Effects, UserId};
+use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 

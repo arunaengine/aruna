@@ -517,7 +517,7 @@ async fn fail_or_park(
     }
 }
 
-fn holder(context: &DriverContext) -> aruna_core::types::NodeId {
+fn holder(context: &DriverContext) -> aruna_core::id::NodeId {
     context
         .net_handle
         .as_ref()
@@ -532,9 +532,9 @@ mod tests {
     use crate::jobs::store::{insert_job, record_attempt_intent};
     use crate::tests::fixtures::workflow::{execution_spec, node_id};
     use aruna_compute::ExecutorRegistry;
+    use aruna_core::UserId;
     use aruna_core::structs::{AttemptIntent, FIRST_GRANTABLE_HANDLE, JobClaim, JobId, RealmId};
     use aruna_core::structured_id::{BucketId, PlacementHandle};
-    use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;

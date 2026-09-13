@@ -245,7 +245,7 @@ async fn answers_by_alias() {
     assert_eq!(status.job.job_id, family.job_id);
 
     let stranger = AuthContext {
-        user_id: aruna_core::types::UserId::new(Ulid::from_bytes([12u8; 16]), REALM),
+        user_id: aruna_core::UserId::new(Ulid::from_bytes([12u8; 16]), REALM),
         realm_id: REALM,
         path_restrictions: None,
         session: None,

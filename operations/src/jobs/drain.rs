@@ -4,6 +4,7 @@ use std::time::Duration;
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::{
     JOB_DUE_INDEX_PREFIX, JOB_LEASE_INDEX_PREFIX, JobError, JobExecutionClass, JobId, JobRecord,
@@ -11,7 +12,7 @@ use aruna_core::structs::{
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Key, NodeId};
+use aruna_core::types::Key;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -410,12 +411,12 @@ mod tests {
     use super::*;
     use crate::jobs::JOB_LEASE_MS;
     use crate::jobs::store::insert_job;
+    use aruna_core::UserId;
     use aruna_core::structs::{
         AttemptIntent, FIRST_GRANTABLE_HANDLE, JobClaim, JobPayload, JobState, RealmId,
         due_index_key,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
-    use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use std::sync::Mutex;
     use tempfile::tempdir;

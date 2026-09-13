@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::UserId;
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
     DocumentSyncRevision, DocumentSyncTarget,
@@ -13,7 +14,6 @@ use aruna_core::metadata::MetadataGraphPruneJobRecord;
 use aruna_core::structs::{Actor, FIRST_GRANTABLE_HANDLE, JobId, RealmConfigDocument, RealmId};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_core::types::UserId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;

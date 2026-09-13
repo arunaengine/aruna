@@ -2,6 +2,7 @@ use super::{
     MAX_GROUP_SESSIONS, S3SessionCredentials, S3SessionError, build_session, decode_index,
     encode_index, expiry_key, owner_key, session_age,
 };
+use aruna_core::UserId;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -10,7 +11,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{PathRestriction, S3_SESSION_MAX_TTL, S3Session};
-use aruna_core::types::{Effects, GroupId, UserId};
+use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
 use std::time::SystemTime;

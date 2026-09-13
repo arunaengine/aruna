@@ -1,8 +1,9 @@
+use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::Actor;
 use crate::structs::realm::RealmId;
 use crate::structs::{Permission, Role};
-use crate::types::{GroupId, RoleId, UserId};
+use crate::types::{GroupId, RoleId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use ulid::Ulid;

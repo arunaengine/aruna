@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use aruna_blob::blob::BlobHandler;
+use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::StorageError;
@@ -28,7 +29,7 @@ use aruna_core::structs::{
     VersionKey,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{GroupId, UserId};
+use aruna_core::types::GroupId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::connectors::create_connector::{
     CreateSourceConnectorInput, CreateSourceConnectorOperation,

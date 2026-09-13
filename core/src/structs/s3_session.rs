@@ -1,10 +1,11 @@
+use crate::UserId;
 use crate::auth::credential_hash;
 use crate::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError, credential_aad,
 };
 use crate::errors::ConversionError;
 use crate::structs::{PathRestriction, UserAccess};
-use crate::types::{GroupId, UserId};
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;

@@ -1,4 +1,5 @@
 use super::{S3SessionError, decode_index, encode_index, expiry_key, owner_key};
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -6,7 +7,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::S3Session;
-use aruna_core::types::{Effects, Key, UserId};
+use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use ulid::Ulid;
 

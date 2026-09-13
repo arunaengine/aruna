@@ -1,6 +1,7 @@
 use crate::replication::protocol::LocationSummaryRequest;
+use aruna_core::UserId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::{AuthContext, RealmId};
-use aruna_core::types::{NodeId, UserId};
 use ulid::Ulid;
 
 pub(crate) fn realm_id() -> RealmId {
