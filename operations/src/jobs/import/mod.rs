@@ -1396,18 +1396,6 @@ async fn mark_not_attempted(
     Ok(())
 }
 
-/// The report code for a phase failure message. Validation failures carry their
-/// typed violation through `write_validation_rows`; this call site only ever sees
-/// a plain failure string or the panic marker, so there is no typed reason to
-/// pass. The substring keeps a code embedded in such a message reportable.
-fn phase_failure_code(message: &str) -> ReasonCode {
-    if message.contains("unsupported_crate_version") {
-        ReasonCode::UnsupportedCrateVersion
-    } else {
-        ReasonCode::Failed
-    }
-}
-
 async fn write_phase_error(
     ctx: &JobContext,
     phase: ImportPhase,
@@ -1416,7 +1404,9 @@ async fn write_phase_error(
     let key = format!("failure/{}", phase_name(phase));
     let row = ImportReportRow {
         entry_key: key,
-        code: phase_failure_code(message),
+        // The phase-failure path only sees a plain string or the panic marker;
+        // validation codes travel typed through `write_validation_rows`.
+        code: ReasonCode::Failed,
         message: Some(message.to_string()),
         detail: ImportReportDetail {
             archive_path: "ro-crate-metadata.json".to_string(),
@@ -1706,6 +1696,8 @@ enum BlobWriteFailure {
     Checksum,
     /// A declared body length that does not match what arrived.
     ContentLength,
+    /// A client/body fault, distinct from a backend failure.
+    ClientBody,
     /// A backend fault the import cannot pin to the written bytes.
     Unknown,
 }
@@ -1726,13 +1718,32 @@ impl BlobWriteFailure {
     }
 }
 
+/// The import's retry decision for a frozen blob write fault. The typed variant
+/// decides first; only a backend message is interpreted, and only to recognize
+/// the backend's own integrity wording.
+fn backend_blob_failure(error: &BlobError) -> BlobWriteFailure {
+    match error {
+        BlobError::WriteError(message)
+        | BlobError::WriteCleanup { message, .. }
+        | BlobError::OperatorCreationFailed(message)
+        | BlobError::OutboardCreationFailed(message)
+        | BlobError::MakeBucketError(message)
+        | BlobError::ConnectionFailed(message) => BlobWriteFailure::classify(message),
+        BlobError::SizeLimitExceeded { .. } => BlobWriteFailure::ContentLength,
+        BlobError::StreamFailed(_) => BlobWriteFailure::ClientBody,
+        _ => BlobWriteFailure::Unknown,
+    }
+}
+
 fn classify_put(error: PutObjectError) -> ImportFailure {
     match error {
         PutObjectError::StorageError(_) => ImportFailure::Retryable(error.to_string()),
-        PutObjectError::BlobWriteFailed(ref message)
-            if BlobWriteFailure::classify(message).retryable() =>
-        {
-            ImportFailure::Retryable(error.to_string())
+        PutObjectError::BlobWriteFailed(ref cause) => {
+            if backend_blob_failure(cause).retryable() {
+                ImportFailure::Retryable(error.to_string())
+            } else {
+                ImportFailure::Permanent(error.to_string())
+            }
         }
         _ => ImportFailure::Permanent(error.to_string()),
     }
@@ -1976,34 +1987,42 @@ pub(crate) mod tests {
         }
 
         assert!(matches!(
-            classify_put(PutObjectError::BlobWriteFailed(
+            classify_put(PutObjectError::BlobWriteFailed(BlobError::WriteError(
                 "checksum mismatch for sha256".to_string()
-            )),
+            ))),
             ImportFailure::Permanent(_)
         ));
         assert!(matches!(
-            classify_put(PutObjectError::BlobWriteFailed(
+            classify_put(PutObjectError::BlobWriteFailed(BlobError::WriteError(
                 "No space left on device".to_string()
-            )),
+            ))),
             ImportFailure::Retryable(_)
         ));
-    }
-
-    // Validation failures carry a typed violation to `write_validation_rows`; the
-    // phase-failure path only sees plain strings, so it still classifies the
-    // embedded code and leaves anything else as a plain failure.
-    #[test]
-    fn classifies_phase_failure_codes() {
-        use aruna_core::structs::ReasonCode;
-
-        assert_eq!(
-            phase_failure_code("unsupported_crate_version: crate 9.9"),
-            ReasonCode::UnsupportedCrateVersion
-        );
-        assert_eq!(
-            phase_failure_code("import plan is missing"),
-            ReasonCode::Failed
-        );
+        // A typed fault decides before any wording: the same backend text on a
+        // client/body fault stays permanent, and a punctuation change cannot
+        // flip a local cause.
+        for wording in [
+            "No space left on device",
+            "no space left on device!",
+            "checksum mismatch",
+        ] {
+            assert!(matches!(
+                classify_put(PutObjectError::BlobWriteFailed(BlobError::StreamFailed(
+                    wording.to_string()
+                ))),
+                ImportFailure::Permanent(_)
+            ));
+            assert!(matches!(
+                classify_put(PutObjectError::BlobWriteFailed(
+                    BlobError::SizeLimitExceeded { limit: 5 }
+                )),
+                ImportFailure::Permanent(_)
+            ));
+            assert!(matches!(
+                classify_put(PutObjectError::BlobWriteFailed(BlobError::ChannelClosed)),
+                ImportFailure::Retryable(_)
+            ));
+        }
     }
 
     #[test]
