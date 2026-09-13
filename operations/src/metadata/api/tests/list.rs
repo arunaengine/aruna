@@ -1,5 +1,6 @@
 use super::export::{seed_registry_cache, write_entry, write_pending_marker};
 use super::*;
+use aruna_core::StructuredId;
 
 #[tokio::test]
 async fn filters_graph_delete() {

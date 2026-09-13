@@ -1,12 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
@@ -28,14 +26,13 @@ use aruna_core::structs::{
 };
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
-use aruna_core::{MetaResourceId, NodeId, StructuredId};
+use aruna_core::{MetaResourceId, NodeId};
 use aruna_storage::StorageHandle;
-use futures_util::StreamExt;
-use futures_util::future::{BoxFuture, FutureExt};
+use futures_util::future::BoxFuture;
 use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{Instrument, Span, debug_span, field, warn};
+use tracing::{Span, debug_span, field, warn};
 use ulid::Ulid;
 
 pub use self::distributed::{aggregate_query_results, query_form, query_select_limit};

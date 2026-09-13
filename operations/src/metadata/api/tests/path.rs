@@ -1,4 +1,5 @@
 use super::*;
+use aruna_core::StructuredId;
 
 #[test]
 fn user_result_opaque() {

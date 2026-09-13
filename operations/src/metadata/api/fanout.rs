@@ -1,5 +1,19 @@
+use super::field;
+
+use super::{
+    Arc, BoxFuture, BucketSearchExecution, BucketSearchHit, BucketSearchRequest, DriverContext,
+    HashSet, Instant, METADATA_DISTRIBUTED_QUERY_DEADLINE, METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT,
+    METADATA_DISTRIBUTED_QUERY_MAX_NODES, METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_ROWS,
+    MetadataApiError, MetadataApiQueryMode, MetadataAuthToken, MetadataReadError, NodeId, RealmId,
+    SearchBucketsInput, Span, debug_span, deduplicate_fanout_nodes, discover_realm_nodes,
+    map_read_error, query_fingerprint, record_elapsed_ms, search_local_buckets,
+    select_fanout_nodes, short_display_id, stream, warn,
+};
+
 use super::distributed::record_bucket_result;
-use super::*;
+use futures_util::StreamExt;
+use futures_util::future::FutureExt;
+use tracing::Instrument;
 
 pub(super) fn ensure_query_mode(mode: &Option<MetadataApiQueryMode>) {
     match mode {
