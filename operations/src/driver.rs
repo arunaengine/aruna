@@ -34,7 +34,6 @@ use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
 use crate::metadata::MetadataHandle;
 
-#[path = "effect_adapters/mod.rs"]
 mod effect_adapters;
 
 pub use effect_adapters::routing::{
