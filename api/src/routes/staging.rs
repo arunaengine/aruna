@@ -1298,6 +1298,7 @@ async fn reference_blob(
             bucket: request.bucket.clone(),
             key: request.key.clone(),
             expected_bucket: bucket_info,
+            inherited_policies: Vec::new(),
         },
     )
     .await

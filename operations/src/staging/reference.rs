@@ -42,6 +42,9 @@ pub struct MaterializeReferenceInput {
     pub bucket: String,
     pub key: String,
     pub expected_bucket: BucketInfo,
+    /// Refs the reference carries over from an object it derives from; they
+    /// are unioned with the bucket default and never dropped.
+    pub inherited_policies: Vec<PlacementPolicyRef>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -105,7 +108,7 @@ pub async fn stage_reference_blob(
 
     let result: Result<(Ulid, bool), MaterializeReferenceError> = async {
         guard_purge_fence(context, txn_id, &input.bucket, &input.key).await?;
-        let bucket_policies = guard_expected_bucket(
+        let mut policies = guard_expected_bucket(
             context,
             txn_id,
             &input.bucket,
@@ -113,6 +116,7 @@ pub async fn stage_reference_blob(
             &input.expected_bucket,
         )
         .await?;
+        policies.extend(input.inherited_policies.iter().copied());
         guard_resolved_connector_unchanged(
             context,
             txn_id,
@@ -199,7 +203,7 @@ pub async fn stage_reference_blob(
                     input.user_id,
                     now,
                 )
-                .with_policies(bucket_policies)?,
+                .with_policies(policies)?,
                 Some(txn_id),
             )?,
         )
@@ -856,6 +860,7 @@ mod tests {
                 bucket: "bucket-a".to_string(),
                 key: "object.txt".to_string(),
                 expected_bucket,
+                inherited_policies: Vec::new(),
             },
         )
         .await
@@ -945,6 +950,7 @@ mod tests {
                 bucket: "bucket-a".to_string(),
                 key: "object.txt".to_string(),
                 expected_bucket,
+                inherited_policies: Vec::new(),
             },
         )
         .await;
@@ -1012,6 +1018,7 @@ mod tests {
             bucket: "bucket-a".to_string(),
             key: "object.txt".to_string(),
             expected_bucket,
+            inherited_policies: Vec::new(),
         };
 
         let first = stage_reference_blob(context, input.clone()).await.unwrap();
