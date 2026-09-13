@@ -39,6 +39,7 @@ pub struct NodeResources {
     pub(crate) task_handle: TaskHandle,
     pub(crate) task_queues: TaskQueues,
     pub(crate) usage_counters_rebuilt: bool,
+    pub(crate) monitoring: Arc<MonitoringState>,
     pub(crate) ops_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -85,25 +86,24 @@ impl Acquired {
 
     /// Runs the ordered teardown for the acquired subset: ingress (none here),
     /// admissions, tasks, jobs, background children, network, metadata, blob,
-    /// then storage, and aborts the ops listener last.
+    /// then storage, and aborts the ops listener last. The monitoring sampler is
+    /// stopped by the sequence before storage closes.
     pub(crate) async fn cleanup(self) {
         info!("Startup stopped early; releasing the acquired resources");
         // The ops task and the driver context are stopped after the ordered
         // teardown and joined, so no detached clone keeps storage open when
-        // cleanup returns.
+        // cleanup returns. The monitoring sampler is stopped and awaited by the
+        // sequence before storage closes.
         let ops = self.ops_handle;
         let driver_ctx = self.driver_ctx;
-        // Stop the metrics refresher before storage closes so its in-flight
-        // driver context cannot keep the store open past cleanup.
-        if let Some(monitoring) = &self.monitoring {
-            monitoring.stop_queue_refresher();
-        }
         NodeShutdown {
             shutdown: self.shutdown,
             readiness: self.readiness,
             rest: None,
             s3: None,
             portal: None,
+            session_s3: None,
+            monitoring: self.monitoring,
             task_handle: self.task_handle,
             jobs_runtime: self.jobs_runtime,
             net_handle: self.net_handle,
@@ -141,6 +141,9 @@ impl Acquired {
                 .task_queues
                 .expect("acquisition builds the task queues"),
             usage_counters_rebuilt: self.usage_counters_rebuilt,
+            monitoring: self
+                .monitoring
+                .expect("acquisition builds the monitoring state"),
             ops_handle: self.ops_handle.expect("acquisition starts the ops server"),
         }
     }
@@ -256,6 +259,9 @@ async fn fill(
         task_handle: Some(acquired.task_handle.clone()),
         compute_handle: compute_handle.clone(),
     });
+    // The driver context and the monitoring refresher it feeds are owned before
+    // the ops listener can fail to bind.
+    acquired.driver_ctx = Some(driver_ctx.clone());
 
     // Start ops before realm bootstrap so readiness reports startup failure.
     let ops_state = MonitoringState::with_recovery(
@@ -265,9 +271,9 @@ async fn fill(
         acquired.recovery.clone(),
     )
     .await;
+    acquired.monitoring = Some(ops_state.clone());
     let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
     let bound = ops_listener.local_addr()?;
-    let monitoring = ops_state.clone();
     let ops_handle = tokio::spawn(async move {
         if let Err(error) = serve_ops(ops_listener, ops_state).await {
             error!(error = %error, "Ops server stopped");
@@ -275,8 +281,6 @@ async fn fill(
     });
     info!(ops_address = %bound, "Ops server listening");
     acquired.ops_handle = Some(ops_handle);
-    acquired.driver_ctx = Some(driver_ctx.clone());
-    acquired.monitoring = Some(monitoring);
     checkpoint(StartupStage::Ops)?;
 
     // A rebuild is the only local evidence that counters were not carried over.
