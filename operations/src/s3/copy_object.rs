@@ -659,6 +659,7 @@ pub(crate) mod test {
                 conditions: CopySourceConditions::default(),
                 metadata: None,
                 restrictions: None,
+                references: CopyReferences::Materialize,
             },
         )
         .await
@@ -714,6 +715,7 @@ pub(crate) mod test {
                 conditions: CopySourceConditions::default(),
                 metadata: None,
                 restrictions: None,
+                references: CopyReferences::Materialize,
             },
         )
         .await
@@ -721,7 +723,7 @@ pub(crate) mod test {
 
         let source_version =
             read_dest_version(&context, "bucket", "source.txt", source.version_id).await;
-        assert_eq!(result.location, source.location);
+        assert_eq!(result.location, Some(source.location));
         assert_eq!(result.source_version_id, Some(source.version_id));
         assert_eq!(result.source_last_modified, Some(source_version.created_at));
         // The copy dedups onto the source location, but its last-modified must
@@ -797,6 +799,7 @@ pub(crate) mod test {
                 conditions: CopySourceConditions::default(),
                 metadata: None,
                 restrictions: None,
+                references: CopyReferences::Materialize,
             },
         )
         .await
@@ -841,6 +844,141 @@ pub(crate) mod test {
 
     // A copy reading a capped reference must surface the exact variant, so the
     // caller learns that only an explicit rebind heals it.
+    #[tokio::test]
+    async fn preserved_copy_keeps_reference() {
+        // A kept reference is cloned from the source version alone: the
+        // connector is never contacted, so the source may be unreachable.
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        seed_bucket(&context, "bucket", group_id, user_id, Vec::new()).await;
+        let (endpoint, server) = spawn_reference_server(b"reference-bytes").await;
+        server.abort();
+        let _ = server.await;
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([("endpoint".to_string(), endpoint)]),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: None,
+        };
+        write_version(
+            &context,
+            "bucket",
+            "ref.txt",
+            BlobVersion::reference(
+                source.clone(),
+                SourceMetadata {
+                    content_length: 15,
+                    content_type: Some("text/plain".to_string()),
+                    etag: Some("etag-1".to_string()),
+                    last_modified: Some(SystemTime::UNIX_EPOCH),
+                    source_version: None,
+                },
+                SystemTime::UNIX_EPOCH,
+                user_id,
+                SystemTime::UNIX_EPOCH,
+            ),
+        )
+        .await;
+
+        let result = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "ref.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Preserve,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.location.is_none());
+        assert_eq!(result.size, 15);
+        assert!(result.source_version_id.is_some());
+
+        let dest_version =
+            read_dest_version(&context, "bucket", "dest.txt", result.version_id).await;
+        assert!(!dest_version.is_materialized());
+        let binding = dest_version.source_binding().expect("a reference binding");
+        assert_eq!(binding.strategy, StagingStrategy::Reference);
+        assert_eq!(binding.descriptor, source.descriptor);
+    }
+
+    #[tokio::test]
+    async fn same_backend_copy_adopts() {
+        // Bytes the destination's backend already holds are adopted without a
+        // stream: nothing passes the progress counter and the location is shared.
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        seed_bucket(&context, "bucket", group_id, user_id, Vec::new()).await;
+        let data: &'static [u8] = b"adopt these bytes";
+        let source = drive(
+            PutObjectOperation::new(put_config(
+                realm_id, group_id, node_id, "bucket", "src.txt", data,
+            )),
+            &context,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        let pulled = Arc::new(AtomicU64::new(0));
+        let result = copy_object_tracked(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "src.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Materialize,
+            },
+            Some(pulled.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pulled.load(Ordering::Relaxed), 0, "no byte streamed");
+        assert_eq!(result.location, Some(source.location.clone()));
+        assert_eq!(result.size, data.len() as u64);
+        let dest_version =
+            read_dest_version(&context, "bucket", "dest.txt", result.version_id).await;
+        assert!(dest_version.is_materialized());
+    }
+
     #[tokio::test]
     async fn copy_reports_exhausted() {
         let (_temp, context) = full_context().await;
@@ -901,6 +1039,7 @@ pub(crate) mod test {
                 conditions: CopySourceConditions::default(),
                 metadata: None,
                 restrictions: None,
+                references: CopyReferences::Materialize,
             },
         )
         .await
@@ -971,6 +1110,7 @@ pub(crate) mod test {
                 conditions: CopySourceConditions::default(),
                 metadata: None,
                 restrictions: None,
+                references: CopyReferences::Materialize,
             },
         )
         .await
@@ -1137,6 +1277,7 @@ pub(crate) mod test {
                 },
                 metadata: None,
                 restrictions: None,
+                references: CopyReferences::Materialize,
             },
         )
         .await
