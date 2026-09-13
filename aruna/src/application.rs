@@ -3,14 +3,7 @@
 //! `run_node` acquires resources, prepares the realm, binds listeners, starts
 //! background work, supervises ingress, and then runs the ordered shutdown.
 
-use std::sync::Arc;
-
-use aruna_api::monitoring::Readiness;
-use aruna_core::shutdown::Shutdown;
 use aruna_operations::device::wipe as device_wipe;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_tasks::TaskHandle;
 
 use crate::shutdown::{NodeShutdown, arm_signal_exit, shutdown_grace_env, wait_for_signal};
 use crate::startup;
@@ -98,79 +91,68 @@ pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
     // Install signal handling before readiness or background work can start.
     let mut signal = tokio::spawn(wait_for_signal());
 
-    let NodeResources {
-        config,
-        driver_ctx,
-        net_handle,
-        shutdown,
-        metrics,
-        readiness,
-        recovery,
-        jobs_runtime,
-        task_handle,
-        task_queues,
-        usage_counters_rebuilt,
-        ops_handle,
-    } = startup::resources::acquire().await?;
+    // One acquired owner stays whole through realm preparation, listener
+    // binding, and background startup. Every failure and accepted cancellation
+    // releases exactly this owner; only a completed handoff takes it apart.
+    let resources = startup::resources::acquire().await?;
 
     // A stop requested while resources were still being acquired must not run
     // realm preparation against a node that is already being torn down.
     if startup_stop_requested(&signal) {
-        return Ok(stop_during_startup(
-            shutdown,
-            readiness,
-            None,
-            task_handle,
-            jobs_runtime,
-            &driver_ctx,
-            ops_handle,
-        )
-        .await);
+        release_unready(resources, None).await;
+        return Ok(ProcessOutcome::StartupCancelled);
     }
 
-    let core_announcement = startup::realm::prepare(&config, &driver_ctx, &net_handle).await?;
+    let core_announcement = match startup::realm::prepare(
+        &resources.config,
+        &resources.driver_ctx,
+        &resources.net_handle,
+    )
+    .await
+    {
+        Ok(core_announcement) => core_announcement,
+        Err(error) => {
+            // Release the acquired subset, then report the initiating failure.
+            release_unready(resources, None).await;
+            return Err(error);
+        }
+    };
 
     if startup_stop_requested(&signal) {
-        return Ok(stop_during_startup(
-            shutdown,
-            readiness,
-            None,
-            task_handle,
-            jobs_runtime,
-            &driver_ctx,
-            ops_handle,
-        )
-        .await);
+        release_unready(resources, None).await;
+        return Ok(ProcessOutcome::StartupCancelled);
     }
 
-    let bindings = bind_servers(
-        config,
-        driver_ctx.clone(),
-        jobs_runtime.clone(),
-        metrics.clone(),
-        &shutdown,
+    let bindings = match bind_servers(
+        &resources.config,
+        resources.driver_ctx.clone(),
+        resources.jobs_runtime.clone(),
+        resources.metrics.clone(),
+        &resources.shutdown,
     )
-    .await?;
+    .await
+    {
+        Ok(bindings) => bindings,
+        Err(error) => {
+            // `bind` already aborted any listener it started; release the
+            // acquired resources and report the initiating failure.
+            release_unready(resources, None).await;
+            return Err(error);
+        }
+    };
 
     // The operator asked to stop before admissions opened: tear down the
     // bound listeners and acquired resources without announcing readiness.
     if startup_stop_requested(&signal) {
-        return Ok(stop_during_startup(
-            shutdown,
-            readiness,
-            Some(bindings),
-            task_handle,
-            jobs_runtime,
-            &driver_ctx,
-            ops_handle,
-        )
-        .await);
+        release_unready(resources, Some(bindings)).await;
+        return Ok(ProcessOutcome::StartupCancelled);
     }
 
     let ServerBindings {
         rest_handle,
         s3_handle,
         mut portal_handle,
+        session_s3_handle,
         realm_id,
         node_id,
         is_initial_boot,
@@ -181,14 +163,14 @@ pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
         realm_id,
         node_id,
         is_initial_boot,
-        driver_ctx: driver_ctx.clone(),
-        shutdown: shutdown.clone(),
-        readiness: readiness.clone(),
-        recovery: recovery.clone(),
-        jobs_runtime: jobs_runtime.clone(),
-        task_handle: task_handle.clone(),
-        task_queues,
-        usage_counters_rebuilt,
+        driver_ctx: resources.driver_ctx.clone(),
+        shutdown: resources.shutdown.clone(),
+        readiness: resources.readiness.clone(),
+        recovery: resources.recovery.clone(),
+        jobs_runtime: resources.jobs_runtime.clone(),
+        task_handle: resources.task_handle.clone(),
+        task_queues: resources.task_queues,
+        usage_counters_rebuilt: resources.usage_counters_rebuilt,
         core_announcement,
     })
     .await;
@@ -236,18 +218,20 @@ pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
     }
 
     NodeShutdown {
-        shutdown,
-        readiness,
+        shutdown: resources.shutdown,
+        readiness: resources.readiness,
         rest: rest_handle,
         s3: s3_handle,
         portal: portal_handle,
-        task_handle,
-        jobs_runtime,
-        net_handle: driver_ctx.net_handle.clone(),
-        metadata_handle: driver_ctx.metadata_handle.clone(),
-        blob_handle: driver_ctx.blob_handle.clone(),
-        storage_handle: driver_ctx.storage_handle.clone(),
-        ops: Some(ops_handle),
+        session_s3: session_s3_handle,
+        monitoring: Some(resources.monitoring),
+        task_handle: resources.task_handle,
+        jobs_runtime: resources.jobs_runtime,
+        net_handle: resources.driver_ctx.net_handle.clone(),
+        metadata_handle: resources.driver_ctx.metadata_handle.clone(),
+        blob_handle: resources.driver_ctx.blob_handle.clone(),
+        storage_handle: resources.driver_ctx.storage_handle.clone(),
+        ops: Some(resources.ops_handle),
         grace: shutdown_grace_env(),
     }
     .run()
@@ -279,25 +263,38 @@ pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
 }
 
 /// Runs the ordered teardown for everything acquired before background work
-/// started, including bound listeners when they already exist, and reports the
-/// stop as a startup cancellation rather than a ready shutdown.
-async fn stop_during_startup(
-    shutdown: Shutdown,
-    readiness: Readiness,
-    bindings: Option<ServerBindings>,
-    task_handle: TaskHandle,
-    jobs_runtime: Arc<JobsRuntime>,
-    driver_ctx: &DriverContext,
-    ops_handle: tokio::task::JoinHandle<()>,
-) -> ProcessOutcome {
-    let (rest, s3, portal) = match bindings {
+/// started, including bound listeners when they already exist. The caller
+/// decides whether the stop is a cancellation or a failure.
+async fn release_unready(resources: NodeResources, bindings: Option<ServerBindings>) {
+    let NodeResources {
+        config: _,
+        driver_ctx,
+        net_handle: _,
+        shutdown,
+        metrics: _,
+        readiness,
+        recovery: _,
+        jobs_runtime,
+        task_handle,
+        task_queues: _,
+        usage_counters_rebuilt: _,
+        monitoring,
+        ops_handle,
+    } = resources;
+    let (rest, s3, portal, session_s3) = match bindings {
         Some(ServerBindings {
             rest_handle,
             s3_handle,
             portal_handle,
+            session_s3_handle,
             ..
-        }) => (Some(rest_handle), s3_handle, portal_handle),
-        None => (None, None, None),
+        }) => (
+            Some(rest_handle),
+            s3_handle,
+            portal_handle,
+            session_s3_handle,
+        ),
+        None => (None, None, None, None),
     };
     NodeShutdown {
         shutdown,
@@ -305,6 +302,8 @@ async fn stop_during_startup(
         rest,
         s3,
         portal,
+        session_s3,
+        monitoring: Some(monitoring),
         task_handle,
         jobs_runtime,
         net_handle: driver_ctx.net_handle.clone(),
@@ -316,7 +315,6 @@ async fn stop_during_startup(
     }
     .run()
     .await;
-    ProcessOutcome::StartupCancelled
 }
 
 #[cfg(test)]
