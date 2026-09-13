@@ -30,8 +30,6 @@ use tracing::warn;
 
 use crate::config::Config;
 
-pub(crate) use settings::{session_s3_address, session_subnet};
-
 /// Why a selected compute backend could not be built. The categories stay
 /// distinct so an invalid configuration is never silently treated as
 /// unavailable compute.
@@ -124,15 +122,39 @@ pub(super) struct KubernetesSettings {
     pub(super) pull_deadline: Duration,
 }
 
+/// The compute side of the node: the built registry plus every value listener
+/// assembly needs, resolved once from the same typed settings.
+pub(crate) struct ComputeSetup {
+    pub(crate) registry: Option<Arc<ExecutorRegistry>>,
+    /// The Docker session bridge gateway, resolved with the backend settings.
+    pub(crate) session_s3: Option<std::net::SocketAddr>,
+}
+
+impl ComputeSettings {
+    /// The session bridge gateway for the selected backend. Docker is the only
+    /// backend with a session bridge; the value comes from its typed settings,
+    /// never from a second environment read.
+    pub(super) fn session_s3(&self, config: &Config) -> Option<std::net::SocketAddr> {
+        let BackendSettings::Docker(docker) = &self.backend else {
+            return None;
+        };
+        settings::session_s3_address(config.s3_address.as_deref(), &docker.session_subnet)
+    }
+}
+
 /// Builds the registry for the selected backend, or `None` when compute is
 /// turned off. An unavailable backend is allowed only when the operator marks
 /// compute optional; invalid configuration always fails.
-pub(crate) async fn build_registry(
-    config: &Config,
-) -> Result<Option<Arc<ExecutorRegistry>>, String> {
+pub(crate) async fn build_registry(config: &Config) -> Result<ComputeSetup, String> {
     let settings = settings::collect().map_err(compute_error_message)?;
+    let session_s3 = settings.session_s3(config);
     let result = match &settings.backend {
-        BackendSettings::None => return Ok(None),
+        BackendSettings::None => {
+            return Ok(ComputeSetup {
+                registry: None,
+                session_s3,
+            });
+        }
         BackendSettings::Docker(docker) => build_docker(&settings, docker, config).await,
         BackendSettings::Apptainer(apptainer) => {
             build_apptainer(&settings, apptainer, config).await
@@ -149,7 +171,10 @@ pub(crate) async fn build_registry(
         }
         Err(error) => return Err(compute_error_message(error)),
     };
-    Ok(registry)
+    Ok(ComputeSetup {
+        registry,
+        session_s3,
+    })
 }
 
 fn compute_error_message(error: ComputeBuildError) -> String {

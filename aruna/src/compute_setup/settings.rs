@@ -62,6 +62,13 @@ pub(super) fn collect() -> Result<ComputeSettings, ComputeBuildError> {
     })
 }
 
+/// The session subnet an operator configured, else the default. Read once,
+/// inside the one collection boundary.
+fn session_subnet() -> String {
+    dotenvy::var("ARUNA_COMPUTE_DOCKER_SESSION_SUBNET")
+        .unwrap_or_else(|_| aruna_compute::executor::config::DEFAULT_SESSION_SUBNET.to_string())
+}
+
 fn collect_docker() -> Result<super::DockerSettings, ComputeBuildError> {
     Ok(super::DockerSettings {
         disk_bytes: parse_disk_limit(
@@ -175,31 +182,17 @@ fn collect_kubernetes() -> Result<super::KubernetesSettings, ComputeBuildError> 
     })
 }
 
-/// The session subnet an operator configured, else the default.
-pub(crate) fn session_subnet() -> String {
-    dotenvy::var("ARUNA_COMPUTE_DOCKER_SESSION_SUBNET")
-        .unwrap_or_else(|_| aruna_compute::executor::config::DEFAULT_SESSION_SUBNET.to_string())
-}
-
 /// The gateway address of the Docker session bridge, on the configured S3 port.
 /// It is what a session container targets, whatever the node itself binds.
+/// Pure in the typed settings: the caller already knows the selected backend.
 #[cfg(feature = "docker")]
-pub(crate) fn session_s3_address(config: &Config, subnet: &str) -> Option<std::net::SocketAddr> {
+pub(super) fn session_s3_address(
+    s3_address: Option<&str>,
+    subnet: &str,
+) -> Option<std::net::SocketAddr> {
     use aruna_compute::executor::docker::session_gateway;
 
-    if dotenvy::var("ARUNA_COMPUTE_EXECUTOR")
-        .unwrap_or_default()
-        .trim()
-        != "docker"
-    {
-        return None;
-    }
-    let port = config
-        .s3_address
-        .as_deref()?
-        .parse::<std::net::SocketAddr>()
-        .ok()?
-        .port();
+    let port = s3_address?.parse::<std::net::SocketAddr>().ok()?.port();
     match session_gateway(subnet) {
         Ok(gateway) => Some(std::net::SocketAddr::new(gateway.into(), port)),
         Err(error) => {
@@ -210,7 +203,10 @@ pub(crate) fn session_s3_address(config: &Config, subnet: &str) -> Option<std::n
 }
 
 #[cfg(not(feature = "docker"))]
-pub(crate) fn session_s3_address(_config: &Config, _subnet: &str) -> Option<std::net::SocketAddr> {
+pub(super) fn session_s3_address(
+    _s3_address: Option<&str>,
+    _subnet: &str,
+) -> Option<std::net::SocketAddr> {
     None
 }
 
@@ -525,6 +521,16 @@ mod pure_tests {
             matches!(&error, ComputeBuildError::Invalid(message) if message.contains("podman")),
             "unknown backend must be a configuration error: {error:?}"
         );
+    }
+
+    #[cfg(feature = "docker")]
+    #[test]
+    fn session_gateway_comes_from_typed_settings() {
+        let address = session_s3_address(Some("127.0.0.1:9000"), "172.30.255.0/24")
+            .expect("a docker subnet yields a gateway on the S3 port");
+        assert_eq!(address.port(), 9000);
+        assert!(session_s3_address(None, "172.30.255.0/24").is_none());
+        assert!(session_s3_address(Some("127.0.0.1:9000"), "not-a-subnet").is_none());
     }
 
     // The accepted spellings are fixed: case-sensitive booleans, exact
