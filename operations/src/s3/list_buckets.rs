@@ -31,6 +31,8 @@ pub enum ListBucketsError {
     },
     #[error("ListBuckets failed")]
     ListBucketsFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -206,7 +208,7 @@ fn decode_cursor(token: &str) -> Result<Key, ConversionError> {
 }
 
 impl Operation for ListBucketsOperation {
-    type Output = Option<Result<ListBucketsResult, ListBucketsError>>;
+    type Output = ListBucketsResult;
     type Error = ListBucketsError;
 
     fn start(&mut self) -> Effects {
@@ -233,13 +235,11 @@ impl Operation for ListBucketsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ListBucketsState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(ListBucketsError::ListBucketsFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(ListBucketsError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -329,8 +329,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.buckets.len(), 2);
@@ -395,7 +393,7 @@ mod test {
         }));
         assert!(effects.is_empty());
 
-        let result = op.finalize().unwrap().unwrap().unwrap();
+        let result = op.finalize().unwrap();
         let names: Vec<_> = result.buckets.into_iter().map(|(name, _)| name).collect();
         assert_eq!(names, vec!["alpha".to_string(), "gamma".to_string()]);
         assert_eq!(result.continuation_token, None);
@@ -443,7 +441,7 @@ mod test {
             next_start_after: Some(Key::from(b"beta".to_vec())),
         }));
 
-        let first = operation.finalize().unwrap().unwrap().unwrap();
+        let first = operation.finalize().unwrap();
         assert_eq!(first.buckets.len(), 1);
         let token = first.continuation_token.unwrap();
         assert_eq!(decode_cursor(&token).unwrap(), Key::from(b"alpha".to_vec()));
@@ -459,7 +457,7 @@ mod test {
             values: vec![entry("beta", group_id)],
             next_start_after: None,
         }));
-        let second = next.finalize().unwrap().unwrap().unwrap();
+        let second = next.finalize().unwrap();
         assert_eq!(
             second
                 .buckets
@@ -505,7 +503,7 @@ mod test {
             next_start_after: Some(Key::from(b"foreign".to_vec())),
         }));
 
-        let result = operation.finalize().unwrap().unwrap().unwrap();
+        let result = operation.finalize().unwrap();
         assert!(result.buckets.is_empty());
         let token = result.continuation_token.unwrap();
         assert_ne!(token, "foreign");

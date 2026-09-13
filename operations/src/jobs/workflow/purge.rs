@@ -136,14 +136,8 @@ async fn run_fenced_purge(
                 &ctx.driver,
             )
             .await
-            .and_then(|result| result.transpose())
             {
-                Ok(Some(())) | Err(DeleteBucketError::NotFound) => {}
-                Ok(None) => {
-                    return Err(
-                        JobError::retryable("purge bucket delete returned no result").into(),
-                    );
-                }
+                Ok(()) | Err(DeleteBucketError::NotFound) => {}
                 Err(error) => {
                     return Err(JobError::retryable(format!(
                         "purge bucket delete failed: {error}"
@@ -243,12 +237,8 @@ async fn abort_uploads(
                 &ctx.driver,
             )
             .await
-            .and_then(|result| result.transpose())
             {
-                Ok(Some(())) | Err(AbortMultipartUploadError::NoSuchUpload) => removed += 1,
-                Ok(None) => {
-                    return Err(JobError::retryable("multipart abort returned no result").into());
-                }
+                Ok(()) | Err(AbortMultipartUploadError::NoSuchUpload) => removed += 1,
                 Err(AbortMultipartUploadError::UploadNotOpen) => {
                     return Err(JobError::retryable(
                         "matching multipart upload changed state during purge",
@@ -461,9 +451,7 @@ async fn list_version_page(
         &ctx.driver,
     )
     .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| JobError::retryable(format!("purge version list failed: {error}")))?
-    .ok_or_else(|| JobError::retryable("purge version list returned no result"))?;
+    .map_err(|error| JobError::retryable(format!("purge version list failed: {error}")))?;
 
     let mut items = result.items;
     let mut is_truncated = result.is_truncated;
@@ -472,7 +460,9 @@ async fn list_version_page(
     if let StoragePurgeScope::File { key, .. } = scope {
         items.retain(|item| match item {
             ListObjectVersionsItem::Version { key: item, .. }
-            | ListObjectVersionsItem::DeleteMarker { key: item, .. } => item == key,
+            | ListObjectVersionsItem::DeleteMarker { key: item, .. } => {
+                item.as_str() == key.as_str()
+            }
         });
         if next_key_marker.as_deref() != Some(key.as_str()) {
             is_truncated = false;
@@ -526,9 +516,7 @@ async fn list_multipart_cursor(
         &ctx.driver,
     )
     .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| JobError::retryable(format!("purge multipart list failed: {error}")))?
-    .ok_or_else(|| JobError::retryable("purge multipart list returned no result"))?;
+    .map_err(|error| JobError::retryable(format!("purge multipart list failed: {error}")))?;
 
     let mut uploads = result.uploads;
     let mut is_truncated = result.is_truncated;

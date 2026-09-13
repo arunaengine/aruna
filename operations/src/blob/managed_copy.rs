@@ -1031,8 +1031,6 @@ mod driver_tests {
         )
         .await
         .expect("put drives")
-        .expect("put succeeds")
-        .expect("put returns a result")
         .version_id
     }
 
@@ -1210,9 +1208,7 @@ mod driver_tests {
                 &context,
             )
             .await
-            .expect("put drives")
-            .expect("put succeeds")
-            .expect("put returns a result");
+            .expect("put drives");
         }
 
         assert_eq!(count_copies(&context, version_id).await, 1);
@@ -1271,9 +1267,7 @@ mod driver_tests {
             &context,
         )
         .await
-        .expect("delete drives")
-        .expect("delete succeeds")
-        .expect("delete returns a result");
+        .expect("delete drives");
 
         assert!(read_version(&context, version_id).await.is_none());
         assert_eq!(count_copies(&context, version_id).await, 0);

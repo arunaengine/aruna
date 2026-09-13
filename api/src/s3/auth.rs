@@ -446,12 +446,9 @@ impl AuthProvider {
             ));
         }
         let operation = GetUserAccessOperation::new(access_key_id.to_string());
-        match drive(operation, self.driver_ctx.as_ref())
-            .await
-            .and_then(|result| result.transpose())
-        {
-            Ok(Some(user_access)) => Ok(user_access),
-            Ok(None) | Err(GetUserAccessError::NotFound) => Err(s3_error!(
+        match drive(operation, self.driver_ctx.as_ref()).await {
+            Ok(user_access) => Ok(user_access),
+            Err(GetUserAccessError::NotFound) => Err(s3_error!(
                 InvalidAccessKeyId,
                 "The Access Key Id you provided does not exist in our records."
             )),

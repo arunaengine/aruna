@@ -258,11 +258,6 @@ async fn resolve_inputs(
                 SubmitJobError::InvalidWorkspace(format!("{reference}: input object not found"))
             }
             other => SubmitJobError::PlacementUnavailable(format!("{reference}: {other}")),
-        })?
-        .transpose()
-        .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?
-        .ok_or_else(|| {
-            SubmitJobError::InvalidWorkspace(format!("{reference}: input object not found"))
         })?;
         let version = head
             .resolved_version_id

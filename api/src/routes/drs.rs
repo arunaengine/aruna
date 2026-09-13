@@ -692,9 +692,8 @@ pub async fn download_object(
     )
     .await
     {
-        Ok(Some(Ok(result))) => result,
-        Ok(None) => return drs_error(StatusCode::NOT_FOUND, "DRS object not found"),
-        Ok(Some(Err(error))) | Err(error) => return download_error(error),
+        Ok(result) => result,
+        Err(error) => return download_error(error),
     };
 
     let location = result.location.unwrap_or(resolved_location);
@@ -916,19 +915,13 @@ async fn resolve_versioned(
     )
     .await
     {
-        Ok(Some(Ok(result))) => result,
-        Ok(Some(Err(
+        Ok(result) => result,
+        Err(
             HeadObjectError::NoSuchKey
             | HeadObjectError::NoSuchVersion
             | HeadObjectError::DeleteMarker,
-        )))
-        | Err(
-            HeadObjectError::NoSuchKey
-            | HeadObjectError::NoSuchVersion
-            | HeadObjectError::DeleteMarker,
-        )
-        | Ok(None) => return Ok(ResolveOutcome::NotFound),
-        Ok(Some(Err(error))) | Err(error) => {
+        ) => return Ok(ResolveOutcome::NotFound),
+        Err(error) => {
             return Err(DrsError::internal(error.to_string()));
         }
     };
@@ -1014,21 +1007,15 @@ async fn resolve_content_hash(
         )
         .await
         {
-            Ok(Some(Ok(result))) => result,
-            Ok(Some(Err(
+            Ok(result) => result,
+            Err(
                 HeadObjectError::NoSuchKey
                 | HeadObjectError::NoSuchVersion
                 | HeadObjectError::DeleteMarker,
-            )))
-            | Err(
-                HeadObjectError::NoSuchKey
-                | HeadObjectError::NoSuchVersion
-                | HeadObjectError::DeleteMarker,
-            )
-            | Ok(None) => {
+            ) => {
                 continue;
             }
-            Ok(Some(Err(error))) | Err(error) => {
+            Err(error) => {
                 debug!(head_object_error = ?error);
                 return Err(DrsError::internal(error.to_string()));
             }

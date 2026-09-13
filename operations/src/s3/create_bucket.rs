@@ -46,6 +46,8 @@ pub enum CreateBucketError {
     UsageUpdateError(#[from] UsageUpdateError),
     #[error("CreateBucket failed")]
     CreateBucketFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Debug, PartialEq)]
@@ -197,7 +199,7 @@ impl CreateBucketOperation {
 }
 
 impl Operation for CreateBucketOperation {
-    type Output = Option<Result<BucketInfo, CreateBucketError>>;
+    type Output = BucketInfo;
     type Error = CreateBucketError;
 
     fn start(&mut self) -> Effects {
@@ -228,13 +230,11 @@ impl Operation for CreateBucketOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if CreateBucketState::Error == self.state {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(CreateBucketError::CreateBucketFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(CreateBucketError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -284,8 +284,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result, bucket_info);
@@ -320,8 +318,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let result = drive(

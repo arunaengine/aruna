@@ -268,11 +268,6 @@ async fn delete_target(
     .map_err(|error| {
         debug!(error = %error, "A forwarded sync delete failed");
         SyncRefusal::Unavailable
-    })?
-    .ok_or(SyncRefusal::Unavailable)?
-    .map_err(|error| {
-        debug!(error = %error, "A forwarded sync delete failed");
-        SyncRefusal::Unavailable
     })?;
     Ok(SyncPullAck {
         version_id: result.version_id,
@@ -337,14 +332,10 @@ async fn commit_pull(
         SYNC_SOURCE_VERSION_TAG.to_string(),
         request.source.version.to_string(),
     )]));
-    let result = drive(operation, context)
-        .await
-        .map_err(|_| SyncRefusal::Unavailable)?
-        .ok_or(SyncRefusal::Unavailable)?
-        .map_err(|error| {
-            debug!(error = %error, "A forwarded sync pull could not be written");
-            SyncRefusal::Unavailable
-        })?;
+    let result = drive(operation, context).await.map_err(|error| {
+        debug!(error = %error, "A forwarded sync pull could not be written");
+        SyncRefusal::Unavailable
+    })?;
     Ok(SyncPullAck {
         version_id: result.version_id,
         already_applied: false,
@@ -482,8 +473,6 @@ async fn list_heads(
         context,
     )
     .await
-    .map_err(|_| SyncRefusal::Unavailable)?
-    .ok_or(SyncRefusal::Unavailable)?
     .map_err(|_| SyncRefusal::Unavailable)?;
     let heads = result
         .items

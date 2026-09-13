@@ -37,6 +37,8 @@ pub enum RevokeUserAccessError {
     InvalidOperationState,
     #[error("RevokeUserAccess failed")]
     RevokeUserAccessFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Debug, PartialEq)]
@@ -205,7 +207,7 @@ impl RevokeUserAccessOperation {
 }
 
 impl Operation for RevokeUserAccessOperation {
-    type Output = Option<Result<UserAccess, RevokeUserAccessError>>;
+    type Output = UserAccess;
     type Error = RevokeUserAccessError;
 
     fn start(&mut self) -> Effects {
@@ -234,13 +236,11 @@ impl Operation for RevokeUserAccessOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == RevokeUserAccessState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(RevokeUserAccessError::RevokeUserAccessFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(RevokeUserAccessError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(op.state, RevokeUserAccessState::Finish);
         assert!(matches!(
             op.finalize(),
-            Ok(Some(Ok(revoked))) if revoked.revoked_at.is_some()
+            Ok(revoked) if revoked.revoked_at.is_some()
         ));
     }
 
@@ -424,8 +424,6 @@ mod tests {
 
         let result = drive(RevokeUserAccessOperation::new(access_key), &driver_ctx)
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
         assert!(result.revoked_at.is_some());
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle

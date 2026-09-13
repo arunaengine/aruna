@@ -57,6 +57,8 @@ pub enum AbortMultipartUploadError {
     CompletionInProgress,
     #[error("AbortMultipartUpload failed")]
     AbortMultipartUploadFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 impl From<UploadTargetError> for AbortMultipartUploadError {
@@ -418,7 +420,7 @@ impl AbortMultipartUploadOperation {
 }
 
 impl Operation for AbortMultipartUploadOperation {
-    type Output = Option<Result<(), AbortMultipartUploadError>>;
+    type Output = ();
     type Error = AbortMultipartUploadError;
 
     fn start(&mut self) -> Effects {
@@ -467,15 +469,10 @@ impl Operation for AbortMultipartUploadOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            AbortMultipartUploadState::Finish => Ok(self.output),
-            AbortMultipartUploadState::Error => {
-                if let Some(Err(error)) = self.output {
-                    return Err(error);
-                }
-                Err(AbortMultipartUploadError::AbortMultipartUploadFailed)
-            }
-            _ => Err(AbortMultipartUploadError::InvalidOperationState),
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(AbortMultipartUploadError::NotFinished),
         }
     }
 
@@ -685,7 +682,7 @@ mod tests {
 
         assert_eq!(
             operation.finalize(),
-            Err(AbortMultipartUploadError::InvalidOperationState)
+            Err(AbortMultipartUploadError::NotFinished)
         );
     }
 
@@ -695,7 +692,7 @@ mod tests {
         operation.state = AbortMultipartUploadState::Finish;
         operation.output = Some(Ok(()));
 
-        assert_eq!(operation.finalize(), Ok(Some(Ok(()))));
+        assert_eq!(operation.finalize(), Ok(()));
     }
 
     fn part_location() -> BackendLocation {

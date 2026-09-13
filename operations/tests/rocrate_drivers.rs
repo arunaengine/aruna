@@ -1390,8 +1390,7 @@ async fn create_bucket(
         ),
         context,
     )
-    .await?
-    .ok_or("bucket operation did not finish")??;
+    .await?;
     Ok(())
 }
 
@@ -1746,8 +1745,7 @@ async fn put_object(
         }),
         fixture.context.as_ref(),
     )
-    .await?
-    .ok_or("put object returned no result")??)
+    .await?)
 }
 
 async fn create_connector(

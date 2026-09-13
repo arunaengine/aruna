@@ -898,9 +898,7 @@ async fn artifact_output(
             &server.state.get_ctx(),
         )
         .await
-        .and_then(|result| result.transpose())
-        .ok()
-        .flatten(),
+        .ok(),
         _ => None,
     };
     let content_type = head

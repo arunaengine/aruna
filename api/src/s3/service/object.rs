@@ -184,9 +184,7 @@ impl ArunaS3Service {
             consume_scope_page(remaining_pages)?;
             let result = drive(ListObjectsV2Operation::new(input.clone()), &self.state)
                 .await
-                .and_then(|result| result.transpose())
-                .map_err(IntoS3Error::into_s3_error)?
-                .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
+                .map_err(IntoS3Error::into_s3_error)?;
             if result
                 .objects
                 .iter()
@@ -222,9 +220,7 @@ impl ArunaS3Service {
             consume_scope_page(&mut remaining_pages)?;
             let mut result = drive(ListObjectsV2Operation::new(input.clone()), &self.state)
                 .await
-                .and_then(|result| result.transpose())
-                .map_err(IntoS3Error::into_s3_error)?
-                .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
+                .map_err(IntoS3Error::into_s3_error)?;
 
             if let Some(scope) = scope {
                 result

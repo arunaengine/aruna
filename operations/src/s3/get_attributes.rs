@@ -64,6 +64,8 @@ pub enum GetObjectAttributesError {
     ManagedCopyError(#[from] ManagedCopyError),
     #[error("GetObjectAttributes failed")]
     GetObjectAttributesFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Debug, PartialEq)]
@@ -462,7 +464,7 @@ impl GetObjectAttributesOperation {
 }
 
 impl Operation for GetObjectAttributesOperation {
-    type Output = Option<Result<GetObjectAttributesResult, GetObjectAttributesError>>;
+    type Output = GetObjectAttributesResult;
     type Error = GetObjectAttributesError;
 
     fn start(&mut self) -> Effects {
@@ -496,13 +498,11 @@ impl Operation for GetObjectAttributesOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == GetObjectAttributesState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(GetObjectAttributesError::GetObjectAttributesFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(GetObjectAttributesError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -689,8 +689,6 @@ mod tests {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.location, Some(location));
@@ -727,8 +725,6 @@ mod tests {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.location, Some(location));
@@ -783,8 +779,6 @@ mod tests {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.location, Some(location));

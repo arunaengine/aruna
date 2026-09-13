@@ -49,9 +49,7 @@ pub async fn delete_objects(
             .with_restrictions(input.restrictions.clone()),
             context,
         )
-        .await
-        .and_then(|output| output.transpose())
-        .and_then(|result| result.ok_or(DeleteObjectError::DeleteObjectFailed));
+        .await;
 
         outcomes.push(DeleteObjectsEntryOutcome {
             key: entry.key,
@@ -146,8 +144,6 @@ mod test {
             context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
     }
 

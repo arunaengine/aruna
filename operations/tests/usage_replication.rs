@@ -64,9 +64,7 @@ async fn snapshot_reaches_peer() -> Result<(), Box<dyn std::error::Error>> {
         ),
         node_a.context.as_ref(),
     )
-    .await?
-    .unwrap()
-    .unwrap();
+    .await?;
 
     publish_usage_snapshots(
         node_a.context.as_ref(),
@@ -252,9 +250,7 @@ async fn steady_write_publishes() -> Result<(), Box<dyn std::error::Error>> {
         ),
         node.context.as_ref(),
     )
-    .await?
-    .unwrap()
-    .unwrap();
+    .await?;
 
     let snapshot_key = usage_global_key(node.net.node_id());
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(

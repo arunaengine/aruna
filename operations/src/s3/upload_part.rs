@@ -86,6 +86,8 @@ pub enum UploadPartError {
     PurgeFence(#[from] PurgeFenceError),
     #[error("UploadPart failed")]
     UploadPartFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 impl From<UploadTargetError> for UploadPartError {
@@ -687,7 +689,7 @@ impl UploadPartOperation {
 }
 
 impl Operation for UploadPartOperation {
-    type Output = Option<Result<UploadPartResult, UploadPartError>>;
+    type Output = UploadPartResult;
     type Error = UploadPartError;
 
     fn start(&mut self) -> Effects {
@@ -722,14 +724,11 @@ impl Operation for UploadPartOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if let Some(Err(error)) = self.output {
-            return Err(error);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(UploadPartError::NotFinished),
         }
-        if self.state != UploadPartState::Finish {
-            return Err(UploadPartError::UploadPartFailed);
-        }
-
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -1286,9 +1285,7 @@ mod test {
                 .is_empty()
         );
         assert_eq!(op.state, UploadPartState::Finish);
-        let Some(Ok(result)) = op.finalize().unwrap() else {
-            panic!("expected successful replacement")
-        };
+        let result = op.finalize().expect("expected successful replacement");
         assert_eq!(result.location, new);
     }
 
@@ -1315,9 +1312,9 @@ mod test {
 
         assert!(effects.is_empty());
         assert_eq!(op.state, UploadPartState::Finish);
-        let Some(Ok(result)) = op.finalize().unwrap() else {
-            panic!("expected the committed part to succeed")
-        };
+        let result = op
+            .finalize()
+            .expect("expected the committed part to succeed");
         assert_eq!(result.location, location);
     }
 

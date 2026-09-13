@@ -221,8 +221,7 @@ async fn historical_hash_resolves() -> TestResult<()> {
             }),
             joiner.context.as_ref(),
         )
-        .await?
-        .ok_or_else(|| std::io::Error::other("head_object returned no historical result"))??;
+        .await?;
         let old_location = old_head.location.ok_or_else(|| {
             std::io::Error::other("head_object returned no historical materialized location")
         })?;

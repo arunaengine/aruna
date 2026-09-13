@@ -199,9 +199,7 @@ pub async fn copy_object_tracked(
         context,
     )
     .await
-    .and_then(|result| result.transpose())
-    .map_err(head_error)?
-    .ok_or(CopyObjectError::Get(GetObjectError::GetObjectFailed))?;
+    .map_err(head_error)?;
     let source_last_modified = head
         .version_created_at
         .or_else(|| head.location.as_ref().map(|location| location.created_at))
@@ -243,9 +241,8 @@ pub async fn copy_object_tracked(
         .with_restrictions(input.source_auth_context.path_restrictions.clone()),
         context,
     )
-    .await
-    .and_then(|result| result.transpose())?
-    .ok_or(CopyObjectError::Get(GetObjectError::GetObjectFailed))?;
+    .await?;
+
     let source_version_id = source.version_id;
     let materialized = source.location.is_some();
     let content_length = source.location.as_ref().map(|location| location.blob_size);
@@ -306,10 +303,7 @@ pub async fn copy_object_tracked(
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
-    let put_result = drive(operation, context)
-        .await
-        .and_then(|result| result.transpose())?;
-    let put_result = put_result.ok_or(PutObjectError::PutObjectFailed)?;
+    let put_result = drive(operation, context).await?;
 
     // The new version time owns copy time when dedup reuses an older location.
     let created_at = UNIX_EPOCH + Duration::from_millis(put_result.version_id.timestamp_ms());
@@ -621,7 +615,7 @@ pub(crate) mod test {
         let gate = gate_context(&context, realm_id, 1_000)
             .await
             .expect("subject reads")
-            .expect("the fixture advertises a subject");
+            .expect("gate present");
         drive(
             PutObjectOperation::new(put_config(
                 realm_id,
@@ -635,8 +629,6 @@ pub(crate) mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let result = copy_object(
@@ -687,8 +679,6 @@ pub(crate) mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let copy_started_ms = SystemTime::now()
@@ -829,8 +819,6 @@ pub(crate) mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap()
         .blob;
         let mut read_buffer = Vec::new();
@@ -1250,8 +1238,6 @@ pub(crate) mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let error = copy_object(

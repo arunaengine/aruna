@@ -320,9 +320,7 @@ impl McpServer {
                 &self.state.get_ctx(),
             )
             .await
-            .and_then(|result| result.transpose())
-            .map_err(internal_error)?
-            .ok_or_else(|| internal_error("bucket listing did not finish"))?;
+            .map_err(internal_error)?;
             for (bucket, info) in result.buckets {
                 authorize_tool(
                     &self.state,
@@ -394,9 +392,7 @@ impl McpServer {
             &self.state.get_ctx(),
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(internal_error)?
-        .ok_or_else(|| internal_error("object listing did not finish"))?;
+        .map_err(internal_error)?;
         let objects = result
             .objects
             .into_iter()
@@ -512,9 +508,7 @@ impl McpServer {
             &self.state.get_ctx(),
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(map_head_error)?
-        .ok_or_else(|| internal_error("object head did not finish"))?;
+        .map_err(map_head_error)?;
         let size = result
             .location
             .as_ref()
@@ -633,9 +627,7 @@ impl McpServer {
                 &self.state.get_ctx(),
             )
             .await
-            .and_then(|result| result.transpose())
-            .map_err(internal_error)?
-            .ok_or_else(|| internal_error("object listing did not finish"))?;
+            .map_err(internal_error)?;
             scanned = scanned.saturating_add(page.objects.len());
             for object in &page.objects {
                 let Some(at) = entry_time(object) else {
@@ -913,9 +905,7 @@ pub(crate) async fn read_text(
         auth.path_restrictions.clone(),
     )
     .await
-    .and_then(|result| result.transpose())
-    .map_err(map_get_error)?
-    .ok_or_else(|| internal_error("object read did not finish"))?;
+    .map_err(map_get_error)?;
     let content_type = result
         .metadata
         .remove(OBJECT_CONTENT_TYPE_KEY)
@@ -1044,9 +1034,7 @@ pub(crate) async fn write_text(
     }
     let result = drive(operation, &server.state.get_ctx())
         .await
-        .and_then(|result| result.transpose())
-        .map_err(map_put_error)?
-        .ok_or_else(|| internal_error("object write did not finish"))?;
+        .map_err(map_put_error)?;
     complete_put(
         &server.state.get_ctx(),
         server.state.get_realm_id(),
@@ -1199,6 +1187,7 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
         error @ (GetObjectError::HoldersUnavailable | GetObjectError::HolderIntegrityFailure) => {
             internal_error(error)
         }
+        GetObjectError::NotFinished => internal_error("object read did not finish"),
         GetObjectError::GetObjectFailed => internal_error("object read failed"),
     }
 }
@@ -1231,6 +1220,7 @@ fn map_head_error(error: HeadObjectError) -> CallToolResult {
         HeadObjectError::ResolveReferenceError(error) => internal_error(error),
         HeadObjectError::StagingSourceError(error) => internal_error(error),
         HeadObjectError::ManagedCopyError(error) => internal_error(error),
+        HeadObjectError::NotFinished => internal_error("object head did not finish"),
         HeadObjectError::HeadObjectFailed => internal_error("object head failed"),
     }
 }

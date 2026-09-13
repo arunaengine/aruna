@@ -126,8 +126,6 @@ async fn create_bucket(h: &Harness, bucket: &str, group_id: Ulid) {
         &h.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 }
 
@@ -162,8 +160,6 @@ async fn put_object(
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
 }
 
 async fn delete_object(
@@ -187,8 +183,6 @@ async fn delete_object(
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
 }
 
 async fn create_upload(h: &Harness, bucket: &str, key: &str, group_id: Ulid) -> Ulid {
@@ -204,8 +198,6 @@ async fn create_upload(h: &Harness, bucket: &str, key: &str, group_id: Ulid) -> 
         &h.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap()
     .record
     .upload_id
@@ -235,8 +227,6 @@ async fn upload_part(
         &h.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap()
 }
 
@@ -276,8 +266,6 @@ async fn complete_upload(
         &h.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap()
 }
 
@@ -367,8 +355,6 @@ async fn bucket_delta_updates() {
     // delete_bucket refuses non-empty buckets, so only empty deletion is drivable.
     drive(DeleteBucketOperation::new("counted".to_string()), &h.driver)
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
     assert_eq!(read_global(&h.driver).await.buckets, 0);
     assert_eq!(read_group(&h.driver, group_id).await.buckets, 0);
@@ -593,8 +579,6 @@ async fn abort_preserves_counters() {
         &h.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     // Abort touches no counters; only the bucket remains accounted for.
@@ -641,11 +625,6 @@ async fn try_put_object(
         &h.driver,
     )
     .await
-    .map(|result| {
-        result
-            .expect("put object output")
-            .expect("put object inner")
-    })
 }
 
 fn remote_node(seed: u8) -> NodeId {
@@ -888,7 +867,6 @@ async fn try_complete_multipart(
         &h.driver,
     )
     .await
-    .map(|result| result.expect("complete output").expect("complete inner"))
 }
 
 #[tokio::test]

@@ -390,10 +390,6 @@ async fn prepare_reference(
             context,
         )
         .await
-        .map_err(map_head_error)?
-        .ok_or_else(|| {
-            NativeReferenceReject::Unavailable("source head did not finish".to_string())
-        })?
         .map_err(map_head_error)?;
         let metadata = head_metadata(&result, request.version_id)?;
         return Ok(PreparedReference {
@@ -419,8 +415,6 @@ async fn prepare_reference(
         context,
     )
     .await
-    .map_err(map_get_error)?
-    .ok_or_else(|| NativeReferenceReject::Unavailable("source read did not finish".to_string()))?
     .map_err(map_get_error)?;
     let metadata = result_metadata(&result, request.version_id)?;
     Ok(PreparedReference {

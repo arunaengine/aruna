@@ -80,9 +80,7 @@ pub async fn upload_part_copy(
         .with_restrictions(input.source_auth_context.path_restrictions.clone()),
         context,
     )
-    .await
-    .and_then(|result| result.transpose())?
-    .ok_or(UploadPartCopyError::Get(GetObjectError::GetObjectFailed))?;
+    .await?;
 
     let source_version_id = source.version_id;
     let source_last_modified = source
@@ -159,9 +157,7 @@ pub async fn upload_part_copy(
         }),
         context,
     )
-    .await
-    .and_then(|result| result.transpose())?;
-    let part = part.ok_or(UploadPartError::UploadPartFailed)?;
+    .await?;
 
     Ok(UploadPartCopyResultData {
         part_location: part.location,
@@ -411,7 +407,7 @@ mod test {
         if let Some(gate) = gate {
             operation = operation.with_gate(gate);
         }
-        drive(operation, context).await.unwrap().unwrap().unwrap();
+        drive(operation, context).await.unwrap();
     }
 
     async fn seed_multipart_upload(

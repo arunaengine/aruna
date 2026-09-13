@@ -159,8 +159,6 @@ async fn create_upload(
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
     .record
 }
 
@@ -189,8 +187,6 @@ async fn upload_part_bytes(
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap()
 }
 
@@ -236,8 +232,6 @@ async fn complete_upload(
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
 }
 
 #[tokio::test]
@@ -262,8 +256,6 @@ async fn completion_persists_parts() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let upload_id = created.record.upload_id;
@@ -286,8 +278,6 @@ async fn completion_persists_parts() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let uploaded_part2 = drive(
@@ -306,8 +296,6 @@ async fn completion_persists_parts() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let complete = drive(
@@ -361,8 +349,6 @@ async fn completion_persists_parts() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     assert!(exists(complete.location.get_full_path().unwrap()).unwrap());
@@ -555,8 +541,6 @@ async fn rejects_missing_checksum() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
     let upload_id = created.record.upload_id;
     let uploaded_part = upload_part_bytes(
@@ -618,8 +602,6 @@ async fn overwrite_cleans_blob() {
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
     .record
     .upload_id;
 
@@ -639,8 +621,6 @@ async fn overwrite_cleans_blob() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let second = drive(
@@ -659,8 +639,6 @@ async fn overwrite_cleans_blob() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     assert_ne!(first.location.backend_path, second.location.backend_path);
@@ -701,8 +679,6 @@ async fn completion_retains_path() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let created = drive(
@@ -717,8 +693,6 @@ async fn completion_retains_path() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let upload_id = created.record.upload_id;
@@ -741,8 +715,6 @@ async fn completion_retains_path() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let uploaded_part2 = drive(
@@ -761,8 +733,6 @@ async fn completion_retains_path() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let complete = drive(
@@ -800,8 +770,6 @@ async fn completion_retains_path() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let initial_hash: [u8; 32] = initial.location.get_blake3().unwrap().try_into().unwrap();
@@ -1005,8 +973,6 @@ async fn completion_deduplicates_put() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let upload = create_upload(&context, "bucket-a", "multipart.bin", group_id, created_by).await;
@@ -1211,8 +1177,6 @@ async fn abort_removes_parts() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let upload_id = created.record.upload_id;
@@ -1232,8 +1196,6 @@ async fn abort_removes_parts() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     drive(
@@ -1246,8 +1208,6 @@ async fn abort_removes_parts() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     assert!(
@@ -1289,8 +1249,6 @@ async fn checksum_mismatch_cleans() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap()
     .record
     .upload_id;
@@ -1358,8 +1316,6 @@ async fn delete_removes_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let upload_id = created.record.upload_id;
@@ -1382,8 +1338,6 @@ async fn delete_removes_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let uploaded_part2 = drive(
@@ -1402,8 +1356,6 @@ async fn delete_removes_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let complete = drive(
@@ -1441,8 +1393,6 @@ async fn delete_removes_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     drive(
@@ -1458,8 +1408,6 @@ async fn delete_removes_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     assert!(
@@ -1663,8 +1611,6 @@ async fn dropped_completion_retries() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     assert_eq!(retried.part_count, 1);
@@ -1725,8 +1671,6 @@ async fn abort_refuses_lease() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     assert!(read_upload(&context, upload.upload_id).await.is_none());

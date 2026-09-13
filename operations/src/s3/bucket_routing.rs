@@ -37,6 +37,8 @@ pub enum PutBucketRoutingError {
     GroupMismatch,
     #[error("No transaction found")]
     NoTransactionFound,
+    #[error("PutBucketRouting did not finish")]
+    NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -92,7 +94,7 @@ impl PutBucketRoutingOperation {
 }
 
 impl Operation for PutBucketRoutingOperation {
-    type Output = Option<Result<Vec<StorageRoutingRule>, PutBucketRoutingError>>;
+    type Output = Vec<StorageRoutingRule>;
     type Error = PutBucketRoutingError;
 
     fn start(&mut self) -> Effects {
@@ -220,12 +222,8 @@ impl Operation for PutBucketRoutingOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == PutBucketRoutingState::Error
-            && let Some(Err(err)) = self.output
-        {
-            return Err(err);
-        }
-        Ok(self.output)
+        self.output
+            .unwrap_or(Err(PutBucketRoutingError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -253,6 +251,8 @@ pub enum GetBucketRoutingError {
     ConversionError(#[from] ConversionError),
     #[error("The specified bucket does not exist.")]
     NoSuchBucket,
+    #[error("GetBucketRouting did not finish")]
+    NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -294,7 +294,7 @@ impl GetBucketRoutingOperation {
 }
 
 impl Operation for GetBucketRoutingOperation {
-    type Output = Option<Result<Vec<StorageRoutingRule>, GetBucketRoutingError>>;
+    type Output = Vec<StorageRoutingRule>;
     type Error = GetBucketRoutingError;
 
     fn start(&mut self) -> Effects {
@@ -344,12 +344,8 @@ impl Operation for GetBucketRoutingOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == GetBucketRoutingState::Error
-            && let Some(Err(err)) = self.output
-        {
-            return Err(err);
-        }
-        Ok(self.output)
+        self.output
+            .unwrap_or(Err(GetBucketRoutingError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -559,7 +555,7 @@ mod tests {
             value: Some(info.to_bytes().unwrap().into()),
         }));
 
-        assert_eq!(operation.finalize().unwrap(), Some(Ok(rules)));
+        assert_eq!(operation.finalize().unwrap(), rules);
     }
 
     #[test]

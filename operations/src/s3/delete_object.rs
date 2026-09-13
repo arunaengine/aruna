@@ -112,6 +112,8 @@ pub enum DeleteObjectError {
     PurgeFence(#[from] PurgeFenceError),
     #[error("DeleteObject failed")]
     DeleteObjectFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Debug, PartialEq)]
@@ -920,7 +922,7 @@ impl DeleteObjectOperation {
 }
 
 impl Operation for DeleteObjectOperation {
-    type Output = Option<Result<DeleteObjectResult, DeleteObjectError>>;
+    type Output = DeleteObjectResult;
     type Error = DeleteObjectError;
 
     fn start(&mut self) -> Effects {
@@ -969,13 +971,11 @@ impl Operation for DeleteObjectOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == DeleteObjectState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(DeleteObjectError::DeleteObjectFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(DeleteObjectError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -1621,8 +1621,6 @@ mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let delete_result = drive(
@@ -1638,8 +1636,6 @@ mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert!(exists(put_result.location.get_full_path().unwrap()).unwrap());
@@ -1776,8 +1772,6 @@ mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let tombstone = drive(
@@ -1793,8 +1787,6 @@ mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         assert!(tombstone.delete_marker);
 
@@ -1811,8 +1803,6 @@ mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         assert!(delete_marker_result.delete_marker);
 
@@ -1880,8 +1870,6 @@ mod test {
         )
         .await
         .unwrap()
-        .unwrap()
-        .unwrap()
         .blob;
         let restored = restored_blob.next().await.unwrap().unwrap();
         assert_eq!(restored.as_ref(), b"hello");
@@ -1899,8 +1887,6 @@ mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         assert!(!removed_object_version.delete_marker);
 

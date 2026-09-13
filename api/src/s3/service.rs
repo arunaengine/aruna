@@ -335,9 +335,7 @@ impl S3 for ArunaS3Service {
 
         drive(operation, &self.state)
             .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to create bucket"))?;
+            .map_err(IntoS3Error::into_s3_error)?;
 
         Ok(S3Response::new(CreateBucketOutput::default()))
     }
@@ -464,9 +462,7 @@ impl S3 for ArunaS3Service {
             &self.state,
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(InternalError, "Failed to list buckets"))?;
+        .map_err(IntoS3Error::into_s3_error)?;
 
         let mut buckets = Vec::new();
         for (bucket, bucket_info) in result.buckets {
@@ -508,9 +504,7 @@ impl S3 for ArunaS3Service {
             &self.state,
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(InternalError, "Failed to put bucket CORS configuration"))?;
+        .map_err(IntoS3Error::into_s3_error)?;
 
         Ok(S3Response::new(PutBucketCorsOutput::default()))
     }
@@ -531,9 +525,7 @@ impl S3 for ArunaS3Service {
             &self.state,
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(InternalError, "Failed to get bucket CORS configuration"))?;
+        .map_err(IntoS3Error::into_s3_error)?;
 
         Ok(S3Response::new(map_bucket_cors(config)))
     }
@@ -555,9 +547,7 @@ impl S3 for ArunaS3Service {
             &self.state,
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(InternalError, "Failed to delete bucket CORS configuration"))?;
+        .map_err(IntoS3Error::into_s3_error)?;
 
         Ok(S3Response::new(DeleteBucketCorsOutput::default()))
     }
@@ -886,9 +876,7 @@ impl S3 for ArunaS3Service {
 
         let result = drive(operation, &self.state)
             .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to process PUT request"))?;
+            .map_err(IntoS3Error::into_s3_error)?;
         validate_trailing_checksum(
             trailer_algorithm,
             &checksum_request.checksum_type,
@@ -1156,9 +1144,7 @@ impl S3 for ArunaS3Service {
 
         let result = drive(operation, &self.state)
             .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to create multipart upload"))?;
+            .map_err(IntoS3Error::into_s3_error)?;
 
         Ok(S3Response::new(CreateMultipartUploadOutput {
             bucket: Some(req.input.bucket),
@@ -1233,9 +1219,7 @@ impl S3 for ArunaS3Service {
 
         let result = drive(operation, &self.state)
             .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to upload part"))?;
+            .map_err(IntoS3Error::into_s3_error)?;
         validate_trailing_checksum(
             trailer_algorithm,
             &checksum_request.checksum_type,
@@ -1473,11 +1457,8 @@ impl S3 for ArunaS3Service {
         let service = self.clone();
         let deadline = tokio::time::Instant::now() + COMPLETION_DEADLINE;
         let work = async move {
-            let outcome = match drive_until(operation, &service.state, deadline)
-                .await
-                .and_then(|result| result.transpose())
-            {
-                Ok(Some(result)) => {
+            let outcome = match drive_until(operation, &service.state, deadline).await {
+                Ok(result) => {
                     service
                         .complete_put(
                             replication_auth,
@@ -1490,10 +1471,6 @@ impl S3 for ArunaS3Service {
                         .await;
                     Ok(result)
                 }
-                Ok(None) => Err(CompletionFailure::new(&s3_error!(
-                    InternalError,
-                    "Failed to complete multipart upload"
-                ))),
                 Err(error) => Err(CompletionFailure::new(&error.into_s3_error())),
             };
             Arc::new(outcome)
@@ -1540,9 +1517,7 @@ impl S3 for ArunaS3Service {
 
         drive(operation, &self.state)
             .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to abort multipart upload"))?;
+            .map_err(IntoS3Error::into_s3_error)?;
 
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
@@ -1605,9 +1580,7 @@ impl S3 for ArunaS3Service {
         // continues against the realm's holders instead of failing here.
         let result = get_object_routed(&self.state, input, user_access.path_restrictions.clone())
             .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to process GET request"))?;
+            .map_err(IntoS3Error::into_s3_error)?;
         self.record_touch(
             &user_access.access_key,
             &response_bucket,
@@ -1751,9 +1724,7 @@ impl S3 for ArunaS3Service {
             &self.state,
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(InternalError, "Failed to get object attributes"))?;
+        .map_err(IntoS3Error::into_s3_error)?;
 
         let remote_info = if result.location.is_none() {
             Some(
@@ -1958,9 +1929,7 @@ impl S3 for ArunaS3Service {
 
         let result = drive(operation, &self.state)
             .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to process HEAD request"))?;
+            .map_err(IntoS3Error::into_s3_error)?;
 
         let remote_info = if result.location.is_none() {
             Some(
@@ -2076,9 +2045,7 @@ impl S3 for ArunaS3Service {
             &self.state,
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(InternalError, "Failed to list parts"))?;
+        .map_err(IntoS3Error::into_s3_error)?;
 
         let checksum_algorithm = result
             .upload
@@ -2192,9 +2159,7 @@ impl S3 for ArunaS3Service {
             &self.state,
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(InternalError, "Failed to list multipart uploads"))?;
+        .map_err(IntoS3Error::into_s3_error)?;
 
         let url_encoded = req
             .input
@@ -2314,9 +2279,7 @@ impl S3 for ArunaS3Service {
             &self.state,
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(InternalError, "Failed to list object versions"))?;
+        .map_err(IntoS3Error::into_s3_error)?;
 
         let owner = Some(Owner {
             display_name: None,
@@ -2452,9 +2415,7 @@ impl S3 for ArunaS3Service {
 
         let result = drive(operation, &self.state)
             .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to process DELETE request"))?;
+            .map_err(IntoS3Error::into_s3_error)?;
 
         self.delete_object_response(
             replication_auth,
@@ -2669,9 +2630,7 @@ impl S3 for ArunaS3Service {
 
         drive(DeleteBucketOperation::new(req.input.bucket), &self.state)
             .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to delete bucket"))?;
+            .map_err(IntoS3Error::into_s3_error)?;
 
         Ok(S3Response::new(DeleteBucketOutput::default()))
     }

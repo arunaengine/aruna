@@ -58,6 +58,8 @@ pub enum DeleteBucketError {
     UsageUpdateError(#[from] UsageUpdateError),
     #[error("DeleteBucket failed")]
     DeleteBucketFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Debug, PartialEq)]
@@ -408,7 +410,7 @@ impl DeleteBucketOperation {
 }
 
 impl Operation for DeleteBucketOperation {
-    type Output = Option<Result<(), DeleteBucketError>>;
+    type Output = ();
     type Error = DeleteBucketError;
 
     fn start(&mut self) -> Effects {
@@ -446,13 +448,11 @@ impl Operation for DeleteBucketOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == DeleteBucketState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(DeleteBucketError::DeleteBucketFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(DeleteBucketError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -513,15 +513,11 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
-        let result = drive(DeleteBucketOperation::new(bucket.clone()), &driver_ctx)
+        drive(DeleteBucketOperation::new(bucket.clone()), &driver_ctx)
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(result, Ok(()));
 
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
             .send_storage_effect(StorageEffect::Read {
@@ -567,15 +563,11 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
-        let result = drive(DeleteBucketOperation::new(bucket.clone()), &driver_ctx)
+        drive(DeleteBucketOperation::new(bucket.clone()), &driver_ctx)
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(result, Ok(()));
 
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
             .send_storage_effect(StorageEffect::Read {
@@ -620,8 +612,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         let realm_id = RealmId::from_bytes([7; 32]);
         let local_node = iroh::SecretKey::from_bytes(&[8; 32]).public();
@@ -680,8 +670,6 @@ mod test {
 
         drive(DeleteBucketOperation::new(bucket), &driver_ctx)
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
 
         for (key_space, key, _) in keys {

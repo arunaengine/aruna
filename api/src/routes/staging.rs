@@ -937,9 +937,7 @@ pub async fn list_references(
         &state.get_ctx(),
     )
     .await
-    .and_then(|output| output.transpose())
-    .map_err(|error| ServerError::InternalError(error.to_string()))?
-    .ok_or_else(|| ServerError::InternalError("object listing produced no result".to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.to_string()))?;
 
     let entries = result
         .objects

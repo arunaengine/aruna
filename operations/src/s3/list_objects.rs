@@ -49,6 +49,8 @@ pub enum ListObjectsV2Error {
     NoTransactionFound,
     #[error("ListObjectsV2 failed")]
     ListObjectsV2Failed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -687,7 +689,7 @@ impl ListObjectsV2Operation {
 }
 
 impl Operation for ListObjectsV2Operation {
-    type Output = Option<Result<ListObjectsV2Result, ListObjectsV2Error>>;
+    type Output = ListObjectsV2Result;
     type Error = ListObjectsV2Error;
 
     fn start(&mut self) -> Effects {
@@ -718,13 +720,11 @@ impl Operation for ListObjectsV2Operation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ListObjectsV2State::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(ListObjectsV2Error::ListObjectsV2Failed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(ListObjectsV2Error::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -853,8 +853,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.objects.len(), 1);
@@ -896,8 +894,6 @@ mod test {
                 &driver_ctx,
             )
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
 
             for obj in result.objects {
@@ -954,8 +950,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let keys: Vec<_> = result
@@ -1027,8 +1021,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert!(result.objects.is_empty());
@@ -1068,8 +1060,6 @@ mod test {
                 &driver_ctx,
             )
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
 
             for obj in result.objects {
@@ -1111,8 +1101,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert!(result.objects.is_empty());
@@ -1200,8 +1188,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.objects.len(), 1);
@@ -1344,8 +1330,6 @@ mod test {
             driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         result
             .objects
@@ -1452,8 +1436,6 @@ mod test {
             driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap()
     }
 
@@ -1603,8 +1585,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let keys: Vec<_> = result

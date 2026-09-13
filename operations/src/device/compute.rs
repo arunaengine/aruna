@@ -301,15 +301,13 @@ async fn resolve_local(
         context,
     )
     .await
-    .and_then(|result| result.transpose())
     {
-        Ok(Some(head)) => head
+        Ok(head) => head
             .resolved_version_id
             .or(head.version_id)
             .or(version_id)
             .ok_or_else(missing),
-        Ok(None)
-        | Err(
+        Err(
             HeadObjectError::NoSuchKey
             | HeadObjectError::NoSuchVersion
             | HeadObjectError::DeleteMarker,

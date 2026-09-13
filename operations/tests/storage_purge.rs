@@ -141,8 +141,6 @@ async fn setup_context() -> TestContext {
         &driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     TestContext {
@@ -391,8 +389,6 @@ async fn scoped_fence_isolates() {
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
     .record;
     assert_eq!(outside_upload.key, "allowed/outside.bin");
     let stored_upload = read_value(
@@ -551,8 +547,6 @@ async fn purge_resumes_cleanly() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let first = purge_result(run_storage_purge(&prefix_job, &prefix_spec).await);

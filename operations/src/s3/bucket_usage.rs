@@ -121,9 +121,7 @@ impl BucketUsageOperation {
         let Some(versions) = self.versions.take() else {
             return self.fail(BucketUsageError::BucketUsageFailed);
         };
-        let result = match versions.finalize().and_then(|result| {
-            result.unwrap_or(Err(ListObjectVersionsError::ListObjectVersionsFailed))
-        }) {
+        let result = match versions.finalize() {
             Ok(result) => result,
             Err(error) => return self.fail(error.into()),
         };
@@ -161,9 +159,7 @@ impl BucketUsageOperation {
         let Some(uploads) = self.uploads.take() else {
             return self.fail(BucketUsageError::BucketUsageFailed);
         };
-        let result = match uploads.finalize().and_then(|result| {
-            result.unwrap_or(Err(ListMultipartUploadsError::ListMultipartUploadsFailed))
-        }) {
+        let result = match uploads.finalize() {
             Ok(result) => result,
             // The scan keeps its row budget, so a reader cannot walk every
             // multipart row on the node; an exhausted budget is a lower bound.

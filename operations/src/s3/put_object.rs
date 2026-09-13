@@ -1469,7 +1469,7 @@ impl PutObjectOperation {
 }
 
 impl Operation for PutObjectOperation {
-    type Output = Option<Result<PutObjectResult, PutObjectError>>;
+    type Output = PutObjectResult;
     type Error = PutObjectError;
 
     fn start(&mut self) -> Effects {
@@ -1523,22 +1523,17 @@ impl Operation for PutObjectOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if PutObjectState::Error == self.state {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(PutObjectError::PutObjectFailed);
-        }
-        Ok(self.output.map(|result| {
-            result.and_then(|location| {
-                self.version_id
-                    .map(|version_id| PutObjectResult {
-                        location,
-                        version_id,
-                    })
-                    .ok_or(PutObjectError::PutObjectFailed)
+        let location = match self.output {
+            Some(Ok(location)) => location,
+            Some(Err(error)) => return Err(error),
+            None => return Err(PutObjectError::PutObjectFailed),
+        };
+        self.version_id
+            .map(|version_id| PutObjectResult {
+                location,
+                version_id,
             })
-        }))
+            .ok_or(PutObjectError::PutObjectFailed)
     }
 
     fn abort(&mut self) -> Effects {
@@ -2476,7 +2471,7 @@ mod test {
         assert_eq!(op.state, PutObjectState::Finish);
         assert!(matches!(
             op.finalize(),
-            Ok(Some(Ok(result))) if result.location == location
+            Ok(result) if result.location == location
         ));
     }
 
@@ -2747,11 +2742,7 @@ mod test {
             compute_handle: None,
         };
         // Jesus, Take the Wheel!
-        let result = drive(put_operation, &context)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let result = drive(put_operation, &context).await.unwrap();
 
         assert!(exists(result.location.get_full_path().unwrap()).unwrap());
         assert_eq!(
@@ -2904,8 +2895,6 @@ mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         assert_eq!(retry, result);
         assert_eq!(
@@ -3001,8 +2990,6 @@ mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let second = drive(
@@ -3030,8 +3017,6 @@ mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(first.location, second.location);
@@ -3200,8 +3185,6 @@ mod test {
         )
         .await
         .unwrap()
-        .unwrap()
-        .unwrap()
     }
 
     #[tokio::test]
@@ -3302,7 +3285,7 @@ mod test {
         )
         .await
         .unwrap();
-        assert!(deleted.is_some_and(|result| result.is_ok()));
+        let _ = deleted;
 
         let location_value = read_value(
             &context,
@@ -3451,8 +3434,6 @@ mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let second = drive(
@@ -3480,8 +3461,6 @@ mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_ne!(first.location, second.location);
