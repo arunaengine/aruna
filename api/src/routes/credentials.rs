@@ -699,6 +699,11 @@ async fn authorize_credential_issuance(
                 Err(error) => return Err(error),
             }
         }
+        // A member whose roles reach only part of the group data may still
+        // take a credential: it inherits those roles and every S3 request is
+        // authorized against them. The derived roots are the authorization
+        // surface; probing their bare directory path would ask a `/**` grant
+        // to match the directory itself.
         let roots = aruna_operations::auth::permission_rules::reachable_roots(
             &state.get_ctx(),
             &effective_auth,
@@ -706,16 +711,10 @@ async fn authorize_credential_issuance(
         )
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
-        for root in roots {
-            match crate::auth::ensure_permission(state, &effective_auth, root, Permission::READ)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(ServerError::Forbidden) => {}
-                Err(error) => return Err(error),
-            }
+        if roots.is_empty() {
+            return Err(ServerError::Forbidden);
         }
-        return Err(ServerError::Forbidden);
+        return Ok(());
     };
 
     for restriction in effective_restrictions {
