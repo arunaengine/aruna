@@ -110,7 +110,7 @@ pub enum PutObjectError {
     #[error("blob write failed: {0}")]
     WriteFailed(String),
     #[error("blob backend write failed: {0}")]
-    BlobWriteFailed(String),
+    BlobWriteFailed(BlobError),
     #[error("preassigned version exists without a materialized blob")]
     InvalidPreassignedVersion,
     #[error(transparent)]
@@ -577,13 +577,14 @@ impl PutObjectOperation {
             Event::Blob(BlobEvent::Error(BlobError::StreamFailed(message))) => {
                 return self.cleanup_failed_write(PutObjectError::WriteFailed(message));
             }
-            Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, message })) => {
-                self.written_location = Some(location);
-                return self.cleanup_failed_write(PutObjectError::BlobWriteFailed(message));
+            Event::Blob(BlobEvent::Error(error @ BlobError::WriteCleanup { .. })) => {
+                if let BlobError::WriteCleanup { location, .. } = &error {
+                    self.written_location = Some(location.clone());
+                }
+                return self.cleanup_failed_write(PutObjectError::BlobWriteFailed(error));
             }
             Event::Blob(BlobEvent::Error(error)) => {
-                return self
-                    .cleanup_failed_write(PutObjectError::BlobWriteFailed(error.to_string()));
+                return self.cleanup_failed_write(PutObjectError::BlobWriteFailed(error));
             }
             _ => return self.emit_error(PutObjectError::InvalidOperationState),
         };
