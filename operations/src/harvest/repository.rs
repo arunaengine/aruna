@@ -147,7 +147,7 @@ pub fn connector_writes(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     // the connector key is group-scoped

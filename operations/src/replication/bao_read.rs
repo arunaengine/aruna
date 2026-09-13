@@ -1468,7 +1468,7 @@ impl Operation for IncomingBaoReadOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use std::collections::{HashMap, HashSet};
     use std::time::SystemTime;
 

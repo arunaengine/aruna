@@ -649,7 +649,7 @@ impl Operation for ReleaseExecutionOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::errors::StorageError;
 

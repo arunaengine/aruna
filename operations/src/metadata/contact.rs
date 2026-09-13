@@ -52,7 +52,7 @@ fn within_window(seen_ms: u64, now_ms: u64) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{PEER_CONTACT_WINDOW, PeerContacts};
     use aruna_core::NodeId;
 

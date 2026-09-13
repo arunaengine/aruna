@@ -234,7 +234,7 @@ pub fn build_transition_effects(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         HeadAliasContext, add_index_effect, build_transition_effects, iter_hash_page,
         iter_index_effect,

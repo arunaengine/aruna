@@ -32,7 +32,7 @@ pub(crate) fn conflict_backoff(attempt: usize, seed: &[u8]) -> Duration {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     #[test]

@@ -263,7 +263,7 @@ fn extract_values(value: &Value) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use crate::harvest::oai_pmh::parse::OaiHeader;
 

@@ -181,7 +181,7 @@ fn prefix_snippet(text: &str, max_len: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     use oxrdf::{Literal, NamedNode};

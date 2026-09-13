@@ -421,7 +421,7 @@ impl Operation for GetGroupRoutingOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         GetGroupRoutingError, GetGroupRoutingOperation, GroupRoutingInputsError,
         GroupRoutingInputsOperation, PutGroupRoutingError, PutGroupRoutingOperation,

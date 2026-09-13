@@ -486,7 +486,7 @@ impl Operation for AbortMultipartUploadOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
     use aruna_core::structs::{BackendLocation, BackendRef};

@@ -159,7 +159,7 @@ impl Operation for RemoteLocationSummaryOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use crate::tests::fixtures::locations::{node_id, request};
     use aruna_core::effects::Effect;
     use aruna_core::events::Event;

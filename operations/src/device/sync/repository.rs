@@ -267,7 +267,7 @@ pub(crate) async fn abort_txn(context: &Arc<crate::driver::DriverContext>, txn_i
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{base_key, key_path};
     use ulid::Ulid;
 

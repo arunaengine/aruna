@@ -104,7 +104,7 @@ pub(super) async fn dispatch_audit_page(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::audit_nodes;
     use aruna_core::audit::{AuditPageBatch, MAX_AUDIT_PEERS};
 

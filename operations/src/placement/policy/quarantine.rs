@@ -267,7 +267,7 @@ impl Operation for ResolveQuarantineOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::id::NodeId;

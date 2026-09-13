@@ -406,7 +406,7 @@ fn permanent_rule(error: &ShaclError) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     fn triples(turtle: &str) -> Vec<ShapeTriple> {

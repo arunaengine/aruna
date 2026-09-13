@@ -622,7 +622,7 @@ impl Operation for PolicyCoverageOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         AttachmentGap, CopyState, CoverageError, CoverageInput, CoverageLimit, CoverageReport,
         CoverageScope, PolicyCoverageOperation,

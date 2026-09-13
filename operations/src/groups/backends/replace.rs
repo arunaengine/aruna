@@ -299,7 +299,7 @@ impl Operation for ReplaceGroupBackendOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::ReplaceGroupBackendOperation;
     use crate::groups::backends::create::{CreateGroupBackendError, CreateGroupBackendInput};
     use crate::groups::backends::validation::GroupBackendError;

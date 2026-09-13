@@ -23,7 +23,7 @@ pub fn breaks_authority(value: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{breaks_authority, is_canonical};
 
     #[test]

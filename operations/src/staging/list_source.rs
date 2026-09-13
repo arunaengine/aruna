@@ -159,7 +159,7 @@ impl Operation for ListStagingSourceOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::{
         ResolvedSourceAccess, ResolvedSourceConnector, SourceConnector, SourceConnectorKind,

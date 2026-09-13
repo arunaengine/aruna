@@ -405,7 +405,7 @@ impl Operation for PutBucketPlacementOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{PutBucketPlacementError, PutBucketPlacementInput, PutBucketPlacementOperation};
     use crate::placement::policy::cache::PolicyCacheEntry;
     use crate::tests::fixtures::policy::signed_document;

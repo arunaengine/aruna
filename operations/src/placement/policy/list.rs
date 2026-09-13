@@ -200,7 +200,7 @@ impl Operation for ListPoliciesOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{ListPoliciesError, ListPoliciesInput, ListPoliciesOperation, PolicyListPage};
     use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};

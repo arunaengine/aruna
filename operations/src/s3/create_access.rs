@@ -437,7 +437,7 @@ impl Operation for CreateUserAccessOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use crate::s3::access_index::owner_key;
 

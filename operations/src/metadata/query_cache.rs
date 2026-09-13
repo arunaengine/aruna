@@ -355,7 +355,7 @@ fn results_bytes(results: &MetadataQueryResults) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use std::collections::BTreeMap;
 
     use super::*;

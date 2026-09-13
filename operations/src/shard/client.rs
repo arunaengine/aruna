@@ -110,7 +110,7 @@ pub(crate) async fn close_stream(stream: &mut BiStream) {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     fn node_id(seed: u8) -> NodeId {

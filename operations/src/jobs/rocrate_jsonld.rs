@@ -103,7 +103,7 @@ fn collect_terms(context: &Value, terms: &mut HashMap<String, Option<String>>) {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     #[test]

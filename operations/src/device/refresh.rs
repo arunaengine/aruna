@@ -245,7 +245,7 @@ fn local_is_ahead(local: &craqle::VectorClock, remote: &craqle::VectorClock) -> 
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::local_is_ahead;
     use craqle::{ActorId, VectorClock};
 

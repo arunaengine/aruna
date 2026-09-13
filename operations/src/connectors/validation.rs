@@ -189,7 +189,7 @@ pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorValidat
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     #[test]

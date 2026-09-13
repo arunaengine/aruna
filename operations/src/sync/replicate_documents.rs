@@ -381,7 +381,7 @@ impl Operation for ReplicateDocumentsOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::{PlacementStrategy, RealmNodeKind};
     use aruna_core::task::TaskEvent;

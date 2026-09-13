@@ -622,7 +622,7 @@ fn permanent_error(message: impl Into<String>) -> JobRunOutcome {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use ulid::Ulid;
 

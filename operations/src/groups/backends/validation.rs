@@ -236,7 +236,7 @@ fn normalize(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{GroupBackendError, validate_backend_input};
     use aruna_core::structs::GroupBackendKind;
     use std::collections::HashMap;

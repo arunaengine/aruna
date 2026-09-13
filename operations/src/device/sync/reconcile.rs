@@ -771,7 +771,7 @@ fn fail(operation: &mut ReconcileFolderOperation, error: ReconcileError) -> Effe
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::structs::{FileStat, FolderMode, FolderState, RealmId, RemoteBinding};

@@ -16,7 +16,7 @@ pub(crate) fn builtin_shapes(iri: &str) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use oxttl::TurtleParser;
 

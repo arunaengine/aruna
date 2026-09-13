@@ -185,7 +185,7 @@ pub(super) async fn read_hidden_range(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     #[test]

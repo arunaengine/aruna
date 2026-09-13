@@ -405,7 +405,7 @@ impl Operation for ResolvePolicyOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::effects::NetEffect;
     use aruna_core::events::{NetEvent, PolicyFetchEvent};

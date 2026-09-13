@@ -101,7 +101,7 @@ async fn quota_revision(context: &DriverContext, group_id: GroupId) -> Result<u6
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::compute_quota::{QuotaDimension, QuotaScope};
     use ulid::Ulid;

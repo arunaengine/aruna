@@ -59,7 +59,7 @@ pub fn filter_local_subscriptions(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::{RealmId, RealmNodeKind};
     use std::collections::HashSet;

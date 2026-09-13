@@ -521,7 +521,7 @@ fn logical_record(spec: &LogicalJobSpec) -> JobRecord {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use crate::tests::fixtures::records::{Family, REALM};
 

@@ -744,7 +744,7 @@ fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateU
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{UpdateUserError, UpdateUserInput, UpdateUserOperation};
     use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};

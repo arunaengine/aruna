@@ -221,7 +221,7 @@ impl Operation for SearchUsersOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{SearchUsersInput, SearchUsersMatch, SearchUsersOperation, SearchUsersOutput};
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, IterStart, StorageEffect};

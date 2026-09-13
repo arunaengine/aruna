@@ -70,7 +70,7 @@ pub fn ensure_peer_trust(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{PeerTrust, RealmPeerError, ensure_peer_trust};
     use aruna_core::NodeId;
     use aruna_core::UserId;

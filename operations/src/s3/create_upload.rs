@@ -386,7 +386,7 @@ impl Operation for CreateMultipartUploadOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         CreateMultipartUploadError, CreateMultipartUploadInput, CreateMultipartUploadOperation,
     };

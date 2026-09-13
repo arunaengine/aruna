@@ -199,7 +199,7 @@ impl Operation for ResolveUsersOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{ResolveUsersInput, ResolveUsersOperation, ResolvedUser};
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};

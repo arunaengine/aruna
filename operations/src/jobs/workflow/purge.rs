@@ -594,7 +594,7 @@ fn fence_error(error: PurgeFenceError) -> JobError {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::purge_audit_record;
     use aruna_core::UserId;
     use aruna_core::structs::RealmId;

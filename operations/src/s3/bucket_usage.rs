@@ -223,7 +223,7 @@ impl Operation for BucketUsageOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::errors::StorageError;
     use aruna_core::events::StorageEvent;

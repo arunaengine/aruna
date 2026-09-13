@@ -108,7 +108,7 @@ fn metadata_error_transient(error: &MetadataError) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::metadata::{
         MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,

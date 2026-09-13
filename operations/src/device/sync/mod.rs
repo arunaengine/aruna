@@ -388,7 +388,7 @@ async fn local_is_device(context: &Arc<DriverContext>) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     fn view(boundary: &str) -> RemoteView {

@@ -296,7 +296,7 @@ impl Operation for PolicyDiagnosticsOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         DiagnosticsError, DiagnosticsInput, DiagnosticsReport, PolicyDiagnosticsOperation,
     };

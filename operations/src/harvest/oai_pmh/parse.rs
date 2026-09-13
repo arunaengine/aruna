@@ -307,7 +307,7 @@ pub fn parse_datestamp_ms(datestamp: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     const LIST: &str = r#"<?xml version="1.0"?>

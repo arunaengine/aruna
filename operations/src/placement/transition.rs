@@ -283,7 +283,7 @@ fn locations_of(config: &RealmConfigDocument, holders: &[NodeId]) -> Vec<String>
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::{
         PlacementTransition, RealmId, RealmNodeKind, StallReport, TransitionStatus,

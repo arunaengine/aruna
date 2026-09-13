@@ -735,7 +735,7 @@ fn remove_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,

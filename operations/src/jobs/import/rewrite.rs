@@ -396,7 +396,7 @@ fn validation_issue(violation: CrateViolation) -> MetadataValidationViolation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     fn crate_json(version: &str) -> String {

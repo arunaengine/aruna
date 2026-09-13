@@ -508,7 +508,7 @@ fn rfc3339(ms: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use crate::metadata::create_document::CreateMetadataDocumentError;
     use aruna_core::metadata::{

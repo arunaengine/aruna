@@ -206,7 +206,7 @@ impl Operation for ListSessionOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::{RealmId, SessionKind};
     use byteview::ByteView;

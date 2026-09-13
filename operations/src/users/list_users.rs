@@ -239,7 +239,7 @@ impl Operation for ListUsersOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{ListUsersError, ListUsersInput, ListUsersOperation, ListUsersOutput};
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, IterStart, StorageEffect};

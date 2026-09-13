@@ -1352,7 +1352,7 @@ mod test {
 /// A listing must keep working for a governed head this node cannot answer
 /// for; it simply stops describing bytes it may not serve.
 #[cfg(test)]
-mod serve_tests {
+mod pure_tests {
     use super::served_copy;
     use crate::blob::managed_copy::register_entry;
     use aruna_core::structs::{

@@ -165,7 +165,7 @@ impl Operation for RelationshipReplicaNodesOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{RelationshipReplicaNodesOperation, ReplicaTarget};
     use crate::tests::fixtures::locations::{node_id, realm_id};
     use aruna_core::events::{Event, StorageEvent};

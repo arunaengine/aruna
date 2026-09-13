@@ -58,7 +58,7 @@ fn publication_targets(documents: &[DocumentSyncPublish]) -> Vec<DocumentSyncTar
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::publication_targets;
     use aruna_core::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncPublish, DocumentSyncRevision,

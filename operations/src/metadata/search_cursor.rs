@@ -474,7 +474,7 @@ fn watermark_of(hit: &MetadataSearchHit) -> SearchWatermark {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     fn secret_key(seed: u8) -> iroh::SecretKey {

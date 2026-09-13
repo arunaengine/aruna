@@ -43,7 +43,7 @@ pub(crate) fn validate_upload(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::BackendRef;
     use std::collections::HashMap;

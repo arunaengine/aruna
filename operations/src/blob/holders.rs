@@ -310,7 +310,7 @@ impl Operation for GetBlobHoldersOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use aruna_core::events::DhtEntry;
     use aruna_core::operation::Operation;
 
