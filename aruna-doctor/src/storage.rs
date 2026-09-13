@@ -676,7 +676,6 @@ mod tests {
                 context.as_ref(),
             )
             .await
-            .unwrap()
             .unwrap();
             assert!(!credentials.0.is_empty());
             assert!(!credentials.1.expose().is_empty());

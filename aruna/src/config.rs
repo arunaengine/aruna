@@ -5,10 +5,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::onboarding::{
-    BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingPhase,
-    OnboardingSecret, OnboardingSecretError, issuer_proof_message, node_proof_message,
-};
+use aruna_core::onboarding::{OnboardingMode, OnboardingPhase, OnboardingSecretError};
 use aruna_core::structs::{
     BlobTimeoutConfig, DynamicDiscoveryMethod, NodeBackendsConfig, NodeCapabilities,
     OidcProviderConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
@@ -17,18 +14,13 @@ use aruna_core::structs::{
 use aruna_net::{DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_config};
 
 use crate::identity::{
-    BootOrigin, EnrollmentPlan, IdentityStore, PersistedNodeIdentity, PersistedNodeState,
-    PersistedNodeStatus, bootstrap_node_state, decode_bootstrap_response,
-    onboarding_bootstrap_client, persist_node_state, plan_enrollment, validate_bootstrap_response,
+    BootOrigin, EnrollmentPlan, IdentityStore, PersistedNodeState, PersistedNodeStatus,
+    bootstrap_node_state, persist_node_state, plan_enrollment, refresh_onboarding_bootstrap,
 };
 use crate::settings::{Settings, invalid_config_value, normalize_env_value, validate_relay_urls};
 use aruna_operations::metadata::MetadataSearchStorage;
 use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle, errors::StorageLibError};
-use base64::Engine;
 use byteview::ByteView;
-use crypto_box::{SecretKey as TransportSecretKey, aead::OsRng as CryptoOsRng};
-use ed25519_dalek::pkcs8::DecodePrivateKey;
-use ed25519_dalek::{Signer, SigningKey};
 use iroh::EndpointAddr;
 use iroh::KeyParsingError;
 use std::array::TryFromSliceError;
@@ -566,112 +558,6 @@ fn fold_components(path: &std::path::Path) -> std::path::PathBuf {
         }
     }
     folded
-}
-
-pub(crate) async fn refresh_onboarding_bootstrap(
-    onboarding_secret: &str,
-    node_state: &PersistedNodeState,
-    node_location: Option<String>,
-    node_weight: Option<u32>,
-    node_labels: BTreeMap<String, String>,
-    timeout: Duration,
-) -> Result<BootstrapOnboardingResponse, SetupError> {
-    let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
-    let node_signing_key = SigningKey::from_bytes(&node_state.net_secret_key);
-    let node_id = iroh::SecretKey::from_bytes(&node_state.net_secret_key).public();
-
-    let mut transport_secret_key = None;
-    let transport_public_key = if matches!(decoded_secret.mode, OnboardingMode::Management) {
-        let secret_key = TransportSecretKey::generate(&mut CryptoOsRng);
-        let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(secret_key.public_key().as_bytes());
-        transport_secret_key = Some(secret_key);
-        Some(public_key)
-    } else {
-        None
-    };
-
-    let issuer_signing_key = match (&decoded_secret.mode, &node_state.identity) {
-        (
-            OnboardingMode::Server,
-            PersistedNodeIdentity::Server {
-                issuer_private_key_pem,
-                ..
-            },
-        ) => Some(SigningKey::from_pkcs8_pem(issuer_private_key_pem)?),
-        (OnboardingMode::Server, _) => {
-            return Err(SetupError::MissingOnboardingMaterial(
-                OnboardingMode::Server,
-            ));
-        }
-        _ => None,
-    };
-    let issuer_public_key = issuer_signing_key.as_ref().map(|issuer_signing_key| {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(issuer_signing_key.verifying_key().to_bytes())
-    });
-    let node_id_string = node_id.to_string();
-    let node_proof = node_signing_key
-        .sign(&node_proof_message(
-            onboarding_secret,
-            &node_id_string,
-            transport_public_key.as_deref(),
-        ))
-        .to_string();
-    let issuer_proof = issuer_signing_key
-        .as_ref()
-        .zip(issuer_public_key.as_ref())
-        .map(|(issuer_signing_key, issuer_public_key)| {
-            issuer_signing_key
-                .sign(&issuer_proof_message(
-                    onboarding_secret,
-                    &node_id_string,
-                    issuer_public_key,
-                ))
-                .to_string()
-        });
-
-    let response = onboarding_bootstrap_client(timeout)?
-        .post(format!(
-            "{}/api/v1/access/onboarding/bootstrap",
-            decoded_secret.seed_url.trim_end_matches('/'),
-        ))
-        .json(&BootstrapOnboardingRequest {
-            onboarding_secret: onboarding_secret.to_string(),
-            node_id: node_id_string,
-            node_proof,
-            transport_public_key,
-            issuer_public_key,
-            issuer_proof,
-            node_location,
-            node_weight,
-            node_labels,
-        })
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(SetupError::OnboardingBootstrapFailed(format!(
-            "bootstrap endpoint returned {}",
-            response.status()
-        )));
-    }
-
-    let body = response.bytes().await?;
-    let response = decode_bootstrap_response(&body)?;
-    if response.mode != decoded_secret.mode {
-        return Err(SetupError::OnboardingModeMismatch);
-    }
-    let response_realm_id = response.realm_id()?;
-    if response_realm_id != node_state.realm_id {
-        return Err(SetupError::OnboardingBootstrapFailed(
-            "bootstrap response realm does not match persisted node state".to_string(),
-        ));
-    }
-    validate_bootstrap_response(&response, decoded_secret.mode, node_state.realm_id, node_id)?;
-
-    drop(transport_secret_key);
-    Ok(response)
 }
 
 async fn load_realm_config(
