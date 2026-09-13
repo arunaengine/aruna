@@ -403,7 +403,7 @@ impl McpServer {
             }),
             target: None,
         };
-        let (_, response) = crate::routes::jobs::submit_execution(
+        let response = crate::routes::jobs::admit_execution(
             &self.state,
             Some(auth),
             request_bearer(&parts),
@@ -581,7 +581,7 @@ impl McpServer {
             )
             .await?;
         }
-        let (_, response) = crate::routes::jobs::submit_execution(
+        let response = crate::routes::jobs::admit_execution(
             &self.state,
             Some(auth),
             request_bearer(&parts),
@@ -606,7 +606,7 @@ impl McpServer {
     ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("submit_job", &input)?;
-        let (_, response) = crate::routes::jobs::submit_execution(
+        let response = crate::routes::jobs::admit_execution(
             &self.state,
             Some(auth),
             request_bearer(&parts),

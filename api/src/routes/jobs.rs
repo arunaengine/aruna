@@ -1514,7 +1514,7 @@ pub async fn submit_job(
     Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<SubmitExecutionRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitJobResponse>)> {
-    let (status, response) = submit_execution(
+    let response = admit_execution(
         state.as_ref(),
         auth,
         bearer,
@@ -1522,6 +1522,12 @@ pub async fn submit_job(
         PolicyRequestExtras::rest(),
     )
     .await?;
+    // The transport owns the HTTP status; the application outcome is `created`.
+    let status = if response.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
     Ok((status, Json(response)))
 }
 
@@ -1532,13 +1538,16 @@ fn trimmed(value: Option<String>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-pub(crate) async fn submit_execution(
+/// The transport-independent admission decision shared by REST and MCP. The
+/// response carries the application outcome; each transport maps it to its own
+/// status/response contract.
+pub(crate) async fn admit_execution(
     state: &ServerState,
     auth: Option<AuthContext>,
     bearer: Option<ValidatedArunaBearerTokenCarrier>,
     mut request: SubmitExecutionRequest,
     extras: PolicyRequestExtras,
-) -> ServerResult<(StatusCode, SubmitJobResponse)> {
+) -> ServerResult<SubmitJobResponse> {
     session_request(
         &mut request,
         bearer
@@ -1666,26 +1675,18 @@ pub(crate) async fn submit_execution(
         }
     };
 
-    let status = if accepted.created {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
     let urls = job_urls(state, accepted.job_id).await?;
     // The accepting holder's canonical binding is the alias it answered with;
     // a later merge may move it, which the status surface then reports.
-    Ok((
-        status,
-        SubmitJobResponse {
-            job_id: accepted.job_id.to_string(),
-            created: accepted.created,
-            submission_id: accepted.submission_id,
-            canonical_job_id: accepted.job_id.to_string(),
-            state: accepted.state,
-            origin_node_url: urls.owner_node_url,
-            status_url: urls.status_url,
-        },
-    ))
+    Ok(SubmitJobResponse {
+        job_id: accepted.job_id.to_string(),
+        created: accepted.created,
+        submission_id: accepted.submission_id,
+        canonical_job_id: accepted.job_id.to_string(),
+        state: accepted.state,
+        origin_node_url: urls.owner_node_url,
+        status_url: urls.status_url,
+    })
 }
 
 /// What both submission paths answer with. A local run has no submission
