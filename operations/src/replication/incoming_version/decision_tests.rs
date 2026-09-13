@@ -1,4 +1,3 @@
-
 use super::pure_tests::{make_manifest, make_reference_manifest};
 use super::*;
 use crate::placement::policy::PolicyCacheEntry;

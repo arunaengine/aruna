@@ -1,4 +1,3 @@
-
 use super::{
     IncomingVersionReplicationError, IncomingVersionReplicationOperation,
     IncomingVersionReplicationState, ReceivedBlob,
