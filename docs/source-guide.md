@@ -25,7 +25,7 @@ change.
 3. `drive` calls `start`/`step` on the operation. The operation returns
    `Effect` values (`core/src/effects.rs`) and consumes `Event` values
    (`core/src/events.rs`). It never performs I/O itself.
-4. The effect adapters in `operations/src/effect_adapters/` execute storage, blob,
+4. The effect adapters in `operations/src/driver/effect_adapters/` execute storage, blob,
    net, metadata, and task effects and feed the results back as events.
 5. `finalize` maps the completed state to `Result<Output, Error>`; the
    transport maps that to a response.
@@ -36,8 +36,9 @@ assert effects, `step` explicit events, assert effects, `finalize`.
 ## Add an operation
 
 1. Define the input, output, error, and a private state enum in
-   `operations/src/<area>/<verb>.rs`. Keep `Output` a single domain value;
-   absence and failure belong in the error type.
+   `operations/src/<area>/<verb>.rs`. Keep `Output` one domain value: `Option<T>`
+   only where absence is a real success, never a nested `Option<Result<..>>`;
+   failure belongs in the error type.
 2. Implement `Operation` (`core/src/operation.rs`): `start`, `step`,
    `is_complete`, `finalize`, `abort`, and `expected_error` for ordinary
    client outcomes such as not-found.
@@ -72,8 +73,11 @@ assert effects, `step` explicit events, assert effects, `finalize`.
 
 1. Add the `TaskKey` variant in `core/src/task.rs`.
 2. Handle `TaskEvent` for it in `operations/src/tasks/incoming/` and register
-   the handler/queue with the shared `TaskHandle` lifecycle owner in
-   `initialize_task_holder` (`operations/src/tasks/incoming/restore.rs`).
+   the handler/queue with the shared `TaskHandle` lifecycle owner:
+   `install_task_queues` installs the handler, and
+   `TaskQueues::restore_timers_and_start` restores durable timers and starts
+   the re-arm loop under the caller's `Shutdown`
+   (`operations/src/tasks/incoming/restore.rs`).
 3. Production startup starts queues in `aruna/src/startup/background.rs`
    (`STARTUP_PHASES`); put restore/install work there, not in the task crate
    root.
@@ -124,8 +128,8 @@ its consumer in `aruna/tests/observability.rs`.
 ## Tests and commands
 
 - `just test-fast` runs the audited no-I/O selection
-  (`state_machine_tests` and `pure_tests` modules). These tests use no runtime,
-  storage, network, process, or environment mutation.
+  (`state_machine_tests`, `pure_tests`, and `decision_tests` modules). These
+  tests use no runtime, storage, network, process, or environment mutation.
 - Runtime, storage, and multi-node behavior lives in the ordinary test modules
   and `aruna/tests`.
 - Focused loop: `cargo nextest run -p <crate> --lib --locked --profile fast`.
