@@ -104,10 +104,11 @@ pub struct MonitoringState {
     metrics: Arc<NodeMetrics>,
     readiness: Readiness,
     recovery: RecoveryStatus,
-    /// Stops the background queue-lag refresher. Without it the task's
-    /// in-flight driver context outlives an aborted ops server during partial
-    /// startup cleanup.
-    queue_refresher_cancel: tokio_util::sync::CancellationToken,
+    /// The queue-lag sampler owner. Cancel and completion are held together, so
+    /// no caller can stop sampling without the sampler having released its
+    /// driver context. Taken out exactly once by [`Self::stop_queue_refresher`];
+    /// the ops HTTP task stays separate and keeps serving through the drain.
+    queue_refresher: tokio::sync::Mutex<Option<QueueRefresher>>,
 }
 
 impl MonitoringState {
@@ -129,8 +130,12 @@ impl MonitoringState {
         recovery: RecoveryStatus,
     ) -> Arc<Self> {
         register_storage_source(&metrics, ctx.clone()).await;
-        let queue_refresher_cancel = tokio_util::sync::CancellationToken::new();
-        register_queue_metrics(&metrics, ctx.clone(), queue_refresher_cancel.clone()).await;
+        let queue_metrics = register_queue_metrics(&metrics).await;
+        let queue_refresher = spawn_queue_refresher(
+            Arc::downgrade(&ctx),
+            queue_metrics,
+            tokio_util::sync::CancellationToken::new(),
+        );
         register_recovery_metrics(&metrics, recovery.clone()).await;
         if let Some(net_handle) = &ctx.net_handle {
             net_handle
@@ -143,14 +148,20 @@ impl MonitoringState {
             metrics,
             readiness,
             recovery,
-            queue_refresher_cancel,
+            queue_refresher: tokio::sync::Mutex::new(Some(queue_refresher)),
         })
     }
 
-    /// Stops the queue-lag refresher and waits for it to release the driver
-    /// context. Call before the storage close on a partial startup teardown.
-    pub fn stop_queue_refresher(&self) {
-        self.queue_refresher_cancel.cancel();
+    /// Cancels the queue-lag sampler and awaits its completion before returning.
+    /// Call before the storage close on any teardown path; a later call is a
+    /// no-op. The ops HTTP endpoint is owned by its own task and untouched.
+    pub async fn stop_queue_refresher(&self) {
+        let Some(refresher) = self.queue_refresher.lock().await.take() else {
+            return;
+        };
+        if !refresher.stop().await {
+            tracing::warn!("Queue-lag sampler did not complete cleanly");
+        }
     }
 }
 
@@ -565,36 +576,50 @@ impl QueueMetrics {
     }
 }
 
+/// The queue-lag sampler: its cancellation token and its join handle are one
+/// owner, so stopping is always "cancel and await completion".
+struct QueueRefresher {
+    cancel: tokio_util::sync::CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl QueueRefresher {
+    /// Cancels the sampler and awaits its exit. `true` means the task finished
+    /// rather than panicked or was aborted.
+    async fn stop(self) -> bool {
+        self.cancel.cancel();
+        self.handle.await.is_ok()
+    }
+}
+
 fn spawn_queue_refresher(
     ctx: Weak<DriverContext>,
     queue_metrics: Arc<QueueMetrics>,
     cancel: tokio_util::sync::CancellationToken,
-) {
-    tokio::spawn(async move {
+) -> QueueRefresher {
+    let task_cancel = cancel.clone();
+    let handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(QUEUE_LAG_INTERVAL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut reporter = QueueLagReporter::default();
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => return,
+                _ = task_cancel.cancelled() => return,
                 _ = interval.tick() => {}
             }
             let Some(ctx) = ctx.upgrade() else {
                 return;
             };
             tokio::select! {
-                _ = cancel.cancelled() => return,
+                _ = task_cancel.cancelled() => return,
                 _ = queue_metrics.refresh(ctx.as_ref(), &mut reporter) => {}
             }
         }
     });
+    QueueRefresher { cancel, handle }
 }
 
-async fn register_queue_metrics(
-    metrics: &NodeMetrics,
-    ctx: Arc<DriverContext>,
-    cancel: tokio_util::sync::CancellationToken,
-) {
+async fn register_queue_metrics(metrics: &NodeMetrics) -> Arc<QueueMetrics> {
     let depth = Family::<QueueLabels, Gauge>::default();
     metrics
         .register("queue_depth", "Durable work queue depth", depth.clone())
@@ -641,7 +666,7 @@ async fn register_queue_metrics(
         probe_last_success_timestamp_seconds,
     });
     queue_metrics.seed();
-    spawn_queue_refresher(Arc::downgrade(&ctx), queue_metrics, cancel);
+    queue_metrics
 }
 
 #[cfg(test)]
@@ -930,6 +955,43 @@ mod tests {
                 .get(),
             last_success
         );
+    }
+
+    // The owner cancels and joins in one step and reports a clean completion
+    // rather than dropping the task on the floor.
+    #[tokio::test(start_paused = true)]
+    async fn refresher_stop_observes_completion() {
+        let metrics = NodeMetrics::new();
+        let queue_metrics = register_queue_metrics(&metrics).await;
+        let refresher = spawn_queue_refresher(
+            Weak::new(),
+            queue_metrics,
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        assert!(refresher.stop().await);
+    }
+
+    // A sampler blocked in a storage probe must still be cancelled and joined,
+    // and stopping consumes the owner so a later close cannot race it.
+    #[tokio::test(start_paused = true)]
+    async fn stop_awaits_an_in_flight_sample() {
+        let (storage, receivers) = StorageHandle::new();
+        let state = MonitoringState::new(
+            ctx_with_storage(storage),
+            Arc::new(NodeMetrics::new()),
+            Readiness::new(),
+        )
+        .await;
+        // The first interval tick dispatches its probe; nobody answers it.
+        tokio::task::yield_now().await;
+
+        tokio::time::timeout(Duration::from_secs(5), state.stop_queue_refresher())
+            .await
+            .expect("cancellation must not wait for the unanswered probe");
+
+        assert!(state.queue_refresher.lock().await.is_none());
+        drop(receivers);
     }
 
     #[tokio::test]
