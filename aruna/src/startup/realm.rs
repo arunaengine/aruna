@@ -34,7 +34,11 @@ pub(crate) async fn prepare(
     config: &Config,
     driver_ctx: &Arc<DriverContext>,
     net_handle: &NetHandle,
-) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
+    stop: &tokio_util::sync::CancellationToken,
+) -> Result<Option<CoreAnnouncement>, Box<dyn std::error::Error>> {
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
     let replayed_metadata_events = replay_event_log(driver_ctx.as_ref()).await?;
     if replayed_metadata_events > 0 {
         info!(
@@ -42,11 +46,22 @@ pub(crate) async fn prepare(
             "Replayed metadata event log during startup"
         );
     }
+    // A replay can take a while on a large log; a stop accepted during it must
+    // not proceed into realm bootstrap.
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
 
-    let announcement = prepare_mode(config, driver_ctx, net_handle).await?;
+    let announcement = prepare_mode(config, driver_ctx, net_handle, stop).await?;
+    let Some(announcement) = announcement else {
+        return Ok(None);
+    };
 
     // Prepare local topics before binding; remote convergence stays behind the gate.
     prepare_shard_policy(driver_ctx, config.node_id, config.realm_id).await;
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
     // Devices fetch governing realm documents before serving because they run no sync.
     // A short attempt lets stored copies serve while heartbeat retries an unreachable realm.
     if matches!(config.node_capabilities, NodeCapabilities::User { .. })
@@ -54,20 +69,26 @@ pub(crate) async fn prepare(
     {
         warn!("Serving this device from its stored realm documents for now");
     }
-    Ok(announcement)
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
+    Ok(Some(announcement))
 }
 
 async fn prepare_mode(
     config: &Config,
     driver_ctx: &Arc<DriverContext>,
     net_handle: &NetHandle,
-) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
+    stop: &tokio_util::sync::CancellationToken,
+) -> Result<Option<CoreAnnouncement>, Box<dyn std::error::Error>> {
     match &config.startup_mode {
         StartupMode::InitializeRealm { realm_description } => {
-            init_realm(config, driver_ctx, realm_description).await
+            init_realm(config, driver_ctx, realm_description, stop).await
         }
-        StartupMode::JoinRealm { phase } => join_realm(config, driver_ctx, net_handle, phase).await,
-        StartupMode::Provisioned => provision_realm(config, driver_ctx).await,
+        StartupMode::JoinRealm { phase } => {
+            join_realm(config, driver_ctx, net_handle, phase, stop).await
+        }
+        StartupMode::Provisioned => provision_realm(config, driver_ctx, stop).await,
     }
 }
 
@@ -75,7 +96,11 @@ async fn init_realm(
     config: &Config,
     driver_ctx: &Arc<DriverContext>,
     realm_description: &str,
-) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
+    stop: &tokio_util::sync::CancellationToken,
+) -> Result<Option<CoreAnnouncement>, Box<dyn std::error::Error>> {
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
     if !realm_bootstrap_exists(driver_ctx.as_ref(), &config.realm_id).await? {
         drive(
             CreateRealmOperation::new(CreateRealmConfig {
@@ -93,6 +118,9 @@ async fn init_realm(
             driver_ctx.as_ref(),
         )
         .await?;
+    }
+    if stop.is_cancelled() {
+        return Ok(None);
     }
     // The subject comes first: the advertisement built from it carries no
     // execution target while this node has no placement subject yet.
@@ -125,11 +153,14 @@ async fn init_realm(
         }
     }
 
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
     mark_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
-    Ok(CoreAnnouncement {
+    Ok(Some(CoreAnnouncement {
         documents,
         allow_genesis: true,
-    })
+    }))
 }
 
 async fn join_realm(
@@ -137,7 +168,11 @@ async fn join_realm(
     driver_ctx: &Arc<DriverContext>,
     net_handle: &NetHandle,
     phase: &OnboardingPhase,
-) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
+    stop: &tokio_util::sync::CancellationToken,
+) -> Result<Option<CoreAnnouncement>, Box<dyn std::error::Error>> {
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
     let bootstrap_peer = config
         .peer_endpoints
         .first()
@@ -153,6 +188,9 @@ async fn join_realm(
         )
         .await?;
     }
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
     wait_for_placement(
         driver_ctx,
         config.realm_id,
@@ -162,6 +200,9 @@ async fn join_realm(
         config.onboarding_sync_timeout(),
     )
     .await?;
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
     if matches!(phase, OnboardingPhase::Bootstrapped) {
         mark_onboarding_phase(
             &driver_ctx.storage_handle,
@@ -188,11 +229,14 @@ async fn join_realm(
             .await?
         }
     };
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
     mark_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
-    Ok(CoreAnnouncement {
+    Ok(Some(CoreAnnouncement {
         documents,
         allow_genesis: false,
-    })
+    }))
 }
 
 /// A device reads the realm's documents over metadata and publishes none of
@@ -204,7 +248,11 @@ fn is_device(config: &Config) -> bool {
 async fn provision_realm(
     config: &Config,
     driver_ctx: &Arc<DriverContext>,
-) -> Result<CoreAnnouncement, Box<dyn std::error::Error>> {
+    stop: &tokio_util::sync::CancellationToken,
+) -> Result<Option<CoreAnnouncement>, Box<dyn std::error::Error>> {
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
     if matches!(
         &config.node_capabilities,
         NodeCapabilities::Management { .. }
@@ -244,10 +292,13 @@ async fn provision_realm(
             .await?
         }
     };
-    Ok(CoreAnnouncement {
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
+    Ok(Some(CoreAnnouncement {
         documents,
         allow_genesis,
-    })
+    }))
 }
 
 /// Reconciles this node's advertised placement subject with the realm's
@@ -279,4 +330,65 @@ async fn seed_node_info(ctx: &DriverContext, config: &Config) -> Result<(), Stri
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
+
+    // A stop accepted before preparation starts must return cleanly without
+    // touching storage or the network, so the caller can release the acquired
+    // resources and report a startup cancellation.
+    #[tokio::test]
+    async fn cancelled_preparation_stops_at_the_boundary() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let map: std::collections::BTreeMap<String, String> = [
+            (
+                "STORAGE_PATH".to_string(),
+                temp.path().to_str().expect("utf8 path").to_string(),
+            ),
+            ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("P2P_SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("S3_HOST".to_string(), "127.0.0.1:0".to_string()),
+            ("S3_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("PORTAL_MODE".to_string(), "disabled".to_string()),
+            ("ARUNA_FJALL_PERSIST_MODE".to_string(), "buffer".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let (config, storage) = crate::config::resolve_settings(
+            crate::settings::read_settings_from(&map).expect("settings parse"),
+        )
+        .await
+        .expect("settings resolve");
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind address"),
+                secret_key: Some(iroh::SecretKey::from_bytes(&[9u8; 32])),
+                realm_id: config.realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+
+        let result = prepare(&config, &driver_ctx, &net, &stop).await;
+
+        assert!(matches!(result, Ok(None)));
+        net.shutdown().await;
+    }
 }

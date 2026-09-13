@@ -68,7 +68,14 @@ pub(crate) const STARTUP_PHASES: &[StartupPhase] = &[
     StartupPhase::RecoverChild,
 ];
 
-pub(crate) async fn start(background: Background) {
+/// Runs the background start, checking for an accepted stop and for an
+/// already-finished ingress listener between phases. Returns whether readiness
+/// was announced; a `false` result means no phase that depends on it ran.
+pub(crate) async fn start(
+    background: Background,
+    stop: &tokio_util::sync::CancellationToken,
+    listener_lost: impl Fn() -> bool,
+) -> bool {
     let Background {
         realm_id,
         node_id,
@@ -89,10 +96,20 @@ pub(crate) async fn start(background: Background) {
     } = core_announcement;
     let mut core_documents = Some(documents);
     let mut task_queues = Some(task_queues);
+    let mut ready_announced = false;
 
     for phase in STARTUP_PHASES {
+        // A stop accepted while an earlier phase ran must not admit more work,
+        // and a listener that already exited must stop the node, not start
+        // recovery behind it.
+        if stop.is_cancelled() || listener_lost() {
+            break;
+        }
         match phase {
-            StartupPhase::Ready => readiness.set_ready(),
+            StartupPhase::Ready => {
+                readiness.set_ready();
+                ready_announced = true;
+            }
             StartupPhase::CorePublication => {
                 let documents = core_documents
                     .take()
@@ -151,6 +168,7 @@ pub(crate) async fn start(background: Background) {
             }
         }
     }
+    ready_announced
 }
 
 async fn publish_core(
@@ -173,6 +191,86 @@ async fn publish_core(
         documents,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_operations::tasks::incoming::initialize_task_holder;
+
+    async fn test_background() -> (Background, tempfile::TempDir) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
+            .expect("storage opens");
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let task_handle = TaskHandle::new();
+        let jobs_runtime = JobsRuntime::new_paused();
+        let task_queues = initialize_task_holder(
+            driver_ctx.clone(),
+            task_handle.clone(),
+            jobs_runtime.clone(),
+            aruna_core::structs::RoCrateLimits::default(),
+        )
+        .await;
+        let background = Background {
+            realm_id: aruna_core::structs::RealmId::from_bytes([7u8; 32]),
+            node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+            is_initial_boot: false,
+            driver_ctx,
+            shutdown: Shutdown::new(),
+            readiness: Readiness::new(),
+            recovery: RecoveryStatus::new(),
+            jobs_runtime,
+            task_handle,
+            task_queues,
+            usage_counters_rebuilt: false,
+            core_announcement: CoreAnnouncement {
+                documents: Vec::new(),
+                allow_genesis: false,
+            },
+        };
+        (background, temp)
+    }
+
+    // A stop accepted before the first phase must not announce readiness or
+    // start any recovery step.
+    #[tokio::test]
+    async fn accepted_stop_announces_no_readiness() {
+        let (background, _temp) = test_background().await;
+        let readiness = background.readiness.clone();
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+
+        let announced = start(background, &stop, || false).await;
+
+        assert!(!announced);
+        assert!(!readiness.is_ready());
+    }
+
+    // An ingress listener that already exited is observed between startup
+    // phases, so readiness is never announced behind a dead listener.
+    #[tokio::test]
+    async fn lost_listener_announces_no_readiness() {
+        let (background, _temp) = test_background().await;
+        let readiness = background.readiness.clone();
+
+        let announced = start(
+            background,
+            &tokio_util::sync::CancellationToken::new(),
+            || true,
+        )
+        .await;
+
+        assert!(!announced);
+        assert!(!readiness.is_ready());
+    }
 }
 
 #[cfg(test)]
