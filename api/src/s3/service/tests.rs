@@ -1,4 +1,3 @@
-
 use super::bucket::MAX_REPLICATION_TARGETS;
 use super::object::next_marker_of;
 use super::*;
