@@ -1,0 +1,472 @@
+use crate::driver::DriverContext;
+use crate::driver::drive;
+use crate::groups::get_group::GetGroupConfig;
+use crate::groups::get_group::GetGroupOperation;
+use crate::groups::list_groups::ListGroupOperation;
+use crate::metadata::api::MetadataApiError;
+use crate::metadata::api::ensure_record_readable;
+use crate::metadata::api::load_live_record;
+use crate::metadata::handle::MetadataWritePeerError;
+use crate::metadata::protocol::DeviceGroupDocuments;
+use crate::metadata::protocol::GraphState;
+use crate::metadata::protocol::MAX_DEVICE_GROUPS;
+use crate::metadata::protocol::MetadataAuthToken;
+use crate::metadata::protocol::MetadataTransportMessage;
+use crate::metadata::protocol::RealmDocuments;
+use crate::metadata::raw_revision::load_raw_view;
+use crate::metadata::update_document::UpdateMetadataDocumentConfig;
+use crate::metadata::update_document::UpdateMetadataDocumentError;
+use crate::metadata::update_document::UpdateMetadataDocumentMutation;
+use crate::metadata::update_document::UpdateMetadataDocumentOperation;
+use crate::metadata::update_document::update_metadata_document;
+use crate::node::node_info::read_info_documents;
+use crate::placement::process_placements::load_realm_config;
+use aruna_core::NodeId;
+use aruna_core::admin_documents::AdminDocumentClock;
+use aruna_core::admin_documents::AdminDocumentTarget;
+use aruna_core::document::DocumentSyncTarget;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::Event;
+use aruna_core::events::StorageEvent;
+use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
+use aruna_core::metadata::MetadataEffect;
+use aruna_core::metadata::MetadataError;
+use aruna_core::metadata::MetadataEvent;
+use aruna_core::reducer::AdminDocumentReducerState;
+use aruna_core::storage_entries::reducer_state_key;
+use aruna_core::structs::Actor;
+use aruna_core::structs::Group;
+use aruna_core::structs::GroupAuthorizationDocument;
+use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::structs::RealmConfigDocument;
+use aruna_core::structs::RealmId;
+use aruna_core::structs::RealmNodeKind;
+use aruna_core::structs::SyncRefusal;
+use aruna_core::types::UserId;
+use std::sync::Arc;
+use tracing::warn;
+use ulid::Ulid;
+
+use super::authorize::ForwardAuthError;
+use super::authorize::authorize_forwarded_caller;
+use super::authorize::authorize_write;
+use super::authorize::is_sync_eligible;
+use super::authorize::peer_acts_for;
+use super::replay::HeldRecordError;
+use super::replay::held_record;
+use super::routing::holds_metadata_id;
+use super::transport::reject;
+use std::str::FromStr;
+
+pub(super) const DEVICE_GROUP_SCAN_PAGE: usize = 10_000;
+
+/// Serves the realm-wide documents to one of the realm's devices.
+/// A device runs no document sync, so this is how it sees the realm config it is
+/// judged by. Realm infrastructure only, bound to the device's owner.
+pub(crate) async fn serve_realm_documents(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let MetadataTransportMessage::FetchRealmDocuments { auth_token } = message else {
+        return reject("unexpected metadata control message");
+    };
+    MetadataTransportMessage::FetchedRealmDocuments {
+        result: read_realm_documents(context, peer, auth_token).await,
+    }
+}
+
+pub(super) async fn read_realm_documents(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    auth_token: MetadataAuthToken,
+) -> Result<RealmDocuments, SyncRefusal> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(SyncRefusal::Unavailable)?;
+    // Only realm infrastructure answers: a device holds no realm state to serve.
+    if !is_sync_eligible(&config, net_handle.node_id()) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let auth = metadata
+        .authorize_write_peer(peer, Some(auth_token))
+        .await
+        .map_err(|error| match error {
+            MetadataWritePeerError::Unauthorized => SyncRefusal::Unauthorized,
+            MetadataWritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    // The documents are this realm's own; nothing about another realm is served.
+    if auth.realm_id != realm_id || !peer_acts_for(&config, peer, auth.user_id) {
+        return Err(SyncRefusal::Unauthorized);
+    }
+    let realm_config = read_document(context, DocumentSyncTarget::RealmConfig { realm_id })
+        .await?
+        .ok_or(SyncRefusal::NotFound)?;
+    let realm_authorization =
+        read_document(context, DocumentSyncTarget::RealmAuthorization { realm_id }).await?;
+    // The token's own subject: for a device that is its owner by the check above.
+    let owner = read_document(
+        context,
+        DocumentSyncTarget::User {
+            user_id: auth.user_id,
+        },
+    )
+    .await?;
+    let node_ids = config
+        .sync_eligible_nodes()
+        .map_err(|_| SyncRefusal::Unavailable)?;
+    let node_infos = read_info_documents(context, &node_ids)
+        .await
+        .map_err(|error| {
+            warn!(%error, "Failed to read the node info documents for a device");
+            SyncRefusal::Unavailable
+        })?
+        .into_values()
+        .collect();
+    Ok(RealmDocuments {
+        realm_config,
+        realm_authorization,
+        owner,
+        groups: device_group_documents(context, auth.user_id).await,
+        node_infos,
+        management_urls: management_urls(context, &config).await,
+        clock: applied_clock(context, realm_id).await,
+    })
+}
+
+/// The api urls the realm's management nodes published, in node-id order so
+/// repeated answers pin the same peer. A device relays its management-only
+/// routes to these.
+pub(super) async fn management_urls(
+    context: &Arc<DriverContext>,
+    config: &RealmConfigDocument,
+) -> Vec<String> {
+    let node_ids: Vec<NodeId> = config
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, RealmNodeKind::Management))
+        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+        .collect();
+    let documents = match read_info_documents(context, &node_ids).await {
+        Ok(documents) => documents,
+        Err(error) => {
+            warn!(%error, "Failed to read the management urls for a device");
+            return Vec::new();
+        }
+    };
+    let mut urls: Vec<String> = Vec::new();
+    for url in documents
+        .values()
+        .filter_map(|document| document.urls.api.clone())
+    {
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+/// The caller's own groups, as the documents this node stores. A read that
+/// fails yields an empty list: one unreadable group must not cost the device
+/// the realm configuration it is judged by.
+pub(super) async fn device_group_documents(
+    context: &Arc<DriverContext>,
+    user_id: UserId,
+) -> Vec<DeviceGroupDocuments> {
+    let mut documents = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let groups = match drive(
+            ListGroupOperation::with_pagination(DEVICE_GROUP_SCAN_PAGE, offset),
+            context.as_ref(),
+        )
+        .await
+        {
+            Ok(groups) => groups,
+            Err(error) => {
+                warn!(error = %error, "Failed to list groups for a device");
+                return Vec::new();
+            }
+        };
+        let page_len = groups.len();
+        for Group { group_id, .. } in groups {
+            let read = drive(
+                GetGroupOperation::new(GetGroupConfig { group_id }),
+                context.as_ref(),
+            )
+            .await;
+            let Ok((group, authorization)) = read else {
+                warn!(%group_id, "Failed to read a group for a device");
+                continue;
+            };
+            if !holds_any_role(&authorization, user_id) {
+                continue;
+            }
+            documents.push(DeviceGroupDocuments {
+                group,
+                authorization,
+            });
+            if documents.len() >= MAX_DEVICE_GROUPS {
+                return documents;
+            }
+        }
+        if page_len < DEVICE_GROUP_SCAN_PAGE {
+            return documents;
+        }
+        offset = offset.saturating_add(page_len);
+    }
+}
+
+/// Whether the owner holds a role in this group. A device caches its owner's
+/// groups only; a realm-scale group list is not theirs to hold.
+pub(super) fn holds_any_role(authorization: &GroupAuthorizationDocument, user_id: UserId) -> bool {
+    authorization
+        .roles
+        .values()
+        .any(|role| role.assigned_users.contains(&user_id))
+}
+
+/// What this node has applied to the realm configuration, as the reducer keeps
+/// it. A device compares it with its own copy's and never accepts less.
+pub(super) async fn applied_clock(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+) -> AdminDocumentClock {
+    let key = reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id });
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(bytes), ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            key,
+            txn_id: None,
+        })
+        .await
+    else {
+        return AdminDocumentClock::default();
+    };
+    postcard::from_bytes::<AdminDocumentReducerState>(&bytes)
+        .map(|state| state.clock)
+        .unwrap_or_default()
+}
+
+/// One stored document, or `None` when this node holds it not (yet).
+pub(super) async fn read_document(
+    context: &Arc<DriverContext>,
+    target: DocumentSyncTarget,
+) -> Result<Option<Vec<u8>>, SyncRefusal> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            Ok(value.map(|bytes| bytes.as_ref().to_vec()))
+        }
+        other => {
+            warn!(event = ?other, "Failed to read a realm document for a device");
+            Err(SyncRefusal::Unavailable)
+        }
+    }
+}
+
+/// Serves one document's graph state to a device that keeps a replica of it.
+/// Only a holder answers, for the owner the realm config binds the device to; the
+/// device joins the snapshot locally, so state travels, never authority.
+pub(crate) async fn serve_graph_state(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let MetadataTransportMessage::FetchGraphState {
+        auth_token,
+        document_id,
+    } = message
+    else {
+        return reject("unexpected metadata control message");
+    };
+    MetadataTransportMessage::FetchedGraphState {
+        result: read_graph_state(context, peer, auth_token, document_id)
+            .await
+            .map(Box::new),
+    }
+}
+
+pub(super) async fn read_graph_state(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    auth_token: MetadataAuthToken,
+    document_id: Ulid,
+) -> Result<GraphState, SyncRefusal> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(SyncRefusal::Unavailable)?;
+    if !holds_metadata_id(&config, realm_id, net_handle.node_id(), document_id) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let auth = metadata
+        .authorize_write_peer(peer, Some(auth_token))
+        .await
+        .map_err(|error| match error {
+            MetadataWritePeerError::Unauthorized => SyncRefusal::Unauthorized,
+            MetadataWritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    if auth.realm_id != realm_id || !peer_acts_for(&config, peer, auth.user_id) {
+        return Err(SyncRefusal::Unauthorized);
+    }
+    let record = load_live_record(context.as_ref(), document_id)
+        .await
+        .map_err(sync_refusal)?;
+    ensure_record_readable(context.as_ref(), realm_id, Some(&auth), &record, None)
+        .await
+        .map_err(sync_refusal)?;
+    let graph_iri = record.graph_iri.clone();
+    let snapshot = match metadata
+        .send_metadata_effect(MetadataEffect::GraphSnapshot { graph_iri })
+        .await
+    {
+        Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) => *snapshot,
+        other => {
+            warn!(%document_id, event = ?other, "Could not snapshot a graph for a device");
+            return Err(SyncRefusal::Unavailable);
+        }
+    };
+    let raw = load_raw_view(context.as_ref(), document_id, None)
+        .await
+        .map_err(|_| SyncRefusal::Unavailable)?
+        .ok_or(SyncRefusal::NotFound)?;
+    Ok(GraphState {
+        record,
+        snapshot,
+        displayed_jsonld: raw.revision.jsonld,
+        dataset_digest: raw.revision.dataset_digest,
+        findings: raw.revision.merged.map_or(0, |merged| merged.findings),
+    })
+}
+
+pub(super) fn sync_refusal(error: MetadataApiError) -> SyncRefusal {
+    match error {
+        MetadataApiError::Unauthorized => SyncRefusal::Unauthorized,
+        MetadataApiError::Forbidden => SyncRefusal::Forbidden,
+        MetadataApiError::NotFound => SyncRefusal::NotFound,
+        _ => SyncRefusal::Unavailable,
+    }
+}
+
+/// Applies an edit a device already made on its replica.
+/// The batch is appended unchanged as an ordinary update event, so every holder
+/// materializes the same OR-Set change set the owner saw and both sides converge.
+pub(crate) async fn apply_device_batch(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    MetadataTransportMessage::ForwardedApplyBatch {
+        result: run_device_batch(context, peer, message).await.map(Box::new),
+    }
+}
+
+pub(super) async fn run_device_batch(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> Result<MetadataRegistryRecord, SyncRefusal> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(SyncRefusal::Unavailable)?;
+    if !is_sync_eligible(&config, net_handle.node_id()) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let auth = authorize_forwarded_caller(context, peer, realm_id, &message)
+        .await
+        .map_err(|error| match error {
+            ForwardAuthError::Unauthorized => SyncRefusal::Unauthorized,
+            ForwardAuthError::Forbidden => SyncRefusal::Forbidden,
+            ForwardAuthError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    let MetadataTransportMessage::ForwardApplyBatch {
+        config_digest,
+        document_id,
+        batch,
+        authored,
+        ..
+    } = message
+    else {
+        return Err(SyncRefusal::Invalid(
+            "unexpected metadata control message".to_string(),
+        ));
+    };
+    if config.digest().ok() != Some(config_digest) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let record = held_record(context, &config, net_handle.node_id(), document_id)
+        .await
+        .map_err(|error| match error {
+            HeldRecordError::NotFound => SyncRefusal::NotFound,
+            HeldRecordError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    // The batch names the graph it was planned against; another graph's change
+    // set must never be applied here.
+    if batch.graph_iri != record.graph_iri {
+        return Err(SyncRefusal::Invalid(
+            "the batch was planned against another document".to_string(),
+        ));
+    }
+    authorize_write(context, auth.clone(), record.permission_path.clone())
+        .await
+        .map_err(|error| match error {
+            ForwardAuthError::Unauthorized => SyncRefusal::Unauthorized,
+            ForwardAuthError::Forbidden => SyncRefusal::Forbidden,
+            ForwardAuthError::Unavailable(_) => SyncRefusal::Unavailable,
+        })?;
+    let operation = UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+        actor: Actor {
+            node_id: net_handle.node_id(),
+            user_id: auth.user_id,
+            realm_id,
+        },
+        group_id: record.group_id,
+        document_id,
+        public: record.public,
+        mutation: UpdateMetadataDocumentMutation::ApplyBatch { batch, authored },
+    });
+    update_metadata_document(operation, context.as_ref())
+        .await
+        .map_err(|error| match error {
+            UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)) => {
+                SyncRefusal::Invalid(message)
+            }
+            other => {
+                warn!(%document_id, error = %other, "A device edit did not apply");
+                SyncRefusal::Unavailable
+            }
+        })
+}

@@ -1,267 +1,69 @@
+//! The operation runner.
+//!
+//! [`drive`] and [`drive_until`] execute a parent [`Operation`]; suboperations
+//! execute through the same effect loop with their own depth, deadline, and
+//! finalization. The runner keeps transaction ownership explicit:
+//!
+//! - [`TransactionTracker`] tracks every transaction the run started and hands
+//!   unresolved ones back to storage on drop;
+//! - [`RunState::committed`] records a commit acknowledgement, which is what
+//!   the `Operation::abort_after_commit` opt-in gates;
+//! - [`RunState::expired`] and [`RunState::cleanup_deadline`] bound cleanup
+//!   after the deadline, so a managed commit is never canceled by a timeout.
+//!
+//! Effect bodies live in `effect_adapters`; the routing-input helpers the
+//! operation surface assembles configs with are re-exported here.
+
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
-use aruna_core::audit::{AuditPageBatch, MAX_AUDIT_PEERS};
-use aruna_core::effects::{
-    AuditPageEffect, BlobEffect, Effect, JobControlEffect, NetEffect, StorageEffect,
-};
-use aruna_core::errors::{BlobError, StorageError};
-use aruna_core::events::{
-    BlobEvent, Event, JobControlEvent, NetEvent, StorageEvent, SubOperationEvent,
-};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
-};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::errors::StorageError;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, SubOperation};
-use aruna_core::structs::{
-    BackendCatalog, BackendRef, BucketInfo, GroupRoutingInputs, NODE_SUBJECT_KEY, NodeRouting,
-    NodeSubjectRecord, RealmId, RoutingSnapshot, StorageRoutingRule, UsageCounters,
-    usage_backend_keys,
-};
-use aruna_core::types::{GroupId, NodeId, TxnId};
+use aruna_core::types::{Effects, TxnId};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
-use futures_util::{StreamExt, stream};
 use std::any::{type_name, type_name_of_val};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
-use thiserror::Error;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
-use crate::groups::backends::{RecordReadError, parse_read};
-use crate::groups::storage_routing::{GroupRoutingInputsError, GroupRoutingInputsOperation};
 use crate::metadata::MetadataHandle;
-use crate::placement::policy::GateContext;
-use crate::tasks::task_persistence::persist_task_effect;
-use aruna_core::events::NetError;
-use aruna_core::metadata::{MetadataError, MetadataEvent};
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 
-/// Node-local routing inputs for a caller assembling an operation config.
-/// Pure in-memory state: operations never fetch this from inside a step.
-pub fn node_routing(context: &DriverContext) -> NodeRouting {
-    context
-        .blob_handle
-        .as_ref()
-        .map(|handle| handle.routing())
-        .unwrap_or_default()
-}
+#[path = "effect_adapters/mod.rs"]
+mod effect_adapters;
 
-/// Why a write could not learn where it belongs. Absent records are not an
-/// error; only an unreadable or undecodable one is.
-#[derive(Debug, Error, PartialEq)]
-pub enum RoutingInputsError {
-    #[error("group routing inputs unavailable: {0}")]
-    GroupInputs(#[from] GroupRoutingInputsError),
-    #[error("bucket routing rules unavailable: {0}")]
-    BucketRules(#[from] RecordReadError),
-    /// Not `#[from]`: `BucketRules` already owns the conversion from a read.
-    #[error("backend usage counters unavailable: {0}")]
-    BackendUsage(#[source] RecordReadError),
-    #[error("node placement subject unavailable: {0}")]
-    NodeSubject(#[source] RecordReadError),
-}
+pub use effect_adapters::routing::{
+    GateContextError, RoutingInputsError, backend_used_bytes, bucket_snapshot, gate_context,
+    node_routing, now_ms, quota_marked_routing, routing_snapshot,
+};
 
-impl RoutingInputsError {
-    /// The underlying storage failure, so retrying callers can tell a transient
-    /// read failure from a record that will never decode.
-    pub fn storage(&self) -> Option<&aruna_core::errors::StorageError> {
-        let read = match self {
-            Self::GroupInputs(GroupRoutingInputsError::Read(read)) => read,
-            Self::BucketRules(read) | Self::BackendUsage(read) | Self::NodeSubject(read) => read,
-            Self::GroupInputs(GroupRoutingInputsError::Incomplete) => return None,
-        };
-        match read {
-            RecordReadError::Storage(error) => Some(error),
-            RecordReadError::Conversion(_) | RecordReadError::Unexpected => None,
-        }
-    }
-}
-
-/// The group's default target plus the ids of the backends it registered. Only
-/// the named group's ids are ever loaded.
-async fn group_inputs(
-    context: &DriverContext,
-    group_id: GroupId,
-) -> Result<GroupRoutingInputs, RoutingInputsError> {
-    Ok(drive(GroupRoutingInputsOperation::new(group_id), context).await?)
-}
-
-/// Bucket rules for callers that do not already hold the bucket record. A
-/// bucket without a record simply has no rules.
-async fn bucket_rules(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<Vec<StorageRoutingRule>, RoutingInputsError> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: bucket.as_bytes().to_vec().into(),
-            txn_id: None,
-        })
-        .await;
-    Ok(parse_read(event, BucketInfo::from_bytes)?
-        .map(|info| info.storage_routing)
-        .unwrap_or_default())
-}
-
-/// Wall clock for the cache freshness a gate is built with. Operations stay
-/// sans-I/O by taking it as configuration.
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_millis() as u64)
-        .unwrap_or_default()
-}
-
-/// The destination this node evaluates governed writes and serves against. `None`
-/// means no subject was ever advertised, failing governed operations closed; a node
-/// revalidating inventory reports `admitting: false` to stop governed writes.
-pub async fn gate_context(
-    context: &DriverContext,
-    realm_id: RealmId,
-    now_ms: u64,
-) -> Result<Option<GateContext>, GateContextError> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
-            key: NODE_SUBJECT_KEY.to_vec().into(),
-            txn_id: None,
-        })
-        .await;
-    let Some(record) = parse_read(event, NodeSubjectRecord::from_bytes)
-        .map_err(RoutingInputsError::NodeSubject)?
-    else {
-        return Ok(None);
-    };
-    let admitting = !record.serving_blocked && !record.policy_draining;
-    Ok(Some(GateContext {
-        realm_id,
-        subject: record.subject,
-        now_ms,
-        admitting,
-    }))
-}
-
-/// Why a caller could not build a destination gate. An admission stop is not
-/// one: the gate is built either way and `write_gate` refuses a governed write.
-#[derive(Debug, Error, PartialEq)]
-pub enum GateContextError {
-    #[error(transparent)]
-    Routing(#[from] RoutingInputsError),
-}
-
-/// Routing inputs for one bucket write, assembled before the operation starts.
-/// Failing here fails the write: a partial snapshot would route it to the node
-/// default and D3/D4 record that choice for good.
-pub async fn routing_snapshot(
-    context: &DriverContext,
-    group_id: GroupId,
-    bucket: &str,
-) -> Result<RoutingSnapshot, RoutingInputsError> {
-    let snapshot = node_routing(context)
-        .snapshot(group_id)
-        .with_group_inputs(group_inputs(context, group_id).await?)
-        .with_bucket_rules(bucket_rules(context, bucket).await?);
-    mark_full_backends(context, snapshot).await
-}
-
-/// The same inputs when the caller already holds the bucket record, as the S3
-/// surface does from its auth middleware.
-pub async fn bucket_snapshot(
-    context: &DriverContext,
-    bucket: &BucketInfo,
-) -> Result<RoutingSnapshot, RoutingInputsError> {
-    let snapshot = node_routing(context)
-        .snapshot(bucket.group_id)
-        .with_group_inputs(group_inputs(context, bucket.group_id).await?)
-        .with_bucket_rules(bucket.storage_routing.clone());
-    mark_full_backends(context, snapshot).await
-}
-
-/// Node routing whose capped backends already carry their fullness, for the
-/// background writers that build their own snapshot later. Replication reads
-/// the same catalog, so an unreadable counter refuses it too and it retries.
-pub async fn quota_marked_routing(
-    context: &DriverContext,
-) -> Result<NodeRouting, RoutingInputsError> {
-    let routing = node_routing(context);
-    let catalog = mark_full_catalog(context, routing.catalog.clone()).await?;
-    Ok(NodeRouting { catalog, ..routing })
-}
-
-async fn mark_full_backends(
-    context: &DriverContext,
-    snapshot: RoutingSnapshot,
-) -> Result<RoutingSnapshot, RoutingInputsError> {
-    let catalog = mark_full_catalog(context, snapshot.catalog.clone()).await?;
-    Ok(RoutingSnapshot {
-        catalog,
-        ..snapshot
-    })
-}
-
-/// Freezes each capped backend's fullness for one request, exactly like the
-/// group quota ceiling. Concurrent writes can overshoot by their own bytes; an
-/// unreadable counter fails the caller rather than routing past the cap.
-async fn mark_full_catalog(
-    context: &DriverContext,
-    catalog: BackendCatalog,
-) -> Result<BackendCatalog, RoutingInputsError> {
-    let quotas = catalog.quotas();
-    if quotas.is_empty() {
-        return Ok(catalog);
-    }
-    let mut catalog = catalog;
-    for (name, quota) in quotas {
-        let used = backend_used_bytes(context, &BackendRef::Node(name.clone()))
-            .await
-            .map_err(RoutingInputsError::BackendUsage)?;
-        if used >= quota {
-            warn!(backend = %name, quota_bytes = quota, "Storage backend reached its quota");
-            catalog = catalog.mark_full(&name);
-        }
-    }
-    Ok(catalog)
-}
-
-/// Sums one backend's stored-byte shards. A missing row reads as zero, so a node
-/// whose counters were never built reports no usage; an unreadable or
-/// undecodable shard is an error, never a zero.
-pub async fn backend_used_bytes(
-    context: &DriverContext,
-    backend: &BackendRef,
-) -> Result<u64, RecordReadError> {
-    let reads = usage_backend_keys(backend)
-        .into_iter()
-        .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.into()))
-        .collect::<Vec<_>>();
-    let values = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        _ => return Err(RecordReadError::Unexpected),
-    };
-    let mut total = 0u64;
-    for (_, value) in values {
-        let Some(value) = value else { continue };
-        total = total.saturating_add(UsageCounters::from_bytes(value.as_ref())?.stored_bytes);
-    }
-    Ok(total)
-}
-
+/// Handles and capabilities one operation run may use.
+///
+/// Only `storage_handle` is required. Every other plane is optional, and a node
+/// without one keeps the explicit outcome its adapter reports:
+///
+/// - absent `blob_handle`: blob, staging-source, and local-file effects fail
+///   with `BlobError::HandleMissing`, `StagingSourceError::HandleMissing`, or a
+///   local-file error message, never a silent success;
+/// - absent `net_handle`: ordinary net effects report `NetError::ChannelClosed`;
+///   the one deliberate exception is a document publication, which reports the
+///   selected targets as `DocumentsPublished`, because the operation already
+///   decided the publication and only its fan-out is absent;
+/// - absent `metadata_handle`: metadata effects report
+///   `MetadataError::HandleMissing`;
+/// - absent `task_handle`: the task effect is still persisted, then reported as
+///   a task error with no key;
+/// - absent `compute_handle`: this runner dispatches no compute; compute
+///   callers check the registry before naming an executor.
+///
+/// Governed writes additionally consult the node's advertised placement subject
+/// through the storage handle; [`gate_context`] fails them closed when no
+/// subject was ever advertised.
 #[derive(Clone)]
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
@@ -287,350 +89,7 @@ impl std::fmt::Debug for DriverContext {
 
 const MAX_SUBOP_DEPTH: usize = 32;
 const SUBOP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
-const AUDIT_FANOUT_CONCURRENCY: usize = 8;
-const AUDIT_PEER_DEADLINE: Duration = Duration::from_secs(3);
-const AUDIT_FANOUT_DEADLINE: Duration = Duration::from_secs(30);
-const REALM_PEER_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
-
-#[tracing::instrument(
-    name = "operation.effect",
-    level = "debug",
-    skip(effect, context),
-    fields(depth, effect = effect_kind(&effect))
-)]
-async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) -> Event {
-    dispatch_effect_until(effect, context, depth, None).await
-}
-
-async fn dispatch_effect_until(
-    effect: Effect,
-    context: &DriverContext,
-    depth: usize,
-    deadline: Option<tokio::time::Instant>,
-) -> Event {
-    let effect_name = effect_kind(&effect);
-    if depth == 0 {
-        tracing::debug!(
-            effect = effect_name,
-            "Dispatching top-level operation effect"
-        );
-    }
-    trace!(
-        event = "operation.effect.dispatch",
-        depth,
-        effect = effect_name,
-        "Dispatching operation effect"
-    );
-
-    let event = match effect {
-        Effect::Blob(blob_effect) => {
-            if let Some(blob_handle) = &context.blob_handle {
-                Box::pin(blob_handle.send_blob_effect(blob_effect)).await
-            } else {
-                Event::Blob(BlobEvent::Error(BlobError::HandleMissing))
-            }
-        }
-        Effect::StagingSource(staging_source_effect) => {
-            if crate::staging::native_source::is_native_effect(&staging_source_effect) {
-                Box::pin(crate::staging::native_source::send_native_effect(
-                    staging_source_effect,
-                    context,
-                ))
-                .await
-            } else if let Some(blob_handle) = &context.blob_handle {
-                Box::pin(blob_handle.send_staging_effect(staging_source_effect)).await
-            } else {
-                Event::StagingSource(aruna_core::events::StagingSourceEvent::Error {
-                    error: aruna_core::errors::StagingSourceError::HandleMissing,
-                })
-            }
-        }
-        Effect::LocalFile(local_file_effect) => {
-            if let Some(blob_handle) = &context.blob_handle {
-                Box::pin(blob_handle.send_file_effect(local_file_effect)).await
-            } else {
-                Event::LocalFile(aruna_core::events::LocalFileEvent::Error {
-                    message: "this node has no local file adapter".to_string(),
-                })
-            }
-        }
-        Effect::Storage(storage_effect) => {
-            let realm_config_write = match &storage_effect {
-                StorageEffect::Write {
-                    key_space,
-                    value,
-                    txn_id: None,
-                    ..
-                } if key_space == REALM_CONFIG_KEYSPACE => Some(value.clone()),
-                _ => None,
-            };
-            let refresh_after_commit =
-                matches!(&storage_effect, StorageEffect::CommitTransaction { .. });
-            let event = Box::pin(context.storage_handle.send_storage_effect(storage_effect)).await;
-            if let Some(net_handle) = context.net_handle.as_ref() {
-                match (&event, realm_config_write) {
-                    (
-                        Event::Storage(aruna_core::events::StorageEvent::WriteResult { .. }),
-                        Some(bytes),
-                    ) => {
-                        match tokio::time::timeout(
-                            REALM_PEER_REFRESH_TIMEOUT,
-                            net_handle.refresh_encoded_peers(&bytes),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(error)) => {
-                                warn!(error = %error, "Failed to refresh realm peers from written realm config");
-                            }
-                            Err(_) => {
-                                warn!(
-                                    timeout_ms = REALM_PEER_REFRESH_TIMEOUT.as_millis() as u64,
-                                    "Timed out refreshing realm peers from written realm config"
-                                );
-                            }
-                        }
-                    }
-                    (
-                        Event::Storage(aruna_core::events::StorageEvent::TransactionCommitted {
-                            ..
-                        }),
-                        _,
-                    ) if refresh_after_commit => {
-                        match tokio::time::timeout(
-                            REALM_PEER_REFRESH_TIMEOUT,
-                            net_handle.reload_realm_peers(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(error)) => {
-                                warn!(error = %error, "Failed to refresh realm peers after storage commit");
-                            }
-                            Err(_) => {
-                                warn!(
-                                    timeout_ms = REALM_PEER_REFRESH_TIMEOUT.as_millis() as u64,
-                                    "Timed out refreshing realm peers after storage commit"
-                                );
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            event
-        }
-        // Job-control routing runs its frame I/O here, where the runner holds
-        // the context; the net crate never sees this effect.
-        Effect::Net(NetEffect::JobControl(job_control)) => {
-            Box::pin(dispatch_job_control(*job_control, context)).await
-        }
-        // Audit fan-out runs its frame I/O here for the same reason.
-        Effect::Net(NetEffect::AuditPage(audit)) => {
-            Box::pin(dispatch_audit_page(*audit, context, deadline)).await
-        }
-        // Policy fetch resolves its holders in the operation and runs only the
-        // holder round-trips here.
-        Effect::Net(NetEffect::PolicyFetch(fetch)) => Event::Net(NetEvent::PolicyFetch(
-            Box::pin(crate::placement::policy::fetch_policy(context, *fetch)).await,
-        )),
-        // Publication signing needs this node's key, which only the handle holds.
-        Effect::Net(NetEffect::PolicySign(claim)) => Event::Net(NetEvent::PolicySign(
-            crate::placement::policy::sign_publication(context, *claim),
-        )),
-        // Job-record replication and launch offers resolve their holders in the
-        // operation and run only the holder round-trips here.
-        Effect::Net(NetEffect::JobRecord(record)) => Event::Net(NetEvent::JobRecord(
-            Box::pin(crate::jobs::records::dispatch_record(context, *record)).await,
-        )),
-        Effect::Net(NetEffect::LaunchOffer(offer)) => Event::Net(NetEvent::LaunchOffer(
-            Box::pin(crate::jobs::records::dispatch_offer(context, *offer)).await,
-        )),
-        Effect::Net(net_effect) => {
-            if let Some(net_handle) = &context.net_handle {
-                Box::pin(net_handle.send_effect(Effect::Net(net_effect))).await
-            } else {
-                match net_effect {
-                    aruna_core::effects::NetEffect::DocumentSync(
-                        DocumentSyncEffect::PublishDocuments { documents, .. },
-                    ) => Event::Net(NetEvent::DocumentSync(
-                        DocumentSyncNetEvent::DocumentsPublished {
-                            targets: documents
-                                .into_iter()
-                                .map(|document| document.target().clone())
-                                .collect(),
-                        },
-                    )),
-                    _ => Event::Net(NetEvent::Error(NetError::ChannelClosed)),
-                }
-            }
-        }
-        Effect::Metadata(metadata_effect) => {
-            if let Some(metadata_handle) = &context.metadata_handle {
-                Box::pin(metadata_handle.send_effect(Effect::Metadata(metadata_effect))).await
-            } else {
-                Event::Metadata(MetadataEvent::Error {
-                    graph_iri: None,
-                    error: MetadataError::HandleMissing,
-                })
-            }
-        }
-        Effect::SubOperation(sub_operation) => {
-            if depth >= MAX_SUBOP_DEPTH {
-                Event::SubOperation(SubOperationEvent::DepthLimitExceeded {
-                    max_depth: MAX_SUBOP_DEPTH,
-                })
-            } else {
-                // Keep the child owned by this future so cancellation cannot detach it.
-                drive_suboperation(sub_operation, context, depth + 1, deadline).await
-            }
-        }
-        Effect::Task(task_effect) => {
-            if let Err(message) = persist_task_effect(&context.storage_handle, &task_effect).await {
-                return Event::Task(TaskEvent::Error {
-                    key: task_effect_key(&task_effect),
-                    message,
-                });
-            }
-            if let Some(task_handle) = &context.task_handle {
-                Box::pin(task_handle.send_effect(Effect::Task(task_effect))).await
-            } else {
-                Event::Task(TaskEvent::Error {
-                    key: None,
-                    message: "task handle unavailable".to_string(),
-                })
-            }
-        }
-        Effect::Search() => {
-            tracing::warn!(
-                depth,
-                effect = effect_name,
-                "Search effect is not handled by driver yet"
-            );
-            Event::Search()
-        }
-        Effect::Stream() => {
-            tracing::warn!(
-                depth,
-                effect = effect_name,
-                "Top-level stream effect is not handled by driver yet"
-            );
-            Event::Stream()
-        }
-    };
-
-    trace!(
-        event = "operation.effect.result",
-        depth,
-        effect = effect_name,
-        result = event_kind(&event),
-        "Received operation event"
-    );
-    if depth == 0 {
-        tracing::debug!(
-            effect = effect_name,
-            result = event_kind(&event),
-            "Received top-level operation event"
-        );
-    }
-
-    event
-}
-
-/// Executes a job-control request by opening the frame stream and reading the
-/// owner's reply; an unreachable owner is reported so the routing operation can
-/// map it to `Unavailable` (503). The artifact body path stays out of band.
-async fn dispatch_job_control(effect: JobControlEffect, context: &DriverContext) -> Event {
-    let JobControlEffect { owner, request } = effect;
-    let event = match crate::jobs::protocol::send_job_request(context, owner, request).await {
-        Ok(reply) => JobControlEvent::Response(Box::new(reply.response)),
-        Err(error) => JobControlEvent::Unavailable(error.to_string()),
-    };
-    Event::Net(NetEvent::JobControl(event))
-}
-
-fn audit_nodes(nodes: Vec<NodeId>, batch: &mut AuditPageBatch) -> BTreeSet<NodeId> {
-    let mut queried: BTreeSet<NodeId> = nodes.into_iter().collect();
-    // Every node past the fan-out cap is reported missing; querying none of them
-    // would render an empty page as an almost complete audit trail.
-    while queried.len() > MAX_AUDIT_PEERS {
-        if let Some(node) = queried.pop_last() {
-            batch.mark_missing(node);
-        }
-    }
-    queried
-}
-
-/// Requests every node's local audit page over the metadata control transport,
-/// concurrently so one unreachable node cannot spend the whole request deadline.
-/// An unreachable or denied node is reported so the aggregator records it missing.
-async fn dispatch_audit_page(
-    effect: AuditPageEffect,
-    context: &DriverContext,
-    operation_deadline: Option<tokio::time::Instant>,
-) -> Event {
-    let AuditPageEffect {
-        nodes: input_nodes,
-        request,
-    } = effect;
-    let mut batch = AuditPageBatch::with_limit(request.limit);
-    let nodes = audit_nodes(input_nodes, &mut batch);
-    let mut remaining = nodes.clone();
-    if remaining.is_empty() {
-        return Event::Net(NetEvent::AuditPages(batch));
-    }
-
-    let deadline =
-        operation_deadline.unwrap_or_else(|| tokio::time::Instant::now() + AUDIT_FANOUT_DEADLINE);
-    let requests = stream::iter(nodes.into_iter().map(|node| {
-        let request = request.clone();
-        async move {
-            let peer_deadline = tokio::time::Instant::now() + AUDIT_PEER_DEADLINE;
-            let peer_deadline = if peer_deadline < deadline {
-                peer_deadline
-            } else {
-                deadline
-            };
-            let result = tokio::time::timeout_at(
-                peer_deadline,
-                crate::metadata::audit::send_audit_request(context, node, request),
-            )
-            .await;
-            (node, result)
-        }
-    }))
-    .buffer_unordered(AUDIT_FANOUT_CONCURRENCY);
-    futures_util::pin_mut!(requests);
-    loop {
-        let next = match tokio::time::timeout_at(deadline, requests.next()).await {
-            Ok(next) => next,
-            Err(_) => break,
-        };
-        let Some((node, result)) = next else {
-            break;
-        };
-        remaining.remove(&node);
-        match result {
-            Ok(Ok(response)) => {
-                if let Err(error) = batch.add_page(node, response, &request) {
-                    trace!(?node, ?error, "Rejected audit page");
-                }
-            }
-            Ok(Err(error)) => {
-                trace!(?node, ?error, "Audit page unavailable");
-                batch.mark_missing(node);
-            }
-            Err(_) => {
-                trace!(?node, "Audit page request timed out");
-                batch.mark_missing(node);
-            }
-        }
-    }
-    for node in remaining {
-        batch.mark_missing(node);
-    }
-    Event::Net(NetEvent::AuditPages(batch))
-}
+const MAX_TRACKED_TRANSACTIONS: usize = 32;
 
 /// Reserves every tenant backend an effect names for the rest of the operation.
 /// The bytes land inside one effect, but the transaction naming them commits
@@ -645,21 +104,16 @@ fn hold_backends(context: &DriverContext, effect: &Effect, holds: &mut Vec<Group
     }
 }
 
-fn task_effect_key(effect: &TaskEffect) -> Option<TaskKey> {
-    match effect {
-        TaskEffect::ResetTimer { key, .. }
-        | TaskEffect::ShortenTimer { key, .. }
-        | TaskEffect::CancelTimer { key }
-        | TaskEffect::AbortRunningHandlers { key } => Some(key.clone()),
-    }
-}
-
-const MAX_TRACKED_TRANSACTIONS: usize = 32;
-
+/// The per-transaction lifecycle the tracker keeps explicit. A state is never
+/// collapsed into a finished boolean: an unknown commit outcome stays unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransactionState {
+    /// Started and neither committed nor aborted yet.
     Open,
+    /// A commit returned an error that leaves the outcome unknown; no later
+    /// abort may run, and storage owns the handoff.
     CommitUnknown,
+    /// An abort failed; cleanup may retry it once.
     AbortFailed,
 }
 
@@ -682,6 +136,9 @@ fn transaction_effect(effect: &Effect) -> Option<TransactionEffect> {
     }
 }
 
+/// Whether one effect/event pair is a commit acknowledgement for that effect's
+/// own transaction. An acknowledgement is what later allows an abort after
+/// commit, so it is recorded separately from the tracker's states.
 fn commit_done(transaction: Option<TransactionEffect>, event: &Event) -> bool {
     matches!(
         (transaction, event),
@@ -692,6 +149,9 @@ fn commit_done(transaction: Option<TransactionEffect>, event: &Event) -> bool {
     )
 }
 
+/// Whether an effect owns its own timeout and must not be canceled by the
+/// runner deadline. Managed effects finish their storage/blob round-trip so a
+/// commit acknowledgement is never lost.
 fn managed_effect(effect: &Effect) -> bool {
     match effect {
         Effect::Blob(BlobEffect::ReleaseReservation { .. }) => true,
@@ -855,9 +315,11 @@ async fn abort_leaked_transaction(
                 break;
             }
             let effect = Effect::Storage(StorageEffect::AbortTransaction { txn_id });
-            let Ok(event) =
-                tokio::time::timeout_at(cleanup_deadline, dispatch_effect(effect, context, depth))
-                    .await
+            let Ok(event) = tokio::time::timeout_at(
+                cleanup_deadline,
+                effect_adapters::dispatch_effect(effect, context, depth),
+            )
+            .await
             else {
                 warn!(%txn_id, "Transaction cleanup deadline expired");
                 break;
@@ -877,6 +339,270 @@ async fn abort_leaked_transaction(
     }
 }
 
+/// Adds effects the runner still has to dispatch, minus aborts whose commit
+/// outcome is unknown. Such an abort could roll back an already committed
+/// transaction, so storage keeps ownership instead.
+fn extend_unblocked(queue: &mut VecDeque<Effect>, effects: Effects, tracker: &TransactionTracker) {
+    queue.extend(effects.into_iter().filter(|effect| {
+        !matches!(
+            transaction_effect(effect),
+            Some(TransactionEffect::Abort(txn_id)) if tracker.blocked_abort(txn_id)
+        )
+    }));
+}
+
+/// Explicit state the effect loop carries between dispatches.
+///
+/// The concerns stay apart on purpose: `tracker` owns every transaction this
+/// run started (including commits whose outcome is unknown), `committed` is the
+/// commit acknowledgement that gates `abort_after_commit`, and
+/// `expired`/`cleanup_deadline` bound cleanup after the deadline. `holds` keep
+/// tenant backend reservations alive until the run returns.
+struct RunState {
+    tracker: TransactionTracker,
+    holds: Vec<GroupHold>,
+    committed: bool,
+    expired: bool,
+    cleanup_deadline: Option<tokio::time::Instant>,
+}
+
+impl RunState {
+    fn new(context: &DriverContext) -> Self {
+        Self {
+            tracker: TransactionTracker::new(context.storage_handle.clone()),
+            holds: Vec::new(),
+            committed: false,
+            expired: false,
+            cleanup_deadline: None,
+        }
+    }
+
+    /// Records one effect/event outcome and the commit acknowledgement it may
+    /// carry, without collapsing either into a single finished flag.
+    fn record_outcome(&mut self, transaction: Option<TransactionEffect>, event: &Event) {
+        self.tracker.observe(transaction, event);
+        self.committed |= commit_done(transaction, event);
+    }
+
+    /// The deadline stopped normal effects; only bounded cleanup may run now.
+    fn mark_expired(&mut self) {
+        self.expired = true;
+        self.cleanup_deadline = Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
+    }
+}
+
+/// Whether a deadline may still run `abort` after a commit was acknowledged.
+#[derive(Clone, Copy)]
+enum DeadlineAbort {
+    /// Suboperations always stop at an acknowledged commit.
+    BeforeCommitOnly,
+    /// Parents keep the operation's opt-in: only an `abort` that protects
+    /// already committed work may run after one.
+    OperationOptIn { abort_after_commit: bool },
+}
+
+impl DeadlineAbort {
+    fn allows(self, committed: bool) -> bool {
+        match self {
+            Self::BeforeCommitOnly => !committed,
+            Self::OperationOptIn { abort_after_commit } => !committed || abort_after_commit,
+        }
+    }
+}
+
+/// How often the effect loop re-reads the deadline. The suboperation loop
+/// re-checks every effect; the parent marks expiry once and then dispatches its
+/// cleanup effects under the cleanup deadline.
+#[derive(Clone, Copy)]
+enum ExpiryRecheck {
+    Once,
+    EveryEffect,
+}
+
+/// The effect-loop half of an operation, shared by parent operations and
+/// suboperations. Finalization stays with each entry point because a parent
+/// yields a typed result while a suboperation yields an event.
+trait Drive: Send {
+    fn start(&mut self) -> Effects;
+    fn step(&mut self, event: Event) -> Effects;
+    fn is_complete(&self) -> bool;
+    fn abort(&mut self) -> Effects;
+}
+
+/// Parent adapter: the operation borrows, while typed finalization stays in the
+/// parent entry points.
+struct ParentRun<'a, O: Operation>(&'a mut O);
+
+impl<O: Operation> Drive for ParentRun<'_, O> {
+    fn start(&mut self) -> Effects {
+        self.0.start()
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.0.step(event)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.0.is_complete()
+    }
+
+    fn abort(&mut self) -> Effects {
+        self.0.abort()
+    }
+}
+
+/// Suboperation adapter: a boxed child yields an event from `finalize` instead
+/// of a typed result.
+struct SubRun<'a>(&'a mut dyn SubOperation);
+
+impl Drive for SubRun<'_> {
+    fn start(&mut self) -> Effects {
+        self.0.start()
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.0.step(event)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.0.is_complete()
+    }
+
+    fn abort(&mut self) -> Effects {
+        self.0.abort()
+    }
+}
+
+/// Runs the effect queue to completion or to its deadline, then returns the
+/// explicit run state so the caller can finalize and hand off transactions.
+///
+/// `expiry_log` names the parent operation, so only a parent's deadline logs
+/// the abort-path warning; suboperation expiry stays quiet.
+async fn drive_effects(
+    executable: &mut dyn Drive,
+    context: &DriverContext,
+    depth: usize,
+    deadline: Option<tokio::time::Instant>,
+    abort_policy: DeadlineAbort,
+    expiry_recheck: ExpiryRecheck,
+    expiry_log: Option<&str>,
+) -> RunState {
+    let mut queue: VecDeque<Effect> = executable.start().into_iter().collect();
+    let mut state = RunState::new(context);
+
+    while !executable.is_complete() {
+        while let Some(effect) = queue.pop_front() {
+            let transaction = transaction_effect(&effect);
+            if let Some(TransactionEffect::Abort(txn_id)) = transaction
+                && state.tracker.blocked_abort(txn_id)
+            {
+                warn!(%txn_id, "Skipping abort after an unknown commit outcome");
+                continue;
+            }
+            let recheck = match expiry_recheck {
+                ExpiryRecheck::Once => !state.expired,
+                ExpiryRecheck::EveryEffect => true,
+            };
+            if recheck
+                && deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+                && !managed_effect(&effect)
+            {
+                state.mark_expired();
+                queue.clear();
+                // Suppress aborts after commit. Dropping `state.holds` releases
+                // backend reservations.
+                if abort_policy.allows(state.committed) {
+                    extend_unblocked(&mut queue, executable.abort(), &state.tracker);
+                }
+                continue;
+            }
+            hold_backends(context, &effect, &mut state.holds);
+            let commit = matches!(transaction, Some(TransactionEffect::Commit(_)));
+            let event = if state.tracker.reject_start(transaction) {
+                warn!("Transaction tracker capacity reached");
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                })
+            } else if state.expired {
+                let Some(cleanup_deadline) = state.cleanup_deadline else {
+                    break;
+                };
+                let Ok(event) = tokio::time::timeout_at(
+                    cleanup_deadline,
+                    effect_adapters::dispatch_effect(effect, context, depth),
+                )
+                .await
+                else {
+                    queue.clear();
+                    break;
+                };
+                event
+            } else if let Some(deadline) = deadline {
+                let managed = managed_effect(&effect);
+                // Managed effects own their timeout and must not be canceled here.
+                let dispatch = Box::pin(effect_adapters::dispatch_effect_until(
+                    effect,
+                    context,
+                    depth,
+                    Some(deadline),
+                ));
+                if managed {
+                    dispatch.await
+                } else {
+                    match tokio::time::timeout_at(deadline, dispatch).await {
+                        Ok(event) => event,
+                        Err(_) => {
+                            state.mark_expired();
+                            if let Some(operation) = expiry_log {
+                                warn!(
+                                    operation = %operation,
+                                    "Operation deadline expired; running its abort path"
+                                );
+                            }
+                            queue.clear();
+                            if commit {
+                                Event::Storage(StorageEvent::Error {
+                                    error: StorageError::CommitFailed,
+                                })
+                            } else {
+                                if abort_policy.allows(state.committed) {
+                                    extend_unblocked(
+                                        &mut queue,
+                                        executable.abort(),
+                                        &state.tracker,
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+            } else {
+                Box::pin(effect_adapters::dispatch_effect(effect, context, depth)).await
+            };
+            state.record_outcome(transaction, &event);
+            if !executable.is_complete() {
+                extend_unblocked(&mut queue, executable.step(event), &state.tracker);
+            }
+        }
+
+        if queue.is_empty() && !executable.is_complete() {
+            if state.expired {
+                break;
+            }
+            extend_unblocked(&mut queue, executable.abort(), &state.tracker);
+            if queue.is_empty() {
+                break;
+            }
+        }
+    }
+
+    state
+}
+
+/// Suboperation execution: its own depth, deadline, and event finalization, but
+/// the same effect loop and transaction ownership as a parent. A depth limit is
+/// enforced by the dispatch overview before this is reached.
 fn drive_suboperation<'a>(
     mut operation: Box<dyn SubOperation>,
     context: &'a DriverContext,
@@ -893,135 +619,20 @@ fn drive_suboperation<'a>(
                 depth,
                 "Starting suboperation"
             );
-            let mut queue: VecDeque<_> = operation.start().into_iter().collect();
-            let mut holds = Vec::new();
-            let mut tracker = TransactionTracker::new(context.storage_handle.clone());
-            let mut expired = false;
-            let mut committed = false;
-            let mut cleanup_deadline = None;
+            let mut run = SubRun(operation.as_mut());
+            let mut state = drive_effects(
+                &mut run,
+                context,
+                depth,
+                deadline,
+                DeadlineAbort::BeforeCommitOnly,
+                ExpiryRecheck::EveryEffect,
+                None,
+            )
+            .await;
 
-            while !operation.is_complete() {
-                while let Some(effect) = queue.pop_front() {
-                    let transaction = transaction_effect(&effect);
-                    if let Some(TransactionEffect::Abort(txn_id)) = transaction
-                        && tracker.blocked_abort(txn_id)
-                    {
-                        warn!(%txn_id, "Skipping abort after an unknown commit outcome");
-                        continue;
-                    }
-                    if let Some(deadline) = deadline
-                        && deadline <= tokio::time::Instant::now()
-                        && !managed_effect(&effect)
-                    {
-                        expired = true;
-                        cleanup_deadline =
-                            Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
-                        queue.clear();
-                        if !committed {
-                            queue.extend(operation.abort().into_iter().filter(|effect| {
-                                !matches!(
-                                    transaction_effect(effect),
-                                    Some(TransactionEffect::Abort(txn_id))
-                                        if tracker.blocked_abort(txn_id)
-                                )
-                            }));
-                        }
-                        continue;
-                    }
-                    hold_backends(context, &effect, &mut holds);
-                    let commit = matches!(transaction, Some(TransactionEffect::Commit(_)));
-                    let event = if tracker.reject_start(transaction) {
-                        warn!("Transaction tracker capacity reached");
-                        Event::Storage(StorageEvent::Error {
-                            error: StorageError::TransactionConflict,
-                        })
-                    } else if expired {
-                        let Some(deadline) = cleanup_deadline else {
-                            break;
-                        };
-                        let Ok(event) = tokio::time::timeout_at(
-                            deadline,
-                            dispatch_effect(effect, context, depth),
-                        )
-                        .await
-                        else {
-                            queue.clear();
-                            break;
-                        };
-                        event
-                    } else if let Some(deadline) = deadline {
-                        let managed = managed_effect(&effect);
-                        let dispatch = Box::pin(dispatch_effect_until(
-                            effect,
-                            context,
-                            depth,
-                            Some(deadline),
-                        ));
-                        if managed {
-                            dispatch.await
-                        } else {
-                            match tokio::time::timeout_at(deadline, dispatch).await {
-                                Ok(event) => event,
-                                Err(_) => {
-                                    expired = true;
-                                    cleanup_deadline =
-                                        Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
-                                    queue.clear();
-                                    if commit {
-                                        Event::Storage(StorageEvent::Error {
-                                            error: StorageError::CommitFailed,
-                                        })
-                                    } else {
-                                        if !committed {
-                                            queue.extend(operation.abort().into_iter().filter(
-                                                |effect| {
-                                                    !matches!(
-                                                        transaction_effect(effect),
-                                                        Some(TransactionEffect::Abort(txn_id))
-                                                            if tracker.blocked_abort(txn_id)
-                                                    )
-                                                },
-                                            ));
-                                        }
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        dispatch_effect(effect, context, depth).await
-                    };
-                    tracker.observe(transaction, &event);
-                    committed |= commit_done(transaction, &event);
-                    if !operation.is_complete() {
-                        queue.extend(operation.step(event).into_iter().filter(|effect| {
-                            !matches!(
-                                transaction_effect(effect),
-                                Some(TransactionEffect::Abort(txn_id))
-                                    if tracker.blocked_abort(txn_id)
-                            )
-                        }));
-                    }
-                }
-
-                if queue.is_empty() && !operation.is_complete() {
-                    if expired {
-                        break;
-                    }
-                    queue.extend(operation.abort().into_iter().filter(|effect| {
-                        !matches!(
-                            transaction_effect(effect),
-                            Some(TransactionEffect::Abort(txn_id))
-                                if tracker.blocked_abort(txn_id)
-                        )
-                    }));
-                    if queue.is_empty() {
-                        break;
-                    }
-                }
-            }
-
-            abort_leaked_transaction(&mut tracker, context, depth, cleanup_deadline).await;
+            abort_leaked_transaction(&mut state.tracker, context, depth, state.cleanup_deadline)
+                .await;
             trace!(
                 event = "suboperation.completed",
                 operation = %operation_name,
@@ -1048,133 +659,28 @@ pub async fn drive_until<O: Operation>(
     context: &DriverContext,
     deadline: tokio::time::Instant,
 ) -> Result<O::Output, O::Error> {
-    let mut queue: VecDeque<_> = operation.start().into_iter().collect();
-    let mut expired = false;
-    let mut committed = false;
-    let mut cleanup_deadline = None;
-    let mut holds = Vec::new();
-    let mut tracker = TransactionTracker::new(context.storage_handle.clone());
-
-    while !operation.is_complete() {
-        while let Some(effect) = queue.pop_front() {
-            let transaction = transaction_effect(&effect);
-            if let Some(TransactionEffect::Abort(txn_id)) = transaction
-                && tracker.blocked_abort(txn_id)
-            {
-                warn!(%txn_id, "Skipping abort after an unknown commit outcome");
-                continue;
-            }
-            if !expired && deadline <= tokio::time::Instant::now() && !managed_effect(&effect) {
-                expired = true;
-                cleanup_deadline = Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
-                queue.clear();
-                // Suppress aborts after commit. Dropping `holds` releases backend reservations.
-                if !committed || operation.abort_after_commit() {
-                    queue.extend(operation.abort().into_iter().filter(|effect| {
-                        !matches!(
-                            transaction_effect(effect),
-                            Some(TransactionEffect::Abort(txn_id))
-                                if tracker.blocked_abort(txn_id)
-                        )
-                    }));
-                }
-                continue;
-            }
-            hold_backends(context, &effect, &mut holds);
-            let commit = matches!(transaction, Some(TransactionEffect::Commit(_)));
-            let event = if tracker.reject_start(transaction) {
-                warn!("Transaction tracker capacity reached");
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                })
-            } else if expired {
-                let Some(cleanup_deadline) = cleanup_deadline else {
-                    break;
-                };
-                let Ok(event) =
-                    tokio::time::timeout_at(cleanup_deadline, dispatch_effect(effect, context, 0))
-                        .await
-                else {
-                    queue.clear();
-                    break;
-                };
-                event
-            } else {
-                let managed = managed_effect(&effect);
-                // Managed effects own their timeout and must not be canceled here.
-                let dispatch = Box::pin(dispatch_effect_until(effect, context, 0, Some(deadline)));
-                match if managed {
-                    Ok(dispatch.await)
-                } else {
-                    tokio::time::timeout_at(deadline, dispatch).await
-                } {
-                    Ok(event) => event,
-                    Err(_) => {
-                        expired = true;
-                        warn!(
-                            operation = %type_name::<O>(),
-                            "Operation deadline expired; running its abort path"
-                        );
-                        cleanup_deadline =
-                            Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
-                        queue.clear();
-                        if commit {
-                            Event::Storage(StorageEvent::Error {
-                                error: StorageError::CommitFailed,
-                            })
-                        } else {
-                            if !committed || operation.abort_after_commit() {
-                                queue.extend(operation.abort().into_iter().filter(|effect| {
-                                    !matches!(
-                                        transaction_effect(effect),
-                                        Some(TransactionEffect::Abort(txn_id))
-                                            if tracker.blocked_abort(txn_id)
-                                    )
-                                }));
-                            }
-                            continue;
-                        }
-                    }
-                }
-            };
-            tracker.observe(transaction, &event);
-            committed |= commit_done(transaction, &event);
-            if !operation.is_complete() {
-                queue.extend(operation.step(event).into_iter().filter(|effect| {
-                    !matches!(
-                        transaction_effect(effect),
-                        Some(TransactionEffect::Abort(txn_id))
-                            if tracker.blocked_abort(txn_id)
-                    )
-                }));
-            }
-        }
-
-        if queue.is_empty() && !operation.is_complete() {
-            if expired {
-                break;
-            }
-            queue.extend(operation.abort().into_iter().filter(|effect| {
-                !matches!(
-                    transaction_effect(effect),
-                    Some(TransactionEffect::Abort(txn_id)) if tracker.blocked_abort(txn_id)
-                )
-            }));
-            if queue.is_empty() {
-                break;
-            }
-        }
-    }
+    let abort_after_commit = operation.abort_after_commit();
+    let mut run = ParentRun(&mut operation);
+    let mut state = drive_effects(
+        &mut run,
+        context,
+        0,
+        Some(deadline),
+        DeadlineAbort::OperationOptIn { abort_after_commit },
+        ExpiryRecheck::Once,
+        Some(type_name::<O>()),
+    )
+    .await;
     if !operation.is_complete() {
         // Nonterminal operations cannot finalize. Drop late cleanup effects and let the
         // tracker resolve any transaction they name.
         let _ = operation.abort();
     }
     abort_leaked_transaction(
-        &mut tracker,
+        &mut state.tracker,
         context,
         0,
-        Some(cleanup_deadline.unwrap_or(deadline)),
+        Some(state.cleanup_deadline.unwrap_or(deadline)),
     )
     .await;
     let result = operation.finalize();
@@ -1198,6 +704,9 @@ pub async fn drive_until<O: Operation>(
     result
 }
 
+/// Drives an operation without a deadline. Transaction ownership and the effect
+/// loop are the same as [`drive_until`]; only the deadline and its logging
+/// differ.
 #[tracing::instrument(
     name = "operation",
     level = "debug",
@@ -1216,53 +725,18 @@ pub async fn drive<O: Operation>(
         "Starting operation"
     );
 
-    let mut queue: VecDeque<_> = operation.start().into_iter().collect();
-    let mut holds = Vec::new();
-    let mut tracker = TransactionTracker::new(context.storage_handle.clone());
-
-    while !operation.is_complete() {
-        while let Some(effect) = queue.pop_front() {
-            let transaction = transaction_effect(&effect);
-            if let Some(TransactionEffect::Abort(txn_id)) = transaction
-                && tracker.blocked_abort(txn_id)
-            {
-                warn!(%txn_id, "Skipping abort after an unknown commit outcome");
-                continue;
-            }
-            hold_backends(context, &effect, &mut holds);
-            let event = if tracker.reject_start(transaction) {
-                warn!("Transaction tracker capacity reached");
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                })
-            } else {
-                Box::pin(dispatch_effect(effect, context, 0)).await
-            };
-            tracker.observe(transaction, &event);
-            if !operation.is_complete() {
-                queue.extend(operation.step(event).into_iter().filter(|effect| {
-                    !matches!(
-                        transaction_effect(effect),
-                        Some(TransactionEffect::Abort(txn_id))
-                            if tracker.blocked_abort(txn_id)
-                    )
-                }));
-            }
-        }
-
-        if queue.is_empty() && !operation.is_complete() {
-            queue.extend(operation.abort().into_iter().filter(|effect| {
-                !matches!(
-                    transaction_effect(effect),
-                    Some(TransactionEffect::Abort(txn_id)) if tracker.blocked_abort(txn_id)
-                )
-            }));
-            if queue.is_empty() {
-                break;
-            }
-        }
-    }
-    abort_leaked_transaction(&mut tracker, context, 0, None).await;
+    let mut run = ParentRun(&mut operation);
+    let mut state = drive_effects(
+        &mut run,
+        context,
+        0,
+        None,
+        DeadlineAbort::BeforeCommitOnly,
+        ExpiryRecheck::Once,
+        None,
+    )
+    .await;
+    abort_leaked_transaction(&mut state.tracker, context, 0, None).await;
     let result = operation.finalize();
     match &result {
         Ok(_) => trace!(
@@ -1286,48 +760,16 @@ pub async fn drive<O: Operation>(
     result
 }
 
-fn effect_kind(effect: &Effect) -> &'static str {
-    match effect {
-        Effect::Blob(_) => "blob",
-        Effect::StagingSource(_) => "staging_source",
-        Effect::LocalFile(_) => "local_file",
-        Effect::Storage(_) => "storage",
-        Effect::Net(_) => "net",
-        Effect::Metadata(_) => "metadata",
-        Effect::SubOperation(_) => "suboperation",
-        Effect::Task(_) => "task",
-        Effect::Search() => "search",
-        Effect::Stream() => "stream",
-    }
-}
-
-fn event_kind(event: &Event) -> &'static str {
-    match event {
-        Event::Blob(_) => "blob",
-        Event::StagingSource(_) => "staging_source",
-        Event::LocalFile(_) => "local_file",
-        Event::Storage(_) => "storage",
-        Event::Net(_) => "net",
-        Event::Metadata(_) => "metadata",
-        Event::SubOperation(_) => "suboperation",
-        Event::Task(_) => "task",
-        Event::Search() => "search",
-        Event::Stream() => "stream",
-    }
-}
-
 #[cfg(test)]
 mod test {
     use crate::driver::{
-        DriverContext, MAX_TRACKED_TRANSACTIONS, TransactionEffect, TransactionState,
-        TransactionTracker, audit_nodes, drive, managed_effect,
+        DeadlineAbort, DriverContext, MAX_TRACKED_TRANSACTIONS, TransactionEffect,
+        TransactionState, TransactionTracker, drive, extend_unblocked,
     };
     use aruna_core::{
-        audit::{AuditPageBatch, MAX_AUDIT_PEERS},
         effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect},
         errors::StorageError,
         events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent},
-        keyspaces::REALM_CONFIG_KEYSPACE,
         operation::{Operation, boxed_suboperation},
         structs::{ResolvedSourceAccess, SourceConnectorKind},
         task::{TaskEffect, TaskKey},
@@ -1335,267 +777,10 @@ mod test {
     };
     use aruna_storage::storage;
     use byteview::ByteView;
+    use std::collections::VecDeque;
     use std::convert::Infallible;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tempfile::tempdir;
-
-    #[test]
-    fn caps_audit_peers() {
-        // Over the cap the fan-out still asks MAX_AUDIT_PEERS nodes and reports
-        // the rest as missing instead of returning an empty page.
-        let nodes = (1..=(MAX_AUDIT_PEERS as u8 + 2))
-            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
-            .collect::<Vec<_>>();
-        let mut batch = AuditPageBatch::new();
-
-        let queried = audit_nodes(nodes, &mut batch);
-
-        assert_eq!(queried.len(), MAX_AUDIT_PEERS);
-        assert_eq!(batch.missing_nodes.len(), 2);
-        assert_eq!(batch.missing_overflow, 0);
-        assert!(batch.completed_nodes.is_empty());
-        assert!(
-            batch
-                .missing_nodes
-                .iter()
-                .all(|node| !queried.contains(node))
-        );
-    }
-
-    #[tokio::test]
-    async fn snapshot_reads_rules() {
-        // The snapshot seam has to pick up both stored scopes, not stay empty.
-        use crate::driver::{bucket_snapshot, routing_snapshot};
-        use aruna_core::keyspaces::{GROUP_STORAGE_ROUTING_KEYSPACE, S3_BUCKET_KEYSPACE};
-        use aruna_core::structs::{
-            BucketInfo, GroupStorageRouting, RoutingTarget, StorageRoutingRule,
-        };
-        use std::time::SystemTime;
-
-        let dir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        let group_id = ulid::Ulid::generate();
-        let rule = StorageRoutingRule {
-            key_prefix: "archive/".to_string(),
-            exact: false,
-            target: RoutingTarget::Class("cold".to_string()),
-        };
-        let info = BucketInfo {
-            group_id,
-            created_at: SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
-            cors_configuration: None,
-            storage_routing: vec![rule.clone()],
-            placement_policies: Vec::new(),
-            placement_policy_generation: 0,
-        };
-        let record = GroupStorageRouting {
-            group_id,
-            default_target: Some(RoutingTarget::Class("archive".to_string())),
-            updated_at: SystemTime::UNIX_EPOCH,
-            updated_by: aruna_core::UserId::default(),
-        };
-        write_value(
-            &context,
-            S3_BUCKET_KEYSPACE,
-            b"routed".to_vec(),
-            info.to_bytes().unwrap(),
-        )
-        .await;
-        write_value(
-            &context,
-            GROUP_STORAGE_ROUTING_KEYSPACE,
-            group_id.to_bytes().to_vec(),
-            record.to_bytes().unwrap(),
-        )
-        .await;
-
-        let snapshot = routing_snapshot(&context, group_id, "routed")
-            .await
-            .unwrap();
-        assert_eq!(snapshot.bucket_rules, vec![rule.clone()]);
-        assert_eq!(snapshot.group_default, record.default_target);
-
-        let known = bucket_snapshot(&context, &info).await.unwrap();
-        assert_eq!(known.bucket_rules, vec![rule]);
-        assert_eq!(known.group_default, record.default_target);
-
-        // An unwritten group and bucket are normal empty state, never an error.
-        let absent = routing_snapshot(&context, ulid::Ulid::generate(), "missing")
-            .await
-            .unwrap();
-        assert!(absent.bucket_rules.is_empty());
-        assert_eq!(absent.group_default, None);
-    }
-
-    #[tokio::test]
-    async fn sums_backend_shards() {
-        // Fullness is measured over every shard of one backend, and only that one.
-        use crate::driver::backend_used_bytes;
-        use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
-        use aruna_core::structs::{BackendRef, UsageCounters, usage_backend_key};
-
-        let dir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        let counters = |bytes| UsageCounters {
-            stored_bytes: bytes,
-            ..Default::default()
-        };
-        for (backend, shard, bytes) in [
-            (BackendRef::node_default(), 0, 10u64),
-            (BackendRef::node_default(), 5, 7),
-            (BackendRef::Node("cold".to_string()), 0, 100),
-        ] {
-            write_value(
-                &context,
-                USAGE_STATS_KEYSPACE,
-                usage_backend_key(&backend, shard),
-                counters(bytes).to_bytes().unwrap(),
-            )
-            .await;
-        }
-
-        assert_eq!(
-            backend_used_bytes(&context, &BackendRef::node_default())
-                .await
-                .unwrap(),
-            17
-        );
-        assert_eq!(
-            backend_used_bytes(&context, &BackendRef::Node("gone".to_string()))
-                .await
-                .unwrap(),
-            0
-        );
-
-        // One undecodable shard must fail the read, not read as zero usage.
-        write_value(
-            &context,
-            USAGE_STATS_KEYSPACE,
-            usage_backend_key(&BackendRef::node_default(), 1),
-            vec![0xff; 8],
-        )
-        .await;
-        assert!(
-            backend_used_bytes(&context, &BackendRef::node_default())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn blocked_subject_reads() {
-        // A blocked node still reports its subject: only a write carrying refs
-        // is stopped, and that decision belongs to the gate.
-        use crate::driver::gate_context;
-        use aruna_core::keyspaces::NODE_SUBJECT_KEYSPACE;
-        use aruna_core::structs::{NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementSubject, RealmId};
-
-        let dir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        let realm_id = RealmId::from_bytes([3u8; 32]);
-        let subject = PlacementSubject {
-            node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
-            generation: 1,
-            location: "eu-west".to_string(),
-            labels: Default::default(),
-            executor_kind: None,
-            local_to_controller: true,
-        };
-        // A node that never advertised a subject has no gate at all.
-        assert_eq!(gate_context(&context, realm_id, 0).await.unwrap(), None);
-
-        let mut record = NodeSubjectRecord::seed(subject).unwrap();
-        record.serving_blocked = true;
-        record.policy_draining = true;
-        write_value(
-            &context,
-            NODE_SUBJECT_KEYSPACE,
-            NODE_SUBJECT_KEY.to_vec(),
-            record.to_bytes().unwrap(),
-        )
-        .await;
-
-        let gate = gate_context(&context, realm_id, 0)
-            .await
-            .unwrap()
-            .expect("subject is advertised");
-        assert!(!gate.admitting);
-    }
-
-    #[tokio::test]
-    async fn snapshot_fails_corrupt() {
-        // A bucket record that will not decode must fail the write instead of
-        // routing it to the node default.
-        use crate::driver::routing_snapshot;
-        use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-
-        let dir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        write_value(
-            &context,
-            S3_BUCKET_KEYSPACE,
-            b"corrupt".to_vec(),
-            vec![0xff; 8],
-        )
-        .await;
-
-        let result = routing_snapshot(&context, ulid::Ulid::generate(), "corrupt").await;
-
-        assert!(matches!(
-            result,
-            Err(crate::driver::RoutingInputsError::BucketRules(_))
-        ));
-    }
-
-    async fn write_value(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key: key.into(),
-                value: value.into(),
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ));
-    }
 
     #[derive(Debug, PartialEq)]
     pub struct TestOperation {
@@ -1746,76 +931,6 @@ mod test {
                 value: ByteView::from(*b"ran"),
                 txn_id: None,
             })]
-        }
-    }
-
-    #[derive(Debug, PartialEq)]
-    struct CommitOutcome {
-        state: u8,
-        failed: bool,
-        txn_id: Option<TxnId>,
-    }
-
-    impl Operation for CommitOutcome {
-        type Output = ();
-        type Error = ();
-
-        fn start(&mut self) -> aruna_core::types::Effects {
-            if let Some(txn_id) = self.txn_id {
-                self.state = 3;
-                return smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
-                    txn_id
-                },)];
-            }
-            self.state = 1;
-            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        }
-
-        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-            match (event, self.state) {
-                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
-                    self.txn_id = Some(txn_id);
-                    self.state = 2;
-                    smallvec::smallvec![Effect::Storage(StorageEffect::Write {
-                        key_space: "default".to_string(),
-                        key: ByteView::from(*b"commit-outcome"),
-                        value: ByteView::from(*b"committed"),
-                        txn_id: Some(txn_id),
-                    })]
-                }
-                (Event::Storage(StorageEvent::WriteResult { .. }), 2) => {
-                    self.state = 3;
-                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
-                        txn_id: self.txn_id.expect("transaction id recorded"),
-                    })]
-                }
-                (Event::Storage(StorageEvent::TransactionCommitted { .. }), 3) => {
-                    self.state = 4;
-                    smallvec::smallvec![]
-                }
-                (Event::Storage(StorageEvent::Error { .. }), 3) => {
-                    self.failed = true;
-                    self.state = 4;
-                    smallvec::smallvec![]
-                }
-                _ => smallvec::smallvec![],
-            }
-        }
-
-        fn is_complete(&self) -> bool {
-            self.state == 4
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            if self.failed { Err(()) } else { Ok(()) }
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            self.failed = true;
-            self.state = 4;
-            smallvec::smallvec![]
         }
     }
 
@@ -2093,6 +1208,61 @@ mod test {
         assert_eq!(tracker.states.len(), MAX_TRACKED_TRANSACTIONS);
     }
 
+    #[test]
+    fn deadline_abort_policy_explicit() {
+        // A suboperation stops at an acknowledged commit; a parent continues
+        // only through the operation's opt-in.
+        assert!(DeadlineAbort::BeforeCommitOnly.allows(false));
+        assert!(!DeadlineAbort::BeforeCommitOnly.allows(true));
+        assert!(
+            DeadlineAbort::OperationOptIn {
+                abort_after_commit: false
+            }
+            .allows(false)
+        );
+        assert!(
+            !DeadlineAbort::OperationOptIn {
+                abort_after_commit: false
+            }
+            .allows(true)
+        );
+        assert!(
+            DeadlineAbort::OperationOptIn {
+                abort_after_commit: true
+            }
+            .allows(true)
+        );
+    }
+
+    #[test]
+    fn transaction_aborts_filtered() {
+        // A transaction whose commit outcome is unknown must not be aborted by
+        // later effects: storage owns its resolution.
+        let id = ulid::Ulid::generate();
+        let mut tracker = TransactionTracker::default();
+        tracker.observe(
+            Some(TransactionEffect::Start),
+            &Event::Storage(StorageEvent::TransactionStarted { txn_id: id }),
+        );
+        tracker.observe(
+            Some(TransactionEffect::Commit(id)),
+            &Event::Storage(StorageEvent::Error {
+                error: StorageError::CommitFailed,
+            }),
+        );
+        let mut queue = VecDeque::new();
+        extend_unblocked(
+            &mut queue,
+            smallvec::smallvec![
+                Effect::Storage(StorageEffect::AbortTransaction { txn_id: id }),
+                Effect::Search(),
+            ],
+            &tracker,
+        );
+        assert_eq!(queue.len(), 1);
+        assert!(matches!(queue.pop_front(), Some(Effect::Search())));
+    }
+
     #[tokio::test]
     async fn drive_commit_safe() {
         let directory = tempdir().unwrap();
@@ -2177,153 +1347,6 @@ mod test {
             Some(ByteView::from(*b"staged"))
         );
         assert!(transaction_reopens(&context).await);
-    }
-
-    #[tokio::test]
-    async fn commit_refresh_survives() {
-        // Real time: the proxy actor answers from an OS thread, and paused-time
-        // auto-advance would fire the storage request timeout before it can.
-        assert!(managed_effect(&Effect::Storage(
-            StorageEffect::CommitTransaction {
-                txn_id: ulid::Ulid::generate(),
-            },
-        )));
-        assert!(managed_effect(&Effect::Storage(StorageEffect::Write {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: ByteView::from(*b"realm"),
-            value: ByteView::from(*b"config"),
-            txn_id: None,
-        })));
-        let directory = tempdir().unwrap();
-        let direct = storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
-        let (storage_handle, receivers) = storage::StorageHandle::new();
-        let receiver = receivers.foreground;
-        drop(receivers.bulk);
-        let committed = Arc::new(AtomicBool::new(false));
-        let committed_for_actor = committed.clone();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (actor_done_tx, actor_done_rx) = std::sync::mpsc::channel();
-        let actor = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let mut started_tx = Some(started_tx);
-            let mut done_tx = Some(done_tx);
-            while let Ok((effect, response, _span, _queued, _in_flight)) = receiver.recv() {
-                let gated = committed_for_actor.load(Ordering::Acquire)
-                    && matches!(
-                        &effect,
-                        StorageEffect::Read { key_space, .. }
-                            if key_space == REALM_CONFIG_KEYSPACE
-                    );
-                if gated {
-                    if let Some(sender) = started_tx.take() {
-                        let _ = sender.send(());
-                    }
-                    release_rx.recv().unwrap();
-                    committed_for_actor.store(false, Ordering::Release);
-                }
-                let committed_effect = matches!(&effect, StorageEffect::CommitTransaction { .. });
-                let Event::Storage(event) = runtime.block_on(direct.send_storage_effect(effect))
-                else {
-                    unreachable!("storage proxy only handles storage events");
-                };
-                let committed_event =
-                    committed_effect && matches!(&event, StorageEvent::TransactionCommitted { .. });
-                if committed_event {
-                    committed_for_actor.store(true, Ordering::Release);
-                }
-                let _ = response.send(event);
-                if gated && let Some(sender) = done_tx.take() {
-                    let _ = sender.send(());
-                }
-            }
-            let _ = actor_done_tx.send(());
-        });
-        let net_handle = aruna_net::NetHandle::new(
-            aruna_net::NetConfig {
-                discovery_method: aruna_net::DiscoveryMethod::None,
-                relay_method: aruna_net::RelayMethod::None,
-                ..aruna_net::NetConfig::default()
-            },
-            storage_handle.clone(),
-        )
-        .await
-        .unwrap();
-        let context = DriverContext {
-            storage_handle: storage_handle.clone(),
-            net_handle: Some(net_handle.clone()),
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        let txn_id = match storage_handle
-            .send_storage_effect(StorageEffect::StartTransaction { read: false })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-            other => panic!("unexpected transaction start: {other:?}"),
-        };
-        match storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: "default".to_string(),
-                key: ByteView::from(*b"commit-outcome"),
-                value: ByteView::from(*b"committed"),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected transaction write: {other:?}"),
-        }
-        let task_context = context.clone();
-        let mut task = tokio::spawn(async move {
-            crate::driver::drive_until(
-                CommitOutcome {
-                    state: 0,
-                    failed: false,
-                    txn_id: Some(txn_id),
-                },
-                &task_context,
-                tokio::time::Instant::now() + std::time::Duration::from_millis(100),
-            )
-            .await
-        });
-
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            tokio::select! {
-                started = started_rx => started.unwrap(),
-                result = &mut task => panic!("drive finished before commit refresh: {result:?}"),
-            }
-        })
-        .await
-        .expect("commit refresh did not start");
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(30), &mut task)
-                .await
-                .expect("commit refresh did not honor its own timeout")
-                .unwrap()
-                .is_ok()
-        );
-
-        committed.store(false, Ordering::Release);
-        release_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(30), done_rx)
-            .await
-            .expect("released refresh did not finish")
-            .unwrap();
-        net_handle.shutdown().await;
-        drop(context);
-        drop(net_handle);
-        drop(storage_handle);
-        actor_done_rx
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("storage proxy did not stop");
-        actor.join().unwrap();
     }
 
     #[tokio::test]
@@ -2543,7 +1566,7 @@ mod test {
         state: u8,
         txn_id: Option<TxnId>,
         commit: bool,
-        seen: Arc<Mutex<Option<TxnId>>>,
+        seen: Arc<std::sync::Mutex<Option<TxnId>>>,
         aborted: Arc<std::sync::atomic::AtomicBool>,
         ready: Arc<tokio::sync::Notify>,
     }
@@ -2622,7 +1645,7 @@ mod test {
     struct NestedDeadline {
         commit: bool,
         done: bool,
-        seen: Arc<Mutex<Option<TxnId>>>,
+        seen: Arc<std::sync::Mutex<Option<TxnId>>>,
         aborted: Arc<std::sync::atomic::AtomicBool>,
         ready: Arc<tokio::sync::Notify>,
     }
@@ -2686,7 +1709,7 @@ mod test {
         tokio::time::resume();
         let (_directory, context) = blob_context().await;
         tokio::time::pause();
-        let seen = Arc::new(Mutex::new(None));
+        let seen = Arc::new(std::sync::Mutex::new(None));
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready = Arc::new(tokio::sync::Notify::new());
         let operation = NestedDeadline {
@@ -2730,7 +1753,7 @@ mod test {
         tokio::time::resume();
         let (_directory, context) = blob_context().await;
         tokio::time::pause();
-        let seen = Arc::new(Mutex::new(None));
+        let seen = Arc::new(std::sync::Mutex::new(None));
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready = Arc::new(tokio::sync::Notify::new());
         let operation = NestedDeadline {
@@ -3138,137 +2161,5 @@ mod test {
             .unwrap()
             .join()
             .unwrap();
-    }
-}
-
-#[cfg(test)]
-mod routing_tests {
-    use super::{DriverContext, bucket_snapshot, routing_snapshot};
-    use crate::tests::fixtures::staging::setup_driver_context;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::GROUP_STORAGE_ROUTING_KEYSPACE;
-    use aruna_core::structs::{
-        BackendRef, BucketInfo, GroupBackendKind, GroupStorageBackend, GroupStorageRouting,
-        ResolvedBackend, RoutingTarget, resolve_backend,
-    };
-    use std::collections::HashMap;
-    use std::time::SystemTime;
-    use ulid::Ulid;
-
-    async fn write(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key: key.into(),
-                value: value.into(),
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ));
-    }
-
-    async fn register(context: &DriverContext, group_id: Ulid) -> Ulid {
-        let record = GroupStorageBackend {
-            backend_id: Ulid::generate(),
-            group_id,
-            name: "tenant".to_string(),
-            kind: GroupBackendKind::S3,
-            public_config: HashMap::new(),
-            created_at: SystemTime::UNIX_EPOCH,
-            updated_at: SystemTime::UNIX_EPOCH,
-            created_by: Default::default(),
-            disabled: false,
-            cleanup: aruna_core::structs::CleanupStrategy::Retain,
-        };
-        for (key_space, key, value) in crate::groups::backends::record_writes(&record).unwrap() {
-            write(context, &key_space, key.to_vec(), value.to_vec()).await;
-        }
-        record.backend_id
-    }
-
-    async fn set_default(context: &DriverContext, group_id: Ulid, backend_id: Ulid) {
-        let record = GroupStorageRouting {
-            group_id,
-            default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
-            updated_at: SystemTime::UNIX_EPOCH,
-            updated_by: Default::default(),
-        };
-        write(
-            context,
-            GROUP_STORAGE_ROUTING_KEYSPACE,
-            group_id.to_bytes().to_vec(),
-            record.to_bytes().unwrap(),
-        )
-        .await;
-    }
-
-    fn bucket(group_id: Ulid) -> BucketInfo {
-        BucketInfo {
-            group_id,
-            created_at: SystemTime::UNIX_EPOCH,
-            created_by: Default::default(),
-            cors_configuration: None,
-            storage_routing: Vec::new(),
-            placement_policies: Vec::new(),
-            placement_policy_generation: 0,
-        }
-    }
-
-    #[tokio::test]
-    async fn routes_group_backend() {
-        // The catalog is built the way production builds it, so a group default
-        // naming a registered backend has to resolve rather than fail.
-        let test = setup_driver_context().await;
-        let group_id = Ulid::generate();
-        let backend_id = register(&test.driver_context, group_id).await;
-        set_default(&test.driver_context, group_id, backend_id).await;
-
-        let snapshot = routing_snapshot(&test.driver_context, group_id, "b")
-            .await
-            .unwrap();
-
-        assert_eq!(
-            resolve_backend(&snapshot, "b", "k").unwrap(),
-            ResolvedBackend::new(BackendRef::Group(backend_id), None)
-        );
-    }
-
-    #[tokio::test]
-    async fn scopes_catalog() {
-        // Another group's backend must never enter this group's catalog.
-        let test = setup_driver_context().await;
-        let group_id = Ulid::generate();
-        let foreign = register(&test.driver_context, Ulid::generate()).await;
-        set_default(&test.driver_context, group_id, foreign).await;
-
-        let snapshot = routing_snapshot(&test.driver_context, group_id, "b")
-            .await
-            .unwrap();
-
-        assert!(resolve_backend(&snapshot, "b", "k").is_err());
-    }
-
-    #[tokio::test]
-    async fn snapshot_loads_group() {
-        // A caller holding the bucket record still has to pick up the group's
-        // default target and backend ids.
-        let test = setup_driver_context().await;
-        let group_id = Ulid::generate();
-        let backend_id = register(&test.driver_context, group_id).await;
-        set_default(&test.driver_context, group_id, backend_id).await;
-
-        let snapshot = bucket_snapshot(&test.driver_context, &bucket(group_id))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            resolve_backend(&snapshot, "b", "k").unwrap(),
-            ResolvedBackend::new(BackendRef::Group(backend_id), None)
-        );
     }
 }

@@ -217,3 +217,48 @@ async fn export_rocrate_page(
         .await
         .map_err(map_event_error)
 }
+
+#[derive(Debug, Clone)]
+pub struct GetVisibleMetadataDocumentRequest {
+    pub document_id: Ulid,
+    pub auth: Option<AuthContext>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataRoCrateExportView {
+    Full,
+    Summary,
+    Page,
+    Raw,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportMetadataRoCrateRequest {
+    pub document_id: Ulid,
+    pub auth: Option<AuthContext>,
+    pub view: MetadataRoCrateExportView,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ExportMetadataRoCrateResult {
+    Full {
+        record: MetadataRegistryRecord,
+        jsonld: String,
+    },
+    Summary {
+        record: MetadataRegistryRecord,
+        jsonld: String,
+    },
+    Page {
+        record: MetadataRegistryRecord,
+        page: MetadataRoCratePage,
+    },
+    Raw {
+        record: MetadataRegistryRecord,
+        raw: crate::metadata::raw_revision::MetadataRawView,
+        dataset_digest: Option<[u8; 32]>,
+    },
+}

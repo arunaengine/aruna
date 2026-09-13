@@ -630,3 +630,59 @@ pub async fn search_buckets_distributed(
     hits.truncate(limit);
     Ok(BucketSearchExecution { hits, fanout_stats })
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct MetadataFanoutStats {
+    pub nodes_queried: usize,
+    pub nodes_failed: usize,
+    pub failed_partitions: Vec<NodeId>,
+    pub discovery_failed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MetadataRealmNodeDiscovery {
+    pub(crate) nodes: Vec<NodeId>,
+    pub(crate) failed: bool,
+}
+
+#[derive(Debug)]
+pub(super) struct MetadataFanoutScope {
+    pub(super) mode: Option<MetadataApiQueryMode>,
+    pub(super) target_nodes: Option<Vec<NodeId>>,
+    pub(super) allow_partial: bool,
+    pub(super) discovery_failed: bool,
+    pub(super) subject: Option<[u8; 32]>,
+    pub(super) deadline: Option<tokio::time::Instant>,
+}
+
+impl MetadataFanoutScope {
+    pub(super) fn new(
+        mode: Option<MetadataApiQueryMode>,
+        target_nodes: Option<Vec<NodeId>>,
+        allow_partial: bool,
+    ) -> Self {
+        Self {
+            mode,
+            target_nodes,
+            allow_partial,
+            discovery_failed: false,
+            subject: None,
+            deadline: None,
+        }
+    }
+
+    pub(super) fn with_discovery_failed(mut self, discovery_failed: bool) -> Self {
+        self.discovery_failed = discovery_failed;
+        self
+    }
+
+    pub(super) fn with_subject(mut self, subject: [u8; 32]) -> Self {
+        self.subject = Some(subject);
+        self
+    }
+
+    pub(super) fn with_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+}
