@@ -9,7 +9,7 @@ use crate::shutdown::{NodeShutdown, arm_signal_exit, shutdown_grace_env, wait_fo
 use crate::startup;
 use crate::startup::background::{Background, start as start_background};
 use crate::startup::listeners::{ServerBindings, bind as bind_servers, device_wipe_armed};
-use crate::startup::listeners::{portal_exit, s3_exit};
+use crate::startup::listeners::{portal_exit, s3_exit, session_s3_exit};
 use crate::startup::resources::NodeResources;
 
 /// What the node process accomplished, mapped to one exit behavior by the
@@ -57,6 +57,8 @@ pub enum Service {
     Rest,
     S3,
     Portal,
+    /// The optional session bridge listener; only sessions lose their endpoint.
+    SessionS3,
     Ops,
 }
 
@@ -72,12 +74,23 @@ pub enum ServiceExit {
 /// The named supervision policy per long-lived server. The ops listener is
 /// deliberately `ReportedOnly`: it must answer `/readyz` and `/healthz` through
 /// the entire drain, its task logs an unexpected exit, and the shutdown
-/// sequence aborts it at the very end. Changing a policy here is an explicit
-/// behavior change, not a side effect of moving code.
+/// sequence aborts it at the very end. The session bridge is also
+/// `ReportedOnly`: its bind and exit are optional and only sessions are
+/// affected. Changing a policy here is an explicit behavior change, not a side
+/// effect of moving code.
 pub fn supervision(service: Service) -> ServiceExit {
     match service {
         Service::Rest | Service::S3 | Service::Portal => ServiceExit::StopsNode,
-        Service::Ops => ServiceExit::ReportedOnly,
+        Service::SessionS3 | Service::Ops => ServiceExit::ReportedOnly,
+    }
+}
+
+/// Applies the policy to one observed exit: `Some` stops the node with that
+/// message, `None` reports it and keeps serving.
+fn exit_effect(service: Service, message: &str) -> Option<&str> {
+    match supervision(service) {
+        ServiceExit::StopsNode => Some(message),
+        ServiceExit::ReportedOnly => None,
     }
 }
 
@@ -231,7 +244,7 @@ pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
         rest_handle,
         s3_handle,
         mut portal_handle,
-        session_s3_handle,
+        mut session_s3_handle,
         realm_id: _,
         node_id: _,
         is_initial_boot: _,
@@ -241,28 +254,51 @@ pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
     let mut rest_handle = Some(rest_handle);
     let mut s3_handle = s3_handle;
 
-    // A server that returns before shutdown was requested has failed: the node
-    // is no longer serving, so it must not exit as success.
+    // Every long-lived server exit is classified by the one named policy: a
+    // `StopsNode` exit ends serving with its message, a `ReportedOnly` exit is
+    // logged and the node keeps waiting on the remaining servers.
     let mut failure: Option<String> = None;
-    tokio::select! {
-        message = s3_exit(s3_handle.as_mut()) => {
-            s3_handle = None;
-            failure = Some(message);
+    loop {
+        let observed = tokio::select! {
+            message = s3_exit(s3_handle.as_mut()) => {
+                s3_handle = None;
+                Some((Service::S3, message))
+            }
+            result = rest_handle.as_mut().expect("rest server handle is present") => {
+                rest_handle = None;
+                Some((Service::Rest, match result {
+                    Ok(Ok(())) => "REST server stopped unexpectedly".to_string(),
+                    Ok(Err(error)) => format!("REST server failed: {error}"),
+                    Err(error) => format!("REST server panicked: {error}"),
+                }))
+            }
+            message = portal_exit(portal_handle.as_mut()) => {
+                portal_handle = None;
+                Some((Service::Portal, message))
+            }
+            message = session_s3_exit(session_s3_handle.as_mut()) => {
+                session_s3_handle = None;
+                Some((Service::SessionS3, message))
+            }
+            _ = device_wipe_armed(device_wipe.as_ref()) => None,
+            _ = stop_token.cancelled() => None,
+        };
+        let Some((service, message)) = observed else {
+            break;
+        };
+        match exit_effect(service, &message) {
+            Some(_) => {
+                failure = Some(message);
+                break;
+            }
+            None => {
+                tracing::warn!(
+                    service = ?service,
+                    message = %message,
+                    "Server exited; the node keeps serving"
+                );
+            }
         }
-        result = rest_handle.as_mut().expect("rest server handle is present") => {
-            rest_handle = None;
-            failure = Some(match result {
-                Ok(Ok(())) => "REST server stopped unexpectedly".to_string(),
-                Ok(Err(error)) => format!("REST server failed: {error}"),
-                Err(error) => format!("REST server panicked: {error}"),
-            });
-        }
-        message = portal_exit(portal_handle.as_mut()) => {
-            portal_handle = None;
-            failure = Some(message);
-        }
-        _ = device_wipe_armed(device_wipe.as_ref()) => {}
-        _ = stop_token.cancelled() => {}
     }
 
     if let Some(failure) = failure.as_ref() {
@@ -390,7 +426,28 @@ mod pure_tests {
         assert_eq!(supervision(Service::Rest), ServiceExit::StopsNode);
         assert_eq!(supervision(Service::S3), ServiceExit::StopsNode);
         assert_eq!(supervision(Service::Portal), ServiceExit::StopsNode);
+        assert_eq!(supervision(Service::SessionS3), ServiceExit::ReportedOnly);
         assert_eq!(supervision(Service::Ops), ServiceExit::ReportedOnly);
+    }
+
+    // The real exit path consumes the policy: `StopsNode` decisions carry the
+    // observed message, `ReportedOnly` decisions keep the node serving.
+    #[test]
+    fn exit_decisions_follow_the_policy() {
+        for service in [Service::Rest, Service::S3, Service::Portal] {
+            assert_eq!(
+                exit_effect(service, "observed exit"),
+                Some("observed exit"),
+                "{service:?} must stop the node"
+            );
+        }
+        for service in [Service::SessionS3, Service::Ops] {
+            assert_eq!(
+                exit_effect(service, "observed exit"),
+                None,
+                "{service:?} must only be reported"
+            );
+        }
     }
 
     #[test]
