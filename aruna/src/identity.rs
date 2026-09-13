@@ -6,22 +6,31 @@
 //! a pure function ([`plan_enrollment`]); the HTTP client lives in
 //! `crate::config` and runs only when the plan asks for it.
 
+use std::time::Duration;
+
 use aruna_core::UserId;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
-use aruna_core::onboarding::OnboardingPhase;
+use aruna_core::onboarding::{
+    BootstrapOnboardingResponse, OnboardingMode, OnboardingPhase, OnboardingSyncTicket,
+};
 use aruna_core::structs::{NodeCapabilities, RealmId, StaticRealmEndpoint};
+use aruna_core::time::unix_timestamp_secs;
+use aruna_net::parse_endpoint_config;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{
-    SetupError, generate_node_state, node_capabilities, onboarding_realm_endpoints,
-};
+use crate::config::SetupError;
 
 /// What this boot must do with the persisted identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +74,8 @@ pub fn plan_enrollment(
     }
 }
 
+const NODE_STATE_RECORD_KEY: &[u8] = b"node_state";
+
 /// The persisted identity boundary.
 pub struct IdentityStore {
     storage: StorageHandle,
@@ -107,8 +118,8 @@ impl IdentityStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::keys::generate_signing_key;
     use aruna_core::UserId;
+    use aruna_core::keys::generate_signing_key;
 
     fn state(status: PersistedNodeStatus, phase: Option<OnboardingPhase>) -> PersistedNodeState {
         let realm_signing_key = generate_signing_key();
@@ -239,7 +250,6 @@ mod tests {
     }
 }
 
-const NODE_STATE_RECORD_KEY: &[u8] = b"node_state";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BootOrigin {
     InitializedRealm,
@@ -322,6 +332,166 @@ impl std::fmt::Debug for PersistedNodeState {
             .field("identity", &self.identity)
             .finish()
     }
+}
+
+pub(crate) const ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) fn node_capabilities(
+    node_state: &PersistedNodeState,
+) -> Result<(RealmId, NodeCapabilities), SetupError> {
+    match &node_state.identity {
+        PersistedNodeIdentity::Management {
+            realm_private_key_pem,
+        } => {
+            let realm_signing_key = SigningKey::from_pkcs8_pem(realm_private_key_pem)?;
+            let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+            let realm_verifying_key = realm_signing_key
+                .verifying_key()
+                .to_public_key_pem(LineEnding::default())?
+                .as_bytes()
+                .try_into()?;
+            let realm_encoding_key = realm_signing_key
+                .to_pkcs8_pem(LineEnding::default())?
+                .as_bytes()
+                .try_into()?;
+
+            Ok((
+                realm_id,
+                NodeCapabilities::Management {
+                    realm_signing_key,
+                    realm_verifying_key,
+                    realm_encoding_key,
+                },
+            ))
+        }
+        PersistedNodeIdentity::Server {
+            issuer_private_key_pem,
+            delegation_signature,
+        } => Ok((
+            node_state.realm_id,
+            NodeCapabilities::server_node(
+                SigningKey::from_pkcs8_pem(issuer_private_key_pem)?,
+                node_state.realm_id,
+                delegation_signature.clone(),
+            )?,
+        )),
+        PersistedNodeIdentity::User { .. } => Ok((
+            node_state.realm_id,
+            NodeCapabilities::user_node(node_state.realm_id)?,
+        )),
+    }
+}
+
+pub(crate) fn generate_node_state() -> Result<PersistedNodeState, SetupError> {
+    let realm_signing_key = generate_signing_key();
+    let node_signing_key = generate_signing_key();
+
+    Ok(PersistedNodeState {
+        boot_origin: BootOrigin::InitializedRealm,
+        status: PersistedNodeStatus::PendingInitialization,
+        realm_id: RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes()),
+        net_secret_key: node_signing_key.to_bytes(),
+        onboarding_phase: None,
+        onboarding_sync_ticket: None,
+        identity: PersistedNodeIdentity::Management {
+            realm_private_key_pem: realm_signing_key
+                .to_pkcs8_pem(LineEnding::default())?
+                .to_string(),
+        },
+    })
+}
+
+pub(crate) struct BootstrappedNodeState {
+    pub(crate) node_state: PersistedNodeState,
+    pub(crate) temporary_bootstrap_endpoint: EndpointAddr,
+    pub(crate) realm_endpoints: Vec<EndpointAddr>,
+}
+
+/// Realm endpoints handed over at enrollment, so a joiner dials the realm
+/// without a discovery read of its own. An entry that does not parse, or whose
+/// address names another node, is dropped instead of failing the join.
+pub(crate) fn onboarding_realm_endpoints(endpoints: &[StaticRealmEndpoint]) -> Vec<EndpointAddr> {
+    endpoints
+        .iter()
+        .filter_map(
+            |endpoint| match parse_endpoint_config(&endpoint.endpoint_addr) {
+                Ok(endpoint_addr) if endpoint_addr.id.to_string() == endpoint.node_id => {
+                    Some(endpoint_addr)
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        node_id = %endpoint.node_id,
+                        "Enrollment endpoint address names a different node; ignoring it"
+                    );
+                    None
+                }
+                Err(message) => {
+                    tracing::warn!(
+                        node_id = %endpoint.node_id,
+                        %message,
+                        "Enrollment handed over an unusable realm endpoint; ignoring it"
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+/// The decode half of the enrollment client, separated so response mapping is
+/// testable without an HTTP server.
+pub(crate) fn decode_bootstrap_response(
+    body: &[u8],
+) -> Result<BootstrapOnboardingResponse, SetupError> {
+    serde_json::from_slice(body).map_err(|error| {
+        SetupError::OnboardingBootstrapFailed(format!("invalid bootstrap response: {error}"))
+    })
+}
+
+pub(crate) fn onboarding_bootstrap_client(
+    timeout: Duration,
+) -> Result<reqwest::Client, SetupError> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .build()?)
+}
+
+pub(crate) fn validate_bootstrap_response(
+    response: &BootstrapOnboardingResponse,
+    expected_mode: OnboardingMode,
+    expected_realm_id: RealmId,
+    expected_node_id: iroh::PublicKey,
+) -> Result<(), SetupError> {
+    if response.mode != expected_mode {
+        return Err(SetupError::OnboardingModeMismatch);
+    }
+    if response.realm_id()? != expected_realm_id {
+        return Err(SetupError::OnboardingBootstrapFailed(
+            "bootstrap response realm does not match expected realm".to_string(),
+        ));
+    }
+
+    let ticket = OnboardingSyncTicket::decode(&response.onboarding_sync_ticket)?;
+    if ticket.payload.realm_id != expected_realm_id.to_string() {
+        return Err(SetupError::OnboardingBootstrapFailed(
+            "onboarding sync ticket realm does not match bootstrap response".to_string(),
+        ));
+    }
+    if ticket.payload.node_id != expected_node_id.to_string() {
+        return Err(SetupError::OnboardingBootstrapFailed(
+            "onboarding sync ticket node does not match local node".to_string(),
+        ));
+    }
+    ticket.verify(
+        expected_node_id,
+        &DocumentSyncTarget::RealmConfig {
+            realm_id: expected_realm_id,
+        },
+        unix_timestamp_secs(),
+    )?;
+
+    Ok(())
 }
 
 pub(crate) async fn load_node_state(

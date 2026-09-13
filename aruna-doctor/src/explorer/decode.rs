@@ -967,7 +967,7 @@ mod tests {
         CRAQLE_LOG_BATCH_PREFIX, CraqleStoredBatch, CraqleStoredGraphMeta, CraqleStoredQuadOp,
         CraqleTermId, decode_entry, raw_field,
     };
-    use aruna::config::{
+    use aruna::identity::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
     };
     use aruna_core::compute_quota::{ComputeDepartureReport, JobReservationRecord};
