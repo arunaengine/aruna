@@ -385,7 +385,7 @@ mod tests {
             kind: SessionKind::Assistant,
         });
         let error = create_session(
-            State(state),
+            State(state.clone()),
             Extension(Some(auth)),
             Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
                 "parent",
@@ -400,6 +400,31 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+        // The refusal must not have written a session behind the denial.
+        assert!(session_rows(&state).await.is_empty());
+    }
+
+    /// Every persisted session row, for proving a denial wrote nothing.
+    async fn session_rows(state: &ServerState) -> Vec<(byteview::ByteView, byteview::ByteView)> {
+        use aruna_core::effects::{Effect, StorageEffect};
+        use aruna_core::events::{Event, StorageEvent};
+        use aruna_core::handle::Handle;
+        use aruna_core::keyspaces::USER_SESSION_KEYSPACE;
+        match state
+            .get_ctx()
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Iter {
+                key_space: USER_SESSION_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 16,
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+            other => panic!("unexpected session iter result: {other:?}"),
+        }
     }
 
     #[tokio::test]
