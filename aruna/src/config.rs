@@ -4,7 +4,6 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingPhase,
@@ -18,22 +17,17 @@ use aruna_core::structs::{
 use aruna_net::{DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_config};
 
 use crate::identity::{
-    BootOrigin, BootstrappedNodeState, EnrollmentPlan, IdentityStore, PersistedNodeIdentity,
-    PersistedNodeState, PersistedNodeStatus, decode_bootstrap_response,
-    onboarding_bootstrap_client, onboarding_realm_endpoints, persist_node_state, plan_enrollment,
-    validate_bootstrap_response,
+    BootOrigin, EnrollmentPlan, IdentityStore, PersistedNodeIdentity, PersistedNodeState,
+    PersistedNodeStatus, bootstrap_node_state, decode_bootstrap_response,
+    onboarding_bootstrap_client, persist_node_state, plan_enrollment, validate_bootstrap_response,
 };
 use crate::settings::{Settings, invalid_config_value, normalize_env_value, validate_relay_urls};
 use aruna_operations::metadata::MetadataSearchStorage;
 use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle, errors::StorageLibError};
 use base64::Engine;
 use byteview::ByteView;
-use crypto_box::{
-    PublicKey as TransportPublicKey, SalsaBox, SecretKey as TransportSecretKey,
-    aead::{Aead, OsRng as CryptoOsRng},
-};
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey};
+use crypto_box::{SecretKey as TransportSecretKey, aead::OsRng as CryptoOsRng};
+use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signer, SigningKey};
 use iroh::EndpointAddr;
 use iroh::KeyParsingError;
@@ -572,168 +566,6 @@ fn fold_components(path: &std::path::Path) -> std::path::PathBuf {
         }
     }
     folded
-}
-
-pub(crate) async fn bootstrap_node_state(
-    onboarding_secret: &str,
-    node_location: Option<String>,
-    node_weight: Option<u32>,
-    node_labels: BTreeMap<String, String>,
-    timeout: Duration,
-) -> Result<BootstrappedNodeState, SetupError> {
-    let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
-    let node_signing_key = generate_signing_key();
-    let net_secret_key = node_signing_key.to_bytes();
-    let node_id = iroh::SecretKey::from_bytes(&net_secret_key).public();
-
-    let issuer_signing_key = if matches!(decoded_secret.mode, OnboardingMode::Server) {
-        Some(generate_signing_key())
-    } else {
-        None
-    };
-    let issuer_public_key = issuer_signing_key.as_ref().map(|issuer_signing_key| {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(issuer_signing_key.verifying_key().to_bytes())
-    });
-    let transport_secret_key = if matches!(decoded_secret.mode, OnboardingMode::Management) {
-        Some(TransportSecretKey::generate(&mut CryptoOsRng))
-    } else {
-        None
-    };
-    let transport_public_key = transport_secret_key.as_ref().map(|transport_secret_key| {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(transport_secret_key.public_key().as_bytes())
-    });
-    let node_id_string = node_id.to_string();
-    let node_proof = node_signing_key
-        .sign(&node_proof_message(
-            onboarding_secret,
-            &node_id_string,
-            transport_public_key.as_deref(),
-        ))
-        .to_string();
-    let issuer_proof = issuer_signing_key
-        .as_ref()
-        .zip(issuer_public_key.as_ref())
-        .map(|(issuer_signing_key, issuer_public_key)| {
-            issuer_signing_key
-                .sign(&issuer_proof_message(
-                    onboarding_secret,
-                    &node_id_string,
-                    issuer_public_key,
-                ))
-                .to_string()
-        });
-
-    let response = onboarding_bootstrap_client(timeout)?
-        .post(format!(
-            "{}/api/v1/access/onboarding/bootstrap",
-            decoded_secret.seed_url.trim_end_matches('/'),
-        ))
-        .json(&BootstrapOnboardingRequest {
-            onboarding_secret: onboarding_secret.to_string(),
-            node_id: node_id_string,
-            node_proof,
-            transport_public_key,
-            issuer_public_key,
-            issuer_proof,
-            node_location,
-            node_weight,
-            node_labels,
-        })
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(SetupError::OnboardingBootstrapFailed(format!(
-            "bootstrap endpoint returned {}",
-            response.status()
-        )));
-    }
-
-    let body = response.bytes().await?;
-    let response = decode_bootstrap_response(&body)?;
-    if response.mode != decoded_secret.mode {
-        return Err(SetupError::OnboardingModeMismatch);
-    }
-    let realm_id = response.realm_id()?;
-    validate_bootstrap_response(&response, decoded_secret.mode, realm_id, node_id)?;
-    let temporary_bootstrap_endpoint = response.temporary_bootstrap_endpoint.clone();
-    let realm_endpoints = onboarding_realm_endpoints(&response.realm_endpoints);
-    let identity =
-        match response.mode {
-            OnboardingMode::Management => {
-                let wrapped_key = response.wrapped_realm_private_key.ok_or(
-                    SetupError::MissingOnboardingMaterial(OnboardingMode::Management),
-                )?;
-                let wrapped_nonce = response.wrapped_realm_private_key_nonce.ok_or(
-                    SetupError::MissingOnboardingMaterial(OnboardingMode::Management),
-                )?;
-                let wrapping_public_key =
-                    response
-                        .wrapping_public_key
-                        .ok_or(SetupError::MissingOnboardingMaterial(
-                            OnboardingMode::Management,
-                        ))?;
-                let transport_secret_key = transport_secret_key.ok_or(
-                    SetupError::MissingOnboardingMaterial(OnboardingMode::Management),
-                )?;
-                let wrapping_public_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(wrapping_public_key)
-                    .map_err(SetupError::Base64Error)?;
-                let wrapping_public_key = TransportPublicKey::from(
-                    <[u8; 32]>::try_from(wrapping_public_key_bytes.as_slice())
-                        .map_err(SetupError::FromSliceError)?,
-                );
-                let cipher = SalsaBox::new(&wrapping_public_key, &transport_secret_key);
-                let nonce_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(wrapped_nonce)
-                    .map_err(SetupError::Base64Error)?;
-                let nonce = crypto_box::Nonce::from(
-                    <[u8; 24]>::try_from(nonce_bytes.as_slice())
-                        .map_err(SetupError::FromSliceError)?,
-                );
-                let ciphertext = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(wrapped_key)
-                    .map_err(SetupError::Base64Error)?;
-                let realm_private_key_pem =
-                    String::from_utf8(cipher.decrypt(&nonce, ciphertext.as_ref()).map_err(
-                        |error| SetupError::OnboardingBootstrapFailed(error.to_string()),
-                    )?)?;
-
-                PersistedNodeIdentity::Management {
-                    realm_private_key_pem,
-                }
-            }
-            OnboardingMode::Server => PersistedNodeIdentity::Server {
-                issuer_private_key_pem: issuer_signing_key
-                    .ok_or(SetupError::MissingOnboardingMaterial(
-                        OnboardingMode::Server,
-                    ))?
-                    .to_pkcs8_pem(LineEnding::default())?
-                    .to_string(),
-                delegation_signature: response.delegation_signature.ok_or(
-                    SetupError::MissingOnboardingMaterial(OnboardingMode::Server),
-                )?,
-            },
-            // Devices carry no issuer keys. Their finalized membership grants owner authority,
-            // and the saved owner identifies that authority before the record arrives.
-            OnboardingMode::User { owner } => PersistedNodeIdentity::User { owner },
-        };
-
-    Ok(BootstrappedNodeState {
-        temporary_bootstrap_endpoint,
-        realm_endpoints,
-        node_state: PersistedNodeState {
-            boot_origin: BootOrigin::Onboarded,
-            status: PersistedNodeStatus::PendingOnboarding,
-            realm_id,
-            net_secret_key,
-            onboarding_phase: Some(OnboardingPhase::Bootstrapped),
-            onboarding_sync_ticket: Some(response.onboarding_sync_ticket),
-            identity,
-        },
-    })
 }
 
 pub(crate) async fn refresh_onboarding_bootstrap(
