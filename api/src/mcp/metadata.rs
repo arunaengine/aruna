@@ -860,7 +860,10 @@ mod tests {
                 .unwrap_or_default()
                 .contains("26-character ULID")
         );
-        assert!(parse_document(&Ulid::from_parts(1, 1).to_string()).is_ok());
+        assert!(
+            parse_document("01JZ8Y6T0K4W7M2N9Q5R3S8V1X").is_ok(),
+            "the documented bare 26-character ULID shape must parse"
+        );
     }
 
     #[test]
