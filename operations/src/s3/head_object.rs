@@ -100,6 +100,8 @@ pub struct HeadObjectResult {
     /// Refs stored on the version that was described. A derived write unions
     /// them with its destination default and never drops one.
     pub source_policies: Vec<PlacementPolicyRef>,
+    /// Where the version's bytes come from, for a reference and a snapshot alike.
+    pub source_binding: Option<VersionSourceBinding>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -122,6 +124,7 @@ pub struct HeadObjectOperation {
     pending_copy: Option<ManagedCopyKey>,
     /// Refs of the version being served, compared against its registration.
     source_policies: Vec<PlacementPolicyRef>,
+    source_binding: Option<VersionSourceBinding>,
     output: Option<Result<HeadObjectResult, HeadObjectError>>,
 }
 
@@ -144,6 +147,7 @@ impl HeadObjectOperation {
             pending_location: None,
             pending_copy: None,
             source_policies: Vec::new(),
+            source_binding: None,
             output: None,
         }
     }
@@ -279,8 +283,11 @@ impl HeadObjectOperation {
 
         match version.state {
             BlobVersionState::Materialized {
-                blob_hash, backend, ..
+                blob_hash,
+                backend,
+                source,
             } => {
+                self.source_binding = source;
                 self.source_metadata = None;
                 self.last_refresh = None;
                 self.version_created_at = Some(version.created_at);
@@ -305,6 +312,8 @@ impl HeadObjectOperation {
                 self.source_metadata = Some(cached_metadata);
                 self.last_refresh = Some(last_refresh);
                 self.version_created_at = None;
+                self.source_policies = version.placement_policies.clone();
+                self.source_binding = Some(source.clone());
                 if source.descriptor.kind == SourceConnectorKind::ArunaNative {
                     self.commit_reference(source)
                 } else {
@@ -472,6 +481,7 @@ impl HeadObjectOperation {
             composite_hashes: self.composite_hashes.clone(),
             part_count: self.part_count,
             source_policies: self.source_policies.clone(),
+            source_binding: self.source_binding.clone(),
         }));
 
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
@@ -534,6 +544,7 @@ impl HeadObjectOperation {
                     composite_hashes: self.composite_hashes.clone(),
                     part_count: self.part_count,
                     source_policies: self.source_policies.clone(),
+                    source_binding: self.source_binding.clone(),
                 }));
                 smallvec![]
             }

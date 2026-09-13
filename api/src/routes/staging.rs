@@ -1298,6 +1298,7 @@ async fn reference_blob(
             bucket: request.bucket.clone(),
             key: request.key.clone(),
             expected_bucket: bucket_info,
+            inherited_policies: Vec::new(),
         },
     )
     .await
@@ -1508,7 +1509,7 @@ fn map_list_error(error: ListStagingSourceError) -> ServerError {
     }
 }
 
-async fn queue_live_version_replication(
+pub(crate) async fn queue_live_version_replication(
     state: &ServerState,
     auth_context: AuthContext,
     bucket: String,

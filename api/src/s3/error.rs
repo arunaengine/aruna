@@ -487,6 +487,9 @@ impl IntoS3Error for CopyObjectError {
             CopyObjectError::Put(err) => err.into_s3_error(),
             CopyObjectError::Routing(err) => routing_inputs_error(err),
             CopyObjectError::Gate(err) => gate_context_error(err),
+            CopyObjectError::Reference(err) => {
+                S3Error::with_message(S3ErrorCode::InternalError, err.to_string())
+            }
             CopyObjectError::PreconditionFailed => s3_error!(
                 PreconditionFailed,
                 "At least one of the preconditions you specified did not hold."

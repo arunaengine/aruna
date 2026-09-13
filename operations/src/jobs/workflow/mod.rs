@@ -6,6 +6,7 @@ pub mod run_crate;
 pub mod workspace;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1174,6 +1175,12 @@ async fn realm_session_idle(context: &DriverContext) -> u64 {
         .unwrap_or(DEFAULT_SESSION_IDLE_AFTER_MS)
 }
 
+/// The stored record of a queued copy, when its id parses and it is readable.
+async fn finished_copy(storage: &aruna_storage::StorageHandle, job_id: &str) -> Option<JobRecord> {
+    let job_id = JobId::from_str(job_id).ok()?;
+    read_job_record(storage, job_id, None).await.ok().flatten()
+}
+
 /// Lists what the session brought into its workspace bucket and why it stopped.
 /// Cell traffic is never recorded: the family log is capped per family.
 async fn write_session_report(
@@ -1185,7 +1192,9 @@ async fn write_session_report(
 ) {
     let mut rows = Vec::new();
     if let Some(session) = session {
-        for (index, input) in session.inventory().into_iter().enumerate() {
+        let inventory = session.inventory();
+        let mut next_input = inventory.len();
+        for (index, input) in inventory.into_iter().enumerate() {
             rows.push(SessionReportRow {
                 entry_key: format!("input/{index:04}"),
                 detail: SessionReportDetail::Input {
@@ -1196,6 +1205,32 @@ async fn write_session_report(
                     version_id: input.version_id,
                 },
             });
+        }
+        // A queued copy that finished counts like an inline one. One still
+        // running never reached the kernel, so it is left out.
+        for pending in session.pending() {
+            let Some(record) = finished_copy(storage, &pending.job_id).await else {
+                continue;
+            };
+            let Some(JobResultPayload::CopyObject {
+                version_id,
+                bytes,
+                blake3,
+            }) = record.result
+            else {
+                continue;
+            };
+            rows.push(SessionReportRow {
+                entry_key: format!("input/{next_input:04}"),
+                detail: SessionReportDetail::Input {
+                    dest_key: pending.dest_key,
+                    bytes,
+                    blake3,
+                    source_node_id: pending.source_node_id,
+                    version_id,
+                },
+            });
+            next_input += 1;
         }
         for (index, object) in session.touched().into_iter().enumerate() {
             rows.push(SessionReportRow {

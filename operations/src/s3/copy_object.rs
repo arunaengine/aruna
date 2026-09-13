@@ -3,15 +3,26 @@ use crate::driver::{
     routing_snapshot,
 };
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::head_object::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
 use crate::s3::purge_fence::ensure_write_allowed;
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::staging::reference::{
+    MaterializeReferenceError, ReferenceWrite, write_reference_version,
+};
 use aruna_core::UserId;
+use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, PathRestriction, RealmId, StagingStrategy, VersionSourceBinding,
+    AuthContext, BackendLocation, PathRestriction, RealmId, SourceMetadata, StagingStrategy,
+    VersionSourceBinding, resolve_backend,
 };
 use aruna_core::types::{GroupId, NodeId};
+use futures_util::StreamExt;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
@@ -22,6 +33,17 @@ pub struct CopySourceConditions {
     pub if_none_match: Option<String>,
     pub if_modified_since: Option<SystemTime>,
     pub if_unmodified_since: Option<SystemTime>,
+}
+
+/// What a copy does with a source whose bytes sit behind a reference.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CopyReferences {
+    /// The copy is a reference of its own; no byte moves and the connector is
+    /// not contacted.
+    #[default]
+    Preserve,
+    /// The bytes are pulled and stored as a snapshot.
+    Materialize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,11 +63,16 @@ pub struct CopyObjectInput {
     pub conditions: CopySourceConditions,
     pub metadata: Option<HashMap<String, String>>,
     pub restrictions: Option<Vec<PathRestriction>>,
+    pub references: CopyReferences,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct CopyObjectResultData {
-    pub location: BackendLocation,
+    /// The stored bytes; `None` for a copy that stayed a reference.
+    pub location: Option<BackendLocation>,
+    pub size: u64,
+    /// The observation a kept reference carries.
+    pub source_metadata: Option<SourceMetadata>,
     pub version_id: Ulid,
     pub created_at: SystemTime,
     pub source_version_id: Option<Ulid>,
@@ -62,8 +89,27 @@ pub enum CopyObjectError {
     Routing(#[from] RoutingInputsError),
     #[error(transparent)]
     Gate(#[from] GateContextError),
+    #[error(transparent)]
+    Reference(#[from] MaterializeReferenceError),
     #[error("At least one of the preconditions you specified did not hold.")]
     PreconditionFailed,
+}
+
+/// A description failure reads like the read it stands in for.
+fn head_error(error: HeadObjectError) -> CopyObjectError {
+    CopyObjectError::Get(match error {
+        HeadObjectError::StorageError(error) => GetObjectError::StorageError(error),
+        HeadObjectError::ConversionError(error) => GetObjectError::ConversionError(error),
+        HeadObjectError::NoSuchKey => GetObjectError::NoSuchKey,
+        HeadObjectError::NoSuchVersion => GetObjectError::NoSuchVersion,
+        HeadObjectError::DeleteMarker => GetObjectError::DeleteMarker,
+        HeadObjectError::ResolveReferenceError(error) => {
+            GetObjectError::ResolveReferenceError(error)
+        }
+        HeadObjectError::StagingSourceError(error) => GetObjectError::StagingSourceError(error),
+        HeadObjectError::ManagedCopyError(error) => GetObjectError::ManagedCopyError(error),
+        _ => GetObjectError::GetObjectFailed,
+    })
 }
 
 fn normalize_etag(etag: &str) -> &str {
@@ -129,9 +175,61 @@ pub async fn copy_object(
     context: &DriverContext,
     input: CopyObjectInput,
 ) -> Result<CopyObjectResultData, CopyObjectError> {
+    copy_object_tracked(context, input, None).await
+}
+
+/// `copy_object` with the bytes pulled so far published on `progress`, so a
+/// job can report a long source read while it runs.
+pub async fn copy_object_tracked(
+    context: &DriverContext,
+    input: CopyObjectInput,
+    progress: Option<Arc<AtomicU64>>,
+) -> Result<CopyObjectResultData, CopyObjectError> {
     ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
         .await
         .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
+    // The description touches no source, so a reference can be kept without
+    // contacting its connector.
+    let head = drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: input.source_bucket.clone(),
+            key: input.source_key.clone(),
+            version_id: input.source_version_id,
+        }),
+        context,
+    )
+    .await
+    .and_then(|result| result.transpose())
+    .map_err(head_error)?
+    .ok_or(CopyObjectError::Get(GetObjectError::GetObjectFailed))?;
+    let source_last_modified = head
+        .version_created_at
+        .or_else(|| head.location.as_ref().map(|location| location.created_at))
+        .or_else(|| {
+            head.source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.last_modified)
+        });
+    let source_etag = head
+        .location
+        .as_ref()
+        .and_then(|location| location.hashes.get(HASH_MD5))
+        .map(hex::encode)
+        .or_else(|| {
+            head.source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.etag.clone())
+        });
+    evaluate_source_conditions(
+        &input.conditions,
+        source_etag.as_deref(),
+        source_last_modified,
+        true,
+    )?;
+    if head.location.is_none() && input.references == CopyReferences::Preserve {
+        return preserve_reference(context, input, head, source_last_modified).await;
+    }
+
     let source = drive(
         GetObjectOperation::new(GetObjectInput {
             bucket: input.source_bucket,
@@ -148,38 +246,7 @@ pub async fn copy_object(
     .await
     .and_then(|result| result.transpose())?
     .ok_or(CopyObjectError::Get(GetObjectError::GetObjectFailed))?;
-
     let source_version_id = source.version_id;
-    let source_last_modified = source
-        .version_created_at
-        .or_else(|| source.location.as_ref().map(|location| location.created_at))
-        .or_else(|| {
-            source
-                .source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.last_modified)
-        });
-
-    // Evaluate preconditions before consuming the (lazy) source stream so that a
-    // failed check drops the stream without pulling any bytes.
-    let source_etag = source
-        .location
-        .as_ref()
-        .and_then(|location| location.hashes.get(HASH_MD5))
-        .map(hex::encode)
-        .or_else(|| {
-            source
-                .source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.etag.clone())
-        });
-    evaluate_source_conditions(
-        &input.conditions,
-        source_etag.as_deref(),
-        source_last_modified,
-        true,
-    )?;
-
     let materialized = source.location.is_some();
     let content_length = source.location.as_ref().map(|location| location.blob_size);
     let version_source = if materialized {
@@ -194,8 +261,22 @@ pub async fn copy_object(
             })
     };
     let metadata = input.metadata.unwrap_or(source.metadata);
-
     let routing = routing_snapshot(context, input.group_id, &input.dest_bucket).await?;
+    // Bytes the destination's backend already holds are adopted, not streamed.
+    let adopt = source.location.clone().filter(|location| {
+        resolve_backend(&routing, &input.dest_bucket, &input.dest_key)
+            .is_ok_and(|resolved| resolved.backend == location.backend)
+    });
+    let body = match (adopt.is_some(), progress) {
+        (true, _) => None,
+        (false, Some(pulled)) => Some(BackendStream(Box::pin(source.blob.inspect(move |chunk| {
+            if let Ok(bytes) = chunk {
+                pulled.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            }
+        })))),
+        (false, None) => Some(source.blob),
+    };
+
     let gate = gate_context(context, input.realm_id, now_ms()).await?;
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: input.user_id,
@@ -206,7 +287,7 @@ pub async fn copy_object(
             bucket: input.dest_bucket,
             key: input.dest_key,
             content_length,
-            body: Some(source.blob),
+            body,
         },
         expected_checksums: Vec::new(),
         checksum_type: None,
@@ -219,6 +300,9 @@ pub async fn copy_object(
     .with_metadata(metadata)
     .with_inherited_policies(source.source_policies.clone())
     .with_restrictions(input.restrictions.clone());
+    if let Some(location) = adopt {
+        operation = operation.with_adopted(location);
+    }
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
@@ -233,7 +317,9 @@ pub async fn copy_object(
     let created_at = UNIX_EPOCH + Duration::from_millis(put_result.version_id.timestamp_ms());
 
     Ok(CopyObjectResultData {
-        location: put_result.location,
+        size: put_result.location.blob_size,
+        location: Some(put_result.location),
+        source_metadata: None,
         version_id: put_result.version_id,
         created_at,
         source_version_id,
@@ -241,8 +327,50 @@ pub async fn copy_object(
     })
 }
 
+/// Records a reference of the source's binding at the destination, carrying
+/// the source's refs. No byte moves.
+async fn preserve_reference(
+    context: &DriverContext,
+    input: CopyObjectInput,
+    head: HeadObjectResult,
+    source_last_modified: Option<SystemTime>,
+) -> Result<CopyObjectResultData, CopyObjectError> {
+    let (Some(binding), Some(metadata)) = (head.source_binding, head.source_metadata) else {
+        return Err(CopyObjectError::Get(GetObjectError::GetObjectFailed));
+    };
+    let (version_id, _changed) = write_reference_version(
+        context,
+        ReferenceWrite {
+            group_id: input.group_id,
+            user_id: input.user_id,
+            realm_id: input.realm_id,
+            node_id: input.node_id,
+            bucket: input.dest_bucket,
+            key: input.dest_key,
+            expected_bucket: None,
+            version_source: VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                ..binding
+            },
+            metadata: metadata.clone(),
+            inherited_policies: head.source_policies,
+            connector_guard: None,
+        },
+    )
+    .await?;
+    Ok(CopyObjectResultData {
+        location: None,
+        size: metadata.content_length,
+        source_metadata: Some(metadata),
+        version_id,
+        created_at: UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms()),
+        source_version_id: head.version_id,
+        source_last_modified,
+    })
+}
+
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
     use crate::placement_policy::fixtures::{seed_gate, subject};
     use crate::s3::get_object::{GetObjectOperation, MAX_AUTO_ADVANCES};
@@ -278,7 +406,7 @@ mod test {
         }
     }
 
-    async fn full_context() -> (TempDir, DriverContext) {
+    pub(crate) async fn full_context() -> (TempDir, DriverContext) {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let blob_root = format!("{temp_root}/blobstore");
@@ -314,7 +442,9 @@ mod test {
         (temp_handle, context)
     }
 
-    async fn spawn_reference_server(body: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+    pub(crate) async fn spawn_reference_server(
+        body: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let app = Router::new().route(
             "/folder/file.txt",
             get(
@@ -358,7 +488,12 @@ mod test {
         }
     }
 
-    async fn write_version(context: &DriverContext, bucket: &str, key: &str, version: BlobVersion) {
+    pub(crate) async fn write_version(
+        context: &DriverContext,
+        bucket: &str,
+        key: &str,
+        version: BlobVersion,
+    ) {
         let version_id = Ulid::generate();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
             .storage_handle
@@ -436,7 +571,7 @@ mod test {
         aruna_core::structs::VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
-    async fn seed_bucket(
+    pub(crate) async fn seed_bucket(
         context: &DriverContext,
         bucket: &str,
         group_id: GroupId,
@@ -524,6 +659,7 @@ mod test {
                 conditions: CopySourceConditions::default(),
                 metadata: None,
                 restrictions: None,
+                references: CopyReferences::Materialize,
             },
         )
         .await
@@ -579,6 +715,7 @@ mod test {
                 conditions: CopySourceConditions::default(),
                 metadata: None,
                 restrictions: None,
+                references: CopyReferences::Materialize,
             },
         )
         .await
@@ -586,7 +723,7 @@ mod test {
 
         let source_version =
             read_dest_version(&context, "bucket", "source.txt", source.version_id).await;
-        assert_eq!(result.location, source.location);
+        assert_eq!(result.location, Some(source.location));
         assert_eq!(result.source_version_id, Some(source.version_id));
         assert_eq!(result.source_last_modified, Some(source_version.created_at));
         // The copy dedups onto the source location, but its last-modified must
@@ -662,6 +799,7 @@ mod test {
                 conditions: CopySourceConditions::default(),
                 metadata: None,
                 restrictions: None,
+                references: CopyReferences::Materialize,
             },
         )
         .await
@@ -706,6 +844,141 @@ mod test {
 
     // A copy reading a capped reference must surface the exact variant, so the
     // caller learns that only an explicit rebind heals it.
+    #[tokio::test]
+    async fn preserved_copy_keeps_reference() {
+        // A kept reference is cloned from the source version alone: the
+        // connector is never contacted, so the source may be unreachable.
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        seed_bucket(&context, "bucket", group_id, user_id, Vec::new()).await;
+        let (endpoint, server) = spawn_reference_server(b"reference-bytes").await;
+        server.abort();
+        let _ = server.await;
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([("endpoint".to_string(), endpoint)]),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: None,
+        };
+        write_version(
+            &context,
+            "bucket",
+            "ref.txt",
+            BlobVersion::reference(
+                source.clone(),
+                SourceMetadata {
+                    content_length: 15,
+                    content_type: Some("text/plain".to_string()),
+                    etag: Some("etag-1".to_string()),
+                    last_modified: Some(SystemTime::UNIX_EPOCH),
+                    source_version: None,
+                },
+                SystemTime::UNIX_EPOCH,
+                user_id,
+                SystemTime::UNIX_EPOCH,
+            ),
+        )
+        .await;
+
+        let result = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "ref.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Preserve,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.location.is_none());
+        assert_eq!(result.size, 15);
+        assert!(result.source_version_id.is_some());
+
+        let dest_version =
+            read_dest_version(&context, "bucket", "dest.txt", result.version_id).await;
+        assert!(!dest_version.is_materialized());
+        let binding = dest_version.source_binding().expect("a reference binding");
+        assert_eq!(binding.strategy, StagingStrategy::Reference);
+        assert_eq!(binding.descriptor, source.descriptor);
+    }
+
+    #[tokio::test]
+    async fn same_backend_copy_adopts() {
+        // Bytes the destination's backend already holds are adopted without a
+        // stream: nothing passes the progress counter and the location is shared.
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        seed_bucket(&context, "bucket", group_id, user_id, Vec::new()).await;
+        let data: &'static [u8] = b"adopt these bytes";
+        let source = drive(
+            PutObjectOperation::new(put_config(
+                realm_id, group_id, node_id, "bucket", "src.txt", data,
+            )),
+            &context,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        let pulled = Arc::new(AtomicU64::new(0));
+        let result = copy_object_tracked(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "src.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Materialize,
+            },
+            Some(pulled.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pulled.load(Ordering::Relaxed), 0, "no byte streamed");
+        assert_eq!(result.location, Some(source.location.clone()));
+        assert_eq!(result.size, data.len() as u64);
+        let dest_version =
+            read_dest_version(&context, "bucket", "dest.txt", result.version_id).await;
+        assert!(dest_version.is_materialized());
+    }
+
     #[tokio::test]
     async fn copy_reports_exhausted() {
         let (_temp, context) = full_context().await;
@@ -766,6 +1039,7 @@ mod test {
                 conditions: CopySourceConditions::default(),
                 metadata: None,
                 restrictions: None,
+                references: CopyReferences::Materialize,
             },
         )
         .await
@@ -836,6 +1110,7 @@ mod test {
                 conditions: CopySourceConditions::default(),
                 metadata: None,
                 restrictions: None,
+                references: CopyReferences::Materialize,
             },
         )
         .await
@@ -1002,6 +1277,7 @@ mod test {
                 },
                 metadata: None,
                 restrictions: None,
+                references: CopyReferences::Materialize,
             },
         )
         .await

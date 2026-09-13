@@ -363,6 +363,21 @@ pub struct StagingJobSpec {
     pub prefixes: Vec<StagingJobPrefix>,
 }
 
+/// One server-side object copy run outside a request, for a source whose bytes
+/// sit behind a reference and must be pulled before they can be deduplicated.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyJobSpec {
+    pub auth_context: AuthContext,
+    pub node_id: NodeId,
+    pub source_bucket: String,
+    pub source_key: String,
+    pub source_version_id: Option<Ulid>,
+    pub source_group_id: GroupId,
+    pub dest_bucket: String,
+    pub dest_key: String,
+    pub group_id: GroupId,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StagingJobPhase {
@@ -724,6 +739,9 @@ pub enum JobPayload {
     MintPersistentId(MintPersistentIdSpec),
     /// One server-side permanent purge family, scoped to a file, prefix, or bucket.
     StoragePurge(StoragePurgeSpec),
+    /// One object copy the request path handed off because its source must be
+    /// pulled from a reference first. Safe to requeue: a rerun copies again.
+    CopyObject(CopyJobSpec),
 }
 
 impl JobPayload {
@@ -740,6 +758,7 @@ impl JobPayload {
             JobPayload::Harvest(_) => "harvest",
             JobPayload::MintPersistentId(_) => "mint_persistent_id",
             JobPayload::StoragePurge(_) => "storage_purge",
+            JobPayload::CopyObject(_) => "copy_object",
         }
     }
 
@@ -753,6 +772,7 @@ impl JobPayload {
             | JobPayload::ExportRoCrate(_) => "items",
             JobPayload::Harvest(_) => "records",
             JobPayload::StoragePurge(_) => "entries",
+            JobPayload::CopyObject(_) => "bytes",
             JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. } => "steps",
@@ -771,7 +791,8 @@ impl JobPayload {
             | JobPayload::StoragePurge(_)
             | JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
-            | JobPayload::TerminalCleanup { .. } => JobExecutionClass::InProcess,
+            | JobPayload::TerminalCleanup { .. }
+            | JobPayload::CopyObject(_) => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
         }
     }
@@ -1016,6 +1037,14 @@ pub enum JobResultPayload {
         newly_minted: bool,
     },
     StoragePurge(StoragePurgeResult),
+    CopyObject {
+        /// The source version the bytes came from, as the inline copy reports
+        /// it; empty when the source named no version.
+        version_id: String,
+        bytes: u64,
+        /// Hex blake3 of the copied bytes; empty when the backend reported none.
+        blake3: String,
+    },
 }
 
 impl JobResultPayload {
@@ -1031,6 +1060,7 @@ impl JobResultPayload {
             JobResultPayload::Harvest { .. } => "harvest",
             JobResultPayload::PersistentId { .. } => "persistent_id",
             JobResultPayload::StoragePurge(_) => "storage_purge",
+            JobResultPayload::CopyObject { .. } => "copy_object",
         }
     }
 
@@ -1207,6 +1237,15 @@ impl JobResultPayload {
                     "emptiness_proven": result.emptiness_proven,
                 })
             }
+            JobResultPayload::CopyObject {
+                version_id,
+                bytes,
+                blake3,
+            } => serde_json::json!({
+                "version_id": version_id,
+                "bytes": bytes,
+                "blake3": blake3,
+            }),
         }
     }
 }

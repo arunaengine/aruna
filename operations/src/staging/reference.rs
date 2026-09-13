@@ -42,6 +42,9 @@ pub struct MaterializeReferenceInput {
     pub bucket: String,
     pub key: String,
     pub expected_bucket: BucketInfo,
+    /// Refs the reference carries over from an object it derives from; they
+    /// are unioned with the bucket default and never dropped.
+    pub inherited_policies: Vec<PlacementPolicyRef>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -90,6 +93,60 @@ pub async fn stage_reference_blob(
         Some(input.node_id),
         Some(head_result.connector.connector_id),
     );
+    let (version_id, _changed) = write_reference_version(
+        context,
+        ReferenceWrite {
+            group_id: input.group_id,
+            user_id: input.user_id,
+            realm_id: input.realm_id,
+            node_id: input.node_id,
+            bucket: input.bucket,
+            key: input.key,
+            expected_bucket: Some(input.expected_bucket),
+            version_source: version_source.clone(),
+            metadata: head_result.metadata.clone(),
+            inherited_policies: input.inherited_policies,
+            connector_guard: Some((
+                head_result.connector.clone(),
+                head_result.secret_fingerprint,
+            )),
+        },
+    )
+    .await?;
+
+    Ok(MaterializeReferenceResult {
+        connector: head_result.connector,
+        source_metadata: head_result.metadata,
+        version_source,
+        version_id,
+    })
+}
+
+/// One reference version to record: freshly resolved through a connector, or
+/// cloned from a version that already carries the binding.
+pub struct ReferenceWrite {
+    pub group_id: GroupId,
+    pub user_id: UserId,
+    pub realm_id: RealmId,
+    pub node_id: NodeId,
+    pub bucket: String,
+    pub key: String,
+    /// The bucket as the caller saw it; `None` only checks the group.
+    pub expected_bucket: Option<BucketInfo>,
+    pub version_source: VersionSourceBinding,
+    pub metadata: SourceMetadata,
+    /// Refs unioned with the bucket default and never dropped.
+    pub inherited_policies: Vec<PlacementPolicyRef>,
+    /// The connector the binding was resolved through, re-checked at commit.
+    pub connector_guard: Option<(SourceConnector, Option<[u8; 16]>)>,
+}
+
+/// Writes the reference version in one transaction and says whether anything
+/// changed: the same binding with the same observation at the head is kept.
+pub async fn write_reference_version(
+    context: &DriverContext,
+    write: ReferenceWrite,
+) -> Result<(Ulid, bool), MaterializeReferenceError> {
     let version_id = Ulid::generate();
     let now = SystemTime::now();
 
@@ -104,32 +161,29 @@ pub async fn stage_reference_blob(
     };
 
     let result: Result<(Ulid, bool), MaterializeReferenceError> = async {
-        guard_purge_fence(context, txn_id, &input.bucket, &input.key).await?;
-        let bucket_policies = guard_expected_bucket(
+        guard_purge_fence(context, txn_id, &write.bucket, &write.key).await?;
+        let mut policies = guard_expected_bucket(
             context,
             txn_id,
-            &input.bucket,
-            input.group_id,
-            &input.expected_bucket,
+            &write.bucket,
+            write.group_id,
+            write.expected_bucket.as_ref(),
         )
         .await?;
-        guard_resolved_connector_unchanged(
-            context,
-            txn_id,
-            &head_result.connector,
-            head_result.secret_fingerprint,
-        )
-        .await?;
+        policies.extend(write.inherited_policies.iter().copied());
+        if let Some((connector, fingerprint)) = write.connector_guard.as_ref() {
+            guard_resolved_connector_unchanged(context, txn_id, connector, *fingerprint).await?;
+        }
 
         let existing_pointer =
-            read_current_pointer(context, txn_id, &input.bucket, &input.key).await?;
+            read_current_pointer(context, txn_id, &write.bucket, &write.key).await?;
         let existing_version = match existing_pointer.as_ref() {
             Some(pointer) => {
                 read_blob_version(
                     context,
                     txn_id,
-                    &input.bucket,
-                    &input.key,
+                    &write.bucket,
+                    &write.key,
                     pointer.version_id,
                 )
                 .await?
@@ -148,8 +202,8 @@ pub async fn stage_reference_blob(
                 ..
             }),
         ) = (existing_pointer.as_ref(), existing_version.as_ref())
-            && source == &version_source
-            && source_metadata_matches(cached_metadata, &head_result.metadata)
+            && source == &write.version_source
+            && source_metadata_matches(cached_metadata, &write.metadata)
         {
             match context
                 .storage_handle
@@ -174,11 +228,11 @@ pub async fn stage_reference_blob(
 
         for effect in build_head_transition_effects(
             &HeadAliasContext::new(
-                input.realm_id,
-                input.group_id,
-                input.node_id,
-                &input.bucket,
-                &input.key,
+                write.realm_id,
+                write.group_id,
+                write.node_id,
+                &write.bucket,
+                &write.key,
             ),
             Some(next_pointer),
             None,
@@ -187,27 +241,27 @@ pub async fn stage_reference_blob(
             apply_storage_effect(context, effect).await?;
         }
 
-        let version_key = VersionKey::new(&input.bucket, &input.key, version_id);
+        let version_key = VersionKey::new(&write.bucket, &write.key, version_id);
         apply_storage_effect(
             context,
             write_blob_version_effect(
                 &version_key,
                 &BlobVersion::reference(
-                    version_source.clone(),
-                    head_result.metadata.clone(),
+                    write.version_source.clone(),
+                    write.metadata.clone(),
                     now,
-                    input.user_id,
+                    write.user_id,
                     now,
                 )
-                .with_policies(bucket_policies)?,
+                .with_policies(policies)?,
                 Some(txn_id),
             )?,
         )
         .await?;
 
-        let referenced_bytes = head_result.metadata.content_length;
+        let referenced_bytes = write.metadata.content_length;
         let mut usage_update = UsageCounterUpdate::for_group(
-            input.group_id,
+            write.group_id,
             UsageDelta {
                 objects: if was_live { 0 } else { 1 },
                 referenced_bytes: i128::from(referenced_bytes),
@@ -245,13 +299,7 @@ pub async fn stage_reference_blob(
     if changed {
         schedule_usage_snapshot_publish(context).await;
     }
-
-    Ok(MaterializeReferenceResult {
-        connector: head_result.connector,
-        source_metadata: head_result.metadata,
-        version_source,
-        version_id,
-    })
+    Ok((version_id, changed))
 }
 
 async fn guard_purge_fence(
@@ -460,7 +508,7 @@ async fn guard_expected_bucket(
     txn_id: TxnId,
     bucket: &str,
     group_id: GroupId,
-    expected: &BucketInfo,
+    expected: Option<&BucketInfo>,
 ) -> Result<Vec<PlacementPolicyRef>, MaterializeReferenceError> {
     let current = match context
         .storage_handle
@@ -478,9 +526,16 @@ async fn guard_expected_bucket(
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         _ => return Err(StorageError::ReadError("unexpected event".to_string()).into()),
     };
-    if expected.group_id != group_id
-        || current.as_ref().map(BucketInfo::identity) != Some(expected.identity())
-    {
+    let unchanged = match expected {
+        Some(expected) => {
+            expected.group_id == group_id
+                && current.as_ref().map(BucketInfo::identity) == Some(expected.identity())
+        }
+        None => current
+            .as_ref()
+            .is_some_and(|bucket| bucket.group_id == group_id),
+    };
+    if !unchanged {
         return Err(StorageError::TransactionConflict.into());
     }
     Ok(current
@@ -793,7 +848,7 @@ mod tests {
         let txn_id = start_write_transaction(&context).await;
 
         assert_conflict(
-            guard_expected_bucket(&context, txn_id, "bucket-a", group_id, &expected)
+            guard_expected_bucket(&context, txn_id, "bucket-a", group_id, Some(&expected))
                 .await
                 .map(|_| ()),
         );
@@ -856,6 +911,7 @@ mod tests {
                 bucket: "bucket-a".to_string(),
                 key: "object.txt".to_string(),
                 expected_bucket,
+                inherited_policies: Vec::new(),
             },
         )
         .await
@@ -945,6 +1001,7 @@ mod tests {
                 bucket: "bucket-a".to_string(),
                 key: "object.txt".to_string(),
                 expected_bucket,
+                inherited_policies: Vec::new(),
             },
         )
         .await;
@@ -1012,6 +1069,7 @@ mod tests {
             bucket: "bucket-a".to_string(),
             key: "object.txt".to_string(),
             expected_bucket,
+            inherited_policies: Vec::new(),
         };
 
         let first = stage_reference_blob(context, input.clone()).await.unwrap();

@@ -312,6 +312,7 @@ async fn stage_item(
                 bucket: spec.bucket.clone(),
                 key: item.target_key.clone(),
                 expected_bucket,
+                inherited_policies: Vec::new(),
             },
         )
         .await

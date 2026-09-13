@@ -29,7 +29,7 @@ use aruna_operations::s3::complete_multipart_upload::{
     CompleteMultipartUploadOperation, CompleteMultipartUploadResult,
 };
 use aruna_operations::s3::copy_object::{
-    CopyObjectInput, CopyObjectResultData, CopySourceConditions,
+    CopyObjectInput, CopyObjectResultData, CopyReferences, CopySourceConditions,
 };
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::create_multipart_upload::{
@@ -975,6 +975,7 @@ async fn copy_object(
             conditions: CopySourceConditions::default(),
             metadata: None,
             restrictions: None,
+            references: CopyReferences::Materialize,
         },
     )
     .await

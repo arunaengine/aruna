@@ -186,6 +186,10 @@ pub struct PutObjectOperation {
     pending_cleanup: PendingCleanup,
     existing_pointer: Option<CurrentVersionPointer>,
     new_blob: bool,
+    /// A blob already on the resolved backend, taken instead of a stream.
+    adopt: Option<BackendLocation>,
+    /// The written location belongs to another version; never delete it.
+    adopted: bool,
     was_live: bool,
     usage_update: Option<UsageCounterUpdate>,
     quota_gate: Option<QuotaGate>,
@@ -231,6 +235,8 @@ impl PutObjectOperation {
             pending_cleanup: PendingCleanup::default(),
             existing_pointer: None,
             new_blob: false,
+            adopt: None,
+            adopted: false,
             was_live: false,
             usage_update: None,
             quota_gate: None,
@@ -276,6 +282,13 @@ impl PutObjectOperation {
     /// constrained as what it was copied from.
     pub fn with_inherited_policies(mut self, policies: Vec<PlacementPolicyRef>) -> Self {
         self.inherited_policies = policies;
+        self
+    }
+
+    /// A blob the destination's backend already holds. The version is minted
+    /// on it without streaming; the request body must be `None`.
+    pub fn with_adopted(mut self, location: BackendLocation) -> Self {
+        self.adopt = Some(location);
         self
     }
 
@@ -527,6 +540,19 @@ impl PutObjectOperation {
             Ok(resolved) => resolved,
             Err(error) => return self.emit_error(error.into()),
         };
+        if let Some(location) = self.config_adopt() {
+            if location.backend != resolved.backend {
+                return self.emit_error(PutObjectError::WriteFailed(
+                    "the adopted blob sits on another backend".to_string(),
+                ));
+            }
+            self.adopted = true;
+            self.written_location = Some(location);
+            self.state = PutObjectState::StartTransaction;
+            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })];
+        }
         self.state = PutObjectState::WriteBlob;
         if let Some(blob) = self.config.request.body.take() {
             smallvec![Effect::Blob(BlobEffect::Write {
@@ -539,6 +565,10 @@ impl PutObjectOperation {
         } else {
             self.emit_error(PutObjectError::MissingBody)
         }
+    }
+
+    fn config_adopt(&mut self) -> Option<BackendLocation> {
+        self.adopt.take()
     }
 
     fn handle_write_finished(&mut self, event: Event) -> Effects {
@@ -699,7 +729,7 @@ impl PutObjectOperation {
                     Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
                 };
 
-                if existing_location != written_location {
+                if !self.adopted && existing_location != written_location {
                     self.cleanup_location = Some(written_location);
                 }
                 self.output = Some(Ok(existing_location));
@@ -1106,6 +1136,8 @@ impl PutObjectOperation {
     fn rollback_written_blob(&mut self) -> Effects {
         self.state = PutObjectState::CleanupFailedWrite;
         match self.written_location.take() {
+            // An adopted blob belongs to another version and stays.
+            Some(_) if self.adopted => self.emit_pending_error(),
             Some(location) => {
                 self.rollback_location = Some(location.clone());
                 smallvec![Effect::Blob(BlobEffect::Delete { location })]
@@ -1132,6 +1164,10 @@ impl PutObjectOperation {
     }
 
     fn write_cleanup_row(&mut self, txn_id: Ulid) -> Effects {
+        if self.adopted {
+            self.state = PutObjectState::CommitTransaction;
+            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        }
         let Some(location) = self.written_location.clone() else {
             return self.emit_error(PutObjectError::MissingOutput);
         };
@@ -1224,6 +1260,9 @@ impl PutObjectOperation {
         let Some(location) = self.written_location.take() else {
             return self.emit_error(error.into());
         };
+        if self.adopted {
+            return self.emit_error(error.into());
+        }
         let release_id = location.ulid;
         warn!(
             event = "put_object.commit_outcome_unknown",
@@ -1522,7 +1561,9 @@ impl Operation for PutObjectOperation {
 
     fn abort(&mut self) -> Effects {
         let mut actions: Effects = smallvec![];
-        if let Some(location) = self.written_location.take() {
+        if let Some(location) = self.written_location.take()
+            && !self.adopted
+        {
             actions.push(Effect::Blob(BlobEffect::Delete { location }));
         }
         if let Some(txn_id) = self.txn_id.take() {

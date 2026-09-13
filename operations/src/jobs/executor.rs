@@ -123,6 +123,7 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
         JobPayload::StoragePurge(spec) => {
             crate::jobs::workflow::purge::run_storage_purge(ctx, spec).await
         }
+        JobPayload::CopyObject(spec) => crate::jobs::copy::run_copy_job(ctx, spec).await,
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
             "execution payload dispatched through the in-process seam",
@@ -147,7 +148,8 @@ pub fn run_cleanup(payload: &JobPayload) {
         | JobPayload::StoragePurge(_)
         | JobPayload::MintPersistentId(_)
         | JobPayload::WriteRunCrate { .. }
-        | JobPayload::TerminalCleanup { .. } => {}
+        | JobPayload::TerminalCleanup { .. }
+        | JobPayload::CopyObject(_) => {}
     }
 }
 

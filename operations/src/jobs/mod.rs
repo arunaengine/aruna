@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+pub mod copy;
 pub mod drain;
 pub mod executor;
 pub mod export;

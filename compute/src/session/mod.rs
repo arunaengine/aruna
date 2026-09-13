@@ -82,6 +82,15 @@ pub struct StagedInput {
     pub version_id: String,
 }
 
+/// One object a background copy job is still bringing into the workspace
+/// bucket. The report resolves it against the job once the session ends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PendingInput {
+    pub dest_key: String,
+    pub job_id: String,
+    pub source_node_id: String,
+}
+
 /// One object the session's own credential read or wrote, as the S3 plane
 /// attributed it to this job.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -154,6 +163,7 @@ struct Inner {
     credential_expires_at_ms: u64,
     next_request: u64,
     inventory: Vec<StagedInput>,
+    pending: Vec<PendingInput>,
     touched: Vec<TouchedObject>,
 }
 
@@ -241,14 +251,27 @@ impl Session {
     /// lists them at the end, so the run says where its data came from.
     pub fn record_input(&self, input: StagedInput) {
         let mut inner = self.lock();
-        if inner.inventory.len() < MAX_TRACKED_INPUTS {
+        if inner.inventory.len() + inner.pending.len() < MAX_TRACKED_INPUTS {
             inner.inventory.push(input);
+        }
+    }
+
+    /// Records a copy job queued for the workspace bucket, under the same cap.
+    pub fn record_pending(&self, input: PendingInput) {
+        let mut inner = self.lock();
+        if inner.inventory.len() + inner.pending.len() < MAX_TRACKED_INPUTS {
+            inner.pending.push(input);
         }
     }
 
     /// Everything staged into the workspace bucket while the session ran.
     pub fn inventory(&self) -> Vec<StagedInput> {
         self.lock().inventory.clone()
+    }
+
+    /// The copy jobs queued while the session ran, finished or not.
+    pub fn pending(&self) -> Vec<PendingInput> {
+        self.lock().pending.clone()
     }
 
     /// Marks the session as reconnecting after a lost channel, so the client
@@ -763,6 +786,7 @@ fn build_session(config: SessionConfig) -> (Arc<Session>, mpsc::Receiver<HelperR
             credential_expires_at_ms,
             next_request: 0,
             inventory: Vec::new(),
+            pending: Vec::new(),
             touched: Vec::new(),
         }),
         events,

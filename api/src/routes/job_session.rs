@@ -8,17 +8,23 @@ use std::sync::Arc;
 use aruna_compute::session::EventKind;
 use aruna_compute::session::events::SessionEvent;
 use aruna_compute::session::{
-    EndReason, MAX_SCRATCH_READ_BYTES, Session, SessionError, StagedInput,
+    EndReason, MAX_SCRATCH_READ_BYTES, PendingInput, Session, SessionError, StagedInput,
 };
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::{AuthContext, JobId, JobPayload, JobRecord, JobState, key_content_type};
+use aruna_core::structs::{
+    AuthContext, CopyJobSpec, JobId, JobPayload, JobRecord, JobState, Permission, key_content_type,
+};
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::jobs::lifecycle::ids::session_of;
 use aruna_operations::jobs::lifecycle::routing::session_job;
 use aruna_operations::jobs::service::read_session_reason;
-use aruna_operations::s3::copy_object::{CopyObjectInput, CopySourceConditions, copy_object};
+use aruna_operations::jobs::service::submit_copy_job;
+use aruna_operations::s3::copy_object::{
+    CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
+};
 use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
+use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -35,11 +41,15 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::{
+    bucket_blob_permission_path, ensure_permission, require_unrestricted_realm_auth,
+};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::jobs::{
-    JobStatusResponse, coded_response, job_status_response, map_job_route, parse_job_id,
+    JobStatusResponse, coded_response, job_status_response, map_job_route, map_submit_error,
+    parse_job_id,
 };
+use crate::routes::staging::queue_live_version_replication;
 use crate::server_state::ServerState;
 
 /// Envoy idles an upstream at 60 seconds, so the stream keeps itself alive.
@@ -166,6 +176,19 @@ pub struct SessionInputRequest {
     pub source_node_id: Option<String>,
     /// Full key inside the workspace bucket the object lands under.
     pub dest_key: String,
+    /// How a source that is itself a reference lands: `snapshot` pulls the
+    /// bytes through a background job, `reference` links without copying.
+    #[serde(default)]
+    pub strategy: SessionInputStrategy,
+}
+
+/// What the workspace gets for a source whose bytes sit behind a reference.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionInputStrategy {
+    #[default]
+    Snapshot,
+    Reference,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -180,12 +203,17 @@ pub struct StagedInputResponse {
     pub blake3: String,
     pub source_node_id: String,
     pub version_id: String,
+    /// The workspace holds a reference; reads stream from the source.
+    #[serde(default)]
+    pub linked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct PendingInputResponse {
     pub dest_key: String,
+    /// The copy job; `GET /compute/jobs/{job_id}` reports its progress in bytes.
     pub job_id: String,
+    pub source_node_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -198,8 +226,7 @@ pub struct FailedInputResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct SessionInputsResponse {
     pub staged: Vec<StagedInputResponse>,
-    /// Sources that need a staging job of their own. Empty today: a source on
-    /// another node is refused instead, and the caller imports it first.
+    /// Sources a background copy job is pulling in; poll the job for progress.
     pub pending: Vec<PendingInputResponse>,
     /// Items that did not land, named so a partial result stays reconcilable.
     #[serde(default)]
@@ -766,15 +793,20 @@ pub async fn end_session(
 like cancel, and each source additionally needs the caller's read permission on its bucket.
 
 **Behavior**
-- A source on this node is copied server side, which deduplicates onto the stored blob instead of
-  moving bytes.
+- A source stored on this node is copied server side, which deduplicates onto the stored blob
+  instead of moving bytes, and is answered in `staged`.
+- A source that is itself a reference to a connector is pulled by a background copy job and
+  answered in `pending` with the job id. `GET /compute/jobs/{job_id}` reports its progress in bytes;
+  the object appears under `dest_key` once the job succeeded.
+- With `strategy: reference` such a source is not pulled: the workspace gets a reference of its own
+  and reads stream from the source. It is answered in `staged` as `linked` with an empty `blake3`.
 - Nothing is copied into the container: the object lands in the bucket under `dest_key` and the
   kernel reads it from there.
 - Every staged object is recorded in the session inventory and listed in the job report at the end,
-  with the node, version and hash it came from.
+  with the node, version and hash it came from. A queued copy joins the report once it finished.
 - Staging resets the session's idle timer.
-- Destination keys are checked before anything is copied. Once one object landed the answer stays
-  202 and every item that failed after it is named in `failed`.
+- Destination keys are checked before anything is copied. Once one object landed or was queued the
+  answer stays 202 and every item that failed after it is named in `failed`.
 
 **Limits** (refused with 400)
 - At most 64 items per call, and a `dest_key` that is relative and traversal-free.
@@ -784,9 +816,11 @@ like cancel, and each source additionally needs the caller's read permission on 
         "items": [{"bucket": "source-data", "key": "input.txt", "dest_key": "data/input.txt"}]
     })),
     responses(
-        (status = 202, description = "The objects that landed, with every later failure in `failed`", body = SessionInputsResponse, example = json!({
+        (status = 202, description = "The objects that landed or were queued, with every later failure in `failed`", body = SessionInputsResponse, example = json!({
             "staged": [{"dest_key": "data/input.txt", "bytes": 12, "blake3": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
-                "source_node_id": "node-1", "version_id": "01JJRSVERSION0123456789ABC"}], "pending": [], "failed": []
+                "source_node_id": "node-1", "version_id": "01JJRSVERSION0123456789ABC", "linked": false}],
+            "pending": [{"dest_key": "data/genomes/ref.fna", "job_id": "01JJCPYJB00123456789ABCDEF", "source_node_id": "node-1"}],
+            "failed": []
         })),
         (status = 400, description = "An invalid destination key, too many items, or a source on another node", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
@@ -823,11 +857,12 @@ pub async fn stage_inputs(
         items.push((item, dest_key));
     }
     let mut staged = Vec::with_capacity(items.len());
+    let mut pending = Vec::new();
     let mut failed = Vec::new();
     let mut refusal = None;
     for (item, dest_key) in items {
         match stage_one(&state, &auth, &bucket, item, &dest_key).await {
-            Ok(entry) => {
+            Ok(InputOutcome::Staged(entry)) => {
                 session.record_input(StagedInput {
                     dest_key: entry.dest_key.clone(),
                     bytes: entry.bytes,
@@ -836,6 +871,14 @@ pub async fn stage_inputs(
                     version_id: entry.version_id.clone(),
                 });
                 staged.push(entry);
+            }
+            Ok(InputOutcome::Pending(entry)) => {
+                session.record_pending(PendingInput {
+                    dest_key: entry.dest_key.clone(),
+                    job_id: entry.job_id.clone(),
+                    source_node_id: entry.source_node_id.clone(),
+                });
+                pending.push(entry);
             }
             Err(error) => {
                 failed.push(FailedInputResponse {
@@ -846,12 +889,12 @@ pub async fn stage_inputs(
             }
         }
     }
-    // A call that staged nothing made no progress, so it must not keep the
-    // session alive.
-    if !staged.is_empty() {
+    // A call that neither staged nor queued anything made no progress, so it
+    // must not keep the session alive.
+    if !staged.is_empty() || !pending.is_empty() {
         session.touch();
     }
-    inputs_outcome(staged, failed, refusal)
+    inputs_outcome(staged, pending, failed, refusal)
 }
 
 /// Transport checks every item must pass before the first copy, so a refused
@@ -877,14 +920,16 @@ fn check_item(item: &SessionInputRequest, node_id: &str) -> ServerResult<String>
     Ok(dest_key.to_string())
 }
 
-/// A call that staged something answers 202 and names what failed after it. A
-/// call that staged nothing keeps the refusal its first item earned.
+/// A call that staged or queued something answers 202 and names what failed
+/// after it. A call that did neither keeps the refusal its first item earned.
 fn inputs_outcome(
     staged: Vec<StagedInputResponse>,
+    pending: Vec<PendingInputResponse>,
     failed: Vec<FailedInputResponse>,
     refusal: Option<ServerError>,
 ) -> ServerResult<Response> {
     if staged.is_empty()
+        && pending.is_empty()
         && let Some(error) = refusal
     {
         return Err(error);
@@ -893,7 +938,7 @@ fn inputs_outcome(
         StatusCode::ACCEPTED,
         Json(SessionInputsResponse {
             staged,
-            pending: Vec::new(),
+            pending,
             failed,
         }),
     )
@@ -913,66 +958,173 @@ async fn bucket_info(
         .map_err(|_| ServerError::NotFound)
 }
 
-/// Copies one object into the workspace bucket, deduplicating onto its blob.
+/// What one item became: an object in the bucket, or a job still bringing it.
+enum InputOutcome {
+    Staged(StagedInputResponse),
+    Pending(PendingInputResponse),
+}
+
+/// Brings one object into the workspace bucket. A source stored here is
+/// deduplicated inline; one behind a connector is pulled by a job or linked.
 async fn stage_one(
     state: &ServerState,
     auth: &AuthContext,
     bucket: &str,
     item: SessionInputRequest,
     dest_key: &str,
-) -> ServerResult<StagedInputResponse> {
+) -> ServerResult<InputOutcome> {
     let node_id = state.get_node_id();
     let context = state.get_ctx();
     let source_info = bucket_info(&context, &item.bucket).await?;
     let dest_info = bucket_info(&context, bucket).await?;
-    let realm_config = drive(GetRealmConfigOperation::new(state.get_realm_id()), &context)
-        .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    ensure_permission(
+        state,
+        auth,
+        bucket_blob_permission_path(state, source_info.group_id, &item.bucket, &item.key),
+        Permission::READ,
+    )
+    .await?;
     let version_id = item
         .version_id
         .as_deref()
         .map(Ulid::from_string)
         .transpose()
         .map_err(|_| ServerError::BadRequestMessage("an unreadable version id".to_string()))?;
-    let result = copy_object(
+    let head = drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: item.bucket.clone(),
+            key: item.key.clone(),
+            version_id,
+        }),
         &context,
-        CopyObjectInput {
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.to_string()))?
+    .ok_or(ServerError::NotFound)?
+    .map_err(head_error)?;
+    // A stored source deduplicates inline whatever was asked. A reference is
+    // either queued for its pull or kept as a reference, which moves no byte.
+    if head.location.is_none() && item.strategy == SessionInputStrategy::Snapshot {
+        let spec = CopyJobSpec {
+            auth_context: auth.clone(),
+            node_id,
             source_bucket: item.bucket,
             source_key: item.key,
             source_version_id: version_id,
             source_group_id: source_info.group_id,
-            source_auth_context: auth.clone(),
             dest_bucket: bucket.to_string(),
             dest_key: dest_key.to_string(),
-            user_id: auth.user_id,
             group_id: dest_info.group_id,
-            realm_id: state.get_realm_id(),
-            node_id,
-            quota_ceiling: realm_config
-                .quota
-                .effective_group_ceiling(&dest_info.group_id),
-            conditions: CopySourceConditions::default(),
-            metadata: None,
-            restrictions: auth.path_restrictions.clone(),
+        };
+        return queue_copy(state, spec, dest_key)
+            .await
+            .map(InputOutcome::Pending);
+    }
+    let realm_config = drive(GetRealmConfigOperation::new(state.get_realm_id()), &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let input = CopyObjectInput {
+        source_bucket: item.bucket,
+        source_key: item.key,
+        source_version_id: version_id,
+        source_group_id: source_info.group_id,
+        source_auth_context: auth.clone(),
+        dest_bucket: bucket.to_string(),
+        dest_key: dest_key.to_string(),
+        user_id: auth.user_id,
+        group_id: dest_info.group_id,
+        realm_id: state.get_realm_id(),
+        node_id,
+        quota_ceiling: realm_config
+            .quota
+            .effective_group_ceiling(&dest_info.group_id),
+        conditions: CopySourceConditions::default(),
+        metadata: None,
+        restrictions: auth.path_restrictions.clone(),
+        references: match item.strategy {
+            SessionInputStrategy::Snapshot => CopyReferences::Materialize,
+            SessionInputStrategy::Reference => CopyReferences::Preserve,
         },
-    )
-    .await
-    .map_err(|error| ServerError::BadRequestMessage(error.to_string()))?;
+    };
+    copy_inline(state, auth, input, dest_key)
+        .await
+        .map(InputOutcome::Staged)
+}
+
+/// Copies one object into the workspace bucket: stored bytes deduplicate onto
+/// their blob, a kept reference moves none at all.
+async fn copy_inline(
+    state: &ServerState,
+    auth: &AuthContext,
+    input: CopyObjectInput,
+    dest_key: &str,
+) -> ServerResult<StagedInputResponse> {
+    let bucket = input.dest_bucket.clone();
+    let result = copy_object(&state.get_ctx(), input)
+        .await
+        .map_err(|error| ServerError::BadRequestMessage(error.to_string()))?;
+    let linked = result.location.is_none();
+    if linked {
+        // A kept reference writes no replication obligation of its own.
+        queue_live_version_replication(
+            state,
+            auth.clone(),
+            bucket,
+            dest_key.to_string(),
+            result.version_id,
+            false,
+        )
+        .await;
+    }
     Ok(StagedInputResponse {
         dest_key: dest_key.to_string(),
-        bytes: result.location.blob_size,
+        bytes: result.size,
         blake3: result
             .location
-            .hashes
-            .get(HASH_BLAKE3)
+            .as_ref()
+            .and_then(|location| location.hashes.get(HASH_BLAKE3))
             .map(hex::encode)
             .unwrap_or_default(),
-        source_node_id: node_id.to_string(),
+        source_node_id: state.get_node_id().to_string(),
         version_id: result
             .source_version_id
             .map(|version| version.to_string())
             .unwrap_or_default(),
+        linked,
     })
+}
+
+/// Hands the copy to a job, since pulling a reference can outlive a request.
+async fn queue_copy(
+    state: &ServerState,
+    spec: CopyJobSpec,
+    dest_key: &str,
+) -> ServerResult<PendingInputResponse> {
+    let node_id = state.get_node_id();
+    let result = submit_copy_job(
+        &state.get_ctx(),
+        spec,
+        node_id,
+        state.rocrate_limits().artifact_retention_ms,
+    )
+    .await
+    .map_err(map_submit_error)?;
+    Ok(PendingInputResponse {
+        dest_key: dest_key.to_string(),
+        job_id: result.job_id.to_string(),
+        source_node_id: node_id.to_string(),
+    })
+}
+
+/// A missing object reads as 404 like a missing bucket; anything else is the
+/// node's own failure.
+fn head_error(error: HeadObjectError) -> ServerError {
+    match error {
+        HeadObjectError::NoSuchKey
+        | HeadObjectError::NoSuchVersion
+        | HeadObjectError::DeleteMarker => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    }
 }
 
 #[utoipa::path(
@@ -1106,19 +1258,31 @@ mod tests {
         AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext,
         LogLimits, LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, UserSpec,
     };
+    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
+        S3_BUCKET_KEYSPACE,
+    };
     use aruna_core::structs::{
-        CollisionPolicy, ComputeResources, ExecutionSpec, JobId, NodeCapabilities, RealmId,
-        SessionReportDetail, SessionReportRow,
+        Actor, BlobHeadKey, BlobVersion, BucketInfo, CollisionPolicy, ComputeResources,
+        CurrentVersionPointer, ExecutionSpec, Group, GroupAuthorizationDocument, JobId,
+        NodeCapabilities, PortableSourceDescriptor, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmId, SessionReportDetail, SessionReportRow, SourceConnectorKind,
+        SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_core::types::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
     use aruna_operations::jobs::store::{
-        ClaimOutcome, cancel_running_job, claim_job, insert_job, put_job_entry,
+        ClaimOutcome, cancel_running_job, claim_job, insert_job, put_job_entry, read_job_record,
     };
-    use aruna_storage::FjallStorage;
+    use aruna_storage::{FjallStorage, StorageHandle};
     use async_trait::async_trait;
-    use std::collections::BTreeMap;
+    use byteview::ByteView;
+    use std::collections::{BTreeMap, HashMap};
+    use std::str::FromStr;
+    use std::time::UNIX_EPOCH;
     use tempfile::TempDir;
     use tokio::io::{AsyncWriteExt, DuplexStream};
     use tokio::sync::Mutex as AsyncMutex;
@@ -1671,6 +1835,153 @@ mod tests {
         }
     }
 
+    async fn write_row(storage: &StorageHandle, key_space: &str, key: ByteView, value: Vec<u8>) {
+        let _ = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key,
+                value: value.into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    /// A group in the realm with the documents a permission check reads.
+    /// `owner` holds every role of it, or none when `member` is false.
+    async fn seed_group(state: &Arc<ServerState>, owner: UserId, member: bool) -> Ulid {
+        let realm_id = realm();
+        let group_id = Ulid::generate();
+        let actor = Actor {
+            node_id: node(),
+            user_id: owner,
+            realm_id,
+        };
+        let mut auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        if !member {
+            for role in auth.roles.values_mut() {
+                role.assigned_users.remove(&owner);
+            }
+        }
+        let group = Group {
+            display_name: "lab".to_string(),
+            group_id,
+            realm_id,
+            owner,
+            roles: auth.roles.keys().copied().collect(),
+        };
+        let config = DocumentSyncTarget::RealmConfig { realm_id };
+        let storage = &state.get_ctx().storage_handle;
+        write_row(
+            storage,
+            AUTH_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                .to_bytes(&actor)
+                .unwrap(),
+        )
+        .await;
+        write_row(
+            storage,
+            config.storage_keyspace(),
+            config.storage_key(),
+            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+                .to_bytes(&actor)
+                .unwrap(),
+        )
+        .await;
+        write_row(
+            storage,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().into(),
+            auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        write_row(
+            storage,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().into(),
+            group.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        group_id
+    }
+
+    async fn seed_bucket(state: &Arc<ServerState>, bucket: &str, group_id: Ulid, owner: UserId) {
+        let info = BucketInfo {
+            group_id,
+            created_at: UNIX_EPOCH,
+            created_by: owner,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 1,
+        };
+        write_row(
+            &state.get_ctx().storage_handle,
+            S3_BUCKET_KEYSPACE,
+            bucket.as_bytes().to_vec().into(),
+            info.to_bytes().unwrap(),
+        )
+        .await;
+    }
+
+    /// Puts `input.txt` into `bucket` as a reference bound to a connector.
+    async fn seed_reference(state: &Arc<ServerState>, bucket: &str, owner: UserId) {
+        let version_id = Ulid::generate();
+        let version = BlobVersion::reference(
+            VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::Http,
+                    public_config: HashMap::new(),
+                    source_path: "genomes/ref.fna".to_string(),
+                    version_selector: None,
+                    capabilities: Vec::new(),
+                    origin_node_id: None,
+                },
+                connector_id: Some(Ulid::generate()),
+            },
+            SourceMetadata {
+                content_length: 15,
+                content_type: None,
+                etag: Some("etag-1".to_string()),
+                last_modified: None,
+                source_version: None,
+            },
+            UNIX_EPOCH,
+            owner,
+            UNIX_EPOCH,
+        );
+        let storage = &state.get_ctx().storage_handle;
+        write_row(
+            storage,
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new(bucket, "input.txt")
+                .to_bytes()
+                .unwrap()
+                .into(),
+            CurrentVersionPointer::new(version_id).to_bytes().unwrap(),
+        )
+        .await;
+        write_row(
+            storage,
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(bucket, "input.txt", version_id)
+                .to_bytes()
+                .unwrap()
+                .into(),
+            version.to_bytes().unwrap(),
+        )
+        .await;
+    }
+
+    async fn inputs_body(response: Response) -> SessionInputsResponse {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("the body reads");
+        serde_json::from_slice(&bytes).expect("the body parses")
+    }
+
     fn input(bucket: &str, dest_key: &str) -> SessionInputRequest {
         SessionInputRequest {
             bucket: bucket.to_string(),
@@ -1678,6 +1989,7 @@ mod tests {
             version_id: None,
             source_node_id: None,
             dest_key: dest_key.to_string(),
+            strategy: SessionInputStrategy::Snapshot,
         }
     }
 
@@ -1697,6 +2009,139 @@ mod tests {
         )
         .await;
         assert!(matches!(response, Err(ServerError::BadRequestMessage(_))));
+    }
+
+    #[tokio::test]
+    async fn queues_reference_copy() {
+        // A reference behind a connector is not pulled inside the request: a
+        // copy job is queued, answered as pending and remembered by the session.
+        let owner = user(2);
+        let (_dir, state, job_id, _helper) = build_node(owner).await;
+        let group_id = seed_group(&state, owner, true).await;
+        seed_bucket(&state, "source", group_id, owner).await;
+        seed_bucket(&state, "lab-data", group_id, owner).await;
+        seed_reference(&state, "source", owner).await;
+
+        let response = stage_inputs(
+            State(state.clone()),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Json(SessionInputsRequest {
+                items: vec![input("source", "data/genomes/ref.fna")],
+            }),
+        )
+        .await
+        .expect("the copy is queued");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = inputs_body(response).await;
+        assert!(body.staged.is_empty() && body.failed.is_empty());
+        assert_eq!(body.pending.len(), 1);
+        assert_eq!(body.pending[0].dest_key, "data/genomes/ref.fna");
+        assert_eq!(body.pending[0].source_node_id, node().to_string());
+
+        let copy_id = JobId::from_str(&body.pending[0].job_id).expect("a job id");
+        let record = read_job_record(&state.get_ctx().storage_handle, copy_id, None)
+            .await
+            .expect("the record reads")
+            .expect("the copy job is stored");
+        let JobPayload::CopyObject(spec) = record.payload else {
+            panic!("a copy job was queued");
+        };
+        assert_eq!(
+            (spec.source_bucket.as_str(), spec.dest_bucket.as_str()),
+            ("source", "lab-data")
+        );
+        assert_eq!(spec.dest_key, "data/genomes/ref.fna");
+        assert_eq!(spec.auth_context.user_id, owner);
+        assert_eq!(record.progress.unit, "bytes");
+
+        let session = registry_session(&state, job_id).expect("session is live");
+        assert_eq!(
+            session
+                .pending()
+                .into_iter()
+                .map(|p| p.job_id)
+                .collect::<Vec<_>>(),
+            vec![body.pending[0].job_id.clone()]
+        );
+        assert!(session.inventory().is_empty());
+    }
+
+    #[tokio::test]
+    async fn links_reference_across_groups() {
+        // A linked reference is cloned from the source version, so it needs
+        // neither the connector in the workspace's group nor any byte.
+        let owner = user(2);
+        let (_dir, state, job_id, _helper) = build_node(owner).await;
+        let own_group = seed_group(&state, owner, true).await;
+        let shared_group = seed_group(&state, owner, true).await;
+        seed_bucket(&state, "lab-data", own_group, owner).await;
+        seed_bucket(&state, "shared", shared_group, owner).await;
+        seed_reference(&state, "shared", owner).await;
+
+        let mut item = input("shared", "data/genomes/ref.fna");
+        item.strategy = SessionInputStrategy::Reference;
+        let response = stage_inputs(
+            State(state.clone()),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Json(SessionInputsRequest { items: vec![item] }),
+        )
+        .await
+        .expect("the reference is linked");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = inputs_body(response).await;
+        assert!(body.pending.is_empty() && body.failed.is_empty());
+        assert_eq!(body.staged.len(), 1);
+        assert!(body.staged[0].linked);
+        assert_eq!(body.staged[0].bytes, 15);
+        assert!(body.staged[0].blake3.is_empty());
+
+        let head = drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: "lab-data".to_string(),
+                key: "data/genomes/ref.fna".to_string(),
+                version_id: None,
+            }),
+            &state.get_ctx(),
+        )
+        .await
+        .expect("the head drives")
+        .expect("the key exists")
+        .expect("the head succeeds");
+        assert!(head.location.is_none(), "no bytes were stored");
+        let binding = head
+            .source_binding
+            .expect("the workspace holds a reference");
+        assert_eq!(binding.descriptor.source_path, "genomes/ref.fna");
+        let session = registry_session(&state, job_id).expect("session is live");
+        assert_eq!(session.inventory().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refuses_unreadable_source() {
+        // The caller's read permission on the source bucket is checked before
+        // any lookup of the object, so a foreign group's data never moves.
+        let owner = user(2);
+        let (_dir, state, job_id, _helper) = build_node(owner).await;
+        let own_group = seed_group(&state, owner, true).await;
+        let foreign_group = seed_group(&state, owner, false).await;
+        seed_bucket(&state, "lab-data", own_group, owner).await;
+        seed_bucket(&state, "foreign", foreign_group, user(3)).await;
+        seed_reference(&state, "foreign", user(3)).await;
+
+        let response = stage_inputs(
+            State(state.clone()),
+            Extension(auth_for(owner)),
+            Path(job_id.to_string()),
+            Json(SessionInputsRequest {
+                items: vec![input("foreign", "data/ref.fna")],
+            }),
+        )
+        .await;
+        assert!(matches!(response, Err(ServerError::Forbidden)));
+        let session = registry_session(&state, job_id).expect("session is live");
+        assert!(session.pending().is_empty());
     }
 
     #[tokio::test]
@@ -1730,20 +2175,41 @@ mod tests {
             blake3: String::new(),
             source_node_id: node().to_string(),
             version_id: String::new(),
+            linked: false,
         }];
         let failed = vec![FailedInputResponse {
             dest_key: "data/b.txt".to_string(),
             error: "Not found".to_string(),
         }];
-        let response = inputs_outcome(staged, failed, Some(ServerError::NotFound))
+        let response = inputs_outcome(staged, Vec::new(), failed, Some(ServerError::NotFound))
             .expect("a partial result is accepted");
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .expect("the body reads");
-        let body: SessionInputsResponse = serde_json::from_slice(&bytes).expect("the body parses");
+        let body = inputs_body(response).await;
         assert_eq!(body.staged.len(), 1);
         assert_eq!(body.failed[0].dest_key, "data/b.txt");
+    }
+
+    #[test]
+    fn queued_only_is_progress() {
+        // A call that only queued copies still answers 202 instead of the
+        // refusal a later item earned.
+        let pending = vec![PendingInputResponse {
+            dest_key: "data/a.txt".to_string(),
+            job_id: "01JJCPYJB00123456789ABCDEF".to_string(),
+            source_node_id: node().to_string(),
+        }];
+        let response = inputs_outcome(Vec::new(), pending, Vec::new(), Some(ServerError::NotFound))
+            .expect("a queued copy is progress");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(matches!(
+            inputs_outcome(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Some(ServerError::NotFound)
+            ),
+            Err(ServerError::NotFound)
+        ));
     }
 
     /// The parsed body of a session read.
