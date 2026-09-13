@@ -224,10 +224,7 @@ async fn capture_inputs(
             ctx,
         )
         .await
-        .expect("head succeeds")
-        .transpose()
-        .expect("head decodes")
-        .expect("input object exists");
+        .expect("head succeeds");
         let location = head.location.as_ref().expect("input is materialized");
         captured.push(CapturedInput {
             destination_key: input.dest_key.clone(),

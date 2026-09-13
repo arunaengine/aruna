@@ -46,6 +46,8 @@ pub enum ListPartsError {
     UploadNotOpen,
     #[error("ListParts failed")]
     ListPartsFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Debug, PartialEq)]
@@ -230,7 +232,7 @@ impl ListPartsOperation {
 }
 
 impl Operation for ListPartsOperation {
-    type Output = Option<Result<ListPartsResult, ListPartsError>>;
+    type Output = ListPartsResult;
     type Error = ListPartsError;
 
     fn start(&mut self) -> Effects {
@@ -257,13 +259,11 @@ impl Operation for ListPartsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ListPartsState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(ListPartsError::ListPartsFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(ListPartsError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -396,8 +396,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let numbers: Vec<u16> = result.parts.iter().map(|part| part.part_number).collect();
@@ -437,8 +435,6 @@ mod test {
                 &driver_ctx,
             )
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
 
             collected.extend(result.parts.iter().map(|part| part.part_number));
@@ -483,8 +479,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         assert!(result.parts.is_empty());
         assert!(result.is_truncated);
@@ -502,8 +496,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         assert!(result.is_truncated);
         assert_eq!(result.next_part_number_marker, Some(2));

@@ -78,8 +78,7 @@ async fn create_bucket(
         ),
         context,
     )
-    .await?
-    .ok_or("bucket creation did not finish")??;
+    .await?;
     Ok(())
 }
 
@@ -117,8 +116,7 @@ async fn put_object(
         }),
         context,
     )
-    .await?
-    .ok_or("the put did not finish")??;
+    .await?;
     Ok(result.version_id)
 }
 
@@ -145,8 +143,7 @@ async fn read_object(
         }),
         context,
     )
-    .await?
-    .ok_or("the get did not finish")??;
+    .await?;
     let mut bytes = Vec::new();
     let mut blob = result.blob.0;
     while let Some(chunk) = blob.next().await {
@@ -178,8 +175,7 @@ async fn delete_object(
         }),
         context,
     )
-    .await?
-    .ok_or("the delete did not finish")??;
+    .await?;
     Ok(())
 }
 
@@ -525,8 +521,7 @@ async fn recovers_missing_bucket() -> TestResult<()> {
         DeleteBucketOperation::new(REMOTE_BUCKET.to_string()),
         &server.context,
     )
-    .await?
-    .ok_or("bucket deletion did not finish")??;
+    .await?;
     let error = reconcile_folder(&device.context, &folder)
         .await
         .expect_err("the missing bucket is reported");

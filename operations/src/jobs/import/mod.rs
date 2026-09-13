@@ -415,9 +415,7 @@ async fn acquire_source(
                 &ctx.driver,
             )
             .await
-            .and_then(|result| result.transpose())
-            .map_err(classify_get)?
-            .ok_or_else(|| ImportFailure::Permanent("source object not found".to_string()))?;
+            .map_err(classify_get)?;
             let expected_size = result
                 .location
                 .as_ref()
@@ -880,16 +878,12 @@ async fn write_next(
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
-    let result = drive(operation, &ctx.driver)
-        .await
-        .and_then(|result| result.transpose());
-    let result = match result {
+    let result = match drive(operation, &ctx.driver).await {
         Ok(result) => result,
         Err(_) if ctx.cancel.is_cancelled() => return Err(ImportFailure::Cancelled),
         Err(_) if ctx.shutdown.is_cancelled() => return Err(ImportFailure::Interrupted),
         Err(error) => return Err(classify_put(error)),
-    }
-    .ok_or_else(|| ImportFailure::Retryable("object write returned no result".to_string()))?;
+    };
     // The preflight validated identifiers built from the planned version.
     if result.version_id != entry.version_id {
         report_divergent(ctx, entry, result.version_id).await?;

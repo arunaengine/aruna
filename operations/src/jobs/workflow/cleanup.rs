@@ -27,11 +27,8 @@ async fn revoke_credential(ctx: &JobContext, access_key: &str) -> Result<(), Job
     )
     .await
     {
-        Ok(Some(Ok(_)))
-        | Ok(None)
-        | Ok(Some(Err(RevokeUserAccessError::NotFound)))
-        | Err(RevokeUserAccessError::NotFound) => Ok(()),
-        Ok(Some(Err(error))) | Err(error) => Err(revoke_error(error)),
+        Ok(_) | Err(RevokeUserAccessError::NotFound) => Ok(()),
+        Err(error) => Err(revoke_error(error)),
     }
 }
 
@@ -394,8 +391,6 @@ mod tests {
             &ctx.driver,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         if with_object {
@@ -541,10 +536,11 @@ mod tests {
                 JobRunOutcome::Succeeded(JobResultPayload::Cleanup)
             ));
         }
-        let stored = drive(GetUserAccessOperation::new(access.access_key), &ctx.driver)
-            .await
-            .unwrap();
-        assert!(stored.is_none());
+        let stored = drive(GetUserAccessOperation::new(access.access_key), &ctx.driver).await;
+        assert!(matches!(
+            stored,
+            Err(crate::s3::get_access::GetUserAccessError::NotFound)
+        ));
     }
 
     #[tokio::test]

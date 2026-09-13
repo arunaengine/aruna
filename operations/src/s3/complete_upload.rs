@@ -145,6 +145,8 @@ pub enum CompleteMultipartUploadError {
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("CompleteMultipartUpload failed")]
     CompleteMultipartUploadFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 impl From<UploadTargetError> for CompleteMultipartUploadError {
@@ -1752,7 +1754,7 @@ impl CompleteMultipartUploadOperation {
 }
 
 impl Operation for CompleteMultipartUploadOperation {
-    type Output = Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>;
+    type Output = CompleteMultipartUploadResult;
     type Error = CompleteMultipartUploadError;
 
     fn start(&mut self) -> Effects {
@@ -1837,14 +1839,11 @@ impl Operation for CompleteMultipartUploadOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state != CompleteMultipartUploadState::Finish {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(CompleteMultipartUploadError::NotFinished),
         }
-
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -2655,7 +2654,7 @@ mod tests {
         assert!(op.delete_location.is_none());
         assert!(matches!(
             op.finalize(),
-            Err(CompleteMultipartUploadError::CompleteMultipartUploadFailed)
+            Err(CompleteMultipartUploadError::NotFinished)
         ));
     }
 
@@ -3101,7 +3100,7 @@ mod tests {
                 }),
             ]
         ));
-        let result = op.finalize().unwrap().unwrap().unwrap();
+        let result = op.finalize().unwrap();
         assert_eq!(result.location, location);
     }
 

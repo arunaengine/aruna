@@ -396,14 +396,9 @@ async fn register_bucket(
             },
         );
         match drive(operation, context).await {
-            Ok(Some(Ok(_))) => {}
-            Ok(Some(Err(error))) | Err(error) => {
+            Ok(_) => {}
+            Err(error) => {
                 return Err(OfferedDirectoryError::Bucket(error));
-            }
-            Ok(None) => {
-                return Err(
-                    StorageError::WriteError("bucket creation did not finish".to_string()).into(),
-                );
             }
         }
     }
@@ -871,9 +866,7 @@ mod tests {
             context,
         )
         .await
-        .expect("get must run")
-        .expect("get must finish")
-        .expect("get must succeed");
+        .expect("get must run");
 
         let mut body = Vec::new();
         let mut blob = read.blob.0;

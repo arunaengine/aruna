@@ -137,10 +137,7 @@ pub async fn stage_snapshot_blob(
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
-    let put_result = drive(operation, context)
-        .await
-        .and_then(|result| result.transpose())?;
-    let put_result = put_result.ok_or(PutObjectError::PutObjectFailed)?;
+    let put_result = drive(operation, context).await?;
 
     Ok(MaterializeSnapshotResult {
         connector: read_result.connector,

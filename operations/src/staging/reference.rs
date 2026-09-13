@@ -885,8 +885,6 @@ mod tests {
             context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         let initial_hash: [u8; 32] = initial.location.get_blake3().unwrap().try_into().unwrap();
 

@@ -57,6 +57,8 @@ pub enum CreateMultipartUploadError {
     PurgeFence(#[from] PurgeFenceError),
     #[error("CreateMultipartUpload failed")]
     CreateMultipartUploadFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -331,7 +333,7 @@ impl CreateMultipartUploadOperation {
 }
 
 impl Operation for CreateMultipartUploadOperation {
-    type Output = Option<Result<CreateMultipartUploadResult, CreateMultipartUploadError>>;
+    type Output = CreateMultipartUploadResult;
     type Error = CreateMultipartUploadError;
 
     fn start(&mut self) -> Effects {
@@ -366,14 +368,11 @@ impl Operation for CreateMultipartUploadOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == CreateMultipartUploadState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(CreateMultipartUploadError::CreateMultipartUploadFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(CreateMultipartUploadError::NotFinished),
         }
-
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {

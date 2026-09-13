@@ -429,11 +429,9 @@ pub async fn revoke_s3_credentials(
     )
     .await
     {
-        Ok(Some(Ok(credential))) => credential,
-        Ok(None)
-        | Ok(Some(Err(GetUserAccessError::NotFound)))
-        | Err(GetUserAccessError::NotFound) => return Err(ServerError::NotFound),
-        Ok(Some(Err(err))) | Err(err) => return Err(ServerError::InternalError(err.to_string())),
+        Ok(credential) => credential,
+        Err(GetUserAccessError::NotFound) => return Err(ServerError::NotFound),
+        Err(err) => return Err(ServerError::InternalError(err.to_string())),
     };
 
     // Group write cannot revoke another member's credential without user administration.
@@ -457,11 +455,9 @@ pub async fn revoke_s3_credentials(
     )
     .await
     {
-        Ok(Some(Ok(_))) => Ok(StatusCode::NO_CONTENT),
-        Ok(None)
-        | Ok(Some(Err(RevokeUserAccessError::NotFound)))
-        | Err(RevokeUserAccessError::NotFound) => Err(ServerError::NotFound),
-        Ok(Some(Err(err))) | Err(err) => Err(ServerError::InternalError(err.to_string())),
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Err(RevokeUserAccessError::NotFound) => Err(ServerError::NotFound),
+        Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
 }
 
@@ -1086,8 +1082,6 @@ mod tests {
         assert!(matches!(error, ServerError::Forbidden));
         let credential = drive(GetUserAccessOperation::new(access_key_id), &state.get_ctx())
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
         assert!(!credential.is_revoked());
     }

@@ -135,9 +135,7 @@ async fn create_sync_bucket(
         ),
         context,
     )
-    .await?
-    .transpose()?
-    .ok_or(CreateBucketError::CreateBucketFailed)?;
+    .await?;
     Ok(())
 }
 

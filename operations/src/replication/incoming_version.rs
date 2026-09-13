@@ -677,9 +677,7 @@ impl IncomingVersionReplicationOperation {
             ),
             |result| Event::SubOperation(SubOperationEvent::BucketCreated {
                 result: match result {
-                    Ok(Some(Ok(_))) => Ok(()),
-                    Ok(Some(Err(err))) => Err(err.to_string()),
-                    Ok(None) => Err("bucket creation returned no result".to_string()),
+                    Ok(_) => Ok(()),
                     Err(err) => Err(err.to_string()),
                 },
             }),

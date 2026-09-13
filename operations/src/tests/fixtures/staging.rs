@@ -101,8 +101,6 @@ pub(crate) async fn create_test_bucket(
         context,
     )
     .await
-    .expect("bucket creation must succeed")
-    .expect("bucket creation must finish")
-    .expect("bucket creation must return info");
+    .expect("bucket creation must succeed");
     info
 }

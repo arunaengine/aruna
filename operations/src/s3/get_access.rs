@@ -37,6 +37,8 @@ pub enum GetUserAccessError {
     NotFound,
     #[error("GetUserAccess failed")]
     GetUserAccessFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Debug, PartialEq)]
@@ -70,11 +72,13 @@ impl GetUserAccessOperation {
 
     fn access_received(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::ReadResult { value, .. }) = event {
-            let output = value.map(|value| {
-                UserAccess::from_bytes(&value).map_err(GetUserAccessError::ConversionError)
-            });
             self.state = GetUserAccessState::Finish;
-            self.output = output;
+            self.output = Some(match value {
+                Some(value) => {
+                    UserAccess::from_bytes(&value).map_err(GetUserAccessError::ConversionError)
+                }
+                None => Err(GetUserAccessError::NotFound),
+            });
             smallvec![]
         } else {
             self.emit_error(GetUserAccessError::InvalidStateEvent {
@@ -93,7 +97,7 @@ impl GetUserAccessOperation {
 }
 
 impl Operation for GetUserAccessOperation {
-    type Output = Option<Result<UserAccess, GetUserAccessError>>;
+    type Output = UserAccess;
     type Error = GetUserAccessError;
 
     fn start(&mut self) -> Effects {
@@ -120,13 +124,11 @@ impl Operation for GetUserAccessOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if GetUserAccessState::Error == self.state {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(GetUserAccessError::GetUserAccessFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(GetUserAccessError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -184,11 +186,7 @@ mod test {
         };
 
         let operation = GetUserAccessOperation::new(access_key_id.to_string());
-        let result = drive(operation, &driver_ctx)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let result = drive(operation, &driver_ctx).await.unwrap();
 
         assert_eq!(result, user_access);
     }

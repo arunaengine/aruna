@@ -232,7 +232,7 @@ async fn mint_credential(
     ))
     .await
     {
-        Ok(Some(Ok(access))) => {
+        Ok(access) => {
             let matches_job = access.access_key == access_key
                 && access.user_identity == record.created_by
                 && access.group_id == spec.group_id
@@ -256,10 +256,8 @@ async fn mint_credential(
                 return Err(JobError::permanent("workspace credential expired"));
             }
         }
-        Ok(None)
-        | Ok(Some(Err(GetUserAccessError::NotFound)))
-        | Err(GetUserAccessError::NotFound) => {}
-        Ok(Some(Err(error))) | Err(error) => {
+        Err(GetUserAccessError::NotFound) => {}
+        Err(error) => {
             return Err(JobError::retryable(format!(
                 "workspace credential lookup failed: {error}"
             )));
@@ -436,11 +434,9 @@ pub async fn prepare_mounts(
             context,
         ))
         .await
-        .and_then(|result| result.transpose())
         {
-            Ok(Some(_)) => {}
-            Ok(None)
-            | Err(
+            Ok(_) => {}
+            Err(
                 HeadObjectError::NoSuchKey
                 | HeadObjectError::NoSuchVersion
                 | HeadObjectError::DeleteMarker,
@@ -540,11 +536,9 @@ async fn input_bytes(
         }),
         context,
     ))
-    .await
-    .and_then(|result| result.transpose());
+    .await;
     let failure = match local {
-        Ok(Some(get)) => return Ok(StagedSource::from_local(get)),
-        Ok(None) => None,
+        Ok(get) => return Ok(StagedSource::from_local(get)),
         Err(error) => Some(error),
     };
     let Some(input_pin) = captured() else {
@@ -636,9 +630,8 @@ async fn local_copy_source(
             }),
             context,
         ))
-        .await
-        .and_then(|result| result.transpose());
-        if let Ok(Some(get)) = get {
+        .await;
+        if let Ok(get) = get {
             return Some(StagedSource::from_local(get));
         }
     }
@@ -941,7 +934,6 @@ async fn put_file_output(
     }
     let result = Box::pin(drive(operation, context))
         .await
-        .and_then(|result| result.transpose())
         // A failure caused by the container-side stream keeps its own
         // retryable/permanent classification instead of the put's.
         .map_err(
@@ -949,8 +941,7 @@ async fn put_file_output(
                 Some(backend_error) => output_read_error(&backend_error),
                 None => put_object_error("output write", error),
             },
-        )?
-        .ok_or_else(|| JobError::retryable("output write returned no version"))?;
+        )?;
     if remote {
         Box::pin(replicate_output(
             context,
@@ -1098,14 +1089,8 @@ async fn cleanup_output_stage(
         context,
     ))
     .await
-    .and_then(|result| result.transpose())
     {
-        Ok(Some(_)) | Err(DeleteObjectError::NoSuchVersion) => {}
-        Ok(None) => {
-            return Err(JobError::retryable(
-                "output staging delete returned no result",
-            ));
-        }
+        Ok(_) | Err(DeleteObjectError::NoSuchVersion) => {}
         Err(error) => {
             return Err(JobError::retryable(format!(
                 "output staging delete failed: {error}"
@@ -1117,12 +1102,8 @@ async fn cleanup_output_stage(
         context,
     ))
     .await
-    .and_then(|result| result.transpose())
     {
-        Ok(Some(())) | Err(DeleteBucketError::NotFound) => Ok(()),
-        Ok(None) => Err(JobError::retryable(
-            "output staging bucket delete returned no result",
-        )),
+        Ok(()) | Err(DeleteBucketError::NotFound) => Ok(()),
         Err(error) => Err(JobError::retryable(format!(
             "output staging bucket delete failed: {error}"
         ))),
@@ -1438,9 +1419,7 @@ pub async fn collect_outputs(
                 context,
             ))
             .await
-            .and_then(|result| result.transpose())
             .map_err(|error| JobError::retryable(format!("output inventory failed: {error}")))?;
-            let Some(result) = result else { break };
             for object in result.objects {
                 let key = object.head.key;
                 let Some(version_id) = reserved_version(control, node_id, bucket, &key) else {
@@ -1521,16 +1500,14 @@ async fn head_version(
         context,
     ))
     .await
-    .and_then(|result| result.transpose())
     {
-        Ok(Some(result)) => match result.version_id {
+        Ok(result) => match result.version_id {
             Some(found) if found == version_id => Ok(Some(result.location)),
             _ => Err(JobError::permanent(format!(
                 "output {bucket}/{key} does not carry reserved version {version_id}"
             ))),
         },
-        Ok(None)
-        | Err(
+        Err(
             HeadObjectError::NoSuchKey
             | HeadObjectError::NoSuchVersion
             | HeadObjectError::DeleteMarker,
@@ -2059,8 +2036,6 @@ mod tests {
             &context,
         ))
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         let mut expired = access.clone();
         expired.expiry = SystemTime::UNIX_EPOCH;
@@ -2082,8 +2057,6 @@ mod tests {
             &context,
         ))
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         assert!(!renewed_access.is_expired(SystemTime::now()));
         let restrictions = renewed_access.path_restrictions.unwrap();
@@ -2124,8 +2097,6 @@ mod tests {
             &context,
         ))
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         access
             .encrypt_secret(

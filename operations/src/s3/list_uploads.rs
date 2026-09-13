@@ -42,6 +42,8 @@ pub enum ListMultipartUploadsError {
     NoTransactionFound,
     #[error("ListMultipartUploads failed")]
     ListMultipartUploadsFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Debug, PartialEq)]
@@ -312,7 +314,7 @@ impl ListMultipartUploadsOperation {
 }
 
 impl Operation for ListMultipartUploadsOperation {
-    type Output = Option<Result<ListMultipartUploadsResult, ListMultipartUploadsError>>;
+    type Output = ListMultipartUploadsResult;
     type Error = ListMultipartUploadsError;
 
     fn start(&mut self) -> Effects {
@@ -343,13 +345,11 @@ impl Operation for ListMultipartUploadsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ListMultipartUploadsState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(ListMultipartUploadsError::ListMultipartUploadsFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(ListMultipartUploadsError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -464,8 +464,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let keys: Vec<&str> = result
@@ -505,8 +503,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.uploads.len(), 1);
@@ -566,8 +562,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.uploads.len(), 1);
@@ -593,8 +587,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert!(result.uploads.is_empty());
@@ -634,8 +626,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let ordered: Vec<(&str, Ulid)> = result
@@ -700,8 +690,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let ordered: Vec<Ulid> = result
@@ -743,8 +731,6 @@ mod test {
                 &driver_ctx,
             )
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
 
             collected.extend(result.uploads.iter().map(|upload| upload.key.clone()));
@@ -797,8 +783,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         assert!(first.is_truncated);
         assert_eq!(
@@ -822,8 +806,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(second.uploads.len(), 1);
@@ -860,8 +842,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(
@@ -902,8 +882,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let keys: Vec<&str> = result
@@ -941,8 +919,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let keys: Vec<&str> = result

@@ -289,10 +289,7 @@ pub async fn get_bucket_routing(
     .map_err(|error| match error {
         GetBucketRoutingError::NoSuchBucket => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
-    })?
-    .transpose()
-    .map_err(|error| ServerError::InternalError(error.to_string()))?
-    .unwrap_or_default();
+    })?;
 
     let warnings = warnings_for(&state, group_id, rules.iter().map(|rule| &rule.target)).await;
     Ok(Json(BucketRoutingResponse {
@@ -397,10 +394,7 @@ pub async fn put_bucket_routing(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_put_error)?
-    .transpose()
-    .map_err(map_put_error)?
-    .unwrap_or_default();
+    .map_err(map_put_error)?;
 
     let warnings = warnings_for(&state, group_id, stored.iter().map(|rule| &rule.target)).await;
     Ok(Json(BucketRoutingResponse {

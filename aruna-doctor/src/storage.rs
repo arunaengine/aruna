@@ -698,8 +698,6 @@ mod tests {
                 context.as_ref(),
             )
             .await
-            .unwrap()
-            .expect("bucket creation returned no result")
             .unwrap();
 
             let data = b"tiny snapshot object";
@@ -729,8 +727,6 @@ mod tests {
                 context.as_ref(),
             )
             .await
-            .unwrap()
-            .expect("put object returned no result")
             .unwrap();
             assert_eq!(upload.location.blob_size, data.len() as u64);
 

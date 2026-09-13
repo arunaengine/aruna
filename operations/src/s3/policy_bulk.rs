@@ -1142,8 +1142,6 @@ mod tests {
         drive(operation, context)
             .await
             .expect("put drives")
-            .expect("put succeeds")
-            .expect("put returns a result")
             .version_id
     }
 

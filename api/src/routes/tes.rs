@@ -1937,11 +1937,9 @@ async fn authenticate_tes(
     )
     .await
     {
-        Ok(Some(Ok(access))) => access,
-        Ok(None)
-        | Ok(Some(Err(GetUserAccessError::NotFound)))
-        | Err(GetUserAccessError::NotFound) => return Err(TesError::unauthorized()),
-        Ok(Some(Err(error))) | Err(error) => return Err(TesError::internal(error.to_string())),
+        Ok(access) => access,
+        Err(GetUserAccessError::NotFound) => return Err(TesError::unauthorized()),
+        Err(error) => return Err(TesError::internal(error.to_string())),
     };
     // The secret is encrypted with this node's issuer-local key, so it opens only for a
     // credential this node issued; a foreign or tampered record never matches.

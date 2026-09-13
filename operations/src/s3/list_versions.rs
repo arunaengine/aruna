@@ -76,6 +76,8 @@ pub enum ListObjectVersionsError {
     NoTransactionFound,
     #[error("ListObjectVersions failed")]
     ListObjectVersionsFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -730,7 +732,7 @@ impl ListObjectVersionsOperation {
 }
 
 impl Operation for ListObjectVersionsOperation {
-    type Output = Option<Result<ListObjectVersionsResult, ListObjectVersionsError>>;
+    type Output = ListObjectVersionsResult;
     type Error = ListObjectVersionsError;
 
     fn start(&mut self) -> Effects {
@@ -761,13 +763,11 @@ impl Operation for ListObjectVersionsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ListObjectVersionsState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(ListObjectVersionsError::ListObjectVersionsFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(ListObjectVersionsError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -930,8 +930,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.items.len(), 2);
@@ -980,8 +978,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.items.len(), 2);
@@ -1027,8 +1023,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.items.len(), 2);
@@ -1082,8 +1076,6 @@ mod test {
                 &driver_ctx,
             )
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
 
             for item in &result.items {
@@ -1139,8 +1131,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let keys: Vec<&str> = result
@@ -1202,8 +1192,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.items.len(), 1);
@@ -1240,8 +1228,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let keys: Vec<&str> = result
@@ -1286,8 +1272,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert!(first.is_truncated);
@@ -1307,8 +1291,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert!(!second.is_truncated);
@@ -1336,8 +1318,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let observed: Vec<(Ulid, bool)> = result

@@ -2050,8 +2050,6 @@ mod tests {
             &ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let global = read_global_counters(&ctx).await;
@@ -2470,8 +2468,6 @@ mod tests {
             &ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert!(

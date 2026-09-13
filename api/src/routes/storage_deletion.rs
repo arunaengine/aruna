@@ -292,9 +292,7 @@ pub async fn deletion_preflight(
         &state.get_ctx(),
     )
     .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| ServerError::InternalError(error.to_string()))?
-    .ok_or_else(|| ServerError::InternalError("version inventory returned no result".into()))?;
+    .map_err(|error| ServerError::InternalError(error.to_string()))?;
     let uploads = drive(
         ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
             bucket: scope.bucket().to_string(),
@@ -308,9 +306,7 @@ pub async fn deletion_preflight(
         &state.get_ctx(),
     )
     .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| ServerError::InternalError(error.to_string()))?
-    .ok_or_else(|| ServerError::InternalError("multipart inventory returned no result".into()))?;
+    .map_err(|error| ServerError::InternalError(error.to_string()))?;
 
     let (items, versions_truncated, next_version_key_marker, next_version_id_marker) =
         scoped_version_page(&scope, versions);

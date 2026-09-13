@@ -3138,10 +3138,9 @@ async fn create_remote_bucket(
         ),
         context.as_ref(),
     )
-    .await
-    .and_then(|result| result.transpose());
+    .await;
     match created {
-        Ok(Some(_)) => Ok(()),
+        Ok(_) => Ok(()),
         Err(CreateBucketError::BucketAlreadyExists) => {
             match drive(
                 GetBucketInfoOperation::new(bucket.to_string()),
@@ -3156,7 +3155,7 @@ async fn create_remote_bucket(
                 Err(_) => Err(SyncRefusal::Unavailable),
             }
         }
-        Ok(None) | Err(_) => Err(SyncRefusal::Unavailable),
+        Err(_) => Err(SyncRefusal::Unavailable),
     }
 }
 

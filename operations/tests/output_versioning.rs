@@ -124,8 +124,6 @@ async fn create_bucket(harness: &Harness, bucket: &str) {
         &harness.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 }
 
@@ -266,8 +264,6 @@ async fn put_version(
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
 }
 
 async fn head_object(harness: &Harness, version_id: Option<Ulid>) -> HeadObjectResult {
@@ -280,8 +276,6 @@ async fn head_object(harness: &Harness, version_id: Option<Ulid>) -> HeadObjectR
         &harness.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap()
 }
 
@@ -298,8 +292,6 @@ async fn list_versions(harness: &Harness) -> Vec<Ulid> {
         &harness.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
     result
         .items
@@ -650,8 +642,6 @@ async fn list_buckets(harness: &Harness) -> Vec<String> {
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
     .buckets
     .into_iter()
     .map(|(name, _)| name)
@@ -711,18 +701,16 @@ async fn run_capture(
 
 /// Whether the object exists at all, at any version.
 async fn object_exists(harness: &Harness, bucket: &str, key: &str) -> bool {
-    matches!(
-        drive(
-            HeadObjectOperation::new(HeadObjectInput {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                version_id: None,
-            }),
-            &harness.driver,
-        )
-        .await,
-        Ok(Some(Ok(_)))
+    drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: None,
+        }),
+        &harness.driver,
     )
+    .await
+    .is_ok()
 }
 
 #[tokio::test]

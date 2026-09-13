@@ -29,6 +29,8 @@ pub enum PutBucketCorsError {
     NotFound,
     #[error("No transaction found")]
     NoTransactionFound,
+    #[error("PutBucketCors did not finish")]
+    NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -81,7 +83,7 @@ impl PutBucketCorsOperation {
 }
 
 impl Operation for PutBucketCorsOperation {
-    type Output = Option<Result<BucketCorsConfiguration, PutBucketCorsError>>;
+    type Output = BucketCorsConfiguration;
     type Error = PutBucketCorsError;
 
     fn start(&mut self) -> Effects {
@@ -184,12 +186,7 @@ impl Operation for PutBucketCorsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == PutBucketCorsState::Error
-            && let Some(Err(err)) = self.output
-        {
-            return Err(err);
-        }
-        Ok(self.output)
+        self.output.unwrap_or(Err(PutBucketCorsError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -219,6 +216,8 @@ pub enum GetBucketCorsError {
     BucketNotFound,
     #[error("Bucket CORS configuration not found")]
     CorsNotFound,
+    #[error("GetBucketCors did not finish")]
+    NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -260,7 +259,7 @@ impl GetBucketCorsOperation {
 }
 
 impl Operation for GetBucketCorsOperation {
-    type Output = Option<Result<BucketCorsConfiguration, GetBucketCorsError>>;
+    type Output = BucketCorsConfiguration;
     type Error = GetBucketCorsError;
 
     fn start(&mut self) -> Effects {
@@ -312,12 +311,7 @@ impl Operation for GetBucketCorsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == GetBucketCorsState::Error
-            && let Some(Err(err)) = self.output
-        {
-            return Err(err);
-        }
-        Ok(self.output)
+        self.output.unwrap_or(Err(GetBucketCorsError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -346,6 +340,8 @@ pub enum DeleteBucketCorsError {
     NotFound,
     #[error("No transaction found")]
     NoTransactionFound,
+    #[error("DeleteBucketCors did not finish")]
+    NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -396,7 +392,7 @@ impl DeleteBucketCorsOperation {
 }
 
 impl Operation for DeleteBucketCorsOperation {
-    type Output = Option<Result<(), DeleteBucketCorsError>>;
+    type Output = ();
     type Error = DeleteBucketCorsError;
 
     fn start(&mut self) -> Effects {
@@ -499,12 +495,8 @@ impl Operation for DeleteBucketCorsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == DeleteBucketCorsState::Error
-            && let Some(Err(err)) = self.output
-        {
-            return Err(err);
-        }
-        Ok(self.output)
+        self.output
+            .unwrap_or(Err(DeleteBucketCorsError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -631,8 +623,6 @@ mod tests {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         assert_eq!(stored, config);
 
@@ -644,16 +634,12 @@ mod tests {
 
         let fetched = drive(GetBucketCorsOperation::new(bucket.to_string()), &context)
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
         assert_eq!(fetched, config);
 
-        let deleted = drive(DeleteBucketCorsOperation::new(bucket.to_string()), &context)
+        drive(DeleteBucketCorsOperation::new(bucket.to_string()), &context)
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(deleted, Ok(()));
 
         let cleared = read_bucket(&context, bucket).await;
         assert_eq!(cleared.group_id, original.group_id);
@@ -663,16 +649,12 @@ mod tests {
 
         let missing_cors = drive(GetBucketCorsOperation::new(bucket.to_string()), &context)
             .await
-            .unwrap()
-            .unwrap()
             .unwrap_err();
         assert_eq!(missing_cors, GetBucketCorsError::CorsNotFound);
 
-        let deleted_again = drive(DeleteBucketCorsOperation::new(bucket.to_string()), &context)
+        drive(DeleteBucketCorsOperation::new(bucket.to_string()), &context)
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(deleted_again, Ok(()));
     }
 
     #[tokio::test]
@@ -690,8 +672,6 @@ mod tests {
 
         let get_missing = drive(GetBucketCorsOperation::new(bucket.clone()), &context)
             .await
-            .unwrap()
-            .unwrap()
             .unwrap_err();
         assert_eq!(get_missing, GetBucketCorsError::BucketNotFound);
 
@@ -705,8 +685,6 @@ mod tests {
 
         let get_no_config = drive(GetBucketCorsOperation::new(bucket.clone()), &context)
             .await
-            .unwrap()
-            .unwrap()
             .unwrap_err();
         assert_eq!(get_no_config, GetBucketCorsError::CorsNotFound);
     }

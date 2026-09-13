@@ -1843,9 +1843,7 @@ async fn list_group_buckets(
         &state.get_ctx(),
     )
     .await
-    .and_then(|output| output.transpose())
-    .map_err(|err| ServerError::InternalError(err.to_string()))?
-    .ok_or_else(|| ServerError::InternalError("bucket listing produced no result".to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
 
     let entries = result
         .buckets
@@ -1895,9 +1893,7 @@ async fn list_bucket_objects(
         &state.get_ctx(),
     )
     .await
-    .and_then(|output| output.transpose())
-    .map_err(|err| ServerError::InternalError(err.to_string()))?
-    .ok_or_else(|| ServerError::InternalError("object listing produced no result".to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
 
     let mut entries = Vec::with_capacity(result.objects.len() + result.common_prefixes.len());
     for prefix in result.common_prefixes {

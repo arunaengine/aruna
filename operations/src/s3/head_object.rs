@@ -73,6 +73,8 @@ pub enum HeadObjectError {
     ManagedCopyError(#[from] ManagedCopyError),
     #[error("HeadObject failed")]
     HeadObjectFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Debug, PartialEq)]
@@ -541,7 +543,7 @@ impl HeadObjectOperation {
 }
 
 impl Operation for HeadObjectOperation {
-    type Output = Option<Result<HeadObjectResult, HeadObjectError>>;
+    type Output = HeadObjectResult;
     type Error = HeadObjectError;
 
     fn start(&mut self) -> Effects {
@@ -573,13 +575,11 @@ impl Operation for HeadObjectOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if HeadObjectState::Error == self.state {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(HeadObjectError::HeadObjectFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(HeadObjectError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -738,8 +738,6 @@ mod tests {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.location, Some(location));
@@ -837,8 +835,6 @@ mod tests {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert_eq!(result.location, Some(location));
@@ -936,7 +932,7 @@ mod tests {
                 }))
                 .is_empty()
         );
-        let result = operation.finalize().unwrap().unwrap().unwrap();
+        let result = operation.finalize().unwrap();
         assert_eq!(result.source_metadata, Some(refreshed_metadata));
         assert!(result.last_refresh.is_some());
         assert_eq!(result.version_id, Some(version_id));
@@ -1054,8 +1050,6 @@ mod tests {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert!(result.location.is_none());

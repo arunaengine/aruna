@@ -352,9 +352,7 @@ pub(crate) async fn get_user_access(
         GetUserAccessOperation::new(access_key_id.to_string()),
         context,
     )
-    .await?
-    .ok_or_else(|| std::io::Error::other("user access not found"))?
-    .map_err(|err| std::io::Error::other(err.to_string()))?;
+    .await?;
 
     Ok(access)
 }

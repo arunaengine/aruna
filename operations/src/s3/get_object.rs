@@ -153,6 +153,8 @@ pub enum GetObjectError {
     GovernedUnavailable,
     #[error("GetObject failed (miserably)")]
     GetObjectFailed,
+    #[error("operation did not finish")]
+    NotFinished,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1282,7 +1284,7 @@ impl GetObjectOperation {
 }
 
 impl Operation for GetObjectOperation {
-    type Output = Option<Result<GetObjectResult, GetObjectError>>;
+    type Output = GetObjectResult;
     type Error = GetObjectError;
 
     fn start(&mut self) -> Effects {
@@ -1321,13 +1323,11 @@ impl Operation for GetObjectOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if GetObjectState::Error == self.state {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(GetObjectError::GetObjectFailed);
+        match self.output {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Err(GetObjectError::NotFinished),
         }
-        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {
@@ -1344,7 +1344,7 @@ pub async fn get_object_routed(
     context: &DriverContext,
     input: GetObjectInput,
     restrictions: Option<Vec<PathRestriction>>,
-) -> Result<Option<Result<GetObjectResult, GetObjectError>>, GetObjectError> {
+) -> Result<GetObjectResult, GetObjectError> {
     let ranged = input.range.is_some();
     let user_id = input.user_identity;
     let operation = GetObjectOperation::new(input).with_restrictions(restrictions.clone());
@@ -1360,7 +1360,7 @@ pub async fn get_object_routed(
         return result;
     };
     if ranged || !local_is_user(context, user_id.realm_id).await {
-        return Ok(Some(Err(GetObjectError::GetObjectFailed)));
+        return Err(GetObjectError::GetObjectFailed);
     }
     let read = RoutedRead {
         user_id,
@@ -1371,7 +1371,7 @@ pub async fn get_object_routed(
         source_policies,
         restrictions,
     };
-    Ok(Some(routed_blob(context, read).await))
+    routed_blob(context, read).await
 }
 
 /// Resolves complete object facts without transferring holder bytes.
@@ -1385,15 +1385,15 @@ pub async fn get_object_info(
     }
     let user_id = input.user_identity;
     let operation = GetObjectOperation::new(input).with_restrictions(restrictions.clone());
-    match drive(operation, context).await? {
-        Some(Ok(result)) => Ok(result.info),
-        Some(Err(GetObjectError::BlobNotLocal {
+    match drive(operation, context).await {
+        Ok(result) => Ok(result.info),
+        Err(GetObjectError::BlobNotLocal {
             blake3,
             version_id,
             metadata,
             version_created_at,
             source_policies,
-        })) if local_is_user(context, user_id.realm_id).await => {
+        }) if local_is_user(context, user_id.realm_id).await => {
             let read = RoutedRead {
                 user_id,
                 blake3,
@@ -1405,8 +1405,7 @@ pub async fn get_object_info(
             };
             routed_metadata(context, read).await
         }
-        Some(Err(error)) => Err(error),
-        None => Err(GetObjectError::GetObjectFailed),
+        Err(error) => Err(error),
     }
 }
 
@@ -2091,7 +2090,7 @@ mod test {
             )])),
         }));
         assert!(effects.is_empty());
-        let result = operation.finalize().unwrap().unwrap().unwrap();
+        let result = operation.finalize().unwrap();
         let resolved_range = result.resolved_range.unwrap();
         assert_eq!(resolved_range.range, 6..10);
         assert_eq!(resolved_range.content_length, 4);
@@ -2281,11 +2280,7 @@ mod test {
             node_id: test_node_id(),
         });
 
-        let blob_result = drive(operation, &driver_ctx)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let blob_result = drive(operation, &driver_ctx).await.unwrap();
         assert_eq!(
             blob_result.location.as_ref().unwrap().hashes,
             location.hashes
@@ -2388,10 +2383,7 @@ mod test {
             None,
         )
         .await;
-        assert!(matches!(
-            read,
-            Ok(Some(Err(GetObjectError::GetObjectFailed)))
-        ));
+        assert!(matches!(read, Err(GetObjectError::GetObjectFailed)));
 
         let ranged = get_object_routed(
             &driver_ctx,
@@ -2407,10 +2399,7 @@ mod test {
             None,
         )
         .await;
-        assert!(matches!(
-            ranged,
-            Ok(Some(Err(GetObjectError::GetObjectFailed)))
-        ));
+        assert!(matches!(ranged, Err(GetObjectError::GetObjectFailed)));
     }
 
     #[tokio::test]
@@ -2545,12 +2534,7 @@ mod test {
             node_id: test_node_id(),
         });
 
-        let mut blob_stream = drive(operation, &driver_ctx)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
-            .blob;
+        let mut blob_stream = drive(operation, &driver_ctx).await.unwrap().blob;
         let mut read_buffer = Vec::new();
         let mut read_error = None;
         while let Some(result) = blob_stream.next().await {
@@ -2684,8 +2668,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         assert!(result.location.is_none());
@@ -2859,8 +2841,6 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let mut stream = result.blob;

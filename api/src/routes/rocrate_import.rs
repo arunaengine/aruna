@@ -528,9 +528,8 @@ async fn fast_source_check(
             )
             .await
             {
-                Ok(Some(Ok(result))) => result,
-                Ok(Some(Err(error))) | Err(error) => return Err(map_head_error(error)),
-                Ok(None) => return Err(ServerError::NotFound),
+                Ok(result) => result,
+                Err(error) => return Err(map_head_error(error)),
             };
             if result
                 .location
