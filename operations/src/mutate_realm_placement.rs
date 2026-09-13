@@ -41,6 +41,7 @@ use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 use crate::placement::placement_ref_for_target;
+use crate::queue_backoff::conflict_backoff;
 use crate::sync_placement::schedule_placement_revalidation_effect;
 
 const STRATEGY_REFERENCE_SCAN_PAGE_SIZE: usize = 8_192;
@@ -1113,6 +1114,15 @@ impl Operation for MutateRealmPlacementOperation {
     type Output = RealmConfigDocument;
     type Error = MutateRealmPlacementError;
 
+    /// An SSI conflict is ordinary contention that every caller re-drives, so
+    /// only an exhausted retry belongs on the error stream.
+    fn expected_error(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            MutateRealmPlacementError::StorageError(StorageError::TransactionConflict)
+        )
+    }
+
     fn start(&mut self) -> Effects {
         let Some(auth_context) = self.auth_context.clone() else {
             self.state = MutateRealmPlacementState::StartTransaction;
@@ -1400,6 +1410,12 @@ impl Operation for MutateRealmPlacementOperation {
 /// loss are retried without creating a second concurrent drainer or replacing a
 /// persisted failure deadline. `auth_context` carries the requesting caller's
 /// token, and is `None` for a mutation the node originates itself.
+/// Attempts one mutation gets before a persisting conflict is reported.
+const MUTATION_CONFLICT_RETRIES: usize = 10;
+
+/// Drives one placement mutation, re-driving it on an SSI conflict: inbound
+/// replication and the node's own reconciler write the same realm config
+/// document, so bounded interference is expected rather than a failure.
 pub async fn drive_realm_placement_mutation(
     config: MutateRealmPlacementConfig,
     auth_context: Option<AuthContext>,
@@ -1411,11 +1427,32 @@ pub async fn drive_realm_placement_mutation(
             if entry.draining
                 && context.net_handle.as_ref().map(|net| net.node_id()) == Some(entry.node_id)
     );
-    let operation = match auth_context {
-        Some(auth_context) => MutateRealmPlacementOperation::authorized(config, auth_context),
-        None => MutateRealmPlacementOperation::new(config),
+    let mut attempts = 0;
+    let outcome = loop {
+        let operation = match auth_context.clone() {
+            Some(auth_context) => {
+                MutateRealmPlacementOperation::authorized(config.clone(), auth_context)
+            }
+            None => MutateRealmPlacementOperation::new(config.clone()),
+        };
+        match crate::driver::drive(operation, context).await {
+            Err(MutateRealmPlacementError::StorageError(StorageError::TransactionConflict))
+                if attempts < MUTATION_CONFLICT_RETRIES =>
+            {
+                // Retrying with no wait spends every attempt in one contention window.
+                tokio::time::sleep(conflict_backoff(attempts, config.actor.node_id.as_bytes()))
+                    .await;
+                attempts += 1;
+            }
+            Err(MutateRealmPlacementError::StorageError(StorageError::TransactionConflict)) => {
+                warn!(attempts, "Realm placement mutation kept conflicting");
+                break Err(MutateRealmPlacementError::StorageError(
+                    StorageError::TransactionConflict,
+                ));
+            }
+            outcome => break outcome,
+        }
     };
-    let outcome = crate::driver::drive(operation, context).await;
     if outcome.is_ok() && drains_node && context.net_handle.is_some() {
         crate::task_incoming::drive_document_sync_outbox_drain(std::sync::Arc::new(
             context.clone(),
@@ -1523,6 +1560,52 @@ mod tests {
             context,
         )
         .await
+    }
+
+    #[test]
+    fn conflict_is_expected() {
+        assert!(MutateRealmPlacementOperation::expected_error(
+            &MutateRealmPlacementError::StorageError(StorageError::TransactionConflict)
+        ));
+        assert!(!MutateRealmPlacementOperation::expected_error(
+            &MutateRealmPlacementError::RealmConfigNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_mutations_land() {
+        // Writers racing on one document conflict at commit; each re-drives
+        // its own mutation, so all of them land instead of one failing.
+        let root = tempdir().unwrap();
+        let context = context(root.path().to_str().unwrap());
+        let actor = actor(RealmId::from_bytes([21; 32]));
+        seed_config(&context, &actor).await;
+        let ids: Vec<Ulid> = (1..=6u8).map(|seed| Ulid::from_bytes([seed; 16])).collect();
+        let mut tasks = Vec::new();
+        for strategy_id in ids.clone() {
+            let context = context.clone();
+            let actor = actor.clone();
+            tasks.push(tokio::spawn(async move {
+                drive_realm_placement_mutation(
+                    MutateRealmPlacementConfig {
+                        actor,
+                        mutation: RealmPlacementMutation::UpsertStrategy(strategy(strategy_id)),
+                    },
+                    None,
+                    &context,
+                )
+                .await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().expect("every mutation lands");
+        }
+        let config = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+            .await
+            .unwrap();
+        for strategy_id in ids {
+            assert!(config.strategy(&strategy_id).is_some());
+        }
     }
 
     fn strategy(strategy_id: Ulid) -> PlacementStrategy {

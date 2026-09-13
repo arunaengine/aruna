@@ -553,30 +553,17 @@ impl Topology {
     ) -> TestResult<()> {
         let node = &self.nodes[node_index];
         let actor = self.actor(node);
-        // Inbound replication applies concurrently on the same storage, so a
-        // conflicted RMW is re-driven like the production mutation paths do.
-        let mut attempts = 0;
-        let config = loop {
-            let result = hang_cap(
-                "placement mutation",
-                drive_realm_placement_mutation(
-                    MutateRealmPlacementConfig {
-                        actor: actor.clone(),
-                        mutation: mutation.clone(),
-                    },
-                    None,
-                    node.context.as_ref(),
-                ),
-            )
-            .await;
-            match result {
-                Err(aruna_operations::mutate_realm_placement::MutateRealmPlacementError::StorageError(
-                    aruna_core::errors::StorageError::TransactionConflict,
-                )) if attempts < 10 => attempts += 1,
-                other => break other?,
-            }
-        };
-        self.config = config;
+        // Inbound replication applies concurrently on the same storage; the
+        // driver re-drives a conflicted mutation itself.
+        self.config = hang_cap(
+            "placement mutation",
+            drive_realm_placement_mutation(
+                MutateRealmPlacementConfig { actor, mutation },
+                None,
+                node.context.as_ref(),
+            ),
+        )
+        .await?;
         Ok(())
     }
 
