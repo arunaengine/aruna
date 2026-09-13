@@ -1,47 +1,36 @@
-//! Local, read-only inspection of a stopped node's persisted state.
-//!
-//! Three responsibilities, in order: persisted decoding (one decoder per
-//! keyspace record), the doctor commands that read and summarize them, and
-//! presentation (table/JSON output).
-//!
-//! Output policy: the doctor is a local operator tool. `node-state` prints the
-//! persisted identity record including its network secret by design, because
-//! recovering a node may require it. Fixtures use synthetic values only. Any
-//! redaction or reveal-flag change is a CLI contract decision, not an
-//! incidental extraction change.
+//! Persisted decoding: one decoder per keyspace, mapping raw key/value bytes to
+//! the presentation records in [`super::present`]. Malformed or unknown rows
+//! fall back to a raw hex record instead of failing the whole listing.
 
-use crate::error::CliError;
 use aruna::config::PersistedNodeState;
 use aruna_api::server_state::INITIAL_REALM_ADMIN_CLAIMED_KEY;
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::compute_quota::{ComputeDepartureReport, JobReservationRecord};
-use aruna_core::document::{PendingShardPlacement, shard_topic_id};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, COMPUTE_DEPARTURE_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE,
     CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE,
-    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
-    HASH_PATHS_INDEX_KEYSPACE, JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE,
-    JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
-    JOB_FAMILY_RECORD_KEYSPACE, JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE,
-    JOB_RESERVATION_KEYSPACE, JOB_WITNESS_DEADLINE_INDEX_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE,
-    KEYSPACE_CATALOG, MANAGED_COPY_KEYSPACE, NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE,
-    ONBOARDING_KEYSPACE, PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
-    USER_ACCESS_KEYSPACE,
+    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+    JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
+    JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
+    JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE, JOB_RESERVATION_KEYSPACE,
+    JOB_WITNESS_DEADLINE_INDEX_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
+    PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+    S3_MULTIPART_UPLOAD_PART_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
-    BackendLocation, BackendRef, BackendsFile, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, HashPathIndexKey,
-    JobFamilyId, JobRecordEnvelope, JobRecordKey, ManagedCopyKey, ManagedCopyRecord,
-    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
-    MultipartUploadPart, MultipartUploadPartKey, NodeSubjectRecord, POLICY_BULK_INTENT_KEYSPACE,
-    POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, PlacementPolicyDocument, PolicyBulkIntent,
-    PolicyBulkIntentKey, PolicyBulkRun, PolicyMutationRecord, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, UserAccess, VersionKey,
+    BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo, CurrentVersionPointer, Group,
+    GroupAuthorizationDocument, HashPathIndexKey, JobFamilyId, JobRecordEnvelope, JobRecordKey,
+    ManagedCopyKey, ManagedCopyRecord, MultipartObjectMetadataKey, MultipartObjectPart,
+    MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
+    NodeSubjectRecord, POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE,
+    POLICY_MUTATION_KEYSPACE, PlacementPolicyDocument, PolicyBulkIntent, PolicyBulkIntentKey,
+    PolicyBulkRun, PolicyMutationRecord, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    UserAccess, VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
 use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
@@ -55,12 +44,19 @@ use craqle::{
     ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
     VectorClock as CraqleVectorClock,
 };
-use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
-use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
-use std::path::Path;
+use std::collections::HashSet;
 use ulid::Ulid;
+
+use super::present::{
+    DecodedField, DecodedValue, EntryOutput, JsonCraqleClockEntry, JsonCraqleDot,
+    JsonCraqleGraphKey, JsonCraqleGraphMeta, JsonCraqleGraphPolicy, JsonCraqleLogKey,
+    JsonCraqleQuadKey, JsonCraqleStoredBatch, JsonCraqleStoredBatchOp, JsonCraqleVectorClock,
+    JsonGroup, JsonJobRecordEnvelope, JsonJobRecordKey, JsonJobReservation,
+    JsonPendingDocumentPlacement, JsonPersistedNodeState, JsonPlacementPolicyDocument,
+    JsonPolicyCacheEntry, JsonRealmAuthorizationDocument, JsonRealmConfigDocument, JsonStoredEntry,
+    JsonUserAccess, family_id_string,
+};
 
 const CRAQLE_DOT_ENCODING_TAG: u8 = b'D';
 const CRAQLE_BATCH_LOG_ENCODING_TAG: u8 = b'B';
@@ -69,314 +65,17 @@ const CRAQLE_GRAPH_DIRTY_PREFIX: u8 = b'D';
 const CRAQLE_GRAPH_REINDEX_PREFIX: u8 = b'R';
 const CRAQLE_LOG_HEAD_PREFIX: u8 = b'H';
 const CRAQLE_LOG_BATCH_PREFIX: u8 = b'B';
-
-#[derive(Debug, thiserror::Error)]
-pub enum ExplorerError {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Fjall(#[from] fjall::Error),
-    #[error("keyspace not found: {0}")]
-    KeyspaceNotFound(String),
-    #[error("decode failed: {0}")]
-    Decode(String),
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct LocationScanOutput {
-    database_path: String,
-    backends_path: Option<String>,
-    scanned: usize,
-    unresolved: Vec<UnresolvedLocation>,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq, Ord, PartialOrd)]
-struct UnresolvedLocation {
-    backend: String,
-    storage_bucket: String,
-    backend_path: String,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct KeyspacesOutput {
-    database_path: String,
-    keyspaces: Vec<KeyspaceEntry>,
-    missing_keyspaces: Vec<KeyspaceEntry>,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct KeyspaceEntry {
-    name: String,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-struct EntriesOutput {
-    database_path: String,
-    keyspace: String,
-    entries: Vec<EntryOutput>,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-struct TopicsListOutput {
-    database_path: String,
-    topics: Vec<TopicListEntry>,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-struct TopicListEntry {
-    topic_id: String,
-    strategy_id: String,
-    shard: u32,
-    status: &'static str,
-    selected_peer_count: usize,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-struct TopicStatusOutput {
-    database_path: String,
-    topic_id: String,
-    status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pending_placement: Option<JsonPendingDocumentPlacement>,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-struct TopicPlacementsOutput {
-    database_path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    topic_id: Option<String>,
-    placements: Vec<JsonPendingDocumentPlacement>,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-struct EntryOutput {
-    key: DecodedField,
-    value: DecodedValue,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(tag = "format")]
-enum DecodedField {
-    #[serde(rename = "ulid")]
-    Ulid { value: String },
-    #[serde(rename = "realm_id")]
-    RealmId { value: String },
-    #[serde(rename = "dht_key")]
-    DhtKeyId { value: String },
-    #[serde(rename = "craqle_term_id")]
-    CraqleTermId { value: String },
-    #[serde(rename = "craqle_quad_key")]
-    CraqleQuadKey { value: JsonCraqleQuadKey },
-    #[serde(rename = "craqle_graph_key")]
-    CraqleGraphKey { value: JsonCraqleGraphKey },
-    #[serde(rename = "craqle_log_key")]
-    CraqleLogKey { value: JsonCraqleLogKey },
-    #[serde(rename = "utf8")]
-    Utf8 { value: String },
-    #[serde(rename = "blob_head_key")]
-    BlobHeadKey { value: BlobHeadKey },
-    #[serde(rename = "hash_path_index_key")]
-    HashPathIndexKey { value: HashPathIndexKey },
-    #[serde(rename = "blob_location_key")]
-    BlobLocationKey { blake3: String, backend: String },
-    #[serde(rename = "version_key")]
-    VersionKey { value: VersionKey },
-    #[serde(rename = "managed_copy_key")]
-    ManagedCopyKey { value: ManagedCopyKey },
-    #[serde(rename = "multipart_upload_part_key")]
-    MultipartUploadPartKey { value: MultipartUploadPartKey },
-    #[serde(rename = "multipart_object_metadata_key")]
-    MultipartObjectMetadataKey { value: MultipartObjectMetadataKey },
-    #[serde(rename = "attempt_key")]
-    AttemptKey { job_id: String, attempt_epoch: u64 },
-    #[serde(rename = "policy_cache_key")]
-    PolicyCacheKey { policy_id: String, digest: String },
-    #[serde(rename = "policy_bulk_intent_key")]
-    PolicyBulkIntentKey { operation_id: String, key: String },
-    #[serde(rename = "job_record_key")]
-    JobRecordKey { value: JsonJobRecordKey },
-    #[serde(rename = "job_conflict_key")]
-    JobConflictKey {
-        record: JsonJobRecordKey,
-        digest: String,
-    },
-    #[serde(rename = "job_alias_key")]
-    JobAliasKey { job_id: String, family: String },
-    #[serde(rename = "job_family_key")]
-    JobFamilyKey { family: String },
-    #[serde(rename = "job_explain_key")]
-    JobExplainKey { family: String, node_id: String },
-    #[serde(rename = "raw")]
-    Raw { hex: String },
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-#[serde(tag = "type")]
-#[allow(clippy::large_enum_variant)]
-enum DecodedValue {
-    Group {
-        data: JsonGroup,
-    },
-    GroupAuthorizationDocument {
-        data: GroupAuthorizationDocument,
-    },
-    RealmAuthorizationDocument {
-        data: JsonRealmAuthorizationDocument,
-    },
-    RealmConfigDocument {
-        data: JsonRealmConfigDocument,
-    },
-    UserAccess {
-        data: JsonUserAccess,
-    },
-    BucketInfo {
-        data: BucketInfo,
-    },
-    CurrentVersionPointer {
-        data: CurrentVersionPointer,
-    },
-    BackendLocation {
-        data: aruna_core::structs::BackendLocation,
-    },
-    BlobVersion {
-        data: BlobVersion,
-    },
-    ManagedCopyRecord {
-        data: ManagedCopyRecord,
-    },
-    NodeSubjectRecord {
-        data: NodeSubjectRecord,
-    },
-    JobOutputRecord {
-        data: JsonJobRecordEnvelope,
-    },
-    JobFamilyRecord {
-        data: JsonJobRecordEnvelope,
-    },
-    JobPendingRecord {
-        envelope: JsonJobRecordEnvelope,
-        need: String,
-        first_seen_ms: u64,
-        attempts: u32,
-    },
-    JobConflictRecord {
-        envelope: JsonJobRecordEnvelope,
-        retained: String,
-        observed_at_ms: u64,
-        relayed_by: Option<String>,
-    },
-    JobAliasTarget {
-        data: JsonJobRecordKey,
-    },
-    JobProjectionCache {
-        revision: u64,
-        stale: bool,
-        projected: bool,
-    },
-    JobOutboxEntry {
-        data: OutboxEntry,
-    },
-    JobReservation {
-        data: JsonJobReservation,
-    },
-    JobWitnessDeadline {
-        data: WitnessDeadline,
-    },
-    JobPlanExplain {
-        sequence: u32,
-        selected: Option<String>,
-        alternatives: usize,
-        rejected: usize,
-        overlapping: bool,
-        stored_at_ms: u64,
-    },
-    ComputeDepartureReport {
-        data: ComputeDepartureReport,
-    },
-    PlacementPolicyDocument {
-        data: JsonPlacementPolicyDocument,
-    },
-    PolicyCacheEntry {
-        data: JsonPolicyCacheEntry,
-    },
-    PolicyMutationRecord {
-        data: PolicyMutationRecord,
-    },
-    PolicyBulkRun {
-        data: PolicyBulkRun,
-    },
-    PolicyBulkIntent {
-        data: PolicyBulkIntent,
-    },
-    MultipartUpload {
-        data: MultipartUpload,
-    },
-    MultipartUploadPart {
-        data: MultipartUploadPart,
-    },
-    MultipartObjectSummary {
-        data: MultipartObjectSummary,
-    },
-    MultipartObjectPart {
-        data: MultipartObjectPart,
-    },
-    ApiTrustedRealmsList {
-        data: Vec<String>,
-    },
-    ApiInitialRealmAdminClaimed {
-        data: bool,
-    },
-    NodeState {
-        data: JsonPersistedNodeState,
-    },
-    PendingDocumentPlacement {
-        data: JsonPendingDocumentPlacement,
-    },
-    OnboardingSecretRecord {
-        data: OnboardingSecretRecord,
-    },
-    DhtEntries {
-        data: Vec<JsonStoredEntry>,
-    },
-    CraqleTerm {
-        data: String,
-    },
-    CraqleQuadDots {
-        data: Vec<JsonCraqleDot>,
-    },
-    CraqleGraphMeta {
-        data: JsonCraqleGraphMeta,
-    },
-    CraqleGraphDirtyToken {
-        data: u64,
-    },
-    CraqleGraphReindexToken {
-        data: u64,
-    },
-    CraqleLogHead {
-        data: u64,
-    },
-    CraqleLogBatch {
-        data: JsonCraqleStoredBatch,
-    },
-    Raw {
-        hex: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        decode_error: Option<String>,
-    },
-}
-
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-struct CraqleTermId(u128);
+pub(super) struct CraqleTermId(pub(super) u128);
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct CraqleStoredGraphMeta {
-    policy: CraqleGraphPolicy,
-    clock: CraqleVectorClock,
+pub(super) struct CraqleStoredGraphMeta {
+    pub(super) policy: CraqleGraphPolicy,
+    pub(super) clock: CraqleVectorClock,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-enum CraqleStoredQuadOp {
+pub(super) enum CraqleStoredQuadOp {
     Add {
         subject: CraqleTermId,
         predicate: CraqleTermId,
@@ -392,24 +91,24 @@ enum CraqleStoredQuadOp {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct CraqleStoredBatch {
-    actor: CraqleActorId,
-    counter: u64,
-    base_clock: CraqleVectorClock,
-    ops: Vec<CraqleStoredQuadOp>,
-    timestamp: DateTime<Utc>,
+pub(super) struct CraqleStoredBatch {
+    pub(super) actor: CraqleActorId,
+    pub(super) counter: u64,
+    pub(super) base_clock: CraqleVectorClock,
+    pub(super) ops: Vec<CraqleStoredQuadOp>,
+    pub(super) timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CraqleQuadKeyParts {
-    graph: CraqleTermId,
-    subject: CraqleTermId,
-    predicate: CraqleTermId,
-    object: CraqleTermId,
+pub(super) struct CraqleQuadKeyParts {
+    pub(super) graph: CraqleTermId,
+    pub(super) subject: CraqleTermId,
+    pub(super) predicate: CraqleTermId,
+    pub(super) object: CraqleTermId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CraqleGraphKeyParts {
+pub(super) enum CraqleGraphKeyParts {
     Meta {
         graph: CraqleTermId,
     },
@@ -423,7 +122,7 @@ enum CraqleGraphKeyParts {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CraqleLogKeyParts {
+pub(super) enum CraqleLogKeyParts {
     Head {
         graph: CraqleTermId,
         actor: CraqleActorId,
@@ -434,967 +133,7 @@ enum CraqleLogKeyParts {
         counter: u64,
     },
 }
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct JsonCraqleQuadKey {
-    graph: String,
-    subject: String,
-    predicate: String,
-    object: String,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(tag = "kind")]
-enum JsonCraqleGraphKey {
-    Meta { graph: String },
-    Dirty { graph: String, subject: String },
-    Reindex { graph: String },
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(tag = "kind")]
-enum JsonCraqleLogKey {
-    Head {
-        graph: String,
-        actor: String,
-    },
-    Batch {
-        graph: String,
-        actor: String,
-        counter: u64,
-    },
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct JsonCraqleClockEntry {
-    actor: String,
-    counter: u64,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct JsonCraqleVectorClock {
-    entries: Vec<JsonCraqleClockEntry>,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct JsonCraqleDot {
-    actor: String,
-    counter: u64,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct JsonCraqleGraphPolicy {
-    public: bool,
-    permission_paths: Vec<String>,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct JsonCraqleGraphMeta {
-    graph: String,
-    policy: JsonCraqleGraphPolicy,
-    clock: JsonCraqleVectorClock,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(tag = "kind")]
-enum JsonCraqleStoredBatchOp {
-    Add {
-        subject: String,
-        predicate: String,
-        object: String,
-        dot: JsonCraqleDot,
-    },
-    Remove {
-        subject: String,
-        predicate: String,
-        object: String,
-        witnessed: JsonCraqleVectorClock,
-    },
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct JsonCraqleStoredBatch {
-    graph: String,
-    actor: String,
-    counter: u64,
-    base_clock: JsonCraqleVectorClock,
-    ops: Vec<JsonCraqleStoredBatchOp>,
-    timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct JsonGroup(Group);
-
-impl Serialize for JsonGroup {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("Group", 4)?;
-        state.serialize_field("display_name", &self.0.display_name)?;
-        state.serialize_field("group_id", &self.0.group_id.to_string())?;
-        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
-        state.serialize_field("roles", &self.0.roles)?;
-        state.end()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct JsonRealmAuthorizationDocument(RealmAuthorizationDocument);
-
-impl Serialize for JsonRealmAuthorizationDocument {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("RealmAuthorizationDocument", 3)?;
-        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
-        state.serialize_field("roles", &self.0.roles)?;
-        state.serialize_field("operation_restrictions", &self.0.operation_restrictions)?;
-        state.end()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct JsonRealmConfigDocument(RealmConfigDocument);
-
-impl Serialize for JsonRealmConfigDocument {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("RealmConfigDocument", 3)?;
-        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
-        state.serialize_field("description", &self.0.description)?;
-        state.serialize_field("metadata_replication", &self.0.metadata_replication)?;
-        state.end()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct JsonUserAccess(UserAccess);
-
-impl Serialize for JsonUserAccess {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("UserAccess", 8)?;
-        state.serialize_field("access_key", &self.0.access_key)?;
-        state.serialize_field("user_identity", &self.0.user_identity)?;
-        state.serialize_field("group_id", &self.0.group_id.to_string())?;
-        state.serialize_field("secret", &self.0.secret)?;
-        state.serialize_field("expiry", &self.0.expiry)?;
-        state.serialize_field("path_restrictions", &self.0.path_restrictions)?;
-        state.serialize_field("issued_by", &self.0.issued_by)?;
-        state.serialize_field("revoked_at", &self.0.revoked_at)?;
-        state.end()
-    }
-}
-
-/// Signed output record projection: identity, authorship and integrity only.
-/// The record body stays out of the CLI so job payloads never reach a console.
-#[derive(Debug, PartialEq)]
-struct JsonJobRecordEnvelope(JobRecordEnvelope);
-
-impl Serialize for JsonJobRecordEnvelope {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("JobRecordEnvelope", 5)?;
-        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
-        state.serialize_field("published_by", &self.0.published_by.to_string())?;
-        state.serialize_field("kind", &format!("{:?}", self.0.kind()))?;
-        state.serialize_field("digest", &self.0.digest().map(hex::encode).ok())?;
-        state.serialize_field("signature", &hex::encode(self.0.signature.to_bytes()))?;
-        state.end()
-    }
-}
-
-/// The signed identity a job record is stored under, rendered as hex so one
-/// key line stays readable next to its family.
-#[derive(Debug, PartialEq, Eq)]
-struct JsonJobRecordKey(JobRecordKey);
-
-impl Serialize for JsonJobRecordKey {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("JobRecordKey", 4)?;
-        state.serialize_field("family", &family_id_string(&self.0.family))?;
-        state.serialize_field("kind", &format!("{:?}", self.0.kind))?;
-        state.serialize_field("subject", &hex::encode(self.0.subject))?;
-        state.serialize_field("sequence", &self.0.sequence)?;
-        state.end()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct JsonJobReservation(JobReservationRecord);
-
-impl Serialize for JsonJobReservation {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("JobReservationRecord", 8)?;
-        state.serialize_field("execution_id", &self.0.execution_id.to_string())?;
-        state.serialize_field("job_id", &self.0.job_id.to_string())?;
-        state.serialize_field("cpu_cores", &self.0.resources.cpu_cores)?;
-        state.serialize_field("ram_bytes", &self.0.resources.ram_bytes)?;
-        state.serialize_field("disk_bytes", &self.0.resources.disk_bytes)?;
-        state.serialize_field("created_at_ms", &self.0.created_at_ms)?;
-        // The stored site fence: a refusal to start is diagnosed from these two.
-        state.serialize_field("subject_generation", &self.0.subject_generation)?;
-        state.serialize_field("subject_digest", &hex::encode(self.0.subject_digest))?;
-        state.end()
-    }
-}
-
-/// Stable text identity of one request family: submission id and request digest.
-fn family_id_string(family: &JobFamilyId) -> String {
-    format!(
-        "{}:{}",
-        hex::encode(family.submission_id.0),
-        hex::encode(family.request_digest)
-    )
-}
-
-#[derive(Debug, PartialEq)]
-struct JsonPlacementPolicyDocument(PlacementPolicyDocument);
-
-impl Serialize for JsonPlacementPolicyDocument {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("PlacementPolicyDocument", 6)?;
-        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
-        state.serialize_field("policy_id", &self.0.policy.policy_id.to_string())?;
-        state.serialize_field("name", &self.0.policy.name)?;
-        state.serialize_field("allowed", &self.0.policy.allowed)?;
-        state.serialize_field("publisher", &self.0.publication.publisher.to_string())?;
-        state.serialize_field("created_at_ms", &self.0.publication.created_at_ms)?;
-        state.end()
-    }
-}
-
-#[derive(Debug, PartialEq)]
-struct JsonPolicyCacheEntry(PolicyCacheEntry);
-
-impl Serialize for JsonPolicyCacheEntry {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("PolicyCacheEntry", 4)?;
-        match &self.0 {
-            PolicyCacheEntry::Verified {
-                document,
-                stored_at_ms,
-            } => {
-                state.serialize_field("kind", "verified")?;
-                state.serialize_field("stored_at_ms", stored_at_ms)?;
-                state.serialize_field("expires_at_ms", &None::<u64>)?;
-                state
-                    .serialize_field("document", &JsonPlacementPolicyDocument(document.clone()))?;
-            }
-            PolicyCacheEntry::Unavailable {
-                stored_at_ms,
-                expires_at_ms,
-            } => {
-                state.serialize_field("kind", "unavailable")?;
-                state.serialize_field("stored_at_ms", stored_at_ms)?;
-                state.serialize_field("expires_at_ms", &Some(*expires_at_ms))?;
-                state.serialize_field("document", &None::<JsonPlacementPolicyDocument>)?;
-            }
-        }
-        state.end()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct JsonPersistedNodeState(PersistedNodeState);
-
-impl Serialize for JsonPersistedNodeState {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("PersistedNodeState", 6)?;
-        state.serialize_field("boot_origin", &self.0.boot_origin)?;
-        state.serialize_field("status", &self.0.status)?;
-        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
-        state.serialize_field("net_secret_key", &hex::encode(self.0.net_secret_key))?;
-        state.serialize_field("onboarding_phase", &self.0.onboarding_phase)?;
-        state.serialize_field("onboarding_sync_ticket", &self.0.onboarding_sync_ticket)?;
-        state.serialize_field("identity", &self.0.identity)?;
-        state.end()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct JsonPendingDocumentPlacement(PendingShardPlacement);
-
-impl Serialize for JsonPendingDocumentPlacement {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("PendingShardPlacement", 7)?;
-        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
-        state.serialize_field("topic_id", &placement_topic_id(&self.0))?;
-        state.serialize_field("strategy_id", &self.0.placement.strategy_id.to_string())?;
-        state.serialize_field("shard", &self.0.placement.shard)?;
-        state.serialize_field(
-            "authoritative_node_id",
-            &self.0.authoritative_node_id.to_string(),
-        )?;
-        state.serialize_field(
-            "selected_peers",
-            &self
-                .0
-                .selected_peers
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect::<Vec<_>>(),
-        )?;
-        state.serialize_field("updated_at", &self.0.updated_at)?;
-        state.end()
-    }
-}
-
-fn placement_topic_id(placement: &PendingShardPlacement) -> String {
-    shard_topic_id(placement.realm_id, &placement.placement).to_string()
-}
-
-#[derive(Debug)]
-struct JsonStoredEntry(StoredEntry);
-
-impl PartialEq for JsonStoredEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.publisher == other.0.publisher
-            && self.0.realm_id == other.0.realm_id
-            && self.0.value == other.0.value
-            && self.0.expires_at == other.0.expires_at
-            && self.0.revision == other.0.revision
-            && self.0.signature == other.0.signature
-            && self.0.retain_until == other.0.retain_until
-    }
-}
-
-impl Serialize for JsonStoredEntry {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("StoredEntry", 8)?;
-        state.serialize_field("publisher", &self.0.publisher.to_string())?;
-        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
-        state.serialize_field("expires_at", &self.0.expires_at)?;
-        state.serialize_field("revision", &self.0.revision)?;
-        state.serialize_field("retain_until", &self.0.retain_until)?;
-        state.serialize_field("signature", &self.0.signature.to_string())?;
-        state.serialize_field("value_len", &self.0.value.len())?;
-        state.serialize_field("value_hex", &hex::encode(&self.0.value))?;
-        state.end()
-    }
-}
-
-fn term_id_string(id: CraqleTermId) -> String {
-    format!("{:032x}", id.0)
-}
-
-fn decode_term_id(bytes: &[u8], context: &'static str) -> Result<CraqleTermId, String> {
-    let raw: [u8; 16] = bytes.try_into().map_err(|_| {
-        format!(
-            "invalid {context}: expected 16 bytes, found {}",
-            bytes.len()
-        )
-    })?;
-    Ok(CraqleTermId(u128::from_be_bytes(raw)))
-}
-
-fn decode_craqle_u64(bytes: &[u8], context: &'static str) -> Result<u64, String> {
-    let raw: [u8; 8] = bytes
-        .try_into()
-        .map_err(|_| format!("invalid {context}: expected 8 bytes, found {}", bytes.len()))?;
-    Ok(u64::from_be_bytes(raw))
-}
-
-fn json_quad_key(parts: CraqleQuadKeyParts) -> JsonCraqleQuadKey {
-    JsonCraqleQuadKey {
-        graph: term_id_string(parts.graph),
-        subject: term_id_string(parts.subject),
-        predicate: term_id_string(parts.predicate),
-        object: term_id_string(parts.object),
-    }
-}
-
-fn json_graph_key(parts: CraqleGraphKeyParts) -> JsonCraqleGraphKey {
-    match parts {
-        CraqleGraphKeyParts::Meta { graph } => JsonCraqleGraphKey::Meta {
-            graph: term_id_string(graph),
-        },
-        CraqleGraphKeyParts::Dirty { graph, subject } => JsonCraqleGraphKey::Dirty {
-            graph: term_id_string(graph),
-            subject: term_id_string(subject),
-        },
-        CraqleGraphKeyParts::Reindex { graph } => JsonCraqleGraphKey::Reindex {
-            graph: term_id_string(graph),
-        },
-    }
-}
-
-fn json_log_key(parts: CraqleLogKeyParts) -> JsonCraqleLogKey {
-    match parts {
-        CraqleLogKeyParts::Head { graph, actor } => JsonCraqleLogKey::Head {
-            graph: term_id_string(graph),
-            actor: actor.to_string(),
-        },
-        CraqleLogKeyParts::Batch {
-            graph,
-            actor,
-            counter,
-        } => JsonCraqleLogKey::Batch {
-            graph: term_id_string(graph),
-            actor: actor.to_string(),
-            counter,
-        },
-    }
-}
-
-fn json_craqle_dot(dot: CraqleDot) -> JsonCraqleDot {
-    JsonCraqleDot {
-        actor: dot.actor.to_string(),
-        counter: dot.counter,
-    }
-}
-
-fn json_vector_clock(clock: CraqleVectorClock) -> JsonCraqleVectorClock {
-    JsonCraqleVectorClock {
-        entries: clock
-            .0
-            .into_iter()
-            .map(|(actor, counter)| JsonCraqleClockEntry {
-                actor: actor.to_string(),
-                counter,
-            })
-            .collect(),
-    }
-}
-
-fn json_graph_policy(policy: CraqleGraphPolicy) -> JsonCraqleGraphPolicy {
-    let mut permission_paths = policy.permission_paths;
-    permission_paths.sort();
-    permission_paths.dedup();
-    JsonCraqleGraphPolicy {
-        public: policy.public,
-        permission_paths,
-    }
-}
-
-fn json_graph_meta(graph: CraqleTermId, meta: CraqleStoredGraphMeta) -> JsonCraqleGraphMeta {
-    JsonCraqleGraphMeta {
-        graph: term_id_string(graph),
-        policy: json_graph_policy(meta.policy),
-        clock: json_vector_clock(meta.clock),
-    }
-}
-
-fn json_stored_batch(graph: CraqleTermId, batch: CraqleStoredBatch) -> JsonCraqleStoredBatch {
-    JsonCraqleStoredBatch {
-        graph: term_id_string(graph),
-        actor: batch.actor.to_string(),
-        counter: batch.counter,
-        base_clock: json_vector_clock(batch.base_clock),
-        ops: batch
-            .ops
-            .into_iter()
-            .map(|op| match op {
-                CraqleStoredQuadOp::Add {
-                    subject,
-                    predicate,
-                    object,
-                    dot,
-                } => JsonCraqleStoredBatchOp::Add {
-                    subject: term_id_string(subject),
-                    predicate: term_id_string(predicate),
-                    object: term_id_string(object),
-                    dot: json_craqle_dot(dot),
-                },
-                CraqleStoredQuadOp::Remove {
-                    subject,
-                    predicate,
-                    object,
-                    witnessed,
-                } => JsonCraqleStoredBatchOp::Remove {
-                    subject: term_id_string(subject),
-                    predicate: term_id_string(predicate),
-                    object: term_id_string(object),
-                    witnessed: json_vector_clock(witnessed),
-                },
-            })
-            .collect(),
-        timestamp: batch.timestamp,
-    }
-}
-
-fn decode_quad_key(key: &[u8]) -> Result<CraqleQuadKeyParts, String> {
-    if key.len() != 64 {
-        return Err(format!(
-            "invalid craqle quad key: expected 64 bytes, found {}",
-            key.len()
-        ));
-    }
-    Ok(CraqleQuadKeyParts {
-        graph: decode_term_id(&key[0..16], "craqle quad graph")?,
-        subject: decode_term_id(&key[16..32], "craqle quad subject")?,
-        predicate: decode_term_id(&key[32..48], "craqle quad predicate")?,
-        object: decode_term_id(&key[48..64], "craqle quad object")?,
-    })
-}
-
-fn decode_graph_key(key: &[u8]) -> Result<CraqleGraphKeyParts, String> {
-    match key.first().copied() {
-        Some(CRAQLE_GRAPH_META_PREFIX) if key.len() == 17 => Ok(CraqleGraphKeyParts::Meta {
-            graph: decode_term_id(&key[1..17], "craqle graph meta graph")?,
-        }),
-        Some(CRAQLE_GRAPH_DIRTY_PREFIX) if key.len() == 33 => Ok(CraqleGraphKeyParts::Dirty {
-            graph: decode_term_id(&key[1..17], "craqle graph dirty graph")?,
-            subject: decode_term_id(&key[17..33], "craqle graph dirty subject")?,
-        }),
-        Some(CRAQLE_GRAPH_REINDEX_PREFIX) if key.len() == 17 => Ok(CraqleGraphKeyParts::Reindex {
-            graph: decode_term_id(&key[1..17], "craqle graph reindex graph")?,
-        }),
-        Some(prefix) => Err(format!(
-            "invalid craqle graph key prefix `{}` with length {}",
-            prefix as char,
-            key.len()
-        )),
-        None => Err("invalid craqle graph key: empty key".to_string()),
-    }
-}
-
-fn decode_log_key(key: &[u8]) -> Result<CraqleLogKeyParts, String> {
-    match key.first().copied() {
-        Some(CRAQLE_LOG_HEAD_PREFIX) if key.len() == 49 => Ok(CraqleLogKeyParts::Head {
-            graph: decode_term_id(&key[1..17], "craqle log head graph")?,
-            actor: CraqleActorId::from_bytes(
-                key[17..49]
-                    .try_into()
-                    .map_err(|_| "invalid craqle log head actor".to_string())?,
-            ),
-        }),
-        Some(CRAQLE_LOG_BATCH_PREFIX) if key.len() == 57 => Ok(CraqleLogKeyParts::Batch {
-            graph: decode_term_id(&key[1..17], "craqle log batch graph")?,
-            actor: CraqleActorId::from_bytes(
-                key[17..49]
-                    .try_into()
-                    .map_err(|_| "invalid craqle log batch actor".to_string())?,
-            ),
-            counter: decode_craqle_u64(&key[49..57], "craqle log batch counter")?,
-        }),
-        Some(prefix) => Err(format!(
-            "invalid craqle log key prefix `{}` with length {}",
-            prefix as char,
-            key.len()
-        )),
-        None => Err("invalid craqle log key: empty key".to_string()),
-    }
-}
-
-fn decode_craqle_dots(value: &[u8]) -> Result<Vec<JsonCraqleDot>, String> {
-    let dots = if value.first().copied() == Some(CRAQLE_DOT_ENCODING_TAG) {
-        if !(value.len() - 1).is_multiple_of(40) {
-            return Err(format!("invalid craqle dot payload length {}", value.len()));
-        }
-        let (chunks, _) = value[1..].as_chunks::<40>();
-        chunks
-            .iter()
-            .map(|chunk| CraqleDot {
-                actor: CraqleActorId::from_bytes(chunk[0..32].try_into().unwrap()),
-                counter: u64::from_be_bytes(chunk[32..40].try_into().unwrap()),
-            })
-            .collect()
-    } else {
-        postcard::from_bytes::<Vec<CraqleDot>>(value).map_err(|error| error.to_string())?
-    };
-    Ok(dots.into_iter().map(json_craqle_dot).collect())
-}
-
-fn decode_graph_value(key: &[u8], value: &[u8]) -> DecodedValue {
-    match decode_graph_key(key) {
-        Ok(CraqleGraphKeyParts::Meta { graph }) => decode_value_with(
-            value,
-            |bytes| postcard::from_bytes::<CraqleStoredGraphMeta>(bytes),
-            |data| DecodedValue::CraqleGraphMeta {
-                data: json_graph_meta(graph, data),
-            },
-        ),
-        Ok(CraqleGraphKeyParts::Dirty { .. }) => decode_value_with(
-            value,
-            |bytes| decode_craqle_u64(bytes, "craqle graph dirty token"),
-            |data| DecodedValue::CraqleGraphDirtyToken { data },
-        ),
-        Ok(CraqleGraphKeyParts::Reindex { .. }) => decode_value_with(
-            value,
-            |bytes| decode_craqle_u64(bytes, "craqle graph reindex token"),
-            |data| DecodedValue::CraqleGraphReindexToken { data },
-        ),
-        Err(error) => raw_value(value, Some(error)),
-    }
-}
-
-fn decode_log_batch(key: &[u8], value: &[u8]) -> Result<JsonCraqleStoredBatch, String> {
-    let CraqleLogKeyParts::Batch { graph, .. } = decode_log_key(key)? else {
-        return Err("craqle log batch value requires a batch key".to_string());
-    };
-    if value.first().copied() != Some(CRAQLE_BATCH_LOG_ENCODING_TAG) {
-        return Err("unsupported craqle log batch encoding".to_string());
-    }
-    let batch = postcard::from_bytes::<CraqleStoredBatch>(&value[1..])
-        .map_err(|error| error.to_string())?;
-    Ok(json_stored_batch(graph, batch))
-}
-
-fn decode_log_value(key: &[u8], value: &[u8]) -> DecodedValue {
-    match decode_log_key(key) {
-        Ok(CraqleLogKeyParts::Head { .. }) => decode_value_with(
-            value,
-            |bytes| decode_craqle_u64(bytes, "craqle log head"),
-            |data| DecodedValue::CraqleLogHead { data },
-        ),
-        Ok(CraqleLogKeyParts::Batch { .. }) => decode_value_with(
-            value,
-            |bytes| decode_log_batch(key, bytes),
-            |data| DecodedValue::CraqleLogBatch { data },
-        ),
-        Err(error) => raw_value(value, Some(error)),
-    }
-}
-
-pub async fn explore_keyspaces(database_path: String) -> Result<(), CliError> {
-    let output = tokio::task::spawn_blocking({
-        let database_path = database_path.clone();
-        move || list_keyspaces(&database_path)
-    })
-    .await
-    .map_err(std::io::Error::other)??;
-
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
-}
-
-pub async fn explore_entries(database_path: String, keyspace: String) -> Result<(), CliError> {
-    let output = tokio::task::spawn_blocking({
-        let database_path = database_path.clone();
-        let keyspace = keyspace.clone();
-        move || list_entries(&database_path, &keyspace)
-    })
-    .await
-    .map_err(std::io::Error::other)??;
-
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
-}
-
-pub async fn print_node_state(database_path: String) -> Result<(), CliError> {
-    explore_entries(database_path, NODE_STATE_KEYSPACE.to_string()).await
-}
-
-/// Reports locations whose recorded backend no longer resolves: node refs
-/// against the operator's backends file, group refs against the stored tenant
-/// records. Storage-side only, so the doctor needs no blob backend.
-pub async fn scan_locations(
-    database_path: String,
-    backends_path: Option<String>,
-) -> Result<(), CliError> {
-    let output = tokio::task::spawn_blocking({
-        let database_path = database_path.clone();
-        move || location_scan(&database_path, backends_path.as_deref())
-    })
-    .await
-    .map_err(std::io::Error::other)??;
-
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
-}
-
-pub async fn print_topics_list(database_path: String) -> Result<(), CliError> {
-    let output = tokio::task::spawn_blocking({
-        let database_path = database_path.clone();
-        move || topics_list_output(&database_path)
-    })
-    .await
-    .map_err(std::io::Error::other)??;
-
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
-}
-
-pub async fn print_topic_status(database_path: String, topic_id: String) -> Result<(), CliError> {
-    let output = tokio::task::spawn_blocking({
-        let database_path = database_path.clone();
-        let topic_id = topic_id.clone();
-        move || topic_status_output(&database_path, &topic_id)
-    })
-    .await
-    .map_err(std::io::Error::other)??;
-
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
-}
-
-pub async fn print_topic_placements(
-    database_path: String,
-    topic_id: Option<String>,
-) -> Result<(), CliError> {
-    let output = tokio::task::spawn_blocking({
-        let database_path = database_path.clone();
-        let topic_id = topic_id.clone();
-        move || topic_placements_output(&database_path, topic_id.as_deref())
-    })
-    .await
-    .map_err(std::io::Error::other)??;
-
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
-}
-
-fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError> {
-    let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
-    let mut keyspaces = db.list_keyspace_names();
-    keyspaces.sort();
-    let existing = keyspaces
-        .iter()
-        .map(|name| name.as_ref())
-        .collect::<HashSet<_>>();
-    let mut missing_keyspaces = defined_keyspaces()
-        .into_iter()
-        .filter(|name| !existing.contains(name))
-        .map(|name| KeyspaceEntry {
-            name: name.to_string(),
-        })
-        .collect::<Vec<_>>();
-    missing_keyspaces.sort_by(|left, right| left.name.cmp(&right.name));
-
-    Ok(KeyspacesOutput {
-        database_path: database_path.to_string(),
-        keyspaces: keyspaces
-            .into_iter()
-            .map(|name| KeyspaceEntry {
-                name: name.to_string(),
-            })
-            .collect(),
-        missing_keyspaces,
-    })
-}
-
-fn defined_keyspaces() -> Vec<&'static str> {
-    let mut keyspaces = KEYSPACE_CATALOG.to_vec();
-    keyspaces.extend([
-        POLICY_BULK_INTENT_KEYSPACE,
-        POLICY_BULK_RUN_KEYSPACE,
-        POLICY_MUTATION_KEYSPACE,
-    ]);
-    keyspaces
-}
-
-fn list_entries(database_path: &str, keyspace_name: &str) -> Result<EntriesOutput, ExplorerError> {
-    let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
-    let keyspace_names = db.list_keyspace_names();
-    if !keyspace_names
-        .iter()
-        .any(|name| name.as_ref() == keyspace_name)
-    {
-        return Err(ExplorerError::KeyspaceNotFound(keyspace_name.to_string()));
-    }
-
-    let keyspace = db.keyspace(keyspace_name, KeyspaceCreateOptions::default)?;
-    let snapshot = db.read_tx();
-    let mut entries = Vec::new();
-
-    for entry in snapshot.iter(&keyspace) {
-        let (key, value) = entry.into_inner()?;
-        entries.push(decode_entry(keyspace_name, key.as_ref(), value.as_ref()));
-    }
-
-    Ok(EntriesOutput {
-        database_path: database_path.to_string(),
-        keyspace: keyspace_name.to_string(),
-        entries,
-    })
-}
-
-fn known_node_backends(backends_path: Option<&str>) -> Result<BTreeSet<String>, ExplorerError> {
-    let Some(path) = backends_path else {
-        return Ok(BTreeSet::from([BackendRef::DEFAULT_NODE_NAME.to_string()]));
-    };
-    let text = std::fs::read_to_string(path)?;
-    let file =
-        BackendsFile::parse(&text).map_err(|error| ExplorerError::Decode(error.to_string()))?;
-    Ok(file.backend.into_keys().collect())
-}
-
-fn known_group_backends(
-    db: &OptimisticTxDatabase,
-    keyspaces: &[String],
-) -> Result<BTreeSet<Ulid>, ExplorerError> {
-    let mut known = BTreeSet::new();
-    if !keyspaces
-        .iter()
-        .any(|name| name == GROUP_STORAGE_BACKEND_KEYSPACE)
-    {
-        return Ok(known);
-    }
-    let keyspace = db.keyspace(
-        GROUP_STORAGE_BACKEND_KEYSPACE,
-        KeyspaceCreateOptions::default,
-    )?;
-    for entry in db.read_tx().iter(&keyspace) {
-        let (key, _) = entry.into_inner()?;
-        if let Ok(bytes) = <[u8; 16]>::try_from(key.as_ref()) {
-            known.insert(Ulid::from_bytes(bytes));
-        }
-    }
-    Ok(known)
-}
-
-fn location_scan(
-    database_path: &str,
-    backends_path: Option<&str>,
-) -> Result<LocationScanOutput, ExplorerError> {
-    let nodes = known_node_backends(backends_path)?;
-    let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
-    let keyspaces = db
-        .list_keyspace_names()
-        .iter()
-        .map(|name| name.as_ref().to_string())
-        .collect::<Vec<_>>();
-    let groups = known_group_backends(&db, &keyspaces)?;
-
-    let mut scanned = 0;
-    let mut unresolved = Vec::new();
-    if keyspaces.iter().any(|name| name == BLOB_LOCATIONS_KEYSPACE) {
-        let keyspace = db.keyspace(BLOB_LOCATIONS_KEYSPACE, KeyspaceCreateOptions::default)?;
-        for entry in db.read_tx().iter(&keyspace) {
-            let (_, value) = entry.into_inner()?;
-            let location = BackendLocation::from_bytes(value.as_ref())
-                .map_err(|error| ExplorerError::Decode(error.to_string()))?;
-            scanned += 1;
-            let resolves = match &location.backend {
-                BackendRef::Node(name) => nodes.contains(name),
-                BackendRef::Group(id) => groups.contains(id),
-            };
-            if !resolves {
-                unresolved.push(UnresolvedLocation {
-                    backend: location.backend.to_string(),
-                    storage_bucket: location.storage_bucket,
-                    backend_path: location.backend_path,
-                });
-            }
-        }
-    }
-    unresolved.sort();
-
-    Ok(LocationScanOutput {
-        database_path: database_path.to_string(),
-        backends_path: backends_path.map(ToString::to_string),
-        scanned,
-        unresolved,
-    })
-}
-
-fn topics_list_output(database_path: &str) -> Result<TopicsListOutput, ExplorerError> {
-    let mut topics = load_pending_placements(database_path)?
-        .into_iter()
-        .map(|placement| TopicListEntry {
-            topic_id: placement_topic_id(&placement),
-            strategy_id: placement.placement.strategy_id.to_string(),
-            shard: placement.placement.shard,
-            status: "under_replicated",
-            selected_peer_count: placement.selected_peers.len(),
-        })
-        .collect::<Vec<_>>();
-    topics.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
-
-    Ok(TopicsListOutput {
-        database_path: database_path.to_string(),
-        topics,
-    })
-}
-
-fn topic_status_output(
-    database_path: &str,
-    topic_id: &str,
-) -> Result<TopicStatusOutput, ExplorerError> {
-    let pending_placement = load_pending_placements(database_path)?
-        .into_iter()
-        .find(|placement| placement_topic_id(placement) == topic_id)
-        .map(JsonPendingDocumentPlacement);
-    let status = if pending_placement.is_some() {
-        "under_replicated"
-    } else {
-        "not_pending"
-    };
-
-    Ok(TopicStatusOutput {
-        database_path: database_path.to_string(),
-        topic_id: topic_id.to_string(),
-        status,
-        pending_placement,
-    })
-}
-
-fn topic_placements_output(
-    database_path: &str,
-    topic_id: Option<&str>,
-) -> Result<TopicPlacementsOutput, ExplorerError> {
-    let mut placements = load_pending_placements(database_path)?;
-    if let Some(topic_id) = topic_id {
-        placements.retain(|placement| placement_topic_id(placement) == topic_id);
-    }
-    placements.sort_by_key(placement_topic_id);
-
-    Ok(TopicPlacementsOutput {
-        database_path: database_path.to_string(),
-        topic_id: topic_id.map(str::to_string),
-        placements: placements
-            .into_iter()
-            .map(JsonPendingDocumentPlacement)
-            .collect(),
-    })
-}
-
-fn load_pending_placements(
-    database_path: &str,
-) -> Result<Vec<PendingShardPlacement>, ExplorerError> {
-    let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
-    let keyspace_names = db.list_keyspace_names();
-    if !keyspace_names
-        .iter()
-        .any(|name| name.as_ref() == SYNC_PLACEMENT_KEYSPACE)
-    {
-        return Ok(Vec::new());
-    }
-
-    let keyspace = db.keyspace(SYNC_PLACEMENT_KEYSPACE, KeyspaceCreateOptions::default)?;
-    let snapshot = db.read_tx();
-    let mut placements = Vec::new();
-    for entry in snapshot.iter(&keyspace) {
-        let (_, value) = entry.into_inner()?;
-        placements.push(
-            aruna_operations::sync::shard_placement::decode_placement(value.as_ref())
-                .map_err(|error| ExplorerError::Decode(error.to_string()))?,
-        );
-    }
-    Ok(placements)
-}
-
-fn decode_entry(keyspace_name: &str, key: &[u8], value: &[u8]) -> EntryOutput {
+pub(super) fn decode_entry(keyspace_name: &str, key: &[u8], value: &[u8]) -> EntryOutput {
     EntryOutput {
         key: decode_key(keyspace_name, key),
         value: decode_value(keyspace_name, key, value),
@@ -1943,210 +682,343 @@ fn raw_value(value: &[u8], decode_error: Option<String>) -> DecodedValue {
         decode_error,
     }
 }
+fn decode_term_id(bytes: &[u8], context: &'static str) -> Result<CraqleTermId, String> {
+    let raw: [u8; 16] = bytes.try_into().map_err(|_| {
+        format!(
+            "invalid {context}: expected 16 bytes, found {}",
+            bytes.len()
+        )
+    })?;
+    Ok(CraqleTermId(u128::from_be_bytes(raw)))
+}
 
+fn decode_craqle_u64(bytes: &[u8], context: &'static str) -> Result<u64, String> {
+    let raw: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| format!("invalid {context}: expected 8 bytes, found {}", bytes.len()))?;
+    Ok(u64::from_be_bytes(raw))
+}
+
+fn decode_quad_key(key: &[u8]) -> Result<CraqleQuadKeyParts, String> {
+    if key.len() != 64 {
+        return Err(format!(
+            "invalid craqle quad key: expected 64 bytes, found {}",
+            key.len()
+        ));
+    }
+    Ok(CraqleQuadKeyParts {
+        graph: decode_term_id(&key[0..16], "craqle quad graph")?,
+        subject: decode_term_id(&key[16..32], "craqle quad subject")?,
+        predicate: decode_term_id(&key[32..48], "craqle quad predicate")?,
+        object: decode_term_id(&key[48..64], "craqle quad object")?,
+    })
+}
+
+fn decode_graph_key(key: &[u8]) -> Result<CraqleGraphKeyParts, String> {
+    match key.first().copied() {
+        Some(CRAQLE_GRAPH_META_PREFIX) if key.len() == 17 => Ok(CraqleGraphKeyParts::Meta {
+            graph: decode_term_id(&key[1..17], "craqle graph meta graph")?,
+        }),
+        Some(CRAQLE_GRAPH_DIRTY_PREFIX) if key.len() == 33 => Ok(CraqleGraphKeyParts::Dirty {
+            graph: decode_term_id(&key[1..17], "craqle graph dirty graph")?,
+            subject: decode_term_id(&key[17..33], "craqle graph dirty subject")?,
+        }),
+        Some(CRAQLE_GRAPH_REINDEX_PREFIX) if key.len() == 17 => Ok(CraqleGraphKeyParts::Reindex {
+            graph: decode_term_id(&key[1..17], "craqle graph reindex graph")?,
+        }),
+        Some(prefix) => Err(format!(
+            "invalid craqle graph key prefix `{}` with length {}",
+            prefix as char,
+            key.len()
+        )),
+        None => Err("invalid craqle graph key: empty key".to_string()),
+    }
+}
+
+fn decode_log_key(key: &[u8]) -> Result<CraqleLogKeyParts, String> {
+    match key.first().copied() {
+        Some(CRAQLE_LOG_HEAD_PREFIX) if key.len() == 49 => Ok(CraqleLogKeyParts::Head {
+            graph: decode_term_id(&key[1..17], "craqle log head graph")?,
+            actor: CraqleActorId::from_bytes(
+                key[17..49]
+                    .try_into()
+                    .map_err(|_| "invalid craqle log head actor".to_string())?,
+            ),
+        }),
+        Some(CRAQLE_LOG_BATCH_PREFIX) if key.len() == 57 => Ok(CraqleLogKeyParts::Batch {
+            graph: decode_term_id(&key[1..17], "craqle log batch graph")?,
+            actor: CraqleActorId::from_bytes(
+                key[17..49]
+                    .try_into()
+                    .map_err(|_| "invalid craqle log batch actor".to_string())?,
+            ),
+            counter: decode_craqle_u64(&key[49..57], "craqle log batch counter")?,
+        }),
+        Some(prefix) => Err(format!(
+            "invalid craqle log key prefix `{}` with length {}",
+            prefix as char,
+            key.len()
+        )),
+        None => Err("invalid craqle log key: empty key".to_string()),
+    }
+}
+
+fn decode_craqle_dots(value: &[u8]) -> Result<Vec<JsonCraqleDot>, String> {
+    let dots = if value.first().copied() == Some(CRAQLE_DOT_ENCODING_TAG) {
+        if !(value.len() - 1).is_multiple_of(40) {
+            return Err(format!("invalid craqle dot payload length {}", value.len()));
+        }
+        let (chunks, _) = value[1..].as_chunks::<40>();
+        chunks
+            .iter()
+            .map(|chunk| CraqleDot {
+                actor: CraqleActorId::from_bytes(chunk[0..32].try_into().unwrap()),
+                counter: u64::from_be_bytes(chunk[32..40].try_into().unwrap()),
+            })
+            .collect()
+    } else {
+        postcard::from_bytes::<Vec<CraqleDot>>(value).map_err(|error| error.to_string())?
+    };
+    Ok(dots.into_iter().map(json_craqle_dot).collect())
+}
+
+fn decode_graph_value(key: &[u8], value: &[u8]) -> DecodedValue {
+    match decode_graph_key(key) {
+        Ok(CraqleGraphKeyParts::Meta { graph }) => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<CraqleStoredGraphMeta>(bytes),
+            |data| DecodedValue::CraqleGraphMeta {
+                data: json_graph_meta(graph, data),
+            },
+        ),
+        Ok(CraqleGraphKeyParts::Dirty { .. }) => decode_value_with(
+            value,
+            |bytes| decode_craqle_u64(bytes, "craqle graph dirty token"),
+            |data| DecodedValue::CraqleGraphDirtyToken { data },
+        ),
+        Ok(CraqleGraphKeyParts::Reindex { .. }) => decode_value_with(
+            value,
+            |bytes| decode_craqle_u64(bytes, "craqle graph reindex token"),
+            |data| DecodedValue::CraqleGraphReindexToken { data },
+        ),
+        Err(error) => raw_value(value, Some(error)),
+    }
+}
+
+fn decode_log_batch(key: &[u8], value: &[u8]) -> Result<JsonCraqleStoredBatch, String> {
+    let CraqleLogKeyParts::Batch { graph, .. } = decode_log_key(key)? else {
+        return Err("craqle log batch value requires a batch key".to_string());
+    };
+    if value.first().copied() != Some(CRAQLE_BATCH_LOG_ENCODING_TAG) {
+        return Err("unsupported craqle log batch encoding".to_string());
+    }
+    let batch = postcard::from_bytes::<CraqleStoredBatch>(&value[1..])
+        .map_err(|error| error.to_string())?;
+    Ok(json_stored_batch(graph, batch))
+}
+
+fn decode_log_value(key: &[u8], value: &[u8]) -> DecodedValue {
+    match decode_log_key(key) {
+        Ok(CraqleLogKeyParts::Head { .. }) => decode_value_with(
+            value,
+            |bytes| decode_craqle_u64(bytes, "craqle log head"),
+            |data| DecodedValue::CraqleLogHead { data },
+        ),
+        Ok(CraqleLogKeyParts::Batch { .. }) => decode_value_with(
+            value,
+            |bytes| decode_log_batch(key, bytes),
+            |data| DecodedValue::CraqleLogBatch { data },
+        ),
+        Err(error) => raw_value(value, Some(error)),
+    }
+}
+
+fn term_id_string(id: CraqleTermId) -> String {
+    format!("{:032x}", id.0)
+}
+
+fn json_quad_key(parts: CraqleQuadKeyParts) -> JsonCraqleQuadKey {
+    JsonCraqleQuadKey {
+        graph: term_id_string(parts.graph),
+        subject: term_id_string(parts.subject),
+        predicate: term_id_string(parts.predicate),
+        object: term_id_string(parts.object),
+    }
+}
+
+fn json_graph_key(parts: CraqleGraphKeyParts) -> JsonCraqleGraphKey {
+    match parts {
+        CraqleGraphKeyParts::Meta { graph } => JsonCraqleGraphKey::Meta {
+            graph: term_id_string(graph),
+        },
+        CraqleGraphKeyParts::Dirty { graph, subject } => JsonCraqleGraphKey::Dirty {
+            graph: term_id_string(graph),
+            subject: term_id_string(subject),
+        },
+        CraqleGraphKeyParts::Reindex { graph } => JsonCraqleGraphKey::Reindex {
+            graph: term_id_string(graph),
+        },
+    }
+}
+
+fn json_log_key(parts: CraqleLogKeyParts) -> JsonCraqleLogKey {
+    match parts {
+        CraqleLogKeyParts::Head { graph, actor } => JsonCraqleLogKey::Head {
+            graph: term_id_string(graph),
+            actor: actor.to_string(),
+        },
+        CraqleLogKeyParts::Batch {
+            graph,
+            actor,
+            counter,
+        } => JsonCraqleLogKey::Batch {
+            graph: term_id_string(graph),
+            actor: actor.to_string(),
+            counter,
+        },
+    }
+}
+
+fn json_craqle_dot(dot: CraqleDot) -> JsonCraqleDot {
+    JsonCraqleDot {
+        actor: dot.actor.to_string(),
+        counter: dot.counter,
+    }
+}
+
+fn json_vector_clock(clock: CraqleVectorClock) -> JsonCraqleVectorClock {
+    JsonCraqleVectorClock {
+        entries: clock
+            .0
+            .into_iter()
+            .map(|(actor, counter)| JsonCraqleClockEntry {
+                actor: actor.to_string(),
+                counter,
+            })
+            .collect(),
+    }
+}
+
+fn json_graph_policy(policy: CraqleGraphPolicy) -> JsonCraqleGraphPolicy {
+    let mut permission_paths = policy.permission_paths;
+    permission_paths.sort();
+    permission_paths.dedup();
+    JsonCraqleGraphPolicy {
+        public: policy.public,
+        permission_paths,
+    }
+}
+
+fn json_graph_meta(graph: CraqleTermId, meta: CraqleStoredGraphMeta) -> JsonCraqleGraphMeta {
+    JsonCraqleGraphMeta {
+        graph: term_id_string(graph),
+        policy: json_graph_policy(meta.policy),
+        clock: json_vector_clock(meta.clock),
+    }
+}
+
+fn json_stored_batch(graph: CraqleTermId, batch: CraqleStoredBatch) -> JsonCraqleStoredBatch {
+    JsonCraqleStoredBatch {
+        graph: term_id_string(graph),
+        actor: batch.actor.to_string(),
+        counter: batch.counter,
+        base_clock: json_vector_clock(batch.base_clock),
+        ops: batch
+            .ops
+            .into_iter()
+            .map(|op| match op {
+                CraqleStoredQuadOp::Add {
+                    subject,
+                    predicate,
+                    object,
+                    dot,
+                } => JsonCraqleStoredBatchOp::Add {
+                    subject: term_id_string(subject),
+                    predicate: term_id_string(predicate),
+                    object: term_id_string(object),
+                    dot: json_craqle_dot(dot),
+                },
+                CraqleStoredQuadOp::Remove {
+                    subject,
+                    predicate,
+                    object,
+                    witnessed,
+                } => JsonCraqleStoredBatchOp::Remove {
+                    subject: term_id_string(subject),
+                    predicate: term_id_string(predicate),
+                    object: term_id_string(object),
+                    witnessed: json_vector_clock(witnessed),
+                },
+            })
+            .collect(),
+        timestamp: batch.timestamp,
+    }
+}
 #[cfg(test)]
 mod tests {
+    use super::super::present::{
+        DecodedField, DecodedValue, JsonPlacementPolicyDocument, JsonPolicyCacheEntry,
+    };
+    use super::super::present::{
+        JsonCraqleGraphKey, JsonCraqleLogKey, JsonCraqleQuadKey, JsonCraqleStoredBatchOp,
+    };
     use super::{
         CRAQLE_BATCH_LOG_ENCODING_TAG, CRAQLE_DOT_ENCODING_TAG, CRAQLE_GRAPH_META_PREFIX,
-        CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_BATCH_PREFIX, CRAQLE_LOG_KEYSPACE,
-        CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, ComputeDepartureReport, ConflictRecord,
-        CraqleStoredBatch, CraqleStoredGraphMeta, CraqleStoredQuadOp, DecodedField, DecodedValue,
-        JobFamilyId, JobRecordEnvelope, JobReservationRecord, JsonPersistedNodeState,
-        JsonPlacementPolicyDocument, JsonPolicyCacheEntry, OutboxEntry, PendingNeed, PendingRecord,
-        ProjectionCache, WitnessDeadline, WitnessExplain, decode_entry, list_entries,
-        list_keyspaces, location_scan, raw_field,
+        CRAQLE_LOG_BATCH_PREFIX, CraqleStoredBatch, CraqleStoredGraphMeta, CraqleStoredQuadOp,
+        CraqleTermId, decode_entry, raw_field,
     };
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
     };
+    use aruna_core::compute_quota::{ComputeDepartureReport, JobReservationRecord};
     use aruna_core::id::DhtKeyId;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-        COMPUTE_DEPARTURE_KEYSPACE, DHT_KEYSPACE, GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
-        HASH_PATHS_INDEX_KEYSPACE, JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE,
-        JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
-        JOB_FAMILY_RECORD_KEYSPACE, JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE,
-        JOB_RESERVATION_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE, KEYSPACE_CATALOG,
-        NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, PLACEMENT_POLICY_CACHE_KEYSPACE,
-        PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
-        S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+        COMPUTE_DEPARTURE_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE,
+        CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+        JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
+        JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
+        JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE, JOB_RESERVATION_KEYSPACE,
+        JOB_WITNESS_DEADLINE_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE,
+        PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
         S3_MULTIPART_UPLOAD_PART_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::{
         Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-        CurrentVersionPointer, Group, HashPathIndexKey, MultipartChecksumType,
-        MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
-        MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus,
-        POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
-        PlacementPolicy, PlacementPolicyDocument, PlacementPolicyRef, PolicyBulkIntent,
-        PolicyBulkRun, PolicyBulkStatus, PolicyIntentOutcome, PolicyMutationParams,
-        PolicyMutationRecord, PolicyPublication, PolicyRefMode, RealmConfigDocument, RealmId,
-        placement_policy_key,
+        CurrentVersionPointer, HashPathIndexKey, JobFamilyId, JobRecordEnvelope,
+        MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
+        MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
+        MultipartUploadStatus, POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE,
+        POLICY_MUTATION_KEYSPACE, PlacementPolicy, PlacementPolicyDocument, PlacementPolicyRef,
+        PolicyBulkIntent, PolicyBulkRun, PolicyBulkStatus, PolicyIntentOutcome,
+        PolicyMutationParams, PolicyMutationRecord, PolicyPublication, PolicyRefMode,
+        RealmConfigDocument, RealmId, placement_policy_key,
     };
     use aruna_net::dht::storage::StoredEntry;
+    use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
     use aruna_operations::jobs::records::rows::PROJECTION_CACHE_VERSION;
+    use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
+    use aruna_operations::jobs::records::rows::{OutboxEntry, ProjectionCache};
     use aruna_operations::placement::policy::PolicyCacheEntry;
     use chrono::{DateTime, Utc};
     use craqle::{
         ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
         VectorClock as CraqleVectorClock,
     };
-    use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase};
     use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::time::SystemTime;
-    use tempfile::tempdir;
     use ulid::Ulid;
-
-    fn scan_location(backend: BackendRef) -> BackendLocation {
-        BackendLocation {
-            backend,
-            storage_class: None,
-            root: "/tmp".to_string(),
-            storage_bucket: "blob-bucket".to_string(),
-            backend_path: "path/blob.bin".to_string(),
-            ulid: Ulid::from_bytes([5_u8; 16]),
-            compressed: false,
-            encrypted: false,
-            created_by: aruna_core::UserId::default(),
-            created_at: SystemTime::UNIX_EPOCH,
-            staging: false,
-            partial: false,
-            blob_size: 11,
-            hashes: HashMap::new(),
-        }
-    }
-
-    #[test]
-    fn reports_unknown_backend() {
-        // A removed backend must be discoverable without a blob backend.
-        let temp = tempdir().unwrap();
-        let backends_path = temp.path().join("backends.toml");
-        std::fs::write(
-            &backends_path,
-            "[backend.hot]\ntype = \"filesystem\"\nroot = \"/data/hot\"\nmultipart_bucket = \"parts\"\ndefault = true\n",
-        )
-        .unwrap();
-        let group_id = Ulid::generate();
-        {
-            let db = OptimisticTxDatabase::builder(temp.path().join("db"))
-                .open()
-                .unwrap();
-            let locations = db
-                .keyspace(BLOB_LOCATIONS_KEYSPACE, KeyspaceCreateOptions::default)
-                .unwrap();
-            let group_backends = db
-                .keyspace(
-                    GROUP_STORAGE_BACKEND_KEYSPACE,
-                    KeyspaceCreateOptions::default,
-                )
-                .unwrap();
-            let mut txn = db.write_tx().unwrap();
-            txn.insert(
-                locations.clone(),
-                vec![1_u8; 32],
-                scan_location(BackendRef::Node("hot".to_string()))
-                    .to_bytes()
-                    .unwrap(),
-            );
-            txn.insert(
-                locations.clone(),
-                vec![2_u8; 32],
-                scan_location(BackendRef::Node("gone".to_string()))
-                    .to_bytes()
-                    .unwrap(),
-            );
-            txn.insert(
-                locations.clone(),
-                vec![3_u8; 32],
-                scan_location(BackendRef::Group(group_id))
-                    .to_bytes()
-                    .unwrap(),
-            );
-            txn.insert(
-                locations,
-                vec![4_u8; 32],
-                scan_location(BackendRef::Group(Ulid::generate()))
-                    .to_bytes()
-                    .unwrap(),
-            );
-            txn.insert(group_backends, group_id.to_bytes().to_vec(), vec![0_u8]);
-            let _ = txn.commit().unwrap();
-        }
-
-        let output = location_scan(
-            temp.path().join("db").to_str().unwrap(),
-            backends_path.to_str(),
-        )
-        .unwrap();
-
-        assert_eq!(output.scanned, 4);
-        let named = output
-            .unresolved
-            .into_iter()
-            .map(|entry| entry.backend)
-            .collect::<Vec<_>>();
-        assert_eq!(named.len(), 2);
-        assert!(named.contains(&"node:gone".to_string()));
-    }
-
-    #[test]
-    fn lists_sorted_keyspaces() {
-        let temp = tempdir().unwrap();
-        {
-            let db = OptimisticTxDatabase::builder(temp.path()).open().unwrap();
-            db.keyspace("zeta", KeyspaceCreateOptions::default).unwrap();
-            db.keyspace("alpha", KeyspaceCreateOptions::default)
-                .unwrap();
-            db.keyspace(GROUP_KEYSPACE, KeyspaceCreateOptions::default)
-                .unwrap();
-        }
-
-        let output = list_keyspaces(temp.path().to_str().unwrap()).unwrap();
-        let names = output
-            .keyspaces
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                "alpha".to_string(),
-                GROUP_KEYSPACE.to_string(),
-                "zeta".to_string()
-            ]
-        );
-
-        let missing = output
-            .missing_keyspaces
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect::<Vec<_>>();
-        // The catalog plus the three bulk/mutation policy keyspaces is the
-        // expectation; the created group keyspace is excluded.
-        let mut expected_missing = KEYSPACE_CATALOG
-            .iter()
-            .copied()
-            .chain([
-                POLICY_BULK_INTENT_KEYSPACE,
-                POLICY_BULK_RUN_KEYSPACE,
-                POLICY_MUTATION_KEYSPACE,
-            ])
-            .filter(|name| *name != GROUP_KEYSPACE)
-            .map(|name| name.to_string())
-            .collect::<Vec<_>>();
-        expected_missing.sort();
-        assert_eq!(missing, expected_missing);
-    }
 
     #[test]
     fn decodes_bucket_record() {
         let realm_id = RealmId::from_bytes([4_u8; 32]);
         let info = BucketInfo {
-            group_id: Ulid::generate(),
+            group_id: Ulid::from_bytes([7_u8; 16]),
             created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            created_by: aruna_core::UserId::local(Ulid::from_bytes([8_u8; 16]), realm_id),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
@@ -2442,7 +1314,7 @@ mod tests {
             },
             publication: PolicyPublication {
                 publisher: secret.public(),
-                created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+                created_by: aruna_core::UserId::local(Ulid::from_bytes([15_u8; 16]), realm_id),
                 created_at_ms: 42,
                 event_id: Ulid::from_bytes([12_u8; 16]),
                 config_digest: [13_u8; 32],
@@ -2525,7 +1397,7 @@ mod tests {
                 bucket_identity: (
                     Ulid::from_bytes([20_u8; 16]),
                     std::time::SystemTime::UNIX_EPOCH,
-                    aruna_core::UserId::local(Ulid::generate(), realm_id),
+                    aruna_core::UserId::local(Ulid::from_bytes([22_u8; 16]), realm_id),
                 ),
                 target_refs: Vec::new(),
                 mode: PolicyRefMode::Union,
@@ -2563,7 +1435,7 @@ mod tests {
             bucket_identity: (
                 Ulid::from_bytes([24_u8; 16]),
                 std::time::SystemTime::UNIX_EPOCH,
-                aruna_core::UserId::local(Ulid::generate(), realm_id),
+                aruna_core::UserId::local(Ulid::from_bytes([25_u8; 16]), realm_id),
             ),
             generation: 3,
             target_refs: Vec::new(),
@@ -2614,53 +1486,6 @@ mod tests {
             DecodedValue::PolicyBulkIntent { data: intent }
         );
     }
-
-    #[test]
-    fn decodes_group_entries() {
-        let temp = tempdir().unwrap();
-        let group_id = Ulid::generate();
-        let realm_id = RealmId::from_bytes([7_u8; 32]);
-        let actor = Actor {
-            node_id: iroh::SecretKey::from_bytes(&[9_u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
-            realm_id,
-        };
-        let group = Group {
-            display_name: "Explorer Group".to_string(),
-            group_id,
-            realm_id,
-            roles: Default::default(),
-            owner: aruna_core::UserId::local(Ulid::generate(), realm_id),
-        };
-
-        {
-            let db = OptimisticTxDatabase::builder(temp.path()).open().unwrap();
-            let keyspace = db
-                .keyspace(GROUP_KEYSPACE, KeyspaceCreateOptions::default)
-                .unwrap();
-            let mut txn = db.write_tx().unwrap();
-            txn.insert(
-                keyspace,
-                group_id.to_bytes().to_vec(),
-                group.to_bytes(&actor).unwrap(),
-            );
-            let _ = txn.commit().unwrap();
-        }
-
-        let output = list_entries(temp.path().to_str().unwrap(), GROUP_KEYSPACE).unwrap();
-        assert_eq!(output.entries.len(), 1);
-        assert_eq!(
-            output.entries[0].key,
-            DecodedField::Ulid {
-                value: group_id.to_string()
-            }
-        );
-        match &output.entries[0].value {
-            DecodedValue::Group { data } => assert_eq!(data.0.display_name, "Explorer Group"),
-            other => panic!("expected group, got {other:?}"),
-        }
-    }
-
     #[test]
     fn unknown_keyspace_raw() {
         let entry = decode_entry("unknown", b"\x01\x02", b"\x03\x04");
@@ -2684,18 +1509,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_keyspace_errors() {
-        let temp = tempdir().unwrap();
-        let error = list_entries(temp.path().to_str().unwrap(), "missing").unwrap_err();
-        assert!(error.to_string().contains("keyspace not found"));
-    }
-
-    #[test]
     fn decodes_realm_config() {
         let realm_id = RealmId::from_bytes([1_u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[3_u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::UserId::local(Ulid::from_bytes([4_u8; 16]), realm_id),
             realm_id,
         };
         let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -2726,7 +1544,7 @@ mod tests {
     #[test]
     fn decodes_onboarding_secret() {
         let record = OnboardingSecretRecord {
-            enrollment_id: Ulid::generate(),
+            enrollment_id: Ulid::from_bytes([6_u8; 16]),
             secret_hash: "hash123".to_string(),
             mode: OnboardingMode::Server,
             purpose: OnboardingPurpose::NodeEnrollment,
@@ -2759,7 +1577,7 @@ mod tests {
             onboarding_phase: None,
             onboarding_sync_ticket: Some("ticket".to_string()),
             identity: PersistedNodeIdentity::User {
-                owner: aruna_core::types::UserId::nil(realm_id),
+                owner: aruna_core::UserId::nil(realm_id),
             },
         };
         let value = postcard::to_allocvec(&state).unwrap();
@@ -2860,7 +1678,7 @@ mod tests {
     #[test]
     fn decodes_upload_entry() {
         let realm_id = RealmId::from_bytes([3_u8; 32]);
-        let created_by = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let created_by = aruna_core::UserId::local(Ulid::from_bytes([10_u8; 16]), realm_id);
         let upload = MultipartUpload {
             backend: BackendRef::node_default(),
             storage_class: None,
@@ -2898,7 +1716,7 @@ mod tests {
     #[test]
     fn decodes_upload_part() {
         let realm_id = RealmId::from_bytes([9_u8; 32]);
-        let created_by = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let created_by = aruna_core::UserId::local(Ulid::from_bytes([11_u8; 16]), realm_id);
         let key = MultipartUploadPartKey::new(Ulid::from_bytes([2_u8; 16]), 5);
         let part = MultipartUploadPart {
             part_number: 5,
@@ -3049,7 +1867,7 @@ mod tests {
         assert_eq!(
             decoded.key,
             DecodedField::CraqleQuadKey {
-                value: super::JsonCraqleQuadKey {
+                value: JsonCraqleQuadKey {
                     graph: format!("{graph:032x}"),
                     subject: format!("{subject:032x}"),
                     predicate: format!("{predicate:032x}"),
@@ -3087,7 +1905,7 @@ mod tests {
         match decoded.key {
             DecodedField::CraqleGraphKey { value } => assert_eq!(
                 value,
-                super::JsonCraqleGraphKey::Meta {
+                JsonCraqleGraphKey::Meta {
                     graph: format!("{graph:032x}")
                 }
             ),
@@ -3124,9 +1942,9 @@ mod tests {
             counter: 17,
             base_clock: CraqleVectorClock(BTreeMap::from([(actor, 16_u64)])),
             ops: vec![CraqleStoredQuadOp::Add {
-                subject: super::CraqleTermId(subject),
-                predicate: super::CraqleTermId(predicate),
-                object: super::CraqleTermId(object),
+                subject: CraqleTermId(subject),
+                predicate: CraqleTermId(predicate),
+                object: CraqleTermId(object),
                 dot: CraqleDot { actor, counter: 17 },
             }],
             timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
@@ -3139,7 +1957,7 @@ mod tests {
         match decoded.key {
             DecodedField::CraqleLogKey { value } => assert_eq!(
                 value,
-                super::JsonCraqleLogKey::Batch {
+                JsonCraqleLogKey::Batch {
                     graph: format!("{graph:032x}"),
                     actor: actor.to_string(),
                     counter: 17,
@@ -3156,7 +1974,7 @@ mod tests {
                 assert_eq!(data.base_clock.entries[0].counter, 16);
                 assert_eq!(data.ops.len(), 1);
                 match &data.ops[0] {
-                    super::JsonCraqleStoredBatchOp::Add {
+                    JsonCraqleStoredBatchOp::Add {
                         subject: got_subject,
                         predicate: got_predicate,
                         object: got_object,
@@ -3192,7 +2010,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([1_u8; 32]);
         let group_id = Ulid::from_bytes([2_u8; 16]);
         let node_id = iroh::SecretKey::from_bytes(&[3_u8; 32]).public();
-        let created_by = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let created_by = aruna_core::UserId::local(Ulid::from_bytes([6_u8; 16]), realm_id);
         let head_key = BlobHeadKey::new("bucket", "path/file.txt");
         let head_value = aruna_core::structs::CurrentVersionPointer::new_with_generation(
             Ulid::from_bytes([4_u8; 16]),
@@ -3307,27 +2125,6 @@ mod tests {
                 "/{realm_id}/g/{group_id}/data/{}/bucket/path/file.txt",
                 node_id
             )
-        );
-    }
-    // The local operator output intentionally includes the persisted network
-    // secret; a redaction change would be a CLI contract decision.
-    #[test]
-    fn node_state_output_keeps_the_network_secret() {
-        let state = PersistedNodeState {
-            boot_origin: aruna::config::BootOrigin::InitializedRealm,
-            status: aruna::config::PersistedNodeStatus::Complete,
-            realm_id: aruna_core::structs::RealmId([3u8; 32]),
-            net_secret_key: [7u8; 32],
-            onboarding_phase: None,
-            onboarding_sync_ticket: None,
-            identity: aruna::config::PersistedNodeIdentity::Management {
-                realm_private_key_pem: "synthetic-pem".to_string(),
-            },
-        };
-        let json = serde_json::to_value(JsonPersistedNodeState(state)).unwrap();
-        assert_eq!(
-            json["net_secret_key"].as_str(),
-            Some("0707070707070707070707070707070707070707070707070707070707070707")
         );
     }
 }

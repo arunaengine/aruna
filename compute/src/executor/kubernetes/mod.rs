@@ -1,31 +1,24 @@
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::{self, Read, Write};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use aruna_core::compute::runtimes::{SESSION_CLIENT_MODE, SESSION_HELPER_PATH};
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
     ExecutorKind, FenceContext, LogLimits, LogTails, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES,
     NOBODY, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec,
     TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
 };
-use aruna_core::structs::tail_str;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use json_patch::Patch as JsonPatch;
-use k8s_openapi::api::authorization::v1::SelfSubjectAccessReview;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{
-    ConfigMap, ContainerState, ContainerStateTerminated, Namespace, PersistentVolume,
-    PersistentVolumeClaim, Pod, Secret, ServiceAccount,
+    ConfigMap, Namespace, PersistentVolume, PersistentVolumeClaim, Pod, Secret, ServiceAccount,
 };
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::storage::v1::{CSIDriver, StorageClass};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use k8s_openapi::jiff::Timestamp;
 use kube::api::{
     Api, AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
@@ -48,12 +41,18 @@ use super::staging::{StageLayout, StagePlan};
 use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned};
 
 mod manifest;
+mod session;
+mod status;
 
 use manifest::{
     HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, data_pv_manifest, data_pvc_manifest,
     helper_pod, job_manifest, marker_manifest, marker_name, mount_buckets, mount_pv_manifest,
     mount_pvc_manifest, needs_workspace, network_policies, policy_manifests, pvc_manifest,
     secret_manifest, secret_name, session_mount, workspace_name,
+};
+use status::{
+    job_pending, job_status, pod_started, pod_stuck_reason, task_started, task_state,
+    termination_detail, time_ms,
 };
 
 pub const EPOCH_ANNOTATION: &str = "aruna-engine.org/attempt-epoch";
@@ -962,9 +961,9 @@ impl ExecutorBackend for KubernetesBackend {
             .await
             .map_err(kube_error)?;
         for (group, resource, subresource, verb) in
-            required_access(self.config.s3_mount_driver.is_some())
+            session::required_access(self.config.s3_mount_driver.is_some())
         {
-            check_access(
+            session::check_access(
                 self.client.clone(),
                 &self.config.namespace,
                 group,
@@ -1266,45 +1265,7 @@ impl ExecutorBackend for KubernetesBackend {
     /// Runs the helper in client mode inside the task container and hands the
     /// exec's standard input and output to the caller.
     async fn open_session(&self, context: &FenceContext) -> Result<SessionChannel, BackendError> {
-        let pods = self.task_pods(context).await?;
-        let pod = pods
-            .iter()
-            .find(|pod| task_state(pod).is_some_and(|state| state.running.is_some()))
-            .ok_or_else(|| {
-                BackendError::Conflict(format!(
-                    "attempt `{}` has no running task pod",
-                    context.attempt.external_name()
-                ))
-            })?;
-        let params = AttachParams::default()
-            .container("task")
-            .stdin(true)
-            .stdout(true)
-            .stderr(false)
-            .max_stdin_buf_size(EXEC_STREAM_BUF_BYTES)
-            .max_stdout_buf_size(EXEC_STREAM_BUF_BYTES);
-        let mut attached = self
-            .pods()
-            .exec(
-                &pod.name_any(),
-                [SESSION_HELPER_PATH, SESSION_CLIENT_MODE],
-                &params,
-            )
-            .await
-            .map_err(kube_error)?;
-        let input = attached.stdin().ok_or_else(|| {
-            BackendError::Api("session exec did not expose standard input".to_string())
-        })?;
-        let output = attached.stdout().ok_or_else(|| {
-            BackendError::Api("session exec did not expose standard output".to_string())
-        })?;
-        Ok(SessionChannel {
-            input: Box::pin(input),
-            output: Box::pin(SessionReader {
-                inner: output,
-                _process: attached,
-            }),
-        })
+        session::open(self, context).await
     }
 
     async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence {
@@ -1676,173 +1637,6 @@ fn validate_output(job: &Job, path: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
-fn job_status(job: &Job) -> AttemptStatus {
-    let phase = if job_state(job) == Some("cancelled") {
-        AttemptPhase::Cancelled
-    } else if job
-        .status
-        .as_ref()
-        .and_then(|status| status.conditions.as_ref())
-        .is_some_and(|conditions| {
-            conditions
-                .iter()
-                .any(|condition| condition.type_ == "Complete" && condition.status == "True")
-        })
-    {
-        AttemptPhase::Exited { code: 0 }
-    } else if let Some(condition) = job
-        .status
-        .as_ref()
-        .and_then(|status| status.conditions.as_ref())
-        .and_then(|conditions| {
-            conditions
-                .iter()
-                .find(|condition| condition.type_ == "Failed" && condition.status == "True")
-        })
-    {
-        // A Job-level failure with no terminated container carries no evidence
-        // about the payload itself; a terminated one overrides this phase.
-        AttemptPhase::SystemError {
-            reason: condition
-                .message
-                .clone()
-                .or_else(|| condition.reason.clone())
-                .unwrap_or_else(|| "Kubernetes Job failed".to_string()),
-        }
-    } else if job
-        .status
-        .as_ref()
-        .and_then(|status| status.active)
-        .unwrap_or(0)
-        > 0
-    {
-        AttemptPhase::Running
-    } else {
-        AttemptPhase::Submitted
-    };
-    let times = job.status.as_ref();
-    AttemptStatus {
-        phase,
-        backend_ref: job.metadata.uid.clone().unwrap_or_else(|| job.name_any()),
-        started_at_ms: time_ms(times.and_then(|status| status.start_time.as_ref())),
-        finished_at_ms: time_ms(times.and_then(|status| status.completion_time.as_ref())),
-        detail: None,
-    }
-}
-
-/// Reason and message of a terminated container, bounded from the end because
-/// the fallback message holds the last log lines.
-fn termination_detail(state: &ContainerStateTerminated) -> Option<String> {
-    let reason = state.reason.as_deref().unwrap_or_default().trim();
-    let message = state.message.as_deref().unwrap_or_default().trim();
-    let detail = match (reason.is_empty(), message.is_empty()) {
-        (true, true) => return None,
-        (false, true) => reason.to_string(),
-        (true, false) => message.to_string(),
-        (false, false) => format!("{reason}: {message}"),
-    };
-    Some(tail_str(&detail, MAX_TERMINATION_DETAIL).to_string())
-}
-
-fn time_ms(time: Option<&Time>) -> Option<u64> {
-    u64::try_from(time?.0.as_millisecond()).ok()
-}
-
-/// Active but unready Pods are the only ones that can hold a stuck container.
-fn job_pending(job: &Job) -> bool {
-    job.status
-        .as_ref()
-        .is_some_and(|status| status.active.unwrap_or(0) > 0 && status.ready.unwrap_or(0) == 0)
-}
-
-/// Reasons the kubelet reports only after repeated failed attempts. A bare
-/// `ErrImagePull` is a single try, so it never proves a stuck container.
-fn repeated_wait(reason: &str) -> bool {
-    matches!(
-        reason,
-        "ImagePullBackOff" | "CreateContainerConfigError" | "CreateContainerError"
-    )
-}
-
-/// A registry that refuses the reference outright (unknown name, no access)
-/// answers the same on every retry, so waiting out the deadline gains nothing.
-fn pull_refused(reason: &str, message: Option<&str>) -> bool {
-    if !matches!(reason, "ErrImagePull" | "ImagePullBackOff") {
-        return false;
-    }
-    let message = message.unwrap_or_default().to_ascii_lowercase();
-    [
-        "401 unauthorized",
-        "403 forbidden",
-        "404 not found",
-        "manifest unknown",
-        "name unknown",
-        "pull access denied",
-        "repository does not exist",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
-}
-
-/// Kubernetes retries a failing image pull forever, so the Job counts such a Pod
-/// as active and never reports a terminal condition. A malformed or refused
-/// reference fails at once; a repeated one fails once it outlives `deadline`.
-fn pod_stuck_reason(pod: &Pod, deadline: Duration, now: Timestamp) -> Option<String> {
-    let status = pod.status.as_ref()?;
-    let waited = status
-        .start_time
-        .as_ref()
-        .or(pod.metadata.creation_timestamp.as_ref())
-        .map(|since| Duration::try_from(now.duration_since(since.0)).unwrap_or_default())
-        .unwrap_or_default();
-    status
-        .init_container_statuses
-        .iter()
-        .chain(status.container_statuses.iter())
-        .flatten()
-        .find_map(|container| {
-            let waiting = container.state.as_ref()?.waiting.as_ref()?;
-            let reason = waiting.reason.as_deref()?;
-            if reason != "InvalidImageName"
-                && !pull_refused(reason, waiting.message.as_deref())
-                && !(repeated_wait(reason) && waited > deadline)
-            {
-                return None;
-            }
-            let detail = waiting.message.as_deref().unwrap_or("no detail reported");
-            Some(format!(
-                "container `{}` cannot start ({reason}): {detail}",
-                container.name
-            ))
-        })
-}
-
-/// Log reads only succeed once the task container has left its waiting state.
-fn task_started(pod: &Pod) -> bool {
-    task_state(pod).is_some_and(|state| state.running.is_some() || state.terminated.is_some())
-}
-
-fn task_state(pod: &Pod) -> Option<&ContainerState> {
-    pod.status
-        .as_ref()?
-        .container_statuses
-        .as_ref()?
-        .iter()
-        .find(|status| status.name == "task")?
-        .state
-        .as_ref()
-}
-
-/// The container start survives its exit, so both states carry the evidence.
-fn pod_started(pod: &Pod) -> Option<u64> {
-    let state = task_state(pod)?;
-    match (state.running.as_ref(), state.terminated.as_ref()) {
-        (Some(running), _) => time_ms(running.started_at.as_ref()),
-        (None, Some(terminated)) => time_ms(terminated.started_at.as_ref()),
-        (None, None) => None,
-    }
-}
-
 fn job_epoch(job: &Job) -> Result<u64, BackendError> {
     annotation_u64(job, EPOCH_ANNOTATION)
 }
@@ -1917,92 +1711,6 @@ fn attempt_selector(context: &FenceContext) -> String {
 
 fn logs_name(name: &str) -> String {
     format!("{name}-logs")
-}
-
-fn required_access(
-    s3_mount: bool,
-) -> Vec<(
-    &'static str,
-    &'static str,
-    Option<&'static str>,
-    &'static str,
-)> {
-    let mut access = vec![
-        ("batch", "jobs", None, "create"),
-        ("batch", "jobs", None, "get"),
-        ("batch", "jobs", None, "list"),
-        ("batch", "jobs", None, "watch"),
-        ("batch", "jobs", None, "patch"),
-        ("batch", "jobs", None, "delete"),
-        ("", "pods", None, "create"),
-        ("", "pods", None, "get"),
-        ("", "pods", None, "list"),
-        ("", "pods", None, "watch"),
-        ("", "pods", None, "delete"),
-        ("", "pods", Some("exec"), "create"),
-        ("", "pods", Some("exec"), "get"),
-        ("", "pods", Some("log"), "get"),
-        ("", "persistentvolumes", None, "create"),
-        ("", "persistentvolumes", None, "get"),
-        ("", "persistentvolumes", None, "list"),
-        ("", "persistentvolumes", None, "delete"),
-        ("", "persistentvolumeclaims", None, "create"),
-        ("", "persistentvolumeclaims", None, "get"),
-        ("", "persistentvolumeclaims", None, "list"),
-        ("", "persistentvolumeclaims", None, "watch"),
-        ("", "persistentvolumeclaims", None, "delete"),
-        ("", "secrets", None, "create"),
-        ("", "secrets", None, "get"),
-        ("", "secrets", None, "delete"),
-        ("", "configmaps", None, "create"),
-        ("", "configmaps", None, "get"),
-        ("", "configmaps", None, "patch"),
-        ("", "configmaps", None, "delete"),
-        ("", "serviceaccounts", None, "get"),
-        ("networking.k8s.io", "networkpolicies", None, "create"),
-        ("networking.k8s.io", "networkpolicies", None, "get"),
-        ("networking.k8s.io", "networkpolicies", None, "patch"),
-        ("storage.k8s.io", "storageclasses", None, "get"),
-    ];
-    if s3_mount {
-        access.push(("storage.k8s.io", "csidrivers", None, "get"));
-    }
-    access
-}
-
-async fn check_access(
-    client: Client,
-    namespace: &str,
-    group: &str,
-    resource: &str,
-    subresource: Option<&str>,
-    verb: &str,
-) -> Result<(), BackendError> {
-    let reviews: Api<SelfSubjectAccessReview> = Api::all(client);
-    let review: SelfSubjectAccessReview = serde_json::from_value(json!({
-        "apiVersion":"authorization.k8s.io/v1",
-        "kind":"SelfSubjectAccessReview",
-        "spec":{"resourceAttributes":{
-            "namespace":if matches!(resource,"storageclasses" | "csidrivers" | "persistentvolumes") { None } else { Some(namespace) },
-            "group":group,
-            "resource":resource,
-            "subresource":subresource,
-            "verb":verb,
-            "name":if matches!(resource,"storageclasses" | "csidrivers") { Some("") } else { None }
-        }}
-    }))
-    .map_err(|error| BackendError::Api(format!("build access review: {error}")))?;
-    let result = reviews
-        .create(&PostParams::default(), &review)
-        .await
-        .map_err(kube_error)?;
-    if result.status.is_some_and(|status| status.allowed) {
-        Ok(())
-    } else {
-        Err(BackendError::Unavailable(format!(
-            "Kubernetes access denied for {verb} {group}/{resource}"
-        )))
-    }
 }
 
 async fn delete_named<K>(api: Api<K>, name: &str) -> Result<(), BackendError>
@@ -2083,21 +1791,6 @@ fn build_archive(
         }
     }
     builder.finish().map_err(io_error)
-}
-
-struct SessionReader<R> {
-    inner: R,
-    _process: kube::api::AttachedProcess,
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for SessionReader<R> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
-    }
 }
 
 struct ExactReader<R> {
@@ -2338,6 +2031,7 @@ mod tests {
     use aruna_core::compute::AttemptRef;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
+    use super::status::pull_refused;
     use super::*;
 
     fn context() -> FenceContext {
@@ -3335,30 +3029,34 @@ mod tests {
         assert!(pod_stuck_reason(&pod, Duration::from_secs(300), probe_now(1)).is_some());
     }
 
+    // The parsing fixture table: only the published refusal texts refuse an
+    // attempt. Every unknown message, missing message, or non-pull reason stays
+    // retryable instead of being inferred into a failure.
     #[test]
     fn classifies_registry_refusals() {
-        // The message is external kubelet/registry evidence, so only the
-        // published refusal texts refuse an attempt; anything unknown stays
-        // retryable instead of being inferred into a failure.
-        for message in [
-            "401 Unauthorized",
-            "403 Forbidden",
-            "404 Not Found",
-            "manifest unknown",
-            "name unknown",
-            "pull access denied",
-            "repository does not exist",
-        ] {
-            let lower = message.to_ascii_lowercase();
-            assert!(pull_refused("ErrImagePull", Some(message)), "{message}");
-            assert!(pull_refused("ImagePullBackOff", Some(&lower)), "{message}");
+        let fixtures = [
+            ("ErrImagePull", "401 Unauthorized", true),
+            ("ErrImagePull", "403 Forbidden", true),
+            ("ErrImagePull", "404 Not Found", true),
+            ("ErrImagePull", "manifest unknown", true),
+            ("ErrImagePull", "name unknown", true),
+            ("ErrImagePull", "pull access denied", true),
+            ("ErrImagePull", "repository does not exist", true),
+            ("ImagePullBackOff", "401 unauthorized", true),
+            ("ErrImagePull", "connection reset by peer", false),
+            ("ErrImagePull", "i/o timeout", false),
+            ("ErrImagePull", "", false),
+            ("InvalidImageName", "401 Unauthorized", false),
+            ("CreateContainerError", "403 Forbidden", false),
+        ];
+        for (reason, message, refused) in fixtures {
+            assert_eq!(
+                pull_refused(reason, Some(message)),
+                refused,
+                "{reason}: {message}"
+            );
         }
-        assert!(!pull_refused(
-            "ErrImagePull",
-            Some("connection reset by peer")
-        ));
         assert!(!pull_refused("ErrImagePull", None));
-        assert!(!pull_refused("InvalidImageName", Some("401 Unauthorized")));
     }
 
     #[test]

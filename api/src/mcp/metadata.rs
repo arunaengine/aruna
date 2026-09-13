@@ -1,3 +1,9 @@
+//! MCP metadata tools.
+//!
+//! Tools convert through the shared `crate::metadata` adapter (request DTOs,
+//! operation error mapping, the local-write lookup) and never call a REST
+//! handler.
+
 use super::data::{ReadObjectInput, read_text};
 use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
@@ -978,5 +984,404 @@ mod tests {
         assert_eq!(resource_id(&json!("s3://a/b")), Some("s3://a/b"));
         assert_eq!(resource_id(&json!({ "@id": "s3://a/b" })), Some("s3://a/b"));
         assert_eq!(resource_id(&json!({ "other": 1 })), None);
+    }
+}
+
+/// In-process tool contract tests for the D016/D017 replacement: protected
+/// metadata tools are executed for the unauthenticated, wrong-actor,
+/// wrong-scope, and allowed cases, and a refusal is asserted to be exactly the
+/// authorization error, so the privileged operation behind it was not reached.
+#[cfg(test)]
+mod authorization_tests {
+    use super::*;
+    use crate::server_state::ServerState;
+    use crate::tests::fixtures::routes::{
+        seed_group_docs, seed_realm_auth, test_context, test_state, test_storage, write_doc,
+    };
+    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::structs::{
+        Actor, NodeCapabilities, PathRestriction, Permission, RealmConfigDocument, RealmId,
+        RealmNodeKind,
+    };
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_operations::driver::drive;
+    use aruna_operations::metadata::MetadataHandle;
+    use aruna_operations::metadata::create_document::CreateMetadataDocumentPayload;
+    use aruna_operations::realm::announce_presence::{
+        AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    };
+    use aruna_tasks::TaskHandle;
+    use ed25519_dalek::SigningKey;
+    use rmcp::handler::server::tool::Extension;
+    use rmcp::handler::server::wrapper::Parameters;
+    use rmcp::model::CallToolResult;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    struct Fixture {
+        _storage_dir: TempDir,
+        _metadata_dir: TempDir,
+        server: McpServer,
+        auth: AuthContext,
+        group_id: Ulid,
+    }
+
+    fn parts_with(auth: Option<AuthContext>) -> http::request::Parts {
+        let (mut parts, _) = http::Request::builder().body(()).unwrap().into_parts();
+        parts.extensions.insert(auth);
+        parts
+    }
+
+    fn error_body(result: CallToolResult) -> Value {
+        assert_eq!(result.is_error, Some(true));
+        result
+            .structured_content
+            .expect("a tool error carries the structured body")
+    }
+
+    fn denied_body(
+        result: Result<rmcp::Json<JsonPayload>, CallToolResult>,
+        message: &str,
+    ) -> Value {
+        match result {
+            Err(error) => error_body(error),
+            Ok(_) => panic!("{message}"),
+        }
+    }
+
+    async fn fixture() -> Fixture {
+        let (storage_dir, storage_handle) = test_storage();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let realm_id = RealmId::from_bytes(
+            SigningKey::from_bytes(&[3u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                secret_key: Some(iroh::SecretKey::from_bytes(&[11u8; 32])),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let node_id = net.node_id();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id,
+            realm_id,
+        };
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            node_id,
+            storage_handle.clone(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut context = test_context(storage_handle);
+        context.net_handle = Some(net);
+        context.metadata_handle = Some(metadata_handle);
+        context.task_handle = Some(TaskHandle::new());
+        let driver_ctx = Arc::new(context);
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(node_id, RealmNodeKind::Server);
+        config.seed_job_control(node_id, 0);
+        write_doc(
+            &driver_ctx,
+            REALM_CONFIG_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            config.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        drive(
+            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                realm_id,
+                node_id,
+                schedule_refresh: false,
+            }),
+            driver_ctx.as_ref(),
+        )
+        .await
+        .unwrap();
+        let group_id = Ulid::generate();
+        seed_group_docs(
+            &driver_ctx,
+            realm_id,
+            &actor,
+            group_id,
+            "mcp-group",
+            user_id,
+        )
+        .await;
+        seed_realm_auth(&driver_ctx, realm_id, &actor).await;
+
+        let state = test_state(
+            driver_ctx,
+            realm_id,
+            node_id,
+            NodeCapabilities::user_node(realm_id).unwrap(),
+        )
+        .await;
+        Fixture {
+            _storage_dir: storage_dir,
+            _metadata_dir: metadata_dir,
+            server: McpServer::new(Arc::new(state)),
+            auth: AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            group_id,
+        }
+    }
+
+    fn stranger(fixture: &Fixture) -> AuthContext {
+        AuthContext {
+            user_id: aruna_core::UserId::local(Ulid::generate(), fixture.auth.realm_id),
+            realm_id: fixture.auth.realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    async fn drain_metadata_background(state: &ServerState) {
+        let ctx = state.get_ctx();
+        let drained = aruna_operations::metadata::projector::drain_projection_queue(ctx.as_ref())
+            .await
+            .unwrap();
+        if drained.markers_examined == 0 {
+            aruna_operations::metadata::projector::replay_event_log(ctx.as_ref())
+                .await
+                .unwrap();
+        }
+        aruna_operations::metadata::materialization_queue::process_materialization_batch(
+            ctx.as_ref(),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn draft_crate(name: &str) -> Value {
+        json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                    "about": { "@id": "./" }
+                },
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "name": name,
+                    "description": "seeded through the shared metadata adapter",
+                    "datePublished": "2026-01-01"
+                }
+            ]
+        })
+    }
+
+    async fn seed_document(fixture: &Fixture, path: &str) -> Ulid {
+        let record = crate::metadata::run_create_metadata(
+            &fixture.server.state,
+            &fixture.auth,
+            crate::mcp::empty_extras("seed"),
+            None,
+            fixture.group_id,
+            path.to_string(),
+            false,
+            CreateMetadataDocumentPayload::RoCrate {
+                jsonld: serde_json::to_string(&draft_crate("MCP authorization fixture")).unwrap(),
+            },
+        )
+        .await
+        .expect("owner can seed a private document");
+        drain_metadata_background(&fixture.server.state).await;
+        record.document_id
+    }
+
+    #[tokio::test]
+    async fn get_dataset_requires_authentication() {
+        let fixture = fixture().await;
+        let result = fixture
+            .server
+            .get_dataset(
+                Extension(parts_with(None)),
+                Parameters(IdInput {
+                    id: Ulid::generate().to_string(),
+                }),
+            )
+            .await;
+        let body = denied_body(result, "unauthenticated tool call must fail");
+        assert_eq!(body["code"], "Not authorized");
+    }
+
+    #[tokio::test]
+    async fn get_dataset_denies_a_stranger_without_exporting() {
+        let fixture = fixture().await;
+        let document_id = seed_document(&fixture, "datasets/mcp-private").await;
+
+        let denied = fixture
+            .server
+            .get_dataset(
+                Extension(parts_with(Some(stranger(&fixture)))),
+                Parameters(IdInput {
+                    id: document_id.to_string(),
+                }),
+            )
+            .await;
+        let body = denied_body(denied, "a stranger must not read the document");
+        assert_eq!(body["code"], "Forbidden");
+
+        let allowed = fixture
+            .server
+            .get_dataset(
+                Extension(parts_with(Some(fixture.auth.clone()))),
+                Parameters(IdInput {
+                    id: document_id.to_string(),
+                }),
+            )
+            .await
+            .expect("the owner may read the document");
+        assert!(allowed.0.0["raw"].is_object());
+    }
+
+    #[tokio::test]
+    async fn get_dataset_denies_a_wrong_scope_token() {
+        let fixture = fixture().await;
+        let document_id = seed_document(&fixture, "datasets/mcp-scoped").await;
+        let restricted = AuthContext {
+            path_restrictions: Some(vec![PathRestriction {
+                pattern: format!(
+                    "/{}/g/{}/meta/other/**",
+                    fixture.auth.realm_id, fixture.group_id
+                ),
+                permission: Permission::READ,
+            }]),
+            ..fixture.auth.clone()
+        };
+
+        let denied = fixture
+            .server
+            .get_dataset(
+                Extension(parts_with(Some(restricted))),
+                Parameters(IdInput {
+                    id: document_id.to_string(),
+                }),
+            )
+            .await;
+        let body = denied_body(denied, "a path-restricted token must be refused");
+        assert_eq!(body["code"], "Forbidden");
+    }
+
+    #[tokio::test]
+    async fn replace_dataset_denies_a_stranger_without_updating() {
+        let fixture = fixture().await;
+        let document_id = seed_document(&fixture, "datasets/mcp-guarded").await;
+
+        let denied = fixture
+            .server
+            .replace_dataset(
+                Extension(parts_with(Some(stranger(&fixture)))),
+                Parameters(ReplaceDatasetInput {
+                    id: document_id.to_string(),
+                    rocrate: crate::mcp::JsonPayload(json!({
+                        "@context": "https://w3id.org/ro/crate/1.2/context",
+                        "@graph": [
+                            {
+                                "@id": "ro-crate-metadata.json",
+                                "@type": "CreativeWork",
+                                "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                                "about": { "@id": "./" }
+                            },
+                            {
+                                "@id": "./",
+                                "@type": "Dataset",
+                                "name": "Tampered",
+                                "description": "must not be stored",
+                                "datePublished": "2026-01-01"
+                            }
+                        ]
+                    })),
+                    public: None,
+                }),
+            )
+            .await;
+        let body = denied_body(denied, "a stranger must not replace the document");
+        assert_eq!(body["code"], "Forbidden");
+
+        let owner_view = fixture
+            .server
+            .get_dataset(
+                Extension(parts_with(Some(fixture.auth.clone()))),
+                Parameters(IdInput {
+                    id: document_id.to_string(),
+                }),
+            )
+            .await
+            .expect("the owner still reads the untouched document");
+        assert!(
+            !owner_view.0.0.to_string().contains("Tampered"),
+            "the refused replace left the stored crate unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_profiles_allows_the_member() {
+        let fixture = fixture().await;
+        let allowed = fixture
+            .server
+            .list_profiles(Extension(parts_with(Some(fixture.auth.clone()))))
+            .await
+            .expect("a realm member may probe visible profiles");
+        assert!(allowed.0.0.is_object());
+    }
+
+    #[tokio::test]
+    async fn create_dataset_allows_the_group_member() {
+        let fixture = fixture().await;
+        let created = fixture
+            .server
+            .create_dataset(
+                Extension(parts_with(Some(fixture.auth.clone()))),
+                Parameters(CreateDatasetInput {
+                    group_id: fixture.group_id.to_string(),
+                    path: "datasets/mcp-created".to_string(),
+                    rocrate: crate::mcp::JsonPayload(json!({
+                        "@context": "https://w3id.org/ro/crate/1.2/context",
+                        "@graph": [
+                            {
+                                "@id": "ro-crate-metadata.json",
+                                "@type": "CreativeWork",
+                                "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                                "about": { "@id": "./" }
+                            },
+                            {
+                                "@id": "./",
+                                "@type": "Dataset",
+                                "name": "MCP created",
+                                "description": "created through the MCP tool",
+                                "datePublished": "2026-01-01"
+                            }
+                        ]
+                    })),
+                    public: None,
+                }),
+            )
+            .await
+            .expect("a group member may create a dataset");
+        assert_eq!(created.0.0["group_id"], fixture.group_id.to_string());
     }
 }

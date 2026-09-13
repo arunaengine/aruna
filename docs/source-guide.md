@@ -25,7 +25,7 @@ change.
 3. `drive` calls `start`/`step` on the operation. The operation returns
    `Effect` values (`core/src/effects.rs`) and consumes `Event` values
    (`core/src/events.rs`). It never performs I/O itself.
-4. The effect adapters in `operations/src/driver.rs` execute storage, blob,
+4. The effect adapters in `operations/src/effect_adapters/` execute storage, blob,
    net, metadata, and task effects and feed the results back as events.
 5. `finalize` maps the completed state to `Result<Output, Error>`; the
    transport maps that to a response.
@@ -73,7 +73,7 @@ assert effects, `step` explicit events, assert effects, `finalize`.
 1. Add the `TaskKey` variant in `core/src/task.rs`.
 2. Handle `TaskEvent` for it in `operations/src/tasks/incoming/` and register
    the handler/queue with the shared `TaskHandle` lifecycle owner in
-   `initialize_task_holder`.
+   `initialize_task_holder` (`operations/src/tasks/incoming/restore.rs`).
 3. Production startup starts queues in `aruna/src/startup/background.rs`
    (`STARTUP_PHASES`); put restore/install work there, not in the task crate
    root.

@@ -1396,6 +1396,18 @@ async fn mark_not_attempted(
     Ok(())
 }
 
+/// The report code for a phase failure message. Validation failures carry their
+/// typed violation through `write_validation_rows`; this call site only ever sees
+/// a plain failure string or the panic marker, so there is no typed reason to
+/// pass. The substring keeps a code embedded in such a message reportable.
+fn phase_failure_code(message: &str) -> ReasonCode {
+    if message.contains("unsupported_crate_version") {
+        ReasonCode::UnsupportedCrateVersion
+    } else {
+        ReasonCode::Failed
+    }
+}
+
 async fn write_phase_error(
     ctx: &JobContext,
     phase: ImportPhase,
@@ -1404,11 +1416,7 @@ async fn write_phase_error(
     let key = format!("failure/{}", phase_name(phase));
     let row = ImportReportRow {
         entry_key: key,
-        code: if message.contains("unsupported_crate_version") {
-            ReasonCode::UnsupportedCrateVersion
-        } else {
-            ReasonCode::Failed
-        },
+        code: phase_failure_code(message),
         message: Some(message.to_string()),
         detail: ImportReportDetail {
             archive_path: "ro-crate-metadata.json".to_string(),
@@ -1688,11 +1696,41 @@ fn validation_message(violations: &[MetadataValidationViolation]) -> String {
         .join("; ")
 }
 
+/// Why a backend blob write failed, as far as the import may decide on it. The
+/// S3 layer reports these faults as message strings, so the import classifies the
+/// causes it recognizes beside the decision it makes; a cause it does not know
+/// stays retryable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobWriteFailure {
+    /// An integrity fault the source bytes will not heal by retrying.
+    Checksum,
+    /// A declared body length that does not match what arrived.
+    ContentLength,
+    /// A backend fault the import cannot pin to the written bytes.
+    Unknown,
+}
+
+impl BlobWriteFailure {
+    fn classify(message: &str) -> Self {
+        if message.contains("checksum") {
+            Self::Checksum
+        } else if message.contains("Content-Length") {
+            Self::ContentLength
+        } else {
+            Self::Unknown
+        }
+    }
+
+    fn retryable(self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
 fn classify_put(error: PutObjectError) -> ImportFailure {
     match error {
         PutObjectError::StorageError(_) => ImportFailure::Retryable(error.to_string()),
         PutObjectError::BlobWriteFailed(ref message)
-            if !message.contains("checksum") && !message.contains("Content-Length") =>
+            if BlobWriteFailure::classify(message).retryable() =>
         {
             ImportFailure::Retryable(error.to_string())
         }
@@ -1914,6 +1952,60 @@ pub(crate) mod tests {
 
     // A source that keeps changing can settle, but a dropped historical
     // observation and an exhausted binding never heal by retrying.
+    // The S3 layer reports blob-write faults as strings; the fixture table pins
+    // which of them the import treats as permanent and which stay retryable.
+    #[test]
+    fn classifies_blob_write_failures() {
+        let fixtures = [
+            (
+                "checksum mismatch for sha256",
+                BlobWriteFailure::Checksum,
+                false,
+            ),
+            (
+                "Content-Length 12 does not match 13",
+                BlobWriteFailure::ContentLength,
+                false,
+            ),
+            ("No space left on device", BlobWriteFailure::Unknown, true),
+            ("connection reset by peer", BlobWriteFailure::Unknown, true),
+        ];
+        for (message, expected, retryable) in fixtures {
+            assert_eq!(BlobWriteFailure::classify(message), expected, "{message}");
+            assert_eq!(expected.retryable(), retryable, "{message}");
+        }
+
+        assert!(matches!(
+            classify_put(PutObjectError::BlobWriteFailed(
+                "checksum mismatch for sha256".to_string()
+            )),
+            ImportFailure::Permanent(_)
+        ));
+        assert!(matches!(
+            classify_put(PutObjectError::BlobWriteFailed(
+                "No space left on device".to_string()
+            )),
+            ImportFailure::Retryable(_)
+        ));
+    }
+
+    // Validation failures carry a typed violation to `write_validation_rows`; the
+    // phase-failure path only sees plain strings, so it still classifies the
+    // embedded code and leaves anything else as a plain failure.
+    #[test]
+    fn classifies_phase_failure_codes() {
+        use aruna_core::structs::ReasonCode;
+
+        assert_eq!(
+            phase_failure_code("unsupported_crate_version: crate 9.9"),
+            ReasonCode::UnsupportedCrateVersion
+        );
+        assert_eq!(
+            phase_failure_code("import plan is missing"),
+            ReasonCode::Failed
+        );
+    }
+
     #[test]
     fn classifies_reference_errors() {
         assert!(matches!(

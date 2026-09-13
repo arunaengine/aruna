@@ -1025,6 +1025,27 @@ impl ReplicateObjectVersionError {
     }
 }
 
+/// One outbound version push per target node; every accepted event advances
+/// exactly one state, and `step` dispatches each state to the handler named
+/// after its protocol phase.
+///
+/// Manifest preparation
+///   `Init` reads the stored version, its blob location with the managed-copy
+///   serve check, reference source access and multipart metadata;
+///   `ReadCurrentLookup` builds the manifest.
+/// Connection
+///   `OpenConnection` establishes the stream to the target node.
+/// Negotiation
+///   `SendManifest` pushes the manifest and `AwaitNegotiation` accepts one of
+///   [`ReplicationNegotiationResult`].
+/// Transfer
+///   `TransferBlob` pushes the blob when the target asked for it.
+/// Apply acknowledgement
+///   `AwaitApplyComplete` consumes the target's final decision.
+/// Close/cleanup
+///   `CleanupReferenceBlob` drops locally materialized reference bytes,
+///   `WriteReferenceState` records the reference fingerprint and
+///   `CloseConnection` ends the stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ReplicateObjectVersionState {
     Init,
@@ -2051,6 +2072,521 @@ impl ReplicateObjectVersionOperation {
     }
 }
 
+// Phase: manifest preparation
+// Reading the stored version, resolving and materializing reference sources,
+// multipart metadata and the current-version lookup that builds the manifest.
+impl ReplicateObjectVersionOperation {
+    fn handle_version_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let Some(value) = value else {
+            return self.fail(ReplicateObjectVersionError::VersionNotFound);
+        };
+        self.pending_materialized_version = None;
+        self.replication_version = None;
+        let version = match BlobVersion::from_bytes(value.as_ref()) {
+            Ok(version) => version,
+            Err(err) => return self.fail(err.into()),
+        };
+        let is_materialized = version.is_materialized();
+        let is_deleted = version.is_deleted();
+        let has_source_binding = version.source_binding().is_some();
+        debug!(
+            bucket = %self.request.bucket,
+            key = %self.request.key,
+            version_id = %self.request.version_id,
+            target_node = %self.request.target_node_id,
+            is_materialized,
+            is_deleted,
+            has_source_binding,
+            "Loaded blob version for replication"
+        );
+        let BlobVersion {
+            created_at,
+            created_by,
+            state,
+            metadata,
+            published_by: _,
+            placement_policies,
+        } = version;
+        self.version_policies = placement_policies;
+
+        match state {
+            BlobVersionState::Materialized {
+                blob_hash,
+                backend,
+                source,
+            } => {
+                self.pending_materialized_version = Some(PendingMaterializedReplicationVersion {
+                    created_at,
+                    created_by,
+                    blob_hash,
+                    source,
+                    metadata,
+                });
+                self.read_blob_location(BlobLocationKey::new(blob_hash, backend))
+            }
+            BlobVersionState::Deleted => {
+                self.pending_materialized_version = None;
+                self.replication_version = Some(ReplicationVersion::Deleted {
+                    created_at,
+                    created_by,
+                });
+                self.read_current_lookup()
+            }
+            BlobVersionState::Reference {
+                source,
+                cached_metadata,
+                last_refresh,
+                advance_count,
+            } => {
+                self.pending_materialized_version = None;
+                self.resolve_reference(ReplicationVersion::Reference {
+                    created_at,
+                    created_by,
+                    source,
+                    cached_metadata,
+                    last_refresh,
+                    metadata,
+                    advance_count,
+                })
+            }
+        }
+    }
+
+    fn handle_blob_location_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let Some(value) = value else {
+            return self.fail(ReplicateObjectVersionError::VersionNotFound);
+        };
+        let location = match BackendLocation::from_bytes(value.as_ref()) {
+            Ok(location) => location,
+            Err(err) => return self.fail(err.into()),
+        };
+        let Some(PendingMaterializedReplicationVersion {
+            created_at,
+            created_by,
+            blob_hash,
+            source,
+            metadata,
+        }) = self.pending_materialized_version.take()
+        else {
+            return self.fail(ReplicateObjectVersionError::VersionNotFound);
+        };
+        if location.get_blake3() != Some(blob_hash.as_slice()) {
+            return self.fail(ReplicateObjectVersionError::VersionNotFound);
+        }
+        self.replication_version = Some(ReplicationVersion::Materialized {
+            created_at,
+            created_by,
+            location: location.clone(),
+            source,
+            metadata,
+        });
+        // A governed copy is only pushed to a peer when this node may
+        // still serve it; the destination gates itself on arrival.
+        if self.version_policies.is_empty() {
+            return self.read_multipart_summary();
+        }
+        let key = ManagedCopyKey::new(
+            VersionKey::new(
+                &self.request.bucket,
+                &self.request.key,
+                self.request.version_id,
+            ),
+            location.backend.clone(),
+        );
+        let effect = match serve_reads(&key, None) {
+            Ok(effect) => effect,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.pending_copy = Some(key);
+        self.state = ReplicateObjectVersionState::CheckManagedCopy;
+        smallvec![effect]
+    }
+
+    fn handle_managed_copy_checked(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                received: event,
+            });
+        };
+        let (copy, subject) = match split_serve_reads(values) {
+            Ok(split) => split,
+            Err(error) => return self.fail(error.into()),
+        };
+        let Some(key) = self.pending_copy.take() else {
+            return self.fail(ReplicateObjectVersionError::VersionNotFound);
+        };
+        if let Err(error) = validate_registration(
+            copy.as_deref(),
+            &CopyRequest {
+                key: &key,
+                node_id: None,
+                blake3: None,
+                refs: &self.version_policies,
+                subject_generation: Some(subject.subject.generation),
+            },
+        ) {
+            return self.fail(error.into());
+        }
+        self.read_multipart_summary()
+    }
+
+    fn handle_multipart_summary_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        self.multipart_summary = value
+            .as_ref()
+            .and_then(|value| MultipartObjectSummary::from_bytes(value.as_ref()).ok());
+        if self.multipart_summary.is_some() {
+            self.multipart_parts.clear();
+            self.multipart_parts_next_start_after = None;
+            self.read_multipart_parts()
+        } else {
+            self.read_current_lookup()
+        }
+    }
+
+    fn handle_multipart_parts_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::IterResult)",
+                received: event,
+            });
+        };
+
+        for (_, value) in values {
+            let part = match MultipartObjectPart::from_bytes(value.as_ref()) {
+                Ok(part) => part,
+                Err(err) => return self.fail(err.into()),
+            };
+            self.multipart_parts.push(part);
+        }
+
+        if let Some(cursor) = next_start_after {
+            self.multipart_parts_next_start_after = Some(cursor);
+            self.read_multipart_parts()
+        } else {
+            self.multipart_parts_next_start_after = None;
+            self.multipart_parts
+                .sort_unstable_by_key(|part| part.part_number);
+            if let Err(err) = self.validate_multipart_parts() {
+                return self.fail(err);
+            }
+            self.read_current_lookup()
+        }
+    }
+
+    fn handle_current_lookup_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let current_lookup = value
+            .as_ref()
+            .and_then(|value| CurrentVersionPointer::from_bytes(value.as_ref()).ok());
+        debug!(
+            bucket = %self.request.bucket,
+            key = %self.request.key,
+            version_id = %self.request.version_id,
+            target_node = %self.request.target_node_id,
+            current_version_generation = current_lookup.as_ref().map(|pointer| pointer.generation),
+            current_version_matches = current_lookup
+                .as_ref()
+                .map(|pointer| pointer.version_id == self.request.version_id)
+                .unwrap_or(false),
+            "Loaded current version pointer before manifest creation"
+        );
+        if let Err(err) = self.build_manifest(current_lookup) {
+            return self.fail(err);
+        }
+        self.state = ReplicateObjectVersionState::OpenConnection;
+        smallvec![Effect::Blob(BlobEffect::OpenConnection {
+            node_id: self.request.target_node_id,
+        })]
+    }
+}
+
+// Phase: connection
+// Opening the outbound stream to the target node.
+impl ReplicateObjectVersionOperation {
+    fn handle_connection_established(&mut self, event: Event) -> Effects {
+        let Event::Blob(BlobEvent::ConnectionEstablished { stream_id }) = event else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Blob(BlobEvent::ConnectionEstablished)",
+                received: event,
+            });
+        };
+        self.stream_id = Some(stream_id);
+        debug!(
+            bucket = %self.request.bucket,
+            key = %self.request.key,
+            version_id = %self.request.version_id,
+            target_node = %self.request.target_node_id,
+            stream_id = %stream_id,
+            "Opened replication connection to target node"
+        );
+        self.send_manifest()
+    }
+}
+
+// Phase: negotiation
+// Sending the manifest and accepting one of the target's negotiation
+// decisions.
+impl ReplicateObjectVersionOperation {
+    fn handle_manifest_sent(&mut self, event: Event) -> Effects {
+        let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Blob(BlobEvent::MessageSent)",
+                received: event,
+            });
+        };
+        debug!(
+            bucket = %self.request.bucket,
+            key = %self.request.key,
+            version_id = %self.request.version_id,
+            target_node = %self.request.target_node_id,
+            stream_id = ?self.stream_id,
+            "Sent version replication manifest"
+        );
+        self.await_negotiation()
+    }
+
+    fn handle_negotiation_response_received(&mut self, event: Event) -> Effects {
+        let Event::Blob(BlobEvent::MessageReceived { payload, .. }) = event else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Blob(BlobEvent::MessageReceived)",
+                received: event,
+            });
+        };
+
+        let message = match VersionReplicationMessage::from_bytes(&payload) {
+            Ok(message) => message,
+            Err(err) => return self.fail(err.into()),
+        };
+        let VersionReplicationMessage::VersionNegotiationResponse(result) = message else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "VersionReplicationMessage::VersionNegotiationResponse",
+                received: Event::Blob(BlobEvent::MessageReceived {
+                    stream_id: self.stream_id.expect("stream id available"),
+                    payload,
+                }),
+            });
+        };
+
+        match result {
+            ReplicationNegotiationResult::AlreadyReplicatedVersion => {
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    decision = ?result,
+                    "Target reported version already replicated"
+                );
+                self.result = Ok(ReplicationSuboperationResult::Skipped);
+                self.write_reference_state()
+            }
+            ReplicationNegotiationResult::NeedVersionOnly => {
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    decision = ?result,
+                    "Target requested version metadata only"
+                );
+                self.await_apply_complete()
+            }
+            ReplicationNegotiationResult::NeedBlobAndVersion => {
+                let Some(blob) = self
+                    .manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.blob.as_ref())
+                else {
+                    return self.fail(ReplicateObjectVersionError::MissingBlobHash);
+                };
+                self.state = ReplicateObjectVersionState::TransferBlob;
+                let replication_id = Ulid::generate();
+                self.blob_replication_id = Some(replication_id);
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    decision = ?result,
+                    replication_id = %replication_id,
+                    blob_size = blob.size,
+                    "Target requested blob transfer"
+                );
+                smallvec![Effect::Blob(BlobEffect::Replicate {
+                    replication_id,
+                    stream_id: self.stream_id.expect("stream id available"),
+                    location: blob.location.clone(),
+                    keep_alive: true,
+                })]
+            }
+            ReplicationNegotiationResult::Rejected(reason) => {
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    reason = %reason,
+                    "Target rejected version replication"
+                );
+                self.fail(ReplicationError::ReplicationRejected(reason).into())
+            }
+        }
+    }
+}
+
+// Phase: transfer
+// Pushing the blob the target accepted the version for.
+impl ReplicateObjectVersionOperation {
+    fn handle_blob_transferred(&mut self, event: Event) -> Effects {
+        let Event::Blob(BlobEvent::ReplicationFinished { .. }) = event else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Blob(BlobEvent::ReplicationFinished)",
+                received: event,
+            });
+        };
+        debug!(
+            bucket = %self.request.bucket,
+            key = %self.request.key,
+            version_id = %self.request.version_id,
+            target_node = %self.request.target_node_id,
+            replication_id = ?self.blob_replication_id,
+            "Finished blob transfer to target node"
+        );
+        self.await_apply_complete()
+    }
+}
+
+// Phase: apply acknowledgement
+// Waiting for the target to report the replica applied or rejected.
+impl ReplicateObjectVersionOperation {
+    fn handle_apply_response_received(&mut self, event: Event) -> Effects {
+        let Event::Blob(BlobEvent::MessageReceived { payload, .. }) = event else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Blob(BlobEvent::MessageReceived)",
+                received: event,
+            });
+        };
+
+        match VersionReplicationMessage::from_bytes(&payload) {
+            Ok(VersionReplicationMessage::VersionApplyComplete) => {
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    "Target completed version apply"
+                );
+                let replicated_bytes = if self.blob_replication_id.is_some() {
+                    self.manifest
+                        .as_ref()
+                        .and_then(|manifest| manifest.blob.as_ref())
+                        .map_or(0, |blob| blob.size)
+                } else {
+                    0
+                };
+                self.result = Ok(ReplicationSuboperationResult::ReplicatedBytes(
+                    replicated_bytes,
+                ));
+                self.write_reference_state()
+            }
+            Ok(VersionReplicationMessage::VersionApplyRejected(reason)) => {
+                self.fail(ReplicationError::ReplicationRejected(reason).into())
+            }
+            Ok(_) => self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "VersionReplicationMessage::VersionApplyComplete|VersionApplyRejected",
+                received: Event::Blob(BlobEvent::MessageReceived {
+                    stream_id: self.stream_id.expect("stream id available"),
+                    payload,
+                }),
+            }),
+            Err(err) => self.fail(err.into()),
+        }
+    }
+}
+
+// Phase: close/cleanup
+// Dropping locally materialized reference bytes, recording the reference
+// fingerprint and closing the stream.
+impl ReplicateObjectVersionOperation {
+    fn handle_reference_blob_cleaned(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
+                self.close_connection()
+            }
+            other => self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Blob(BlobEvent::DeleteFinished|Error)",
+                received: other,
+            }),
+        }
+    }
+
+    fn handle_reference_state_written(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => self.cleanup_reference_blob(),
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            other => self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::WriteResult)",
+                received: other,
+            }),
+        }
+    }
+
+    fn handle_connection_closed(&mut self, event: Event) -> Effects {
+        let Event::Blob(BlobEvent::ConnectionClosed { .. }) = event else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Blob(BlobEvent::ConnectionClosed)",
+                received: event,
+            });
+        };
+        self.state = ReplicateObjectVersionState::Finish;
+        smallvec![]
+    }
+}
+
 impl Operation for ReplicateObjectVersionOperation {
     type Output = Result<ReplicationSuboperationResult, ReplicateObjectVersionError>;
     type Error = ReplicateObjectVersionError;
@@ -2059,176 +2595,16 @@ impl Operation for ReplicateObjectVersionOperation {
         self.read_version()
     }
 
+    /// One accepted event per protocol phase. The phase order is documented
+    /// on [`ReplicateObjectVersionState`].
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
+            // Manifest preparation: read the version and materialize references.
             ReplicateObjectVersionState::Init => self.read_version(),
-            ReplicateObjectVersionState::ReadVersion => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
-                    });
-                };
-                let Some(value) = value else {
-                    return self.fail(ReplicateObjectVersionError::VersionNotFound);
-                };
-                self.pending_materialized_version = None;
-                self.replication_version = None;
-                let version = match BlobVersion::from_bytes(value.as_ref()) {
-                    Ok(version) => version,
-                    Err(err) => return self.fail(err.into()),
-                };
-                let is_materialized = version.is_materialized();
-                let is_deleted = version.is_deleted();
-                let has_source_binding = version.source_binding().is_some();
-                debug!(
-                    bucket = %self.request.bucket,
-                    key = %self.request.key,
-                    version_id = %self.request.version_id,
-                    target_node = %self.request.target_node_id,
-                    is_materialized,
-                    is_deleted,
-                    has_source_binding,
-                    "Loaded blob version for replication"
-                );
-                let BlobVersion {
-                    created_at,
-                    created_by,
-                    state,
-                    metadata,
-                    published_by: _,
-                    placement_policies,
-                } = version;
-                self.version_policies = placement_policies;
-
-                match state {
-                    BlobVersionState::Materialized {
-                        blob_hash,
-                        backend,
-                        source,
-                    } => {
-                        self.pending_materialized_version =
-                            Some(PendingMaterializedReplicationVersion {
-                                created_at,
-                                created_by,
-                                blob_hash,
-                                source,
-                                metadata,
-                            });
-                        self.read_blob_location(BlobLocationKey::new(blob_hash, backend))
-                    }
-                    BlobVersionState::Deleted => {
-                        self.pending_materialized_version = None;
-                        self.replication_version = Some(ReplicationVersion::Deleted {
-                            created_at,
-                            created_by,
-                        });
-                        self.read_current_lookup()
-                    }
-                    BlobVersionState::Reference {
-                        source,
-                        cached_metadata,
-                        last_refresh,
-                        advance_count,
-                    } => {
-                        self.pending_materialized_version = None;
-                        self.resolve_reference(ReplicationVersion::Reference {
-                            created_at,
-                            created_by,
-                            source,
-                            cached_metadata,
-                            last_refresh,
-                            metadata,
-                            advance_count,
-                        })
-                    }
-                }
-            }
-            ReplicateObjectVersionState::ReadBlobLocation => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
-                    });
-                };
-                let Some(value) = value else {
-                    return self.fail(ReplicateObjectVersionError::VersionNotFound);
-                };
-                let location = match BackendLocation::from_bytes(value.as_ref()) {
-                    Ok(location) => location,
-                    Err(err) => return self.fail(err.into()),
-                };
-                let Some(PendingMaterializedReplicationVersion {
-                    created_at,
-                    created_by,
-                    blob_hash,
-                    source,
-                    metadata,
-                }) = self.pending_materialized_version.take()
-                else {
-                    return self.fail(ReplicateObjectVersionError::VersionNotFound);
-                };
-                if location.get_blake3() != Some(blob_hash.as_slice()) {
-                    return self.fail(ReplicateObjectVersionError::VersionNotFound);
-                }
-                self.replication_version = Some(ReplicationVersion::Materialized {
-                    created_at,
-                    created_by,
-                    location: location.clone(),
-                    source,
-                    metadata,
-                });
-                // A governed copy is only pushed to a peer when this node may
-                // still serve it; the destination gates itself on arrival.
-                if self.version_policies.is_empty() {
-                    return self.read_multipart_summary();
-                }
-                let key = ManagedCopyKey::new(
-                    VersionKey::new(
-                        &self.request.bucket,
-                        &self.request.key,
-                        self.request.version_id,
-                    ),
-                    location.backend.clone(),
-                );
-                let effect = match serve_reads(&key, None) {
-                    Ok(effect) => effect,
-                    Err(error) => return self.fail(error.into()),
-                };
-                self.pending_copy = Some(key);
-                self.state = ReplicateObjectVersionState::CheckManagedCopy;
-                smallvec![effect]
-            }
+            ReplicateObjectVersionState::ReadVersion => self.handle_version_read(event),
+            ReplicateObjectVersionState::ReadBlobLocation => self.handle_blob_location_read(event),
             ReplicateObjectVersionState::CheckManagedCopy => {
-                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                        received: event,
-                    });
-                };
-                let (copy, subject) = match split_serve_reads(values) {
-                    Ok(split) => split,
-                    Err(error) => return self.fail(error.into()),
-                };
-                let Some(key) = self.pending_copy.take() else {
-                    return self.fail(ReplicateObjectVersionError::VersionNotFound);
-                };
-                if let Err(error) = validate_registration(
-                    copy.as_deref(),
-                    &CopyRequest {
-                        key: &key,
-                        node_id: None,
-                        blake3: None,
-                        refs: &self.version_policies,
-                        subject_generation: Some(subject.subject.generation),
-                    },
-                ) {
-                    return self.fail(error.into());
-                }
-                self.read_multipart_summary()
+                self.handle_managed_copy_checked(event)
             }
             ReplicateObjectVersionState::ResolveReferenceAccess => {
                 self.handle_reference_access(event)
@@ -2241,309 +2617,37 @@ impl Operation for ReplicateObjectVersionOperation {
             ReplicateObjectVersionState::ReferencePolicyGate => self.handle_reference_gate(event),
             ReplicateObjectVersionState::WriteReferenceBlob => self.handle_reference_write(event),
             ReplicateObjectVersionState::ReadMultipartSummary => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
-                    });
-                };
-                self.multipart_summary = value
-                    .as_ref()
-                    .and_then(|value| MultipartObjectSummary::from_bytes(value.as_ref()).ok());
-                if self.multipart_summary.is_some() {
-                    self.multipart_parts.clear();
-                    self.multipart_parts_next_start_after = None;
-                    self.read_multipart_parts()
-                } else {
-                    self.read_current_lookup()
-                }
+                self.handle_multipart_summary_read(event)
             }
             ReplicateObjectVersionState::ReadMultipartParts => {
-                let Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) = event
-                else {
-                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::IterResult)",
-                        received: event,
-                    });
-                };
-
-                for (_, value) in values {
-                    let part = match MultipartObjectPart::from_bytes(value.as_ref()) {
-                        Ok(part) => part,
-                        Err(err) => return self.fail(err.into()),
-                    };
-                    self.multipart_parts.push(part);
-                }
-
-                if let Some(cursor) = next_start_after {
-                    self.multipart_parts_next_start_after = Some(cursor);
-                    self.read_multipart_parts()
-                } else {
-                    self.multipart_parts_next_start_after = None;
-                    self.multipart_parts
-                        .sort_unstable_by_key(|part| part.part_number);
-                    if let Err(err) = self.validate_multipart_parts() {
-                        return self.fail(err);
-                    }
-                    self.read_current_lookup()
-                }
+                self.handle_multipart_parts_read(event)
             }
             ReplicateObjectVersionState::ReadCurrentLookup => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
-                    });
-                };
-                let current_lookup = value
-                    .as_ref()
-                    .and_then(|value| CurrentVersionPointer::from_bytes(value.as_ref()).ok());
-                debug!(
-                    bucket = %self.request.bucket,
-                    key = %self.request.key,
-                    version_id = %self.request.version_id,
-                    target_node = %self.request.target_node_id,
-                    current_version_generation = current_lookup.as_ref().map(|pointer| pointer.generation),
-                    current_version_matches = current_lookup
-                        .as_ref()
-                        .map(|pointer| pointer.version_id == self.request.version_id)
-                        .unwrap_or(false),
-                    "Loaded current version pointer before manifest creation"
-                );
-                if let Err(err) = self.build_manifest(current_lookup) {
-                    return self.fail(err);
-                }
-                self.state = ReplicateObjectVersionState::OpenConnection;
-                smallvec![Effect::Blob(BlobEffect::OpenConnection {
-                    node_id: self.request.target_node_id,
-                })]
+                self.handle_current_lookup_read(event)
             }
+            // Connection: open the stream to the target node.
             ReplicateObjectVersionState::OpenConnection => {
-                let Event::Blob(BlobEvent::ConnectionEstablished { stream_id }) = event else {
-                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Blob(BlobEvent::ConnectionEstablished)",
-                        received: event,
-                    });
-                };
-                self.stream_id = Some(stream_id);
-                debug!(
-                    bucket = %self.request.bucket,
-                    key = %self.request.key,
-                    version_id = %self.request.version_id,
-                    target_node = %self.request.target_node_id,
-                    stream_id = %stream_id,
-                    "Opened replication connection to target node"
-                );
-                self.send_manifest()
+                self.handle_connection_established(event)
             }
-            ReplicateObjectVersionState::SendManifest => {
-                let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
-                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Blob(BlobEvent::MessageSent)",
-                        received: event,
-                    });
-                };
-                debug!(
-                    bucket = %self.request.bucket,
-                    key = %self.request.key,
-                    version_id = %self.request.version_id,
-                    target_node = %self.request.target_node_id,
-                    stream_id = ?self.stream_id,
-                    "Sent version replication manifest"
-                );
-                self.await_negotiation()
-            }
+            // Negotiation: send the manifest and accept the target's decision.
+            ReplicateObjectVersionState::SendManifest => self.handle_manifest_sent(event),
             ReplicateObjectVersionState::AwaitNegotiation => {
-                let Event::Blob(BlobEvent::MessageReceived { payload, .. }) = event else {
-                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Blob(BlobEvent::MessageReceived)",
-                        received: event,
-                    });
-                };
-
-                let message = match VersionReplicationMessage::from_bytes(&payload) {
-                    Ok(message) => message,
-                    Err(err) => return self.fail(err.into()),
-                };
-                let VersionReplicationMessage::VersionNegotiationResponse(result) = message else {
-                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "VersionReplicationMessage::VersionNegotiationResponse",
-                        received: Event::Blob(BlobEvent::MessageReceived {
-                            stream_id: self.stream_id.expect("stream id available"),
-                            payload,
-                        }),
-                    });
-                };
-
-                match result {
-                    ReplicationNegotiationResult::AlreadyReplicatedVersion => {
-                        debug!(
-                            bucket = %self.request.bucket,
-                            key = %self.request.key,
-                            version_id = %self.request.version_id,
-                            target_node = %self.request.target_node_id,
-                            decision = ?result,
-                            "Target reported version already replicated"
-                        );
-                        self.result = Ok(ReplicationSuboperationResult::Skipped);
-                        self.write_reference_state()
-                    }
-                    ReplicationNegotiationResult::NeedVersionOnly => {
-                        debug!(
-                            bucket = %self.request.bucket,
-                            key = %self.request.key,
-                            version_id = %self.request.version_id,
-                            target_node = %self.request.target_node_id,
-                            decision = ?result,
-                            "Target requested version metadata only"
-                        );
-                        self.await_apply_complete()
-                    }
-                    ReplicationNegotiationResult::NeedBlobAndVersion => {
-                        let Some(blob) = self
-                            .manifest
-                            .as_ref()
-                            .and_then(|manifest| manifest.blob.as_ref())
-                        else {
-                            return self.fail(ReplicateObjectVersionError::MissingBlobHash);
-                        };
-                        self.state = ReplicateObjectVersionState::TransferBlob;
-                        let replication_id = Ulid::generate();
-                        self.blob_replication_id = Some(replication_id);
-                        debug!(
-                            bucket = %self.request.bucket,
-                            key = %self.request.key,
-                            version_id = %self.request.version_id,
-                            target_node = %self.request.target_node_id,
-                            decision = ?result,
-                            replication_id = %replication_id,
-                            blob_size = blob.size,
-                            "Target requested blob transfer"
-                        );
-                        smallvec![Effect::Blob(BlobEffect::Replicate {
-                            replication_id,
-                            stream_id: self.stream_id.expect("stream id available"),
-                            location: blob.location.clone(),
-                            keep_alive: true,
-                        })]
-                    }
-                    ReplicationNegotiationResult::Rejected(reason) => {
-                        debug!(
-                            bucket = %self.request.bucket,
-                            key = %self.request.key,
-                            version_id = %self.request.version_id,
-                            target_node = %self.request.target_node_id,
-                            reason = %reason,
-                            "Target rejected version replication"
-                        );
-                        self.fail(ReplicationError::ReplicationRejected(reason).into())
-                    }
-                }
+                self.handle_negotiation_response_received(event)
             }
-            ReplicateObjectVersionState::TransferBlob => {
-                let Event::Blob(BlobEvent::ReplicationFinished { .. }) = event else {
-                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Blob(BlobEvent::ReplicationFinished)",
-                        received: event,
-                    });
-                };
-                debug!(
-                    bucket = %self.request.bucket,
-                    key = %self.request.key,
-                    version_id = %self.request.version_id,
-                    target_node = %self.request.target_node_id,
-                    replication_id = ?self.blob_replication_id,
-                    "Finished blob transfer to target node"
-                );
-                self.await_apply_complete()
-            }
+            // Transfer: push the blob the target requested.
+            ReplicateObjectVersionState::TransferBlob => self.handle_blob_transferred(event),
+            // Apply acknowledgement: the target reports the replica applied.
             ReplicateObjectVersionState::AwaitApplyComplete => {
-                let Event::Blob(BlobEvent::MessageReceived { payload, .. }) = event else {
-                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Blob(BlobEvent::MessageReceived)",
-                        received: event,
-                    });
-                };
-
-                match VersionReplicationMessage::from_bytes(&payload) {
-                    Ok(VersionReplicationMessage::VersionApplyComplete) => {
-                        debug!(
-                            bucket = %self.request.bucket,
-                            key = %self.request.key,
-                            version_id = %self.request.version_id,
-                            target_node = %self.request.target_node_id,
-                            "Target completed version apply"
-                        );
-                        let replicated_bytes = if self.blob_replication_id.is_some() {
-                            self.manifest
-                                .as_ref()
-                                .and_then(|manifest| manifest.blob.as_ref())
-                                .map_or(0, |blob| blob.size)
-                        } else {
-                            0
-                        };
-                        self.result = Ok(ReplicationSuboperationResult::ReplicatedBytes(
-                            replicated_bytes,
-                        ));
-                        self.write_reference_state()
-                    }
-                    Ok(VersionReplicationMessage::VersionApplyRejected(reason)) => {
-                        self.fail(ReplicationError::ReplicationRejected(reason).into())
-                    }
-                    Ok(_) => self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected:
-                            "VersionReplicationMessage::VersionApplyComplete|VersionApplyRejected",
-                        received: Event::Blob(BlobEvent::MessageReceived {
-                            stream_id: self.stream_id.expect("stream id available"),
-                            payload,
-                        }),
-                    }),
-                    Err(err) => self.fail(err.into()),
-                }
+                self.handle_apply_response_received(event)
             }
-            ReplicateObjectVersionState::CleanupReferenceBlob => match event {
-                Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
-                    self.close_connection()
-                }
-                other => self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                    state: self.state_name(),
-                    expected: "Event::Blob(BlobEvent::DeleteFinished|Error)",
-                    received: other,
-                }),
-            },
-            ReplicateObjectVersionState::WriteReferenceState => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.cleanup_reference_blob(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                    state: self.state_name(),
-                    expected: "Event::Storage(StorageEvent::WriteResult)",
-                    received: other,
-                }),
-            },
-            ReplicateObjectVersionState::CloseConnection => {
-                let Event::Blob(BlobEvent::ConnectionClosed { .. }) = event else {
-                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Blob(BlobEvent::ConnectionClosed)",
-                        received: event,
-                    });
-                };
-                self.state = ReplicateObjectVersionState::Finish;
-                smallvec![]
+            // Close/cleanup: drop local reference bytes and close the stream.
+            ReplicateObjectVersionState::CleanupReferenceBlob => {
+                self.handle_reference_blob_cleaned(event)
             }
+            ReplicateObjectVersionState::WriteReferenceState => {
+                self.handle_reference_state_written(event)
+            }
+            ReplicateObjectVersionState::CloseConnection => self.handle_connection_closed(event),
             ReplicateObjectVersionState::Finish => smallvec![],
             ReplicateObjectVersionState::Error => smallvec![],
         }
