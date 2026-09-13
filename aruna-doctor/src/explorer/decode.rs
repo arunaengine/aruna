@@ -2,7 +2,7 @@
 //! the presentation records in [`super::present`]. Malformed or unknown rows
 //! fall back to a raw hex record instead of failing the whole listing.
 
-use aruna::config::PersistedNodeState;
+use aruna::identity::PersistedNodeState;
 use aruna_api::server_state::INITIAL_REALM_ADMIN_CLAIMED_KEY;
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::compute_quota::{ComputeDepartureReport, JobReservationRecord};

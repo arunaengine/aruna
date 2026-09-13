@@ -2,7 +2,7 @@ use super::{
     backoff, node_is_ready, prepare_core_documents, publish_core_documents, sync_peer_topic,
     sync_with_retry, unique_user_topic, watch_target_needed,
 };
-use crate::config::PersistedNodeIdentity;
+use crate::identity::PersistedNodeIdentity;
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::StorageEffect;

@@ -824,7 +824,7 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
 
 async fn load_state(
     storage: &aruna_storage::StorageHandle,
-) -> TestResult<aruna::config::PersistedNodeState> {
+) -> TestResult<aruna::identity::PersistedNodeState> {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
@@ -839,7 +839,7 @@ async fn load_state(
     {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
-        }) => Ok(postcard::from_bytes::<aruna::config::PersistedNodeState>(
+        }) => Ok(postcard::from_bytes::<aruna::identity::PersistedNodeState>(
             &value,
         )?),
         other => Err(format!("unexpected node state event: {other:?}").into()),
