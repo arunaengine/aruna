@@ -477,16 +477,131 @@ async fn refresh_scenario() {
     handle.abort();
 }
 
+struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Captures every event formatted on this test's thread until the guard drops.
+fn capture_logs() -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || CaptureWriter(writer.clone()))
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (sink, guard)
+}
+
+/// Real proxy success and failure paths exercise synthetic secrets; neither the
+/// captured output nor any formatted error may disclose them.
+#[tokio::test]
+async fn proxy_paths_do_not_disclose_synthetic_secrets() {
+    const API_KEY: &str = "synthetic-api-key-7f3a";
+    const ACCESS: &str = "synthetic-access-7f3a";
+    const REFRESH: &str = "synthetic-refresh-7f3a";
+
+    let (logs, _guard) = capture_logs();
+    // Prove the capture is live before trusting a negative assertion.
+    tracing::info!(probe = "capture-active-7f3a", "capture probe");
+
+    let router = Router::new().route("/v1/responses", post(|| async { "ok" }));
+    let (base_url, handle) = spawn_mock(router).await;
+    let (_dir, state, auth) = setup_state().await;
+    let provider = make_provider(
+        &state,
+        &auth,
+        AssistantProviderKind::OpenaiCompatible,
+        base_url,
+        Some(API_KEY),
+    );
+
+    send_upstream(
+        &state,
+        &provider,
+        Method::POST,
+        "/v1/responses",
+        &HeaderMap::new(),
+        br#"{"model":"mock"}"#.to_vec(),
+    )
+    .await
+    .expect("successful proxy path");
+
+    // A transport failure formats an error chain that must stay redacted too.
+    let unreachable = make_provider(
+        &state,
+        &auth,
+        AssistantProviderKind::OpenaiCompatible,
+        "http://127.0.0.1:1".to_string(),
+        Some(ACCESS),
+    );
+    let error = send_upstream(
+        &state,
+        &unreachable,
+        Method::POST,
+        "/v1/responses",
+        &HeaderMap::new(),
+        br#"{"model":"mock"}"#.to_vec(),
+    )
+    .await
+    .expect_err("unreachable upstream");
+    let formatted = format!("{error} {error:?} {provider:?} {unreachable:?}");
+    assert!(!formatted.contains(ACCESS), "{formatted}");
+    assert!(!formatted.contains(API_KEY), "{formatted}");
+
+    // The concurrent-refresh path's tokens must not surface in its output.
+    let mut provider = make_provider(
+        &state,
+        &auth,
+        AssistantProviderKind::Chatgpt,
+        "http://127.0.0.1:1".to_string(),
+        None,
+    );
+    let mut secret = provider
+        .open_secret(state.credential_encryption_key())
+        .unwrap();
+    secret.access_token = Some(Secret::new(ACCESS));
+    secret.refresh_token = Some(Secret::new(REFRESH));
+    provider.token_obtained_at = Some(0);
+    provider
+        .encrypt_secret(state.credential_encryption_key(), &secret)
+        .unwrap();
+    let refresh_error = super::super::chatgpt::fresh_provider(&state, provider)
+        .await
+        .expect_err("the refresh endpoint is unreachable");
+    let refresh_formatted = format!("{refresh_error} {refresh_error:?}");
+    assert!(!refresh_formatted.contains(ACCESS), "{refresh_formatted}");
+    assert!(!refresh_formatted.contains(REFRESH), "{refresh_formatted}");
+
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("capture-active-7f3a"), "{logs}");
+    for secret in [API_KEY, ACCESS, REFRESH] {
+        assert!(!logs.contains(secret), "log disclosed {secret}: {logs}");
+    }
+    handle.abort();
+}
+
 #[test]
-fn tracing_hides_secrets() {
-    let proxy = include_str!("../proxy.rs")
-        .split("#[cfg(test)]")
-        .next()
-        .unwrap();
-    let chatgpt = include_str!("../chatgpt.rs")
-        .split("#[cfg(test)]")
-        .next()
-        .unwrap();
-    let sources = format!("{proxy}{chatgpt}");
-    assert!(!sources.contains("tracing::"));
+fn secret_types_redact_in_debug_output() {
+    assert_eq!(
+        format!("{:?}", Secret::new("synthetic-secret")),
+        "Secret(***)"
+    );
+    assert_eq!(
+        format!("{:?}", EncryptedS3Secret::empty()),
+        "EncryptedS3Secret(***)"
+    );
 }

@@ -357,6 +357,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
  "ulid 3.0.0",
  "url",
  "utoipa",
