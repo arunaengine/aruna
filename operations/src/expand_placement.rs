@@ -8,7 +8,6 @@
 //! full barrier/pull/verify/proof machinery still runs. Weight changes,
 //! removals, and drains are never auto-issued.
 
-use aruna_core::errors::StorageError;
 use aruna_core::structs::{Actor, CandidatePlacementMap, RealmConfigDocument, TransitionLimits};
 use aruna_core::util::unix_timestamp_millis;
 use ulid::Ulid;
@@ -16,11 +15,10 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::mutate_realm_placement::{
-    MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
-    RealmPlacementMutation,
+    MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
+    drive_realm_placement_mutation,
 };
 use crate::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
-use crate::queue_backoff::conflict_backoff;
 
 /// Publishes the realm's first candidate map and hands every strategy's
 /// activations to the reducer.
@@ -186,35 +184,19 @@ async fn read_config(
         .map_err(|_| MutateRealmPlacementError::RealmConfigNotFound)
 }
 
-const MUTATION_CONFLICT_RETRIES: usize = 10;
-
-/// Drives one placement mutation, re-driving on SSI conflict: the node's own
-/// reconciler submits transition steps against the same realm config document
-/// concurrently, so bounded interference is expected, not an error.
+/// Drives one placement mutation with the shared conflict re-drive.
 pub(crate) async fn mutate(
     context: &DriverContext,
     actor: &Actor,
     mutation: RealmPlacementMutation,
 ) -> Result<RealmConfigDocument, MutateRealmPlacementError> {
-    let mut attempts = 0;
-    loop {
-        let result = drive(
-            MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
-                actor: actor.clone(),
-                mutation: mutation.clone(),
-            }),
-            context,
-        )
-        .await;
-        match result {
-            Err(MutateRealmPlacementError::StorageError(StorageError::TransactionConflict))
-                if attempts < MUTATION_CONFLICT_RETRIES =>
-            {
-                // Retrying with no wait spends every attempt in one contention window.
-                tokio::time::sleep(conflict_backoff(attempts, actor.node_id.as_bytes())).await;
-                attempts += 1;
-            }
-            other => return other,
-        }
-    }
+    drive_realm_placement_mutation(
+        MutateRealmPlacementConfig {
+            actor: actor.clone(),
+            mutation,
+        },
+        None,
+        context,
+    )
+    .await
 }
