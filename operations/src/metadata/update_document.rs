@@ -19,7 +19,6 @@ use aruna_core::structs::{
     MetadataAuditRecord, MetadataRegistryRecord, PlacementRef, RealmConfigDocument,
 };
 use aruna_core::task::TaskEvent;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -93,6 +92,8 @@ pub struct UpdateMetadataDocumentOperation {
     /// resolved at, read as a fence inside the write transaction.
     fenced: Vec<(PlacementRef, u64)>,
     route_profile_status: Option<MetadataProfileValidationStatus>,
+    /// Phase-time and identity sampling; production keeps the defaults.
+    phase_source: crate::metadata::MetadataPhaseSource,
     state: UpdateMetadataDocumentState,
     output: Option<Result<MetadataRegistryRecord, UpdateMetadataDocumentError>>,
 }
@@ -162,9 +163,10 @@ impl UpdateMetadataDocumentOperation {
             UpdateMetadataDocumentMutation::ApplyBatch { batch, .. } => Some((**batch).clone()),
             _ => None,
         };
+        let phase_source = crate::metadata::MetadataPhaseSource::default();
         Self {
             config,
-            event_id: Ulid::generate(),
+            event_id: phase_source.next_id(),
             txn_id: None,
             record: None,
             update_event: None,
@@ -175,14 +177,27 @@ impl UpdateMetadataDocumentOperation {
             realm_config: None,
             fenced: Vec::new(),
             route_profile_status,
+            phase_source,
             state: UpdateMetadataDocumentState::Init,
             output: None,
         }
     }
 
+    /// Replaces the phase-time and identity source and re-mints the event
+    /// identity from it. Set before `start`; production never calls this.
+    #[cfg(test)]
+    pub(crate) fn with_phase_source(
+        mut self,
+        phase_source: crate::metadata::MetadataPhaseSource,
+    ) -> Self {
+        self.phase_source = phase_source;
+        self.event_id = phase_source.next_id();
+        self
+    }
+
     fn updated_record(&self, mut record: MetadataRegistryRecord) -> MetadataRegistryRecord {
         record.public = self.config.public;
-        record.updated_at_ms = unix_timestamp_millis();
+        record.updated_at_ms = self.phase_source.now_ms();
         record
     }
 
@@ -312,7 +327,7 @@ impl UpdateMetadataDocumentOperation {
         let Some(event) = self.update_event.as_ref() else {
             return Err(UpdateMetadataDocumentError::MissingTransaction);
         };
-        let now = unix_timestamp_millis();
+        let now = self.phase_source.now_ms();
         let audit = self.audit_record(event);
         // Updating an existing document is a mutation, not an origin write, so it
         // never mints the lifecycle sync topic genesis.
@@ -1995,5 +2010,72 @@ mod pure_tests {
                 aruna_core::errors::StorageError::WriteError("boom".to_string())
             ))
         );
+    }
+    const FIXED_PHASE_MS: u64 = 1_700_000_000_000;
+    const FIXED_RECORD_ID: [u8; 16] = [0x7b; 16];
+
+    fn fixed_phase_ms() -> u64 {
+        FIXED_PHASE_MS
+    }
+
+    fn fixed_phase_id() -> Ulid {
+        Ulid::from_bytes(FIXED_RECORD_ID)
+    }
+
+    fn fixed_phase_source() -> crate::metadata::MetadataPhaseSource {
+        crate::metadata::MetadataPhaseSource::fixed(fixed_phase_ms, fixed_phase_id)
+    }
+
+    fn fixed_mutation(record: &MetadataRegistryRecord) -> UpdateMetadataDocumentMutation {
+        UpdateMetadataDocumentMutation::UpsertDataEntity {
+            jsonld: replace_jsonld(record.document_id, "fixed"),
+        }
+    }
+
+    /// The update trace takes its event identity and phase time from the
+    /// injected source, so identical inputs produce identical records.
+    #[test]
+    fn fixed_phase_source_pins_event_id_and_updated_time() {
+        let mut record = record(&actor());
+        record.document_id = Ulid::from_bytes([0x31; 16]);
+        record.graph_iri = MetadataRegistryRecord::graph_iri_for(record.document_id);
+        record.permission_path = MetadataRegistryRecord::permission_path_for(
+            &record.realm_id,
+            record.group_id,
+            &record.document_path,
+            record.document_id,
+        );
+        let first_config = config(actor(), &record, fixed_mutation(&record));
+
+        let operation = UpdateMetadataDocumentOperation::new(first_config)
+            .with_phase_source(fixed_phase_source());
+
+        assert_eq!(operation.event_id, fixed_phase_id());
+        let updated = operation.updated_record(record.clone());
+        assert_eq!(updated.updated_at_ms, FIXED_PHASE_MS);
+
+        let replay =
+            UpdateMetadataDocumentOperation::new(config(actor(), &record, fixed_mutation(&record)))
+                .with_phase_source(fixed_phase_source());
+        assert_eq!(replay.updated_record(record), updated);
+    }
+
+    /// A wrong event is an explicit failure, not a silent state change.
+    #[test]
+    fn wrong_event_in_a_fixed_state_fails() {
+        let record = record(&actor());
+        let mut operation =
+            UpdateMetadataDocumentOperation::new(config(actor(), &record, fixed_mutation(&record)))
+                .with_phase_source(fixed_phase_source());
+        operation.state = UpdateMetadataDocumentState::WriteUpdateBatch;
+
+        let effects = operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.output,
+            Some(Err(UpdateMetadataDocumentError::UnexpectedEvent { .. }))
+        ));
+        assert_eq!(operation.state, UpdateMetadataDocumentState::Error);
     }
 }

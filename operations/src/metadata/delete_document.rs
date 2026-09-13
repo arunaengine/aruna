@@ -59,6 +59,8 @@ pub struct DeleteMetadataDocumentOperation {
     /// Buckets the tombstones publish onto, read inside the write transaction.
     fence: crate::placement::fence::WriteFence,
     txn_id: Option<Ulid>,
+    /// Phase-time and identity sampling; production keeps the defaults.
+    phase_source: crate::metadata::MetadataPhaseSource,
     state: DeleteMetadataDocumentState,
     output: Option<Result<(), DeleteMetadataDocumentError>>,
 }
@@ -135,13 +137,24 @@ impl DeleteMetadataDocumentOperation {
             mapping_route: None,
             fence: Default::default(),
             txn_id: None,
+            phase_source: crate::metadata::MetadataPhaseSource::default(),
             state: DeleteMetadataDocumentState::Init,
             output: None,
         }
     }
 
+    /// Replaces the phase-time and identity source so a test can fix a trace.
+    pub(crate) fn with_phase_source(
+        mut self,
+        phase_source: crate::metadata::MetadataPhaseSource,
+    ) -> Self {
+        self.phase_source = phase_source;
+        self
+    }
+
     fn fresh_copy(&self) -> Self {
         Self::new(self.actor.clone(), self.group_id, self.document_id)
+            .with_phase_source(self.phase_source)
     }
 
     /// Live holders of the document's bucket; the event-time stamp on the
@@ -154,7 +167,11 @@ impl DeleteMetadataDocumentOperation {
         }
     }
 
-    fn audit_record(&self, record: &MetadataRegistryRecord) -> MetadataAuditRecord {
+    fn audit_record(
+        &self,
+        record: &MetadataRegistryRecord,
+        occurred_at_ms: u64,
+    ) -> MetadataAuditRecord {
         MetadataAuditRecord {
             realm_id: record.realm_id,
             group_id: record.group_id,
@@ -163,8 +180,7 @@ impl DeleteMetadataDocumentOperation {
             user_id: self.actor.user_id,
             node_id: self.actor.node_id,
             operation: MetadataAuditOperation::Delete,
-            occurred_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis())
-                .unwrap_or_default(),
+            occurred_at_ms,
             details: Some("delete metadata graph".to_string()),
         }
     }
@@ -185,13 +201,17 @@ impl DeleteMetadataDocumentOperation {
         }
     }
 
-    fn lifecycle_record(&self, record: &MetadataRegistryRecord) -> MetadataGraphLifecycleRecord {
+    fn lifecycle_record(
+        &self,
+        record: &MetadataRegistryRecord,
+        deleted_at_ms: u64,
+    ) -> MetadataGraphLifecycleRecord {
         MetadataGraphLifecycleRecord::deleted(
             record.graph_iri.clone(),
             record.realm_id,
             record.group_id,
             record.document_id,
-            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+            deleted_at_ms,
         )
     }
 
@@ -199,10 +219,11 @@ impl DeleteMetadataDocumentOperation {
         &self,
         record: &MetadataRegistryRecord,
         tombstone: MetadataGraphLifecycleRecord,
+        event_id: Ulid,
     ) -> MetadataDocumentLifecycleRecord {
         MetadataDocumentLifecycleRecord::Delete {
             event: MetadataDocumentDeleteRecord {
-                event_id: Ulid::generate(),
+                event_id,
                 tombstone,
                 deleted_after_event_id: record.last_event_id,
             },
@@ -257,13 +278,13 @@ impl DeleteMetadataDocumentOperation {
         &self,
         record: &MetadataRegistryRecord,
         txn_id: Ulid,
+        outbox_id: Ulid,
     ) -> Result<Effects, DeleteMetadataDocumentError> {
         let Some(lifecycle_record) = self.lifecycle_record.as_ref() else {
             return Err(DeleteMetadataDocumentError::DocumentNotFound);
         };
         let bytes = postcard::to_allocvec(lifecycle_record)
             .map_err(|error| DeleteMetadataDocumentError::ConversionError(error.into()))?;
-        let outbox_id = Ulid::generate();
         let change = graph_revision_change(
             lifecycle_record,
             outbox_id,
@@ -440,12 +461,19 @@ impl DeleteMetadataDocumentOperation {
     fn phase_read_fence(&mut self, event: Event) -> Effects {
         match parse_registry_read(event) {
             Ok(Some(record)) => {
-                let lifecycle_record = self.lifecycle_record(&record);
-                self.document_lifecycle_record =
-                    Some(self.document_lifecycle_record(&record, lifecycle_record.clone()));
+                // Sample the phase once: the tombstone time and the prune job's
+                // creation share this delete's single wall-clock reading.
+                let deleted_at_ms = self.phase_source.now_ms();
+                let event_id = self.phase_source.next_id();
+                let lifecycle_record = self.lifecycle_record(&record, deleted_at_ms);
+                self.document_lifecycle_record = Some(self.document_lifecycle_record(
+                    &record,
+                    lifecycle_record.clone(),
+                    event_id,
+                ));
                 self.prune_job_record = Some(new_prune_job(
                     lifecycle_record.graph_iri.clone(),
-                    unix_timestamp_millis(),
+                    deleted_at_ms,
                 ));
                 self.lifecycle_record = Some(lifecycle_record);
                 self.record = Some(record);
@@ -605,8 +633,13 @@ impl DeleteMetadataDocumentOperation {
                     return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                 };
                 self.state = DeleteMetadataDocumentState::WriteAudit;
-                match write_audit_effect(&self.audit_record(record), Ulid::generate(), Some(txn_id))
-                {
+                let occurred_at_ms = self.phase_source.now_ms();
+                let audit_id = self.phase_source.next_id();
+                match write_audit_effect(
+                    &self.audit_record(record, occurred_at_ms),
+                    audit_id,
+                    Some(txn_id),
+                ) {
                     Ok(effect) => smallvec![effect],
                     Err(error) => self.fail(DeleteMetadataDocumentError::ConversionError(error)),
                 }
@@ -646,7 +679,8 @@ impl DeleteMetadataDocumentOperation {
                     return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                 };
                 self.state = DeleteMetadataDocumentState::WriteGraphLifecycleOutbox;
-                match self.graph_lifecycle_effect(record, txn_id) {
+                let outbox_id = self.phase_source.next_id();
+                match self.graph_lifecycle_effect(record, txn_id, outbox_id) {
                     Ok(effects) => effects,
                     Err(error) => self.fail(error),
                 }
@@ -1059,9 +1093,12 @@ mod pure_tests {
             record.group_id,
             record.document_id,
         );
-        let tombstone = operation.lifecycle_record(&record);
-        operation.document_lifecycle_record =
-            Some(operation.document_lifecycle_record(&record, tombstone.clone()));
+        let tombstone = operation.lifecycle_record(&record, 1_700_000_000_000);
+        operation.document_lifecycle_record = Some(operation.document_lifecycle_record(
+            &record,
+            tombstone.clone(),
+            Ulid::from_bytes([0x61; 16]),
+        ));
 
         let outbox = operation
             .lifecycle_outbox_record(&record)
@@ -1213,7 +1250,7 @@ mod pure_tests {
             .expect("document lifecycle outbox builds");
         let graph_outbox = outbox_from_effects(
             operation
-                .graph_lifecycle_effect(&record, Ulid::generate())
+                .graph_lifecycle_effect(&record, Ulid::generate(), Ulid::from_bytes([0x62; 16]))
                 .expect("graph lifecycle outbox builds"),
         );
         let registry_outbox = outbox_from_effects(
@@ -1350,7 +1387,7 @@ mod pure_tests {
             .expect("document lifecycle outbox builds");
         let graph_outbox = outbox_from_effects(
             operation
-                .graph_lifecycle_effect(&record, Ulid::generate())
+                .graph_lifecycle_effect(&record, Ulid::generate(), Ulid::from_bytes([0x62; 16]))
                 .expect("graph lifecycle outbox builds"),
         );
         let registry_outbox = outbox_from_effects(
@@ -1716,5 +1753,105 @@ mod pure_tests {
             [Effect::Metadata(MetadataEffect::DeleteGraph { graph_iri })]
                 if graph_iri == &record.graph_iri
         ));
+    }
+    const FIXED_PHASE_MS: u64 = 1_700_000_000_000;
+    const FIXED_RECORD_ID: [u8; 16] = [0x7a; 16];
+
+    fn fixed_phase_ms() -> u64 {
+        FIXED_PHASE_MS
+    }
+
+    fn fixed_phase_id() -> Ulid {
+        Ulid::from_bytes(FIXED_RECORD_ID)
+    }
+
+    fn fixed_phase_source() -> crate::metadata::MetadataPhaseSource {
+        crate::metadata::MetadataPhaseSource::fixed(fixed_phase_ms, fixed_phase_id)
+    }
+
+    /// The delete trace samples its identity and phase time from the injected
+    /// source, so the same state and inputs emit byte-identical records.
+    #[test]
+    fn fixed_phase_source_pins_the_delete_trace() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::from_bytes([0x51; 16]);
+        let run = |actor: aruna_core::structs::Actor, record: &MetadataRegistryRecord| {
+            let mut operation =
+                DeleteMetadataDocumentOperation::new(actor, record.group_id, record.document_id)
+                    .with_phase_source(fixed_phase_source());
+            operation.record = Some(record.clone());
+            operation.txn_id = Some(txn_id);
+            operation.state = DeleteMetadataDocumentState::ReadFence;
+            let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: vec![0u8; 4].into(),
+                value: Some(postcard::to_allocvec(record).unwrap().into()),
+            }));
+            (operation, effects)
+        };
+
+        let (operation, effects) = run(actor.clone(), &record);
+        let tombstone = operation
+            .lifecycle_record
+            .as_ref()
+            .expect("tombstone built");
+        assert_eq!(tombstone.updated_at_ms, FIXED_PHASE_MS);
+        let Some(MetadataDocumentLifecycleRecord::Delete { event }) =
+            operation.document_lifecycle_record.as_ref()
+        else {
+            panic!("document lifecycle delete expected");
+        };
+        assert_eq!(event.event_id, fixed_phase_id());
+        assert_eq!(event.tombstone, *tombstone);
+        assert_eq!(
+            operation
+                .prune_job_record
+                .as_ref()
+                .expect("prune job built")
+                .due_at_ms,
+            FIXED_PHASE_MS
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { .. })]
+        ));
+
+        let (replay, replay_effects) = run(actor, &record);
+        assert_eq!(operation, replay);
+        assert_eq!(effects, replay_effects);
+
+        // A retry copy carries the source, so its replayed trace is the same.
+        let (retried, retried_effects) = run(operation.actor.clone(), &record);
+        assert_eq!(retried, replay);
+        assert_eq!(retried_effects, replay_effects);
+    }
+
+    /// A wrong event is an explicit failure, not a silent state change.
+    #[test]
+    fn wrong_event_in_a_fixed_state_fails() {
+        let actor = actor();
+        let record = record(&actor);
+        let mut operation =
+            DeleteMetadataDocumentOperation::new(actor, record.group_id, record.document_id)
+                .with_phase_source(fixed_phase_source());
+        operation.record = Some(record.clone());
+        operation.txn_id = Some(Ulid::from_bytes([0x52; 16]));
+        operation.state = DeleteMetadataDocumentState::DeleteRegistry;
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+
+        // The failure keeps only the transaction cleanup, never a mutation.
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert!(matches!(
+            operation.output,
+            Some(Err(DeleteMetadataDocumentError::UnexpectedEvent { .. }))
+        ));
+        assert_eq!(operation.state, DeleteMetadataDocumentState::Error);
     }
 }
