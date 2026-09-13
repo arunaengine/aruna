@@ -17,7 +17,6 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-use crate::compute_setup::{session_s3_address, session_subnet};
 use crate::config::{Config, PortalConfig, StartupMode};
 use crate::portal;
 
@@ -165,6 +164,7 @@ async fn bind_session_s3(
 
 pub(crate) async fn bind(
     config: &Config,
+    session_s3: Option<std::net::SocketAddr>,
     driver_ctx: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
     metrics: Arc<NodeMetrics>,
@@ -173,6 +173,7 @@ pub(crate) async fn bind(
     let mut started = StartedListeners::default();
     match bind_all(
         config,
+        session_s3,
         driver_ctx,
         jobs_runtime,
         metrics,
@@ -193,6 +194,7 @@ pub(crate) async fn bind(
 /// `started` before the next fallible step.
 async fn bind_all(
     config: &Config,
+    session_s3: Option<std::net::SocketAddr>,
     driver_ctx: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
     metrics: Arc<NodeMetrics>,
@@ -209,7 +211,7 @@ async fn bind_all(
         .as_deref()
         .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
         .is_some_and(|address| address.ip().is_unspecified());
-    let session_s3 = session_s3_address(config, &session_subnet())
+    let session_s3 = session_s3
         .filter(|_| !wildcard_s3)
         .map(|address| SessionS3 {
             address,
@@ -563,6 +565,7 @@ mod tests {
 
         let error = match bind(
             &config,
+            None,
             driver_ctx,
             JobsRuntime::new_paused(),
             std::sync::Arc::new(NodeMetrics::new()),

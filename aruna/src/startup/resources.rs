@@ -39,6 +39,10 @@ pub struct NodeResources {
     pub(crate) task_handle: TaskHandle,
     pub(crate) task_queues: TaskQueues,
     pub(crate) usage_counters_rebuilt: bool,
+    /// The Docker session bridge gateway resolved with the typed compute
+    /// settings; listener assembly consumes this instead of rereading the
+    /// environment.
+    pub(crate) session_s3: Option<std::net::SocketAddr>,
     pub(crate) monitoring: Arc<MonitoringState>,
     pub(crate) ops_handle: tokio::task::JoinHandle<()>,
 }
@@ -61,6 +65,7 @@ struct Acquired {
     ops_handle: Option<tokio::task::JoinHandle<()>>,
     task_queues: Option<TaskQueues>,
     usage_counters_rebuilt: bool,
+    session_s3: Option<std::net::SocketAddr>,
 }
 
 impl Acquired {
@@ -81,6 +86,7 @@ impl Acquired {
             ops_handle: None,
             task_queues: None,
             usage_counters_rebuilt: false,
+            session_s3: None,
         }
     }
 
@@ -141,6 +147,7 @@ impl Acquired {
                 .task_queues
                 .expect("acquisition builds the task queues"),
             usage_counters_rebuilt: self.usage_counters_rebuilt,
+            session_s3: self.session_s3,
             monitoring: self
                 .monitoring
                 .expect("acquisition builds the monitoring state"),
@@ -246,9 +253,11 @@ async fn fill(
     acquired.blob_handle = Some(blob_handle.clone());
     checkpoint(StartupStage::Blob)?;
 
-    let compute_handle = build_registry(config)
+    let compute = build_registry(config)
         .await
         .map_err(std::io::Error::other)?;
+    acquired.session_s3 = compute.session_s3;
+    let compute_handle = compute.registry;
     checkpoint(StartupStage::Compute)?;
 
     let driver_ctx = Arc::new(DriverContext {

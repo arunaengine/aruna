@@ -157,6 +157,7 @@ pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
 
     let bindings = match bind_servers(
         &resources.config,
+        resources.session_s3,
         resources.driver_ctx.clone(),
         resources.jobs_runtime.clone(),
         resources.metrics.clone(),
@@ -378,6 +379,7 @@ async fn release_unready(resources: NodeResources, bindings: Option<ServerBindin
         task_handle,
         task_queues: _,
         usage_counters_rebuilt: _,
+        session_s3: _,
         monitoring,
         ops_handle,
     } = resources;

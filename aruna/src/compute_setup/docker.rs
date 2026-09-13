@@ -30,7 +30,7 @@ pub(super) async fn build(
     if let Some(state_root) = &docker.state_root {
         docker_config.state_root = state_root.clone();
     }
-    let session_subnet = docker.session_subnet.clone();
+    let session_s3 = session_s3_address(config.s3_address.as_deref(), &docker.session_subnet);
     let backend = aruna_compute::executor::docker::DockerBackend::with_config(docker_config)
         .map_err(|error| error.to_string())?;
     aruna_compute::ExecutorBackend::health(&backend)
@@ -48,7 +48,5 @@ pub(super) async fn build(
     Ok(ExecutorRegistry::new()
         .with_backend(std::sync::Arc::new(backend))
         .with_workspace_endpoint(workspace, "eu-central-1".to_string())
-        .with_session_endpoint(
-            session_s3_address(config, &session_subnet).map(|address| format!("http://{address}")),
-        ))
+        .with_session_endpoint(session_s3.map(|address| format!("http://{address}"))))
 }
