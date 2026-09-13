@@ -622,6 +622,7 @@ impl IntoS3Error for DeleteBucketCorsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::errors::BlobError;
 
     #[test]
     fn maps_incomplete_body() {
@@ -657,7 +658,10 @@ mod tests {
     #[test]
     fn maps_backend_write() {
         for error in [
-            PutObjectError::BlobWriteFailed("No space left on device".to_string()).into_s3_error(),
+            PutObjectError::BlobWriteFailed(BlobError::WriteError(
+                "No space left on device".to_string(),
+            ))
+            .into_s3_error(),
             UploadPartError::BlobWriteFailed("No space left on device".to_string()).into_s3_error(),
         ] {
             assert_eq!(*error.code(), S3ErrorCode::InternalError);

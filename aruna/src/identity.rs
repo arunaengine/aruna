@@ -3,8 +3,8 @@
 //! [`IdentityStore`] is the only reader and writer of the persisted identity
 //! record; `Config::resolve` opens storage explicitly and wraps it at that call
 //! site. Whether a boot must mint, bootstrap, refresh, or reuse an identity is
-//! a pure function ([`plan_enrollment`]); the HTTP client lives in
-//! `crate::config` and runs only when the plan asks for it.
+//! a pure function ([`plan_enrollment`]); the enrollment HTTP client and its
+//! response decode live here too and run only when the plan asks for them.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -141,6 +141,36 @@ mod tests {
                 owner: UserId::nil(RealmId::from_bytes([9u8; 32])),
             },
         }
+    }
+
+    #[test]
+    fn bootstrap_response_decode_is_a_boundary() {
+        assert!(matches!(
+            decode_bootstrap_response(b"not json"),
+            Err(SetupError::OnboardingBootstrapFailed(_))
+        ));
+    }
+
+    /// The persisted record keeps its byte layout across the ownership move:
+    /// the stored encoding is part of the deployed compatibility surface.
+    #[test]
+    fn persisted_state_bytes_are_stable() {
+        let state = PersistedNodeState {
+            boot_origin: BootOrigin::InitializedRealm,
+            status: PersistedNodeStatus::PendingInitialization,
+            realm_id: RealmId::from_bytes([1u8; 32]),
+            net_secret_key: [2u8; 32],
+            onboarding_phase: None,
+            onboarding_sync_ticket: None,
+            identity: PersistedNodeIdentity::Management {
+                realm_private_key_pem: "pem".to_string(),
+            },
+        };
+        let encoded = postcard::to_allocvec(&state).expect("state encodes");
+        let decoded: PersistedNodeState = postcard::from_bytes(&encoded).expect("state decodes");
+        assert_eq!(decoded, state);
+        // A fixed field order check: the first field is the boot origin tag.
+        assert_eq!(encoded[0], 0, "boot origin keeps its encoded variant tag");
     }
 
     #[test]
@@ -341,7 +371,7 @@ impl std::fmt::Debug for PersistedNodeState {
     }
 }
 
-pub(crate) const ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) fn node_capabilities(
     node_state: &PersistedNodeState,
@@ -447,9 +477,7 @@ pub(crate) fn onboarding_realm_endpoints(endpoints: &[StaticRealmEndpoint]) -> V
 
 /// The decode half of the enrollment client, separated so response mapping is
 /// testable without an HTTP server.
-pub(crate) fn decode_bootstrap_response(
-    body: &[u8],
-) -> Result<BootstrapOnboardingResponse, SetupError> {
+fn decode_bootstrap_response(body: &[u8]) -> Result<BootstrapOnboardingResponse, SetupError> {
     serde_json::from_slice(body).map_err(|error| {
         SetupError::OnboardingBootstrapFailed(format!("invalid bootstrap response: {error}"))
     })
@@ -617,16 +645,120 @@ pub(crate) async fn bootstrap_node_state(
     })
 }
 
-pub(crate) fn onboarding_bootstrap_client(
+pub(crate) async fn refresh_onboarding_bootstrap(
+    onboarding_secret: &str,
+    node_state: &PersistedNodeState,
+    node_location: Option<String>,
+    node_weight: Option<u32>,
+    node_labels: BTreeMap<String, String>,
     timeout: Duration,
-) -> Result<reqwest::Client, SetupError> {
+) -> Result<BootstrapOnboardingResponse, SetupError> {
+    let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
+    let node_signing_key = SigningKey::from_bytes(&node_state.net_secret_key);
+    let node_id = iroh::SecretKey::from_bytes(&node_state.net_secret_key).public();
+
+    let mut transport_secret_key = None;
+    let transport_public_key = if matches!(decoded_secret.mode, OnboardingMode::Management) {
+        let secret_key = TransportSecretKey::generate(&mut CryptoOsRng);
+        let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(secret_key.public_key().as_bytes());
+        transport_secret_key = Some(secret_key);
+        Some(public_key)
+    } else {
+        None
+    };
+
+    let issuer_signing_key = match (&decoded_secret.mode, &node_state.identity) {
+        (
+            OnboardingMode::Server,
+            PersistedNodeIdentity::Server {
+                issuer_private_key_pem,
+                ..
+            },
+        ) => Some(SigningKey::from_pkcs8_pem(issuer_private_key_pem)?),
+        (OnboardingMode::Server, _) => {
+            return Err(SetupError::MissingOnboardingMaterial(
+                OnboardingMode::Server,
+            ));
+        }
+        _ => None,
+    };
+    let issuer_public_key = issuer_signing_key.as_ref().map(|issuer_signing_key| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(issuer_signing_key.verifying_key().to_bytes())
+    });
+    let node_id_string = node_id.to_string();
+    let node_proof = node_signing_key
+        .sign(&node_proof_message(
+            onboarding_secret,
+            &node_id_string,
+            transport_public_key.as_deref(),
+        ))
+        .to_string();
+    let issuer_proof = issuer_signing_key
+        .as_ref()
+        .zip(issuer_public_key.as_ref())
+        .map(|(issuer_signing_key, issuer_public_key)| {
+            issuer_signing_key
+                .sign(&issuer_proof_message(
+                    onboarding_secret,
+                    &node_id_string,
+                    issuer_public_key,
+                ))
+                .to_string()
+        });
+
+    let response = onboarding_bootstrap_client(timeout)?
+        .post(format!(
+            "{}/api/v1/access/onboarding/bootstrap",
+            decoded_secret.seed_url.trim_end_matches('/'),
+        ))
+        .json(&BootstrapOnboardingRequest {
+            onboarding_secret: onboarding_secret.to_string(),
+            node_id: node_id_string,
+            node_proof,
+            transport_public_key,
+            issuer_public_key,
+            issuer_proof,
+            node_location,
+            node_weight,
+            node_labels,
+        })
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(SetupError::OnboardingBootstrapFailed(format!(
+            "bootstrap endpoint returned {}",
+            response.status()
+        )));
+    }
+
+    let body = response.bytes().await?;
+    let response = decode_bootstrap_response(&body)?;
+    if response.mode != decoded_secret.mode {
+        return Err(SetupError::OnboardingModeMismatch);
+    }
+    let response_realm_id = response.realm_id()?;
+    if response_realm_id != node_state.realm_id {
+        return Err(SetupError::OnboardingBootstrapFailed(
+            "bootstrap response realm does not match persisted node state".to_string(),
+        ));
+    }
+    validate_bootstrap_response(&response, decoded_secret.mode, node_state.realm_id, node_id)?;
+
+    drop(transport_secret_key);
+    Ok(response)
+}
+
+fn onboarding_bootstrap_client(timeout: Duration) -> Result<reqwest::Client, SetupError> {
     Ok(reqwest::Client::builder()
         .connect_timeout(ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT)
         .timeout(timeout)
         .build()?)
 }
 
-pub(crate) fn validate_bootstrap_response(
+fn validate_bootstrap_response(
     response: &BootstrapOnboardingResponse,
     expected_mode: OnboardingMode,
     expected_realm_id: RealmId,
