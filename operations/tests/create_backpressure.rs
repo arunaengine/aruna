@@ -18,7 +18,7 @@ use aruna_operations::metadata::create_document::{
     mint_local_document,
 };
 use aruna_operations::metadata::projector::project_logged_events;
-use aruna_operations::tasks::incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::install_and_start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -63,10 +63,12 @@ async fn spawn_probe_node(with_drains: bool) -> Result<ProbeNode, BoxError> {
         compute_handle: None,
     });
     if let Some(task_handle) = task_handle {
-        initialize_task_incoming(
+        let shutdown = aruna_core::shutdown::Shutdown::new();
+        install_and_start_task_queues(
             context.clone(),
             task_handle,
             aruna_operations::jobs::runtime::JobsRuntime::new(),
+            &shutdown,
         )
         .await;
     }

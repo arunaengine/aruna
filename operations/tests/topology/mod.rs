@@ -51,7 +51,7 @@ use aruna_operations::realm::mutate_placement::{
     MutateRealmPlacementConfig, RealmPlacementMutation, drive_placement_mutation,
 };
 use aruna_operations::sync::incoming::initialize_net_incoming;
-use aruna_operations::tasks::incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::install_and_start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
@@ -1001,10 +1001,12 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
     });
 
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    install_and_start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new_paused(),
+        &shutdown,
     )
     .await;
 

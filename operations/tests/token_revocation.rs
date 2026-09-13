@@ -27,7 +27,7 @@ use aruna_operations::auth::revoke_token::{
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::sync::incoming::initialize_net_incoming;
-use aruna_operations::tasks::incoming::initialize_task_incoming;
+use aruna_operations::tasks::incoming::install_and_start_task_queues;
 use aruna_storage::{FjallStorage, StorageHandle};
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
@@ -218,10 +218,12 @@ async fn spawn_node(realm_id: RealmId) -> TestResult<TestNode> {
     });
 
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    install_and_start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
+        &shutdown,
     )
     .await;
 

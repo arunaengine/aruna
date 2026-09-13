@@ -63,7 +63,7 @@ use aruna_operations::sync::document_outbox::{
     new_outbox_record, outbox_key, read_outbox_record, write_outbox_effect,
 };
 use aruna_operations::sync::incoming::initialize_net_incoming;
-use aruna_operations::tasks::incoming::{OutboxDrainer, initialize_task_incoming};
+use aruna_operations::tasks::incoming::{OutboxDrainer, install_and_start_task_queues};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
@@ -1097,10 +1097,12 @@ async fn spawn_node(
     });
 
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    install_and_start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
+        &shutdown,
     )
     .await;
 

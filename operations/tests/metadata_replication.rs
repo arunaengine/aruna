@@ -59,7 +59,7 @@ use aruna_operations::realm::mutate_placement::{
 use aruna_operations::sync::document_outbox::read_outbox_records;
 use aruna_operations::sync::incoming::initialize_net_incoming;
 use aruna_operations::sync::shard_placement::sort_node_ids;
-use aruna_operations::tasks::incoming::{OutboxDrainer, initialize_task_incoming};
+use aruna_operations::tasks::incoming::{OutboxDrainer, install_and_start_task_queues};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -1130,10 +1130,12 @@ async fn spawn_node_configured(
     // A node without the auto task loop leaves its outbox drain (and every other
     // timer) for the test to drive by hand.
     if start_tasks {
-        initialize_task_incoming(
+        let shutdown = aruna_core::shutdown::Shutdown::new();
+        install_and_start_task_queues(
             context.clone(),
             task_handle,
             aruna_operations::jobs::runtime::JobsRuntime::new(),
+            &shutdown,
         )
         .await;
     }

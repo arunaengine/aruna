@@ -17,7 +17,7 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::startup::RecoveryStatus;
 use aruna_operations::sync::incoming::initialize_net_holder;
-use aruna_operations::tasks::incoming::{TaskQueues, initialize_task_holder};
+use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_tasks::TaskHandle;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -303,7 +303,7 @@ async fn fill(
         acquired.jobs_runtime.clone(),
         &acquired.shutdown,
     );
-    let task_queues = initialize_task_holder(
+    let task_queues = install_task_queues(
         driver_ctx.clone(),
         acquired.task_handle.clone(),
         acquired.jobs_runtime.clone(),
