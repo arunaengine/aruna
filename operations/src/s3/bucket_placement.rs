@@ -409,14 +409,15 @@ mod tests {
     use super::{PutBucketPlacementError, PutBucketPlacementInput, PutBucketPlacementOperation};
     use crate::placement::policy::cache::PolicyCacheEntry;
     use crate::tests::fixtures::policy::signed_document;
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
         AuthContext, BucketInfo, PlacementPolicy, PlacementPolicyRef, PlacementSelector, RealmId,
         VerifiedPolicy,
     };
-    use aruna_core::types::{NodeId, UserId};
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
 

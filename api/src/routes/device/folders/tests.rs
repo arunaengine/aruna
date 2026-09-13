@@ -3,8 +3,8 @@ use super::{
     parse_hash,
 };
 use crate::routes::device::dto::hex_hash;
+use aruna_core::id::NodeId;
 use aruna_core::structs::{RemoteBinding, SyncRefusal};
-use aruna_core::types::NodeId;
 use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::ActionError;
 use axum::http::StatusCode;

@@ -269,9 +269,9 @@ impl Operation for ResolveQuarantineOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
+    use aruna_core::id::NodeId;
     use aruna_core::structs::{PlacementSubject, VersionKey};
-    use aruna_core::types::NodeId;
-    use aruna_core::types::UserId;
     use std::collections::BTreeMap;
     use ulid::Ulid;
 

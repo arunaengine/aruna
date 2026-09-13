@@ -137,8 +137,8 @@ mod tests {
     use crate::device::publish_queue::{PUBLISH_PAGE_SIZE, PublishEntry};
     use crate::driver::drive;
     use crate::tests::fixtures::device::context;
+    use aruna_core::UserId;
     use aruna_core::structs::RealmId;
-    use aruna_core::types::UserId;
     use ulid::Ulid;
 
     #[tokio::test]

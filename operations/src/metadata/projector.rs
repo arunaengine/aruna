@@ -1146,12 +1146,12 @@ async fn schedule_materialization_drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::metadata::{MetadataCreateEventPayload, MetadataDocumentLifecycleRecord};
     use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
     use aruna_core::structs::{
         PlacementRef, PlacementStrategy, RealmConfigDocument, RealmId, RealmNodeKind,
     };
-    use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
     use async_trait::async_trait;

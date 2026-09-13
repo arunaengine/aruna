@@ -1,7 +1,8 @@
+use aruna_core::UserId;
 use aruna_core::structs::{
     RealmId, WatchEvent, WatchEventDetail, WatchEventKind, watch_path_matches,
 };
-use aruna_core::types::{GroupId, UserId};
+use aruna_core::types::GroupId;
 use tracing::warn;
 use ulid::Ulid;
 

@@ -39,7 +39,7 @@ pub struct VersionReplicationManifest {
     pub group_id: aruna_core::types::GroupId,
     pub kind: ReplicationItemKind,
     pub created_at: std::time::SystemTime,
-    pub created_by: aruna_core::types::UserId,
+    pub created_by: aruna_core::UserId,
     pub current_version: bool,
     pub current_version_generation: Option<u64>,
     pub auth_context: AuthContext,

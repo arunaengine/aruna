@@ -627,14 +627,16 @@ mod tests {
         AttachmentGap, CopyState, CoverageError, CoverageInput, CoverageLimit, CoverageReport,
         CoverageScope, PolicyCoverageOperation,
     };
+    use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
         AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, ManagedCopyRecord, ManagedCopyState, PlacementPolicyRef, RealmId,
         VersionKey,
     };
-    use aruna_core::types::{Key, NodeId, UserId};
+    use aruna_core::types::Key;
     use std::collections::HashMap;
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;

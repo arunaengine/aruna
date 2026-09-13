@@ -1069,9 +1069,7 @@ mod tests {
 
     fn user_kind() -> RealmNodeKind {
         RealmNodeKind::User {
-            owner: aruna_core::types::UserId::nil(aruna_core::structs::RealmId::from_bytes(
-                [7u8; 32],
-            )),
+            owner: aruna_core::UserId::nil(aruna_core::structs::RealmId::from_bytes([7u8; 32])),
         }
     }
 

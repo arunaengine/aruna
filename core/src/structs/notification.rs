@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::{RealmId, WatchAuthorizationBinding};
-use crate::types::{GroupId, Key, UserId};
+use crate::types::{GroupId, Key};
 
 pub const NOTIFICATION_DIRECT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 pub const NOTIFICATION_TRANSIENT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;

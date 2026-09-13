@@ -1,3 +1,4 @@
+use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -9,7 +10,7 @@ use aruna_core::structs::{
     NotificationRecord, RealmId, WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription,
     watch_retry_key, watch_retry_prefix, watch_subscription_key,
 };
-use aruna_core::types::{Key, KeySpace, TxnId, UserId};
+use aruna_core::types::{Key, KeySpace, TxnId};
 use tracing::warn;
 
 use crate::driver::DriverContext;
@@ -727,6 +728,7 @@ fn record_delivery_suppression(context: &DriverContext, reason: WatchAuthorizati
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -737,7 +739,6 @@ mod tests {
         RealmConfigDocument, RealmNodeKind, WatchAuthorizationBinding, WatchEventDetail,
         WatchEventKind, WatchEventMask, object_permission_path, watch_resource_path,
     };
-    use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
     use ulid::Ulid;

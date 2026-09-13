@@ -1,5 +1,6 @@
+use aruna_core::UserId;
 use aruna_core::errors::ConversionError;
-use aruna_core::types::{GroupId, Key, UserId, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
 use std::collections::BTreeSet;
 

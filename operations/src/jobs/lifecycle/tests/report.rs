@@ -1,12 +1,12 @@
 //! What the external surfaces read back from one family, including the
 //! responder-local diagnostics that stay outside the projection digest.
 
+use aruna_core::UserId;
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::structs::{
     AuthContext, JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobState,
     PhysicalExecutionState, SubmissionId,
 };
-use aruna_core::types::UserId;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};

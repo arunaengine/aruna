@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use aruna_core::UserId;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     SYNC_ACTION_LOG_KEYSPACE, SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE,
     SYNCED_FOLDER_KEYSPACE,
@@ -11,7 +13,7 @@ use aruna_core::structs::{
     SyncBase, SyncPageLimit, SyncRefusal, SyncedFolder,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{GroupId, Key, NodeId, UserId};
+use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 use ulid::Ulid;
 

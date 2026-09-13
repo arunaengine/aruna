@@ -6,13 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::events::Event;
 use aruna_core::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent,
 };
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_core::types::UserId;
 use craqle::ActorId;
 use thiserror::Error;
 use tracing::warn;
@@ -275,6 +275,7 @@ mod tests {
     use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
     use crate::driver::DriverContext;
     use crate::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::metadata::{
@@ -282,7 +283,6 @@ mod tests {
         MetadataEvent, MetadataGraphPolicy, MetadataRequestDurability,
     };
     use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
-    use aruna_core::types::UserId;
     use craqle::VectorClock;
     use std::sync::Arc;
     use ulid::Ulid;

@@ -484,6 +484,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::realm::get_config::GetRealmConfigOperation;
+    use aruna_core::UserId;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
@@ -491,7 +492,6 @@ mod tests {
         GroupQuotaOverride, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
         RealmNodeKind, UserGroupCapOverride,
     };
-    use aruna_core::types::UserId;
     use tempfile::tempdir;
     use ulid::Ulid;
 

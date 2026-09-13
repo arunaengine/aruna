@@ -1,6 +1,6 @@
+use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::{ArunaArn, ArunaArnType};
-use crate::types::UserId;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use ulid::Ulid;

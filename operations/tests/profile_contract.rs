@@ -3,6 +3,7 @@
 use std::sync::{Arc, LazyLock};
 
 use aruna_core::StructuredId;
+use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -17,7 +18,6 @@ use aruna_core::structs::{
     Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
     RealmId, RealmNodeKind,
 };
-use aruna_core::types::UserId;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::create_document::{

@@ -416,13 +416,13 @@ fn binding_strategy<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentTarget;
     use aruna_core::reducer::{AdminDocumentReducerState, overlay_placement};
     use aruna_core::structs::{
         AffinityRule, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, KIND_LABEL_KEY, LOCATION_LABEL_KEY,
         NodePlacementEntry, RealmId, RealmNode, RealmNodeKind, StrategyBinding,
     };
-    use aruna_core::types::UserId;
     use proptest::prelude::*;
     use ulid::Ulid;
 

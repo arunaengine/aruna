@@ -12,13 +12,14 @@ use crate::staging::reference::{
     MaterializeReferenceError, ReferenceWrite, write_reference_version,
 };
 use aruna_core::UserId;
+use aruna_core::id::NodeId;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
     AuthContext, BackendLocation, PathRestriction, RealmId, SourceMetadata, StagingStrategy,
     VersionSourceBinding, resolve_backend,
 };
-use aruna_core::types::{GroupId, NodeId};
+use aruna_core::types::GroupId;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;

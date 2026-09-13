@@ -149,11 +149,11 @@ impl PolicySetResolver {
 mod tests {
     use super::{PolicySetResolver, ResolveMode, ResolveStep};
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::structs::{
         PlacementPolicy, PlacementPolicyRef, PlacementSelector, PolicyResolution, RealmId,
         VerifiedPolicy,
     };
-    use aruna_core::types::NodeId;
     use byteview::ByteView;
     use ulid::Ulid;
 

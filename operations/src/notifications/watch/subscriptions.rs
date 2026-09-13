@@ -1,3 +1,4 @@
+use aruna_core::UserId;
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
     DocumentSyncRevision, DocumentSyncTarget,
@@ -14,7 +15,7 @@ use aruna_core::structs::{
     RealmId, WatchAuthorizationBinding, WatchEventMask, WatchSubscription, parse_watch_key,
     watch_subscription_prefix,
 };
-use aruna_core::types::{TxnId, UserId};
+use aruna_core::types::TxnId;
 use aruna_storage::StorageHandle;
 use thiserror::Error;
 use ulid::Ulid;

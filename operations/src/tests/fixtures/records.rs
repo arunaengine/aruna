@@ -1,6 +1,7 @@
 //! One realm, one submission family, and signed records for it.
 
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::compute::ExecutionTargetId;
 use aruna_core::structs::{
     CancelAuthority, CollisionPolicy, ComputeResources, EffectiveResources, ExecutionOutputRecord,
@@ -10,7 +11,6 @@ use aruna_core::structs::{
     PhysicalExecutionState, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
     ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
-use aruna_core::types::UserId;
 use ulid::Ulid;
 
 use aruna_core::document::DocumentSyncTarget;

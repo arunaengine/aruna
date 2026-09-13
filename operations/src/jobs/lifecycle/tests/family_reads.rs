@@ -167,7 +167,7 @@ async fn resolves_session_alias() {
         matches!(report, crate::jobs::service::JobReportLookup::Ready { job, .. }
         if job.job_id == receipt.physical_job_id && job.report_digest == [4; 32])
     );
-    let stranger = aruna_core::types::UserId::new(ulid::Ulid(42), REALM);
+    let stranger = aruna_core::UserId::new(ulid::Ulid(42), REALM);
     assert!(matches!(
         crate::jobs::service::read_report_routed(&ctx, stranger, spec.job_id, None, None, 1, None)
             .await,

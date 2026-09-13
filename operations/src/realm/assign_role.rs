@@ -1,3 +1,4 @@
+use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -13,7 +14,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{Actor, AuthContext, Permission, RealmAuthorizationDocument, RealmId};
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Key, KeySpace, RoleId, TxnId, UserId};
+use aruna_core::types::{Key, KeySpace, RoleId, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::HashSet;

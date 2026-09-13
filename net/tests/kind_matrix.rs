@@ -3,11 +3,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::id::NodeId;
 use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::types::UserId;
 use aruna_net::streams::BiStream;
 use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::FjallStorage;

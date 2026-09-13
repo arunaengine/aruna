@@ -1117,7 +1117,7 @@ mod tests {
             .unwrap_or_else(|| node(1));
         let actor = aruna_core::structs::Actor {
             node_id,
-            user_id: aruna_core::types::UserId::nil(config.realm_id),
+            user_id: aruna_core::UserId::nil(config.realm_id),
             realm_id: config.realm_id,
         };
         let target = DocumentSyncTarget::RealmConfig {
@@ -1186,7 +1186,7 @@ mod tests {
         config.ensure_node(
             device,
             RealmNodeKind::User {
-                owner: aruna_core::types::UserId::nil(realm_id),
+                owner: aruna_core::UserId::nil(realm_id),
             },
         );
 
@@ -1205,7 +1205,7 @@ mod tests {
         config.ensure_node(
             local,
             RealmNodeKind::User {
-                owner: aruna_core::types::UserId::nil(realm_id),
+                owner: aruna_core::UserId::nil(realm_id),
             },
         );
         write_realm_config(&ctx, &config).await;
@@ -1242,7 +1242,7 @@ mod tests {
         config.ensure_node(
             local,
             RealmNodeKind::User {
-                owner: aruna_core::types::UserId::nil(realm_id),
+                owner: aruna_core::UserId::nil(realm_id),
             },
         );
         write_realm_config(&ctx, &config).await;
@@ -1590,7 +1590,7 @@ mod tests {
             ingress_node_id: origin,
             realm_id,
             group_id,
-            created_by: aruna_core::types::UserId::nil(realm_id),
+            created_by: aruna_core::UserId::nil(realm_id),
             created_at_ms: 1_000,
             retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
             payload: aruna_core::structs::ExecutionSpec {

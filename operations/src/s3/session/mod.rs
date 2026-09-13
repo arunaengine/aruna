@@ -15,6 +15,7 @@ pub use revoke::{RevokeS3SessionConfig, RevokeS3SessionOperation};
 pub use touch::{TouchS3SessionConfig, TouchS3SessionOperation};
 
 use crate::driver::{DriverContext, drive};
+use aruna_core::UserId;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError,
@@ -24,7 +25,7 @@ use aruna_core::events::Event;
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::{PathRestriction, S3_SESSION_ACCESS_PREFIX, S3Session};
-use aruna_core::types::{GroupId, Key, UserId, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
 use rand::distr::Alphanumeric;
 use rand::{RngExt, rng};

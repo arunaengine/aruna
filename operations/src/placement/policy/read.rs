@@ -463,11 +463,11 @@ mod tests {
     use super::*;
     use crate::tests::fixtures::policy::{admin_user, realm_view, signed_document};
     use aruna_core::NodeId;
+    use aruna_core::UserId;
     use aruna_core::effects::NetEffect;
     use aruna_core::structs::{
         LabelMatch, PlacementPolicy, PlacementSelector, PolicyPublicationClaim, RealmNodeKind,
     };
-    use aruna_core::types::UserId;
     use byteview::ByteView;
     use ulid::Ulid;
 

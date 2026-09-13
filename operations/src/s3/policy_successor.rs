@@ -992,8 +992,10 @@ mod tests {
     };
     use crate::blob::records::HeadAliasContext;
     use crate::s3::purge_fence::PurgeFenceError;
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, USAGE_STATS_KEYSPACE,
     };
@@ -1007,7 +1009,7 @@ mod tests {
         StoragePurgeFence, StoragePurgeScope, UsageCounters, VerifiedPolicy, VersionKey,
         checksum::HASH_BLAKE3, usage_group_key,
     };
-    use aruna_core::types::{Key, NodeId, TxnId, UserId, Value};
+    use aruna_core::types::{Key, TxnId, Value};
     use std::collections::{BTreeMap, HashMap};
     use std::time::{SystemTime, UNIX_EPOCH};
     use ulid::Ulid;

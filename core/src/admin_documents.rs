@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::UserId;
 use crate::structs::{
     Actor, BandPool, BindingScope, CandidatePlacementMap, CompletionProof, HandleRange,
     MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
@@ -11,7 +12,7 @@ use crate::structs::{
     RealmComputeConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StrategyBinding,
     TransitionPlan,
 };
-use crate::types::{GroupId, RoleId, UserId};
+use crate::types::{GroupId, RoleId};
 
 /// Domain separator for the origin signature over an administrative event.
 pub const ADMIN_DOCUMENT_EVENT_DOMAIN: &str = "aruna-admin-document-event-v1";
@@ -306,6 +307,7 @@ pub enum AdminDocumentOperation {
 mod tests {
     use super::{AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget};
     use crate::NodeId;
+    use crate::UserId;
     use crate::structs::{
         AffinityEffect, AffinityRule, BandPool, BindingScope, DocumentClass, HandleRange,
         LabelMatch, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
@@ -313,7 +315,7 @@ mod tests {
         RealmComputeConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
     };
     use crate::structured_id::PlacementHandle;
-    use crate::types::{GroupId, RoleId, UserId};
+    use crate::types::{GroupId, RoleId};
     use std::collections::BTreeMap;
     use ulid::Ulid;
 

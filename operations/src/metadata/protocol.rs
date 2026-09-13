@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
 use aruna_core::document::DocumentSyncTarget;
@@ -16,7 +17,7 @@ use aruna_core::structs::{
     PlacementPolicyRef, PlacementRef, SubmissionId, SyncListCursor, SyncPageLimit, SyncPullAck,
     SyncRefusal, SyncRelationship, SyncVersionPage, VersionedObjectArn,
 };
-use aruna_core::types::{GroupId, UserId};
+use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
 use craqle::GraphReplicaSnapshot;
 use serde::{Deserialize, Serialize};
@@ -787,13 +788,13 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::audit::{AuditPageEntry, AuditPageRequest};
     use aruna_core::metadata::MAX_METADATA_BEARER_TOKEN_LEN;
     use aruna_core::structs::{
         AuthContext, MetadataAuditOperation, MetadataAuditRecord, PathRestriction, Permission,
         RealmId,
     };
-    use aruna_core::types::UserId;
     use tokio::sync::Semaphore;
 
     #[test]

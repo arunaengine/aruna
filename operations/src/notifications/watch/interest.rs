@@ -696,12 +696,12 @@ async fn sync_eligible_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId,
         RealmNodeKind, WatchEventKind, WatchEventMask, WatchInterestEntry,
     };
-    use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};

@@ -6,9 +6,10 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::UserId;
 use crate::errors::StorageError;
 use crate::structs::{AuthContext, MetadataAuditOperation, MetadataRegistryRecord, RealmId};
-use crate::types::{GroupId, UserId};
+use crate::types::GroupId;
 
 pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
 

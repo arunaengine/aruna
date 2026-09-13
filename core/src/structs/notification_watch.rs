@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::{NotificationKind, PathRestriction, RealmId};
-use crate::types::{GroupId, Key, UserId};
+use crate::types::{GroupId, Key};
 
 pub const NOTIFICATION_WATCH_PER_USER_CAP: usize = 50;
 pub const NOTIFICATION_WATCH_MAX_PREFIX_LEN: usize = 1024;

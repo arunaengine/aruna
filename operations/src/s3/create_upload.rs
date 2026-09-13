@@ -3,6 +3,7 @@ use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
 };
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -12,7 +13,7 @@ use aruna_core::structs::{
     BucketInfo, MultipartUpload, MultipartUploadChecksumHint, MultipartUploadStatus,
     PlacementPolicyRef, ResolvedBackend, RoutingError, RoutingSnapshot, resolve_backend,
 };
-use aruna_core::types::{Effects, GroupId, TxnId, UserId};
+use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::SystemTime;

@@ -1,8 +1,9 @@
+use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::blob::checked_refs;
 use crate::structs::checksum::{ChecksumAlgorithm, HASH_MD5};
 use crate::structs::{BackendLocation, BackendRef, PlacementPolicyError, PlacementPolicyRef};
-use crate::types::{GroupId, UserId};
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;

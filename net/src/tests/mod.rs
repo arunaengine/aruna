@@ -760,7 +760,7 @@ async fn config_replaces_peers() -> Result<()> {
     document.ensure_node(
         user_node,
         aruna_core::structs::RealmNodeKind::User {
-            owner: aruna_core::types::UserId::nil(*handle.realm_id()),
+            owner: aruna_core::UserId::nil(*handle.realm_id()),
         },
     );
     let expected = unique_peer_nodes(vec![peer_a, peer_b], handle.node_id());

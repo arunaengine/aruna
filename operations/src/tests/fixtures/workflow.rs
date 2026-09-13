@@ -1,5 +1,5 @@
+use aruna_core::id::NodeId;
 use aruna_core::structs::{ComputeResources, ExecutionSpec};
-use aruna_core::types::NodeId;
 use ulid::Ulid;
 
 pub(crate) fn node_id(seed: u8) -> NodeId {

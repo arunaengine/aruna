@@ -1,9 +1,10 @@
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::User;
-use aruna_core::types::{Effects, UserId};
+use aruna_core::types::Effects;
 use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;

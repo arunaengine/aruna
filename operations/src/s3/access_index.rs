@@ -1,6 +1,7 @@
+use aruna_core::UserId;
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::UserAccess;
-use aruna_core::types::{Key, UserId, Value};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use std::collections::BTreeSet;
 

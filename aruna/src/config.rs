@@ -1,4 +1,5 @@
 use aruna_api::s3::server::S3ServerTimeouts;
+use aruna_core::UserId;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -17,7 +18,6 @@ use aruna_core::structs::{
     RoCrateLimits, StaticRealmEndpoint,
 };
 use aruna_core::time::unix_timestamp_secs;
-use aruna_core::types::UserId;
 use aruna_net::{DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_config};
 
 use crate::identity::{EnrollmentPlan, IdentityStore, plan_enrollment};
@@ -1520,7 +1520,7 @@ mod tests {
             onboarding_phase: None,
             onboarding_sync_ticket: None,
             identity: PersistedNodeIdentity::User {
-                owner: aruna_core::types::UserId::nil(realm_id),
+                owner: aruna_core::UserId::nil(realm_id),
             },
         };
         persist_node_state(&storage, &node_state).await.unwrap();
@@ -1557,7 +1557,7 @@ mod tests {
             onboarding_phase: Some(aruna_core::onboarding::OnboardingPhase::CoreDocumentsFetched),
             onboarding_sync_ticket: Some("already-fetched".to_string()),
             identity: PersistedNodeIdentity::User {
-                owner: aruna_core::types::UserId::nil(realm_id),
+                owner: aruna_core::UserId::nil(realm_id),
             },
         };
         persist_node_state(&storage, &node_state).await.unwrap();

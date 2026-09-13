@@ -7,12 +7,12 @@ use std::ops::Range;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use crate::UserId;
 use crate::metadata::MetadataAuthToken;
 use crate::structs::{
     JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState,
     StagingJobCheckpoint, WorkspaceMode,
 };
-use crate::types::UserId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKind {

@@ -1,6 +1,7 @@
+use crate::UserId;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::reducer::AdminDocumentReducerState;
-use crate::types::{GroupId, RoleId, UserId};
+use crate::types::{GroupId, RoleId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use ulid::Ulid;

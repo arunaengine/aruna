@@ -1435,6 +1435,7 @@ pub async fn drive_placement_mutation(
 mod tests {
     use std::collections::BTreeMap;
 
+    use aruna_core::UserId;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::StorageEvent;
     use aruna_core::metadata::{MetadataCreateEventPayload, MetadataCreateEventRecord};
@@ -1446,7 +1447,6 @@ mod tests {
     };
     use aruna_core::structured_id::PlacementHandle;
     use aruna_core::task::{TaskEffect, TaskKey};
-    use aruna_core::types::UserId;
     use tempfile::tempdir;
 
     use super::*;

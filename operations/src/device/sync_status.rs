@@ -401,8 +401,8 @@ mod tests {
     use super::*;
     use crate::device::publish_queue::publish_entry;
     use crate::device::replica::ReplicaOrigin;
+    use aruna_core::UserId;
     use aruna_core::structs::{FolderMode, RealmId, RemoteBinding};
-    use aruna_core::types::UserId;
 
     fn replica(state: ReplicaState) -> ReplicaRecord {
         let mut replica = ReplicaRecord::new(

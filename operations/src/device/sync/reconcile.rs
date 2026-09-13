@@ -773,8 +773,8 @@ fn fail(operation: &mut ReconcileFolderOperation, error: ReconcileError) -> Effe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::structs::{FileStat, FolderMode, FolderState, RealmId, RemoteBinding};
-    use aruna_core::types::UserId;
     use byteview::ByteView;
 
     fn folder() -> SyncedFolder {

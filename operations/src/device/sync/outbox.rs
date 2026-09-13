@@ -433,8 +433,8 @@ pub(crate) async fn has_rows(storage: &StorageHandle, key_space: &str) -> bool {
 mod tests {
     use std::sync::Arc;
 
+    use aruna_core::UserId;
     use aruna_core::structs::{FolderMode, RemoteBinding};
-    use aruna_core::types::UserId;
     use ulid::Ulid;
 
     use super::{

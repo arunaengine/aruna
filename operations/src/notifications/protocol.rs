@@ -1,10 +1,10 @@
+use aruna_core::UserId;
 pub use aruna_core::structs::{
     NOTIFICATION_WATCH_INTEREST_BYTES_CAP, NOTIFICATION_WATCH_INTEREST_ENTRY_CAP,
 };
 use aruna_core::structs::{
     NotificationRecord, WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
 };
-use aruna_core::types::UserId;
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

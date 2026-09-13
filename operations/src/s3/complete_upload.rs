@@ -18,9 +18,11 @@ use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_rea
 use crate::s3::upload_target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup, delete_records_effect};
 use aruna_blob::hash::Hasher;
+use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
@@ -36,7 +38,7 @@ use aruna_core::structs::{
     PlacementPolicyError, PlacementPolicyRef, RealmId, ResolvedBackend, RoCrateLimits, UsageDelta,
     VersionKey, WriteOwner,
 };
-use aruna_core::types::{Effects, NodeId, TxnId, UserId};
+use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -3281,7 +3283,7 @@ mod gate_tests {
         RealmId::from_bytes([3u8; 32])
     }
 
-    fn node() -> aruna_core::types::NodeId {
+    fn node() -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[9u8; 32]).public()
     }
 

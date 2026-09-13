@@ -1,5 +1,6 @@
+use crate::UserId;
 use crate::errors::ConversionError;
-use crate::types::{GroupId, UserId};
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentClock;
 use aruna_core::auth::revocation_live;
 use aruna_core::document::DocumentSyncTarget;
@@ -22,7 +23,7 @@ use aruna_core::structs::{
     RealmId, SyncRefusal,
 };
 use aruna_core::time::unix_timestamp_secs;
-use aruna_core::types::{Key, UserId, Value};
+use aruna_core::types::{Key, Value};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};

@@ -1,6 +1,6 @@
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::structs::{RealmConfigDocument, RealmId};
-use aruna_core::types::UserId;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -73,8 +73,8 @@ pub fn ensure_peer_trust(
 mod tests {
     use super::{PeerTrust, RealmPeerError, ensure_peer_trust};
     use aruna_core::NodeId;
+    use aruna_core::UserId;
     use aruna_core::structs::{RealmConfigDocument, RealmId, RealmNodeKind};
-    use aruna_core::types::UserId;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

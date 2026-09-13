@@ -1,3 +1,4 @@
+use aruna_core::UserId;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -7,7 +8,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderSecret, AssistantSecretError,
 };
-use aruna_core::types::{Effects, Key, TxnId, UserId, Value};
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::BTreeSet;

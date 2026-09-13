@@ -11,13 +11,14 @@ use aruna_core::audit::{
 };
 use aruna_core::effects::{AuditPageEffect, Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AuthContext, MetadataAuditRecord, Permission, RealmConfigDocument, RealmId,
 };
-use aruna_core::types::{Effects, GroupId, Key, NodeId, Value};
+use aruna_core::types::{Effects, GroupId, Key, Value};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
@@ -957,7 +958,7 @@ mod tests {
     }
 
     fn batch(
-        node: aruna_core::types::NodeId,
+        node: aruna_core::id::NodeId,
         realm_id: RealmId,
         group_id: Ulid,
         document_id: Option<Ulid>,
@@ -986,7 +987,7 @@ mod tests {
     fn peers_share_effect() {
         // Every peer is asked in one adapter round: with one effect per peer the
         // runner contacts them serially and unreachable nodes add up to a timeout.
-        let unique: Vec<aruna_core::types::NodeId> = (1u8..=3)
+        let unique: Vec<aruna_core::id::NodeId> = (1u8..=3)
             .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
             .collect();
         let mut peers = unique.clone();
@@ -1377,7 +1378,7 @@ mod tests {
     fn silent_peer_missing() {
         // A peer the adapter did not answer for must still be reported missing
         // instead of leaving the page looking complete.
-        let peers: Vec<aruna_core::types::NodeId> = (4u8..=5)
+        let peers: Vec<aruna_core::id::NodeId> = (4u8..=5)
             .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
             .collect();
         let mut operation = ListAuditOperation::new(

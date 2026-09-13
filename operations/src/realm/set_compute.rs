@@ -424,6 +424,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::realm::get_config::GetRealmConfigOperation;
+    use aruna_core::UserId;
     use aruna_core::compute_quota::ComputeQuota;
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::StorageEvent;
@@ -431,7 +432,6 @@ mod tests {
     use aruna_core::structs::{
         GroupComputeQuota, LocationLink, RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
-    use aruna_core::types::UserId;
     use tempfile::tempdir;
     use ulid::Ulid;
 

@@ -17,6 +17,7 @@ use ::irokle::{
 use aruna_core::DhtKeyId;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
@@ -77,7 +78,7 @@ use aruna_core::structs::{
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
-use aruna_core::types::{GroupId, RoleId, TxnId, UserId, Value};
+use aruna_core::types::{GroupId, RoleId, TxnId, Value};
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
 use parking_lot::{Mutex, RwLock};

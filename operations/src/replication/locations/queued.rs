@@ -163,8 +163,8 @@ mod tests {
     use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
     use crate::tests::fixtures::locations::{auth, node_id};
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::operation::Operation;
-    use aruna_core::types::NodeId;
     use ulid::Ulid;
 
     fn job(target: ReplicateScopeTarget, target_node: NodeId) -> BlobReplicationJobRecord {

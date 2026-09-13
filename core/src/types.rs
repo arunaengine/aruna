@@ -1,9 +1,8 @@
 //! Crate-wide aliases for the operation contract: effects, transaction and
-//! storage key types, and the ULID id aliases.
+//! storage key types, and the ULID aliases.
 //!
-//! The type-safe identifiers are owned by [`crate::id`] and [`crate::user_id`].
-//! The bottom re-exports keep the historical `aruna_core::types::*` paths
-//! working; new code names the owning module or the crate-root export.
+//! The type-safe identifiers are owned by [`crate::id`] and [`crate::user_id`];
+//! name those modules or the crate-root exports directly.
 
 use byteview::ByteView;
 use smallvec::SmallVec;
@@ -21,8 +20,3 @@ pub type Value = ByteView;
 pub type KeySpace = String;
 pub type GroupId = Ulid;
 pub type RoleId = Ulid;
-
-/// Compatibility re-exports of the type-safe identifiers; `crate::id` and
-/// `crate::user_id` own the definitions.
-pub use crate::id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
-pub use crate::user_id::UserId;

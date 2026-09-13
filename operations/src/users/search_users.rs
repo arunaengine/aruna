@@ -1,10 +1,11 @@
 use aruna_core::USER_KEYSPACE;
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{RealmId, User};
-use aruna_core::types::{Effects, Key, UserId, Value};
+use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -222,11 +223,12 @@ impl Operation for SearchUsersOperation {
 #[cfg(test)]
 mod tests {
     use super::{SearchUsersInput, SearchUsersMatch, SearchUsersOperation, SearchUsersOutput};
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, RealmId, User};
-    use aruna_core::types::{Key, UserId, Value};
+    use aruna_core::types::{Key, Value};
     use std::collections::HashMap;
     use ulid::Ulid;
 

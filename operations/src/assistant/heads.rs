@@ -2,13 +2,14 @@ use super::{
     CHAT_CAP, ChatStoreError, abort_effects, commit, decode_head, decode_heads, head_key,
     iter_heads, iter_turns, read_head, unexpected,
 };
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ASSISTANT_CHAT_HEAD_KEYSPACE, ASSISTANT_CHAT_TURN_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{AssistantChatHead, MAX_ASSISTANT_CHATS};
-use aruna_core::types::{Effects, TxnId, UserId};
+use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -205,10 +205,10 @@ async fn append_output_record(
 
 #[cfg(test)]
 mod tests {
+    use aruna_core::UserId;
     use aruna_core::structs::{
         AttemptIntent, ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobState, RealmId,
     };
-    use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
     use ulid::Ulid;

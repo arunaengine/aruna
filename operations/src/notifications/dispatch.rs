@@ -1,11 +1,11 @@
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::structs::{
     NotificationClass, NotificationKind, NotificationRecord, WatchAuthorizationBinding,
     WatchEventMask, WatchInterestEntry, WatchSubscription,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::UserId;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use ulid::Ulid;

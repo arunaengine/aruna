@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use crate::UserId;
 use crate::alpn::Alpn;
 use crate::audit::AuditPageRequest;
 use crate::compute::ExecutionTargetId;
@@ -15,7 +16,6 @@ use crate::structs::{
     RealmId, ResolvedBackend, ResolvedSourceAccess, SubmissionId, WriteGuard,
 };
 use crate::task::TaskEffect;
-use crate::types::UserId;
 use crate::types::{Key, KeySpace, TxnId, Value};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};

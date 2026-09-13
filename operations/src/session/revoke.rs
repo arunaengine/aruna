@@ -280,8 +280,8 @@ impl Operation for RevokeSessionOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::structs::{RealmId, SessionKind};
-    use aruna_core::types::UserId;
 
     #[test]
     fn revoke_is_idempotent() {

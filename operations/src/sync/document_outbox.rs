@@ -411,13 +411,13 @@ pub async fn restore_outbox_timers(storage: &StorageHandle, task_handle: &TaskHa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision};
     use aruna_core::handle::Handle;
     use aruna_core::structs::{Actor, RealmId};
-    use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
 

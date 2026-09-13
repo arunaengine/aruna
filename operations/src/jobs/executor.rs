@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use aruna_core::id::NodeId;
 use aruna_core::structs::{JobError, JobId, JobPayload, JobProgress, JobResultPayload};
-use aruna_core::types::NodeId;
 use tokio_util::sync::CancellationToken;
 
 use crate::driver::DriverContext;

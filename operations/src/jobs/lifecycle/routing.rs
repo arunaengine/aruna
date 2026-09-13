@@ -2,6 +2,8 @@
 //! single owner: any node that reduced the family can answer, and the alias stays
 //! the stable handle. Byte reads still route to the node that produced them.
 
+use aruna_core::UserId;
+use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobKind, JobStatusView};
 use aruna_core::keyspaces::JOB_FAMILY_ALIAS_KEYSPACE;
 use aruna_core::structs::{
@@ -10,7 +12,6 @@ use aruna_core::structs::{
     LogicalJobState, PhysicalExecutionState, ResultMessage, WorkspaceMode,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{NodeId, UserId};
 
 use std::time::Duration;
 

@@ -1,5 +1,5 @@
+use crate::UserId;
 use crate::errors::ConversionError;
-use crate::types::UserId;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use ulid::Ulid;

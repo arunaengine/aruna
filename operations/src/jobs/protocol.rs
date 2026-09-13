@@ -2,12 +2,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{AuthContext, JobFamilyId, JobId, JobPayload, RealmId};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::UserId;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
 use bytes::Bytes;
 use futures_util::StreamExt;

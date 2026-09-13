@@ -1,10 +1,11 @@
 use aruna_core::USER_KEYSPACE;
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{AuthContext, Permission, RealmId, User};
-use aruna_core::types::{Effects, Key, UserId, Value};
+use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -240,11 +241,11 @@ impl Operation for ListUsersOperation {
 #[cfg(test)]
 mod tests {
     use super::{ListUsersError, ListUsersInput, ListUsersOperation, ListUsersOutput};
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, AuthContext, RealmId, User};
-    use aruna_core::types::UserId;
     use ulid::Ulid;
 
     fn actor(realm_id: RealmId, user_id: UserId) -> Actor {

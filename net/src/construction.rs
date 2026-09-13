@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
+use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::id::NodeId;
 use aruna_core::metrics::NotificationWatchMetrics;
 use aruna_core::structs::{NetworkDiagnosticsState, WatchInterestTable};
-use aruna_core::types::UserId;
 use aruna_storage::StorageHandle;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};

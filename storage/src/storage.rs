@@ -21,6 +21,8 @@ mod shutdown;
 mod telemetry;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_persistence;
 mod transactions;
 mod worker;
 

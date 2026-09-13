@@ -501,6 +501,7 @@ fn overlay_reducer_name(group: &mut Group, reducer_state: &AdminDocumentReducerS
 #[cfg(test)]
 mod tests {
     use super::{UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation};
+    use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::document::{
         DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
@@ -516,7 +517,7 @@ mod tests {
     use aruna_core::storage_entries::reducer_state_key;
     use aruna_core::structs::{Actor, AuthContext, Group, RealmId};
     use aruna_core::task::{TaskEvent, TaskKey};
-    use aruna_core::types::{GroupId, TxnId, UserId};
+    use aruna_core::types::{GroupId, TxnId};
     use byteview::ByteView;
     use ulid::Ulid;
 

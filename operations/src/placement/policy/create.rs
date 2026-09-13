@@ -469,10 +469,10 @@ mod tests {
     use crate::placement::policy::read::{PolicySource, ReadPolicyConfig, ReadPolicyOperation};
     use crate::realm::claim_admin::{ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_core::UserId;
     use aruna_core::handle::Handle;
     use aruna_core::structs::verify_policy_authority;
     use aruna_core::structs::{PlacementSelector, RealmId};
-    use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;

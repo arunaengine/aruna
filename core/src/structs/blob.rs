@@ -1,13 +1,15 @@
+use crate::UserId;
 use crate::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError, credential_aad,
 };
 use crate::errors::{BlobError, ConversionError};
+use crate::id::NodeId;
 use crate::structs::checksum::HASH_BLAKE3;
 use crate::structs::{
     GroupBackendKind, PathRestriction, PlacementPolicyError, PlacementPolicyRef, RealmId,
     SourceMetadata, StorageRoutingRule, VersionSourceBinding,
 };
-use crate::types::{GroupId, NodeId, UserId};
+use crate::types::GroupId;
 use byteview::ByteView;
 use core::fmt;
 use serde::{Deserialize, Serialize};
@@ -1271,12 +1273,12 @@ mod tests {
         key_content_type, object_permission_path,
     };
     use crate::NodeId;
+    use crate::UserId;
     use crate::errors::ConversionError;
     use crate::structs::{
         MAX_POLICY_REFS, PlacementPolicyError, PlacementPolicyRef, PortableSourceDescriptor,
         RealmId, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionSourceBinding,
     };
-    use crate::types::UserId;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::time::SystemTime;

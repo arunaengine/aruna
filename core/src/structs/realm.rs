@@ -1,4 +1,5 @@
 use crate::NodeId;
+use crate::UserId;
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained};
 use crate::errors::ConversionError;
 use crate::reducer::{AdminDocumentReducerState, RevocationIndex};
@@ -13,7 +14,7 @@ use crate::structs::{
 };
 use crate::structs::{Permission, Role};
 use crate::structured_id::{PlacementHandle, StructuredId};
-use crate::types::{GroupId, RoleId, UserId};
+use crate::types::{GroupId, RoleId};
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
@@ -1082,6 +1083,7 @@ fn normalize_replication_factor(replication_factor: u32) -> usize {
 #[cfg(test)]
 mod test {
     use crate::NodeId;
+    use crate::UserId;
     use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use crate::auth::REVOCATION_GRACE_SECS;
     use crate::reducer::AdminDocumentReducerState;
@@ -1094,7 +1096,6 @@ mod test {
         RealmNodeKind, StrategyBinding, SubmissionId, TokenRevocation, default_discovery_config,
         shard_for_subject,
     };
-    use crate::types::UserId;
     use ulid::Ulid;
 
     use super::JobFamilyError;

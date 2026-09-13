@@ -1,9 +1,9 @@
+use aruna_core::UserId;
 use aruna_core::structs::{
     GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
     RealmAuthorizationDocument, ResourceEvent, WatchEvent, WatchSubscription,
     watch_notification_id, watch_path_matches,
 };
-use aruna_core::types::UserId;
 
 pub fn group_admin_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId> {
     let mut ids: Vec<UserId> = auth_doc

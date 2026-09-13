@@ -858,14 +858,15 @@ mod tests {
         AdoptOutcome, ClaimOutcome, JobMutation, adopt_external_attempt, claim_job, complete_job,
         insert_job, list_job_entries, mutate_job, record_attempt_intent, set_cancel_requested,
     };
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::ROCRATE_JOB_STATE_KEYSPACE;
     use aruna_core::structs::{
         AttemptIntent, AuthContext, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
         ImportRoCrateSpec, ImportRoCrateTarget, JobClaim, JobPayload, JobResultPayload, RealmId,
         RoCrateLimits,
     };
-    use aruna_core::types::{NodeId, UserId};
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;

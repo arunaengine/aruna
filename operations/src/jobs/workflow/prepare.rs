@@ -6,8 +6,8 @@ use aruna_core::compute::{
     AttemptRef, NetworkAccess, ResourceRequest, S3Mount, Secret, SecurityContext, StagingMode,
     TaskInput, TaskSpec, UserSpec, WorkspaceBinding,
 };
+use aruna_core::id::NodeId;
 use aruna_core::structs::{ExecutionSpec, InputMode, JobError, JobRecord, WorkspaceMode};
-use aruna_core::types::NodeId;
 
 use super::DEFAULT_WALLTIME;
 use crate::driver::DriverContext;

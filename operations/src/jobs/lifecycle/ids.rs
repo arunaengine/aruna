@@ -2,18 +2,18 @@
 //! The same bytes must produce the same identity on every node, so nothing
 //! locally assigned enters a digest: no job id, origin, timestamp or topology.
 
+use aruna_core::UserId;
 use aruna_core::compute::SessionMount;
 use aruna_core::compute::runtimes::{
     SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_MOUNT_PATH_TAG, SESSION_MOUNT_PREFIX_TAG,
     SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
 };
 use aruna_core::errors::ConversionError;
+use aruna_core::id::NodeId;
 use aruna_core::structs::{
     CapturedInput, EffectiveResources, ExecutionSpec, JobFamilyId, LabelMatch, MAX_SELECTOR_LABELS,
     PlacementPolicyRef, SubmissionId, WorkspaceMode,
 };
-use aruna_core::types::NodeId;
-use aruna_core::types::UserId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;

@@ -1,7 +1,8 @@
 use crate::NodeId;
+use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::realm::RealmId;
-use crate::types::{GroupId, UserId};
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 

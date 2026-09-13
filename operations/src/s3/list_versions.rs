@@ -1363,7 +1363,7 @@ mod serve_tests {
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
 
-    fn node() -> aruna_core::types::NodeId {
+    fn node() -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[9u8; 32]).public()
     }
 

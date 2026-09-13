@@ -361,10 +361,10 @@ pub fn quarantine_row_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UserId;
     use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation};
     use crate::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision};
     use crate::structs::{Actor, PlacementRef, RealmId};
-    use crate::types::UserId;
 
     fn node() -> NodeId {
         NodeId::from_bytes(&[1u8; 32]).unwrap()
