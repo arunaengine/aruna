@@ -404,6 +404,18 @@ pub(crate) async fn s3_exit(handle: Option<&mut tokio::task::JoinHandle<()>>) ->
     }
 }
 
+/// Resolves when the optional session bridge listener exits, and never without
+/// one, so its exit is reported without stopping the node.
+pub(crate) async fn session_s3_exit(handle: Option<&mut tokio::task::JoinHandle<()>>) -> String {
+    match handle {
+        Some(handle) => match handle.await {
+            Ok(()) => "Session S3 server stopped".to_string(),
+            Err(error) => format!("Session S3 server panicked: {error}"),
+        },
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +448,32 @@ mod tests {
         // Without a configured portal the failure select must never fire for it.
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(60), portal_exit(None))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_s3_exit_reports() {
+        // A dead session listener is reported and joined, never a node failure.
+        let mut stopped = tokio::spawn(async {});
+        assert_eq!(
+            session_s3_exit(Some(&mut stopped)).await,
+            "Session S3 server stopped"
+        );
+
+        let mut panicked = tokio::spawn(async { panic!("session s3 panicked") });
+        assert!(
+            session_s3_exit(Some(&mut panicked))
+                .await
+                .contains("panicked")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_s3_exit_pends() {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), session_s3_exit(None))
                 .await
                 .is_err()
         );
