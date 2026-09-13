@@ -183,6 +183,17 @@ fn object_metadata(
     metadata
 }
 
+/// The ETag a reference answers with: the source's when it gave a usable one,
+/// otherwise one derived from the observation, so listings and reads agree and
+/// clients that require an ETag, such as mountpoint, keep working.
+fn reference_etag(metadata: &aruna_core::structs::SourceMetadata) -> ETag {
+    metadata
+        .etag
+        .as_deref()
+        .and_then(|etag| ETag::from_str(etag).ok())
+        .unwrap_or_else(|| ETag::Strong(hex::encode(&metadata.observation_fingerprint()[..16])))
+}
+
 fn etag_condition_value(condition: &ETagCondition) -> String {
     match condition {
         ETagCondition::Any => "*".to_string(),
@@ -905,20 +916,16 @@ impl ArunaS3Service {
                         .get(HASH_MD5)
                         .map(|value| ETag::Strong(hex::encode(value)))
                 })
-                .or_else(|| {
-                    source_metadata.and_then(|metadata| {
-                        metadata
-                            .etag
-                            .as_deref()
-                            .and_then(|etag| ETag::from_str(etag).ok())
-                    })
-                }),
+                .or_else(|| source_metadata.map(reference_etag)),
+            // A reference always answers with a date: clients such as mountpoint
+            // refuse a listing entry without one.
             last_modified: version_created_at
                 .map(Into::into)
                 .or_else(|| location.map(|location| location.created_at.into()))
                 .or_else(|| {
                     source_metadata.and_then(|metadata| metadata.last_modified.map(Into::into))
-                }),
+                })
+                .or_else(|| last_refresh.map(Into::into)),
             metadata: (!response_metadata.is_empty()).then_some(response_metadata),
         }
     }
@@ -2002,11 +2009,7 @@ impl S3 for ArunaS3Service {
                 .hashes
                 .get(HASH_MD5)
                 .map(|value| ETag::Strong(hex::encode(value))),
-            None => result
-                .source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.etag.as_deref())
-                .map(|etag| ETag::Strong(etag.trim_matches('"').to_string())),
+            None => result.source_metadata.as_ref().map(reference_etag),
         };
         let mut copy_object_result = CopyObjectResult {
             e_tag,
@@ -3771,6 +3774,50 @@ mod tests {
         assert_eq!(
             fields.metadata,
             Some(HashMap::from([("user".to_string(), "value".to_string())]))
+        );
+    }
+
+    #[test]
+    fn reference_always_has_etag_and_date() {
+        // Mountpoint refuses a listing entry without ETag or LastModified, so a
+        // reference whose source gave neither still answers both, and the same
+        // way on every surface.
+        let realm_id = RealmId([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let (_dir, service) = parser_service(realm_id, node_id);
+        let refreshed = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let bare = aruna_core::structs::SourceMetadata {
+            content_length: 15,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+        };
+
+        let fields =
+            service.build_object_response_fields(None, None, Some(&bare), Some(refreshed), None);
+        let ETag::Strong(derived) = fields.e_tag.clone().expect("an etag is derived") else {
+            panic!("a derived etag is strong");
+        };
+        assert_eq!(derived.len(), 32);
+        assert_eq!(fields.last_modified, Some(refreshed.into()));
+        assert_eq!(
+            service
+                .build_object_response_fields(None, None, Some(&bare), Some(refreshed), None)
+                .e_tag,
+            fields.e_tag,
+            "the derived etag is stable"
+        );
+
+        let given = aruna_core::structs::SourceMetadata {
+            etag: Some("\"abc-1\"".to_string()),
+            ..bare
+        };
+        assert_eq!(
+            service
+                .build_object_response_fields(None, None, Some(&given), Some(refreshed), None)
+                .e_tag,
+            Some(ETag::Strong("abc-1".to_string()))
         );
     }
 
