@@ -6,7 +6,7 @@
 //! operator settings parsing lives in `crate::settings`. This module holds no
 //! second identity or enrollment path.
 
-use crate::config::PersistedNodeState;
+use crate::identity::PersistedNodeState;
 use aruna_api::server_state::{
     INITIAL_LOCAL_ONBOARDING_SECRET_KEY, load_persisted_state, persist_state,
 };

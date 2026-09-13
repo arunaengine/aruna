@@ -6,7 +6,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
-use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingPhase,
     OnboardingSecret, OnboardingSecretError, OnboardingSyncTicket, issuer_proof_message,
@@ -20,7 +20,10 @@ use aruna_core::structs::{
 use aruna_core::time::unix_timestamp_secs;
 use aruna_net::{DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_config};
 
-use crate::identity::{EnrollmentPlan, IdentityStore, plan_enrollment};
+use crate::identity::{
+    BootOrigin, EnrollmentPlan, IdentityStore, PersistedNodeIdentity, PersistedNodeState,
+    PersistedNodeStatus, persist_node_state, plan_enrollment,
+};
 use crate::settings::{Settings, invalid_config_value, normalize_env_value, validate_relay_urls};
 use aruna_operations::metadata::MetadataSearchStorage;
 use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle, errors::StorageLibError};
@@ -35,7 +38,6 @@ use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::{Signer, SigningKey};
 use iroh::EndpointAddr;
 use iroh::KeyParsingError;
-use serde::{Deserialize, Serialize};
 use std::array::TryFromSliceError;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -45,7 +47,6 @@ use std::str::FromStr;
 use std::time::Duration;
 use thiserror::Error;
 
-const NODE_STATE_RECORD_KEY: &[u8] = b"node_state";
 const ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Config {
@@ -156,90 +157,6 @@ pub enum StartupMode {
     InitializeRealm { realm_description: String },
     JoinRealm { phase: OnboardingPhase },
     Provisioned,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BootOrigin {
-    InitializedRealm,
-    Onboarded,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PersistedNodeStatus {
-    PendingInitialization,
-    PendingOnboarding,
-    Complete,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PersistedNodeIdentity {
-    Management {
-        realm_private_key_pem: String,
-    },
-    Server {
-        issuer_private_key_pem: String,
-        delegation_signature: String,
-    },
-    /// Owner-bound device. The owner is copied from the enrollment answer: a
-    /// device holds no realm state to read it back from before it has joined.
-    User {
-        owner: UserId,
-    },
-}
-
-impl std::fmt::Debug for PersistedNodeIdentity {
-    /// Redacts private key material: this record may be printed in a diagnostic
-    /// path, and keys are not diagnostic output.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Management { .. } => f
-                .debug_struct("Management")
-                .field("realm_private_key_pem", &"<redacted>")
-                .finish(),
-            Self::Server { .. } => f
-                .debug_struct("Server")
-                .field("issuer_private_key_pem", &"<redacted>")
-                .field("delegation_signature", &"<redacted>")
-                .finish(),
-            Self::User { owner } => f.debug_struct("User").field("owner", owner).finish(),
-        }
-    }
-}
-
-impl PersistedNodeIdentity {
-    /// Owner of a device identity; `None` for infrastructure nodes.
-    pub fn owner(&self) -> Option<UserId> {
-        match self {
-            Self::User { owner } => Some(*owner),
-            Self::Management { .. } | Self::Server { .. } => None,
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PersistedNodeState {
-    pub boot_origin: BootOrigin,
-    pub status: PersistedNodeStatus,
-    pub realm_id: RealmId,
-    pub net_secret_key: [u8; 32],
-    pub onboarding_phase: Option<OnboardingPhase>,
-    pub onboarding_sync_ticket: Option<String>,
-    pub identity: PersistedNodeIdentity,
-}
-
-impl std::fmt::Debug for PersistedNodeState {
-    /// Redacts the network secret; the rest of the record is diagnostic.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PersistedNodeState")
-            .field("boot_origin", &self.boot_origin)
-            .field("status", &self.status)
-            .field("realm_id", &self.realm_id)
-            .field("net_secret_key", &"<redacted>")
-            .field("onboarding_phase", &self.onboarding_phase)
-            .field("onboarding_sync_ticket", &self.onboarding_sync_ticket)
-            .field("identity", &self.identity)
-            .finish()
-    }
 }
 
 #[derive(Error, Debug)]
@@ -1254,54 +1171,15 @@ fn policy_relay_method(policy: &RelayPolicy) -> Result<RelayMethod, SetupError> 
     }
 }
 
-pub(crate) async fn load_node_state(
-    storage: &StorageHandle,
-) -> Result<Option<PersistedNodeState>, SetupError> {
-    match storage
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(NODE_STATE_RECORD_KEY),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => Ok(Some(
-            postcard::from_bytes(&bytes).map_err(ConversionError::from)?,
-        )),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(SetupError::UnexpectedStorageEvent(format!("{other:?}"))),
-    }
-}
-
-pub(crate) async fn persist_node_state(
-    storage: &StorageHandle,
-    node_state: &PersistedNodeState,
-) -> Result<(), SetupError> {
-    let value = postcard::to_allocvec(node_state).map_err(ConversionError::from)?;
-    match storage
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(NODE_STATE_RECORD_KEY),
-            value: ByteView::from(value),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(SetupError::UnexpectedStorageEvent(format!("{other:?}"))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, SetupError,
-        decode_bootstrap_response, normalize_root, outermost_roots, persist_node_state,
-        resolve_settings, validate_s3_profile, validate_wipe_roots,
+        SetupError, decode_bootstrap_response, normalize_root, outermost_roots, resolve_settings,
+        validate_s3_profile, validate_wipe_roots,
+    };
+    use crate::identity::{
+        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
+        persist_node_state,
     };
     use crate::settings::read_settings_from;
     use aruna_core::keys::generate_signing_key;

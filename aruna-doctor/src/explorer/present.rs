@@ -2,7 +2,7 @@
 //! prints and the field-by-field projections that keep wire records readable
 //! without exposing unprojected bodies.
 
-use aruna::config::PersistedNodeState;
+use aruna::identity::PersistedNodeState;
 use aruna_core::compute_quota::{ComputeDepartureReport, JobReservationRecord};
 use aruna_core::document::{PendingShardPlacement, shard_topic_id};
 use aruna_core::onboarding::OnboardingSecretRecord;
@@ -675,7 +675,7 @@ impl Serialize for JsonStoredEntry {
 #[cfg(test)]
 mod tests {
     use super::{DecodedField, DecodedValue, EntryOutput, JsonPersistedNodeState};
-    use aruna::config::PersistedNodeState;
+    use aruna::identity::PersistedNodeState;
 
     // The JSON record shape is a CLI contract: the tagged key field and the
     // tagged value field with their fixed fixture values.
@@ -704,13 +704,13 @@ mod tests {
     #[test]
     fn node_state_output_keeps_the_network_secret() {
         let state = PersistedNodeState {
-            boot_origin: aruna::config::BootOrigin::InitializedRealm,
-            status: aruna::config::PersistedNodeStatus::Complete,
+            boot_origin: aruna::identity::BootOrigin::InitializedRealm,
+            status: aruna::identity::PersistedNodeStatus::Complete,
             realm_id: aruna_core::structs::RealmId([3u8; 32]),
             net_secret_key: [7u8; 32],
             onboarding_phase: None,
             onboarding_sync_ticket: None,
-            identity: aruna::config::PersistedNodeIdentity::Management {
+            identity: aruna::identity::PersistedNodeIdentity::Management {
                 realm_private_key_pem: "synthetic-pem".to_string(),
             },
         };

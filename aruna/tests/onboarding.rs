@@ -2,7 +2,8 @@
 #![recursion_limit = "256"]
 mod shared;
 
-use aruna::config::{PersistedNodeIdentity, StartupMode};
+use aruna::config::StartupMode;
+use aruna::identity::PersistedNodeIdentity;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
