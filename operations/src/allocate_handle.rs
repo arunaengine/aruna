@@ -24,8 +24,8 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 use crate::get_realm_config::GetRealmConfigError;
 use crate::mutate_realm_placement::{
-    MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
-    RealmPlacementMutation,
+    MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
+    drive_realm_placement_mutation,
 };
 
 /// Node-local key for the durable allocation cursor. Kept in the non-replicated
@@ -250,11 +250,12 @@ pub async fn allocate_placement_binding(
         allocated_by: Some(allocated.allocated_by),
         allocated_at_ms: Some(allocated.allocated_at_ms),
     };
-    crate::driver::drive(
-        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
+    drive_realm_placement_mutation(
+        MutateRealmPlacementConfig {
             actor,
             mutation: RealmPlacementMutation::AppendPlacementBinding(binding.clone()),
-        }),
+        },
+        None,
         context,
     )
     .await?;
