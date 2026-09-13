@@ -58,7 +58,7 @@ use aruna_operations::s3::complete_multipart_upload::{
     CompleteMultipartUploadResult,
 };
 use aruna_operations::s3::copy_object::{
-    CopyObjectInput as CopyObjectData, CopySourceConditions, copy_object,
+    CopyObjectInput as CopyObjectData, CopyReferences, CopySourceConditions, copy_object,
 };
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::create_multipart_upload::{
@@ -1982,6 +1982,7 @@ impl S3 for ArunaS3Service {
                 }),
                 source_auth_context,
                 restrictions: replication_auth.path_restrictions.clone(),
+                references: CopyReferences::Preserve,
             },
         )
         .await
@@ -1996,21 +1997,30 @@ impl S3 for ArunaS3Service {
         )
         .await;
 
-        let mut copy_object_result = CopyObjectResult {
-            e_tag: result
-                .location
+        let e_tag = match &result.location {
+            Some(location) => location
                 .hashes
                 .get(HASH_MD5)
                 .map(|value| ETag::Strong(hex::encode(value))),
+            None => result
+                .source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.etag.as_deref())
+                .map(|etag| ETag::Strong(etag.trim_matches('"').to_string())),
+        };
+        let mut copy_object_result = CopyObjectResult {
+            e_tag,
             last_modified: Some(result.created_at.into()),
             ..Default::default()
         };
-        copy_object_result.apply_checksums(encode_checksums(
-            &result.location.hashes,
-            ChecksumSelection::AllStored,
-            ChecksumType::from_static(ChecksumType::FULL_OBJECT),
-            None,
-        ));
+        if let Some(location) = &result.location {
+            copy_object_result.apply_checksums(encode_checksums(
+                &location.hashes,
+                ChecksumSelection::AllStored,
+                ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+                None,
+            ));
+        }
 
         Ok(S3Response::new(CopyObjectOutput {
             copy_object_result: Some(copy_object_result),

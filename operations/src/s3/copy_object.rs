@@ -3,13 +3,20 @@ use crate::driver::{
     routing_snapshot,
 };
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::head_object::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
 use crate::s3::purge_fence::ensure_write_allowed;
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::staging::reference::{
+    MaterializeReferenceError, ReferenceWrite, write_reference_version,
+};
 use aruna_core::UserId;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, PathRestriction, RealmId, StagingStrategy, VersionSourceBinding,
+    AuthContext, BackendLocation, PathRestriction, RealmId, SourceMetadata, StagingStrategy,
+    VersionSourceBinding, resolve_backend,
 };
 use aruna_core::types::{GroupId, NodeId};
 use futures_util::StreamExt;
@@ -26,6 +33,17 @@ pub struct CopySourceConditions {
     pub if_none_match: Option<String>,
     pub if_modified_since: Option<SystemTime>,
     pub if_unmodified_since: Option<SystemTime>,
+}
+
+/// What a copy does with a source whose bytes sit behind a reference.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CopyReferences {
+    /// The copy is a reference of its own; no byte moves and the connector is
+    /// not contacted.
+    #[default]
+    Preserve,
+    /// The bytes are pulled and stored as a snapshot.
+    Materialize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,11 +63,16 @@ pub struct CopyObjectInput {
     pub conditions: CopySourceConditions,
     pub metadata: Option<HashMap<String, String>>,
     pub restrictions: Option<Vec<PathRestriction>>,
+    pub references: CopyReferences,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct CopyObjectResultData {
-    pub location: BackendLocation,
+    /// The stored bytes; `None` for a copy that stayed a reference.
+    pub location: Option<BackendLocation>,
+    pub size: u64,
+    /// The observation a kept reference carries.
+    pub source_metadata: Option<SourceMetadata>,
     pub version_id: Ulid,
     pub created_at: SystemTime,
     pub source_version_id: Option<Ulid>,
@@ -66,8 +89,27 @@ pub enum CopyObjectError {
     Routing(#[from] RoutingInputsError),
     #[error(transparent)]
     Gate(#[from] GateContextError),
+    #[error(transparent)]
+    Reference(#[from] MaterializeReferenceError),
     #[error("At least one of the preconditions you specified did not hold.")]
     PreconditionFailed,
+}
+
+/// A description failure reads like the read it stands in for.
+fn head_error(error: HeadObjectError) -> CopyObjectError {
+    CopyObjectError::Get(match error {
+        HeadObjectError::StorageError(error) => GetObjectError::StorageError(error),
+        HeadObjectError::ConversionError(error) => GetObjectError::ConversionError(error),
+        HeadObjectError::NoSuchKey => GetObjectError::NoSuchKey,
+        HeadObjectError::NoSuchVersion => GetObjectError::NoSuchVersion,
+        HeadObjectError::DeleteMarker => GetObjectError::DeleteMarker,
+        HeadObjectError::ResolveReferenceError(error) => {
+            GetObjectError::ResolveReferenceError(error)
+        }
+        HeadObjectError::StagingSourceError(error) => GetObjectError::StagingSourceError(error),
+        HeadObjectError::ManagedCopyError(error) => GetObjectError::ManagedCopyError(error),
+        _ => GetObjectError::GetObjectFailed,
+    })
 }
 
 fn normalize_etag(etag: &str) -> &str {
@@ -146,6 +188,48 @@ pub async fn copy_object_tracked(
     ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
         .await
         .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
+    // The description touches no source, so a reference can be kept without
+    // contacting its connector.
+    let head = drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: input.source_bucket.clone(),
+            key: input.source_key.clone(),
+            version_id: input.source_version_id,
+        }),
+        context,
+    )
+    .await
+    .and_then(|result| result.transpose())
+    .map_err(head_error)?
+    .ok_or(CopyObjectError::Get(GetObjectError::GetObjectFailed))?;
+    let source_last_modified = head
+        .version_created_at
+        .or_else(|| head.location.as_ref().map(|location| location.created_at))
+        .or_else(|| {
+            head.source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.last_modified)
+        });
+    let source_etag = head
+        .location
+        .as_ref()
+        .and_then(|location| location.hashes.get(HASH_MD5))
+        .map(hex::encode)
+        .or_else(|| {
+            head.source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.etag.clone())
+        });
+    evaluate_source_conditions(
+        &input.conditions,
+        source_etag.as_deref(),
+        source_last_modified,
+        true,
+    )?;
+    if head.location.is_none() && input.references == CopyReferences::Preserve {
+        return preserve_reference(context, input, head, source_last_modified).await;
+    }
+
     let source = drive(
         GetObjectOperation::new(GetObjectInput {
             bucket: input.source_bucket,
@@ -162,38 +246,7 @@ pub async fn copy_object_tracked(
     .await
     .and_then(|result| result.transpose())?
     .ok_or(CopyObjectError::Get(GetObjectError::GetObjectFailed))?;
-
     let source_version_id = source.version_id;
-    let source_last_modified = source
-        .version_created_at
-        .or_else(|| source.location.as_ref().map(|location| location.created_at))
-        .or_else(|| {
-            source
-                .source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.last_modified)
-        });
-
-    // Evaluate preconditions before consuming the (lazy) source stream so that a
-    // failed check drops the stream without pulling any bytes.
-    let source_etag = source
-        .location
-        .as_ref()
-        .and_then(|location| location.hashes.get(HASH_MD5))
-        .map(hex::encode)
-        .or_else(|| {
-            source
-                .source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.etag.clone())
-        });
-    evaluate_source_conditions(
-        &input.conditions,
-        source_etag.as_deref(),
-        source_last_modified,
-        true,
-    )?;
-
     let materialized = source.location.is_some();
     let content_length = source.location.as_ref().map(|location| location.blob_size);
     let version_source = if materialized {
@@ -208,16 +261,22 @@ pub async fn copy_object_tracked(
             })
     };
     let metadata = input.metadata.unwrap_or(source.metadata);
-    let body = match progress {
-        Some(pulled) => BackendStream(Box::pin(source.blob.inspect(move |chunk| {
+    let routing = routing_snapshot(context, input.group_id, &input.dest_bucket).await?;
+    // Bytes the destination's backend already holds are adopted, not streamed.
+    let adopt = source.location.clone().filter(|location| {
+        resolve_backend(&routing, &input.dest_bucket, &input.dest_key)
+            .is_ok_and(|resolved| resolved.backend == location.backend)
+    });
+    let body = match (adopt.is_some(), progress) {
+        (true, _) => None,
+        (false, Some(pulled)) => Some(BackendStream(Box::pin(source.blob.inspect(move |chunk| {
             if let Ok(bytes) = chunk {
                 pulled.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             }
-        }))),
-        None => source.blob,
+        })))),
+        (false, None) => Some(source.blob),
     };
 
-    let routing = routing_snapshot(context, input.group_id, &input.dest_bucket).await?;
     let gate = gate_context(context, input.realm_id, now_ms()).await?;
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: input.user_id,
@@ -228,7 +287,7 @@ pub async fn copy_object_tracked(
             bucket: input.dest_bucket,
             key: input.dest_key,
             content_length,
-            body: Some(body),
+            body,
         },
         expected_checksums: Vec::new(),
         checksum_type: None,
@@ -241,6 +300,9 @@ pub async fn copy_object_tracked(
     .with_metadata(metadata)
     .with_inherited_policies(source.source_policies.clone())
     .with_restrictions(input.restrictions.clone());
+    if let Some(location) = adopt {
+        operation = operation.with_adopted(location);
+    }
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
@@ -255,10 +317,54 @@ pub async fn copy_object_tracked(
     let created_at = UNIX_EPOCH + Duration::from_millis(put_result.version_id.timestamp_ms());
 
     Ok(CopyObjectResultData {
-        location: put_result.location,
+        size: put_result.location.blob_size,
+        location: Some(put_result.location),
+        source_metadata: None,
         version_id: put_result.version_id,
         created_at,
         source_version_id,
+        source_last_modified,
+    })
+}
+
+/// Records a reference of the source's binding at the destination, carrying
+/// the source's refs. No byte moves.
+async fn preserve_reference(
+    context: &DriverContext,
+    input: CopyObjectInput,
+    head: HeadObjectResult,
+    source_last_modified: Option<SystemTime>,
+) -> Result<CopyObjectResultData, CopyObjectError> {
+    let (Some(binding), Some(metadata)) = (head.source_binding, head.source_metadata) else {
+        return Err(CopyObjectError::Get(GetObjectError::GetObjectFailed));
+    };
+    let (version_id, _changed) = write_reference_version(
+        context,
+        ReferenceWrite {
+            group_id: input.group_id,
+            user_id: input.user_id,
+            realm_id: input.realm_id,
+            node_id: input.node_id,
+            bucket: input.dest_bucket,
+            key: input.dest_key,
+            expected_bucket: None,
+            version_source: VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                ..binding
+            },
+            metadata: metadata.clone(),
+            inherited_policies: head.source_policies,
+            connector_guard: None,
+        },
+    )
+    .await?;
+    Ok(CopyObjectResultData {
+        location: None,
+        size: metadata.content_length,
+        source_metadata: Some(metadata),
+        version_id,
+        created_at: UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms()),
+        source_version_id: head.version_id,
         source_last_modified,
     })
 }

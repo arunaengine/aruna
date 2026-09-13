@@ -32,7 +32,7 @@ use aruna_operations::s3::complete_multipart_upload::{
     CompleteMultipartUploadError, CompleteMultipartUploadInput, CompleteMultipartUploadOperation,
 };
 use aruna_operations::s3::copy_object::{
-    CopyObjectError, CopyObjectInput, CopySourceConditions, copy_object,
+    CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::create_multipart_upload::{
@@ -246,6 +246,7 @@ async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
                 conditions: CopySourceConditions::default(),
                 metadata: None,
                 restrictions: None,
+                references: CopyReferences::Materialize,
             },
         )
         .await,

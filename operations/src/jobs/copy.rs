@@ -9,7 +9,7 @@ use super::executor::{JobContext, JobRunOutcome};
 use crate::driver::drive;
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::s3::copy_object::{
-    CopyObjectError, CopyObjectInput, CopySourceConditions, copy_object_tracked,
+    CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_tracked,
 };
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::get_object::GetObjectError;
@@ -65,6 +65,7 @@ pub async fn run_copy_job(ctx: &JobContext, spec: &CopyJobSpec) -> JobRunOutcome
             conditions: CopySourceConditions::default(),
             metadata: None,
             restrictions: spec.auth_context.path_restrictions.clone(),
+            references: CopyReferences::Materialize,
         },
         Some(pulled.clone()),
     );
@@ -80,17 +81,17 @@ pub async fn run_copy_job(ctx: &JobContext, spec: &CopyJobSpec) -> JobRunOutcome
     };
     match result {
         Ok(copied) => {
-            ctx.progress.set_current(copied.location.blob_size);
+            ctx.progress.set_current(copied.size);
             JobRunOutcome::Succeeded(JobResultPayload::CopyObject {
                 version_id: copied
                     .source_version_id
                     .map(|version| version.to_string())
                     .unwrap_or_default(),
-                bytes: copied.location.blob_size,
+                bytes: copied.size,
                 blake3: copied
                     .location
-                    .hashes
-                    .get(HASH_BLAKE3)
+                    .as_ref()
+                    .and_then(|location| location.hashes.get(HASH_BLAKE3))
                     .map(hex::encode)
                     .unwrap_or_default(),
             })
@@ -142,9 +143,10 @@ fn copy_error(error: CopyObjectError) -> JobError {
         | CopyObjectError::Put(PutObjectError::StorageError(_))
         | CopyObjectError::Routing(_)
         | CopyObjectError::Gate(_) => JobError::retryable(error.to_string()),
-        CopyObjectError::Get(_) | CopyObjectError::Put(_) | CopyObjectError::PreconditionFailed => {
-            JobError::permanent(error.to_string())
-        }
+        CopyObjectError::Get(_)
+        | CopyObjectError::Put(_)
+        | CopyObjectError::Reference(_)
+        | CopyObjectError::PreconditionFailed => JobError::permanent(error.to_string()),
     }
 }
 
