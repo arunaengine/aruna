@@ -89,6 +89,7 @@ impl NetHandle {
                 inbound_handler: background.inbound_handler,
                 inbound_handler_registered: background.inbound_handler_registered,
                 inbound_tasks: background.inbound_tasks,
+                effect_tasks: background.effect_tasks,
                 eviction_shutdown: background.eviction_shutdown,
                 accept_shutdown: background.accept_shutdown,
                 shutdown: runtime.shutdown,
@@ -410,6 +411,8 @@ struct BackgroundRuntime {
     inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
     inbound_handler_registered: Arc<Notify>,
     inbound_tasks: TaskTracker,
+    /// Accepted effect futures, tracked so shutdown waits for them too.
+    effect_tasks: TaskTracker,
     eviction_shutdown: CancellationToken,
     accept_shutdown: CancellationToken,
     tasks: BackgroundTasks,
@@ -428,6 +431,9 @@ impl BackgroundRuntime {
         let inbound_handler_registered = Arc::new(Notify::new());
 
         let (effect_tx, effect_rx) = mpsc::channel::<EffectHandle>(256);
+        // Accepted effect futures run outside the dispatcher task itself, so
+        // their completion is tracked here and awaited by shutdown.
+        let effect_tasks = TaskTracker::new();
 
         // Inbound handlers and presence refreshes write to storage, so shutdown
         // joins them instead of leaving them detached behind the final sync.
@@ -445,6 +451,7 @@ impl BackgroundRuntime {
         tasks.push(spawn_effect_dispatch(
             effect_rx,
             effect_context,
+            effect_tasks.clone(),
             runtime.shutdown.clone(),
         ));
 
@@ -523,6 +530,7 @@ impl BackgroundRuntime {
             inbound_handler,
             inbound_handler_registered,
             inbound_tasks,
+            effect_tasks,
             eviction_shutdown,
             accept_shutdown,
             tasks,

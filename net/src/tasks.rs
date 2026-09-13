@@ -59,11 +59,15 @@ impl BackgroundTasks {
     }
 }
 
-/// Serializes accepted net effects onto the effect handlers. Each effect runs
-/// in its own task so one slow lookup cannot serialize the rest.
+/// Serializes accepted net effects onto the effect handlers. Each accepted
+/// effect runs in its own tracked task, so the effect completion boundary is
+/// the tracker plus the dispatcher, not the dispatcher alone. A tracker close
+/// only lets `wait` finish; it does not reject later insertions, so callers
+/// must join the dispatcher before treating the tracker as the final boundary.
 pub(crate) fn spawn_effect_dispatch(
     mut effect_rx: mpsc::Receiver<EffectHandle>,
     effect_context: Arc<NetEffectContext>,
+    effect_tasks: TaskTracker,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -73,7 +77,7 @@ pub(crate) fn spawn_effect_dispatch(
                 maybe_effect = effect_rx.recv() => {
                     let Some((effect, response_tx, span)) = maybe_effect else { break };
                     let context = effect_context.clone();
-                    tokio::spawn(async move {
+                    effect_tasks.spawn(async move {
                         let event = effect_handlers::handle_net_effect(&context, effect).await;
                         let _ = response_tx.send(event);
                     }.instrument(span));
@@ -178,4 +182,127 @@ pub(crate) fn spawn_accept_loop(
         )
         .await;
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect};
+    use aruna_core::keys::realm_presence_key;
+    use aruna_core::structs::RealmId;
+    use aruna_storage::FjallStorage;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tracing::Span;
+
+    async fn effect_context(
+        seed: u8,
+    ) -> (crate::NetHandle, Arc<NetEffectContext>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("test storage directory");
+        let storage = FjallStorage::open(directory.path().to_str().expect("test path"))
+            .expect("test storage");
+        let realm_id = RealmId::from_bytes([seed; 32]);
+        let handle = crate::NetHandle::new(
+            crate::NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("test bind address"),
+                secret_key: Some(iroh::SecretKey::from_bytes(&[seed; 32])),
+                realm_id,
+                discovery_method: crate::DiscoveryMethod::None,
+                relay_method: crate::RelayMethod::None,
+                ..crate::NetConfig::default()
+            },
+            storage,
+        )
+        .await
+        .expect("test net handle");
+        let context = Arc::new(NetEffectContext {
+            dht: handle.inner.dht.clone(),
+            document_sync: handle.inner.document_sync.clone(),
+            presence: effect_handlers::RealmPresenceCache::default(),
+            tasks: TaskTracker::new(),
+            shutdown: CancellationToken::new(),
+            refresh_probe: None,
+        });
+        (handle, context, directory)
+    }
+
+    fn presence_effect_for(seed: u8) -> NetEffect {
+        let realm_id = RealmId::from_bytes([seed; 32]);
+        NetEffect::Dht(DhtEffect::Get {
+            key: realm_presence_key(&realm_id),
+            realm_filter: Some(realm_id),
+            options: DhtGetOptions::presence(Duration::from_secs(1), realm_id),
+        })
+    }
+
+    // An accepted effect future is part of the completion boundary: after the
+    // dispatcher joins, the tracker still owns the running child and waits for
+    // it and its response before shutdown returns.
+    #[tokio::test]
+    async fn accepted_effect_cannot_escape_the_completion_boundary() {
+        let (_handle, context, _directory) = effect_context(0x61).await;
+        let effect_tasks = TaskTracker::new();
+        let (effect_tx, effect_rx) = mpsc::channel::<EffectHandle>(8);
+        let shutdown = CancellationToken::new();
+        let dispatcher =
+            spawn_effect_dispatch(effect_rx, context, effect_tasks.clone(), shutdown.clone());
+
+        let (response_tx, response_rx) = oneshot::channel();
+        effect_tx
+            .send((presence_effect_for(0x61), response_tx, Span::current()))
+            .await
+            .expect("the dispatcher is accepting effects");
+        for _ in 0..100 {
+            if !effect_tasks.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !effect_tasks.is_empty(),
+            "the accepted effect must be tracked"
+        );
+
+        // Closing admission and joining the dispatcher is the insertion barrier.
+        shutdown.cancel();
+        dispatcher.await.expect("the dispatcher joins");
+
+        assert!(
+            !effect_tasks.is_empty(),
+            "accepted work must not escape the dispatcher join"
+        );
+        // Admission close only lets `wait` finish; the tracked child is still
+        // awaited to completion by the boundary.
+        effect_tasks.close();
+        tokio::time::timeout(Duration::from_secs(30), effect_tasks.wait())
+            .await
+            .expect("the tracked effect must complete before the boundary");
+        assert!(
+            response_rx.await.is_ok(),
+            "the completed effect must deliver its response"
+        );
+    }
+
+    // After the dispatcher stops, the effect channel is closed: a later send is
+    // rejected instead of being accepted into an unowned task.
+    #[tokio::test]
+    async fn new_effects_are_rejected_after_the_dispatcher_stops() {
+        let (_handle, context, _directory) = effect_context(0x62).await;
+        let (effect_tx, effect_rx) = mpsc::channel::<EffectHandle>(1);
+        let shutdown = CancellationToken::new();
+        let dispatcher =
+            spawn_effect_dispatch(effect_rx, context, TaskTracker::new(), shutdown.clone());
+
+        shutdown.cancel();
+        dispatcher.await.expect("the dispatcher joins");
+
+        let (response_tx, _response_rx) = oneshot::channel();
+        assert!(
+            effect_tx
+                .send((presence_effect_for(0x62), response_tx, Span::current()))
+                .await
+                .is_err(),
+            "the closed admission must reject a new effect"
+        );
+    }
 }
