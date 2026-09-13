@@ -1509,7 +1509,7 @@ fn map_list_error(error: ListStagingSourceError) -> ServerError {
     }
 }
 
-async fn queue_live_version_replication(
+pub(crate) async fn queue_live_version_replication(
     state: &ServerState,
     auth_context: AuthContext,
     bucket: String,

@@ -20,10 +20,11 @@ use aruna_operations::jobs::lifecycle::ids::session_of;
 use aruna_operations::jobs::lifecycle::routing::session_job;
 use aruna_operations::jobs::service::read_session_reason;
 use aruna_operations::jobs::service::submit_copy_job;
-use aruna_operations::s3::copy_object::{CopyObjectInput, CopySourceConditions, copy_object};
+use aruna_operations::s3::copy_object::{
+    CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
+};
 use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use aruna_operations::staging::reference::{MaterializeReferenceInput, stage_reference_blob};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -48,6 +49,7 @@ use crate::routes::jobs::{
     JobStatusResponse, coded_response, job_status_response, map_job_route, map_submit_error,
     parse_job_id,
 };
+use crate::routes::staging::queue_live_version_replication;
 use crate::server_state::ServerState;
 
 /// Envoy idles an upstream at 60 seconds, so the stream keeps itself alive.
@@ -201,6 +203,9 @@ pub struct StagedInputResponse {
     pub blake3: String,
     pub source_node_id: String,
     pub version_id: String,
+    /// The workspace holds a reference; reads stream from the source.
+    #[serde(default)]
+    pub linked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -794,8 +799,7 @@ like cancel, and each source additionally needs the caller's read permission on 
   answered in `pending` with the job id. `GET /compute/jobs/{job_id}` reports its progress in bytes;
   the object appears under `dest_key` once the job succeeded.
 - With `strategy: reference` such a source is not pulled: the workspace gets a reference of its own
-  and reads stream from the connector. It is answered in `staged` with an empty `blake3`, and needs
-  the source bucket in the workspace's group.
+  and reads stream from the source. It is answered in `staged` as `linked` with an empty `blake3`.
 - Nothing is copied into the container: the object lands in the bucket under `dest_key` and the
   kernel reads it from there.
 - Every staged object is recorded in the session inventory and listed in the job report at the end,
@@ -806,8 +810,7 @@ like cancel, and each source additionally needs the caller's read permission on 
 
 **Limits** (refused with 400)
 - At most 64 items per call, and a `dest_key` that is relative and traversal-free.
-- A source on another node: import it into a bucket of this node first.
-- `strategy: reference` for a source in another group: copy it instead."#,
+- A source on another node: import it into a bucket of this node first."#,
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID")),
     request_body(content = SessionInputsRequest, example = json!({
         "items": [{"bucket": "source-data", "key": "input.txt", "dest_key": "data/input.txt"}]
@@ -815,11 +818,11 @@ like cancel, and each source additionally needs the caller's read permission on 
     responses(
         (status = 202, description = "The objects that landed or were queued, with every later failure in `failed`", body = SessionInputsResponse, example = json!({
             "staged": [{"dest_key": "data/input.txt", "bytes": 12, "blake3": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
-                "source_node_id": "node-1", "version_id": "01JJRSVERSION0123456789ABC"}],
+                "source_node_id": "node-1", "version_id": "01JJRSVERSION0123456789ABC", "linked": false}],
             "pending": [{"dest_key": "data/genomes/ref.fna", "job_id": "01JJCPYJB00123456789ABCDEF", "source_node_id": "node-1"}],
             "failed": []
         })),
-        (status = 400, description = "An invalid destination key, too many items, a source on another node, or a reference linked across groups", body = ErrorResponse),
+        (status = 400, description = "An invalid destination key, too many items, or a source on another node", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted, or the caller may not read a source", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
@@ -999,117 +1002,87 @@ async fn stage_one(
     .map_err(|error| ServerError::InternalError(error.to_string()))?
     .ok_or(ServerError::NotFound)?
     .map_err(head_error)?;
-    // Only a reference bound to a connector needs a pull. Anything stored
-    // here deduplicates inline, whatever strategy was asked for.
-    let connector = head
-        .source_binding
-        .as_ref()
-        .filter(|_| head.location.is_none())
-        .and_then(|binding| {
-            Some((
-                binding.connector_id?,
-                binding.descriptor.source_path.clone(),
-            ))
-        });
-    let Some((connector_id, source_path)) = connector else {
-        let realm_config = drive(GetRealmConfigOperation::new(state.get_realm_id()), &context)
-            .await
-            .map_err(|error| ServerError::InternalError(error.to_string()))?;
-        let input = CopyObjectInput {
+    // A stored source deduplicates inline whatever was asked. A reference is
+    // either queued for its pull or kept as a reference, which moves no byte.
+    if head.location.is_none() && item.strategy == SessionInputStrategy::Snapshot {
+        let spec = CopyJobSpec {
+            auth_context: auth.clone(),
+            node_id,
             source_bucket: item.bucket,
             source_key: item.key,
             source_version_id: version_id,
             source_group_id: source_info.group_id,
-            source_auth_context: auth.clone(),
             dest_bucket: bucket.to_string(),
             dest_key: dest_key.to_string(),
-            user_id: auth.user_id,
             group_id: dest_info.group_id,
-            realm_id: state.get_realm_id(),
-            node_id,
-            quota_ceiling: realm_config
-                .quota
-                .effective_group_ceiling(&dest_info.group_id),
-            conditions: CopySourceConditions::default(),
-            metadata: None,
-            restrictions: auth.path_restrictions.clone(),
         };
-        return copy_inline(state, input, dest_key)
+        return queue_copy(state, spec, dest_key)
             .await
-            .map(InputOutcome::Staged);
-    };
-    match item.strategy {
-        SessionInputStrategy::Snapshot => {
-            let spec = CopyJobSpec {
-                auth_context: auth.clone(),
-                node_id,
-                source_bucket: item.bucket,
-                source_key: item.key,
-                source_version_id: version_id,
-                source_group_id: source_info.group_id,
-                dest_bucket: bucket.to_string(),
-                dest_key: dest_key.to_string(),
-                group_id: dest_info.group_id,
-            };
-            queue_copy(state, spec, dest_key)
-                .await
-                .map(InputOutcome::Pending)
-        }
-        SessionInputStrategy::Reference => {
-            // The connector is resolved in the workspace's group, so a
-            // reference from another group has to be copied instead.
-            if source_info.group_id != dest_info.group_id {
-                return Err(ServerError::BadRequestMessage(
-                    "a reference from another group can only be copied".to_string(),
-                ));
-            }
-            let source_version = head.version_id;
-            let result = stage_reference_blob(
-                &context,
-                MaterializeReferenceInput {
-                    group_id: dest_info.group_id,
-                    user_id: auth.user_id,
-                    realm_id: state.get_realm_id(),
-                    node_id,
-                    connector_id,
-                    source_path,
-                    bucket: bucket.to_string(),
-                    key: dest_key.to_string(),
-                    expected_bucket: dest_info,
-                    inherited_policies: head.source_policies,
-                },
-            )
-            .await
-            .map_err(|error| ServerError::BadRequestMessage(error.to_string()))?;
-            Ok(InputOutcome::Staged(StagedInputResponse {
-                dest_key: dest_key.to_string(),
-                bytes: result.source_metadata.content_length,
-                blake3: String::new(),
-                source_node_id: node_id.to_string(),
-                version_id: source_version
-                    .map(|version| version.to_string())
-                    .unwrap_or_default(),
-            }))
-        }
+            .map(InputOutcome::Pending);
     }
+    let realm_config = drive(GetRealmConfigOperation::new(state.get_realm_id()), &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let input = CopyObjectInput {
+        source_bucket: item.bucket,
+        source_key: item.key,
+        source_version_id: version_id,
+        source_group_id: source_info.group_id,
+        source_auth_context: auth.clone(),
+        dest_bucket: bucket.to_string(),
+        dest_key: dest_key.to_string(),
+        user_id: auth.user_id,
+        group_id: dest_info.group_id,
+        realm_id: state.get_realm_id(),
+        node_id,
+        quota_ceiling: realm_config
+            .quota
+            .effective_group_ceiling(&dest_info.group_id),
+        conditions: CopySourceConditions::default(),
+        metadata: None,
+        restrictions: auth.path_restrictions.clone(),
+        references: match item.strategy {
+            SessionInputStrategy::Snapshot => CopyReferences::Materialize,
+            SessionInputStrategy::Reference => CopyReferences::Preserve,
+        },
+    };
+    copy_inline(state, auth, input, dest_key)
+        .await
+        .map(InputOutcome::Staged)
 }
 
-/// Copies one object into the workspace bucket, deduplicating onto its blob.
+/// Copies one object into the workspace bucket: stored bytes deduplicate onto
+/// their blob, a kept reference moves none at all.
 async fn copy_inline(
     state: &ServerState,
+    auth: &AuthContext,
     input: CopyObjectInput,
     dest_key: &str,
 ) -> ServerResult<StagedInputResponse> {
+    let bucket = input.dest_bucket.clone();
     let result = copy_object(&state.get_ctx(), input)
         .await
         .map_err(|error| ServerError::BadRequestMessage(error.to_string()))?;
+    let linked = result.location.is_none();
+    if linked {
+        // A kept reference writes no replication obligation of its own.
+        queue_live_version_replication(
+            state,
+            auth.clone(),
+            bucket,
+            dest_key.to_string(),
+            result.version_id,
+            false,
+        )
+        .await;
+    }
     Ok(StagedInputResponse {
         dest_key: dest_key.to_string(),
-        bytes: result.location.blob_size,
+        bytes: result.size,
         blake3: result
             .location
-            .hashes
-            .get(HASH_BLAKE3)
+            .as_ref()
+            .and_then(|location| location.hashes.get(HASH_BLAKE3))
             .map(hex::encode)
             .unwrap_or_default(),
         source_node_id: state.get_node_id().to_string(),
@@ -1117,6 +1090,7 @@ async fn copy_inline(
             .source_version_id
             .map(|version| version.to_string())
             .unwrap_or_default(),
+        linked,
     })
 }
 
