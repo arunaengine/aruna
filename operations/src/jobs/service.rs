@@ -3,7 +3,7 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    ArtifactRef, AuthContext, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
+    ArtifactRef, AuthContext, CopyJobSpec, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
     FIRST_GRANTABLE_HANDLE, ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord,
     JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, MintPersistentIdSpec, OutputDestination,
     Permission, RealmId, RunCrateStatus, SessionReportDetail, SessionReportRow,
@@ -259,6 +259,33 @@ pub async fn submit_staging_job(
         context,
         SubmitJobSpec {
             payload: JobPayload::Staging(spec),
+            created_by,
+            owner_node_id,
+            dedup_key: None,
+            now_ms: unix_timestamp_millis(),
+            retention_ms,
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+            active_cap: None,
+        },
+        job_id,
+    )
+    .await
+}
+
+/// Queues one background object copy on this node for the caller in `spec`.
+pub async fn submit_copy_job(
+    context: &DriverContext,
+    spec: CopyJobSpec,
+    owner_node_id: NodeId,
+    retention_ms: u64,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let created_by = spec.auth_context.user_id;
+    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id, None).await?;
+    submit_local_job(
+        context,
+        SubmitJobSpec {
+            payload: JobPayload::CopyObject(spec),
             created_by,
             owner_node_id,
             dedup_key: None,

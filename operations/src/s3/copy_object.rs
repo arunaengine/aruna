@@ -6,12 +6,16 @@ use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::purge_fence::ensure_write_allowed;
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use aruna_core::UserId;
+use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
     AuthContext, BackendLocation, PathRestriction, RealmId, StagingStrategy, VersionSourceBinding,
 };
 use aruna_core::types::{GroupId, NodeId};
+use futures_util::StreamExt;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
@@ -129,6 +133,16 @@ pub async fn copy_object(
     context: &DriverContext,
     input: CopyObjectInput,
 ) -> Result<CopyObjectResultData, CopyObjectError> {
+    copy_object_tracked(context, input, None).await
+}
+
+/// `copy_object` with the bytes pulled so far published on `progress`, so a
+/// job can report a long source read while it runs.
+pub async fn copy_object_tracked(
+    context: &DriverContext,
+    input: CopyObjectInput,
+    progress: Option<Arc<AtomicU64>>,
+) -> Result<CopyObjectResultData, CopyObjectError> {
     ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
         .await
         .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
@@ -194,6 +208,14 @@ pub async fn copy_object(
             })
     };
     let metadata = input.metadata.unwrap_or(source.metadata);
+    let body = match progress {
+        Some(pulled) => BackendStream(Box::pin(source.blob.inspect(move |chunk| {
+            if let Ok(bytes) = chunk {
+                pulled.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            }
+        }))),
+        None => source.blob,
+    };
 
     let routing = routing_snapshot(context, input.group_id, &input.dest_bucket).await?;
     let gate = gate_context(context, input.realm_id, now_ms()).await?;
@@ -206,7 +228,7 @@ pub async fn copy_object(
             bucket: input.dest_bucket,
             key: input.dest_key,
             content_length,
-            body: Some(source.blob),
+            body: Some(body),
         },
         expected_checksums: Vec::new(),
         checksum_type: None,
@@ -242,7 +264,7 @@ pub async fn copy_object(
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
     use crate::placement_policy::fixtures::{seed_gate, subject};
     use crate::s3::get_object::{GetObjectOperation, MAX_AUTO_ADVANCES};
@@ -278,7 +300,7 @@ mod test {
         }
     }
 
-    async fn full_context() -> (TempDir, DriverContext) {
+    pub(crate) async fn full_context() -> (TempDir, DriverContext) {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let blob_root = format!("{temp_root}/blobstore");
@@ -314,7 +336,9 @@ mod test {
         (temp_handle, context)
     }
 
-    async fn spawn_reference_server(body: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+    pub(crate) async fn spawn_reference_server(
+        body: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let app = Router::new().route(
             "/folder/file.txt",
             get(
@@ -358,7 +382,12 @@ mod test {
         }
     }
 
-    async fn write_version(context: &DriverContext, bucket: &str, key: &str, version: BlobVersion) {
+    pub(crate) async fn write_version(
+        context: &DriverContext,
+        bucket: &str,
+        key: &str,
+        version: BlobVersion,
+    ) {
         let version_id = Ulid::generate();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
             .storage_handle
@@ -436,7 +465,7 @@ mod test {
         aruna_core::structs::VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
-    async fn seed_bucket(
+    pub(crate) async fn seed_bucket(
         context: &DriverContext,
         bucket: &str,
         group_id: GroupId,

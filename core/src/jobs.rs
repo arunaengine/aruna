@@ -26,6 +26,7 @@ pub enum JobKind {
     Harvest,
     MintPersistentId,
     StoragePurge,
+    CopyObject,
 }
 
 impl JobKind {
@@ -41,6 +42,7 @@ impl JobKind {
             Self::Harvest => "harvest",
             Self::MintPersistentId => "mint_persistent_id",
             Self::StoragePurge => "storage_purge",
+            Self::CopyObject => "copy_object",
         }
     }
 
@@ -66,6 +68,7 @@ impl From<&JobPayload> for JobKind {
             JobPayload::Harvest(_) => Self::Harvest,
             JobPayload::MintPersistentId(_) => Self::MintPersistentId,
             JobPayload::StoragePurge(_) => Self::StoragePurge,
+            JobPayload::CopyObject(_) => Self::CopyObject,
         }
     }
 }
