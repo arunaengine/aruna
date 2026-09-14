@@ -351,6 +351,16 @@ pub struct WorkspaceBinding {
     pub region: String,
 }
 
+/// The slice of the workspace bucket a session sees as a folder below its
+/// working directory, served by the backend's S3 mount driver.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMount {
+    /// Key prefix inside the bucket, empty for the whole bucket, else `/` terminated.
+    pub prefix: String,
+    /// Absolute container path the prefix appears at.
+    pub path: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct S3Mount {
     pub bucket: String,
@@ -537,6 +547,8 @@ pub struct TaskSpec {
     /// The task is an interactive session: it stays running until the node ends
     /// it, and the node opens a byte channel to the helper inside it.
     pub session: bool,
+    /// Set for a session only: where its workspace bucket is mounted.
+    pub session_mount: Option<SessionMount>,
 }
 
 impl TaskSpec {
@@ -558,6 +570,7 @@ impl TaskSpec {
             security: SecurityContext::default(),
             log_limits: LogLimits::default(),
             session: false,
+            session_mount: None,
         }
     }
 

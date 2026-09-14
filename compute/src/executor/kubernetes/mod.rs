@@ -51,8 +51,8 @@ mod manifest;
 use manifest::{
     HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, data_pv_manifest, data_pvc_manifest,
     helper_pod, job_manifest, marker_manifest, marker_name, mount_buckets, mount_pv_manifest,
-    mount_pvc_manifest, mounts_data, needs_workspace, network_policies, policy_manifests,
-    pvc_manifest, secret_manifest, secret_name, workspace_name,
+    mount_pvc_manifest, needs_workspace, network_policies, policy_manifests, pvc_manifest,
+    secret_manifest, secret_name, session_mount, workspace_name,
 };
 
 pub const EPOCH_ANNOTATION: &str = "aruna-engine.org/attempt-epoch";
@@ -222,10 +222,11 @@ impl KubernetesBackend {
         context: &FenceContext,
         spec: &TaskSpec,
     ) -> Result<(), BackendError> {
-        let Some(workspace) = spec.workspace.as_ref() else {
+        let Some((workspace, mount)) = spec.workspace.as_ref().zip(spec.session_mount.as_ref())
+        else {
             return Ok(());
         };
-        let pv = data_pv_manifest(context, &self.config, &workspace.bucket_name)?;
+        let pv = data_pv_manifest(context, &self.config, &workspace.bucket_name, &mount.prefix)?;
         let pvc = data_pvc_manifest(context, &self.config)?;
         self.ensure_volume(context, &workspace.bucket_name, pv, pvc)
             .await
@@ -1022,7 +1023,7 @@ impl ExecutorBackend for KubernetesBackend {
         self.remove_marker(context).await?;
         if spec.session {
             self.ensure_secret(context, spec).await?;
-            if mounts_data(spec, &self.config) {
+            if session_mount(spec, &self.config).is_some() {
                 self.ensure_data(context, spec).await?;
             }
         }
@@ -2607,7 +2608,7 @@ mod tests {
 
     #[tokio::test]
     async fn creates_data_volume() {
-        // A session with a workspace gets its data mount PV and PVC.
+        // A session with a workspace and a recorded mount gets its data PV and PVC.
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = seen.clone();
         let client = fake_client(move |method, path| {
@@ -2643,6 +2644,13 @@ mod tests {
             s3_endpoint: "https://s3.example".to_string(),
             bucket_name: "workspace-bucket".to_string(),
             region: String::new(),
+        });
+        backend.ensure_data(&context(), &spec).await.unwrap();
+        assert!(seen.lock().expect("read requests").is_empty());
+
+        spec.session_mount = Some(aruna_core::compute::SessionMount {
+            prefix: "data/".to_string(),
+            path: "/work/data".to_string(),
         });
         backend.ensure_data(&context(), &spec).await.unwrap();
         assert_eq!(

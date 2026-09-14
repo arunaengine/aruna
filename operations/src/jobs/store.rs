@@ -28,7 +28,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::lifecycle::ids::session_of;
-use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_MUTATE_MAX_ATTEMPTS};
+use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_MUTATE_MAX_ATTEMPTS, JOB_PRUNE_SCAN_PAGE_SIZE};
 use crate::queue_backoff::queue_retry_after_ms;
 
 pub(super) type JobWrites = Vec<(KeySpace, Key, Value)>;
@@ -309,6 +309,103 @@ where
     Err(JobMutationError::Storage(
         "job mutation exhausted conflict retries".to_string(),
     ))
+}
+
+/// What deleting a run from this node's lists found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RunDelete {
+    Deleted,
+    /// No run of this caller is listed on this node.
+    NotFound,
+    /// The run has not finished, or its container cleanup is still queued.
+    Unfinished,
+}
+
+/// Removes a finished run of `user_id` from this node in one transaction: its
+/// row, its list index and every local row pruning removes. The replicated
+/// family records stay, so its history remains readable by id.
+pub async fn delete_finished_run(
+    storage: &StorageHandle,
+    user_id: UserId,
+    job_id: JobId,
+) -> Result<RunDelete, JobMutationError> {
+    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+        let txn_id = start_write_txn(storage)
+            .await
+            .map_err(JobMutationError::Storage)?;
+        match Box::pin(run_delete_txn(storage, txn_id, user_id, job_id)).await {
+            Ok(RunDelete::Deleted) => match commit_txn(storage, txn_id).await {
+                CommitResult::Committed => return Ok(RunDelete::Deleted),
+                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
+                }
+                CommitResult::Conflict => break,
+                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            },
+            outcome => {
+                abort_txn(storage, txn_id).await;
+                return outcome;
+            }
+        }
+    }
+    Err(JobMutationError::Storage(
+        "run delete exhausted conflict retries".to_string(),
+    ))
+}
+
+async fn run_delete_txn(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    user_id: UserId,
+    job_id: JobId,
+) -> Result<RunDelete, JobMutationError> {
+    let Some(record) = read_job_record(storage, job_id, Some(txn_id))
+        .await
+        .map_err(JobMutationError::Storage)?
+    else {
+        return Ok(RunDelete::NotFound);
+    };
+    if record.created_by != user_id || !matches!(record.payload, JobPayload::Execution(_)) {
+        return Ok(RunDelete::NotFound);
+    }
+    if !record.state.is_terminal() {
+        return Ok(RunDelete::Unfinished);
+    }
+    // A queued cleanup still needs this row to fence and remove the container.
+    if read_job_record(storage, cleanup_job_id(job_id), Some(txn_id))
+        .await
+        .map_err(JobMutationError::Storage)?
+        .is_some_and(|cleanup| !cleanup.state.is_terminal())
+    {
+        return Ok(RunDelete::Unfinished);
+    }
+    let mut deletes = job_prune_delete_entries(&record);
+    let mut start_after = None;
+    loop {
+        let (values, next) = iter_prefix_page(
+            storage,
+            JOB_ENTRY_KEYSPACE,
+            Some(job_entry_prefix(job_id)),
+            start_after.take(),
+            JOB_PRUNE_SCAN_PAGE_SIZE,
+            Some(txn_id),
+        )
+        .await
+        .map_err(JobMutationError::Storage)?;
+        deletes.extend(
+            values
+                .into_iter()
+                .map(|(key, _)| (JOB_ENTRY_KEYSPACE.to_string(), key)),
+        );
+        match next {
+            Some(next) => start_after = Some(next),
+            None => break,
+        }
+    }
+    batch_delete(storage, deletes, Some(txn_id))
+        .await
+        .map_err(JobMutationError::Storage)?;
+    Ok(RunDelete::Deleted)
 }
 
 /// Re-checks a mutated record against the attempt control read in the same
@@ -731,7 +828,11 @@ async fn insert_crate_obligation(
     txn_id: TxnId,
     record: &JobRecord,
 ) -> Result<(), JobMutationError> {
-    if !matches!(&record.payload, JobPayload::Execution(_)) {
+    let JobPayload::Execution(spec) = &record.payload else {
+        return Ok(());
+    };
+    // A stopped notebook session keeps its report; it is no run to describe.
+    if session_of(spec).is_some() {
         return Ok(());
     }
     let now_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
@@ -3811,6 +3912,199 @@ mod tests {
         );
         assert_eq!(child.state, JobState::Queued);
         assert!(child.payload.is_internal());
+    }
+
+    #[tokio::test]
+    async fn run_delete_rules() {
+        // Only the caller's finished run is removed, with its list entry; a
+        // running run, a foreign one and a system job stay untouched.
+        let (_dir, storage) = temp_storage();
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let other = UserId::new(Ulid::from_bytes([4u8; 16]), RealmId([1u8; 32]));
+        let run = |seed: u8, state: JobState| {
+            let mut record = JobRecord::new(
+                JobId::from_bytes([seed; 16]),
+                JobPayload::Execution(ExecutionSpec {
+                    group_id: Ulid::from_bytes([3u8; 16]),
+                    name: None,
+                    description: None,
+                    tags: Default::default(),
+                    image: "alpine:3".to_string(),
+                    entrypoint: None,
+                    command: Vec::new(),
+                    workdir: None,
+                    env: Default::default(),
+                    resources: ComputeResources::default(),
+                    executor_constraint: None,
+                    inputs: Vec::new(),
+                    file_outputs: Vec::new(),
+                    workspace_outputs: Vec::new(),
+                    output_prefixes: Vec::new(),
+                    collision_policy: Default::default(),
+                }),
+                owner,
+                node_id(7),
+                1_000 + u64::from(seed),
+                1_000 + u64::from(seed),
+                None,
+            );
+            record.state = state;
+            record.finished_at_ms = state.is_terminal().then_some(2_000);
+            record
+        };
+        let finished = run(0xE1, JobState::Failed);
+        let running = run(0xE2, JobState::Running);
+        let mut probe = finished.clone();
+        probe.job_id = JobId::from_bytes([0xE3; 16]);
+        probe.payload = JobPayload::Probe {
+            steps: 1,
+            step_sleep_ms: 0,
+            fail_at: None,
+            panic_at: None,
+            cleanup_marker: None,
+        };
+        for record in [&finished, &running, &probe] {
+            insert_job(&storage, record).await.unwrap();
+        }
+        batch_write(
+            &storage,
+            vec![(
+                JOB_ENTRY_KEYSPACE.to_string(),
+                job_entry_key(finished.job_id, b"row"),
+                empty_value(),
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let delete = |user, job| delete_finished_run(&storage, user, job);
+        assert_eq!(
+            delete(other, finished.job_id).await.unwrap(),
+            RunDelete::NotFound
+        );
+        assert_eq!(
+            delete(owner, running.job_id).await.unwrap(),
+            RunDelete::Unfinished
+        );
+        assert_eq!(
+            delete(owner, probe.job_id).await.unwrap(),
+            RunDelete::NotFound
+        );
+        assert_eq!(
+            delete(owner, finished.job_id).await.unwrap(),
+            RunDelete::Deleted
+        );
+        assert_eq!(
+            delete(owner, finished.job_id).await.unwrap(),
+            RunDelete::NotFound
+        );
+
+        assert!(
+            read_job_record(&storage, finished.job_id, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (listed, _) = list_jobs_for_user(&storage, owner, None, 10, |_| true)
+            .await
+            .unwrap();
+        let ids: Vec<JobId> = listed.iter().map(|record| record.job_id).collect();
+        assert!(!ids.contains(&finished.job_id));
+        assert!(ids.contains(&running.job_id));
+        let (entries, _) = iter_prefix_page(
+            &storage,
+            JOB_ENTRY_KEYSPACE,
+            Some(job_entry_prefix(finished.job_id)),
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(entries.is_empty(), "report rows go with the run");
+    }
+
+    #[tokio::test]
+    async fn session_skips_crate() {
+        // A stopped notebook session writes no run dataset, while an ordinary
+        // run of the same shape still queues the crate job.
+        use aruna_core::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
+        let (_dir, storage) = temp_storage();
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        for (seed, session) in [(0xD1u8, true), (0xD3u8, false)] {
+            let job_id = JobId::from_bytes([seed; 16]);
+            let token = Ulid::from_bytes([seed + 1; 16]);
+            let mut tags = std::collections::BTreeMap::new();
+            if session {
+                tags.insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+            }
+            let mut record = JobRecord::new(
+                job_id,
+                JobPayload::Execution(ExecutionSpec {
+                    group_id: Ulid::from_bytes([3u8; 16]),
+                    name: None,
+                    description: None,
+                    tags,
+                    image: "session:latest".to_string(),
+                    entrypoint: None,
+                    command: Vec::new(),
+                    workdir: None,
+                    env: Default::default(),
+                    resources: ComputeResources::default(),
+                    executor_constraint: None,
+                    inputs: Vec::new(),
+                    file_outputs: Vec::new(),
+                    workspace_outputs: Vec::new(),
+                    output_prefixes: Vec::new(),
+                    collision_policy: Default::default(),
+                }),
+                owner,
+                node_id(7),
+                1_000,
+                1_000,
+                None,
+            );
+            record.state = JobState::Running;
+            record.claim = Some(JobClaim {
+                holder_node_id: node_id(7),
+                claim_token: token,
+                lease_expires_at_ms: 5_000,
+            });
+            insert_job(&storage, &record).await.unwrap();
+            complete_job(
+                &storage,
+                job_id,
+                token,
+                JobResultPayload::Execution {
+                    exit_code: Some(0),
+                    workspace_bucket: Some("ws-test".to_string()),
+                    outputs: Vec::new(),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    output_digest: None,
+                },
+                JobProgress::new("phases"),
+                6_000,
+            )
+            .await
+            .unwrap();
+
+            let crate_job = read_job_record(&storage, crate_job_id(job_id), None)
+                .await
+                .unwrap();
+            let status = read_run_crate_status(&storage, job_id).await.unwrap();
+            assert_eq!(
+                crate_job.is_none(),
+                session,
+                "crate job for session={session}"
+            );
+            assert_eq!(
+                status.is_none(),
+                session,
+                "crate status for session={session}"
+            );
+        }
     }
 
     #[tokio::test]

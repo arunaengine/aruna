@@ -210,6 +210,13 @@ Python notebooks accept `requirements.txt` for pip packages or `environment.yml`
 environment shared by the Python kernel and Bash cells. Use **Dependencies** in the notebook
 to save the definition and restart the kernel to install changes.
 
+On Kubernetes with `ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER` set, a session sees a folder of its
+workspace bucket below its working directory: `data/` at `/work/data` unless the submission's
+`session_mount` names another bucket folder (an empty prefix is the whole bucket) and kernel
+folder. Files written there land in the bucket and objects put into the bucket show up there.
+The mount follows S3 semantics: files are written in one go, and there is no append or rename.
+Without the driver, or on Docker and Apptainer, a session reaches its bucket over S3 only.
+
 ## Durability Configuration
 
 `ARUNA_FJALL_PERSIST_MODE` controls the Fjall persist mode used by Aruna's local storage engine and document-sync metadata state.

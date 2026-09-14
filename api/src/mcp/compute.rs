@@ -262,6 +262,14 @@ pub struct StartSessionInput {
     /// RAM reserved in bytes. Defaults to 4 GB (4,000,000,000 bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ram_bytes: Option<u64>,
+    /// Folder of the bucket the kernel sees as a folder, for example
+    /// `raw/2024`; an empty string mounts the whole bucket. Defaults to `data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_prefix: Option<String>,
+    /// Absolute folder below `/work` that bucket folder appears at, for example
+    /// `/work/raw`. Defaults to `/work/data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -352,7 +360,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Start an interactive notebook session as a job and return its job_id. The session stays running until end_session, the idle wait passes, the walltime is reached, or it is cancelled. It runs inside an existing bucket of the group, which is where the notebook and every result belong; the container's scratch directory is not kept. Call list_session_runtimes first for the runtime id. Then run_cell to execute code and read_cell_outputs for what it produced.",
+        description = "Start an interactive notebook session as a job and return its job_id. The session stays running until end_session, the idle wait passes, the walltime is reached, or it is cancelled. It runs inside an existing bucket of the group, which is where the notebook and every result belong; the container's scratch directory is not kept. On a backend with an S3 mount driver the bucket folder mount_prefix (default data, an empty string for the whole bucket) appears as the kernel folder mount_path (default /work/data), so files written there land in the bucket. Call list_session_runtimes first for the runtime id. Then run_cell to execute code and read_cell_outputs for what it produced.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn start_session(
@@ -371,6 +379,12 @@ impl McpServer {
             image: String::new(),
             runtime: Some(input.runtime),
             session_idle_after_ms: input.idle_after_ms,
+            session_mount: (input.mount_prefix.is_some() || input.mount_path.is_some()).then_some(
+                crate::routes::jobs::SessionMountRequest {
+                    prefix: input.mount_prefix,
+                    path: input.mount_path,
+                },
+            ),
             entrypoint: None,
             command: Vec::new(),
             env: BTreeMap::new(),
@@ -1120,6 +1134,7 @@ fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallT
             image: runtime.image.to_string(),
             runtime: None,
             session_idle_after_ms: None,
+            session_mount: None,
             entrypoint: None,
             command,
             env,

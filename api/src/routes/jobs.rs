@@ -3,11 +3,12 @@ use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use aruna_core::compute::normalize_container_path;
 use aruna_core::compute::runtimes::{
-    SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_RUNTIME_TAG, SESSION_RUNTIMES, SESSION_TAG,
-    SESSION_TAG_NOTEBOOK, session_runtime,
+    DEFAULT_SESSION_MOUNT_DIR, DEFAULT_SESSION_MOUNT_PREFIX, SESSION_EXPIRY_TAG, SESSION_IDLE_TAG,
+    SESSION_MOUNT_PATH_TAG, SESSION_MOUNT_PREFIX_TAG, SESSION_RUNTIME_TAG, SESSION_RUNTIMES,
+    SESSION_TAG, SESSION_TAG_NOTEBOOK, session_runtime,
 };
+use aruna_core::compute::{SessionMount, normalize_container_path};
 use aruna_core::scheduling::MAX_PLAN_INPUTS;
 use aruna_core::structs::{
     AuthContext, CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec,
@@ -23,9 +24,10 @@ use aruna_operations::device::compute::{
 use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_external_job};
 use aruna_operations::jobs::service::{
     ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
-    cancel_job_routed, list_owned_jobs, read_artifact_routed, read_job_routed, read_owned_job,
-    read_report_routed,
+    cancel_job_routed, delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed,
+    read_owned_job, read_report_routed,
 };
+use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::jobs::{JOB_REPORT_MAX_ROWS, JobRouteError};
 use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -72,7 +74,7 @@ pub struct JobsApiDoc;
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(JobsApiDoc::openapi())
         .routes(routes!(list_jobs, submit_job))
-        .routes(routes!(get_job))
+        .routes(routes!(get_job, delete_job))
         .routes(routes!(cancel_job))
         .routes(routes!(get_job_report))
         .routes(routes!(get_job_artifact, head_job_artifact))
@@ -171,6 +173,21 @@ pub struct WorkspaceRequest {
     pub bucket: Option<String>,
 }
 
+/// The slice of the workspace bucket a session sees as a folder. Everything
+/// written below that folder lands in the bucket and every object under the
+/// prefix shows up in it, when the executing backend has an S3 mount driver.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, rmcp::schemars::JsonSchema)]
+pub struct SessionMountRequest {
+    /// Folder in the bucket, for example `raw/2024`; an empty string mounts the
+    /// whole bucket. Omitted, the `data/` folder is mounted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Absolute folder below the working directory the prefix appears at, for
+    /// example `/work/raw`. Omitted, it is `data` below the working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
 /// Where a submission runs. `local` is served by a user device only, and runs
 /// the job on that machine for its owner.
 #[derive(
@@ -218,6 +235,10 @@ pub struct SubmitExecutionRequest {
     /// request never extends the session. Refused outside a session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_idle_after_ms: Option<u64>,
+    /// Which part of the workspace bucket a session mounts, and where. Refused
+    /// outside a session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_mount: Option<SessionMountRequest>,
     /// Replaces the image ENTRYPOINT. Omit to keep the image default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<Vec<String>>,
@@ -538,6 +559,10 @@ pub struct JobStatusResponse {
     /// automatic attempt runs here and the outcome is not a proven failure.
     #[serde(default)]
     pub locally_exhausted: bool,
+    /// Present for a notebook session: the catalog runtime it runs, for example
+    /// `python-notebook`. Absent for every other job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_runtime: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_crate: Option<serde_json::Value>,
     /// Present only for a distributed external job, whose truth is the
@@ -586,6 +611,7 @@ pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
         workspace_bucket: job.workspace_bucket.clone(),
         workspace_mode: job.workspace_mode.name().to_string(),
         locally_exhausted: job.locally_exhausted,
+        session_runtime: job.session_runtime.clone(),
         run_crate: None,
         family: None,
     }
@@ -838,9 +864,12 @@ fn session_request(
     bearer_expires_at_ms: Option<u64>,
 ) -> ServerResult<()> {
     let Some(value) = request.tags.get(SESSION_TAG) else {
-        if request.runtime.is_some() || request.session_idle_after_ms.is_some() {
+        if request.runtime.is_some()
+            || request.session_idle_after_ms.is_some()
+            || request.session_mount.is_some()
+        {
             return Err(ServerError::BadRequestMessage(format!(
-                "runtime and session_idle_after_ms need the tag {SESSION_TAG}"
+                "runtime, session_idle_after_ms and session_mount need the tag {SESSION_TAG}"
             )));
         }
         return Ok(());
@@ -850,12 +879,18 @@ fn session_request(
             "tag {SESSION_TAG} accepts only the value {SESSION_TAG_NOTEBOOK}"
         )));
     }
-    if [SESSION_RUNTIME_TAG, SESSION_IDLE_TAG, SESSION_EXPIRY_TAG]
-        .iter()
-        .any(|tag| request.tags.contains_key(*tag))
+    if [
+        SESSION_RUNTIME_TAG,
+        SESSION_IDLE_TAG,
+        SESSION_EXPIRY_TAG,
+        SESSION_MOUNT_PREFIX_TAG,
+        SESSION_MOUNT_PATH_TAG,
+    ]
+    .iter()
+    .any(|tag| request.tags.contains_key(*tag))
     {
         return Err(ServerError::BadRequestMessage(
-            "the session runtime, idle and expiry tags are set by the node".to_string(),
+            "the session runtime, idle, expiry and mount tags are set by the node".to_string(),
         ));
     }
     let existing = request
@@ -896,6 +931,16 @@ fn session_request(
     if request.workdir.is_none() {
         request.workdir = Some(SESSION_WORKDIR.to_string());
     }
+    let mount = mount_request(
+        request.session_mount.as_ref(),
+        request.workdir.as_deref().unwrap_or(SESSION_WORKDIR),
+    )?;
+    request
+        .tags
+        .insert(SESSION_MOUNT_PREFIX_TAG.to_string(), mount.prefix);
+    request
+        .tags
+        .insert(SESSION_MOUNT_PATH_TAG.to_string(), mount.path);
     request.cpu_cores.get_or_insert(2);
     request.ram_bytes.get_or_insert(4_000_000_000);
     request.image = runtime.image.to_string();
@@ -919,6 +964,61 @@ fn session_request(
             .insert(SESSION_EXPIRY_TAG.to_string(), expires_at_ms.to_string());
     }
     Ok(())
+}
+
+/// The bucket slice a session mounts and the folder it appears at. An omitted
+/// block mounts `data/` at `<workdir>/data`. The folder must lie below the
+/// working directory and clear of the helper's `.aruna` directory.
+fn mount_request(mount: Option<&SessionMountRequest>, workdir: &str) -> ServerResult<SessionMount> {
+    let workdir = normalize_container_path(workdir).map_err(ServerError::BadRequestMessage)?;
+    let prefix = match mount
+        .and_then(|mount| mount.prefix.as_deref())
+        .map(str::trim)
+    {
+        None => DEFAULT_SESSION_MOUNT_PREFIX.to_string(),
+        Some("") => String::new(),
+        Some(prefix) => {
+            let folder = prefix.trim_end_matches('/');
+            if folder.starts_with('/')
+                || folder
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                return Err(ServerError::BadRequestMessage(
+                    "session_mount.prefix must be a relative, traversal-free bucket folder"
+                        .to_string(),
+                ));
+            }
+            format!("{folder}/")
+        }
+    };
+    let path = match mount.and_then(|mount| mount.path.as_deref()).map(str::trim) {
+        None | Some("") => workdir.join(DEFAULT_SESSION_MOUNT_DIR),
+        Some(path) => normalize_container_path(path).map_err(ServerError::BadRequestMessage)?,
+    };
+    let below = path
+        .strip_prefix(&workdir)
+        .ok()
+        .filter(|rest| !rest.as_os_str().is_empty() && !rest.starts_with(".aruna"));
+    if below.is_none() {
+        return Err(ServerError::BadRequestMessage(
+            "session_mount.path must be a folder below the working directory, outside .aruna"
+                .to_string(),
+        ));
+    }
+    Ok(SessionMount {
+        prefix,
+        path: path.display().to_string(),
+    })
+}
+
+/// The permission path of the mounted bucket folder: the bucket path itself for
+/// the whole bucket, else the folder below it, shaped like an object path.
+fn mount_permission_path(bucket_path: String, prefix: &str) -> String {
+    match prefix.trim_end_matches('/') {
+        "" => bucket_path,
+        folder => format!("{bucket_path}/{folder}"),
+    }
 }
 
 /// An omitted workspace block runs without a bucket of the run's own.
@@ -1289,12 +1389,20 @@ additionally need WRITE on that bucket, which must belong to the same group.
   walltime is reached, or it is cancelled. `session_idle_after_ms` asks for a shorter idle wait
   than the realm's; the executing node clamps it, so a longer request never extends the session.
   Omitted resource limits default to 2 CPU cores and 4 GB RAM (4,000,000,000 bytes).
+- `session_mount` picks the slice of the workspace bucket the kernel sees as a folder: `prefix`
+  is a folder in the bucket (an empty string is the whole bucket) and `path` a folder below the
+  working directory. Omitted, the `data/` folder appears at `<workdir>/data`. The caller needs
+  write permission on that bucket folder, checked on its own path so a policy can refuse the
+  folder alone (403 otherwise). The folder is served by the executing backend's S3 mount driver;
+  without one the session reaches the bucket over S3 only.
 
 **Limits** (all refused with 400)
 - An empty image without a `runtime`, a `cpu_cores` of 0, or a `ram_bytes` of 0 or above 2^63-1.
-- A `runtime` or `session_idle_after_ms` without the session tag, an unknown runtime id, a session
-  without an existing workspace bucket, or a session that also names an image, entrypoint or
-  command.
+- A `runtime`, `session_idle_after_ms` or `session_mount` without the session tag, an unknown
+  runtime id, a session without an existing workspace bucket, or a session that also names an
+  image, entrypoint or command.
+- A `session_mount.prefix` that is absolute or carries an empty or `..` segment, or a
+  `session_mount.path` that is not a folder below the working directory or lies under `.aruna`.
 - More than 512 inputs, more than 1024 outputs, or more than 32 output prefixes.
 - An empty `dest_key`, or a container path that is not absolute and traversal-free.
 - An output without a `bucket` under `workspace.mode` `none`, named in the message.
@@ -1491,6 +1599,29 @@ pub(crate) async fn submit_execution(
     let (file_outputs, workspace_outputs) = native_outputs(request.outputs, workspace_mode)?;
     for bucket in output_buckets(workspace_bucket.as_deref(), &file_outputs) {
         validate_owned_bucket(state, &auth, group_id, &bucket, extras.clone()).await?;
+    }
+    // The mounted folder is written freely from the kernel, so the caller needs
+    // WRITE on that folder itself, not only on the bucket.
+    if let (Some(prefix), Some(bucket)) = (
+        request.tags.get(SESSION_MOUNT_PREFIX_TAG),
+        workspace_bucket.as_deref(),
+    ) {
+        crate::auth::ensure_permission_with(
+            state,
+            &auth,
+            mount_permission_path(
+                blob_bucket_permission_path(
+                    state.get_realm_id(),
+                    group_id,
+                    state.get_node_id(),
+                    bucket,
+                ),
+                prefix,
+            ),
+            Permission::WRITE,
+            extras.clone(),
+        )
+        .await?;
     }
 
     let spec = ExecutionSpec {
@@ -2392,6 +2523,60 @@ pub async fn head_job_artifact(
 }
 
 #[utoipa::path(
+    delete,
+    path = "/compute/jobs/{job_id}",
+    tag = "compute/jobs",
+    summary = "Delete the caller's finished run",
+    description = r#"Removes a finished run from the run and job lists of this node.
+
+**Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
+Self-scoped like the status read: only the submitter may delete, and anybody else's run answers
+404.
+
+**Behavior**
+- A run is listed only by the node that admitted it, so this call is sent to the node whose list
+  showed the run. Every client listing through that node stops seeing it on its next read.
+- The node removes the run's row, its list entry, its report rows and its local attempt records in
+  one transaction, the same rows retention pruning removes.
+- The run's replicated history stays on the nodes that hold it, so a read by id still answers with
+  its final state. Captured outputs and the run dataset are not deleted.
+- Repeating the call answers 404 once the run is gone.
+
+**Limits**
+- Only an execution that succeeded, failed or was cancelled can be deleted; a run still in flight,
+  one with an undecided outcome, or one whose container cleanup is still queued answers 409.
+- System jobs such as imports, exports and copies are not deleted here."#,
+    params(("job_id" = String, Path, description = "Job id as returned at submission, for example `01JJRSTVWXYZ0123456789ABCD`")),
+    responses(
+        (status = 204, description = "The run was removed from this node's lists"),
+        (status = 400, description = "The job id is malformed", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
+        (status = 404, description = "This node lists no such run of the caller; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
+        (status = 409, description = "The run has not finished, or its container cleanup is still queued; cancel it or retry once it settled", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_job(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(job_id): Path<String>,
+) -> ServerResult<StatusCode> {
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let job_id = parse_job_id(&job_id)?;
+    let outcome = delete_owned_run(&state.get_ctx(), auth.user_id, job_id)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    match outcome {
+        RunDelete::Deleted => Ok(StatusCode::NO_CONTENT),
+        RunDelete::NotFound => Err(ServerError::NotFound),
+        RunDelete::Unfinished => Err(ServerError::Conflict(
+            "the run has not finished or its cleanup is still queued".to_string(),
+        )),
+    }
+}
+
+#[utoipa::path(
     post,
     path = "/compute/jobs/{job_id}/cancel",
     tag = "compute/jobs",
@@ -2575,6 +2760,7 @@ mod tests {
                 workspace_bucket: None,
                 workspace_mode: WorkspaceMode::None,
                 locally_exhausted: false,
+                session_runtime: None,
             },
             spec: LogicalJobSpec {
                 submission_id,
@@ -3303,6 +3489,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_job_rules() {
+        // Only the owner removes a finished run; a live one answers 409 and a
+        // second delete answers 404.
+        let (_dir, state) = build_state().await;
+        let owner = user(2);
+        let storage = &state.get_ctx().storage_handle;
+        let finished = JobId::from_bytes([0xA1; 16]);
+        let running = JobId::from_bytes([0xA2; 16]);
+        let mut record = job_for(finished, owner, 1000);
+        record.payload = JobPayload::Execution(ExecutionSpec {
+            group_id: Ulid::from_bytes([5u8; 16]),
+            name: None,
+            description: None,
+            tags: BTreeMap::new(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: BTreeMap::new(),
+            resources: ComputeResources::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: CollisionPolicy::default(),
+        });
+        record.state = JobState::Succeeded;
+        record.finished_at_ms = Some(2000);
+        insert_job(storage, &record).await.unwrap();
+        let mut live = record.clone();
+        live.job_id = running;
+        live.state = JobState::Running;
+        live.finished_at_ms = None;
+        insert_job(storage, &live).await.unwrap();
+
+        let call = |who: UserId, id: JobId| {
+            delete_job(
+                State(state.clone()),
+                Extension(auth_for(who)),
+                Path(id.to_string()),
+            )
+        };
+        assert!(matches!(
+            call(user(3), finished).await,
+            Err(ServerError::NotFound)
+        ));
+        assert!(matches!(
+            call(owner, running).await,
+            Err(ServerError::Conflict(_))
+        ));
+        assert_eq!(call(owner, finished).await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(matches!(
+            call(owner, finished).await,
+            Err(ServerError::NotFound)
+        ));
+        let result = get_job(
+            State(state.clone()),
+            Extension(auth_for(owner)),
+            Extension(None),
+            Path(finished.to_string()),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::NotFound)));
+    }
+
+    #[tokio::test]
     async fn cancel_is_idempotent() {
         let (_dir, state) = build_state().await;
         let owner = user(2);
@@ -3435,6 +3688,7 @@ mod tests {
             image: "alpine:3".to_string(),
             runtime: None,
             session_idle_after_ms: None,
+            session_mount: None,
             entrypoint: None,
             command: vec!["true".to_string()],
             env: BTreeMap::new(),
@@ -3604,6 +3858,7 @@ mod tests {
                 image: "alpine:3".to_string(),
                 runtime: None,
                 session_idle_after_ms: None,
+                session_mount: None,
                 entrypoint: None,
                 command: vec!["true".to_string()],
                 env: BTreeMap::new(),
@@ -3873,6 +4128,7 @@ mod tests {
             image: String::new(),
             runtime: Some("python-notebook".to_string()),
             session_idle_after_ms: Some(600_000),
+            session_mount: None,
             entrypoint: None,
             command: Vec::new(),
             env: BTreeMap::new(),
@@ -3974,9 +4230,123 @@ mod tests {
     }
 
     #[test]
+    fn session_mount_defaults() {
+        // An omitted block keeps the data/ folder below the working directory.
+        let mut request = session_body();
+        session_request(&mut request, None).expect("a session submit is accepted");
+        assert_eq!(
+            request
+                .tags
+                .get(SESSION_MOUNT_PREFIX_TAG)
+                .map(String::as_str),
+            Some("data/")
+        );
+        assert_eq!(
+            request.tags.get(SESSION_MOUNT_PATH_TAG).map(String::as_str),
+            Some("/work/data")
+        );
+    }
+
+    #[test]
+    fn session_mount_chosen() {
+        // The caller picks the bucket folder and the kernel folder. The prefix
+        // ends in one slash, the path is normalised, and an empty prefix is the
+        // whole bucket.
+        let mut request = session_body();
+        request.workdir = Some("/home/user/".to_string());
+        request.session_mount = Some(SessionMountRequest {
+            prefix: Some(" raw/2024 ".to_string()),
+            path: Some("/home/user/project//raw/".to_string()),
+        });
+        session_request(&mut request, None).expect("a chosen mount is accepted");
+        assert_eq!(
+            request
+                .tags
+                .get(SESSION_MOUNT_PREFIX_TAG)
+                .map(String::as_str),
+            Some("raw/2024/")
+        );
+        assert_eq!(
+            request.tags.get(SESSION_MOUNT_PATH_TAG).map(String::as_str),
+            Some("/home/user/project/raw")
+        );
+
+        let mut request = session_body();
+        request.session_mount = Some(SessionMountRequest {
+            prefix: Some(String::new()),
+            path: None,
+        });
+        session_request(&mut request, None).expect("the whole bucket is accepted");
+        assert_eq!(
+            request
+                .tags
+                .get(SESSION_MOUNT_PREFIX_TAG)
+                .map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            request.tags.get(SESSION_MOUNT_PATH_TAG).map(String::as_str),
+            Some("/work/data")
+        );
+    }
+
+    #[test]
+    fn mount_path_checked() {
+        // The whole bucket is checked on the bucket path; a folder on its own
+        // object path, so a policy may deny that folder alone.
+        let bucket = "/realm/g/group/data/node/lab-data".to_string();
+        assert_eq!(mount_permission_path(bucket.clone(), ""), bucket);
+        assert_eq!(
+            mount_permission_path(bucket.clone(), "raw/2024/"),
+            format!("{bucket}/raw/2024")
+        );
+    }
+
+    #[test]
+    fn session_mount_refused() {
+        // A prefix must stay inside the bucket, and the folder must stay below
+        // the working directory and clear of the helper's socket directory.
+        for (prefix, path) in [
+            (Some("/raw"), None),
+            (Some("raw/../other"), None),
+            (Some("raw//2024"), None),
+            (Some("./raw"), None),
+            (None, Some("/work")),
+            (None, Some("/data")),
+            (None, Some("work/data")),
+            (None, Some("/work/.aruna/data")),
+            (None, Some("/work/../data")),
+        ] {
+            let mut request = session_body();
+            request.session_mount = Some(SessionMountRequest {
+                prefix: prefix.map(str::to_string),
+                path: path.map(str::to_string),
+            });
+            assert!(
+                session_request(&mut request, None).is_err(),
+                "{prefix:?} {path:?}"
+            );
+        }
+
+        // Outside a session the block has nothing to mount.
+        let mut request = local_request();
+        request.session_mount = Some(SessionMountRequest {
+            prefix: None,
+            path: None,
+        });
+        assert!(session_request(&mut request, None).is_err());
+    }
+
+    #[test]
     fn session_refuses_reserved() {
-        // The runtime, idle and expiry tags are the node's to set.
-        for tag in [SESSION_RUNTIME_TAG, SESSION_IDLE_TAG, SESSION_EXPIRY_TAG] {
+        // The runtime, idle, expiry and mount tags are the node's to set.
+        for tag in [
+            SESSION_RUNTIME_TAG,
+            SESSION_IDLE_TAG,
+            SESSION_EXPIRY_TAG,
+            SESSION_MOUNT_PREFIX_TAG,
+            SESSION_MOUNT_PATH_TAG,
+        ] {
             let mut request = session_body();
             request.tags.insert(tag.to_string(), "x".to_string());
             assert!(session_request(&mut request, None).is_err());
