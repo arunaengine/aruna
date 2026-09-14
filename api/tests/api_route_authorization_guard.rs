@@ -132,6 +132,11 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "jobs.rs",
+        "delete_job",
+        "self-scoped: delete_finished_run requires the caller to be the creator",
+    ),
+    (
+        "jobs.rs",
         "get_job",
         "self-scoped: read_owned_job requires the caller to be the creator",
     ),

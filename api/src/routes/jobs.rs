@@ -27,6 +27,7 @@ use aruna_operations::jobs::service::{
     cancel_job_routed, list_owned_jobs, read_artifact_routed, read_job_routed, read_owned_job,
     read_report_routed,
 };
+use aruna_operations::jobs::store::{RunDelete, delete_finished_run};
 use aruna_operations::jobs::{JOB_REPORT_MAX_ROWS, JobRouteError};
 use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -73,7 +74,7 @@ pub struct JobsApiDoc;
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(JobsApiDoc::openapi())
         .routes(routes!(list_jobs, submit_job))
-        .routes(routes!(get_job))
+        .routes(routes!(get_job, delete_job))
         .routes(routes!(cancel_job))
         .routes(routes!(get_job_report))
         .routes(routes!(get_job_artifact, head_job_artifact))
@@ -2522,6 +2523,60 @@ pub async fn head_job_artifact(
 }
 
 #[utoipa::path(
+    delete,
+    path = "/compute/jobs/{job_id}",
+    tag = "compute/jobs",
+    summary = "Delete the caller's finished run",
+    description = r#"Removes a finished run from the run and job lists of this node.
+
+**Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
+Self-scoped like the status read: only the submitter may delete, and anybody else's run answers
+404.
+
+**Behavior**
+- A run is listed only by the node that admitted it, so this call is sent to the node whose list
+  showed the run. Every client listing through that node stops seeing it on its next read.
+- The node removes the run's row, its list entry, its report rows and its local attempt records in
+  one transaction, the same rows retention pruning removes.
+- The run's replicated history stays on the nodes that hold it, so a read by id still answers with
+  its final state. Captured outputs and the run dataset are not deleted.
+- Repeating the call answers 404 once the run is gone.
+
+**Limits**
+- Only an execution that succeeded, failed or was cancelled can be deleted; a run still in flight,
+  one with an undecided outcome, or one whose container cleanup is still queued answers 409.
+- System jobs such as imports, exports and copies are not deleted here."#,
+    params(("job_id" = String, Path, description = "Job id as returned at submission, for example `01JJRSTVWXYZ0123456789ABCD`")),
+    responses(
+        (status = 204, description = "The run was removed from this node's lists"),
+        (status = 400, description = "The job id is malformed", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
+        (status = 404, description = "This node lists no such run of the caller; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
+        (status = 409, description = "The run has not finished, or its container cleanup is still queued; cancel it or retry once it settled", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_job(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(job_id): Path<String>,
+) -> ServerResult<StatusCode> {
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let job_id = parse_job_id(&job_id)?;
+    let outcome = delete_finished_run(&state.get_ctx().storage_handle, auth.user_id, job_id)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    match outcome {
+        RunDelete::Deleted => Ok(StatusCode::NO_CONTENT),
+        RunDelete::NotFound => Err(ServerError::NotFound),
+        RunDelete::Unfinished => Err(ServerError::Conflict(
+            "the run has not finished or its cleanup is still queued".to_string(),
+        )),
+    }
+}
+
+#[utoipa::path(
     post,
     path = "/compute/jobs/{job_id}/cancel",
     tag = "compute/jobs",
@@ -3428,6 +3483,73 @@ mod tests {
             Extension(auth_for(user(3))),
             Extension(None),
             Path(job_id.to_string()),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn delete_job_rules() {
+        // Only the owner removes a finished run; a live one answers 409 and a
+        // second delete answers 404.
+        let (_dir, state) = build_state().await;
+        let owner = user(2);
+        let storage = &state.get_ctx().storage_handle;
+        let finished = JobId::from_bytes([0xA1; 16]);
+        let running = JobId::from_bytes([0xA2; 16]);
+        let mut record = job_for(finished, owner, 1000);
+        record.payload = JobPayload::Execution(ExecutionSpec {
+            group_id: Ulid::from_bytes([5u8; 16]),
+            name: None,
+            description: None,
+            tags: BTreeMap::new(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: BTreeMap::new(),
+            resources: ComputeResources::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: CollisionPolicy::default(),
+        });
+        record.state = JobState::Succeeded;
+        record.finished_at_ms = Some(2000);
+        insert_job(storage, &record).await.unwrap();
+        let mut live = record.clone();
+        live.job_id = running;
+        live.state = JobState::Running;
+        live.finished_at_ms = None;
+        insert_job(storage, &live).await.unwrap();
+
+        let call = |who: UserId, id: JobId| {
+            delete_job(
+                State(state.clone()),
+                Extension(auth_for(who)),
+                Path(id.to_string()),
+            )
+        };
+        assert!(matches!(
+            call(user(3), finished).await,
+            Err(ServerError::NotFound)
+        ));
+        assert!(matches!(
+            call(owner, running).await,
+            Err(ServerError::Conflict(_))
+        ));
+        assert_eq!(call(owner, finished).await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(matches!(
+            call(owner, finished).await,
+            Err(ServerError::NotFound)
+        ));
+        let result = get_job(
+            State(state.clone()),
+            Extension(auth_for(owner)),
+            Extension(None),
+            Path(finished.to_string()),
         )
         .await;
         assert!(matches!(result, Err(ServerError::NotFound)));

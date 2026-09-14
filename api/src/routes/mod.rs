@@ -238,6 +238,7 @@ mod tests {
         ("GET", "/system/realm/placement"),
         ("GET", "/system/usage"),
         ("GET", "/compute/jobs"),
+        ("DELETE", "/compute/jobs/{job_id}"),
         ("GET", "/compute/jobs/{job_id}"),
         ("GET", "/compute/jobs/{job_id}/artifacts/rocrate"),
         ("GET", "/compute/jobs/{job_id}/audit"),
