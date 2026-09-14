@@ -16,6 +16,7 @@ use aruna_operations::tasks::incoming::TaskQueues;
 use aruna_tasks::TaskHandle;
 use tracing::warn;
 
+use crate::application::{Service, ServiceExit};
 use crate::startup::realm::CoreAnnouncement;
 use crate::startup::test_hooks;
 
@@ -68,14 +69,29 @@ pub(crate) const STARTUP_PHASES: &[StartupPhase] = &[
     StartupPhase::RecoverChild,
 ];
 
-/// Runs the background start, checking for an accepted stop and for an
-/// already-finished ingress listener between phases. Returns whether readiness
-/// was announced; a `false` result means no phase that depends on it ran.
+/// What the ordered background start did, in the same required-versus-optional
+/// service terms as steady-state supervision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackgroundOutcome {
+    /// Readiness was announced and the phase sequence completed. An optional
+    /// listener exit is reported without abandoning later phases.
+    Started,
+    /// A stop was accepted; no background work was admitted.
+    Cancelled,
+    /// A listener whose loss stops the node exited; the sequence stopped.
+    RequiredListenerFailed(Service),
+}
+
+/// Runs the background start, applying the steady-state supervision policy to
+/// any finished ingress listener between phases. An optional exit is reported
+/// and the required phases continue; a required exit stops the sequence and is
+/// returned for the caller's failure path.
 pub(crate) async fn start(
     background: Background,
     stop: &tokio_util::sync::CancellationToken,
-    listener_lost: impl Fn() -> bool,
-) -> bool {
+    observed_exit: impl Fn() -> Option<(Service, ServiceExit)>,
+    mut on_phase: impl FnMut(StartupPhase),
+) -> BackgroundOutcome {
     let Background {
         realm_id,
         node_id,
@@ -99,12 +115,26 @@ pub(crate) async fn start(
     let mut ready_announced = false;
 
     for phase in STARTUP_PHASES {
-        // A stop accepted while an earlier phase ran must not admit more work,
-        // and a listener that already exited must stop the node, not start
-        // recovery behind it.
-        if stop.is_cancelled() || listener_lost() {
+        // The supervision policy applies here exactly as it does in steady
+        // state: a required listener stops the sequence, an optional one is
+        // reported and the required phases continue.
+        match observed_exit() {
+            Some((service, ServiceExit::StopsNode)) => {
+                return BackgroundOutcome::RequiredListenerFailed(service);
+            }
+            Some((service, ServiceExit::ReportedOnly)) => {
+                warn!(
+                    service = ?service,
+                    "Optional listener exited during background startup; continuing required phases"
+                );
+            }
+            None => {}
+        }
+        // A stop accepted while an earlier phase ran must not admit more work.
+        if stop.is_cancelled() {
             break;
         }
+        on_phase(*phase);
         match phase {
             StartupPhase::Ready => {
                 readiness.set_ready();
@@ -168,7 +198,11 @@ pub(crate) async fn start(
             }
         }
     }
-    ready_announced
+    if ready_announced {
+        BackgroundOutcome::Started
+    } else {
+        BackgroundOutcome::Cancelled
+    }
 }
 
 async fn publish_core(
@@ -247,29 +281,148 @@ mod tests {
         let readiness = background.readiness.clone();
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();
+        let mut executed = Vec::new();
 
-        let announced = start(background, &stop, || false).await;
+        let outcome = start(background, &stop, || None, |phase| executed.push(phase)).await;
 
-        assert!(!announced);
+        assert_eq!(outcome, BackgroundOutcome::Cancelled);
+        assert!(executed.is_empty());
         assert!(!readiness.is_ready());
     }
 
-    // An ingress listener that already exited is observed between startup
-    // phases, so readiness is never announced behind a dead listener.
+    // A required listener that already exited is observed before the first
+    // phase, so the sequence stops and readiness is never announced behind it.
     #[tokio::test]
-    async fn lost_listener_announces_no_readiness() {
+    async fn required_listener_failure_stops_before_readiness() {
         let (background, _temp) = test_background().await;
         let readiness = background.readiness.clone();
+        let mut executed = Vec::new();
 
-        let announced = start(
+        let outcome = start(
             background,
             &tokio_util::sync::CancellationToken::new(),
-            || true,
+            || Some((Service::Rest, ServiceExit::StopsNode)),
+            |phase| executed.push(phase),
         )
         .await;
 
-        assert!(!announced);
+        assert_eq!(
+            outcome,
+            BackgroundOutcome::RequiredListenerFailed(Service::Rest)
+        );
+        assert!(executed.is_empty());
         assert!(!readiness.is_ready());
+    }
+
+    // An optional listener exit before readiness is reported, not fatal: every
+    // required phase still runs and readiness is announced.
+    #[tokio::test]
+    async fn optional_listener_failure_before_readiness_runs_every_phase() {
+        let (background, _temp) = test_background().await;
+        let readiness = background.readiness.clone();
+        let mut executed = Vec::new();
+
+        let outcome = start(
+            background,
+            &tokio_util::sync::CancellationToken::new(),
+            || Some((Service::SessionS3, ServiceExit::ReportedOnly)),
+            |phase| executed.push(phase),
+        )
+        .await;
+
+        assert_eq!(outcome, BackgroundOutcome::Started);
+        assert_eq!(executed, STARTUP_PHASES.to_vec());
+        assert!(readiness.is_ready());
+    }
+
+    // An optional listener exit between recovery phases must not abandon the
+    // phases after it: the sequence still reaches the end and readiness holds.
+    #[tokio::test]
+    async fn optional_listener_failure_between_phases_keeps_running() {
+        let (background, _temp) = test_background().await;
+        let readiness = background.readiness.clone();
+        let mut executed = Vec::new();
+        let optional_lost = std::cell::Cell::new(false);
+        let observe = |phase: StartupPhase| {
+            if phase == StartupPhase::RecoverStaleJobs {
+                optional_lost.set(true);
+            }
+        };
+
+        let outcome = start(
+            background,
+            &tokio_util::sync::CancellationToken::new(),
+            || {
+                optional_lost
+                    .get()
+                    .then_some((Service::SessionS3, ServiceExit::ReportedOnly))
+            },
+            |phase| {
+                observe(phase);
+                executed.push(phase);
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, BackgroundOutcome::Started);
+        assert_eq!(executed, STARTUP_PHASES.to_vec());
+        assert!(readiness.is_ready());
+    }
+
+    // A stop accepted between phases stops the sequence, and a stop racing a
+    // required failure reports the failure; optional exits never mask a stop.
+    #[tokio::test]
+    async fn stop_between_phases_prevents_later_phases() {
+        let (background, _temp) = test_background().await;
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut executed = Vec::new();
+
+        let outcome = start(
+            background,
+            &stop,
+            || None,
+            |phase| {
+                if phase == StartupPhase::RecoverStaleJobs {
+                    stop.cancel();
+                }
+                executed.push(phase);
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, BackgroundOutcome::Cancelled);
+        assert_eq!(
+            executed,
+            vec![
+                StartupPhase::Ready,
+                StartupPhase::CorePublication,
+                StartupPhase::RecoverStaleJobs
+            ]
+        );
+    }
+
+    // A required listener failure wins over a simultaneous stop: the caller
+    // reports the failed service, and no later phase is admitted.
+    #[tokio::test]
+    async fn required_failure_wins_over_simultaneous_stop() {
+        let (background, _temp) = test_background().await;
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+        let mut executed = Vec::new();
+
+        let outcome = start(
+            background,
+            &stop,
+            || Some((Service::Rest, ServiceExit::StopsNode)),
+            |phase| executed.push(phase),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            BackgroundOutcome::RequiredListenerFailed(Service::Rest)
+        );
+        assert!(executed.is_empty());
     }
 }
 
