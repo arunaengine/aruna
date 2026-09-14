@@ -6,7 +6,7 @@ use aruna_core::structs::{PlacementRef, RealmId};
 use aruna_net::streams::BiStream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::shard::manifest_entry_digest;
 

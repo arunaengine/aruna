@@ -20,6 +20,7 @@ use aruna_storage::FjallStorage;
 use async_trait::async_trait;
 use byteview::ByteView;
 use tempfile::tempdir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use ulid::Ulid;
 
@@ -370,18 +371,13 @@ async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Er
             .ok_or("expected inbound stream")?;
     assert_eq!(incoming_alpn, Alpn::Bao);
 
-    let chunk = incoming_stream
+    let mut chunk = vec![0u8; b"hello stream".len()];
+    incoming_stream
         .1
-        .read_chunk(1024)
+        .read_exact(&mut chunk)
         .await
-        .map_err(|e| std::io::Error::other(format!("failed to read inbound stream data: {e}")))?
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "inbound stream closed without data",
-            )
-        })?;
-    assert_eq!(chunk.to_vec(), b"hello stream".to_vec());
+        .map_err(|e| std::io::Error::other(format!("failed to read inbound stream data: {e}")))?;
+    assert_eq!(chunk, b"hello stream".to_vec());
 
     handle_a.shutdown().await;
     handle_b.shutdown().await;

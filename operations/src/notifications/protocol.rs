@@ -7,7 +7,7 @@ use aruna_core::structs::{
 use aruna_core::types::UserId;
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ulid::Ulid;
 
 pub const NOTIFICATION_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;

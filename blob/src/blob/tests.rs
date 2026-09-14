@@ -8,7 +8,6 @@ use super::{
 };
 use crate::messages::{MessageType, ReplicationMessage};
 use crate::s3::make_bucket;
-use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
@@ -26,8 +25,11 @@ use aruna_core::structs::{
     GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey, MultipartUploadPartKey, RealmId,
     ResolvedBackend, ResolvedSourceAccess, SourceConnectorKind, Status,
 };
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_core::{NodeId, UserId};
+use aruna_net::streams::BiStream;
+use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::storage;
+use async_trait::async_trait;
 use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1564,6 +1566,62 @@ async fn concurrent_connections_receive_distinct_non_nil_ids() {
 
     net_a.shutdown().await;
     net_b.shutdown().await;
+}
+
+struct StreamCapture(tokio::sync::mpsc::UnboundedSender<(Alpn, BiStream, NodeId)>);
+
+#[async_trait]
+impl InboundEventHandler for StreamCapture {
+    async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
+        self.0.send((alpn, stream, node_id)).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn same_node_connection() {
+    let context = setup_blob_handle(1).await;
+    let handler = context.blob_handle.handler.clone();
+    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .net
+        .set_inbound_handler(Arc::new(StreamCapture(stream_tx)));
+    let local = handler.net.node_id();
+
+    let BlobEvent::ConnectionEstablished { stream_id } = handler.open_connection(local).await
+    else {
+        panic!("connection to the local node is refused");
+    };
+    let (alpn, inbound, peer) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alpn, Alpn::Bao);
+    assert_eq!(peer, local);
+    let inbound_id = handler.add_connection(None, peer, inbound).await.unwrap();
+
+    assert!(matches!(
+        handler.send_message(stream_id, b"manifest".to_vec()).await,
+        BlobEvent::MessageSent { .. }
+    ));
+    assert!(matches!(
+        handler.read_message(inbound_id).await,
+        BlobEvent::MessageReceived { payload, .. } if payload == b"manifest"
+    ));
+    assert!(matches!(
+        handler.send_message(inbound_id, b"ack".to_vec()).await,
+        BlobEvent::MessageSent { .. }
+    ));
+    assert!(matches!(
+        handler.read_message(stream_id).await,
+        BlobEvent::MessageReceived { payload, .. } if payload == b"ack"
+    ));
+
+    handler.close_connection(stream_id).await;
+    assert!(matches!(
+        handler.read_message(inbound_id).await,
+        BlobEvent::Error(_)
+    ));
+    handler.close_connection(inbound_id).await;
 }
 
 #[tokio::test]

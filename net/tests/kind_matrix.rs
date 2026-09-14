@@ -14,6 +14,7 @@ use aruna_storage::FjallStorage;
 use async_trait::async_trait;
 use irokle::Storage as _;
 use tempfile::tempdir;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 const NETWORK_HANG_CAP: Duration = Duration::from_secs(45);

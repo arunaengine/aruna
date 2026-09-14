@@ -455,6 +455,8 @@ struct NetInner {
     inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
     inbound_handler_registered: Arc<Notify>,
     inbound_tasks: TaskTracker,
+    // Released with admission, or the inbound stream task never sees the channel close.
+    loopback_streams: parking_lot::Mutex<Option<mpsc::Sender<(Alpn, streams::BiStream, NodeId)>>>,
     eviction_shutdown: CancellationToken,
     accept_shutdown: CancellationToken,
     shutdown: CancellationToken,
@@ -688,6 +690,7 @@ impl NetHandle {
 
         let (dht_tx, mut dht_rx) = mpsc::channel(64);
         let (stream_tx, mut stream_rx) = mpsc::channel(64);
+        let loopback_streams = parking_lot::Mutex::new(Some(stream_tx.clone()));
 
         let dht_inbound_tx = dht_resources.inbound_stream_tx.clone();
         let dht_task = tokio::spawn(async move {
@@ -913,6 +916,7 @@ impl NetHandle {
             inbound_handler,
             inbound_handler_registered,
             inbound_tasks,
+            loopback_streams,
             eviction_shutdown,
             accept_shutdown,
             shutdown,
@@ -1439,6 +1443,21 @@ impl NetHandle {
     }
 
     async fn open_stream_inner(&self, node_id: NodeId, alpn: Alpn) -> Result<streams::BiStream> {
+        // iroh refuses to dial its own endpoint, so a stream to this node is
+        // an in-process pipe that still passes through the inbound handler.
+        if node_id == self.inner.node_id {
+            if !self.inner.inbound_admission.local_serves(alpn) {
+                return Err(NetError::Stream(format!(
+                    "{alpn} is not served by this node kind"
+                )));
+            }
+            let Some(loopback_streams) = self.inner.loopback_streams.lock().clone() else {
+                return Err(NetError::Stream(
+                    "node no longer admits streams".to_string(),
+                ));
+            };
+            return streams::open_loopback(alpn, node_id, &loopback_streams);
+        }
         if node_id != self.inner.node_id {
             if let Err(err) = self.inner.dht.add_peer(node_id) {
                 warn!(
@@ -1554,6 +1573,7 @@ impl NetHandle {
     /// without waiting for the ones in flight or tearing the endpoint down.
     pub fn close_admission(&self) {
         self.inner.accept_shutdown.cancel();
+        self.inner.loopback_streams.lock().take();
         self.inner.inbound_tasks.close();
     }
 
@@ -2662,6 +2682,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Duration, sleep};
 
     fn make_secret(seed: u8) -> iroh::SecretKey {
@@ -3519,6 +3540,65 @@ mod tests {
         );
 
         accepting.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loopback_stream_reaches_handler() -> Result<()> {
+        let (handle, _dir) = test_net_handle().await?;
+        let holding = Arc::new(HoldingInboundHandler {
+            streams: tokio::sync::Mutex::new(Vec::new()),
+        });
+        handle.set_inbound_handler(holding.clone());
+
+        let mut outbound = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+        outbound
+            .0
+            .write_all(b"manifest")
+            .await
+            .map_err(|e| NetError::Io(e.to_string()))?;
+        let mut inbound = None;
+        for _ in 0..50 {
+            inbound = holding.streams.lock().await.pop();
+            if inbound.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let mut inbound = inbound.expect("loopback stream reaches the inbound handler");
+
+        let mut request = [0u8; 8];
+        inbound
+            .1
+            .read_exact(&mut request)
+            .await
+            .map_err(|e| NetError::Io(e.to_string()))?;
+        assert_eq!(&request, b"manifest");
+        inbound
+            .0
+            .write_all(b"ack")
+            .await
+            .map_err(|e| NetError::Io(e.to_string()))?;
+        let mut reply = [0u8; 3];
+        outbound
+            .1
+            .read_exact(&mut reply)
+            .await
+            .map_err(|e| NetError::Io(e.to_string()))?;
+        assert_eq!(&reply, b"ack");
+
+        outbound
+            .0
+            .finish()
+            .map_err(|e| NetError::Stream(e.to_string()))?;
+        let rest = inbound
+            .1
+            .read_to_end(1)
+            .await
+            .map_err(|e| NetError::Stream(e.to_string()))?;
+        assert!(rest.is_empty());
+
+        handle.shutdown().await;
         Ok(())
     }
 

@@ -94,7 +94,8 @@ use tracing::{debug, error, info, warn};
 use ulid::Ulid;
 
 use crate::error::{NetError, Result};
-use crate::streams::{BiStream, PeerKinds};
+use crate::streams::{BiStream, PeerKinds, RecvStream, SendStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use ::irokle as irokle_crate;
 
@@ -9960,7 +9961,7 @@ fn deferred_topics_key() -> ByteView {
 }
 
 async fn read_inbound_sync_messages(
-    recv: &mut iroh::endpoint::RecvStream,
+    recv: &mut RecvStream,
     reservation: &mut InboundByteReservation,
 ) -> Result<(Vec<SyncMessage>, Vec<irokle_crate::TopicId>)> {
     let mut messages = Vec::new();
@@ -9993,7 +9994,7 @@ async fn read_inbound_sync_messages(
 }
 
 async fn read_next_inbound_sync_frame(
-    recv: &mut iroh::endpoint::RecvStream,
+    recv: &mut RecvStream,
     bytes_read: &mut usize,
     reservation: &mut InboundByteReservation,
 ) -> Result<Option<Vec<u8>>> {
@@ -10052,18 +10053,16 @@ async fn read_next_inbound_sync_frame(
     Ok(Some(payload))
 }
 
-async fn read_some_inbound_sync(
-    recv: &mut iroh::endpoint::RecvStream,
-    buf: &mut [u8],
-) -> Result<Option<usize>> {
-    timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT, recv.read(buf))
+async fn read_some_inbound_sync(recv: &mut RecvStream, buf: &mut [u8]) -> Result<Option<usize>> {
+    let read = timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT, recv.read(buf))
         .await
         .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
-        .map_err(|error| NetError::Stream(error.to_string()))
+        .map_err(|error| NetError::Stream(error.to_string()))?;
+    Ok((read > 0).then_some(read))
 }
 
 async fn write_inbound_sync_messages(
-    send: &mut iroh::endpoint::SendStream,
+    send: &mut SendStream,
     messages: &[SyncMessage],
 ) -> Result<()> {
     for message in messages {

@@ -8,7 +8,9 @@ use futures::{AsyncReadExt, AsyncSeekExt};
 use iroh_io::{AsyncSliceReader, AsyncSliceWriter, AsyncStreamReader, AsyncStreamWriter};
 use opendal::{FuturesAsyncReader, Operator};
 use std::{future::Future, io, time::Duration};
-use tokio::io::{AsyncWriteExt as TokioAsyncWriteExt, DuplexStream};
+use tokio::io::{
+    AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt, DuplexStream,
+};
 use tokio::time::timeout;
 use tracing::debug;
 
