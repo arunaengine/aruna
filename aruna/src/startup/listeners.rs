@@ -5,7 +5,7 @@ use std::sync::Arc;
 use aruna_api::auth::OidcValidator;
 use aruna_api::cors::CorsConfig;
 use aruna_api::csp::PortalCspConfig;
-use aruna_api::s3::server::{S3Server, S3ServerTimeouts};
+use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_core::metrics::NodeMetrics;
@@ -22,11 +22,13 @@ use crate::portal;
 
 pub(crate) struct ServerBindings {
     pub(crate) rest_handle: tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSetupError>>,
-    pub(crate) s3_handle: Option<tokio::task::JoinHandle<()>>,
+    /// S3 and session S3 carry their own connection-completion boundary, so a
+    /// forced abort can still await every child's release.
+    pub(crate) s3_handle: Option<S3ServerHandle>,
     pub(crate) portal_handle: Option<tokio::task::JoinHandle<()>>,
     /// The optional session bridge listener, joined with the other ingress
     /// listeners instead of being left to its cancellation token.
-    pub(crate) session_s3_handle: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) session_s3_handle: Option<S3ServerHandle>,
     pub(crate) realm_id: aruna_core::structs::RealmId,
     pub(crate) node_id: iroh::PublicKey,
     pub(crate) is_initial_boot: bool,
@@ -40,17 +42,24 @@ pub(crate) struct ServerBindings {
 #[derive(Default)]
 struct StartedListeners {
     portal: Option<tokio::task::JoinHandle<()>>,
-    s3: Option<tokio::task::JoinHandle<()>>,
-    session_s3: Option<tokio::task::JoinHandle<()>>,
+    s3: Option<S3ServerHandle>,
+    session_s3: Option<S3ServerHandle>,
 }
 
 impl StartedListeners {
-    /// Aborts and awaits every started listener in reverse start order.
+    /// Aborts and awaits every started listener in reverse start order. The S3
+    /// handles await their connection children after the abort, so a partial
+    /// bind releases every accepted connection, not just the accept loop.
     async fn abort_all(&mut self) {
-        for handle in [self.session_s3.take(), self.s3.take(), self.portal.take()]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(handle) = self.session_s3.take() {
+            handle.abort();
+            handle.wait().await;
+        }
+        if let Some(handle) = self.s3.take() {
+            handle.abort();
+            handle.wait().await;
+        }
+        if let Some(handle) = self.portal.take() {
             handle.abort();
             let _ = handle.await;
         }
@@ -121,7 +130,7 @@ async fn bind_session_s3(
     metrics: Arc<NodeMetrics>,
     s3_timeouts: S3ServerTimeouts,
     shutdown: &Shutdown,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<S3ServerHandle> {
     let session = session?;
     let address = session.address;
     let server = match S3Server::new(
@@ -396,24 +405,18 @@ pub(crate) async fn portal_exit(handle: Option<&mut tokio::task::JoinHandle<()>>
     }
 }
 
-pub(crate) async fn s3_exit(handle: Option<&mut tokio::task::JoinHandle<()>>) -> String {
+pub(crate) async fn s3_exit(handle: Option<&mut S3ServerHandle>) -> String {
     match handle {
-        Some(handle) => match handle.await {
-            Ok(()) => "S3 server stopped unexpectedly".to_string(),
-            Err(error) => format!("S3 server panicked: {error}"),
-        },
+        Some(handle) => handle.exit("S3").await,
         None => std::future::pending().await,
     }
 }
 
 /// Resolves when the optional session bridge listener exits, and never without
 /// one, so its exit is reported without stopping the node.
-pub(crate) async fn session_s3_exit(handle: Option<&mut tokio::task::JoinHandle<()>>) -> String {
+pub(crate) async fn session_s3_exit(handle: Option<&mut S3ServerHandle>) -> String {
     match handle {
-        Some(handle) => match handle.await {
-            Ok(()) => "Session S3 server stopped".to_string(),
-            Err(error) => format!("Session S3 server panicked: {error}"),
-        },
+        Some(handle) => handle.exit("Session S3").await,
         None => std::future::pending().await,
     }
 }
@@ -457,19 +460,53 @@ mod tests {
 
     #[tokio::test]
     async fn session_s3_exit_reports() {
-        // A dead session listener is reported and joined, never a node failure.
-        let mut stopped = tokio::spawn(async {});
-        assert_eq!(
-            session_s3_exit(Some(&mut stopped)).await,
-            "Session S3 server stopped"
-        );
+        use aruna_core::metrics::NodeMetrics;
+        use aruna_core::shutdown::Shutdown;
+        use aruna_core::structs::{RealmId, RoCrateLimits};
 
-        let mut panicked = tokio::spawn(async { panic!("session s3 panicked") });
-        assert!(
-            session_s3_exit(Some(&mut panicked))
-                .await
-                .contains("panicked")
-        );
+        // A real session listener that stopped on its shutdown token is
+        // reported, never treated as a node failure.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
+            .expect("storage opens");
+        let driver_ctx = std::sync::Arc::new(aruna_operations::driver::DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let secret = iroh::SecretKey::from_bytes(&[0x46; 32]);
+        let shutdown = Shutdown::new();
+        let mut handle = bind_session_s3(
+            Some(SessionS3 {
+                address: "127.0.0.1:0".parse().expect("loopback address"),
+                realm_id: RealmId::from_bytes([7u8; 32]),
+                node_id: secret.public(),
+                key: aruna_core::credential_encryption::CredentialEncryptionKey::derive(
+                    &secret.to_bytes(),
+                ),
+                rocrate_limits: RoCrateLimits::default(),
+            }),
+            "127.0.0.1",
+            driver_ctx,
+            CorsConfig::default(),
+            std::sync::Arc::new(NodeMetrics::new()),
+            S3ServerTimeouts::default(),
+            &shutdown,
+        )
+        .await
+        .expect("the session S3 listener binds on an ephemeral loopback port");
+
+        shutdown.trigger();
+        let message = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            session_s3_exit(Some(&mut handle)),
+        )
+        .await
+        .expect("the session listener must stop on the shutdown token");
+        assert_eq!(message, "Session S3 server stopped unexpectedly");
     }
 
     #[tokio::test(start_paused = true)]
@@ -495,25 +532,18 @@ mod tests {
     async fn partial_bind_aborts_and_awaits_started_listeners() {
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut started = StartedListeners::default();
-        for slot in 0..3 {
-            let counter = DropCounter(dropped.clone());
-            let handle = tokio::spawn(async move {
-                let _counter = counter;
-                std::future::pending::<()>().await;
-            });
-            match slot {
-                0 => started.portal = Some(handle),
-                1 => started.s3 = Some(handle),
-                _ => started.session_s3 = Some(handle),
-            }
-        }
+        let counter = DropCounter(dropped.clone());
+        started.portal = Some(tokio::spawn(async move {
+            let _counter = counter;
+            std::future::pending::<()>().await;
+        }));
 
         started.abort_all().await;
 
         assert_eq!(
             dropped.load(std::sync::atomic::Ordering::SeqCst),
-            3,
-            "every started listener task must be aborted and awaited"
+            1,
+            "the started listener task must be aborted and awaited"
         );
         assert!(started.portal.is_none());
         assert!(started.s3.is_none());
@@ -655,10 +685,56 @@ mod tests {
         .expect("the session S3 listener binds on an ephemeral loopback port");
 
         shutdown.trigger();
-        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle.wait())
             .await
-            .expect("the retained session listener must stop on the shutdown token")
-            .expect("the session listener must not panic");
+            .expect("the retained session listener must stop on the shutdown token");
+    }
+
+    // A forced abort of the session listener still awaits its children; the
+    // port releases only once `wait` returned.
+    #[tokio::test]
+    async fn forced_session_listener_abort_waits_for_children() {
+        use aruna_core::metrics::NodeMetrics;
+        use aruna_core::shutdown::Shutdown;
+        use aruna_core::structs::{RealmId, RoCrateLimits};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
+            .expect("storage opens");
+        let driver_ctx = std::sync::Arc::new(aruna_operations::driver::DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let secret = iroh::SecretKey::from_bytes(&[0x45; 32]);
+        let session = SessionS3 {
+            address: "127.0.0.1:0".parse().expect("loopback address"),
+            realm_id: RealmId::from_bytes([7u8; 32]),
+            node_id: secret.public(),
+            key: aruna_core::credential_encryption::CredentialEncryptionKey::derive(
+                &secret.to_bytes(),
+            ),
+            rocrate_limits: RoCrateLimits::default(),
+        };
+        let handle = bind_session_s3(
+            Some(session),
+            "127.0.0.1",
+            driver_ctx,
+            CorsConfig::default(),
+            std::sync::Arc::new(NodeMetrics::new()),
+            S3ServerTimeouts::default(),
+            &Shutdown::new(),
+        )
+        .await
+        .expect("the session S3 listener binds on an ephemeral loopback port");
+
+        handle.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle.wait())
+            .await
+            .expect("a forced abort must still await every connection child");
     }
 }
 
