@@ -11,7 +11,7 @@ use aruna_core::structs::RealmId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
 use aruna_tasks::TaskHandle;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -105,7 +105,7 @@ async fn rejoin_peer(
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });
-    initialize_net_incoming(context.clone());
+    initialize_net_incoming_for_tests(context.clone());
     peer.add_peer_addr(seed.net.endpoint_addr()).await;
     seed.net.add_peer_addr(peer.endpoint_addr()).await;
     Ok(RejoinedPeer {

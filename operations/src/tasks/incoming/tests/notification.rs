@@ -131,7 +131,7 @@ async fn notification_delivers_holder() {
         task_handle: None,
         compute_handle: None,
     });
-    crate::sync::incoming::initialize_net_incoming(context_b.clone());
+    crate::sync::incoming::initialize_net_incoming_for_tests(context_b.clone());
 
     let context_a = Arc::new(DriverContext {
         storage_handle: storage_a.clone(),

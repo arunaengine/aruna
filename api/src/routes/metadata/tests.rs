@@ -59,7 +59,7 @@ use aruna_operations::metadata::repository::{write_document_lifecycle, write_gra
 use aruna_operations::realm::announce_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
-use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
@@ -3045,7 +3045,7 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });
-    initialize_net_incoming(context.clone());
+    initialize_net_incoming_for_tests(context.clone());
     let state = Arc::new(
         ServerState::new(
             context,

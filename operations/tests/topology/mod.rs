@@ -50,7 +50,7 @@ use aruna_operations::realm::announce_presence::{
 use aruna_operations::realm::mutate_placement::{
     MutateRealmPlacementConfig, RealmPlacementMutation, drive_placement_mutation,
 };
-use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
 use aruna_operations::tasks::incoming::install_and_start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -1000,7 +1000,7 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
         compute_handle: None,
     });
 
-    initialize_net_incoming(context.clone());
+    initialize_net_incoming_for_tests(context.clone());
     let shutdown = aruna_core::shutdown::Shutdown::new();
     install_and_start_task_queues(
         context.clone(),

@@ -1966,7 +1966,7 @@ mod tests {
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
         });
-        crate::sync::incoming::initialize_net_incoming(context.clone());
+        crate::sync::incoming::initialize_net_incoming_for_tests(context.clone());
         RecoveryNode {
             _dir: dir,
             net,

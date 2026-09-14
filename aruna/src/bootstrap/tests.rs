@@ -17,7 +17,7 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::notifications::watch::interest::publish_watch_interest;
 use aruna_operations::sync::document_outbox::read_outbox_records;
-use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
 use aruna_operations::tasks::incoming::OutboxDrainer;
 use aruna_storage::FjallStorage;
 use byteview::ByteView;
@@ -377,8 +377,8 @@ async fn joiner_announces_watch() {
     let (_joiner_dir, joiner_context, joiner_net) = net_context(realm_id, 11).await;
     let bootstrap_context = Arc::new(bootstrap_context);
     let joiner_context = Arc::new(joiner_context);
-    initialize_net_incoming(bootstrap_context.clone());
-    initialize_net_incoming(joiner_context.clone());
+    initialize_net_incoming_for_tests(bootstrap_context.clone());
+    initialize_net_incoming_for_tests(joiner_context.clone());
     let bootstrap_id = bootstrap_net.node_id();
     let joiner_id = joiner_net.node_id();
     write_config_nodes(
@@ -464,8 +464,8 @@ async fn retries_until_seeded() {
     let (_joiner_dir, joiner_context, joiner_net) = net_context(realm_id, 13).await;
     let bootstrap_context = Arc::new(bootstrap_context);
     let joiner_context = Arc::new(joiner_context);
-    initialize_net_incoming(bootstrap_context.clone());
-    initialize_net_incoming(joiner_context.clone());
+    initialize_net_incoming_for_tests(bootstrap_context.clone());
+    initialize_net_incoming_for_tests(joiner_context.clone());
     let bootstrap_id = bootstrap_net.node_id();
     let joiner_id = joiner_net.node_id();
     write_config_nodes(

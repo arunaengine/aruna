@@ -1245,7 +1245,7 @@ async fn pull_reaches_holder() {
     ex_holder.add_peer_addr(net.endpoint_addr()).await;
     // The ex-holder must serve inbound sync streams for the pull to reach
     // its genesis.
-    crate::sync::incoming::initialize_net_incoming(Arc::new(DriverContext {
+    crate::sync::incoming::initialize_net_incoming_for_tests(Arc::new(DriverContext {
         storage_handle: ex_storage.clone(),
         net_handle: Some(ex_holder.clone()),
         blob_handle: None,

@@ -57,7 +57,7 @@ use aruna_operations::realm::mutate_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
 };
 use aruna_operations::sync::document_outbox::read_outbox_records;
-use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use aruna_operations::tasks::incoming::{OutboxDrainer, install_and_start_task_queues};
 use aruna_storage::FjallStorage;
@@ -103,6 +103,9 @@ struct TestNode {
     _temp_dir: TempDir,
     net: NetHandle,
     context: Arc<DriverContext>,
+    /// Keeps the inbound handler's scheduled tasks tied to a live owner for
+    /// the node's whole lifetime.
+    _shutdown: aruna_core::shutdown::Shutdown,
 }
 
 #[tokio::test]
@@ -1126,24 +1129,25 @@ async fn spawn_node_configured(
         compute_handle: None,
     });
 
-    initialize_net_incoming(context.clone());
+    let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    initialize_net_holder(
+        context.clone(),
+        aruna_core::structs::RoCrateLimits::default(),
+        jobs_runtime.clone(),
+        &shutdown,
+    );
     // A node without the auto task loop leaves its outbox drain (and every other
     // timer) for the test to drive by hand.
     if start_tasks {
-        let shutdown = aruna_core::shutdown::Shutdown::new();
-        install_and_start_task_queues(
-            context.clone(),
-            task_handle,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
-            &shutdown,
-        )
-        .await;
+        install_and_start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
     }
 
     Ok(TestNode {
         _temp_dir: temp_dir,
         net,
         context,
+        _shutdown: shutdown,
     })
 }
 

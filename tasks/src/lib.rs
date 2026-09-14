@@ -272,9 +272,7 @@ impl SchedulerState {
         }
     }
 
-    fn dispatch_due_timers(&mut self, command_tx: &mpsc::WeakSender<TaskCommand>) {
-        let now = Instant::now();
-
+    fn dispatch_due_timers(&mut self, now: Instant, command_tx: &mpsc::WeakSender<TaskCommand>) {
         while let Some((&(deadline, timer_id), key)) = self.timers_by_deadline.first_key_value() {
             if deadline > now {
                 break;
@@ -296,9 +294,7 @@ impl SchedulerState {
         }
     }
 
-    fn warn_long_tasks(&mut self) {
-        let now = Instant::now();
-
+    fn warn_long_tasks(&mut self, now: Instant) {
         while let Some(&(warn_at, run_id)) = self.running_warn_deadlines.first() {
             if warn_at > now {
                 break;
@@ -321,8 +317,8 @@ impl SchedulerState {
         }
     }
 
-    fn reset_timer(&mut self, key: TaskKey, after: Duration) -> TaskEvent {
-        let Some(deadline) = Instant::now().checked_add(after) else {
+    fn reset_timer(&mut self, key: TaskKey, after: Duration, now: Instant) -> TaskEvent {
+        let Some(deadline) = now.checked_add(after) else {
             return TaskEvent::Error {
                 key: Some(key),
                 message: "timer deadline overflow".to_string(),
@@ -342,8 +338,7 @@ impl SchedulerState {
         TaskEvent::TimerScheduled { key, after }
     }
 
-    fn shorten_timer(&mut self, key: TaskKey, after: Duration) -> TaskEvent {
-        let now = Instant::now();
+    fn shorten_timer(&mut self, key: TaskKey, after: Duration, now: Instant) -> TaskEvent {
         let Some(requested_deadline) = now.checked_add(after) else {
             return TaskEvent::Error {
                 key: Some(key),
@@ -379,8 +374,7 @@ impl SchedulerState {
         TaskEvent::TimerScheduled { key, after }
     }
 
-    fn schedule_idle_timer(&mut self, key: TaskKey, after: Duration) -> TaskEvent {
-        let now = Instant::now();
+    fn schedule_idle_timer(&mut self, key: TaskKey, after: Duration, now: Instant) -> TaskEvent {
         if let Some(existing) = self.timers_by_key.get(&key) {
             return TaskEvent::TimerScheduled {
                 key,
@@ -392,7 +386,7 @@ impl SchedulerState {
             return TaskEvent::TimerScheduled { key, after };
         }
 
-        self.reset_timer(key, after)
+        self.reset_timer(key, after, now)
     }
 
     fn cancel_timer(&mut self, key: TaskKey) -> TaskEvent {
@@ -405,6 +399,7 @@ impl SchedulerState {
         run_id: u64,
         key: TaskKey,
         elapsed: Duration,
+        now: Instant,
         command_tx: &mpsc::WeakSender<TaskCommand>,
     ) {
         let Some(entry) = self.running_by_id.remove(&run_id) else {
@@ -424,7 +419,7 @@ impl SchedulerState {
         }
 
         if self.release_key(&entry.key) && self.refire_requested.remove(&entry.key) {
-            self.spawn_handler(entry.key, Instant::now(), command_tx);
+            self.spawn_handler(entry.key, now, command_tx);
         }
 
         self.notify_if_drained();
@@ -481,7 +476,12 @@ impl SchedulerState {
         TaskEvent::RunningHandlersAborted { key, count }
     }
 
-    fn handle_command(&mut self, command: TaskCommand, command_tx: &mpsc::WeakSender<TaskCommand>) {
+    fn handle_command(
+        &mut self,
+        command: TaskCommand,
+        now: Instant,
+        command_tx: &mpsc::WeakSender<TaskCommand>,
+    ) {
         match command {
             TaskCommand::SetInboundHandler { handler, response } => {
                 self.inbound_handler = Some(handler);
@@ -496,21 +496,21 @@ impl SchedulerState {
                 after,
                 response,
             } => {
-                let _ = response.send(self.reset_timer(key, after));
+                let _ = response.send(self.reset_timer(key, after, now));
             }
             TaskCommand::ShortenTimer {
                 key,
                 after,
                 response,
             } => {
-                let _ = response.send(self.shorten_timer(key, after));
+                let _ = response.send(self.shorten_timer(key, after, now));
             }
             TaskCommand::ScheduleTimerIfIdle {
                 key,
                 after,
                 response,
             } => {
-                let _ = response.send(self.schedule_idle_timer(key, after));
+                let _ = response.send(self.schedule_idle_timer(key, after, now));
             }
             TaskCommand::CancelTimer { key, response } => {
                 let _ = response.send(self.cancel_timer(key));
@@ -522,7 +522,7 @@ impl SchedulerState {
                 run_id,
                 key,
                 elapsed,
-            } => self.complete_handler(run_id, key, elapsed, command_tx),
+            } => self.complete_handler(run_id, key, elapsed, now, command_tx),
             TaskCommand::StopAdmission { response } => {
                 let _ = response.send(self.stop_admission());
             }
@@ -552,15 +552,16 @@ async fn run_scheduler(
     let mut state = SchedulerState::new(admission_closed);
 
     loop {
-        state.dispatch_due_timers(&command_tx);
-        state.warn_long_tasks();
+        let now = Instant::now();
+        state.dispatch_due_timers(now, &command_tx);
+        state.warn_long_tasks(now);
 
         match state.next_deadline() {
             Some(deadline) => {
                 tokio::select! {
                     maybe_command = command_rx.recv() => {
                         let Some(command) = maybe_command else { break };
-                        state.handle_command(command, &command_tx);
+                        state.handle_command(command, now, &command_tx);
                     }
                     _ = tokio::time::sleep_until(deadline) => {}
                 }
@@ -569,7 +570,7 @@ async fn run_scheduler(
                 let Some(command) = command_rx.recv().await else {
                     break;
                 };
-                state.handle_command(command, &command_tx);
+                state.handle_command(command, now, &command_tx);
             }
         }
     }
@@ -1578,5 +1579,100 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// Timer-decision coverage with explicit times: no runtime, spawning, or
+/// command loop is involved.
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+
+    fn state() -> SchedulerState {
+        SchedulerState::new(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn key() -> TaskKey {
+        TaskKey::RealmPresence {
+            realm_id: aruna_core::structs::RealmId([7u8; 32]),
+            node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+        }
+    }
+
+    #[test]
+    fn due_timers_dispatch_at_their_deadline_only() {
+        let mut state = state();
+        let start = Instant::now();
+        let key = key();
+        state.reset_timer(key.clone(), Duration::from_secs(10), start);
+        let (tx, _rx) = mpsc::channel(1);
+        let weak = tx.downgrade();
+
+        state.dispatch_due_timers(start + Duration::from_secs(9), &weak);
+        assert!(
+            state.timers_by_key.contains_key(&key),
+            "a timer before its deadline stays pending"
+        );
+        state.dispatch_due_timers(start + Duration::from_secs(10), &weak);
+        assert!(
+            !state.timers_by_key.contains_key(&key),
+            "a timer dispatches at its deadline"
+        );
+    }
+
+    #[test]
+    fn shorten_replaces_only_earlier_deadlines() {
+        let mut state = state();
+        let start = Instant::now();
+        let key = key();
+        state.reset_timer(key.clone(), Duration::from_secs(10), start);
+
+        state.shorten_timer(key.clone(), Duration::from_secs(30), start);
+        assert_eq!(
+            state.timers_by_key.get(&key).unwrap().deadline,
+            start + Duration::from_secs(10),
+            "a later request keeps the existing deadline"
+        );
+        state.shorten_timer(key.clone(), Duration::from_secs(5), start);
+        assert_eq!(
+            state.timers_by_key.get(&key).unwrap().deadline,
+            start + Duration::from_secs(5),
+            "an earlier request replaces the deadline"
+        );
+    }
+
+    #[test]
+    fn idle_timer_respects_running_key() {
+        let mut state = state();
+        let start = Instant::now();
+        let key = key();
+        state.in_flight_keys.insert(key.clone(), 1);
+        state.schedule_idle_timer(key.clone(), Duration::from_secs(1), start);
+        assert!(
+            state.timers_by_key.is_empty(),
+            "a key with a running handler gets no idle timer"
+        );
+
+        state.release_key(&key);
+        let event = state.schedule_idle_timer(key.clone(), Duration::from_secs(1), start);
+        assert!(matches!(event, TaskEvent::TimerScheduled { .. }));
+        assert!(state.timers_by_key.contains_key(&key));
+    }
+
+    #[test]
+    fn cancel_removes_both_indexes() {
+        let mut state = state();
+        let start = Instant::now();
+        let key = key();
+        state.reset_timer(key.clone(), Duration::from_secs(10), start);
+        assert!(!state.timers_by_deadline.is_empty());
+
+        state.cancel_timer(key.clone());
+
+        assert!(state.timers_by_key.is_empty());
+        assert!(
+            state.timers_by_deadline.is_empty(),
+            "a cancelled timer leaves no deadline entry"
+        );
     }
 }
