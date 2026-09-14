@@ -12,7 +12,7 @@ use aruna_api::routes::credentials::{
     CreateS3CredentialsRequest, CreateS3CredentialsResponse, CreateS3PathRestriction,
 };
 use aruna_api::routes::groups::{CreateGroupRequest, CreateGroupResponse, GroupInfoResponse};
-use aruna_api::s3::server::{S3Server, S3ServerTimeouts};
+use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
@@ -163,7 +163,7 @@ pub(crate) struct SeedNode {
     pub(crate) readiness: Readiness,
     pub(crate) s3: Option<S3Endpoint>,
     server_task: JoinHandle<()>,
-    s3_task: Option<JoinHandle<()>>,
+    s3_task: Option<S3ServerHandle>,
     ops_task: JoinHandle<()>,
 }
 
@@ -178,7 +178,7 @@ impl SeedNode {
         let _ = self.server_task.await;
         let _ = self.ops_task.await;
         if let Some(s3_task) = self.s3_task {
-            let _ = s3_task.await;
+            s3_task.wait().await;
         }
         hang_cap("seed net shutdown", self.net.shutdown()).await;
     }
@@ -193,7 +193,7 @@ pub(crate) struct JoinerNode {
     pub(crate) base_url: String,
     pub(crate) s3: Option<S3Endpoint>,
     server_task: JoinHandle<()>,
-    s3_task: Option<JoinHandle<()>>,
+    s3_task: Option<S3ServerHandle>,
 }
 
 impl JoinerNode {
@@ -205,7 +205,7 @@ impl JoinerNode {
         }
         let _ = self.server_task.await;
         if let Some(s3_task) = self.s3_task {
-            let _ = s3_task.await;
+            s3_task.wait().await;
         }
         hang_cap("joiner net shutdown", self.net.shutdown()).await;
     }
@@ -1010,7 +1010,7 @@ async fn spawn_optional_s3(
     realm_id: RealmId,
     node_id: iroh::PublicKey,
     metrics: Arc<NodeMetrics>,
-) -> TestResult<(Option<S3Endpoint>, Option<JoinHandle<()>>)> {
+) -> TestResult<(Option<S3Endpoint>, Option<S3ServerHandle>)> {
     if mode != NodeServiceMode::Full {
         return Ok((None, None));
     }
@@ -1024,7 +1024,7 @@ async fn spawn_s3_server(
     realm_id: RealmId,
     node_id: iroh::PublicKey,
     metrics: Arc<NodeMetrics>,
-) -> TestResult<(S3Endpoint, JoinHandle<()>)> {
+) -> TestResult<(S3Endpoint, S3ServerHandle)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let bind_addr = listener.local_addr()?;
     let address = bind_addr.to_string();

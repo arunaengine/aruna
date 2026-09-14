@@ -725,13 +725,14 @@ impl S3Server {
         self
     }
 
-    /// Accepts until `shutdown` is cancelled. Connection tasks are tracked, so
-    /// the returned handle only resolves once every request has finished.
+    /// Accepts until `shutdown` is cancelled. Connection tasks are tracked by
+    /// the returned handle, so both graceful and forced shutdown can await
+    /// every child's release instead of detaching it with the accept task.
     pub fn run_with_listener(
         self,
         listener: TcpListener,
         shutdown: CancellationToken,
-    ) -> Result<(SocketAddr, JoinHandle<()>), S3ServerError> {
+    ) -> Result<(SocketAddr, S3ServerHandle), S3ServerError> {
         let local_addr = listener.local_addr()?;
         let connection_limit = self.connection_limit.clone();
         let timeouts = self.timeouts;
@@ -758,10 +759,12 @@ impl S3Server {
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(timeouts.initial_request);
         let connections = TaskTracker::new();
+        let connection_tracker = connections.clone();
         let abort_connections = CancellationToken::new();
+        let server_abort = abort_connections.clone();
 
         let server = async move {
-            let _abort_connections = abort_connections.clone().drop_guard();
+            let _abort_connections = server_abort.clone().drop_guard();
             loop {
                 let (socket, peer) = tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -788,8 +791,8 @@ impl S3Server {
                 service.activity = Some(activity.clone());
                 let builder = connection.clone();
                 let connection_shutdown = shutdown.clone();
-                let connection_abort = abort_connections.clone();
-                connections.spawn(async move {
+                let connection_abort = server_abort.clone();
+                connection_tracker.spawn(async move {
                     let _permit = permit;
                     let conn = builder.serve_connection(TokioIo::new(socket), service);
                     let mut conn = std::pin::pin!(conn);
@@ -811,25 +814,70 @@ impl S3Server {
                 });
             }
 
-            connections.close();
-            let in_flight = connections.len();
+            connection_tracker.close();
+            let in_flight = connection_tracker.len();
             if in_flight > 0 {
                 info!(in_flight, "Draining in-flight S3 connections");
             }
-            connections.wait().await;
+            connection_tracker.wait().await;
         };
 
         let task = tokio::spawn(server);
         info!("server is running at http://{local_addr}");
 
-        Ok((local_addr, task))
+        Ok((
+            local_addr,
+            S3ServerHandle {
+                task,
+                connections,
+                abort_connections,
+            },
+        ))
     }
 
     #[tracing::instrument(level = "trace", skip(self, shutdown))]
-    pub async fn run(self, shutdown: CancellationToken) -> Result<JoinHandle<()>, S3ServerError> {
+    pub async fn run(self, shutdown: CancellationToken) -> Result<S3ServerHandle, S3ServerError> {
         let listener = TcpListener::bind(&self.address).await?;
-        let (_, task) = self.run_with_listener(listener, shutdown)?;
-        Ok(task)
+        let (_, handle) = self.run_with_listener(listener, shutdown)?;
+        Ok(handle)
+    }
+}
+
+/// Completion boundary for one bound S3 server. The accept task and the
+/// connection tracker are separate owners: aborting the accept task still
+/// leaves every connection child tracked here, so a forced shutdown awaits
+/// their release instead of detaching them with the aborted future.
+pub struct S3ServerHandle {
+    task: JoinHandle<()>,
+    connections: TaskTracker,
+    abort_connections: CancellationToken,
+}
+
+impl S3ServerHandle {
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    /// Stops accepting and asks every connection to close; does not wait.
+    pub fn abort(&self) {
+        self.abort_connections.cancel();
+        self.task.abort();
+    }
+
+    /// Resolves when the accept loop exits, for supervision selects.
+    pub async fn exit(&mut self, label: &str) -> String {
+        match (&mut self.task).await {
+            Ok(()) => format!("{label} server stopped unexpectedly"),
+            Err(error) if error.is_cancelled() => format!("{label} server aborted"),
+            Err(error) => format!("{label} server panicked: {error}"),
+        }
+    }
+
+    /// Waits for the accept loop and every connection task to release.
+    pub async fn wait(self) {
+        let _ = self.task.await;
+        self.connections.close();
+        self.connections.wait().await;
     }
 }
 
@@ -1152,5 +1200,82 @@ mod tests {
         let ip = std::net::IpAddr::from([127, 0, 0, 1]);
         assert!(server.rate_limits.check_ip(ip).is_ok());
         assert!(server.rate_limits.check_ip(ip).is_err());
+    }
+
+    // The handle reports how its accept loop ended, including cancellation and
+    // panic, so supervision selects keep their named failure messages.
+    #[tokio::test]
+    async fn exit_reports_stop_abort_and_panic() {
+        let handle = |task| S3ServerHandle {
+            task,
+            connections: TaskTracker::new(),
+            abort_connections: CancellationToken::new(),
+        };
+
+        let mut stopped = handle(tokio::spawn(async {}));
+        assert_eq!(stopped.exit("S3").await, "S3 server stopped unexpectedly");
+
+        let mut aborted = handle(tokio::spawn(std::future::pending::<()>()));
+        aborted.task.abort();
+        assert_eq!(aborted.exit("S3").await, "S3 server aborted");
+
+        let mut panicked = handle(tokio::spawn(async { panic!("boom") }));
+        assert!(panicked.exit("S3").await.contains("S3 server panicked"));
+    }
+
+    // A forced abort must still own every accepted connection: `wait` resolves
+    // only after the connection children released, not merely after the accept
+    // task was cancelled.
+    #[tokio::test]
+    async fn forced_abort_waits_for_accepted_connections() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap())
+            .expect("test storage");
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let node_id = iroh::SecretKey::from_bytes(&[0x56; 32]).public();
+        let server = S3Server::new(
+            "127.0.0.1:0",
+            "localhost".to_string(),
+            driver_ctx,
+            RealmId([0x56; 32]),
+            node_id,
+            CredentialEncryptionKey::random(),
+            Default::default(),
+            crate::cors::CorsConfig::default(),
+            Arc::new(NodeMetrics::new()),
+        )
+        .await
+        .expect("s3 server builds");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let (_bound, handle) = server
+            .run_with_listener(listener, CancellationToken::new())
+            .expect("server runs");
+
+        // One accepted connection with a partial request keeps a connection
+        // child active; the short wait is the OS boundary, not a schedule guess.
+        let mut socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        socket
+            .write_all(b"GET /bucket/key HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .expect("partial request");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        handle.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait())
+            .await
+            .expect("a forced abort must await every connection child");
     }
 }

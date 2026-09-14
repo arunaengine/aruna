@@ -102,12 +102,14 @@ pub struct NodeShutdown {
     pub readiness: Readiness,
     /// `None` once a server has already terminated on its own.
     pub rest: Option<JoinHandle<Result<(), ServerSetupError>>>,
-    pub s3: Option<JoinHandle<()>>,
+    /// S3 keeps its connection children owned by this handle, so both the
+    /// graceful join and the forced abort await their release.
+    pub s3: Option<aruna_api::s3::server::S3ServerHandle>,
     /// Portal SPA listener; drains with the other ingress listeners and is
     /// absent when no portal is configured.
     pub portal: Option<JoinHandle<()>>,
     /// Optional session bridge listener; joined with the other ingress tasks.
-    pub session_s3: Option<JoinHandle<()>>,
+    pub session_s3: Option<aruna_api::s3::server::S3ServerHandle>,
     /// The monitoring refresher owner. Its sampler is cancelled and awaited
     /// before storage closes; the ops HTTP task above stays separate.
     pub monitoring: Option<Arc<MonitoringState>>,
@@ -146,18 +148,16 @@ impl NodeShutdown {
                 let _ = rest.await;
             }
             rest = None;
-            if let Some(s3) = s3.as_mut() {
-                let _ = s3.await;
+            if let Some(s3) = s3.take() {
+                s3.wait().await;
             }
-            s3 = None;
             if let Some(portal) = portal.as_mut() {
                 let _ = portal.await;
             }
             portal = None;
-            if let Some(session_s3) = session_s3.as_mut() {
-                let _ = session_s3.await;
+            if let Some(session_s3) = session_s3.take() {
+                session_s3.wait().await;
             }
-            session_s3 = None;
             ingress_complete = true;
         })
         .await;
@@ -177,14 +177,16 @@ impl NodeShutdown {
             if let Some(rest) = rest {
                 let _ = rest.await;
             }
+            // The S3 abort already cancelled its connections; waiting proves
+            // every connection child released before the sequence continues.
             if let Some(s3) = s3 {
-                let _ = s3.await;
+                s3.wait().await;
             }
             if let Some(portal) = portal {
                 let _ = portal.await;
             }
             if let Some(session_s3) = session_s3 {
-                let _ = session_s3.await;
+                session_s3.wait().await;
             }
         }
 
@@ -334,6 +336,9 @@ impl NodeShutdown {
         );
         if let Some(ops) = self.ops {
             ops.abort();
+            // Awaiting the aborted task proves its resources released instead
+            // of detaching behind the final wipe path.
+            let _ = ops.await;
         }
         drop(watchdog);
     }
@@ -696,10 +701,11 @@ mod tests {
         assert_eq!(storage_handle.rejected_writes(), 0);
     }
 
-    // The optional session listener is joined with the other ingress tasks
-    // instead of being left to its cancellation token.
+    // Ingress listeners driven by the shutdown token are joined with the
+    // sequence instead of being left to their cancellation token. S3 handles
+    // carry their connection tracker and are covered in the listener tests.
     #[tokio::test]
-    async fn session_listener_joined_on_shutdown() {
+    async fn portal_listener_joined_on_shutdown() {
         let dir = tempdir().expect("temp dir");
         let storage_handle = open_storage(&dir);
         let shutdown = Shutdown::new();
@@ -713,7 +719,7 @@ mod tests {
         });
 
         let mut sequence = node_shutdown(shutdown.clone(), storage_handle.clone());
-        sequence.session_s3 = Some(handle);
+        sequence.portal = Some(handle);
 
         sequence.run().await;
 
