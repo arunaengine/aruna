@@ -2608,7 +2608,7 @@ mod tests {
 
     #[tokio::test]
     async fn creates_data_volume() {
-        // A session with a workspace gets its data mount PV and PVC.
+        // A session with a workspace and a recorded mount gets its data PV and PVC.
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = seen.clone();
         let client = fake_client(move |method, path| {
@@ -2644,6 +2644,13 @@ mod tests {
             s3_endpoint: "https://s3.example".to_string(),
             bucket_name: "workspace-bucket".to_string(),
             region: String::new(),
+        });
+        backend.ensure_data(&context(), &spec).await.unwrap();
+        assert!(seen.lock().expect("read requests").is_empty());
+
+        spec.session_mount = Some(aruna_core::compute::SessionMount {
+            prefix: "data/".to_string(),
+            path: "/work/data".to_string(),
         });
         backend.ensure_data(&context(), &spec).await.unwrap();
         assert_eq!(
