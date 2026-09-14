@@ -3071,10 +3071,7 @@ fn materialized_apply_traces_to_finalize() {
     assert_eq!(op.state, IncomingVersionReplicationState::Finish);
     assert!(op.is_complete());
 
-    let result = op
-        .finalize()
-        .expect("trace finalizes")
-        .expect("trace commits successfully");
+    let result = op.finalize().expect("trace commits successfully");
     assert!(result.applied);
     assert_eq!(result.group_id, Some(group_id));
 }
@@ -3180,10 +3177,7 @@ fn delete_marker_apply_traces_to_finalize() {
     op.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
     assert_eq!(op.state, IncomingVersionReplicationState::Finish);
 
-    let result = op
-        .finalize()
-        .expect("trace finalizes")
-        .expect("delete marker commits successfully");
+    let result = op.finalize().expect("delete marker commits successfully");
     assert!(result.applied);
     assert_eq!(result.group_id, Some(group_id));
 }
@@ -3220,10 +3214,7 @@ fn rejected_negotiation_traces_to_finalize() {
     op.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
     assert_eq!(op.state, IncomingVersionReplicationState::Finish);
 
-    let result = op
-        .finalize()
-        .expect("trace finalizes")
-        .expect("rejection is a clean result");
+    let result = op.finalize().expect("rejection is a clean result");
     assert!(!result.applied);
     assert_eq!(result.group_id, Some(group_id));
 }
@@ -3286,4 +3277,51 @@ fn reclaim_candidate_stamps_enqueue_time_after_long_apply() {
     let candidate = aruna_core::structs::ReclaimCandidate::from_bytes(value.as_ref()).unwrap();
     assert_eq!(candidate.enqueued_at, enqueued_at);
     assert_ne!(candidate.enqueued_at, started_at);
+}
+
+// Finalization before a terminal state is an explicit error. A fresh receiver
+// and every in-flight negotiation, transfer, and commit phase must not report
+// the applied default.
+#[test]
+fn premature_finalize_is_rejected_in_every_nonterminal_state() {
+    for state in [
+        IncomingVersionReplicationState::Init,
+        IncomingVersionReplicationState::SendNegotiation,
+        IncomingVersionReplicationState::ReceiveBlob,
+        IncomingVersionReplicationState::CommitTransaction,
+        IncomingVersionReplicationState::ReleaseReservation,
+        IncomingVersionReplicationState::CloseConnection,
+    ] {
+        let mut op = IncomingVersionReplicationOperation::new(
+            trace_stream_id(),
+            iroh::SecretKey::from_bytes(&[0x30; 32]).public(),
+            test_realm_id(),
+            make_manifest(ReplicationItemKind::Materialized),
+        )
+        .with_clock(fixed_trace_clock);
+        op.state = state.clone();
+        assert_eq!(
+            op.finalize(),
+            Err(IncomingVersionReplicationError::NotFinished),
+            "{state:?} must reject finalization"
+        );
+    }
+}
+
+// A failure recorded through the operation's own failure path reaches
+// finalization as the operation error, not as a successful default.
+#[test]
+fn failed_state_finalizes_to_the_recorded_error() {
+    let mut op = IncomingVersionReplicationOperation::new(
+        trace_stream_id(),
+        iroh::SecretKey::from_bytes(&[0x30; 32]).public(),
+        test_realm_id(),
+        make_manifest(ReplicationItemKind::Materialized),
+    )
+    .with_clock(fixed_trace_clock);
+    op.fail(IncomingVersionReplicationError::RealmMismatch);
+    assert_eq!(
+        op.finalize(),
+        Err(IncomingVersionReplicationError::RealmMismatch)
+    );
 }

@@ -755,7 +755,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                                                 op = op.with_gate(gate);
                                             }
                                             match drive(op, self.context.as_ref()).await {
-                                                Ok(Ok(result)) => {
+                                                Ok(result) => {
                                                     emit_replication_watch(
                                                         self.context.as_ref(),
                                                         net_handle.node_id(),
@@ -764,7 +764,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                                                     )
                                                     .await;
                                                 }
-                                                Ok(Err(err)) | Err(err) => {
+                                                Err(err) => {
                                                     error!(error = ?err, "Failed to process inbound version replication stream");
                                                     close_failed_bao(&blob_handle, stream_id).await;
                                                 }
