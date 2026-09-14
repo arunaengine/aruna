@@ -929,8 +929,6 @@ pub(crate) mod test {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         let pulled = Arc::new(AtomicU64::new(0));

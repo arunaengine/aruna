@@ -1001,8 +1001,6 @@ async fn stage_one(
         &context,
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?
-    .ok_or(ServerError::NotFound)?
     .map_err(head_error)?;
     // A stored source deduplicates inline whatever was asked. A reference is
     // either queued for its pull or kept as a reference, which moves no byte.

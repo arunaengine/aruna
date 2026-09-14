@@ -170,7 +170,7 @@ pub async fn write_reference_version(
         .await?;
         policies.extend(write.inherited_policies.iter().copied());
         if let Some((connector, fingerprint)) = write.connector_guard.as_ref() {
-            guard_resolved_connector_unchanged(context, txn_id, connector, *fingerprint).await?;
+            guard_connector_unchanged(context, txn_id, connector, *fingerprint).await?;
         }
 
         let existing_pointer =

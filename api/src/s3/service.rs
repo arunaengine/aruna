@@ -62,10 +62,9 @@ use aruna_operations::s3::bucket_cors::{
 };
 use aruna_operations::s3::complete_upload::{
     CompleteMultipartUploadInput as CMUI, CompleteMultipartUploadOperation,
-    CompleteMultipartUploadResult,
 };
 use aruna_operations::s3::copy_object::{
-    CopyObjectInput as CopyObjectData, CopyReferences, CopySourceConditions, copy_object,
+    CopyObjectInput as CopyObjectData, CopyReferences, copy_object,
 };
 use aruna_operations::s3::copy_part::{
     UploadPartCopyInput as UploadPartCopyData, upload_part_copy,

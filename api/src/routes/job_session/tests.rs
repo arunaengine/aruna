@@ -609,7 +609,7 @@ async fn seed_group(state: &Arc<ServerState>, owner: UserId, member: bool) -> Ul
         user_id: owner,
         realm_id,
     };
-    let mut auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+    let mut auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
     if !member {
         for role in auth.roles.values_mut() {
             role.assigned_users.remove(&owner);
@@ -628,7 +628,7 @@ async fn seed_group(state: &Arc<ServerState>, owner: UserId, member: bool) -> Ul
         storage,
         AUTH_KEYSPACE,
         (*realm_id.as_bytes()).into(),
-        RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+        RealmAuthorizationDocument::default_realm_doc(realm_id)
             .to_bytes(&actor)
             .unwrap(),
     )

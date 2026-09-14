@@ -166,7 +166,8 @@ fn reference_always_has_etag_and_date() {
         source_version: None,
     };
 
-    let fields = service.build_response_fields(None, None, None, Some(&bare), Some(refreshed), None);
+    let fields =
+        service.build_response_fields(None, None, None, Some(&bare), Some(refreshed), None);
     let ETag::Strong(derived) = fields.e_tag.clone().expect("an etag is derived") else {
         panic!("a derived etag is strong");
     };
