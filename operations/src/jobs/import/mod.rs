@@ -1687,9 +1687,9 @@ fn validation_message(violations: &[MetadataValidationViolation]) -> String {
 }
 
 /// Why a backend blob write failed, as far as the import may decide on it. The
-/// S3 layer reports these faults as message strings, so the import classifies the
-/// causes it recognizes beside the decision it makes; a cause it does not know
-/// stays retryable.
+/// typed blob error carries the cause from where it was identified; no local
+/// error text is interpreted, so wording cannot flip permanence. A cause the
+/// import does not know stays retryable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlobWriteFailure {
     /// An integrity fault the source bytes will not heal by retrying.
@@ -1703,34 +1703,25 @@ enum BlobWriteFailure {
 }
 
 impl BlobWriteFailure {
-    fn classify(message: &str) -> Self {
-        if message.contains("checksum") {
-            Self::Checksum
-        } else if message.contains("Content-Length") {
-            Self::ContentLength
-        } else {
-            Self::Unknown
-        }
-    }
-
     fn retryable(self) -> bool {
         matches!(self, Self::Unknown)
     }
 }
 
-/// The import's retry decision for a frozen blob write fault. The typed variant
-/// decides first; only a backend message is interpreted, and only to recognize
-/// the backend's own integrity wording.
+/// The import's retry decision for a frozen blob write fault, taken from the
+/// typed cause. Integrity and client-body faults are permanent; transport,
+/// setup, cleanup, and storage faults stay retryable.
 fn backend_blob_failure(error: &BlobError) -> BlobWriteFailure {
     match error {
-        BlobError::WriteError(message)
-        | BlobError::WriteCleanup { message, .. }
-        | BlobError::OperatorCreationFailed(message)
-        | BlobError::OutboardCreationFailed(message)
-        | BlobError::MakeBucketError(message)
-        | BlobError::ConnectionFailed(message) => BlobWriteFailure::classify(message),
+        BlobError::IntegrityCheckFailed(_) => BlobWriteFailure::Checksum,
         BlobError::SizeLimitExceeded { .. } => BlobWriteFailure::ContentLength,
         BlobError::StreamFailed(_) => BlobWriteFailure::ClientBody,
+        BlobError::WriteError(_)
+        | BlobError::WriteCleanup { .. }
+        | BlobError::OperatorCreationFailed(_)
+        | BlobError::OutboardCreationFailed(_)
+        | BlobError::MakeBucketError(_)
+        | BlobError::ConnectionFailed(_) => BlobWriteFailure::Unknown,
         _ => BlobWriteFailure::Unknown,
     }
 }
@@ -1787,12 +1778,14 @@ fn classify_read(error: ReadStagingSourceError) -> ImportFailure {
 }
 
 fn classify_blob(error: BlobError) -> ImportFailure {
-    match error {
+    match &error {
         BlobError::SizeLimitExceeded { limit } => {
             ImportFailure::Permanent(format!("import source exceeds limit {limit}"))
         }
-        error @ BlobError::StreamFailed(_) => ImportFailure::Permanent(error.to_string()),
-        error => ImportFailure::Retryable(error.to_string()),
+        BlobError::IntegrityCheckFailed(_) | BlobError::StreamFailed(_) => {
+            ImportFailure::Permanent(error.to_string())
+        }
+        _ => ImportFailure::Retryable(error.to_string()),
     }
 }
 
@@ -1963,49 +1956,57 @@ pub(crate) mod tests {
 
     // A source that keeps changing can settle, but a dropped historical
     // observation and an exhausted binding never heal by retrying.
-    // The S3 layer reports blob-write faults as strings; the fixture table pins
-    // which of them the import treats as permanent and which stay retryable.
+    // The typed blob cause decides permanence; local wording never does.
     #[test]
     fn classifies_blob_write_failures() {
-        let fixtures = [
+        let cases = [
             (
-                "checksum mismatch for sha256",
+                BlobError::IntegrityCheckFailed("sha256 mismatch".to_string()),
                 BlobWriteFailure::Checksum,
                 false,
             ),
             (
-                "Content-Length 12 does not match 13",
+                BlobError::SizeLimitExceeded { limit: 5 },
                 BlobWriteFailure::ContentLength,
                 false,
             ),
-            ("No space left on device", BlobWriteFailure::Unknown, true),
-            ("connection reset by peer", BlobWriteFailure::Unknown, true),
+            (
+                BlobError::StreamFailed("checksum mismatch".to_string()),
+                BlobWriteFailure::ClientBody,
+                false,
+            ),
+            (
+                BlobError::WriteError("checksum mismatch for sha256".to_string()),
+                BlobWriteFailure::Unknown,
+                true,
+            ),
+            (
+                BlobError::ConnectionFailed("connection reset by peer".to_string()),
+                BlobWriteFailure::Unknown,
+                true,
+            ),
         ];
-        for (message, expected, retryable) in fixtures {
-            assert_eq!(BlobWriteFailure::classify(message), expected, "{message}");
-            assert_eq!(expected.retryable(), retryable, "{message}");
+        for (error, expected, retryable) in cases {
+            assert_eq!(backend_blob_failure(&error), expected, "{error:?}");
+            assert_eq!(expected.retryable(), retryable, "{error:?}");
         }
 
-        assert!(matches!(
-            classify_put(PutObjectError::BlobWriteFailed(BlobError::WriteError(
-                "checksum mismatch for sha256".to_string()
-            ))),
-            ImportFailure::Permanent(_)
-        ));
-        assert!(matches!(
-            classify_put(PutObjectError::BlobWriteFailed(BlobError::WriteError(
-                "No space left on device".to_string()
-            ))),
-            ImportFailure::Retryable(_)
-        ));
-        // A typed fault decides before any wording: the same backend text on a
-        // client/body fault stays permanent, and a punctuation change cannot
-        // flip a local cause.
+        // A generic write fault stays retryable whatever its text says, so a
+        // punctuation or wording change cannot flip its permanence.
         for wording in [
             "No space left on device",
             "no space left on device!",
             "checksum mismatch",
         ] {
+            assert!(
+                matches!(
+                    classify_put(PutObjectError::BlobWriteFailed(BlobError::WriteError(
+                        wording.to_string()
+                    ))),
+                    ImportFailure::Retryable(_)
+                ),
+                "{wording}"
+            );
             assert!(matches!(
                 classify_put(PutObjectError::BlobWriteFailed(BlobError::StreamFailed(
                     wording.to_string()
@@ -2021,6 +2022,12 @@ pub(crate) mod tests {
             assert!(matches!(
                 classify_put(PutObjectError::BlobWriteFailed(BlobError::ChannelClosed)),
                 ImportFailure::Retryable(_)
+            ));
+            assert!(matches!(
+                classify_put(PutObjectError::BlobWriteFailed(
+                    BlobError::IntegrityCheckFailed(wording.to_string())
+                )),
+                ImportFailure::Permanent(_)
             ));
         }
     }
