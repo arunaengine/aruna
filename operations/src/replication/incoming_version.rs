@@ -192,6 +192,8 @@ pub enum IncomingVersionReplicationError {
     ExistingBlobChanged,
     #[error("Replaced multipart metadata exceeds the supported part limit")]
     MultipartMetadataOverflow,
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -443,7 +445,7 @@ impl IncomingVersionReplicationOperation {
 }
 
 impl Operation for IncomingVersionReplicationOperation {
-    type Output = Result<IncomingVersionReplicationResult, IncomingVersionReplicationError>;
+    type Output = IncomingVersionReplicationResult;
     type Error = IncomingVersionReplicationError;
 
     fn start(&mut self) -> Effects {
@@ -638,11 +640,25 @@ impl Operation for IncomingVersionReplicationOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
+        // Only a terminal state carries an outcome; a premature finalize is an
+        // explicit error rather than a successful default.
+        if !matches!(
+            self.state,
+            IncomingVersionReplicationState::Finish | IncomingVersionReplicationState::Error
+        ) {
+            return Err(IncomingVersionReplicationError::NotFinished);
+        }
         let default = self.result(self.apply_committed);
-        let output = self.output.unwrap_or(Ok(default));
-        match (self.state, output) {
-            (IncomingVersionReplicationState::Error, Err(error)) => Err(error),
-            (_, output) => Ok(output),
+        match (self.state, self.output) {
+            (_, Some(Ok(output))) => Ok(output),
+            (_, Some(Err(error))) => Err(error),
+            (IncomingVersionReplicationState::Finish, None) => Ok(default),
+            (IncomingVersionReplicationState::Error, None) => {
+                Err(IncomingVersionReplicationError::ReplicationError(
+                    ReplicationError::ReplicationFailed,
+                ))
+            }
+            _ => unreachable!("nonterminal states are rejected before the outcome is read"),
         }
     }
 

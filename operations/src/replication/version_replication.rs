@@ -702,8 +702,8 @@ impl ReplicateScopeOperation {
             operation,
             |result| Event::SubOperation(SubOperationEvent::ReplicationItemResult {
                 result: match result {
-                    Ok(Ok(value)) => Ok(value),
-                    Ok(Err(error)) | Err(error) => Err(ReplicationItemError {
+                    Ok(value) => Ok(value),
+                    Err(error) => Err(ReplicationItemError {
                         failure: error.failure_category(),
                         message: error.to_string(),
                     }),
@@ -1012,6 +1012,8 @@ pub enum ReplicateObjectVersionError {
     MissingBlobHash,
     #[error("Multipart metadata incomplete: expected {expected} parts, found {actual}")]
     MultipartPartCountMismatch { expected: usize, actual: usize },
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -2597,7 +2599,7 @@ impl ReplicateObjectVersionOperation {
 }
 
 impl Operation for ReplicateObjectVersionOperation {
-    type Output = Result<ReplicationSuboperationResult, ReplicateObjectVersionError>;
+    type Output = ReplicationSuboperationResult;
     type Error = ReplicateObjectVersionError;
 
     fn start(&mut self) -> Effects {
@@ -2670,13 +2672,16 @@ impl Operation for ReplicateObjectVersionOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ReplicateObjectVersionState::Error {
-            return match self.result {
+        // Only a terminal state carries an outcome; an unstarted or in-flight
+        // operation must not report a successful default.
+        match self.state {
+            ReplicateObjectVersionState::Finish => self.result,
+            ReplicateObjectVersionState::Error => match self.result {
                 Ok(_) => Err(ReplicateObjectVersionError::VersionNotFound),
                 Err(err) => Err(err),
-            };
+            },
+            _ => Err(ReplicateObjectVersionError::NotFinished),
         }
-        Ok(self.result)
     }
 
     fn abort(&mut self) -> Effects {
@@ -2695,8 +2700,9 @@ impl Operation for ReplicateObjectVersionOperation {
 mod tests {
     use super::{
         MAX_SCOPE_VERSIONS, ReplicateObjectVersionError, ReplicateObjectVersionOperation,
-        ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
-        ReplicationFailure, ReplicationVersion, SourceAuthorization, SyncTransferContext,
+        ReplicateObjectVersionState, ReplicateScopeError, ReplicateScopeInput,
+        ReplicateScopeOperation, ReplicateScopeState, ReplicateScopeTarget, ReplicationFailure,
+        ReplicationVersion, SourceAuthorization, SyncTransferContext,
     };
     use crate::driver::DriverContext;
     use crate::replication::protocol::{
@@ -3093,7 +3099,7 @@ mod tests {
     #[test]
     fn scope_dedups_versions() {
         let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
-        op.state = super::ReplicateScopeState::IterateVersions;
+        op.state = ReplicateScopeState::IterateVersions;
         let version_id = Ulid::from_bytes([1u8; 16]);
         let cursor: aruna_core::types::Key = vec![9u8].into();
 
@@ -3115,7 +3121,7 @@ mod tests {
         // A page pushing the examined total past the budget is rejected before
         // any of its versions are enqueued.
         let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
-        op.state = super::ReplicateScopeState::IterateVersions;
+        op.state = ReplicateScopeState::IterateVersions;
         let values = (0..=MAX_SCOPE_VERSIONS)
             .map(|index| {
                 version_entry(
@@ -3131,7 +3137,7 @@ mod tests {
         }));
 
         assert!(effects.is_empty());
-        assert_eq!(op.state, super::ReplicateScopeState::Error);
+        assert_eq!(op.state, ReplicateScopeState::Error);
         assert!(op.pending_versions.is_empty());
         assert_eq!(
             op.output,
@@ -3141,55 +3147,98 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scope_finalize_is_explicit_before_completion() {
-        let op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
-        assert_eq!(op.finalize(), Err(ReplicateScopeError::NotFinished));
-    }
+    /// Pure start/step/finalize coverage for the scope and one-version
+    /// operations. These tests use fixed inputs and no runtime, storage, or
+    /// network; they are part of the audited fast selection.
+    mod state_machine_tests {
+        use super::*;
 
-    #[test]
-    fn scope_finalize_reports_a_failed_child_item() {
-        // Malformed or refused child output is recorded and still finalizes to
-        // the scope result, never to a successful absence.
-        let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
-        op.state = super::ReplicateScopeState::RunVersionReplication;
+        #[test]
+        fn scope_finalize_is_explicit_before_completion() {
+            let op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+            assert_eq!(op.finalize(), Err(ReplicateScopeError::NotFinished));
+        }
 
-        let effects = op.step(Event::SubOperation(
-            SubOperationEvent::ReplicationItemResult {
-                result: Err(ReplicationItemError {
-                    failure: ReplicationFailure::AccessDenied,
-                    message: "denied".to_string(),
-                }),
-            },
-        ));
+        // An unstarted or in-flight version push must never finalize to the
+        // initialized `Replicated` default; only a terminal state carries a result.
+        #[test]
+        fn object_version_finalize_rejects_nonterminal_states() {
+            for state in [
+                ReplicateObjectVersionState::Init,
+                ReplicateObjectVersionState::SendManifest,
+                ReplicateObjectVersionState::AwaitNegotiation,
+                ReplicateObjectVersionState::TransferBlob,
+                ReplicateObjectVersionState::AwaitApplyComplete,
+                ReplicateObjectVersionState::CloseConnection,
+            ] {
+                let mut op =
+                    ReplicateObjectVersionOperation::new(version_request(Ulid::from_parts(11, 11)));
+                op.state = state.clone();
+                assert_eq!(
+                    op.finalize(),
+                    Err(ReplicateObjectVersionError::NotFinished),
+                    "{state:?} must reject finalization"
+                );
+            }
+        }
 
-        assert!(effects.is_empty());
-        assert_eq!(op.state, super::ReplicateScopeState::Finish);
-        assert_eq!(op.result.failed, 1);
-        assert_eq!(op.result.failure, Some(ReplicationFailure::AccessDenied));
-        let expected = op.result.clone();
-        assert_eq!(op.finalize(), Ok(expected));
-    }
+        // A recorded failure survives finalization through the operation error
+        // boundary instead of being reported as a successful outcome.
+        #[test]
+        fn object_version_finalize_returns_recorded_failure() {
+            let mut op =
+                ReplicateObjectVersionOperation::new(version_request(Ulid::from_parts(12, 12)));
+            op.fail(ReplicateObjectVersionError::VersionNotFound);
+            assert_eq!(
+                op.finalize(),
+                Err(ReplicateObjectVersionError::VersionNotFound)
+            );
+        }
 
-    #[test]
-    fn scope_counts_bytes_finalizes_success() {
-        let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
-        op.state = super::ReplicateScopeState::RunVersionReplication;
+        #[test]
+        fn scope_finalize_reports_a_failed_child_item() {
+            // Malformed or refused child output is recorded and still finalizes to
+            // the scope result, never to a successful absence.
+            let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+            op.state = ReplicateScopeState::RunVersionReplication;
 
-        op.step(Event::SubOperation(
-            SubOperationEvent::ReplicationItemResult {
-                result: Ok(ReplicationSuboperationResult::ReplicatedBytes(42)),
-            },
-        ));
+            let effects = op.step(Event::SubOperation(
+                SubOperationEvent::ReplicationItemResult {
+                    result: Err(ReplicationItemError {
+                        failure: ReplicationFailure::AccessDenied,
+                        message: "denied".to_string(),
+                    }),
+                },
+            ));
 
-        let expected = op.result.clone();
-        assert_eq!(op.finalize(), Ok(expected));
+            assert!(effects.is_empty());
+            assert_eq!(op.state, ReplicateScopeState::Finish);
+            assert_eq!(op.result.failed, 1);
+            assert_eq!(op.result.failure, Some(ReplicationFailure::AccessDenied));
+            let expected = op.result.clone();
+            assert_eq!(op.finalize(), Ok(expected));
+        }
+
+        #[test]
+        fn scope_counts_bytes_finalizes_success() {
+            let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+            op.state = ReplicateScopeState::RunVersionReplication;
+
+            op.step(Event::SubOperation(
+                SubOperationEvent::ReplicationItemResult {
+                    result: Ok(ReplicationSuboperationResult::ReplicatedBytes(42)),
+                },
+            ));
+
+            let expected = op.result.clone();
+            assert_eq!(op.finalize(), Ok(expected));
+        }
     }
 
     #[test]
     fn scope_paginates_cursor() {
         let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
-        op.state = super::ReplicateScopeState::IterateVersions;
+        op.state = ReplicateScopeState::IterateVersions;
         let cursor: aruna_core::types::Key = vec![9u8].into();
 
         let effects = op.step(Event::Storage(StorageEvent::IterResult {
@@ -3215,7 +3264,7 @@ mod tests {
         let input = scope_input(ReplicateScopeTarget::Bucket);
         let (_directory, authorization) = source_auth(&input, false).await;
         let mut op = ReplicateScopeOperation::new(input).with_source_authorization(authorization);
-        op.state = super::ReplicateScopeState::IterateVersions;
+        op.state = ReplicateScopeState::IterateVersions;
 
         let first = (0..512)
             .map(|index| {
@@ -3263,7 +3312,7 @@ mod tests {
             next_start_after: None,
         }));
         assert!(effects.is_empty());
-        assert_eq!(op.state, super::ReplicateScopeState::Error);
+        assert_eq!(op.state, ReplicateScopeState::Error);
         assert_eq!(
             op.output,
             Some(Err(ReplicateScopeError::ScopeLimit {
@@ -3280,7 +3329,7 @@ mod tests {
         input.auth_context.user_id = UserId::local(Ulid::from_bytes([4u8; 16]), test_realm_id());
         let (_directory, authorization) = source_auth(&input, true).await;
         let mut op = ReplicateScopeOperation::new(input).with_source_authorization(authorization);
-        op.state = super::ReplicateScopeState::IterateVersions;
+        op.state = ReplicateScopeState::IterateVersions;
 
         let effects = op.step(Event::Storage(StorageEvent::IterResult {
             values: vec![version_entry("dir/file.txt", Ulid::from_bytes([1u8; 16]))],
@@ -3325,13 +3374,13 @@ mod tests {
         assert_eq!(op.result.replicated, 0);
         assert_eq!(op.result.skipped, 0);
         assert_eq!(op.result.failed, 0);
-        assert_eq!(op.state, super::ReplicateScopeState::Finish);
+        assert_eq!(op.state, ReplicateScopeState::Finish);
     }
 
     #[test]
     fn scope_counts_bytes() {
         let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
-        op.state = super::ReplicateScopeState::RunVersionReplication;
+        op.state = ReplicateScopeState::RunVersionReplication;
 
         op.step(Event::SubOperation(
             SubOperationEvent::ReplicationItemResult {
@@ -3341,7 +3390,7 @@ mod tests {
 
         assert_eq!(op.result.replicated, 1);
         assert_eq!(op.result.replicated_bytes, 42);
-        assert_eq!(op.state, super::ReplicateScopeState::Finish);
+        assert_eq!(op.state, ReplicateScopeState::Finish);
     }
 
     #[test]
@@ -3359,7 +3408,7 @@ mod tests {
         let effects = denied.run_next_replication();
 
         assert!(effects.is_empty());
-        assert_eq!(denied.state, super::ReplicateScopeState::Finish);
+        assert_eq!(denied.state, ReplicateScopeState::Finish);
         assert_eq!(denied.result.failed, 1);
         assert_eq!(
             denied.result.last_error.as_deref(),
@@ -3377,7 +3426,7 @@ mod tests {
         let effects = op.run_next_replication();
 
         assert!(effects.is_empty());
-        assert_eq!(op.state, super::ReplicateScopeState::Error);
+        assert_eq!(op.state, ReplicateScopeState::Error);
         assert_eq!(
             op.output,
             Some(Err(ReplicateScopeError::ReplicateObjectVersionError(
@@ -3505,7 +3554,7 @@ mod tests {
             next_start_after: None,
         }));
         assert!(effects.is_empty());
-        assert_eq!(op.state, super::ReplicateObjectVersionState::Error);
+        assert_eq!(op.state, ReplicateObjectVersionState::Error);
         assert_eq!(
             op.result,
             Err(ReplicateObjectVersionError::MultipartPartCountMismatch {
@@ -3959,11 +4008,8 @@ mod tests {
         }));
 
         assert!(effects.is_empty());
-        assert_eq!(op.state, super::ReplicateObjectVersionState::Finish);
-        assert_eq!(
-            op.finalize(),
-            Ok(Ok(ReplicationSuboperationResult::Skipped))
-        );
+        assert_eq!(op.state, ReplicateObjectVersionState::Finish);
+        assert_eq!(op.finalize(), Ok(ReplicationSuboperationResult::Skipped));
     }
 
     #[test]
@@ -4009,11 +4055,8 @@ mod tests {
         }));
 
         assert!(effects.is_empty());
-        assert_eq!(op.state, super::ReplicateObjectVersionState::Finish);
-        assert_eq!(
-            op.finalize(),
-            Ok(Ok(ReplicationSuboperationResult::Skipped))
-        );
+        assert_eq!(op.state, ReplicateObjectVersionState::Finish);
+        assert_eq!(op.finalize(), Ok(ReplicationSuboperationResult::Skipped));
     }
 
     #[test]
@@ -4028,11 +4071,8 @@ mod tests {
         }));
 
         assert!(effects.is_empty());
-        assert_eq!(op.state, super::ReplicateObjectVersionState::Finish);
-        assert_eq!(
-            op.finalize(),
-            Ok(Ok(ReplicationSuboperationResult::Skipped))
-        );
+        assert_eq!(op.state, ReplicateObjectVersionState::Finish);
+        assert_eq!(op.finalize(), Ok(ReplicationSuboperationResult::Skipped));
     }
 
     #[test]
@@ -4258,10 +4298,7 @@ mod tests {
             payload: apply_complete,
         }));
 
-        assert_eq!(
-            op.state,
-            super::ReplicateObjectVersionState::CleanupReferenceBlob
-        );
+        assert_eq!(op.state, ReplicateObjectVersionState::CleanupReferenceBlob);
         assert_eq!(
             effects.as_slice(),
             [Effect::Blob(BlobEffect::Delete {
