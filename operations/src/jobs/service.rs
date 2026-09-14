@@ -27,8 +27,9 @@ use super::protocol::{JobRequest, JobResponse, JobRouteError, WireRange, send_jo
 use super::runtime::JobsRuntime;
 use super::staging::read_staging_checkpoint;
 use super::store::{
-    CancelRequestOutcome, JobMutationError, find_dedup_plan, list_job_entries, list_jobs_for_user,
-    read_artifact_tombstone, read_job_record, read_run_crate_status, set_cancel_requested,
+    CancelRequestOutcome, JobMutationError, RunDelete, delete_finished_run, find_dedup_plan,
+    list_job_entries, list_jobs_for_user, read_artifact_tombstone, read_job_record,
+    read_run_crate_status, set_cancel_requested,
 };
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
@@ -524,6 +525,15 @@ pub async fn list_owned_jobs(
     filter: impl Fn(&JobRecord) -> bool,
 ) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
     list_jobs_for_user(&context.storage_handle, user_id, cursor, limit, filter).await
+}
+
+/// Removes the caller's finished run from this node's lists; see [`delete_finished_run`].
+pub async fn delete_owned_run(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+) -> Result<RunDelete, JobMutationError> {
+    delete_finished_run(&context.storage_handle, user_id, job_id).await
 }
 
 pub async fn read_owned_job(

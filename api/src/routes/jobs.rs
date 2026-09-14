@@ -24,10 +24,10 @@ use aruna_operations::device::compute::{
 use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_external_job};
 use aruna_operations::jobs::service::{
     ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
-    cancel_job_routed, list_owned_jobs, read_artifact_routed, read_job_routed, read_owned_job,
-    read_report_routed,
+    cancel_job_routed, delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed,
+    read_owned_job, read_report_routed,
 };
-use aruna_operations::jobs::store::{RunDelete, delete_finished_run};
+use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::jobs::{JOB_REPORT_MAX_ROWS, JobRouteError};
 use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -2564,7 +2564,7 @@ pub async fn delete_job(
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
-    let outcome = delete_finished_run(&state.get_ctx().storage_handle, auth.user_id, job_id)
+    let outcome = delete_owned_run(&state.get_ctx(), auth.user_id, job_id)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
     match outcome {
