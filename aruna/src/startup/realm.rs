@@ -20,7 +20,8 @@ use crate::bootstrap::{
     ensure_onboarding_secret, fetch_core_documents, prepare_core_documents, realm_bootstrap_exists,
     wait_for_placement,
 };
-use crate::config::{Config, StartupMode, mark_onboarding_phase, mark_state_complete};
+use crate::config::{Config, StartupMode};
+use crate::identity::{mark_onboarding_phase, mark_state_complete};
 
 pub(crate) struct CoreAnnouncement {
     pub(crate) documents: Vec<DocumentSyncTarget>,

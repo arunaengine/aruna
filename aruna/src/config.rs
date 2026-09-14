@@ -15,7 +15,7 @@ use aruna_net::{DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_
 
 use crate::identity::{
     BootOrigin, EnrollmentPlan, IdentityStore, PersistedNodeState, PersistedNodeStatus,
-    bootstrap_node_state, persist_node_state, plan_enrollment, refresh_onboarding_bootstrap,
+    bootstrap_node_state, plan_enrollment, refresh_onboarding_bootstrap,
 };
 use crate::settings::{Settings, invalid_config_value, normalize_env_value, validate_relay_urls};
 use aruna_operations::metadata::MetadataSearchStorage;
@@ -308,7 +308,7 @@ pub async fn resolve_config(
     let bootstrap_timeout = Duration::from_secs(onboarding_bootstrap_timeout_secs);
     // The store arrived already open and owned; the identity store owns every read and
     // write of the persisted identity record.
-    let identity = IdentityStore::open(storage_handle.clone());
+    let identity = IdentityStore::from_storage(storage_handle.clone());
     let loaded = identity.load().await?;
     let plan = plan_enrollment(loaded.as_ref(), onboarding_secret.is_some())?;
     let (mut node_state, mut temporary_bootstrap_endpoint, mut enrollment_endpoints) = match plan {
@@ -460,31 +460,6 @@ pub async fn resolve_config(
 /// operator doctor: parse settings, open storage, resolve the configuration.
 pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     resolve_settings(crate::settings::read_settings()?).await
-}
-
-pub async fn mark_state_complete(
-    storage: &StorageHandle,
-    node_state: &PersistedNodeState,
-) -> Result<(), SetupError> {
-    if matches!(node_state.status, PersistedNodeStatus::Complete) {
-        return Ok(());
-    }
-
-    let mut updated_state = node_state.clone();
-    updated_state.status = PersistedNodeStatus::Complete;
-    updated_state.onboarding_phase = None;
-    updated_state.onboarding_sync_ticket = None;
-    persist_node_state(storage, &updated_state).await
-}
-
-pub async fn mark_onboarding_phase(
-    storage: &StorageHandle,
-    node_state: &PersistedNodeState,
-    phase: OnboardingPhase,
-) -> Result<(), SetupError> {
-    let mut updated_state = node_state.clone();
-    updated_state.onboarding_phase = Some(phase);
-    persist_node_state(storage, &updated_state).await
 }
 
 /// Only a device may run without an S3 listener. An infrastructure node whose
@@ -1042,7 +1017,7 @@ mod tests {
         // than mint a second identity.
         let tempdir = tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let store = crate::identity::IdentityStore::open(storage);
+        let store = crate::identity::IdentityStore::from_storage(storage);
         let generated = store.generate().unwrap();
         assert!(matches!(
             generated.status,
