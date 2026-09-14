@@ -39,6 +39,30 @@ use supervise::{execution_heartbeat, supervise_and_finalize};
 /// validation, and credential expiry must all agree on this value.
 pub(crate) const DEFAULT_WALLTIME: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The fenced attempt this run owns. Preparation produces it, supervision and
+/// recovery consume it, and every field is named rather than passed as a tuple.
+struct Attempt {
+    backend: Arc<dyn ExecutorBackend>,
+    fence: FenceContext,
+    spec: ExecutionSpec,
+    bucket: String,
+    cancel: CancellationToken,
+}
+
+/// What the prepare-and-submit stage produced.
+enum AttemptOutcome {
+    /// The run stopped before the attempt reached submit; its path already
+    /// finalized the job.
+    Stopped,
+    /// The backend accepted the fenced attempt; supervision owns it now.
+    Submitted(Attempt),
+    /// The submit outcome is unknown; reconciliation decides adoption.
+    ReconciliationRequired {
+        attempt: Attempt,
+        error: BackendError,
+    },
+}
+
 /// Drive a claimed execution job through prepare -> submit -> supervise -> finalize.
 /// External attempts never share the generic in-process supervisor because a lost
 /// lease must not requeue a container (spec 16.7); this owns the fenced lifecycle.
@@ -128,7 +152,7 @@ pub async fn run_execution_job(
                         &context, job_id, token, &record, error, false,
                     ))
                     .await;
-                    return None;
+                    return AttemptOutcome::Stopped;
                 }
             };
 
@@ -137,7 +161,7 @@ pub async fn run_execution_job(
             .await
             .is_err()
         {
-            return None;
+            return AttemptOutcome::Stopped;
         }
 
         let attempt_no = record.attempts;
@@ -156,7 +180,7 @@ pub async fn run_execution_job(
                     &context, job_id, token, &record, job_error, true,
                 ))
                 .await;
-                return None;
+                return AttemptOutcome::Stopped;
             }
         };
         let task_spec = build_task_spec(
@@ -173,7 +197,7 @@ pub async fn run_execution_job(
             Ok(reservation) => reservation.map(|reservation| reservation.execution_id),
             Err(error) => {
                 warn!(job_id = %job_id, %error, "Execution reservation lookup failed");
-                return None;
+                return AttemptOutcome::Stopped;
             }
         };
         // Write-ahead the attempt intent BEFORE submit so a lost attempt is adoptable.
@@ -212,9 +236,9 @@ pub async fn run_execution_job(
                         }
                     }
                 }
-                return None;
+                return AttemptOutcome::Stopped;
             }
-            Err(_) => return None,
+            Err(_) => return AttemptOutcome::Stopped,
         };
         if intent_commit.record.cancel_requested {
             match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await {
@@ -223,7 +247,7 @@ pub async fn run_execution_job(
                     warn!(job_id = %job_id, error = %error, "Pre-submit cancellation write failed")
                 }
             }
-            return None;
+            return AttemptOutcome::Stopped;
         }
 
         let fence = FenceContext {
@@ -232,7 +256,7 @@ pub async fn run_execution_job(
             controller_generation: intent_commit.control.controller_generation,
         };
         if backend.fence(&fence).await.is_err() {
-            return None;
+            return AttemptOutcome::Stopped;
         }
 
         let submitted = match backend.submit(&fence, &task_spec, &cancel).await {
@@ -242,10 +266,19 @@ pub async fn run_execution_job(
                     &context, job_id, token, &backend, &fence, &spec, &bucket,
                 ))
                 .await;
-                return None;
+                return AttemptOutcome::Stopped;
             }
             Err(error) => {
-                return Some(Err((backend, fence, spec, bucket, cancel, error)));
+                return AttemptOutcome::ReconciliationRequired {
+                    attempt: Attempt {
+                        backend,
+                        fence,
+                        spec,
+                        bucket,
+                        cancel,
+                    },
+                    error,
+                };
             }
         };
 
@@ -260,7 +293,7 @@ pub async fn run_execution_job(
         .await
         {
             Ok(record) => record,
-            Err(_) => return None,
+            Err(_) => return AttemptOutcome::Stopped,
         };
         publish_progress(&context, job_id, PhysicalExecutionState::Running).await;
         if running.cancel_requested {
@@ -268,25 +301,37 @@ pub async fn run_execution_job(
                 &context, job_id, token, &backend, &fence, &spec, &bucket,
             ))
             .await;
-            return None;
+            return AttemptOutcome::Stopped;
         }
 
-        Some(Ok((backend, fence, spec, bucket, cancel)))
+        AttemptOutcome::Submitted(Attempt {
+            backend,
+            fence,
+            spec,
+            bucket,
+            cancel,
+        })
     });
 
-    let prepared = tokio::select! {
-        result = &mut prepare_and_submit => result,
+    let outcome = tokio::select! {
+        outcome = &mut prepare_and_submit => outcome,
         _ = &mut heartbeat => return,
     };
-    let Some(prepared) = prepared else {
-        stop.cancel();
-        let _ = (&mut heartbeat).await;
-        return;
-    };
-    match prepared {
-        Ok((backend, fence, spec, bucket, cancel)) => {
+    match outcome {
+        AttemptOutcome::Stopped => {
             stop.cancel();
             let _ = (&mut heartbeat).await;
+        }
+        AttemptOutcome::Submitted(attempt) => {
+            stop.cancel();
+            let _ = (&mut heartbeat).await;
+            let Attempt {
+                backend,
+                fence,
+                spec,
+                bucket,
+                cancel,
+            } = attempt;
             Box::pin(supervise_and_finalize(
                 context.clone(),
                 job_id,
@@ -299,21 +344,36 @@ pub async fn run_execution_job(
             ))
             .await;
         }
-        Err((backend, fence, spec, bucket, cancel, error)) => {
+        AttemptOutcome::ReconciliationRequired { attempt, error } => {
+            // Recovery runs while the heartbeat still owns the lease; either the
+            // adoption verdict or a heartbeat stop ends the race.
             let resumed = {
                 let mut recovery = Box::pin(recover_failed_submit(
-                    &context, job_id, token, &backend, &fence, &spec, &bucket, &cancel, error,
+                    &context,
+                    job_id,
+                    token,
+                    &attempt.backend,
+                    &attempt.fence,
+                    &attempt.spec,
+                    &attempt.bucket,
+                    &attempt.cancel,
+                    error,
                 ));
                 tokio::select! {
-                    result = &mut recovery => {
-                        stop.cancel();
-                        let _ = (&mut heartbeat).await;
-                        Some(result)
-                    }
+                    result = &mut recovery => Some(result),
                     _ = &mut heartbeat => None,
                 }
             };
+            stop.cancel();
+            let _ = (&mut heartbeat).await;
             if resumed == Some(true) {
+                let Attempt {
+                    backend,
+                    fence,
+                    spec,
+                    bucket,
+                    cancel,
+                } = attempt;
                 Box::pin(supervise_and_finalize(
                     context.clone(),
                     job_id,
