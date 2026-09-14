@@ -7,7 +7,7 @@ use aruna_operations::device::wipe as device_wipe;
 
 use crate::shutdown::{NodeShutdown, arm_signal_exit, shutdown_grace_env, wait_for_signal};
 use crate::startup;
-use crate::startup::background::{Background, start as start_background};
+use crate::startup::background::{Background, BackgroundOutcome, start as start_background};
 use crate::startup::listeners::{ServerBindings, bind as bind_servers, device_wipe_armed};
 use crate::startup::listeners::{portal_exit, s3_exit, session_s3_exit};
 use crate::startup::resources::NodeResources;
@@ -94,37 +94,98 @@ fn exit_effect(service: Service, message: &str) -> Option<&str> {
     }
 }
 
-/// Bridges the installed signal handler into the startup cancellation token.
-/// Checking the token between startup stages keeps cancellation from waiting
-/// behind later fallible work.
-fn bridge_signal_stop(
-    signal: tokio::task::JoinHandle<()>,
+/// Owns the process signal tasks for one `run_node`: the first-signal waiter
+/// that bridges into the startup stop token, and the second-signal escalation
+/// armed for every drain. `finish` runs on every exit path, so an application
+/// run never leaves a signal task behind.
+struct SignalTasks {
     stop: tokio_util::sync::CancellationToken,
-) {
-    tokio::spawn(async move {
-        let _ = signal.await;
-        stop.cancel();
-    });
+    first: Option<tokio::task::JoinHandle<()>>,
+    escalation: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SignalTasks {
+    /// Installs the OS signal handlers before readiness or background work can
+    /// start. One token carries "stop accepted" to every startup boundary, so a
+    /// stop during preparation or recovery does not wait behind the next
+    /// fallible stage.
+    fn install() -> Self {
+        Self::with_first(wait_for_signal())
+    }
+
+    /// The same lifecycle with a controllable first signal, so tests need no
+    /// OS signal or runtime timing.
+    fn with_first(first_signal: impl std::future::Future<Output = ()> + Send + 'static) -> Self {
+        let stop = tokio_util::sync::CancellationToken::new();
+        let bridge = stop.clone();
+        let first = tokio::spawn(async move {
+            first_signal.await;
+            bridge.cancel();
+        });
+        Self {
+            stop,
+            first: Some(first),
+            escalation: None,
+        }
+    }
+
+    fn stop(&self) -> tokio_util::sync::CancellationToken {
+        self.stop.clone()
+    }
+
+    /// Applies the second-signal policy consistently across every drain: when a
+    /// stop was already accepted, a second signal exits immediately; otherwise
+    /// escalation arms as soon as the first signal arrives.
+    fn arm_escalation(&mut self) {
+        if self.escalation.is_some() {
+            return;
+        }
+        let stop = self.stop.clone();
+        self.escalation = Some(tokio::spawn(async move {
+            stop.cancelled().await;
+            let _ = arm_signal_exit().await;
+        }));
+    }
+
+    /// Finishes both signal tasks on successful shutdown, acquisition failure,
+    /// preparation failure, and accepted startup cancellation.
+    async fn finish(&mut self) {
+        if let Some(escalation) = self.escalation.take() {
+            escalation.abort();
+            let _ = escalation.await;
+        }
+        if let Some(first) = self.first.take() {
+            first.abort();
+            let _ = first.await;
+        }
+    }
 }
 
 pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
-    // Install signal handling before readiness or background work can start.
-    // One token carries "stop accepted" to every startup boundary, so a stop
-    // during preparation or recovery does not wait behind the next fallible
-    // stage; the signal task stays the only place that installs handlers.
-    let signal = tokio::spawn(wait_for_signal());
-    let stop_token = tokio_util::sync::CancellationToken::new();
-    bridge_signal_stop(signal, stop_token.clone());
+    let mut signals = SignalTasks::install();
+    let outcome = run_node_owned(&mut signals).await;
+    signals.finish().await;
+    outcome
+}
+
+async fn run_node_owned(
+    signals: &mut SignalTasks,
+) -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
+    let stop_token = signals.stop();
 
     // One acquired owner stays whole through realm preparation, listener
     // binding, and background startup. Every failure and accepted cancellation
     // releases exactly this owner; only a completed handoff takes it apart.
-    let resources = startup::resources::acquire().await?;
+    let resources = match startup::resources::acquire(&stop_token).await {
+        Ok(Some(resources)) => resources,
+        Ok(None) => return Ok(ProcessOutcome::StartupCancelled),
+        Err(error) => return Err(error),
+    };
 
     // A stop requested while resources were still being acquired must not run
     // realm preparation against a node that is already being torn down.
     if stop_token.is_cancelled() {
-        release_unready(resources, None).await;
+        release_unready(signals, resources, None).await;
         return Ok(ProcessOutcome::StartupCancelled);
     }
 
@@ -140,18 +201,18 @@ pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
         Ok(None) => {
             // The stop was accepted between preparation phases; release the
             // acquired subset without continuing startup.
-            release_unready(resources, None).await;
+            release_unready(signals, resources, None).await;
             return Ok(ProcessOutcome::StartupCancelled);
         }
         Err(error) => {
             // Release the acquired subset, then report the initiating failure.
-            release_unready(resources, None).await;
+            release_unready(signals, resources, None).await;
             return Err(error);
         }
     };
 
     if stop_token.is_cancelled() {
-        release_unready(resources, None).await;
+        release_unready(signals, resources, None).await;
         return Ok(ProcessOutcome::StartupCancelled);
     }
 
@@ -169,7 +230,7 @@ pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
         Err(error) => {
             // `bind` already aborted any listener it started; release the
             // acquired resources and report the initiating failure.
-            release_unready(resources, None).await;
+            release_unready(signals, resources, None).await;
             return Err(error);
         }
     };
@@ -177,14 +238,14 @@ pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
     // The operator asked to stop before admissions opened: tear down the
     // bound listeners and acquired resources without announcing readiness.
     if stop_token.is_cancelled() {
-        release_unready(resources, Some(bindings)).await;
+        release_unready(signals, resources, Some(bindings)).await;
         return Ok(ProcessOutcome::StartupCancelled);
     }
 
-    // Background startup checks for an accepted stop and for an ingress
-    // listener that already exited between its phases, so neither admits
-    // recovery work behind a node that is going down.
-    let ready_announced = start_background(
+    // Background startup applies the same required-versus-optional service
+    // policy as steady-state supervision, so an optional listener exit never
+    // abandons required recovery phases.
+    match start_background(
         Background {
             realm_id: bindings.realm_id,
             node_id: bindings.node_id,
@@ -200,45 +261,20 @@ pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
             core_announcement,
         },
         &stop_token,
-        || {
-            bindings.rest_handle.is_finished()
-                || bindings
-                    .s3_handle
-                    .as_ref()
-                    .is_some_and(tokio::task::JoinHandle::is_finished)
-                || bindings
-                    .portal_handle
-                    .as_ref()
-                    .is_some_and(tokio::task::JoinHandle::is_finished)
-                || bindings
-                    .session_s3_handle
-                    .as_ref()
-                    .is_some_and(tokio::task::JoinHandle::is_finished)
-        },
+        || observed_listener_exit(&bindings),
+        |_| {},
     )
-    .await;
-
-    // Cancellation before readiness means no background work started; report it
-    // as a startup cancellation. A listener that already exited instead falls
-    // through to the failure select, which names the failed service.
-    if !ready_announced
-        && stop_token.is_cancelled()
-        && !bindings.rest_handle.is_finished()
-        && !bindings
-            .s3_handle
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-        && !bindings
-            .portal_handle
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-        && !bindings
-            .session_s3_handle
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
+    .await
     {
-        release_unready(resources, Some(bindings)).await;
-        return Ok(ProcessOutcome::StartupCancelled);
+        BackgroundOutcome::Started => {}
+        BackgroundOutcome::Cancelled => {
+            release_unready(signals, resources, Some(bindings)).await;
+            return Ok(ProcessOutcome::StartupCancelled);
+        }
+        BackgroundOutcome::RequiredListenerFailed(service) => {
+            // Fall through to the failure select, which names the service.
+            tracing::error!(service = ?service, "Required listener exited during background startup");
+        }
     }
 
     let ServerBindings {
@@ -307,16 +343,9 @@ pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
     }
 
     // A second termination signal means "stop now". After a server failure no
-    // signal has arrived yet, so wait for the first before arming escalation.
-    if failure.is_some() {
-        let signal_token = stop_token.clone();
-        tokio::spawn(async move {
-            signal_token.cancelled().await;
-            let _ = arm_signal_exit().await;
-        });
-    } else {
-        arm_signal_exit();
-    }
+    // signal has arrived yet, so the owner waits for the first before arming
+    // escalation; after a first signal it arms immediately.
+    signals.arm_escalation();
 
     NodeShutdown {
         shutdown: resources.shutdown,
@@ -363,10 +392,46 @@ pub async fn run_node() -> Result<ProcessOutcome, Box<dyn std::error::Error>> {
     })
 }
 
+/// Observes a finished ingress listener between startup phases and classifies
+/// it with the one named supervision policy. Required listeners are reported
+/// before the optional session bridge, so a dead required server is never
+/// masked by an optional exit.
+fn observed_listener_exit(bindings: &ServerBindings) -> Option<(Service, ServiceExit)> {
+    if bindings.rest_handle.is_finished() {
+        Some((Service::Rest, supervision(Service::Rest)))
+    } else if bindings
+        .s3_handle
+        .as_ref()
+        .is_some_and(aruna_api::s3::server::S3ServerHandle::is_finished)
+    {
+        Some((Service::S3, supervision(Service::S3)))
+    } else if bindings
+        .portal_handle
+        .as_ref()
+        .is_some_and(|handle| handle.is_finished())
+    {
+        Some((Service::Portal, supervision(Service::Portal)))
+    } else if bindings
+        .session_s3_handle
+        .as_ref()
+        .is_some_and(aruna_api::s3::server::S3ServerHandle::is_finished)
+    {
+        Some((Service::SessionS3, supervision(Service::SessionS3)))
+    } else {
+        None
+    }
+}
+
 /// Runs the ordered teardown for everything acquired before background work
 /// started, including bound listeners when they already exist. The caller
-/// decides whether the stop is a cancellation or a failure.
-async fn release_unready(resources: NodeResources, bindings: Option<ServerBindings>) {
+/// decides whether the stop is a cancellation or a failure, and every early
+/// drain applies the same second-signal policy as the normal one.
+async fn release_unready(
+    signals: &mut SignalTasks,
+    resources: NodeResources,
+    bindings: Option<ServerBindings>,
+) {
+    signals.arm_escalation();
     let NodeResources {
         config: _,
         driver_ctx,
@@ -486,21 +551,83 @@ mod pure_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::oneshot;
 
-    // A finished signal task must cancel the startup token; a running one must
-    // not. This is the cancellation bridge without any signal or wall-clock wait.
+    /// A controllable first signal: it resolves when the test fires it and
+    /// records its own abort, so no OS signal or wall-clock wait is involved.
+    struct ControlledSignal {
+        fired: oneshot::Receiver<()>,
+        aborted: Arc<AtomicBool>,
+    }
+
+    impl ControlledSignal {
+        fn new(aborted: Arc<AtomicBool>) -> (Self, oneshot::Sender<()>) {
+            let (fire_tx, fired) = oneshot::channel();
+            (Self { fired, aborted }, fire_tx)
+        }
+    }
+
+    impl std::future::Future for ControlledSignal {
+        type Output = ();
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            match std::future::Future::poll(std::pin::Pin::new(&mut self.fired), cx) {
+                std::task::Poll::Ready(_) => std::task::Poll::Ready(()),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    impl Drop for ControlledSignal {
+        fn drop(&mut self) {
+            self.aborted.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // A first signal cancels the startup token, and finishing the owner leaves
+    // no signal task behind.
     #[tokio::test]
-    async fn a_finished_signal_task_cancels_the_stop_token() {
-        let running = tokio::spawn(std::future::pending::<()>());
-        let stop = tokio_util::sync::CancellationToken::new();
-        bridge_signal_stop(running, stop.clone());
-        tokio::task::yield_now().await;
+    async fn first_signal_cancels_the_stop_token_and_finish_clears_tasks() {
+        let aborted = Arc::new(AtomicBool::new(false));
+        let (signal, fire) = ControlledSignal::new(aborted.clone());
+        let mut signals = SignalTasks::with_first(signal);
+        let stop = signals.stop();
         assert!(!stop.is_cancelled());
 
-        let finished = tokio::spawn(async {});
-        let stop = tokio_util::sync::CancellationToken::new();
-        bridge_signal_stop(finished, stop.clone());
-        tokio::task::yield_now().await;
+        fire.send(())
+            .expect("the bridge is waiting for the first signal");
+        signals
+            .first
+            .as_mut()
+            .expect("the first-signal task is retained")
+            .await
+            .expect("the first-signal task completes");
         assert!(stop.is_cancelled());
+
+        signals.finish().await;
+        assert!(signals.first.is_none());
+        assert!(signals.escalation.is_none());
+    }
+
+    // Finishing without a signal aborts the waiter once and clears the
+    // escalation too, so repeated application runs leave nothing behind.
+    #[tokio::test]
+    async fn finish_aborts_both_signal_tasks() {
+        let aborted = Arc::new(AtomicBool::new(false));
+        let (signal, _fire) = ControlledSignal::new(aborted.clone());
+        let mut signals = SignalTasks::with_first(signal);
+        signals.arm_escalation();
+        assert!(signals.escalation.is_some());
+
+        signals.finish().await;
+
+        assert!(aborted.load(Ordering::SeqCst));
+        assert!(signals.first.is_none());
+        assert!(signals.escalation.is_none());
     }
 }
