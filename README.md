@@ -73,7 +73,7 @@ The quickest way to try Aruna is a local 3-node demo deployment.
 
 #### For local builds:
 
-- Rust `1.97.1` (see [rust-toolchain.toml](rust-toolchain.toml), for source builds)
+- Rust `1.98.1` (see [rust-toolchain.toml](rust-toolchain.toml), for source builds)
 - OpenSSL development headers
 - `mold` linker
 

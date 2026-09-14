@@ -258,12 +258,23 @@ jobs:
           cargo check --workspace --locked
           cargo check --workspace --all-targets --all-features --locked
 
+      # The aruna node manifest defines the same backend selections; checking
+      # only the compute crate hides node-side configuration that is compiled
+      # under each feature.
       - name: Check the compute feature selections
         run: |
           set -euo pipefail
           cargo check -p aruna-compute --no-default-features --locked
           for features in docker apptainer kubernetes; do
             cargo check -p aruna-compute --no-default-features --features "$features" --locked
+          done
+
+      - name: Check the node feature selections
+        run: |
+          set -euo pipefail
+          cargo check -p aruna --no-default-features --locked
+          for features in docker apptainer kubernetes; do
+            cargo check -p aruna --no-default-features --features "$features" --locked
           done
 
   fmt:
@@ -276,11 +287,11 @@ jobs:
       - name: Install nightly rustfmt
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
-          toolchain: nightly-2026-08-23
+          toolchain: nightly-2026-09-14
           components: rustfmt
 
       - name: Check formatting
-        run: cargo +nightly-2026-08-23 fmt --all -- --check
+        run: cargo +nightly-2026-09-14 fmt --all -- --check
 
   clippy:
     runs-on: ubuntu-latest
@@ -292,14 +303,14 @@ jobs:
       - name: Install nightly clippy
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
-          toolchain: nightly-2026-08-23
+          toolchain: nightly-2026-09-14
           components: clippy
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Run clippy
-        run: cargo +nightly-2026-08-23 clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo +nightly-2026-09-14 clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   deny:
     runs-on: ubuntu-latest

@@ -12,10 +12,11 @@ described in [docs/source-guide.md](docs/source-guide.md).
 
 During local work, use focused checks for the changed behavior and run
 `just lint` (the same formatting and Clippy commands as CI). The lint recipe
-pins `nightly-2026-08-23`; install it with
-`rustup toolchain install nightly-2026-08-23 -c rustfmt -c clippy` if it is
-missing. Do not run the general test suite per edit or commit;
-documentation-only changes need reference and formatting checks.
+pins `nightly-2026-09-14`; install it with
+`rustup toolchain install nightly-2026-09-14 -c rustfmt -c clippy` if it is
+missing. Builds use stable `1.98.1` from `rust-toolchain.toml`. Do not run the
+general test suite per edit or commit; documentation-only changes need
+reference and formatting checks.
 
 After submitting a PR, run the full checks in parallel CI jobs against its final
 revision. The same commands are available locally: `just check` compiles every

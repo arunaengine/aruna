@@ -21,7 +21,7 @@ version = "3.0.0-alpha.85"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
-rust-version = "1.97.1"
+rust-version = "1.98.1"
 
 [workspace.dependencies]
 # Workspace crates
