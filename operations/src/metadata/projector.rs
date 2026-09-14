@@ -165,11 +165,25 @@ pub async fn restore_projection_timer(storage: &StorageHandle, task_handle: &Tas
 }
 
 pub async fn replay_event_log(context: &DriverContext) -> Result<usize, MetadataProjectionError> {
+    replay_event_log_until(context, || true).await
+}
+
+/// Replays the event log one page at a time, checking `should_continue` before
+/// each page. A stop accepted during a large replay ends it at a page boundary
+/// with every completed page already projected, so the caller can release its
+/// resources without abandoning an in-flight projection step.
+pub async fn replay_event_log_until(
+    context: &DriverContext,
+    mut should_continue: impl FnMut() -> bool,
+) -> Result<usize, MetadataProjectionError> {
     let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
     let mut start_after: Option<Key> = None;
     let mut projected = 0usize;
 
     loop {
+        if !should_continue() {
+            return Ok(projected);
+        }
         let page = context
             .storage_handle
             .send_storage_effect(StorageEffect::Iter {

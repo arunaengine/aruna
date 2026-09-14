@@ -23,7 +23,8 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::compute_setup::build_registry;
-use crate::config::{Config, load};
+use crate::config::{Config, open_storage, resolve_config};
+use crate::settings::Settings;
 use crate::shutdown::{NodeShutdown, shutdown_grace_env};
 
 /// The node resources a running process owns. This is not the Tokio runtime.
@@ -170,17 +171,68 @@ pub(crate) enum StartupStage {
     TaskQueues,
 }
 
-pub(crate) async fn acquire() -> Result<NodeResources, Box<dyn std::error::Error>> {
-    let (config, storage_handle) = load().await?;
+/// A startup stop was accepted between acquisition stages. It is a distinct
+/// outcome from a failure: the acquired subset is released and the node
+/// reports a clean startup cancellation.
+#[derive(Debug)]
+pub(crate) struct StartupStopped;
+
+impl std::fmt::Display for StartupStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("startup stop accepted during resource acquisition")
+    }
+}
+
+impl std::error::Error for StartupStopped {}
+
+pub(crate) async fn acquire(
+    stop: &tokio_util::sync::CancellationToken,
+) -> Result<Option<NodeResources>, Box<dyn std::error::Error>> {
+    // Parsing operator settings is pure; the store is the first owned
+    // resource, established before identity and enrollment I/O.
+    let settings = crate::settings::read_settings()?;
+    let storage_handle = open_storage(&settings)?;
     // The node runtime always exists here; a missing one is a concrete startup
     // error, never a scheduler-less handle that only looks started.
     let task_handle = TaskHandle::try_new().map_err(std::io::Error::other)?;
-    acquire_resources(config, storage_handle, task_handle, |_| Ok(())).await
+    acquire_with_storage(settings, storage_handle, task_handle, stop, |_| Ok(())).await
 }
 
-/// Acquires the node resources and, on any failure, releases exactly what was
-/// acquired. `checkpoint` observes each stage boundary; production passes a
-/// no-op.
+/// Acquires the node resources from parsed settings and an already-open store,
+/// so identity loading, enrollment, and every later stage run inside the
+/// explicit cleanup boundary. `Ok(None)` means a stop was accepted and exactly
+/// the acquired subset was released.
+pub(crate) async fn acquire_with_storage(
+    settings: Settings,
+    storage_handle: aruna_storage::StorageHandle,
+    task_handle: TaskHandle,
+    stop: &tokio_util::sync::CancellationToken,
+    mut checkpoint: impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<Option<NodeResources>, Box<dyn std::error::Error>> {
+    let mut acquired = Acquired::new(storage_handle, task_handle);
+    let config = match resolve_config(settings, acquired.storage_handle.clone()).await {
+        Ok(config) => config,
+        Err(error) => {
+            acquired.cleanup().await;
+            return Err(error.into());
+        }
+    };
+    match fill(&config, &mut acquired, stop, &mut checkpoint).await {
+        Ok(()) => Ok(Some(acquired.finish(config))),
+        Err(error) => {
+            acquired.cleanup().await;
+            match error.downcast::<StartupStopped>() {
+                Ok(_) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+/// Acquires the resources for an already-resolved configuration. Kept for the
+/// stage-walking startup tests; production resolves the configuration inside
+/// the owned boundary via [`acquire_with_storage`].
+#[cfg(test)]
 pub(crate) async fn acquire_resources(
     config: Config,
     storage_handle: aruna_storage::StorageHandle,
@@ -188,7 +240,8 @@ pub(crate) async fn acquire_resources(
     mut checkpoint: impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<NodeResources, Box<dyn std::error::Error>> {
     let mut acquired = Acquired::new(storage_handle, task_handle);
-    match fill(&config, &mut acquired, &mut checkpoint).await {
+    let stop = tokio_util::sync::CancellationToken::new();
+    match fill(&config, &mut acquired, &stop, &mut checkpoint).await {
         Ok(()) => Ok(acquired.finish(config)),
         Err(error) => {
             acquired.cleanup().await;
@@ -202,8 +255,18 @@ pub(crate) async fn acquire_resources(
 async fn fill(
     config: &Config,
     acquired: &mut Acquired,
+    stop: &tokio_util::sync::CancellationToken,
     checkpoint: &mut impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // A stop accepted between stages must not admit the next acquisition.
+    let stopped = |stop: &tokio_util::sync::CancellationToken| {
+        if stop.is_cancelled() {
+            Err(Box::new(StartupStopped) as Box<dyn std::error::Error>)
+        } else {
+            Ok(())
+        }
+    };
+    stopped(stop)?;
     let net_handle = NetHandle::new(
         NetConfig {
             bind_addr: config.p2p_socket_addr,
@@ -228,6 +291,7 @@ async fn fill(
     }
     acquired.net_handle = Some(net_handle.clone());
     checkpoint(StartupStage::Net)?;
+    stopped(stop)?;
 
     let metadata_handle = MetadataHandle::new_with_options(
         &config.metadata_storage_path,
@@ -242,6 +306,7 @@ async fn fill(
     )?;
     acquired.metadata_handle = Some(metadata_handle.clone());
     checkpoint(StartupStage::Metadata)?;
+    stopped(stop)?;
 
     let blob_handle = BlobHandler::with_registry(
         BackendRegistry::from_config(&config.blob_backends).map_err(std::io::Error::other)?,
@@ -252,6 +317,7 @@ async fn fill(
     .await?;
     acquired.blob_handle = Some(blob_handle.clone());
     checkpoint(StartupStage::Blob)?;
+    stopped(stop)?;
 
     let compute = build_registry(config)
         .await
@@ -259,6 +325,7 @@ async fn fill(
     acquired.session_s3 = compute.session_s3;
     let compute_handle = compute.registry;
     checkpoint(StartupStage::Compute)?;
+    stopped(stop)?;
 
     let driver_ctx = Arc::new(DriverContext {
         storage_handle: acquired.storage_handle.clone(),
@@ -291,10 +358,12 @@ async fn fill(
     info!(ops_address = %bound, "Ops server listening");
     acquired.ops_handle = Some(ops_handle);
     checkpoint(StartupStage::Ops)?;
+    stopped(stop)?;
 
     // A rebuild is the only local evidence that counters were not carried over.
     acquired.usage_counters_rebuilt = ensure_usage_counters(driver_ctx.as_ref()).await?;
     checkpoint(StartupStage::UsageCounters)?;
+    stopped(stop)?;
 
     // Bind compute reconciliation before startup recovery.
     initialize_net_holder(
