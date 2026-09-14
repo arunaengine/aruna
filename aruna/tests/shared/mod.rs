@@ -4,7 +4,8 @@ use aruna::bootstrap::{
     fetch_core_documents, prepare_core_documents, publish_core_documents, realm_bootstrap_exists,
     wait_for_placement,
 };
-use aruna::config::{Config, mark_onboarding_phase, mark_state_complete, resolve_settings};
+use aruna::config::{Config, resolve_settings};
+use aruna::identity::{mark_onboarding_phase, mark_state_complete};
 use aruna::settings::read_settings_from;
 use aruna_api::cors::CorsConfig;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
