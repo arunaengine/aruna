@@ -542,7 +542,7 @@ mod pure_tests {
     use aruna_core::structs::{AttemptIntent, InputMode, InputSelection, OutputObject, RealmId};
     use serde_json::Value;
 
-    fn execution_record() -> (JobRecord, ExecutionSpec) {
+    pub(super) fn execution_record() -> (JobRecord, ExecutionSpec) {
         // Succeeded run with one S3 input and one produced output.
         let realm = RealmId([1; 32]);
         let user = UserId::new(Ulid::from_bytes([2; 16]), realm);
@@ -627,7 +627,7 @@ mod pure_tests {
         serde_json::from_str(&build_crate_jsonld(record, spec, doc)).unwrap()
     }
 
-    fn entity_id(value: &Value) -> Option<&str> {
+    pub(super) fn entity_id(value: &Value) -> Option<&str> {
         value
             .as_str()
             .or_else(|| value.get("@id").and_then(Value::as_str))
@@ -724,6 +724,45 @@ mod pure_tests {
     }
 
     #[test]
+    fn command_quotes_arguments() {
+        let (_, mut spec) = execution_record();
+        spec.entrypoint = Some(vec!["/bin/echo".to_string()]);
+        spec.command = vec![String::new(), "it's ready".to_string()];
+        assert_eq!(command_line(&spec), "/bin/echo '' 'it'\"'\"'s ready'");
+    }
+
+    #[test]
+    fn failed_run_status() {
+        // A nonzero exit yields FailedActionStatus and an error string.
+        let (mut record, spec) = execution_record();
+        record.state = JobState::Failed;
+        if let Some(JobResultPayload::Execution { exit_code, .. }) = &mut record.result {
+            *exit_code = Some(2);
+        }
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let action = graph
+            .iter()
+            .find(|e| e["@type"] == "CreateAction")
+            .expect("action");
+        assert_eq!(
+            action["actionStatus"]["@id"],
+            "http://schema.org/FailedActionStatus"
+        );
+        assert_eq!(action["error"], "exit code 2");
+    }
+}
+
+/// Storage/profile boundary coverage for the crate generator; kept out of the
+/// pure selection because it opens temporary Craqle and SHACL stores.
+#[cfg(test)]
+mod tests {
+    use super::pure_tests::{entity_id, execution_record};
+    use super::*;
+    use serde_json::Value;
+    use ulid::Ulid;
+
+    #[test]
     fn crate_survives_roundtrip() {
         // Storage must retain exact profile and workflow-run terms.
         let (record, spec) = execution_record();
@@ -811,34 +850,5 @@ mod pure_tests {
             .collect();
         assert!(blocking.is_empty(), "{blocking:#?}");
         assert!(report.structural.is_empty(), "{:#?}", report.structural);
-    }
-
-    #[test]
-    fn command_quotes_arguments() {
-        let (_, mut spec) = execution_record();
-        spec.entrypoint = Some(vec!["/bin/echo".to_string()]);
-        spec.command = vec![String::new(), "it's ready".to_string()];
-        assert_eq!(command_line(&spec), "/bin/echo '' 'it'\"'\"'s ready'");
-    }
-
-    #[test]
-    fn failed_run_status() {
-        // A nonzero exit yields FailedActionStatus and an error string.
-        let (mut record, spec) = execution_record();
-        record.state = JobState::Failed;
-        if let Some(JobResultPayload::Execution { exit_code, .. }) = &mut record.result {
-            *exit_code = Some(2);
-        }
-        let value = parse(&record, &spec);
-        let graph = value["@graph"].as_array().unwrap();
-        let action = graph
-            .iter()
-            .find(|e| e["@type"] == "CreateAction")
-            .expect("action");
-        assert_eq!(
-            action["actionStatus"]["@id"],
-            "http://schema.org/FailedActionStatus"
-        );
-        assert_eq!(action["error"], "exit code 2");
     }
 }
