@@ -4,8 +4,10 @@
 //! assigned locally enters a digest: no job id, no origin, no timestamp, no
 //! resolved server default and no current topology.
 
+use aruna_core::compute::SessionMount;
 use aruna_core::compute::runtimes::{
-    SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+    SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_MOUNT_PATH_TAG, SESSION_MOUNT_PREFIX_TAG,
+    SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
 };
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{
@@ -167,6 +169,8 @@ pub struct SessionSpec {
     pub idle_after_ms: Option<u64>,
     /// When the submitter's bearer expires. The credential never outlives it.
     pub expires_at_ms: Option<u64>,
+    /// Where the workspace bucket is mounted, when the submission recorded it.
+    pub mount: Option<SessionMount>,
 }
 
 /// The interactive session the stored spec asks for. `None` is an ordinary run.
@@ -174,6 +178,17 @@ pub fn session_of(spec: &ExecutionSpec) -> Option<SessionSpec> {
     if spec.tags.get(SESSION_TAG).map(String::as_str) != Some(SESSION_TAG_NOTEBOOK) {
         return None;
     }
+    let mount = spec
+        .tags
+        .get(SESSION_MOUNT_PATH_TAG)
+        .map(|path| SessionMount {
+            prefix: spec
+                .tags
+                .get(SESSION_MOUNT_PREFIX_TAG)
+                .cloned()
+                .unwrap_or_default(),
+            path: path.clone(),
+        });
     Some(SessionSpec {
         runtime: spec
             .tags
@@ -188,6 +203,7 @@ pub fn session_of(spec: &ExecutionSpec) -> Option<SessionSpec> {
             .tags
             .get(SESSION_EXPIRY_TAG)
             .and_then(|value| value.parse().ok()),
+        mount,
     })
 }
 
@@ -224,5 +240,66 @@ pub fn effective_resources(spec: &ExecutionSpec) -> EffectiveResources {
             .max_walltime_ms
             .unwrap_or(DEFAULT_WALLTIME_MS),
         preemptible: spec.resources.preemptible,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aruna_core::structs::ComputeResources;
+
+    use super::*;
+
+    fn session_spec() -> ExecutionSpec {
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+        tags.insert(
+            SESSION_RUNTIME_TAG.to_string(),
+            "python-notebook".to_string(),
+        );
+        ExecutionSpec {
+            group_id: Ulid::from_bytes([3u8; 16]),
+            name: None,
+            description: None,
+            tags,
+            image: "session:latest".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: Some("/work".to_string()),
+            env: Default::default(),
+            resources: ComputeResources::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        }
+    }
+
+    #[test]
+    fn session_reads_mount() {
+        // The recorded mount tags name the bucket slice and its folder; a spec
+        // stored without them mounts nothing rather than guessing a layout.
+        let mut spec = session_spec();
+        assert_eq!(session_of(&spec).unwrap().mount, None);
+
+        spec.tags
+            .insert(SESSION_MOUNT_PATH_TAG.to_string(), "/work/raw".to_string());
+        assert_eq!(
+            session_of(&spec).unwrap().mount,
+            Some(SessionMount {
+                prefix: String::new(),
+                path: "/work/raw".to_string(),
+            })
+        );
+
+        spec.tags.insert(
+            SESSION_MOUNT_PREFIX_TAG.to_string(),
+            "raw/2024/".to_string(),
+        );
+        assert_eq!(
+            session_of(&spec).unwrap().mount.unwrap().prefix,
+            "raw/2024/"
+        );
     }
 }

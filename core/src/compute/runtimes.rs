@@ -70,6 +70,14 @@ pub const SESSION_EXPIRY_TAG: &str = "aruna-engine.org/session-expires-at-ms";
 /// Idle wait the submitter asked for. The executing node clamps it to the realm
 /// value, so a longer request never extends the session.
 pub const SESSION_IDLE_TAG: &str = "aruna-engine.org/session-idle-ms";
+/// Key prefix of the workspace bucket a session mounts; empty means the whole
+/// bucket. Set by the node from the submission, defaulting to `data/`.
+pub const SESSION_MOUNT_PREFIX_TAG: &str = "aruna-engine.org/session-mount-prefix";
+/// Container path that prefix is mounted at, below the working directory.
+pub const SESSION_MOUNT_PATH_TAG: &str = "aruna-engine.org/session-mount-path";
+pub const DEFAULT_SESSION_MOUNT_PREFIX: &str = "data/";
+/// Folder name below the working directory the default mount uses.
+pub const DEFAULT_SESSION_MOUNT_DIR: &str = "data";
 
 /// Unix socket the session helper listens on, relative to the working
 /// directory. The node passes the absolute path in `ARUNA_SESSION_SOCKET`.

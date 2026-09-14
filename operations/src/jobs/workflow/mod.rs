@@ -617,9 +617,9 @@ pub(super) fn build_task_spec(
         preemptible: spec.resources.preemptible,
         backend_extensions: std::collections::BTreeMap::new(),
     };
-    let session = session_of(spec).is_some();
+    let session = session_of(spec);
     let mut env = spec.env.clone();
-    if let (true, Some(workdir)) = (session, spec.workdir.as_deref()) {
+    if let (Some(_), Some(workdir)) = (&session, spec.workdir.as_deref()) {
         env.insert(
             "ARUNA_SESSION_SOCKET".to_string(),
             format!("{}/{SESSION_SOCKET_PATH}", workdir.trim_end_matches('/')),
@@ -649,7 +649,8 @@ pub(super) fn build_task_spec(
             ..Default::default()
         },
         log_limits: Default::default(),
-        session,
+        session: session.is_some(),
+        session_mount: session.and_then(|session| session.mount),
         inputs,
         s3_mounts: mounts,
         staging_mode: staging,
