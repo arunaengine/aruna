@@ -92,8 +92,9 @@ assert effects, `step` explicit events, assert effects, `finalize`.
 3. Add the feature to `compute/Cargo.toml` and `aruna/Cargo.toml`, gate the
    module at the backend boundary, build the registry in
    `compute_setup/<backend>.rs`.
-4. Check every selection locally:
-   `cargo check -p aruna --all-targets --no-default-features --features <backend>`.
+4. Check every selection locally for the backend crate and the node:
+   `cargo check -p aruna-compute -p aruna --all-targets --no-default-features
+   --features <backend>`.
 5. Test path/planning refusals with fixed data; keep real daemon integration
    tests separate and few.
 
@@ -111,8 +112,10 @@ assert effects, `step` explicit events, assert effects, `finalize`.
 `aruna/src/main.rs` (process entry) starts the Tokio runtime and calls
 `aruna::application::run_node`, which runs in order:
 
-1. `startup::resources::acquire` builds the network, metadata, blob, compute,
-   ops, and task resources; on failure it tears down only what it acquired.
+1. `startup::resources::acquire` opens storage, then resolves identity,
+   enrollment, and settings inside one owned boundary before building the
+   network, metadata, blob, compute, ops, and task resources; on failure or an
+   accepted stop it tears down only what it acquired.
 2. `startup::realm::prepare` replays metadata and prepares the realm mode
    (initialize, join, or provision).
 3. `startup::listeners::bind` binds REST, S3, portal, and session S3.
@@ -127,9 +130,12 @@ its consumer in `aruna/tests/observability.rs`.
 
 ## Tests and commands
 
-- `just test-fast` runs the audited no-I/O selection
-  (`state_machine_tests`, `pure_tests`, and `decision_tests` modules). These
-  tests use no runtime, storage, network, process, or environment mutation.
+- `just test-fast` runs the audited no-I/O selection across `aruna-core` and
+  `aruna-operations`: the `state_machine_tests`, `pure_tests`, and
+  `decision_tests` modules plus the pure `reducer::tests` family. These tests
+  use no runtime, storage, network, process, or environment mutation. A module
+  with that name must keep the guarantee: filesystem, database, or discovery
+  coverage belongs in an ordinary `tests` module beside it.
 - Runtime, storage, and multi-node behavior lives in the ordinary test modules
   and `aruna/tests`.
 - Focused loop: `cargo nextest run -p <crate> --lib --locked --profile fast`.

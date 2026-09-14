@@ -1,16 +1,17 @@
 # Formatting and Clippy with the pinned nightly toolchain, as CI runs them.
 lint:
-	cargo +nightly-2026-08-23 fmt --all -- --check
-	cargo +nightly-2026-08-23 clippy --workspace --all-targets --all-features --locked -- -D warnings
+	cargo +nightly-2026-09-14 fmt --all -- --check
+	cargo +nightly-2026-09-14 clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 # Workspace tests and doctests, as the CI tests job runs them.
 test:
 	cargo nextest run --workspace --all-targets --all-features --locked --profile ci
 	cargo test --workspace --all-features --locked --doc
 
-# The fast editing loop: only the audited no-I/O state-machine and pure tests.
-test-fast package="aruna-operations":
-	cargo nextest run -p {{package}} --lib --locked --profile fast
+# The fast editing loop: only the audited no-I/O state-machine and pure tests
+# in core and operations.
+test-fast:
+	cargo nextest run -p aruna-core -p aruna-operations --lib --locked --profile fast
 
 # The same selection across every workspace target; compiles more than it runs.
 test-fast-workspace:
@@ -24,6 +25,10 @@ check:
 	cargo check -p aruna-compute --no-default-features --features docker --locked
 	cargo check -p aruna-compute --no-default-features --features apptainer --locked
 	cargo check -p aruna-compute --no-default-features --features kubernetes --locked
+	cargo check -p aruna --no-default-features --locked
+	cargo check -p aruna --no-default-features --features docker --locked
+	cargo check -p aruna --no-default-features --features apptainer --locked
+	cargo check -p aruna --no-default-features --features kubernetes --locked
 
 # Single-node stack with Keycloak; prints service URLs and ADMIN_TOKEN.
 local:

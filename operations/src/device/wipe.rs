@@ -227,13 +227,11 @@ fn purge_root(root: &Path, failed: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod pure_tests {
     use super::{
-        DeviceWipe, WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation, WipeDeviceState, purge,
+        DeviceWipe, WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation, WipeDeviceState,
     };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
-    use std::fs;
-    use tempfile::tempdir;
 
     fn node() -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[8u8; 32]).public()
@@ -290,6 +288,28 @@ mod pure_tests {
     }
 
     #[test]
+    fn arms_once() {
+        let wipe = DeviceWipe::new(
+            vec![std::path::PathBuf::from("/tmp/aruna-wipe-test")],
+            Vec::new(),
+        );
+        assert!(!wipe.is_armed());
+        wipe.arm();
+        assert!(wipe.is_armed());
+        assert_eq!(wipe.roots().len(), 1);
+        assert!(wipe.unsupported().is_empty());
+    }
+}
+
+/// Filesystem-boundary coverage for the purge walk; kept out of the pure
+/// selection because it mutates a temporary filesystem.
+#[cfg(test)]
+mod tests {
+    use super::purge;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
     fn erases_root_contents() {
         // The root survives so a mounted volume stays mounted.
         let root = tempdir().unwrap();
@@ -306,18 +326,5 @@ mod pure_tests {
         let root = tempdir().unwrap();
         let missing = root.path().join("gone");
         assert!(purge(&[missing]).is_empty());
-    }
-
-    #[test]
-    fn arms_once() {
-        let wipe = DeviceWipe::new(
-            vec![std::path::PathBuf::from("/tmp/aruna-wipe-test")],
-            Vec::new(),
-        );
-        assert!(!wipe.is_armed());
-        wipe.arm();
-        assert!(wipe.is_armed());
-        assert_eq!(wipe.roots().len(), 1);
-        assert!(wipe.unsupported().is_empty());
     }
 }

@@ -70,8 +70,7 @@ pub(super) async fn build(
 
 #[cfg(test)]
 mod pure_tests {
-    use super::super::settings::{parse_s3_cidrs, policy_paths};
-    use tempfile::tempdir;
+    use super::super::settings::parse_s3_cidrs;
 
     #[test]
     fn validates_cluster_cidrs() {
@@ -83,6 +82,14 @@ mod pure_tests {
         assert!(parse_s3_cidrs("2001:db8::/129").is_err());
         assert!(parse_s3_cidrs("invalid/8").is_err());
     }
+}
+
+/// Filesystem-boundary coverage for policy-path expansion; kept out of the
+/// pure selection because it writes to a temporary directory.
+#[cfg(test)]
+mod tests {
+    use super::super::settings::policy_paths;
+    use tempfile::tempdir;
 
     #[test]
     fn expands_policy_paths() {
