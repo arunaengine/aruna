@@ -313,6 +313,7 @@ pub(crate) fn status_view(
         workspace_bucket,
         workspace_mode: mode,
         locally_exhausted: false,
+        session_runtime: spec.payload.session_runtime(),
     }
 }
 

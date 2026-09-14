@@ -558,6 +558,10 @@ pub struct JobStatusResponse {
     /// automatic attempt runs here and the outcome is not a proven failure.
     #[serde(default)]
     pub locally_exhausted: bool,
+    /// Present for a notebook session: the catalog runtime it runs, for example
+    /// `python-notebook`. Absent for every other job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_runtime: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_crate: Option<serde_json::Value>,
     /// Present only for a distributed external job, whose truth is the
@@ -606,6 +610,7 @@ pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
         workspace_bucket: job.workspace_bucket.clone(),
         workspace_mode: job.workspace_mode.name().to_string(),
         locally_exhausted: job.locally_exhausted,
+        session_runtime: job.session_runtime.clone(),
         run_crate: None,
         family: None,
     }
@@ -2700,6 +2705,7 @@ mod tests {
                 workspace_bucket: None,
                 workspace_mode: WorkspaceMode::None,
                 locally_exhausted: false,
+                session_runtime: None,
             },
             spec: LogicalJobSpec {
                 submission_id,

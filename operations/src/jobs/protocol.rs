@@ -725,6 +725,7 @@ mod tests {
                 workspace_bucket: Some("workspace".to_string()),
                 workspace_mode: WorkspaceMode::None,
                 locally_exhausted: false,
+                session_runtime: None,
             },
             run_crate: Some(r#"{"status":"pending"}"#.to_string()),
         };

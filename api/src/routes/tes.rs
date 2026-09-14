@@ -3173,6 +3173,7 @@ mod tests {
                 workspace_bucket: Some("ws".to_string()),
                 workspace_mode: WorkspaceMode::None,
                 locally_exhausted: false,
+                session_runtime: None,
             },
             spec,
             submission_id,

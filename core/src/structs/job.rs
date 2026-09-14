@@ -9,6 +9,7 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::compute::ExecutionTargetId;
+use crate::compute::runtimes::{SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK};
 use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
 use crate::structs::{
@@ -742,6 +743,21 @@ pub enum JobPayload {
     /// One object copy the request path handed off because its source must be
     /// pulled from a reference first. Safe to requeue: a rerun copies again.
     CopyObject(CopyJobSpec),
+}
+
+impl ExecutionSpec {
+    /// The catalog runtime of a notebook session; `None` for an ordinary run.
+    pub fn session_runtime(&self) -> Option<String> {
+        if self.tags.get(SESSION_TAG).map(String::as_str) != Some(SESSION_TAG_NOTEBOOK) {
+            return None;
+        }
+        Some(
+            self.tags
+                .get(SESSION_RUNTIME_TAG)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
 }
 
 impl JobPayload {

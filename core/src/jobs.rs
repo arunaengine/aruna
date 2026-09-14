@@ -93,6 +93,8 @@ pub struct JobStatusView {
     /// This node spent its attempts without a job-specific verdict; no further
     /// automatic attempt runs here and the outcome stays undecided.
     pub locally_exhausted: bool,
+    /// Set for a notebook session: the catalog runtime it runs.
+    pub session_runtime: Option<String>,
 }
 
 mod json_value {
@@ -134,6 +136,10 @@ impl From<&JobRecord> for JobStatusView {
             workspace_bucket: record.workspace_bucket.clone(),
             workspace_mode: record.workspace_mode,
             locally_exhausted: record.locally_exhausted,
+            session_runtime: match &record.payload {
+                JobPayload::Execution(spec) => spec.session_runtime(),
+                _ => None,
+            },
         }
     }
 }

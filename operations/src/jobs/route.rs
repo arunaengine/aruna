@@ -240,6 +240,7 @@ mod tests {
             workspace_bucket: None,
             workspace_mode: WorkspaceMode::None,
             locally_exhausted: false,
+            session_runtime: None,
         }
     }
 
