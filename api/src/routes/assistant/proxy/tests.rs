@@ -507,25 +507,56 @@ fn capture_logs() -> (
 }
 
 /// Real proxy success and failure paths exercise synthetic secrets; neither the
-/// captured output nor any formatted error may disclose them.
+/// captured output nor any formatted error may disclose them, and the refresh
+/// path talks to a controlled local issuer instead of a live one.
 #[tokio::test]
 async fn proxy_paths_do_not_disclose_synthetic_secrets() {
     const API_KEY: &str = "synthetic-api-key-7f3a";
     const ACCESS: &str = "synthetic-access-7f3a";
     const REFRESH: &str = "synthetic-refresh-7f3a";
+    const ROTATED_ACCESS: &str = "rotated-access-7f3a";
 
     let (logs, _guard) = capture_logs();
     // Prove the capture is live before trusting a negative assertion.
     tracing::info!(probe = "capture-active-7f3a", "capture probe");
 
-    let router = Router::new().route("/v1/responses", post(|| async { "ok" }));
+    // A closed local port for the transport-failure case; never a fixed one.
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
+        let address = listener.local_addr().expect("probe address");
+        drop(listener);
+        format!("http://{address}")
+    };
+    let refresh_attempts = Arc::new(AtomicUsize::new(0));
+    let attempts = refresh_attempts.clone();
+    let router = Router::new()
+        .route("/v1/responses", post(|| async { "ok" }))
+        .route(
+            "/oauth/token",
+            post(move || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Json(serde_json::json!({
+                            "access_token": ROTATED_ACCESS,
+                            "refresh_token": "rotated-refresh-7f3a",
+                        }))
+                        .into_response()
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                }
+            }),
+        );
     let (base_url, handle) = spawn_mock(router).await;
     let (_dir, state, auth) = setup_state().await;
+    // The refresh issuer must be the controlled local server.
+    let state = Arc::new(state.with_chatgpt_urls(base_url.clone(), base_url.clone()));
     let provider = make_provider(
         &state,
         &auth,
         AssistantProviderKind::OpenaiCompatible,
-        base_url,
+        base_url.clone(),
         Some(API_KEY),
     );
 
@@ -545,7 +576,7 @@ async fn proxy_paths_do_not_disclose_synthetic_secrets() {
         &state,
         &auth,
         AssistantProviderKind::OpenaiCompatible,
-        "http://127.0.0.1:1".to_string(),
+        closed,
         Some(ACCESS),
     );
     let error = send_upstream(
@@ -562,12 +593,13 @@ async fn proxy_paths_do_not_disclose_synthetic_secrets() {
     assert!(!formatted.contains(ACCESS), "{formatted}");
     assert!(!formatted.contains(API_KEY), "{formatted}");
 
-    // The concurrent-refresh path's tokens must not surface in its output.
+    // The refresh path succeeds against the local issuer, and its tokens and
+    // the rotated result must not surface in any output.
     let mut provider = make_provider(
         &state,
         &auth,
         AssistantProviderKind::Chatgpt,
-        "http://127.0.0.1:1".to_string(),
+        base_url.clone(),
         None,
     );
     let mut secret = provider
@@ -576,19 +608,79 @@ async fn proxy_paths_do_not_disclose_synthetic_secrets() {
     secret.access_token = Some(Secret::new(ACCESS));
     secret.refresh_token = Some(Secret::new(REFRESH));
     provider.token_obtained_at = Some(0);
-    provider
-        .encrypt_secret(state.credential_encryption_key(), &secret)
-        .unwrap();
-    let refresh_error = super::super::chatgpt::fresh_provider(&state, provider)
+    let expected = provider.clone();
+    drive(
+        CreateProviderOperation::new(
+            provider,
+            secret,
+            AssistantHeaders(BTreeMap::new()),
+            state.credential_encryption_key().clone(),
+        ),
+        &state.get_ctx(),
+    )
+    .await
+    .expect("the refresh fixture persists");
+    let refreshed = super::super::chatgpt::fresh_provider(&state, expected)
         .await
-        .expect_err("the refresh endpoint is unreachable");
-    let refresh_formatted = format!("{refresh_error} {refresh_error:?}");
+        .expect("the controlled issuer answers the refresh");
+    assert_eq!(
+        refresh_attempts.load(Ordering::SeqCst),
+        1,
+        "the refresh request must reach the local issuer"
+    );
+    let rotated = refreshed
+        .open_secret(state.credential_encryption_key())
+        .unwrap();
+    assert_eq!(
+        rotated.access_token.as_ref().map(Secret::expose),
+        Some(ROTATED_ACCESS)
+    );
+
+    // A refused refresh reports its category and stays redacted.
+    let mut failing = make_provider(
+        &state,
+        &auth,
+        AssistantProviderKind::Chatgpt,
+        base_url.clone(),
+        None,
+    );
+    let mut secret = failing
+        .open_secret(state.credential_encryption_key())
+        .unwrap();
+    secret.access_token = Some(Secret::new(ACCESS));
+    secret.refresh_token = Some(Secret::new(REFRESH));
+    failing.token_obtained_at = Some(0);
+    let expected = failing.clone();
+    drive(
+        CreateProviderOperation::new(
+            failing,
+            secret,
+            AssistantHeaders(BTreeMap::new()),
+            state.credential_encryption_key().clone(),
+        ),
+        &state.get_ctx(),
+    )
+    .await
+    .expect("the failing refresh fixture persists");
+    let refresh_error = super::super::chatgpt::fresh_provider(&state, expected)
+        .await
+        .expect_err("the second refresh is refused");
+    assert!(
+        matches!(&refresh_error, ServerError::BadGatewayReason(message) if message == "ChatGPT refresh failed"),
+        "{refresh_error:?}"
+    );
+    assert_eq!(refresh_attempts.load(Ordering::SeqCst), 2);
+    let refresh_formatted = format!("{refresh_error} {refresh_error:?} {refreshed:?}");
     assert!(!refresh_formatted.contains(ACCESS), "{refresh_formatted}");
     assert!(!refresh_formatted.contains(REFRESH), "{refresh_formatted}");
+    assert!(
+        !refresh_formatted.contains(ROTATED_ACCESS),
+        "{refresh_formatted}"
+    );
 
     let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("capture-active-7f3a"), "{logs}");
-    for secret in [API_KEY, ACCESS, REFRESH] {
+    for secret in [API_KEY, ACCESS, REFRESH, ROTATED_ACCESS] {
         assert!(!logs.contains(secret), "log disclosed {secret}: {logs}");
     }
     handle.abort();
