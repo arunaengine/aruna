@@ -556,7 +556,11 @@ async fn reconcile_inbound_topics(
     true
 }
 
-pub fn initialize_net_incoming(context: Arc<DriverContext>) {
+/// Test and tooling installation with private owners: this creates the job
+/// runtime and shutdown owner for the handler it registers. It is intentionally
+/// not a production entry point; startup installs through
+/// [`initialize_net_holder`] with the node's own owners and lifecycle.
+pub fn initialize_net_incoming_for_tests(context: Arc<DriverContext>) {
     initialize_net_holder(
         context,
         RoCrateLimits::default(),

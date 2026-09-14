@@ -62,7 +62,7 @@ use aruna_operations::realm::set_policies::{
 use aruna_operations::sync::document_outbox::{
     new_outbox_record, outbox_key, read_outbox_record, write_outbox_effect,
 };
-use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{OutboxDrainer, install_and_start_task_queues};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -84,6 +84,9 @@ struct TestNode {
     net: NetHandle,
     context: Arc<DriverContext>,
     sync_eligible: bool,
+    /// Keeps the inbound handler's scheduled tasks tied to a live owner for
+    /// the node's whole lifetime.
+    _shutdown: aruna_core::shutdown::Shutdown,
 }
 
 /// A User-kind node forwards its create because it holds no bucket.
@@ -1096,21 +1099,22 @@ async fn spawn_node(
         compute_handle: None,
     });
 
-    initialize_net_incoming(context.clone());
+    let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
     let shutdown = aruna_core::shutdown::Shutdown::new();
-    install_and_start_task_queues(
+    initialize_net_holder(
         context.clone(),
-        task_handle,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
+        aruna_core::structs::RoCrateLimits::default(),
+        jobs_runtime.clone(),
         &shutdown,
-    )
-    .await;
+    );
+    install_and_start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
 
     Ok(TestNode {
         _temp_dir: temp_dir,
         net,
         context,
         sync_eligible,
+        _shutdown: shutdown,
     })
 }
 

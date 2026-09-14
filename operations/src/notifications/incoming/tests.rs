@@ -7,7 +7,7 @@ use crate::notifications::inbox::upsert_inbox_records;
 use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_UNAUTHORIZED, create_local_watch, list_watch_subscriptions,
 };
-use crate::sync::incoming::initialize_net_incoming;
+use crate::sync::incoming::initialize_net_incoming_for_tests;
 use aruna_core::UserId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
@@ -59,7 +59,7 @@ async fn spawn(realm_id: RealmId, secret: [u8; 32]) -> Node {
         task_handle: None,
         compute_handle: None,
     });
-    initialize_net_incoming(context.clone());
+    initialize_net_incoming_for_tests(context.clone());
     Node {
         _dir: dir,
         net,

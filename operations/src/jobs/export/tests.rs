@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::jobs::executor::ProgressReporter;
-use crate::sync::incoming::initialize_net_incoming;
+use crate::sync::incoming::initialize_net_incoming_for_tests;
 use crate::tests::fixtures::import::{
     RewriteTarget, file_id_candidates, inspect_archive, open_archive, payload_entries,
     read_metadata, rewrite_document, signature_entry, validate_document,
@@ -118,7 +118,7 @@ async fn bao_node(realm_id: RealmId) -> BaoNode {
         task_handle: None,
         compute_handle: None,
     });
-    initialize_net_incoming(driver.clone());
+    initialize_net_incoming_for_tests(driver.clone());
     BaoNode {
         _tempdir: tempdir,
         net,

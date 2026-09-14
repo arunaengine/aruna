@@ -43,7 +43,7 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::replay_event_log;
-use aruna_operations::sync::incoming::initialize_net_incoming;
+use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use bytes::Bytes;
@@ -229,7 +229,7 @@ async fn setup_remote(
         &location,
     )
     .await?;
-    initialize_net_incoming(holder.context.clone());
+    initialize_net_incoming_for_tests(holder.context.clone());
 
     let config = seed_exporter(&exporter, holder.net.node_id(), owner, group_id, realm_id).await?;
     // Minted on the exporter so the document lands in a bucket it leads.
