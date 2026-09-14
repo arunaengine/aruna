@@ -166,7 +166,10 @@ impl UpdateMetadataDocumentOperation {
         let phase_source = crate::metadata::MetadataPhaseSource::default();
         Self {
             config,
-            event_id: phase_source.next_id(),
+            // The event identity is minted from the phase source on the first
+            // real transition, so replacing the source before `start` is not
+            // shadowed by an incidental constructor sample.
+            event_id: Ulid::nil(),
             txn_id: None,
             record: None,
             update_event: None,
@@ -954,6 +957,9 @@ impl Operation for UpdateMetadataDocumentOperation {
     type Error = UpdateMetadataDocumentError;
 
     fn start(&mut self) -> Effects {
+        if self.event_id.is_nil() {
+            self.event_id = self.phase_source.next_id();
+        }
         self.state = UpdateMetadataDocumentState::ReadCurrent;
         smallvec![read_registry_effect(
             self.config.group_id,

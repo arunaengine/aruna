@@ -23,7 +23,6 @@ use aruna_core::structs::{
     shard_for_subject,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredIdGenerator};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, TxnId, Value};
 use aruna_core::{MetaResourceId, StructuredId};
 use serde::{Deserialize, Serialize};
@@ -98,6 +97,9 @@ pub struct CreateMetadataDocumentOperation {
     pending_realm_config: Option<RealmConfigDocument>,
     pending_placement: Option<PlacementRef>,
     pending_holders: Vec<NodeId>,
+    /// The phase-time and identity source. Production uses the default source;
+    /// tests replace it before the first record is built.
+    phase_source: crate::metadata::MetadataPhaseSource,
     output: Option<Result<CreateMetadataDocumentResult, CreateMetadataDocumentError>>,
 }
 
@@ -182,8 +184,21 @@ impl CreateMetadataDocumentOperation {
             pending_realm_config: None,
             pending_placement: None,
             pending_holders: Vec::new(),
+            phase_source: crate::metadata::MetadataPhaseSource::default(),
             output: None,
         }
+    }
+
+    /// Replaces the phase-time and identity source before the first record is
+    /// built. Production never calls this; tests call the same implementation
+    /// with fixed samplers.
+    #[cfg(test)]
+    pub(crate) fn with_phase_source(
+        mut self,
+        phase_source: crate::metadata::MetadataPhaseSource,
+    ) -> Self {
+        self.phase_source = phase_source;
+        self
     }
 
     pub fn new_generated_id(config: CreateMetadataDocumentConfig) -> Self {
@@ -220,6 +235,7 @@ impl CreateMetadataDocumentOperation {
             pending_realm_config: None,
             pending_placement: None,
             pending_holders: Vec::new(),
+            phase_source: self.phase_source,
             output: None,
         }
     }
@@ -283,7 +299,7 @@ impl CreateMetadataDocumentOperation {
         holder_node_ids: Vec<NodeId>,
         placement: PlacementRef,
     ) -> MetadataRegistryRecord {
-        let now = unix_timestamp_millis();
+        let now = self.phase_source.now_ms();
         MetadataRegistryRecord {
             realm_id: self.config.actor.realm_id,
             group_id: self.config.group_id,
@@ -325,7 +341,7 @@ impl CreateMetadataDocumentOperation {
     }
 
     fn create_event_record(&self, record: &MetadataRegistryRecord) -> MetadataCreateEventRecord {
-        let event_id = Ulid::generate();
+        let event_id = self.phase_source.next_id();
         let mut record = record.clone();
         record.establishing_event_id = event_id;
         record.last_event_id = event_id;
@@ -1424,6 +1440,31 @@ mod tests {
                 event_id: winner.event_id,
             }
         );
+    }
+
+    // The phase source is sampled when the record and event are built, not in
+    // the constructor, so a fixed source pins the whole create trace.
+    #[test]
+    fn fixed_phase_source_pins_created_time_and_event_id() {
+        let realm_id = RealmId([43u8; 32]);
+        let actor = actor(realm_id, 5);
+        let document_id = Ulid::from_bytes([43; 16]);
+        let operation = CreateMetadataDocumentOperation::new(config(
+            actor,
+            GroupId::from_bytes([0x43; 16]),
+            document_id,
+        ))
+        .with_phase_source(crate::metadata::MetadataPhaseSource::fixed(
+            || 1_700_000_000_000,
+            || Ulid::from_bytes([0x77; 16]),
+        ));
+
+        let record = operation.build_record(Vec::new(), PlacementRef::NIL);
+        assert_eq!(record.created_at_ms, 1_700_000_000_000);
+        assert_eq!(record.updated_at_ms, 1_700_000_000_000);
+        let event = operation.create_event_record(&record);
+        assert_eq!(event.event_id, Ulid::from_bytes([0x77; 16]));
+        assert_eq!(event.occurred_at_ms, 1_700_000_000_000);
     }
 
     #[test]

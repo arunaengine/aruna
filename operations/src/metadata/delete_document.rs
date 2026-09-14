@@ -17,7 +17,6 @@ use aruna_core::structs::{
     RealmConfigDocument,
 };
 use aruna_core::task::TaskEvent;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Effects;
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -761,7 +760,7 @@ impl DeleteMetadataDocumentOperation {
                 Some(mapping),
                 &self.mapping_route,
                 self.document_id,
-                unix_timestamp_millis(),
+                self.phase_source.now_ms(),
             ),
         };
         match transition {
