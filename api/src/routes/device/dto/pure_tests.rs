@@ -36,7 +36,7 @@ fn reports_download_error() {
 fn pending_replace_reason() {
     let base = base_with(EntryState::PendingReplace {
         reason: ReplaceReason::BaseUnknown,
-        remote_version: Ulid::generate(),
+        remote_version: Ulid::from_bytes([1u8; 16]),
         conflicted_copy: Some("notes (1).txt".to_string()),
     });
     let view = entry_view("notes.txt".to_string(), base);
@@ -49,7 +49,7 @@ fn pending_replace_reason() {
 #[test]
 fn conflict_reports_copy() {
     let base = base_with(EntryState::Conflict {
-        remote_version: Ulid::generate(),
+        remote_version: Ulid::from_bytes([2u8; 16]),
         conflicted_copy: "notes (conflict).txt".to_string(),
     });
     let view = entry_view("notes.txt".to_string(), base);
@@ -70,10 +70,10 @@ fn folder_error_message() {
     )
     .unwrap();
     let folder = SyncedFolder {
-        folder_id: Ulid::generate(),
+        folder_id: Ulid::from_bytes([3u8; 16]),
         root: "/home/user/data".to_string(),
         local_bucket: "device-bucket".to_string(),
-        group_id: Ulid::generate(),
+        group_id: Ulid::from_bytes([4u8; 16]),
         remote: RemoteBinding {
             node_id: node,
             bucket: "realm-bucket".to_string(),
@@ -85,7 +85,7 @@ fn folder_error_message() {
             reason: "watcher stopped".to_string(),
         },
         created_by: aruna_core::UserId::local(
-            Ulid::generate(),
+            Ulid::from_bytes([5u8; 16]),
             aruna_core::structs::RealmId::from_bytes([5u8; 32]),
         ),
         created_at_ms: 7,
@@ -116,14 +116,14 @@ fn folder_error_message() {
 #[test]
 fn failed_action_reason() {
     let record = SyncActionRecord {
-        action_id: Ulid::generate(),
-        folder_id: Ulid::generate(),
+        action_id: Ulid::from_bytes([6u8; 16]),
+        folder_id: Ulid::from_bytes([7u8; 16]),
         kind: ActionKind::RemoveLocal,
         scope: ActionScope::Entry {
             relative: "notes.txt".to_string(),
         },
         actor: aruna_core::UserId::local(
-            Ulid::generate(),
+            Ulid::from_bytes([8u8; 16]),
             aruna_core::structs::RealmId::from_bytes([5u8; 32]),
         ),
         at_ms: 11,
@@ -243,10 +243,10 @@ fn projects_deleting_folder() {
     )
     .unwrap();
     let folder = SyncedFolder {
-        folder_id: Ulid::generate(),
+        folder_id: Ulid::from_bytes([9u8; 16]),
         root: "/home/user/data".to_string(),
         local_bucket: "device-bucket".to_string(),
-        group_id: Ulid::generate(),
+        group_id: Ulid::from_bytes([10u8; 16]),
         remote: RemoteBinding {
             node_id: node,
             bucket: "realm-bucket".to_string(),
@@ -256,7 +256,7 @@ fn projects_deleting_folder() {
         propagate_deletes: false,
         state: FolderState::Deleting,
         created_by: aruna_core::UserId::local(
-            Ulid::generate(),
+            Ulid::from_bytes([11u8; 16]),
             aruna_core::structs::RealmId::from_bytes([5u8; 32]),
         ),
         created_at_ms: 7,
