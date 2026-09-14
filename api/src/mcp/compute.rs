@@ -379,8 +379,8 @@ impl McpServer {
             image: String::new(),
             runtime: Some(input.runtime),
             session_idle_after_ms: input.idle_after_ms,
-            session_mount: (input.mount_prefix.is_some() || input.mount_path.is_some()).then(
-                || crate::routes::jobs::SessionMountRequest {
+            session_mount: (input.mount_prefix.is_some() || input.mount_path.is_some()).then_some(
+                crate::routes::jobs::SessionMountRequest {
                     prefix: input.mount_prefix,
                     path: input.mount_path,
                 },
