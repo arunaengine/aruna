@@ -77,7 +77,9 @@ enum TaskCommand {
     },
 }
 
-/// Outcome of draining the scheduler on shutdown.
+/// Outcome of draining the scheduler's timer handlers on shutdown. This is the
+/// handler boundary only: the scheduler loop itself terminates when the last
+/// command sender drops, which every clone of the handle owns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TaskShutdownReport {
     /// Handlers still running when admission stopped.
@@ -126,6 +128,9 @@ struct RunningTaskEntry {
     warn_at: Instant,
     warned: bool,
     task: JoinHandle<()>,
+    /// Cooperative stop for one key's run. The entry, its key exclusion, and
+    /// its drain accounting stay until the handler reports completion.
+    cancel: Option<oneshot::Sender<()>>,
 }
 
 impl SchedulerState {
@@ -192,7 +197,12 @@ impl SchedulerState {
         }
     }
 
-    fn track_running_task(&mut self, task: &RunningTask, handle: JoinHandle<()>) {
+    fn track_running_task(
+        &mut self,
+        task: &RunningTask,
+        handle: JoinHandle<()>,
+        cancel: Option<oneshot::Sender<()>>,
+    ) {
         let Some(id) = task.id else {
             return;
         };
@@ -209,6 +219,7 @@ impl SchedulerState {
                 warn_at,
                 warned: false,
                 task: handle,
+                cancel,
             },
         );
         self.running_warn_deadlines.insert((warn_at, id));
@@ -226,8 +237,9 @@ impl SchedulerState {
         }
         if let Some(handler) = self.inbound_handler.clone() {
             let task = self.prepare_running_task(key, started_at);
-            let handle = spawn_timer_handler(handler, command_tx.clone(), task.clone());
-            self.track_running_task(&task, handle);
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let handle = spawn_timer_handler(handler, command_tx.clone(), task.clone(), cancel_rx);
+            self.track_running_task(&task, handle, Some(cancel_tx));
         }
     }
 
@@ -450,28 +462,23 @@ impl SchedulerState {
         }
     }
 
+    /// Requests a cooperative stop for every run of one key. The entries stay
+    /// owned and keep their key exclusion until each handler reports its
+    /// completion, so the same key cannot be rescheduled and the drain cannot
+    /// be declared before the aborted futures actually ended.
     fn abort_running_handlers(&mut self, key: TaskKey) -> TaskEvent {
-        let run_ids = self
-            .running_by_id
-            .iter()
-            .filter_map(|(run_id, entry)| (entry.key == key).then_some(*run_id))
-            .collect::<Vec<_>>();
-
-        for run_id in &run_ids {
-            if let Some(entry) = self.running_by_id.remove(run_id) {
-                self.running_warn_deadlines
-                    .remove(&(entry.warn_at, *run_id));
-                entry.task.abort();
-                self.release_key(&entry.key);
+        let mut count = 0usize;
+        for entry in self.running_by_id.values_mut() {
+            if entry.key == key {
+                if let Some(cancel) = entry.cancel.take() {
+                    let _ = cancel.send(());
+                }
+                count += 1;
             }
         }
         self.refire_requested.remove(&key);
-        self.notify_if_drained();
 
-        TaskEvent::RunningHandlersAborted {
-            key,
-            count: run_ids.len(),
-        }
+        TaskEvent::RunningHandlersAborted { key, count }
     }
 
     fn handle_command(&mut self, command: TaskCommand, command_tx: &mpsc::WeakSender<TaskCommand>) {
@@ -572,6 +579,7 @@ fn spawn_timer_handler(
     handler: Arc<dyn InboundTaskHandler>,
     command_tx: mpsc::WeakSender<TaskCommand>,
     task: RunningTask,
+    mut cancel: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if task.id.is_none() {
@@ -581,7 +589,14 @@ fn spawn_timer_handler(
             );
         }
 
-        handler.handle_timer(task.key.clone()).await;
+        // A cooperative stop drops the handler future at its next await, then
+        // still reports completion so the scheduler releases the key and the
+        // drain only after the run really ended.
+        tokio::select! {
+            biased;
+            _ = &mut cancel => {}
+            _ = handler.handle_timer(task.key.clone()) => {}
+        }
 
         let elapsed = task.started_at.elapsed();
         if let Some(run_id) = task.id {
@@ -755,8 +770,10 @@ impl TaskHandle {
     }
 
     /// Stops admitting timer handlers, waits up to `drain` for the ones already
-    /// running, then aborts whatever is left. Pending timers are durable, so an
-    /// undrained handler is retried on the next boot rather than lost.
+    /// running, then aborts whatever is left and awaits the drops. Pending
+    /// timers are durable, so an undrained handler is retried on the next boot
+    /// rather than lost. Handler draining and scheduler-loop termination are
+    /// distinct: this never claims the loop has ended.
     pub async fn shutdown(&self, drain: Duration) -> TaskShutdownReport {
         self.close_admission();
         let Some(in_flight) = self.stop_admission().await else {
@@ -1379,6 +1396,156 @@ mod tests {
         };
         assert_eq!(count, 0);
         assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// Runs a synchronous section with no await point, so an abort request
+    /// cannot be observed until the section ends. The markers make both the
+    /// start and the end of the run explicit.
+    #[derive(Clone)]
+    struct SlowSyncHandler {
+        runs: Arc<AtomicUsize>,
+        started: Arc<Notify>,
+        finished: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for SlowSyncHandler {
+        async fn handle_timer(&self, _key: TaskKey) {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            std::thread::sleep(Duration::from_millis(150));
+            self.finished.notify_one();
+        }
+    }
+
+    // A per-key abort keeps the run owned until its completion is observed: no
+    // second abort can see an empty entry while the handler is still running,
+    // and a third abort only reports zero after the completion arrived.
+    #[tokio::test]
+    async fn per_key_abort_retains_entry_until_completion() {
+        let handle = TaskHandle::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let key = test_key();
+        handle
+            .set_inbound_handler(Arc::new(SlowSyncHandler {
+                runs: runs.clone(),
+                started: started.clone(),
+                finished: finished.clone(),
+            }))
+            .await;
+        fire_timer(&handle, key.clone()).await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("handler should start");
+
+        let Event::Task(TaskEvent::RunningHandlersAborted { count, .. }) = handle
+            .send_effect(Effect::Task(TaskEffect::AbortRunningHandlers {
+                key: key.clone(),
+            }))
+            .await
+        else {
+            panic!("expected running handler abort event");
+        };
+        assert_eq!(count, 1);
+
+        // The handler is inside its synchronous section, so it cannot have
+        // reported completion; the entry must still be owned and abortable.
+        let Event::Task(TaskEvent::RunningHandlersAborted { count, .. }) = handle
+            .send_effect(Effect::Task(TaskEffect::AbortRunningHandlers {
+                key: key.clone(),
+            }))
+            .await
+        else {
+            panic!("expected running handler abort event");
+        };
+        assert_eq!(count, 1, "the aborted run must stay owned until completion");
+
+        tokio::time::timeout(Duration::from_secs(1), finished.notified())
+            .await
+            .expect("handler should reach its completion");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let Event::Task(TaskEvent::RunningHandlersAborted { count, .. }) = handle
+                    .send_effect(Effect::Task(TaskEffect::AbortRunningHandlers {
+                        key: key.clone(),
+                    }))
+                    .await
+                else {
+                    panic!("expected running handler abort event");
+                };
+                if count == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completion must clear the retained entry");
+    }
+
+    // After a per-key abort, the same key can be rescheduled; the new run only
+    // starts once the aborted run reported completion.
+    #[tokio::test]
+    async fn same_key_reschedule_waits_for_aborted_run() {
+        let handle = TaskHandle::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let key = test_key();
+        handle
+            .set_inbound_handler(Arc::new(SlowSyncHandler {
+                runs: runs.clone(),
+                started: started.clone(),
+                finished: finished.clone(),
+            }))
+            .await;
+        fire_timer(&handle, key.clone()).await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("handler should start");
+
+        let _ = handle
+            .send_effect(Effect::Task(TaskEffect::AbortRunningHandlers {
+                key: key.clone(),
+            }))
+            .await;
+        fire_timer(&handle, key.clone()).await;
+
+        wait_for_runs(&runs, 2).await;
+    }
+
+    // Repeating shutdown after handlers were already drained is a clean no-op
+    // instead of a second teardown.
+    #[tokio::test]
+    async fn repeated_shutdown_is_clean() {
+        let handle = TaskHandle::new();
+        let first = handle.shutdown(Duration::from_millis(10)).await;
+        let second = handle.shutdown(Duration::from_millis(10)).await;
+
+        assert!(!first.scheduler_unavailable);
+        assert!(!second.scheduler_unavailable);
+        assert_eq!(second.in_flight, 0);
+        assert_eq!(second.aborted, 0);
+        assert!(second.drained());
+    }
+
+    // A retained clone owns the command channel just like the original, so
+    // dropping one handle must not stop the scheduler.
+    #[tokio::test]
+    async fn dropped_clone_keeps_the_scheduler_running() {
+        let handle = TaskHandle::new();
+        let clone = handle.clone();
+        let key = test_key();
+        drop(handle);
+
+        let Event::Task(TaskEvent::TimerCancelled { .. }) = clone
+            .send_effect(Effect::Task(TaskEffect::CancelTimer { key }))
+            .await
+        else {
+            panic!("the retained clone must reach the scheduler");
+        };
     }
 
     #[tokio::test]
