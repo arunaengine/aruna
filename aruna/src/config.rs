@@ -233,9 +233,30 @@ impl Config {
     }
 }
 
-/// Opens local storage, resolves or bootstraps the persisted node state and
-/// derives the realm network configuration from it.
+/// Opens the local store for parsed settings. The caller owns the handle from
+/// here on, before any identity or enrollment I/O needs it.
+pub fn open_storage(settings: &Settings) -> Result<StorageHandle, SetupError> {
+    Ok(FjallStorage::open_with_policy(
+        &settings.storage_path,
+        settings.fjall_persist_policy,
+    )?)
+}
+
+/// Convenience for callers that want the store and the resolved configuration
+/// together. Startup uses [`open_storage`] and [`resolve_config`] directly so
+/// the resource owner exists before the identity I/O.
 pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHandle), SetupError> {
+    let storage_handle = open_storage(&settings)?;
+    let config = resolve_config(settings, storage_handle.clone()).await?;
+    Ok((config, storage_handle))
+}
+
+/// Resolves or bootstraps the persisted node state on an already-open store and
+/// derives the realm network configuration from it.
+pub async fn resolve_config(
+    settings: Settings,
+    storage_handle: StorageHandle,
+) -> Result<Config, SetupError> {
     let Settings {
         storage_path,
         metadata_storage_path,
@@ -285,8 +306,7 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
         node_weight,
     } = settings;
     let bootstrap_timeout = Duration::from_secs(onboarding_bootstrap_timeout_secs);
-    let storage_handle = FjallStorage::open_with_policy(&storage_path, fjall_persist_policy)?;
-    // Opening storage is explicit here: the identity store owns every read and
+    // The store arrived already open and owned; the identity store owns every read and
     // write of the persisted identity record.
     let identity = IdentityStore::open(storage_handle.clone());
     let loaded = identity.load().await?;
@@ -376,69 +396,68 @@ pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHand
     // realm reachability after it disappears and before discovery completes.
     peer_endpoints.extend(enrollment_endpoints);
 
-    Ok((
-        Config {
-            storage_path,
-            metadata_storage_path,
-            metadata_search_storage,
-            fjall_persist_policy,
-            document_sync_storage_path,
-            blob_root,
-            blob_backends,
-            blob_bucket_prefix,
-            blob_max_bucket_size,
-            blob_multipart_bucket,
-            blob_control_plane_connect_timeout_secs,
-            blob_control_plane_io_timeout_secs,
-            blob_transfer_idle_timeout_secs,
-            onboarding_bootstrap_timeout_secs,
-            onboarding_document_sync_timeout_secs,
-            s3_initial_request_timeout_secs,
-            s3_connection_idle_timeout_secs,
-            s3_stream_lifetime_timeout_secs,
-            http_socket_addr,
-            ops_socket_addr,
-            max_http_body_size,
-            cors_allowed_origins,
-            desktop_cors,
-            mcp_enabled,
-            portal_csp_extra_origins,
-            p2p_socket_addr,
-            max_concurrent_uni_streams,
-            max_concurrent_bidi_streams,
-            node_capabilities,
-            realm_id,
-            node_id,
-            net_secret_key,
-            peer_nodes,
-            peer_endpoints,
-            document_sync_runtime,
-            temporary_bootstrap_active,
-            discovery_method,
-            relay_method,
-            default_metadata_replication_factor,
-            s3_host,
-            api_public_url,
-            s3_public_url,
-            trusted_proxies,
-            rocrate_limits,
-            rate_limits,
-            s3_address,
-            onboarding_secret,
-            oidc_providers,
-            realm_description,
-            portal,
-            assistant_proxy,
-            startup_mode,
-            node_state,
-            node_labels,
-            node_location,
-            node_weight,
-        },
-        storage_handle,
-    ))
+    Ok(Config {
+        storage_path,
+        metadata_storage_path,
+        metadata_search_storage,
+        fjall_persist_policy,
+        document_sync_storage_path,
+        blob_root,
+        blob_backends,
+        blob_bucket_prefix,
+        blob_max_bucket_size,
+        blob_multipart_bucket,
+        blob_control_plane_connect_timeout_secs,
+        blob_control_plane_io_timeout_secs,
+        blob_transfer_idle_timeout_secs,
+        onboarding_bootstrap_timeout_secs,
+        onboarding_document_sync_timeout_secs,
+        s3_initial_request_timeout_secs,
+        s3_connection_idle_timeout_secs,
+        s3_stream_lifetime_timeout_secs,
+        http_socket_addr,
+        ops_socket_addr,
+        max_http_body_size,
+        cors_allowed_origins,
+        desktop_cors,
+        mcp_enabled,
+        portal_csp_extra_origins,
+        p2p_socket_addr,
+        max_concurrent_uni_streams,
+        max_concurrent_bidi_streams,
+        node_capabilities,
+        realm_id,
+        node_id,
+        net_secret_key,
+        peer_nodes,
+        peer_endpoints,
+        document_sync_runtime,
+        temporary_bootstrap_active,
+        discovery_method,
+        relay_method,
+        default_metadata_replication_factor,
+        s3_host,
+        api_public_url,
+        s3_public_url,
+        trusted_proxies,
+        rocrate_limits,
+        rate_limits,
+        s3_address,
+        onboarding_secret,
+        oidc_providers,
+        realm_description,
+        portal,
+        assistant_proxy,
+        startup_mode,
+        node_state,
+        node_labels,
+        node_location,
+        node_weight,
+    })
 }
 
+/// Convenience for callers outside the node startup path, such as the
+/// operator doctor: parse settings, open storage, resolve the configuration.
 pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     resolve_settings(crate::settings::read_settings()?).await
 }

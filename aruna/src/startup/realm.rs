@@ -10,7 +10,7 @@ use aruna_core::structs::{Actor, NodeCapabilities, NodeUrls, RealmNodeKind};
 use aruna_net::NetHandle;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::projector::replay_event_log;
+use aruna_operations::metadata::projector::replay_event_log_until;
 use aruna_operations::node::startup::prepare_shard_policy;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::ensure_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
@@ -39,7 +39,8 @@ pub(crate) async fn prepare(
     if stop.is_cancelled() {
         return Ok(None);
     }
-    let replayed_metadata_events = replay_event_log(driver_ctx.as_ref()).await?;
+    let replayed_metadata_events =
+        replay_event_log_until(driver_ctx.as_ref(), || !stop.is_cancelled()).await?;
     if replayed_metadata_events > 0 {
         info!(
             replayed_metadata_events,
