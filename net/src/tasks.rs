@@ -6,9 +6,12 @@
 //! DHT driver to release, which the constructor handles explicitly. Shutdown
 //! drains inbound handlers first and then joins through this owner.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use aruna_core::alpn::Alpn;
+use aruna_core::effects::NetEffect;
+use aruna_core::events::NetEvent;
 use aruna_core::id::NodeId;
 use crossfire::TrySendError;
 use iroh::Endpoint;
@@ -51,34 +54,68 @@ impl BackgroundTasks {
         self.handles.is_empty()
     }
 
-    /// Joins every loop, newest first. The set is empty afterwards.
+    /// Joins every loop, newest first. A handle leaves the owner only after its
+    /// task was observed finished, so a join future dropped by an outer
+    /// deadline stays resumable instead of detaching the task it had popped.
     pub(crate) async fn join_all(&mut self) {
-        while let Some(handle) = self.handles.pop() {
-            let _ = handle.await;
+        while let Some(handle) = self.handles.last_mut() {
+            if !handle.is_finished() {
+                let _ = (&mut *handle).await;
+            }
+            self.handles.pop();
         }
     }
 }
 
-/// Serializes accepted net effects onto the effect handlers. Each accepted
+/// Executes one accepted net effect and returns its response event. Production
+/// routes through [`effect_handlers::handle_net_effect`]; tests supply
+/// controlled start, release, and completion signals instead of real I/O.
+pub(crate) trait EffectExecutor: Send + Sync + 'static {
+    fn execute(&self, effect: NetEffect) -> impl Future<Output = NetEvent> + Send;
+}
+
+impl EffectExecutor for NetEffectContext {
+    async fn execute(&self, effect: NetEffect) -> NetEvent {
+        effect_handlers::handle_net_effect(self, effect).await
+    }
+}
+
+/// Serializes accepted net effects onto the effect executor. Each accepted
 /// effect runs in its own tracked task, so the effect completion boundary is
 /// the tracker plus the dispatcher, not the dispatcher alone. A tracker close
 /// only lets `wait` finish; it does not reject later insertions, so callers
 /// must join the dispatcher before treating the tracker as the final boundary.
-pub(crate) fn spawn_effect_dispatch(
+///
+/// On cancellation the receiver is closed and every effect already buffered in
+/// the channel is still spawned under the tracker before the dispatcher exits:
+/// work accepted into the channel is settled by completion, not dropped with
+/// the receiver, and later submissions fail closed.
+pub(crate) fn spawn_effect_dispatch<E: EffectExecutor>(
     mut effect_rx: mpsc::Receiver<EffectHandle>,
-    effect_context: Arc<NetEffectContext>,
+    executor: Arc<E>,
     effect_tasks: TaskTracker,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => break,
+                biased;
+                _ = shutdown.cancelled() => {
+                    effect_rx.close();
+                    while let Ok((effect, response_tx, span)) = effect_rx.try_recv() {
+                        let executor = executor.clone();
+                        effect_tasks.spawn(async move {
+                            let event = executor.execute(effect).await;
+                            let _ = response_tx.send(event);
+                        }.instrument(span));
+                    }
+                    break;
+                }
                 maybe_effect = effect_rx.recv() => {
                     let Some((effect, response_tx, span)) = maybe_effect else { break };
-                    let context = effect_context.clone();
+                    let executor = executor.clone();
                     effect_tasks.spawn(async move {
-                        let event = effect_handlers::handle_net_effect(&context, effect).await;
+                        let event = executor.execute(effect).await;
                         let _ = response_tx.send(event);
                     }.instrument(span));
                 }
@@ -190,40 +227,48 @@ mod tests {
     use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect};
     use aruna_core::keys::realm_presence_key;
     use aruna_core::structs::RealmId;
-    use aruna_storage::FjallStorage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::oneshot;
     use tracing::Span;
 
-    async fn effect_context(
-        seed: u8,
-    ) -> (crate::NetHandle, Arc<NetEffectContext>, tempfile::TempDir) {
-        let directory = tempfile::tempdir().expect("test storage directory");
-        let storage = FjallStorage::open(directory.path().to_str().expect("test path"))
-            .expect("test storage");
-        let realm_id = RealmId::from_bytes([seed; 32]);
-        let handle = crate::NetHandle::new(
-            crate::NetConfig {
-                bind_addr: "127.0.0.1:0".parse().expect("test bind address"),
-                secret_key: Some(iroh::SecretKey::from_bytes(&[seed; 32])),
-                realm_id,
-                discovery_method: crate::DiscoveryMethod::None,
-                relay_method: crate::RelayMethod::None,
-                ..crate::NetConfig::default()
-            },
-            storage,
+    /// Deterministic executor: reports each start, blocks until released, and
+    /// counts completions. None of the dispatcher ownership assertions need a
+    /// runtime endpoint, storage, or a timing guess.
+    struct ControlledExecutor {
+        started: mpsc::UnboundedSender<()>,
+        release: Arc<Semaphore>,
+        completed: Arc<AtomicUsize>,
+    }
+
+    impl EffectExecutor for ControlledExecutor {
+        async fn execute(&self, _effect: NetEffect) -> NetEvent {
+            let _ = self.started.send(());
+            let _ = self.release.acquire().await;
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            NetEvent::Error(aruna_core::events::NetError::ChannelClosed)
+        }
+    }
+
+    fn controlled_executor() -> (
+        Arc<ControlledExecutor>,
+        mpsc::UnboundedReceiver<()>,
+        Arc<Semaphore>,
+        Arc<AtomicUsize>,
+    ) {
+        let (started_tx, started_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(ControlledExecutor {
+                started: started_tx,
+                release: release.clone(),
+                completed: completed.clone(),
+            }),
+            started_rx,
+            release,
+            completed,
         )
-        .await
-        .expect("test net handle");
-        let context = Arc::new(NetEffectContext {
-            dht: handle.inner.dht.clone(),
-            document_sync: handle.inner.document_sync.clone(),
-            presence: effect_handlers::RealmPresenceCache::default(),
-            tasks: TaskTracker::new(),
-            shutdown: CancellationToken::new(),
-            refresh_probe: None,
-        });
-        (handle, context, directory)
     }
 
     fn presence_effect_for(seed: u8) -> NetEffect {
@@ -240,58 +285,85 @@ mod tests {
     // it and its response before shutdown returns.
     #[tokio::test]
     async fn accepted_effect_cannot_escape_the_completion_boundary() {
-        let (_handle, context, _directory) = effect_context(0x61).await;
+        let (executor, mut started, release, completed) = controlled_executor();
         let effect_tasks = TaskTracker::new();
         let (effect_tx, effect_rx) = mpsc::channel::<EffectHandle>(8);
         let shutdown = CancellationToken::new();
         let dispatcher =
-            spawn_effect_dispatch(effect_rx, context, effect_tasks.clone(), shutdown.clone());
+            spawn_effect_dispatch(effect_rx, executor, effect_tasks.clone(), shutdown.clone());
 
         let (response_tx, response_rx) = oneshot::channel();
         effect_tx
             .send((presence_effect_for(0x61), response_tx, Span::current()))
             .await
             .expect("the dispatcher is accepting effects");
-        for _ in 0..100 {
-            if !effect_tasks.is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !effect_tasks.is_empty(),
-            "the accepted effect must be tracked"
-        );
+        started.recv().await.expect("the accepted effect started");
+        assert_eq!(effect_tasks.len(), 1, "the accepted effect is tracked");
 
-        // Closing admission and joining the dispatcher is the insertion barrier.
+        // Cancelling admission and joining the dispatcher is the insertion
+        // barrier; the running child stays owned by the tracker.
         shutdown.cancel();
         dispatcher.await.expect("the dispatcher joins");
 
-        assert!(
-            !effect_tasks.is_empty(),
+        assert_eq!(
+            effect_tasks.len(),
+            1,
             "accepted work must not escape the dispatcher join"
         );
-        // Admission close only lets `wait` finish; the tracked child is still
-        // awaited to completion by the boundary.
+        release.add_permits(1);
         effect_tasks.close();
-        tokio::time::timeout(Duration::from_secs(30), effect_tasks.wait())
-            .await
-            .expect("the tracked effect must complete before the boundary");
+        effect_tasks.wait().await;
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
         assert!(
             response_rx.await.is_ok(),
             "the completed effect must deliver its response"
         );
     }
 
+    // Effects already buffered when the dispatcher is cancelled are settled by
+    // being spawned under the tracker, not dropped with the receiver.
+    #[tokio::test]
+    async fn queued_effects_are_settled_before_the_receiver_drops() {
+        let (executor, mut started, release, completed) = controlled_executor();
+        let effect_tasks = TaskTracker::new();
+        let (effect_tx, effect_rx) = mpsc::channel::<EffectHandle>(2);
+        for seed in [0x62, 0x63] {
+            let (response_tx, _response_rx) = oneshot::channel();
+            effect_tx
+                .send((presence_effect_for(seed), response_tx, Span::current()))
+                .await
+                .expect("the channel buffers the queued effect");
+        }
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let dispatcher =
+            spawn_effect_dispatch(effect_rx, executor, effect_tasks.clone(), shutdown.clone());
+        dispatcher.await.expect("the dispatcher joins");
+
+        assert_eq!(
+            effect_tasks.len(),
+            2,
+            "every buffered effect must be spawned before the receiver drops"
+        );
+        for _ in 0..2 {
+            started.recv().await.expect("the queued effect started");
+        }
+        release.add_permits(2);
+        effect_tasks.close();
+        effect_tasks.wait().await;
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+    }
+
     // After the dispatcher stops, the effect channel is closed: a later send is
     // rejected instead of being accepted into an unowned task.
     #[tokio::test]
     async fn new_effects_are_rejected_after_the_dispatcher_stops() {
-        let (_handle, context, _directory) = effect_context(0x62).await;
+        let (executor, _started, _release, _completed) = controlled_executor();
         let (effect_tx, effect_rx) = mpsc::channel::<EffectHandle>(1);
         let shutdown = CancellationToken::new();
         let dispatcher =
-            spawn_effect_dispatch(effect_rx, context, TaskTracker::new(), shutdown.clone());
+            spawn_effect_dispatch(effect_rx, executor, TaskTracker::new(), shutdown.clone());
 
         shutdown.cancel();
         dispatcher.await.expect("the dispatcher joins");
@@ -299,7 +371,7 @@ mod tests {
         let (response_tx, _response_rx) = oneshot::channel();
         assert!(
             effect_tx
-                .send((presence_effect_for(0x62), response_tx, Span::current()))
+                .send((presence_effect_for(0x64), response_tx, Span::current()))
                 .await
                 .is_err(),
             "the closed admission must reject a new effect"

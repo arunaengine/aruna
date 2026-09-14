@@ -940,6 +940,75 @@ async fn close_stops_accept() -> Result<()> {
     Ok(())
 }
 
+// An interrupted shutdown must not detach the child it was joining: the owner
+// keeps the handle, a resumed call joins it, and its completion runs once.
+#[tokio::test]
+async fn interrupted_shutdown_resumes_and_releases_children_once() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Semaphore;
+
+    let (handle, _dir) = test_net_handle().await?;
+    let release = Arc::new(Semaphore::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let child_release = release.clone();
+    let child_completed = completed.clone();
+    handle
+        .inner
+        .tasks
+        .lock()
+        .await
+        .push(tokio::spawn(async move {
+            let _ = child_release.acquire().await;
+            child_completed.fetch_add(1, Ordering::SeqCst);
+        }));
+
+    let interrupted = tokio::time::timeout(
+        Duration::from_millis(50),
+        handle.shutdown_with_drain(Duration::from_millis(10)),
+    )
+    .await;
+    assert!(
+        interrupted.is_err(),
+        "the controlled child must keep the first shutdown active"
+    );
+    assert_eq!(completed.load(Ordering::SeqCst), 0);
+
+    release.add_permits(1);
+    let complete = handle.shutdown_with_drain(Duration::from_millis(10)).await;
+
+    assert!(complete, "the resumed shutdown joins the released child");
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+    assert!(handle.inner.tasks.lock().await.is_empty());
+    Ok(())
+}
+
+// Repeated shutdown after the first returned incomplete still makes progress:
+// the retained owners are joined by the later call instead of being abandoned.
+#[tokio::test]
+async fn repeated_shutdown_joins_retained_children() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::oneshot;
+
+    let (handle, _dir) = test_net_handle().await?;
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let child_stopped = stopped.clone();
+    handle.inner.inbound_tasks.spawn(async move {
+        let _ = release_rx.await;
+        child_stopped.store(true, Ordering::SeqCst);
+    });
+
+    let first = handle.shutdown_with_drain(Duration::from_millis(10)).await;
+    assert!(!first, "the blocked child outlives the first forced drain");
+    assert!(!stopped.load(Ordering::SeqCst));
+
+    release_tx.send(()).expect("the child still waits");
+    let second = handle.shutdown_with_drain(Duration::from_millis(100)).await;
+    assert!(second, "the later call joins the released child");
+    assert!(stopped.load(Ordering::SeqCst));
+    Ok(())
+}
+
 #[tokio::test]
 async fn peer_warnings() -> Result<()> {
     let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
