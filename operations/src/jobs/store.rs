@@ -731,7 +731,11 @@ async fn insert_crate_obligation(
     txn_id: TxnId,
     record: &JobRecord,
 ) -> Result<(), JobMutationError> {
-    if !matches!(&record.payload, JobPayload::Execution(_)) {
+    let JobPayload::Execution(spec) = &record.payload else {
+        return Ok(());
+    };
+    // A stopped notebook session keeps its report; it is no run to describe.
+    if session_of(spec).is_some() {
         return Ok(());
     }
     let now_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
@@ -3811,6 +3815,88 @@ mod tests {
         );
         assert_eq!(child.state, JobState::Queued);
         assert!(child.payload.is_internal());
+    }
+
+    #[tokio::test]
+    async fn session_skips_crate() {
+        // A stopped notebook session writes no run dataset, while an ordinary
+        // run of the same shape still queues the crate job.
+        use aruna_core::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
+        let (_dir, storage) = temp_storage();
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        for (seed, session) in [(0xD1u8, true), (0xD3u8, false)] {
+            let job_id = JobId::from_bytes([seed; 16]);
+            let token = Ulid::from_bytes([seed + 1; 16]);
+            let mut tags = std::collections::BTreeMap::new();
+            if session {
+                tags.insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+            }
+            let mut record = JobRecord::new(
+                job_id,
+                JobPayload::Execution(ExecutionSpec {
+                    group_id: Ulid::from_bytes([3u8; 16]),
+                    name: None,
+                    description: None,
+                    tags,
+                    image: "session:latest".to_string(),
+                    entrypoint: None,
+                    command: Vec::new(),
+                    workdir: None,
+                    env: Default::default(),
+                    resources: ComputeResources::default(),
+                    executor_constraint: None,
+                    inputs: Vec::new(),
+                    file_outputs: Vec::new(),
+                    workspace_outputs: Vec::new(),
+                    output_prefixes: Vec::new(),
+                    collision_policy: Default::default(),
+                }),
+                owner,
+                node_id(7),
+                1_000,
+                1_000,
+                None,
+            );
+            record.state = JobState::Running;
+            record.claim = Some(JobClaim {
+                holder_node_id: node_id(7),
+                claim_token: token,
+                lease_expires_at_ms: 5_000,
+            });
+            insert_job(&storage, &record).await.unwrap();
+            complete_job(
+                &storage,
+                job_id,
+                token,
+                JobResultPayload::Execution {
+                    exit_code: Some(0),
+                    workspace_bucket: Some("ws-test".to_string()),
+                    outputs: Vec::new(),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    output_digest: None,
+                },
+                JobProgress::new("phases"),
+                6_000,
+            )
+            .await
+            .unwrap();
+
+            let crate_job = read_job_record(&storage, crate_job_id(job_id), None)
+                .await
+                .unwrap();
+            let status = read_run_crate_status(&storage, job_id).await.unwrap();
+            assert_eq!(
+                crate_job.is_none(),
+                session,
+                "crate job for session={session}"
+            );
+            assert_eq!(
+                status.is_none(),
+                session,
+                "crate status for session={session}"
+            );
+        }
     }
 
     #[tokio::test]
