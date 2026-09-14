@@ -319,7 +319,11 @@ async fn fill(
     checkpoint(StartupStage::Blob)?;
     stopped(stop)?;
 
-    let compute = build_registry(config)
+    // Compute settings are collected once from the explicit process source at
+    // the resource boundary, then passed into backend construction.
+    let compute_settings = crate::compute_setup::collect(&crate::settings::ProcessEnv)
+        .map_err(std::io::Error::other)?;
+    let compute = build_registry(config, &compute_settings)
         .await
         .map_err(std::io::Error::other)?;
     acquired.session_s3 = compute.session_s3;
