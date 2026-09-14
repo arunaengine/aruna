@@ -1,8 +1,8 @@
-//! Compute settings read from the environment.
+//! Compute settings read from an explicit operator-input source.
 //!
-//! [`collect`] is the only place that reads compute environment variables. It
-//! returns typed values the backend builders consume, so a builder never reads
-//! the environment again and validation can be tested from explicit values.
+//! [`collect`] consumes one [`crate::settings::SettingsEnv`] and returns typed
+//! values the backend builders consume, so a builder never reads the process
+//! environment and validation can be tested from supplied maps.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -41,22 +41,26 @@ pub(super) fn selected_backend(selected: &str) -> Result<SelectedBackend, Comput
 /// Reads every compute setting once. Backend-specific settings are parsed only
 /// for the selected backend, so an invalid value for an unused backend never
 /// fails a start.
-pub(super) fn collect() -> Result<ComputeSettings, ComputeBuildError> {
-    let selected = dotenvy::var("ARUNA_COMPUTE_EXECUTOR").unwrap_or_else(|_| "none".to_string());
+pub(super) fn collect(
+    env: &dyn crate::settings::SettingsEnv,
+) -> Result<ComputeSettings, ComputeBuildError> {
+    let selected = env
+        .var("ARUNA_COMPUTE_EXECUTOR")
+        .unwrap_or_else(|| "none".to_string());
     let backend = match selected_backend(&selected)? {
         SelectedBackend::None => BackendSettings::None,
-        SelectedBackend::Docker => BackendSettings::Docker(collect_docker()?),
-        SelectedBackend::Apptainer => BackendSettings::Apptainer(collect_apptainer()?),
-        SelectedBackend::Kubernetes => BackendSettings::Kubernetes(collect_kubernetes()?),
+        SelectedBackend::Docker => BackendSettings::Docker(collect_docker(env)?),
+        SelectedBackend::Apptainer => BackendSettings::Apptainer(collect_apptainer(env)?),
+        SelectedBackend::Kubernetes => BackendSettings::Kubernetes(collect_kubernetes(env)?),
     };
     let has_backend = !matches!(backend, BackendSettings::None);
     Ok(ComputeSettings {
         backend,
-        optional: parse_bool(dotenvy::var("ARUNA_COMPUTE_OPTIONAL").ok().as_deref()),
-        local_only: parse_bool(dotenvy::var("ARUNA_COMPUTE_LOCAL_ONLY").ok().as_deref()),
-        s3_url: parse_nonempty(dotenvy::var("ARUNA_COMPUTE_S3_URL").ok().as_deref()),
+        optional: parse_bool(env.var("ARUNA_COMPUTE_OPTIONAL").as_deref()),
+        local_only: parse_bool(env.var("ARUNA_COMPUTE_LOCAL_ONLY").as_deref()),
+        s3_url: parse_nonempty(env.var("ARUNA_COMPUTE_S3_URL").as_deref()),
         envelope: match has_backend {
-            true => Some(compute_envelope()?),
+            true => Some(compute_envelope(env)?),
             false => None,
         },
     })
@@ -64,119 +68,113 @@ pub(super) fn collect() -> Result<ComputeSettings, ComputeBuildError> {
 
 /// The session subnet an operator configured, else the default. Read once,
 /// inside the one collection boundary.
-fn session_subnet() -> String {
-    dotenvy::var("ARUNA_COMPUTE_DOCKER_SESSION_SUBNET")
-        .unwrap_or_else(|_| aruna_compute::executor::config::DEFAULT_SESSION_SUBNET.to_string())
+fn session_subnet(env: &dyn crate::settings::SettingsEnv) -> String {
+    env.var("ARUNA_COMPUTE_DOCKER_SESSION_SUBNET")
+        .unwrap_or_else(|| aruna_compute::executor::config::DEFAULT_SESSION_SUBNET.to_string())
 }
 
-fn collect_docker() -> Result<super::DockerSettings, ComputeBuildError> {
+fn collect_docker(
+    env: &dyn crate::settings::SettingsEnv,
+) -> Result<super::DockerSettings, ComputeBuildError> {
     Ok(super::DockerSettings {
-        disk_bytes: parse_disk_limit(
-            dotenvy::var("ARUNA_COMPUTE_DOCKER_DISK_BYTES")
-                .ok()
-                .as_deref(),
-        )?,
-        session_subnet: session_subnet(),
+        disk_bytes: parse_disk_limit(env.var("ARUNA_COMPUTE_DOCKER_DISK_BYTES").as_deref())?,
+        session_subnet: session_subnet(env),
         pull_deadline: parse_duration(
             "ARUNA_COMPUTE_DOCKER_PULL_DEADLINE",
-            dotenvy::var("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE")
-                .ok()
-                .as_deref(),
+            env.var("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE").as_deref(),
             300,
         )?,
-        keep_failed: parse_bool(dotenvy::var("ARUNA_COMPUTE_KEEP_FAILED").ok().as_deref()),
-        state_root: parse_path(dotenvy::var("ARUNA_COMPUTE_STATE_ROOT").ok().as_deref()),
+        keep_failed: parse_bool(env.var("ARUNA_COMPUTE_KEEP_FAILED").as_deref()),
+        state_root: parse_path(env.var("ARUNA_COMPUTE_STATE_ROOT").as_deref()),
     })
 }
 
-fn collect_apptainer() -> Result<super::ApptainerSettings, ComputeBuildError> {
-    let cgroup_root = dotenvy::var("ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT")
+fn collect_apptainer(
+    env: &dyn crate::settings::SettingsEnv,
+) -> Result<super::ApptainerSettings, ComputeBuildError> {
+    let cgroup_root = env
+        .var("ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT")
         .map(PathBuf::from)
-        .map_err(|_| {
+        .ok_or_else(|| {
             ComputeBuildError::Invalid(
                 "Apptainer executor requires ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT".to_string(),
             )
         })?;
-    let state_root = dotenvy::var("ARUNA_COMPUTE_APPTAINER_STATE_ROOT")
+    let state_root = env
+        .var("ARUNA_COMPUTE_APPTAINER_STATE_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./compute-state/apptainer"));
-    let sif_cache = dotenvy::var("ARUNA_COMPUTE_APPTAINER_SIF_CACHE")
+        .unwrap_or_else(|| PathBuf::from("./compute-state/apptainer"));
+    let sif_cache = env
+        .var("ARUNA_COMPUTE_APPTAINER_SIF_CACHE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./compute-state/sif"));
+        .unwrap_or_else(|| PathBuf::from("./compute-state/sif"));
     Ok(super::ApptainerSettings {
         cgroup_root,
         state_root,
         sif_cache,
         stop_grace: parse_duration(
             "ARUNA_COMPUTE_STOP_GRACE",
-            dotenvy::var("ARUNA_COMPUTE_STOP_GRACE").ok().as_deref(),
+            env.var("ARUNA_COMPUTE_STOP_GRACE").as_deref(),
             10,
         )?,
         pull_deadline: parse_duration(
             "ARUNA_COMPUTE_APPTAINER_PULL_DEADLINE",
-            dotenvy::var("ARUNA_COMPUTE_APPTAINER_PULL_DEADLINE")
-                .ok()
-                .as_deref(),
+            env.var("ARUNA_COMPUTE_APPTAINER_PULL_DEADLINE").as_deref(),
             300,
         )?,
     })
 }
 
-fn collect_kubernetes() -> Result<super::KubernetesSettings, ComputeBuildError> {
-    let storage_class = dotenvy::var("ARUNA_COMPUTE_K8S_STORAGE_CLASS").map_err(|_| {
+fn collect_kubernetes(
+    env: &dyn crate::settings::SettingsEnv,
+) -> Result<super::KubernetesSettings, ComputeBuildError> {
+    let storage_class = env.var("ARUNA_COMPUTE_K8S_STORAGE_CLASS").ok_or_else(|| {
         ComputeBuildError::Invalid(
             "Kubernetes executor requires ARUNA_COMPUTE_K8S_STORAGE_CLASS".to_string(),
         )
     })?;
-    let helper_image = dotenvy::var("ARUNA_COMPUTE_K8S_HELPER_IMAGE").map_err(|_| {
+    let helper_image = env.var("ARUNA_COMPUTE_K8S_HELPER_IMAGE").ok_or_else(|| {
         ComputeBuildError::Invalid(
             "Kubernetes executor requires ARUNA_COMPUTE_K8S_HELPER_IMAGE".to_string(),
         )
     })?;
-    let s3_cidrs = dotenvy::var("ARUNA_COMPUTE_K8S_S3_CIDRS")
-        .ok()
+    let s3_cidrs = env
+        .var("ARUNA_COMPUTE_K8S_S3_CIDRS")
         .map(|value| parse_s3_cidrs(&value))
         .transpose()?
         .unwrap_or_default();
-    let policy_manifests = dotenvy::var("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS")
-        .ok()
+    let policy_manifests = env
+        .var("ARUNA_COMPUTE_K8S_POLICY_MANIFESTS")
         .map(|value| policy_paths(&value))
         .transpose()?
         .unwrap_or_default();
     Ok(super::KubernetesSettings {
-        namespace: dotenvy::var("ARUNA_COMPUTE_K8S_NAMESPACE")
-            .unwrap_or_else(|_| "default".to_string()),
+        namespace: env
+            .var("ARUNA_COMPUTE_K8S_NAMESPACE")
+            .unwrap_or_else(|| "default".to_string()),
         storage_class,
         helper_image,
         s3_cidrs,
-        s3_port: parse_nonempty(dotenvy::var("ARUNA_COMPUTE_K8S_S3_PORT").ok().as_deref()),
-        mount_driver: parse_nonempty(
-            dotenvy::var("ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER")
-                .ok()
-                .as_deref(),
-        ),
+        s3_port: parse_nonempty(env.var("ARUNA_COMPUTE_K8S_S3_PORT").as_deref()),
+        mount_driver: parse_nonempty(env.var("ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER").as_deref()),
         policy_manifests,
-        service_account: dotenvy::var("ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT")
-            .unwrap_or_else(|_| aruna_compute::DEFAULT_WORKLOAD_SA.to_string()),
-        execution_location: dotenvy::var("ARUNA_COMPUTE_K8S_EXECUTION_LOCATION")
+        service_account: env
+            .var("ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT")
+            .unwrap_or_else(|| aruna_compute::DEFAULT_WORKLOAD_SA.to_string()),
+        execution_location: env
+            .var("ARUNA_COMPUTE_K8S_EXECUTION_LOCATION")
             .unwrap_or_default(),
         execution_labels: parse_labels(
             "ARUNA_COMPUTE_K8S_EXECUTION_LABELS",
-            dotenvy::var("ARUNA_COMPUTE_K8S_EXECUTION_LABELS")
-                .ok()
-                .as_deref(),
+            env.var("ARUNA_COMPUTE_K8S_EXECUTION_LABELS").as_deref(),
         )?,
         node_selector: parse_labels(
             "ARUNA_COMPUTE_K8S_NODE_SELECTOR",
-            dotenvy::var("ARUNA_COMPUTE_K8S_NODE_SELECTOR")
-                .ok()
-                .as_deref(),
+            env.var("ARUNA_COMPUTE_K8S_NODE_SELECTOR").as_deref(),
         )?,
         pull_deadline: parse_duration(
             "ARUNA_COMPUTE_K8S_PULL_DEADLINE",
-            dotenvy::var("ARUNA_COMPUTE_K8S_PULL_DEADLINE")
-                .ok()
-                .as_deref(),
+            env.var("ARUNA_COMPUTE_K8S_PULL_DEADLINE").as_deref(),
             300,
         )?,
     })
@@ -238,23 +236,23 @@ pub(super) fn parse_path(value: Option<&str>) -> Option<PathBuf> {
     parse_nonempty(value).map(PathBuf::from)
 }
 
-fn compute_envelope() -> Result<ResourceEnvelope, String> {
+fn compute_envelope(env: &dyn crate::settings::SettingsEnv) -> Result<ResourceEnvelope, String> {
     Ok(ResourceEnvelope {
         max_cpu_cores: parse_number(
             "ARUNA_COMPUTE_MAX_CPU_CORES",
-            dotenvy::var("ARUNA_COMPUTE_MAX_CPU_CORES").ok().as_deref(),
+            env.var("ARUNA_COMPUTE_MAX_CPU_CORES").as_deref(),
         )?,
         max_ram_bytes: parse_number(
             "ARUNA_COMPUTE_MAX_RAM_BYTES",
-            dotenvy::var("ARUNA_COMPUTE_MAX_RAM_BYTES").ok().as_deref(),
+            env.var("ARUNA_COMPUTE_MAX_RAM_BYTES").as_deref(),
         )?,
         max_disk_bytes: parse_number(
             "ARUNA_COMPUTE_MAX_DISK_BYTES",
-            dotenvy::var("ARUNA_COMPUTE_MAX_DISK_BYTES").ok().as_deref(),
+            env.var("ARUNA_COMPUTE_MAX_DISK_BYTES").as_deref(),
         )?,
         max_concurrent: parse_number(
             "ARUNA_COMPUTE_MAX_CONCURRENT",
-            dotenvy::var("ARUNA_COMPUTE_MAX_CONCURRENT").ok().as_deref(),
+            env.var("ARUNA_COMPUTE_MAX_CONCURRENT").as_deref(),
         )?,
     })
 }
@@ -500,6 +498,36 @@ pub(super) fn kubernetes_s3_access(
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+
+    // The whole collection runs from a supplied map: no process environment is
+    // read or mutated, and only the selected backend's values are parsed.
+    #[test]
+    fn collects_from_a_supplied_map() {
+        let env = BTreeMap::from([
+            ("ARUNA_COMPUTE_EXECUTOR".to_string(), "none".to_string()),
+            ("ARUNA_COMPUTE_OPTIONAL".to_string(), "true".to_string()),
+            ("ARUNA_COMPUTE_LOCAL_ONLY".to_string(), "1".to_string()),
+            (
+                "ARUNA_COMPUTE_S3_URL".to_string(),
+                " https://s3.example.test ".to_string(),
+            ),
+            // An unused backend's invalid value must not fail the collection.
+            (
+                "ARUNA_COMPUTE_STOP_GRACE".to_string(),
+                "not-a-number".to_string(),
+            ),
+        ]);
+        let settings = collect(&env).expect("the supplied map collects");
+        assert!(matches!(settings.backend, BackendSettings::None));
+        assert!(settings.optional);
+        assert!(settings.local_only);
+        assert_eq!(settings.s3_url.as_deref(), Some("https://s3.example.test"));
+        assert!(settings.envelope.is_none(), "no backend means no envelope");
+
+        let unknown =
+            BTreeMap::from([("ARUNA_COMPUTE_EXECUTOR".to_string(), "podman".to_string())]);
+        assert!(collect(&unknown).is_err());
+    }
 
     #[test]
     fn selects_known_backends() {

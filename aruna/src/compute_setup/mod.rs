@@ -1,9 +1,10 @@
 //! Selection and construction of the node's compute executor.
 //!
-//! `settings::collect` reads the operator's compute environment once into
-//! [`ComputeSettings`]; the backend modules only consume those typed values.
-//! The node keeps running without compute when the operator marks compute
-//! optional.
+//! [`collect`] reads one explicit operator-input source into
+//! [`ComputeSettings`]; the backend modules only consume those typed values,
+//! and [`build_registry`] receives the value instead of rereading the
+//! environment. The node keeps running without compute when the operator
+//! marks compute optional.
 
 // Without a compiled backend the parsed settings are only constructed, never
 // read; keep the no-backend feature check warning-free.
@@ -142,11 +143,21 @@ impl ComputeSettings {
     }
 }
 
-/// Builds the registry for the selected backend, or `None` when compute is
-/// turned off. An unavailable backend is allowed only when the operator marks
-/// compute optional; invalid configuration always fails.
-pub(crate) async fn build_registry(config: &Config) -> Result<ComputeSetup, String> {
-    let settings = settings::collect().map_err(compute_error_message)?;
+/// Collects the typed compute settings once from one explicit operator-input
+/// source. Production passes the process environment at the resource boundary;
+/// tests pass a map.
+pub(crate) fn collect(env: &dyn crate::settings::SettingsEnv) -> Result<ComputeSettings, String> {
+    settings::collect(env).map_err(compute_error_message)
+}
+
+/// Builds the registry for the selected backend from already-collected
+/// settings, or `None` when compute is turned off. An unavailable backend is
+/// allowed only when the operator marks compute optional; invalid
+/// configuration always fails.
+pub(crate) async fn build_registry(
+    config: &Config,
+    settings: &ComputeSettings,
+) -> Result<ComputeSetup, String> {
     let session_s3 = settings.session_s3(config);
     let result = match &settings.backend {
         BackendSettings::None => {
