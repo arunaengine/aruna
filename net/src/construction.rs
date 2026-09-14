@@ -94,6 +94,7 @@ impl NetHandle {
                 eviction_shutdown: background.eviction_shutdown,
                 accept_shutdown: background.accept_shutdown,
                 shutdown: runtime.shutdown,
+                teardown: tokio::sync::OnceCell::new(),
                 tasks: Mutex::new(background.tasks),
             }),
             monitor: runtime.monitor,

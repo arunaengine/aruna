@@ -146,6 +146,10 @@ struct NetInner {
     eviction_shutdown: CancellationToken,
     accept_shutdown: CancellationToken,
     shutdown: CancellationToken,
+    /// Runs the DHT/document-sync/pool/endpoint teardown exactly once. A
+    /// previous attempt dropped part-way leaves the cell uninitialized, so a
+    /// later shutdown call retries it instead of assuming it completed.
+    teardown: tokio::sync::OnceCell<()>,
     tasks: Mutex<BackgroundTasks>,
 }
 
@@ -773,30 +777,35 @@ impl NetHandle {
 
     /// Stops accepting inbound streams and rejects further inbound handlers,
     /// without waiting for the ones in flight or tearing the endpoint down.
-    /// Closing the trackers only lets their waits finish; it does not reject
-    /// insertions, so the dispatchers still running may add accepted work until
-    /// [`Self::shutdown_with_drain`] joins them.
+    /// This is the inbound boundary only: outgoing effects stay available so
+    /// earlier writer drains can still use the network, until
+    /// [`Self::shutdown_with_drain`] reaches final closure. Closing a tracker
+    /// only lets its wait finish; it does not reject insertions, so callers
+    /// must still join the dispatchers before trusting the tracker.
     pub fn close_admission(&self) {
         self.inner.accept_shutdown.cancel();
         self.inner.loopback_streams.lock().take();
         self.inner.inbound_tasks.close();
-        self.inner.effect_tasks.close();
     }
 
     /// Stops inbound admission, gives handlers that are already running up to
-    /// `drain` to finish while the endpoint is still usable, then tears the
-    /// network down and joins every child, including accepted effect futures.
-    /// Returns whether every tracked child completed before its forced bound.
+    /// `drain` to finish while the endpoint is still usable, then closes the
+    /// outgoing-effect boundary, tears the transport down, and joins every
+    /// child, including accepted effect futures. Returns whether every tracked
+    /// child completed before its forced bound.
+    ///
+    /// The sequence is resumable: an interrupted call leaves every unfinished
+    /// owner retained, and a later call retries the joins. A cancelled token is
+    /// never treated as proof that a child finished.
     pub async fn shutdown_with_drain(&self, drain: Duration) -> bool {
-        if self.inner.shutdown.is_cancelled() {
-            return false;
-        }
-
+        // The inbound boundary closes first, while outgoing effects stay
+        // available for the writer drains ahead of the network phase.
         self.close_admission();
-        if tokio::time::timeout(drain, self.inner.inbound_tasks.wait())
-            .await
-            .is_err()
-        {
+        let inbound_drained_before_teardown =
+            tokio::time::timeout(drain, self.inner.inbound_tasks.wait())
+                .await
+                .is_ok();
+        if !inbound_drained_before_teardown {
             warn!(
                 pending = self.inner.inbound_tasks.len(),
                 drain_ms = drain.as_millis(),
@@ -804,16 +813,27 @@ impl NetHandle {
             );
         }
 
+        // Final closure of the outgoing-effect boundary. The dispatcher settles
+        // every effect already buffered in the channel under the tracker before
+        // its receiver drops, and later submissions fail closed.
         self.inner.shutdown.cancel();
-        if let Err(err) = self.inner.dht.shutdown().await {
-            warn!(error = %err, "DHT shutdown returned error");
-        }
-        self.inner.document_sync.shutdown().await;
-        self.inner.eviction_shutdown.cancel();
-        if let Err(err) = self.inner.connection_pool.shutdown().await {
-            warn!(error = %err, "Connection pool shutdown returned error");
-        }
-        self.inner.endpoint.close().await;
+        self.inner.effect_tasks.close();
+
+        // Teardown runs once; a previous attempt dropped part-way is retried.
+        self.inner
+            .teardown
+            .get_or_init(|| async {
+                if let Err(err) = self.inner.dht.shutdown().await {
+                    warn!(error = %err, "DHT shutdown returned error");
+                }
+                self.inner.document_sync.shutdown().await;
+                self.inner.eviction_shutdown.cancel();
+                if let Err(err) = self.inner.connection_pool.shutdown().await {
+                    warn!(error = %err, "Connection pool shutdown returned error");
+                }
+                self.inner.endpoint.close().await;
+            })
+            .await;
 
         // Joining the dispatcher first is the admission barrier: it cannot have
         // inserted an effect after this returns.
