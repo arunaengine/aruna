@@ -151,7 +151,7 @@ rmcp = { version = "3.3.0", default-features = false, features = [
     "transport-streamable-http-server",
 ] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
-rustls = { version = "0.23.44", features = ["ring"] }
+rustls = { version = "0.23.45", features = ["ring"] }
 kube = { version = "4.2.0", default-features = false, features = [
     "client",
     "jsonpatch",
