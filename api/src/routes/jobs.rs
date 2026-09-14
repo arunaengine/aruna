@@ -1611,12 +1611,7 @@ pub(crate) async fn admit_execution(
             state,
             &auth,
             mount_permission_path(
-                blob_bucket_permission_path(
-                    state.get_realm_id(),
-                    group_id,
-                    state.get_node_id(),
-                    bucket,
-                ),
+                bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
                 prefix,
             ),
             Permission::WRITE,
@@ -2555,7 +2550,7 @@ pub async fn delete_job(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
     let outcome = delete_owned_run(&state.get_ctx(), auth.user_id, job_id)
         .await
