@@ -281,6 +281,26 @@ class FolderTest(unittest.TestCase):
         ]
         self.assertEqual(self.folders(tree), [("pkg/src/small", 3)])
 
+    def test_umbrella_with_module_folders_passes(self):
+        tree = [
+            "pkg/Cargo.toml",
+            "pkg/src/lib.rs",
+            "pkg/src/umbrella/one.rs",
+            "pkg/src/umbrella/two.rs",
+            "pkg/src/umbrella/three.rs",
+            "pkg/src/umbrella/first/mod.rs",
+            "pkg/src/umbrella/first/a.rs",
+            "pkg/src/umbrella/first/b.rs",
+            "pkg/src/umbrella/first/c.rs",
+            "pkg/src/umbrella/first/d.rs",
+            "pkg/src/umbrella/second/mod.rs",
+            "pkg/src/umbrella/second/a.rs",
+            "pkg/src/umbrella/second/b.rs",
+            "pkg/src/umbrella/second/c.rs",
+            "pkg/src/umbrella/second/d.rs",
+        ]
+        self.assertEqual(self.folders(tree), [])
+
     def test_structural_roots_are_exempt(self):
         tree = [
             "pkg/Cargo.toml",

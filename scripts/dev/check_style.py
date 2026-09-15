@@ -392,8 +392,10 @@ def check_folders(root):
             real = [f for f in files if not f.startswith(".") and f != "mod.rs"]
             if not real and not any(f.endswith(".rs") for f in files):
                 continue
-            if len(real) < FOLDER_MIN:
-                yield (os.path.relpath(dirpath, root), len(real))
+            modules = [d for d in dirs if not d.startswith(".")]
+            count = len(real) + len(modules)
+            if count < FOLDER_MIN:
+                yield (os.path.relpath(dirpath, root), count)
 
 
 def decl_terms(name):
@@ -526,7 +528,7 @@ def main(argv):
         print(f"EXTERNAL_NAMES needs a reason for: {', '.join(sorted(missing))}", file=sys.stderr)
         return 2
     findings = []
-    findings.extend(("folder", path, 0, f"{count} of {FOLDER_MIN} files besides mod.rs") for path, count in check_folders(root))
+    findings.extend(("folder", path, 0, f"{count} of {FOLDER_MIN} entries besides mod.rs") for path, count in check_folders(root))
     findings.extend(check_sources(root))
     return report(findings, args.limit)
 

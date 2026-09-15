@@ -34,7 +34,8 @@ recipe checks. The local recipes are not the entire CI matrix.
 ### Structure and naming
 
 - **Folder threshold.** A source subfolder needs at least four real, cohesive
-  files besides `mod.rs`; examples and tests count toward that total. A
+  entries besides `mod.rs`, with a nested module folder counting as one
+  cohesive entry; examples and tests count toward that total. A
   one-file folder is hoisted into its parent, and a folder with two to four
   files is flattened into sibling files beside the parent or merged into it.
   The threshold does not apply to structural roots: workspace and package
