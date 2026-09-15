@@ -21,9 +21,9 @@ use aruna_operations::notifications::dispatch::{
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::sync::incoming::initialize_net_holder;
-use aruna_operations::tasks::incoming::{drain_notification_outbox, install_and_start_task_queues};
+use aruna_operations::tasks::incoming::{drain_notification_outbox, start_task_queues};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -415,7 +415,7 @@ async fn resolve_holder_on(
     recipient: UserId,
 ) -> Result<NodeId, Box<dyn std::error::Error>> {
     let config = drive(
-        GetRealmConfigOperation::new(recipient.realm_id),
+        GetConfigOperation::new(recipient.realm_id),
         node.context.as_ref(),
     )
     .await?;
@@ -534,7 +534,7 @@ async fn build_node(
         jobs_runtime.clone(),
         &shutdown,
     );
-    install_and_start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
+    start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
 
     Ok(TestNode {
         _temp_dir: temp_dir,

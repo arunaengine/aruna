@@ -33,7 +33,7 @@ use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation, HeadObjectResult};
 use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::list_versions::{
-    ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
+    ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
 use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
@@ -282,7 +282,7 @@ async fn head_object(harness: &Harness, version_id: Option<Ulid>) -> HeadObjectR
 
 async fn list_versions(harness: &Harness) -> Vec<Ulid> {
     let result = drive(
-        ListObjectVersionsOperation::new(ListObjectVersionsInput {
+        ListVersionsOperation::new(ListVersionsInput {
             bucket: BUCKET.to_string(),
             prefix: Some(KEY.to_string()),
             delimiter: None,
@@ -298,8 +298,8 @@ async fn list_versions(harness: &Harness) -> Vec<Ulid> {
         .items
         .into_iter()
         .filter_map(|item| match item {
-            ListObjectVersionsItem::Version { version_id, .. } => Some(version_id),
-            ListObjectVersionsItem::DeleteMarker { .. } => None,
+            ListVersionsItem::Version { version_id, .. } => Some(version_id),
+            ListVersionsItem::DeleteMarker { .. } => None,
         })
         .collect()
 }

@@ -28,24 +28,23 @@ use aruna_operations::jobs::service::{
 };
 use aruna_operations::jobs::store::find_dedup_job;
 use aruna_operations::jobs::submit::{SubmitJobError, mint_job_id};
-use aruna_operations::metadata::MetadataAuthToken;
+use aruna_operations::metadata::AuthToken;
 use aruna_operations::metadata::api::{
-    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataApiError,
-    MetadataApiQueryMode, MetadataDocumentQueryRequest, MetadataRoCrateExportView,
-    query_metadata_document,
+    ApiQueryMode, DocumentQueryRequest, ExportMetadataRequest, ExportMetadataResult,
+    MetadataApiError, RoCrateExportView, query_metadata_document,
 };
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_forward_document, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,
+    mint_local_document,
 };
 use aruna_operations::metadata::forward::{
     export_rocrate_routed, route_metadata_create, route_metadata_delete, route_metadata_update,
 };
 use aruna_operations::metadata::get_document::{
-    GetMetadataDocumentError, GetMetadataDocumentOperation, load_document_record,
+    GetDocumentError, GetDocumentOperation, load_document_record,
 };
 use aruna_operations::metadata::projector::replay_event_log;
-use aruna_operations::metadata::update_document::UpdateMetadataDocumentMutation;
+use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use std::cell::RefCell;
 use ulid::Ulid;
@@ -674,7 +673,7 @@ async fn create_stamps_origin() -> TestResult<()> {
     }
 
     let view = drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         origin.context.as_ref(),
     )
     .await?;
@@ -723,13 +722,13 @@ async fn read_misses_nonholder() -> TestResult<()> {
     .await?;
 
     let result = drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         bystander.context.as_ref(),
     )
     .await;
     assert_eq!(
         result.unwrap_err(),
-        GetMetadataDocumentError::MetadataError(MetadataError::GraphNotFound),
+        GetDocumentError::MetadataError(MetadataError::GraphNotFound),
         "non-holder served a graph it never received"
     );
 
@@ -737,14 +736,11 @@ async fn read_misses_nonholder() -> TestResult<()> {
     // its miss is the record's.
     let user = realm.user_node();
     let result = drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         user.context.as_ref(),
     )
     .await;
-    assert_eq!(
-        result.unwrap_err(),
-        GetMetadataDocumentError::DocumentNotFound
-    );
+    assert_eq!(result.unwrap_err(), GetDocumentError::DocumentNotFound);
 
     realm.shutdown().await;
     Ok(())
@@ -805,7 +801,7 @@ async fn bystander_writes_forward() -> TestResult<()> {
         let node = realm.find(*holder);
         wait_until("update reaches holder", node.node_id(), || async {
             drive(
-                GetMetadataDocumentOperation::new(group_id, document_id),
+                GetDocumentOperation::new(group_id, document_id),
                 node.context.as_ref(),
             )
             .await
@@ -815,12 +811,12 @@ async fn bystander_writes_forward() -> TestResult<()> {
     }
     assert_eq!(
         drive(
-            GetMetadataDocumentOperation::new(group_id, document_id),
+            GetDocumentOperation::new(group_id, document_id),
             bystander.context.as_ref(),
         )
         .await
         .unwrap_err(),
-        GetMetadataDocumentError::MetadataError(MetadataError::GraphNotFound),
+        GetDocumentError::MetadataError(MetadataError::GraphNotFound),
         "the forwarder must not have applied the write onto a bucket it does not hold"
     );
 
@@ -853,7 +849,7 @@ async fn bystander_writes_forward() -> TestResult<()> {
     let healthy = realm.find(holders[1]);
     wait_until("stale holder forwards", healthy.node_id(), || async {
         drive(
-            GetMetadataDocumentOperation::new(group_id, document_id),
+            GetDocumentOperation::new(group_id, document_id),
             healthy.context.as_ref(),
         )
         .await
@@ -868,11 +864,11 @@ async fn bystander_writes_forward() -> TestResult<()> {
         wait_until("delete reaches holder", node.node_id(), || async {
             matches!(
                 drive(
-                    GetMetadataDocumentOperation::new(group_id, document_id),
+                    GetDocumentOperation::new(group_id, document_id),
                     node.context.as_ref(),
                 )
                 .await,
-                Err(GetMetadataDocumentError::DocumentNotFound)
+                Err(GetDocumentError::DocumentNotFound)
             )
         })
         .await?;
@@ -917,12 +913,12 @@ async fn document_sparql_routes() -> TestResult<()> {
         bystander.context.as_ref(),
         realm.realm_id,
         bystander.node_id(),
-        MetadataDocumentQueryRequest {
+        DocumentQueryRequest {
             document_id,
             auth: None,
             bearer_token: Some(realm.bearer_string()),
             query: "ASK { ?s ?p ?o }".to_string(),
-            mode: Some(MetadataApiQueryMode::Distributed),
+            mode: Some(ApiQueryMode::Distributed),
             allow_partial: false,
         },
     )
@@ -967,16 +963,16 @@ async fn document_export_routes() -> TestResult<()> {
     )
     .await?;
 
-    let request = |auth| ExportMetadataRoCrateRequest {
+    let request = |auth| ExportMetadataRequest {
         document_id,
         auth,
-        view: MetadataRoCrateExportView::Full,
+        view: RoCrateExportView::Full,
         limit: None,
         offset: None,
         after: None,
     };
     let bearer = export_routed(&realm, bystander, request(None), realm.bearer_token()).await?;
-    assert!(matches!(bearer, ExportMetadataRoCrateResult::Full { .. }));
+    assert!(matches!(bearer, ExportMetadataResult::Full { .. }));
 
     let principal = AuthContext {
         user_id: realm.user_id,
@@ -988,10 +984,10 @@ async fn document_export_routes() -> TestResult<()> {
         &realm,
         bystander,
         request(Some(principal.clone())),
-        MetadataAuthToken::internal(principal),
+        AuthToken::internal(principal),
     )
     .await?;
-    assert!(matches!(internal, ExportMetadataRoCrateResult::Full { .. }));
+    assert!(matches!(internal, ExportMetadataResult::Full { .. }));
 
     realm.shutdown().await;
     Ok(())
@@ -1014,13 +1010,7 @@ async fn user_create_forwards() -> TestResult<()> {
     );
 
     let created = route_metadata_create(
-        CreateMetadataDocumentOperation::new(document_config(
-            &realm,
-            user,
-            group_id,
-            document_id,
-            path,
-        )),
+        CreateDocumentOperation::new(document_config(&realm, user, group_id, document_id, path)),
         user.context.clone(),
         Some(realm.bearer_token()),
     )
@@ -1042,12 +1032,12 @@ async fn user_create_forwards() -> TestResult<()> {
     // is not a sync target at all.
     assert_eq!(
         drive(
-            GetMetadataDocumentOperation::new(group_id, document_id),
+            GetDocumentOperation::new(group_id, document_id),
             user.context.as_ref(),
         )
         .await
         .unwrap_err(),
-        GetMetadataDocumentError::DocumentNotFound
+        GetDocumentError::DocumentNotFound
     );
 
     realm.shutdown().await;
@@ -1060,9 +1050,9 @@ async fn user_create_forwards() -> TestResult<()> {
 async fn export_routed(
     realm: &Topology,
     bystander: &TestNode,
-    request: ExportMetadataRoCrateRequest,
-    token: MetadataAuthToken,
-) -> TestResult<ExportMetadataRoCrateResult> {
+    request: ExportMetadataRequest,
+    token: AuthToken,
+) -> TestResult<ExportMetadataResult> {
     let export = RefCell::new(None);
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "no routed export reached a holder",
@@ -1108,7 +1098,7 @@ async fn update_routed(
                 None,
                 document_id,
                 None,
-                UpdateMetadataDocumentMutation::UpsertDataEntity {
+                UpdateDocumentMutation::UpsertDataEntity {
                     jsonld: jsonld.to_string(),
                 },
                 Some(realm.bearer_token()),
@@ -1166,14 +1156,14 @@ fn document_config(
     group_id: Ulid,
     document_id: Ulid,
     document_path: &str,
-) -> CreateMetadataDocumentConfig {
-    CreateMetadataDocumentConfig {
+) -> CreateDocumentConfig {
+    CreateDocumentConfig {
         actor: realm.actor(node),
         group_id,
         document_id,
         document_path: document_path.to_string(),
         public: true,
-        payload: CreateMetadataDocumentPayload::Scaffold {
+        payload: CreateDocumentPayload::Scaffold {
             name: "Topology Dataset".to_string(),
             description: "Written on a realm above the replication factor".to_string(),
             date_published: "2026-01-01".to_string(),
@@ -1191,7 +1181,7 @@ async fn create_document(
     document_path: &str,
 ) -> TestResult<aruna_core::structs::PlacementRef> {
     let created = drive(
-        CreateMetadataDocumentOperation::new(document_config(
+        CreateDocumentOperation::new(document_config(
             realm,
             node,
             group_id,
@@ -1207,7 +1197,7 @@ async fn create_document(
 
 async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
     drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         node.context.as_ref(),
     )
     .await
