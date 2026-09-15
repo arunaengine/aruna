@@ -125,7 +125,7 @@ async fn ensure_topic_genesis(
     let probe = net_handle
         .probe_shard_geneses(vec![topic_id], peers.to_vec())
         .await;
-    if probe.known_by_co_holder.contains(&topic_id) {
+    if probe.known_co_holder.contains(&topic_id) {
         if let Err(error) = net_handle.sync_topic_peers(topic_id, peers.to_vec()).await {
             debug!(%topic_id, error = %error, "graph topic adopt attempt failed");
         }

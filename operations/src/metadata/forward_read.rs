@@ -46,9 +46,9 @@ use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::read_error;
 use futures_util::StreamExt;
 
-pub(super) const METADATA_READ_FANOUT_LIMIT: usize = 8;
+pub(super) const READ_FANOUT_LIMIT: usize = 8;
 
-pub(super) const METADATA_READ_PEER_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const READ_PEER_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) const METADATA_READ_DEADLINE: Duration = Duration::from_secs(12);
 
@@ -63,13 +63,13 @@ where
     let requests = futures_util::stream::iter(holders.into_iter().map(|holder| {
         let request = request(holder);
         async move {
-            let result = timeout(METADATA_READ_PEER_TIMEOUT, request)
+            let result = timeout(READ_PEER_TIMEOUT, request)
                 .await
                 .unwrap_or(Err(MetadataReadError::Unavailable));
             (holder, result)
         }
     }))
-    .buffer_unordered(METADATA_READ_FANOUT_LIMIT);
+    .buffer_unordered(READ_FANOUT_LIMIT);
     futures_util::pin_mut!(requests);
 
     let deadline = Instant::now() + METADATA_READ_DEADLINE;
@@ -396,7 +396,7 @@ pub async fn route_profile_status(
                 match metadata
                     .request_forwarded_write(
                         holder,
-                        MetadataTransportMessage::ForwardProfileValidationStatus {
+                        MetadataTransportMessage::ForwardValidationStatus {
                             auth_token,
                             config_digest,
                             document_id: request.document_id,
@@ -405,7 +405,7 @@ pub async fn route_profile_status(
                     )
                     .await
                 {
-                    Ok(MetadataTransportMessage::ForwardedProfileValidationStatus { result }) => {
+                    Ok(MetadataTransportMessage::ForwardedValidationStatus { result }) => {
                         result.map(|status| *status)
                     }
                     _ => Err(MetadataReadError::Unavailable),

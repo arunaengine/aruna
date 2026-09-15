@@ -8,7 +8,7 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE};
+use aruna_core::keyspaces::{GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE};
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::telemetry::record_elapsed_ms;
@@ -21,8 +21,8 @@ use ulid::Ulid;
 
 use super::entity_convert::error_from_craqle;
 use super::{
-    LifecycleDeletedEntry, METADATA_GRAPH_SYNC_ATTEMPTS, METADATA_GRAPH_SYNC_RETRY_AFTER,
-    METADATA_REGISTRY_CANDIDATE_LIMIT, METADATA_VISIBILITY_CACHE_TTL, MetadataHandle,
+    LifecycleDeletedEntry, GRAPH_SYNC_ATTEMPTS, GRAPH_SYNC_AFTER,
+    REGISTRY_CANDIDATE_LIMIT, VISIBILITY_CACHE_TTL, MetadataHandle,
     MetadataInner, MetadataVisibilityCache, RegistryCacheEntry, VisibilityFillResult,
     metadata_graph_fence, summary_cache,
 };
@@ -102,7 +102,7 @@ impl MetadataVisibilityCache {
             records: map,
             snapshot: Some(records),
             group_snapshots: HashMap::new(),
-            expires_at: Instant::now() + METADATA_VISIBILITY_CACHE_TTL,
+            expires_at: Instant::now() + VISIBILITY_CACHE_TTL,
         });
     }
 
@@ -112,8 +112,8 @@ impl MetadataVisibilityCache {
         lifecycle_entries: Vec<(String, bool)>,
         fill_generation: u64,
     ) -> bool {
-        if records.len() > METADATA_REGISTRY_CANDIDATE_LIMIT
-            || lifecycle_entries.len() > METADATA_REGISTRY_CANDIDATE_LIMIT
+        if records.len() > REGISTRY_CANDIDATE_LIMIT
+            || lifecycle_entries.len() > REGISTRY_CANDIDATE_LIMIT
         {
             return false;
         }
@@ -125,7 +125,7 @@ impl MetadataVisibilityCache {
             .map(|record| (record.document_id, record.clone()))
             .collect();
         let now = Instant::now();
-        let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
+        let expires_at = now + VISIBILITY_CACHE_TTL;
         let mut registry = self
             .registry
             .lock()
@@ -192,7 +192,7 @@ impl MetadataVisibilityCache {
             graph_iri,
             LifecycleDeletedEntry {
                 deleted,
-                expires_at: now + METADATA_VISIBILITY_CACHE_TTL,
+                expires_at: now + VISIBILITY_CACHE_TTL,
             },
         );
     }
@@ -205,11 +205,11 @@ impl MetadataVisibilityCache {
         entries: impl IntoIterator<Item = (String, bool)>,
     ) {
         let entries = entries.into_iter().collect::<Vec<_>>();
-        if entries.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+        if entries.len() > REGISTRY_CANDIDATE_LIMIT {
             return;
         }
         let now = Instant::now();
-        let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
+        let expires_at = now + VISIBILITY_CACHE_TTL;
         let mut lifecycle = self
             .lifecycle_deleted
             .lock()
@@ -241,7 +241,7 @@ impl MetadataVisibilityCache {
             .keys()
             .filter(|graph_iri| protected.contains(*graph_iri))
             .count();
-        let available = METADATA_REGISTRY_CANDIDATE_LIMIT.saturating_sub(protected.len());
+        let available = REGISTRY_CANDIDATE_LIMIT.saturating_sub(protected.len());
         let remove_count = lifecycle
             .len()
             .saturating_sub(protected_count)
@@ -266,11 +266,11 @@ impl MetadataVisibilityCache {
             return false;
         }
         let entries = entries.into_iter().collect::<Vec<_>>();
-        if entries.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+        if entries.len() > REGISTRY_CANDIDATE_LIMIT {
             return false;
         }
         let now = Instant::now();
-        let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
+        let expires_at = now + VISIBILITY_CACHE_TTL;
         let mut lifecycle = self
             .lifecycle_deleted
             .lock()
@@ -323,7 +323,7 @@ impl MetadataVisibilityCache {
             .iter()
             .filter(|update| !entry.records.contains_key(&update.document_id))
             .count();
-        if entry.records.len().saturating_add(new_records) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+        if entry.records.len().saturating_add(new_records) > REGISTRY_CANDIDATE_LIMIT {
             *registry = None;
             return;
         }
@@ -481,7 +481,7 @@ impl MetadataHandle {
         let task_graph_iri = graph_iri.clone();
         let task_peers = peers.clone();
         tokio::spawn(async move {
-            for attempt in 1..=METADATA_GRAPH_SYNC_ATTEMPTS {
+            for attempt in 1..=GRAPH_SYNC_ATTEMPTS {
                 match sync_graph_once(inner.clone(), task_graph_iri.clone(), task_peers.clone())
                     .await
                 {
@@ -490,12 +490,12 @@ impl MetadataHandle {
                         warn!(
                             graph_iri = %task_graph_iri,
                             attempt,
-                            attempts = METADATA_GRAPH_SYNC_ATTEMPTS,
+                            attempts = GRAPH_SYNC_ATTEMPTS,
                             error = ?error,
                             "Metadata graph sync attempt failed"
                         );
-                        if attempt < METADATA_GRAPH_SYNC_ATTEMPTS {
-                            sleep(METADATA_GRAPH_SYNC_RETRY_AFTER).await;
+                        if attempt < GRAPH_SYNC_ATTEMPTS {
+                            sleep(GRAPH_SYNC_AFTER).await;
                         }
                     }
                 }
@@ -765,7 +765,7 @@ pub(super) async fn list_group_records(
     group_id: GroupId,
     limit: usize,
 ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
-    let limit = limit.min(METADATA_REGISTRY_CANDIDATE_LIMIT);
+    let limit = limit.min(REGISTRY_CANDIDATE_LIMIT);
     if let Some((records, true)) = inner.visibility_cache.records_group_any(group_id)
         && records.len() <= limit
     {
@@ -794,7 +794,7 @@ pub(super) async fn list_group_records(
         }
     }
 
-    let (deleted_graphs, _) = list_deleted_iris(&inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
+    let (deleted_graphs, _) = list_deleted_iris(&inner, REGISTRY_CANDIDATE_LIMIT).await?;
     Ok(Arc::new(
         records
             .into_iter()
@@ -833,7 +833,7 @@ pub(super) async fn fill_visibility_caches(
                 key_space: METADATA_INDEX_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.map(IterStart::After),
-                limit: METADATA_REGISTRY_CANDIDATE_LIMIT
+                limit: REGISTRY_CANDIDATE_LIMIT
                     .saturating_sub(records.len())
                     .saturating_add(1),
                 txn_id: None,
@@ -843,7 +843,7 @@ pub(super) async fn fill_visibility_caches(
             MetadataError::Backend(format!("metadata registry iteration failed: {error:?}"))
         })?;
         registry_pages += 1;
-        if records.len().saturating_add(page.len()) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+        if records.len().saturating_add(page.len()) > REGISTRY_CANDIDATE_LIMIT {
             return Err(MetadataError::Backend(
                 "metadata candidate limit exceeded".to_string(),
             ));
@@ -863,7 +863,7 @@ pub(super) async fn fill_visibility_caches(
     // Lifecycle records are deletion tombstones, so one keyspace sweep refreshes the
     // deleted-state of every registry graph without per-graph point reads.
     let (deleted_graphs, lifecycle_pages) =
-        list_deleted_iris(inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
+        list_deleted_iris(inner, REGISTRY_CANDIDATE_LIMIT).await?;
     span.record("lifecycle_pages", lifecycle_pages as u64);
     span.record("deleted_count", deleted_graphs.len() as u64);
 
@@ -903,7 +903,7 @@ pub(super) async fn list_deleted_iris(
         let event = inner
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::Iter {
-                key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+                key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.map(IterStart::After),
                 limit: limit.saturating_add(1),

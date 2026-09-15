@@ -150,7 +150,7 @@ async fn member_peer_accepted() {
     let configured_peer = node_id_seed(12);
     persist_auth_state(
         &storage,
-        TRUSTED_REALMS_LIST_KEY,
+        REALMS_LIST_KEY,
         &HashSet::from([realm_id]),
     )
     .await;
@@ -231,7 +231,7 @@ async fn bucket_realm_mismatch() {
     let (_dir, storage) = auth_storage();
     persist_auth_state(
         &storage,
-        TRUSTED_REALMS_LIST_KEY,
+        REALMS_LIST_KEY,
         &HashSet::from([realm_id]),
     )
     .await;
@@ -269,7 +269,7 @@ async fn revocation_blind_decode() {
     let (_dir, storage) = auth_storage();
     persist_auth_state(
         &storage,
-        TRUSTED_REALMS_LIST_KEY,
+        REALMS_LIST_KEY,
         &HashSet::from([realm_id]),
     )
     .await;
@@ -304,7 +304,7 @@ async fn foreign_peer_rejected() {
     let auth_realm_peer = node_id_seed(23);
     persist_auth_state(
         &storage,
-        TRUSTED_REALMS_LIST_KEY,
+        REALMS_LIST_KEY,
         &HashSet::from([realm_id]),
     )
     .await;
@@ -390,7 +390,7 @@ async fn auth_validates_token() {
     persist_realm_config(&storage, realm_id, &[]).await;
     persist_auth_state(
         &storage,
-        TRUSTED_REALMS_LIST_KEY,
+        REALMS_LIST_KEY,
         &HashSet::from([realm_id]),
     )
     .await;
@@ -420,7 +420,7 @@ async fn auth_preserves_path() {
     persist_realm_config(&storage, realm_id, &[]).await;
     persist_auth_state(
         &storage,
-        TRUSTED_REALMS_LIST_KEY,
+        REALMS_LIST_KEY,
         &HashSet::from([realm_id]),
     )
     .await;
@@ -444,7 +444,7 @@ async fn auth_rejects_revoked() {
     let (_revoked_dir, revoked_storage) = auth_storage();
     persist_auth_state(
         &revoked_storage,
-        TRUSTED_REALMS_LIST_KEY,
+        REALMS_LIST_KEY,
         &HashSet::from([realm_id]),
     )
     .await;
@@ -470,7 +470,7 @@ async fn replicated_revocation_rejects() {
     let (_dir, storage) = auth_storage();
     persist_auth_state(
         &storage,
-        TRUSTED_REALMS_LIST_KEY,
+        REALMS_LIST_KEY,
         &HashSet::from([realm_id]),
     )
     .await;

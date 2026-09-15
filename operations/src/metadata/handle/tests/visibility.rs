@@ -87,7 +87,7 @@ fn upsert_replaces_existing() {
 }
 #[test]
 fn upsert_discards_cache() {
-    let records = (0..METADATA_REGISTRY_CANDIDATE_LIMIT)
+    let records = (0..REGISTRY_CANDIDATE_LIMIT)
         .map(|index| registry_record(&format!("datasets/{index}")))
         .collect();
     let cache = filled_cache(records);
@@ -201,7 +201,7 @@ fn store_prunes_expired() {
 fn refresh_keeps_tombstone() {
     let cache = MetadataVisibilityCache::new();
     cache.refresh_lifecycle_deleted(
-        (0..METADATA_REGISTRY_CANDIDATE_LIMIT)
+        (0..REGISTRY_CANDIDATE_LIMIT)
             .map(|index| (format!("urn:graph:old:{index}"), false))
             .collect::<Vec<_>>(),
     );
@@ -211,7 +211,7 @@ fn refresh_keeps_tombstone() {
     assert_eq!(cache.lifecycle_deleted("urn:graph:deleted"), Some(true));
     assert_eq!(
         cache.lifecycle_deleted.lock().unwrap().len(),
-        METADATA_REGISTRY_CANDIDATE_LIMIT
+        REGISTRY_CANDIDATE_LIMIT
     );
 }
 #[test]
@@ -220,7 +220,7 @@ fn eviction_keeps_tombstone() {
     let cache = MetadataVisibilityCache::new();
     cache.store_lifecycle_deleted(deleted_record.graph_iri.clone(), true);
     cache.refresh_lifecycle_deleted(
-        (0..METADATA_REGISTRY_CANDIDATE_LIMIT)
+        (0..REGISTRY_CANDIDATE_LIMIT)
             .map(|index| (format!("urn:graph:current:{index}"), false))
             .collect::<Vec<_>>(),
     );

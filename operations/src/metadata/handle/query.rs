@@ -17,8 +17,8 @@ use tracing::{Span, debug_span, field};
 use super::effects::{graph_ids, record_error, record_query_counts};
 use super::search::select_authorized_graphs;
 use super::{
-    METADATA_QUERY_COMMON_PREFIXES, METADATA_QUERY_DEADLINE, METADATA_QUERY_MAX_BYTES,
-    METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS, METADATA_REGISTRY_CANDIDATE_LIMIT,
+    QUERY_PREFIXES, METADATA_QUERY_DEADLINE, QUERY_MAX_BYTES,
+    MAX_RESULT_BYTES, QUERY_MAX_ROWS, REGISTRY_CANDIDATE_LIMIT,
     MetadataHandle, MetadataInner,
 };
 use crate::metadata::query_cache::{CachedQuery, LocalScopeKind, graphs_digest, local_key};
@@ -52,7 +52,7 @@ pub(super) async fn query_local_graphs(
     let query = parse_metadata_query(&sparql)?;
     if graph_iris
         .as_ref()
-        .is_some_and(|graphs| graphs.len() > METADATA_REGISTRY_CANDIDATE_LIMIT)
+        .is_some_and(|graphs| graphs.len() > REGISTRY_CANDIDATE_LIMIT)
     {
         return Err(MetadataError::Backend(
             "metadata candidate limit exceeded".to_string(),
@@ -210,13 +210,13 @@ impl Drop for MetadataCancellationGuard {
 }
 
 pub(super) fn parse_metadata_query(sparql: &str) -> Result<Query, MetadataError> {
-    if sparql.len() > METADATA_QUERY_MAX_BYTES {
+    if sparql.len() > QUERY_MAX_BYTES {
         return Err(MetadataError::InvalidInput(format!(
-            "SPARQL query exceeds the {METADATA_QUERY_MAX_BYTES}-byte limit"
+            "SPARQL query exceeds the {QUERY_MAX_BYTES}-byte limit"
         )));
     }
     let query = SparqlParser::new()
-        .parse_query(&format!("{METADATA_QUERY_COMMON_PREFIXES}{sparql}"))
+        .parse_query(&format!("{QUERY_PREFIXES}{sparql}"))
         .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
     let pattern = match &query {
         Query::Select { pattern, .. } | Query::Ask { pattern, .. } => pattern,
@@ -318,9 +318,9 @@ fn evaluate_query_snapshot(
     ensure_not_cancelled(cancellation)?;
     let serialized =
         serde_json::to_vec(&results).map_err(|error| MetadataError::Backend(error.to_string()))?;
-    if serialized.len() > METADATA_QUERY_MAX_RESULT_BYTES {
+    if serialized.len() > MAX_RESULT_BYTES {
         return Err(MetadataError::InvalidInput(format!(
-            "metadata query result exceeds the {METADATA_QUERY_MAX_RESULT_BYTES}-byte limit"
+            "metadata query result exceeds the {MAX_RESULT_BYTES}-byte limit"
         )));
     }
     Ok(results)
@@ -336,9 +336,9 @@ fn collect_query_results(
             for solution in solutions {
                 let solution =
                     solution.map_err(|error| MetadataError::Backend(error.to_string()))?;
-                if rows.len() == METADATA_QUERY_MAX_ROWS {
+                if rows.len() == QUERY_MAX_ROWS {
                     return Err(MetadataError::InvalidInput(format!(
-                        "metadata query result exceeds the {METADATA_QUERY_MAX_ROWS}-row limit"
+                        "metadata query result exceeds the {QUERY_MAX_ROWS}-row limit"
                     )));
                 }
                 let row = solution
@@ -355,9 +355,9 @@ fn collect_query_results(
                         .len()
                         .saturating_add(1),
                 );
-                if serialized_bytes > METADATA_QUERY_MAX_RESULT_BYTES {
+                if serialized_bytes > MAX_RESULT_BYTES {
                     return Err(MetadataError::InvalidInput(format!(
-                        "metadata query result exceeds the {METADATA_QUERY_MAX_RESULT_BYTES}-byte limit"
+                        "metadata query result exceeds the {MAX_RESULT_BYTES}-byte limit"
                     )));
                 }
                 rows.push(row);

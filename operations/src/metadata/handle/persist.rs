@@ -22,12 +22,12 @@ pub(super) fn flush_sync_journal(
         "metadata.backend.document_sync.flush",
         effect = effect_name,
         graph_iri = graph_iri.unwrap_or("<none>"),
-        mode = inner.document_sync_persist_policy.label(),
+        mode = inner.sync_persist_policy.label(),
         elapsed_ms = field::Empty,
         result = field::Empty,
     );
     let started = Instant::now();
-    let result = span.in_scope(|| db.persist(inner.document_sync_persist_policy.as_fjall()));
+    let result = span.in_scope(|| db.persist(inner.sync_persist_policy.as_fjall()));
     record_elapsed_ms(&span, "elapsed_ms", started);
     match result {
         Ok(()) => {
@@ -73,7 +73,7 @@ pub(super) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
         MetadataEffect::SetGraphPolicy { .. }
         | MetadataEffect::AddGraphPeer { .. }
         | MetadataEffect::DeleteGraph { .. } => true,
-        MetadataEffect::SyncGraphBestEffort { .. }
+        MetadataEffect::SyncBestEffort { .. }
         | MetadataEffect::QueryGraphs { .. }
         | MetadataEffect::SearchGraphs { .. }
         | MetadataEffect::GetGraphPolicy { .. }

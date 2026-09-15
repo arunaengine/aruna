@@ -4,7 +4,7 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::METADATA_IRI_REFERENCE_INDEX_KEYSPACE;
+use aruna_core::keyspaces::IRI_INDEX_KEYSPACE;
 use aruna_core::metadata::{
     IriIndexRecord, MaterializationState, MaterializationStatusRecord, MetadataError,
 };
@@ -17,13 +17,13 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
-use super::handle::METADATA_REGISTRY_CANDIDATE_LIMIT;
+use super::handle::REGISTRY_CANDIDATE_LIMIT;
 use super::repository::{StorageReadError, parse_status_read, read_status_effect};
 
-const IRI_INDEX_PAGE_SIZE: usize = 128;
-const IRI_INDEX_WRITE_BATCH_SIZE: usize = 128;
+const INDEX_PAGE_SIZE: usize = 128;
+const INDEX_BATCH_SIZE: usize = 128;
 
-pub(crate) const DCTERMS_CONFORMS_TO_IRI: &str = "http://purl.org/dc/terms/conformsTo";
+pub(crate) const DCTERMS_CONFORMS_IRI: &str = "http://purl.org/dc/terms/conformsTo";
 
 /// Keeps the storage cause intact so callers can tell an overloaded backend
 /// apart from a genuine index or document problem.
@@ -114,7 +114,7 @@ pub(crate) enum IriFreshnessState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IriFreshness {
     pub state: IriFreshnessState,
-    pub oldest_status_updated_at_ms: Option<u64>,
+    pub oldest_status_updated: Option<u64>,
 }
 
 /// Backlinks to `object_iri`. A `predicate_iri` uses the predicate-first index
@@ -178,12 +178,12 @@ pub(crate) async fn iri_index_freshness(
     let mut current = false;
     let mut pending = false;
     let mut failed = false;
-    let mut oldest_status_updated_at_ms = None;
+    let mut oldest_status_updated = None;
     for record in registry_records {
         let status = read_materialization_status(storage, record.document_id).await?;
         if let Some(status) = status.as_ref() {
-            oldest_status_updated_at_ms = Some(
-                oldest_status_updated_at_ms.map_or(status.updated_at_ms, |oldest: u64| {
+            oldest_status_updated = Some(
+                oldest_status_updated.map_or(status.updated_at_ms, |oldest: u64| {
                     oldest.min(status.updated_at_ms)
                 }),
             );
@@ -214,7 +214,7 @@ pub(crate) async fn iri_index_freshness(
     };
     Ok(IriFreshness {
         state,
-        oldest_status_updated_at_ms,
+        oldest_status_updated,
     })
 }
 
@@ -227,10 +227,10 @@ async fn scan_records(
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                key_space: IRI_INDEX_KEYSPACE.to_string(),
                 prefix: prefix.clone(),
                 start: start_after.map(IterStart::After),
-                limit: IRI_INDEX_PAGE_SIZE,
+                limit: INDEX_PAGE_SIZE,
                 txn_id: None,
             })
             .await;
@@ -239,7 +239,7 @@ async fn scan_records(
                 values,
                 next_start_after,
             }) => {
-                if records.len().saturating_add(values.len()) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+                if records.len().saturating_add(values.len()) > REGISTRY_CANDIDATE_LIMIT {
                     return Err(MetadataIriError::UnexpectedEvent(
                         "metadata IRI reference candidate limit exceeded".to_string(),
                     ));
@@ -333,10 +333,10 @@ where
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                key_space: IRI_INDEX_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
-                limit: IRI_INDEX_PAGE_SIZE,
+                limit: INDEX_PAGE_SIZE,
                 txn_id,
             })
             .await;
@@ -354,7 +354,7 @@ where
             if let Some((document_id, cursor)) = iri_reference_ids(key.as_ref())
                 && select(document_id, cursor)
             {
-                selected.push((METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(), key));
+                selected.push((IRI_INDEX_KEYSPACE.to_string(), key));
             }
         }
         match next_start_after {
@@ -412,7 +412,7 @@ pub(crate) async fn delete_keys(
     storage: &StorageHandle,
     keys: Vec<(String, ByteView)>,
 ) -> Result<(), MetadataError> {
-    for chunk in keys.chunks(IRI_INDEX_WRITE_BATCH_SIZE) {
+    for chunk in keys.chunks(INDEX_BATCH_SIZE) {
         match storage
             .send_storage_effect(StorageEffect::BatchDelete {
                 deletes: chunk.to_vec(),
@@ -511,7 +511,7 @@ async fn write_iri_references(
     storage: &StorageHandle,
     records: &[IriIndexRecord],
 ) -> Result<(), MetadataIriError> {
-    for records in records.chunks(IRI_INDEX_WRITE_BATCH_SIZE) {
+    for records in records.chunks(INDEX_BATCH_SIZE) {
         let writes = iri_write_entries(records)?;
         match storage
             .send_storage_effect(StorageEffect::BatchWrite {
@@ -546,7 +546,7 @@ mod tests {
         match storage
             .send_storage_effect(StorageEffect::BatchWrite {
                 writes: vec![(
-                    METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                    IRI_INDEX_KEYSPACE.to_string(),
                     index_key(document_id, cursor),
                     ByteView::from(vec![1u8]),
                 )],
@@ -594,17 +594,17 @@ mod tests {
             vec![
                 (
                     "https://example.test/subject-b".to_string(),
-                    DCTERMS_CONFORMS_TO_IRI.to_string(),
+                    DCTERMS_CONFORMS_IRI.to_string(),
                     "https://example.test/profile".to_string(),
                 ),
                 (
                     "https://example.test/subject-a".to_string(),
-                    DCTERMS_CONFORMS_TO_IRI.to_string(),
+                    DCTERMS_CONFORMS_IRI.to_string(),
                     "https://example.test/profile".to_string(),
                 ),
                 (
                     "https://example.test/subject-a".to_string(),
-                    DCTERMS_CONFORMS_TO_IRI.to_string(),
+                    DCTERMS_CONFORMS_IRI.to_string(),
                     "https://example.test/profile".to_string(),
                 ),
             ],
@@ -632,14 +632,14 @@ mod tests {
             IriIndexRecord {
                 document_id: current_document_id,
                 document_cursor: cursor,
-                predicate_iri: DCTERMS_CONFORMS_TO_IRI.to_string(),
+                predicate_iri: DCTERMS_CONFORMS_IRI.to_string(),
                 object_iri: profile.to_string(),
                 subject_iris: vec!["https://example.test/current".to_string()],
             },
             IriIndexRecord {
                 document_id: stale_document_id,
                 document_cursor: Ulid::from_parts(2, 0),
-                predicate_iri: DCTERMS_CONFORMS_TO_IRI.to_string(),
+                predicate_iri: DCTERMS_CONFORMS_IRI.to_string(),
                 object_iri: profile.to_string(),
                 subject_iris: vec!["https://example.test/stale".to_string()],
             },
@@ -657,7 +657,7 @@ mod tests {
         ];
 
         let matches =
-            collect_iri_matches(records, &registry_records, DCTERMS_CONFORMS_TO_IRI, profile);
+            collect_iri_matches(records, &registry_records, DCTERMS_CONFORMS_IRI, profile);
 
         assert_eq!(matches.len(), 1);
         assert_eq!(

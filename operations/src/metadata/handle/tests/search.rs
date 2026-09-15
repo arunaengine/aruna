@@ -2,7 +2,7 @@ use super::visibility::{group_record, read_rules, registry_record};
 use super::*;
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::metadata::handle::search::clamp_remote_limit;
-use crate::metadata::search_cursor::METADATA_SEARCH_MAX_PAGINATION_DEPTH;
+use crate::metadata::search_cursor::MAX_PAGINATION_DEPTH;
 use aruna_core::structs::identity::auth::Permission;
 use craqle::GraphPolicy;
 use craqle::{Action as CraqleAction, Authorizer as CraqleAuthorizer};
@@ -401,7 +401,7 @@ fn search_limit_clamps() {
     assert_eq!(clamp_remote_limit(0), 1);
     assert_eq!(clamp_remote_limit(25), 25);
     assert_eq!(
-        clamp_remote_limit(METADATA_SEARCH_MAX_PAGINATION_DEPTH + 1),
-        METADATA_SEARCH_MAX_PAGINATION_DEPTH
+        clamp_remote_limit(MAX_PAGINATION_DEPTH + 1),
+        MAX_PAGINATION_DEPTH
     );
 }

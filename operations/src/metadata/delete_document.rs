@@ -50,8 +50,8 @@ pub struct DeleteDocumentOperation {
     lifecycle_record: Option<GraphLifecycleRecord>,
     document_lifecycle_record: Option<MetadataLifecycleRecord>,
     prune_job_record: Option<GraphPruneRecord>,
-    document_lifecycle_placement_ref: PlacementRef,
-    graph_lifecycle_placement_ref: PlacementRef,
+    document_placement_ref: PlacementRef,
+    lifecycle_placement_ref: PlacementRef,
     registry_placement_ref: PlacementRef,
     holder_peers: Vec<NodeId>,
     registry_peers: Vec<NodeId>,
@@ -74,22 +74,22 @@ enum DeleteDocumentState {
     ReadFence,
     ReadBucketFence,
     WriteGraphLifecycle,
-    WriteGraphPruneJob,
+    WritePruneJob,
     WriteDocumentLifecycle,
     DeleteRegistry,
     DeleteDocumentIndex,
     DeleteHolders,
     DeleteUpdatedIndex,
     WriteAudit,
-    WriteDocumentLifecycleOutbox,
-    WriteGraphLifecycleOutbox,
+    WriteLifecycleOutbox,
+    WriteGraphOutbox,
     WriteDeleteOutbox,
     ReadPidMapping,
     WritePidTombstone,
     CommitTransaction,
-    ScheduleGraphPruneQueue,
+    SchedulePruneQueue,
     PruneGraph,
-    ScheduleGraphLifecycleSync,
+    ScheduleGraphSync,
     ScheduleDeleteSync,
     Finish,
     Error,
@@ -129,8 +129,8 @@ impl DeleteDocumentOperation {
             lifecycle_record: None,
             document_lifecycle_record: None,
             prune_job_record: None,
-            document_lifecycle_placement_ref: PlacementRef::NIL,
-            graph_lifecycle_placement_ref: PlacementRef::NIL,
+            document_placement_ref: PlacementRef::NIL,
+            lifecycle_placement_ref: PlacementRef::NIL,
             registry_placement_ref: PlacementRef::NIL,
             holder_peers: Vec::new(),
             registry_peers: Vec::new(),
@@ -225,7 +225,7 @@ impl DeleteDocumentOperation {
             event: MetadataDeleteRecord {
                 event_id,
                 tombstone,
-                deleted_after_event_id: record.last_event_id,
+                deleted_after_id: record.last_event_id,
             },
         }
     }
@@ -242,7 +242,7 @@ impl DeleteDocumentOperation {
         let change = lifecycle_revision_change(
             lifecycle_record,
             self.actor.node_id,
-            self.document_lifecycle_placement_ref,
+            self.document_placement_ref,
         );
         // A delete mints the graph-lifecycle topic genesis before publishing its tombstone.
         Ok(new_identified_record(
@@ -253,12 +253,12 @@ impl DeleteDocumentOperation {
             },
             self.peers(record),
             DocumentOutboxEvent::Upsert { bytes, change },
-            self.document_lifecycle_placement_ref,
+            self.document_placement_ref,
             true,
         )
         .fenced_at(
             self.fence
-                .generation(&record.realm_id, &self.document_lifecycle_placement_ref),
+                .generation(&record.realm_id, &self.document_placement_ref),
         ))
     }
 
@@ -289,7 +289,7 @@ impl DeleteDocumentOperation {
             lifecycle_record,
             outbox_id,
             self.actor.node_id,
-            self.graph_lifecycle_placement_ref,
+            self.lifecycle_placement_ref,
         );
         let outbox = new_identified_record(
             outbox_id,
@@ -301,12 +301,12 @@ impl DeleteDocumentOperation {
             DocumentOutboxEvent::Upsert { bytes, change },
             // First (and only) write to the per-graph lifecycle topic, so the
             // deleting holder originates and may mint its genesis.
-            self.graph_lifecycle_placement_ref,
+            self.lifecycle_placement_ref,
             true,
         )
         .fenced_at(
             self.fence
-                .generation(&record.realm_id, &self.graph_lifecycle_placement_ref),
+                .generation(&record.realm_id, &self.lifecycle_placement_ref),
         );
         Ok(smallvec![
             write_transaction_effect(&outbox, Some(txn_id))
@@ -409,8 +409,8 @@ impl DeleteDocumentOperation {
                     // Every record rides the bucket its create stamped, so a tombstone
                     // lands on the document's own topic.
                     self.holder_peers = resolve_shard_holders(&config, &record.placement);
-                    self.document_lifecycle_placement_ref = record.placement;
-                    self.graph_lifecycle_placement_ref = record.placement;
+                    self.document_placement_ref = record.placement;
+                    self.lifecycle_placement_ref = record.placement;
                     // The registry tombstone follows its everywhere-bound registry topic.
                     self.registry_placement_ref = registry_placement(&config, record);
                     self.registry_peers =
@@ -519,7 +519,7 @@ impl DeleteDocumentOperation {
                 let Some(prune_job_record) = self.prune_job_record.as_ref() else {
                     return self.fail(DeleteDocumentError::DocumentNotFound);
                 };
-                self.state = DeleteDocumentState::WriteGraphPruneJob;
+                self.state = DeleteDocumentState::WritePruneJob;
                 match write_prune_effect(prune_job_record, Some(txn_id)) {
                     Ok(effect) => smallvec![effect],
                     Err(error) => self.fail(DeleteDocumentError::ConversionError(error)),
@@ -544,7 +544,7 @@ impl DeleteDocumentOperation {
                 match write_lifecycle_revision(
                     document_lifecycle_record,
                     self.actor.node_id,
-                    self.document_lifecycle_placement_ref,
+                    self.document_placement_ref,
                     Some(txn_id),
                 ) {
                     Ok(effect) => smallvec![effect],
@@ -658,7 +658,7 @@ impl DeleteDocumentOperation {
                 let Some(record) = self.record.as_ref() else {
                     return self.fail(DeleteDocumentError::DocumentNotFound);
                 };
-                self.state = DeleteDocumentState::WriteDocumentLifecycleOutbox;
+                self.state = DeleteDocumentState::WriteLifecycleOutbox;
                 match self.document_lifecycle_effect(record, txn_id) {
                     Ok(effects) => effects,
                     Err(error) => self.fail(error),
@@ -678,7 +678,7 @@ impl DeleteDocumentOperation {
                 let Some(record) = self.record.as_ref() else {
                     return self.fail(DeleteDocumentError::DocumentNotFound);
                 };
-                self.state = DeleteDocumentState::WriteGraphLifecycleOutbox;
+                self.state = DeleteDocumentState::WriteGraphOutbox;
                 let outbox_id = self.phase_source.next_id();
                 match self.graph_lifecycle_effect(record, txn_id, outbox_id) {
                     Ok(effects) => effects,
@@ -806,7 +806,7 @@ impl DeleteDocumentOperation {
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
-                self.state = DeleteDocumentState::ScheduleGraphPruneQueue;
+                self.state = DeleteDocumentState::SchedulePruneQueue;
                 smallvec![schedule_prune_drain()]
             }
             Event::Storage(StorageEvent::Error { error }) => {
@@ -850,7 +850,7 @@ impl DeleteDocumentOperation {
                 if self.record.is_none() {
                     return self.fail(DeleteDocumentError::DocumentNotFound);
                 }
-                self.state = DeleteDocumentState::ScheduleGraphLifecycleSync;
+                self.state = DeleteDocumentState::ScheduleGraphSync;
                 match self.lifecycle_schedule_effect() {
                     Ok(effects) => effects,
                     Err(error) => self.fail(error),
@@ -861,7 +861,7 @@ impl DeleteDocumentOperation {
                 if self.record.is_none() {
                     return self.fail(DeleteDocumentError::DocumentNotFound);
                 }
-                self.state = DeleteDocumentState::ScheduleGraphLifecycleSync;
+                self.state = DeleteDocumentState::ScheduleGraphSync;
                 match self.lifecycle_schedule_effect() {
                     Ok(effects) => effects,
                     Err(error) => self.fail(error),
@@ -964,23 +964,23 @@ impl Operation for DeleteDocumentOperation {
             DeleteDocumentState::ReadFence => self.read_fence(event),
             DeleteDocumentState::ReadBucketFence => self.read_bucket_fence(event),
             DeleteDocumentState::WriteGraphLifecycle => self.write_graph_tombstone(event),
-            DeleteDocumentState::WriteGraphPruneJob => self.write_prune_job(event),
+            DeleteDocumentState::WritePruneJob => self.write_prune_job(event),
             DeleteDocumentState::WriteDocumentLifecycle => self.write_document_lifecycle(event),
             DeleteDocumentState::DeleteRegistry => self.delete_registry(event),
             DeleteDocumentState::DeleteDocumentIndex => self.delete_document_index(event),
             DeleteDocumentState::DeleteHolders => self.delete_holders(event),
             DeleteDocumentState::DeleteUpdatedIndex => self.delete_timestamp_index(event),
             DeleteDocumentState::WriteAudit => self.write_audit(event),
-            DeleteDocumentState::WriteDocumentLifecycleOutbox => self.write_lifecycle_outbox(event),
-            DeleteDocumentState::WriteGraphLifecycleOutbox => self.write_graph_outbox(event),
+            DeleteDocumentState::WriteLifecycleOutbox => self.write_lifecycle_outbox(event),
+            DeleteDocumentState::WriteGraphOutbox => self.write_graph_outbox(event),
             DeleteDocumentState::WriteDeleteOutbox => self.write_delete_outbox(event),
             // Commit the PID tombstone with the registry row to prevent a crash leaving it active.
             DeleteDocumentState::ReadPidMapping => self.read_pid_mapping(event),
             DeleteDocumentState::WritePidTombstone => self.write_pid_tombstone(event),
             DeleteDocumentState::CommitTransaction => self.commit_transaction(event),
-            DeleteDocumentState::ScheduleGraphPruneQueue => self.schedule_prune_queue(event),
+            DeleteDocumentState::SchedulePruneQueue => self.schedule_prune_queue(event),
             DeleteDocumentState::PruneGraph => self.prune_graph(event),
-            DeleteDocumentState::ScheduleGraphLifecycleSync => self.schedule_graph_sync(event),
+            DeleteDocumentState::ScheduleGraphSync => self.schedule_graph_sync(event),
             DeleteDocumentState::ScheduleDeleteSync => self.schedule_delete_sync(event),
             DeleteDocumentState::Finish
             | DeleteDocumentState::Error
@@ -1012,8 +1012,8 @@ mod pure_tests {
     use super::*;
     use aruna_core::document::{DocumentChange, DocumentChangeKind};
     use aruna_core::keyspaces::{
-        DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-        METADATA_GRAPH_PRUNE_JOB_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE,
+        SYNC_REVISION_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
+        PRUNE_JOB_KEYSPACE, ID_MAPPING_KEYSPACE,
     };
     use aruna_core::storage_entries::sync_revision_key;
     use aruna_core::structs::execution::job::JobId;
@@ -1098,7 +1098,7 @@ mod pure_tests {
         };
         assert_eq!(event.event_id, outbox.outbox_id);
         assert_eq!(event.tombstone, tombstone);
-        assert_eq!(event.deleted_after_event_id, record.last_event_id);
+        assert_eq!(event.deleted_after_id, record.last_event_id);
     }
 
     #[test]
@@ -1127,7 +1127,7 @@ mod pure_tests {
         };
         assert_eq!(
             key_space,
-            aruna_core::keyspaces::METADATA_UPDATED_INDEX_KEYSPACE
+            aruna_core::keyspaces::UPDATED_INDEX_KEYSPACE
         );
         assert_eq!(
             key.as_ref(),
@@ -1208,8 +1208,8 @@ mod pure_tests {
             value: Some(postcard::to_allocvec(&record).unwrap().into()),
         }));
 
-        assert_eq!(operation.document_lifecycle_placement_ref, record.placement);
-        assert_eq!(operation.graph_lifecycle_placement_ref, record.placement);
+        assert_eq!(operation.document_placement_ref, record.placement);
+        assert_eq!(operation.lifecycle_placement_ref, record.placement);
         // The registry tombstone follows the registry row, which rides the
         // everywhere-bound registry class rather than the document's capped bucket.
         let registry_ref = registry_placement(&config, &record);
@@ -1485,7 +1485,7 @@ mod pure_tests {
         else {
             panic!("expected prune job write effect");
         };
-        assert_eq!(key_space, METADATA_GRAPH_PRUNE_JOB_KEYSPACE);
+        assert_eq!(key_space, PRUNE_JOB_KEYSPACE);
         assert_eq!(*write_txn_id, txn_id);
         let job: GraphPruneRecord = postcard::from_bytes(value).unwrap();
         assert_eq!(job.graph_iri, record.graph_iri);
@@ -1508,7 +1508,7 @@ mod pure_tests {
 
         let lifecycle = writes
             .iter()
-            .find(|(keyspace, _, _)| keyspace == METADATA_DOCUMENT_LIFECYCLE_KEYSPACE)
+            .find(|(keyspace, _, _)| keyspace == DOCUMENT_LIFECYCLE_KEYSPACE)
             .map(|(_, _, value)| {
                 postcard::from_bytes::<MetadataLifecycleRecord>(value)
                     .expect("lifecycle record decodes")
@@ -1517,13 +1517,13 @@ mod pure_tests {
         let MetadataLifecycleRecord::Delete { event } = lifecycle else {
             panic!("expected delete lifecycle record");
         };
-        assert_eq!(event.deleted_after_event_id, fenced.last_event_id);
+        assert_eq!(event.deleted_after_id, fenced.last_event_id);
         let target = DocumentTarget::MetadataDocumentLifecycle {
             document_id: record.document_id,
         };
         let (revision_key, revision): (_, DocumentChange) = writes
             .iter()
-            .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_REVISION_KEYSPACE)
+            .find(|(keyspace, _, _)| keyspace == SYNC_REVISION_KEYSPACE)
             .map(|(_, key, value)| {
                 (
                     key,
@@ -1613,7 +1613,7 @@ mod pure_tests {
         else {
             panic!("expected a persistent id mapping read, got {effects:?}");
         };
-        assert_eq!(key_space, PERSISTENT_ID_MAPPING_KEYSPACE);
+        assert_eq!(key_space, ID_MAPPING_KEYSPACE);
         assert_eq!(*read_txn_id, txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -1670,7 +1670,7 @@ mod pure_tests {
         assert_eq!(*write_txn_id, txn_id);
         let mapping = writes
             .iter()
-            .find(|(keyspace, _, _)| keyspace == PERSISTENT_ID_MAPPING_KEYSPACE)
+            .find(|(keyspace, _, _)| keyspace == ID_MAPPING_KEYSPACE)
             .map(|(_, _, value)| PersistentIdMapping::from_bytes(value).expect("mapping decodes"))
             .expect("the batch carries the mapping row");
         assert_eq!(mapping.target, record.document_id);
@@ -1722,10 +1722,10 @@ mod pure_tests {
         let mut operation =
             DeleteDocumentOperation::new(actor, record.group_id, record.document_id);
         operation.record = Some(record.clone());
-        operation.state = DeleteDocumentState::ScheduleGraphPruneQueue;
+        operation.state = DeleteDocumentState::SchedulePruneQueue;
 
         let effects = operation.step(Event::Task(TaskEvent::Error {
-            key: Some(aruna_core::task::TaskKey::DrainMetadataGraphPruneQueue),
+            key: Some(aruna_core::task::TaskKey::DrainPruneQueue),
             message: "scheduler unavailable".to_string(),
         }));
 

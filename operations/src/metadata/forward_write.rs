@@ -86,7 +86,7 @@ pub async fn route_metadata_create(
 ) -> Result<CreateDocumentResult, MetadataWriteError> {
     let config = operation.config().clone();
     match create_metadata_document(operation, context.clone()).await {
-        Err(CreateDocumentError::OriginHoldsNoBucket) => {}
+        Err(CreateDocumentError::HoldsNoBucket) => {}
         Ok(created) => return Ok(created),
         Err(error) => return Err(error.into()),
     }
@@ -208,7 +208,7 @@ pub async fn create_metadata_authorized(
     } else {
         match mint_local_document(&realm_config, &actor, group_id, &path) {
             Ok(document_id) => document_id.as_ulid(),
-            Err(CreateDocumentError::OriginHoldsNoBucket) => {
+            Err(CreateDocumentError::HoldsNoBucket) => {
                 mint_forward_document(&realm_config, &actor, group_id, &path)?.as_ulid()
             }
             Err(error) => return Err(error.into()),
@@ -363,7 +363,7 @@ pub async fn route_metadata_update(
         MetadataTransportMessage::ForwardedRecord { .. } => Err(MetadataWriteError::Undeliverable(
             "holder returned a metadata update record for another document".to_string(),
         )),
-        MetadataTransportMessage::ForwardedUpdateInvalidInput { message } => {
+        MetadataTransportMessage::UpdateInvalidInput { message } => {
             Err(UpdateDocumentError::MetadataError(MetadataError::InvalidInput(message)).into())
         }
         MetadataTransportMessage::ForwardedProfileValidation { findings } => Err(
@@ -555,7 +555,7 @@ pub(crate) async fn apply_forwarded_write(
         | MetadataTransportMessage::ForwardUpdateDocument { config_digest, .. }
         | MetadataTransportMessage::ForwardDeleteDocument { config_digest, .. }
         | MetadataTransportMessage::ForwardReadDocument { config_digest, .. }
-        | MetadataTransportMessage::ForwardProfileValidationStatus { config_digest, .. } => {
+        | MetadataTransportMessage::ForwardValidationStatus { config_digest, .. } => {
             *config_digest
         }
         _ => return reject("unexpected forwarded metadata message"),
@@ -601,7 +601,7 @@ pub(crate) async fn apply_forwarded_write(
         .await;
     }
 
-    if let MetadataTransportMessage::ForwardProfileValidationStatus {
+    if let MetadataTransportMessage::ForwardValidationStatus {
         auth_token,
         document_id,
         revalidate,
@@ -610,7 +610,7 @@ pub(crate) async fn apply_forwarded_write(
     {
         return Box::pin(async {
             let Some(metadata) = context.metadata_handle.as_ref() else {
-                return MetadataTransportMessage::ForwardedProfileValidationStatus {
+                return MetadataTransportMessage::ForwardedValidationStatus {
                     result: Err(MetadataReadError::Unavailable),
                 };
             };
@@ -624,7 +624,7 @@ pub(crate) async fn apply_forwarded_write(
                     let record = match load_live_record(context.as_ref(), *document_id).await {
                         Ok(record) => record,
                         Err(error) => {
-                            return MetadataTransportMessage::ForwardedProfileValidationStatus {
+                            return MetadataTransportMessage::ForwardedValidationStatus {
                                 result: Err(read_error(error)),
                             };
                         }
@@ -638,7 +638,7 @@ pub(crate) async fn apply_forwarded_write(
                     )
                     .await
                     {
-                        return MetadataTransportMessage::ForwardedProfileValidationStatus {
+                        return MetadataTransportMessage::ForwardedValidationStatus {
                             result: Err(read_error(error)),
                         };
                     }
@@ -653,7 +653,7 @@ pub(crate) async fn apply_forwarded_write(
                 Ok(_) => Err(MetadataReadError::Unavailable),
                 Err(error) => Err(error),
             };
-            MetadataTransportMessage::ForwardedProfileValidationStatus { result }
+            MetadataTransportMessage::ForwardedValidationStatus { result }
         })
         .await;
     }
@@ -739,7 +739,7 @@ pub(crate) async fn apply_forwarded_write(
                     match held_record(context, &config, net_handle.node_id(), document_id).await {
                         Ok(record) => record,
                         Err(HeldRecordError::NotFound) => {
-                            return MetadataTransportMessage::ForwardedWriteNotFound;
+                            return MetadataTransportMessage::WriteNotFound;
                         }
                         Err(HeldRecordError::Unavailable(error)) => {
                             warn!(%document_id, %error, "Forwarded metadata update is unavailable");
@@ -767,11 +767,11 @@ pub(crate) async fn apply_forwarded_write(
                         record: Box::new(record),
                     },
                     Err(UpdateDocumentError::RawLimit) => {
-                        MetadataTransportMessage::ForwardedMetadataHistoryCapacity
+                        MetadataTransportMessage::MetadataHistoryCapacity
                     }
                     Err(UpdateDocumentError::MetadataError(MetadataError::InvalidInput(
                         message,
-                    ))) => MetadataTransportMessage::ForwardedUpdateInvalidInput { message },
+                    ))) => MetadataTransportMessage::UpdateInvalidInput { message },
                     Err(UpdateDocumentError::MetadataError(MetadataError::ProfileValidation(
                         findings,
                     ))) => MetadataTransportMessage::ForwardedProfileValidation { findings },
@@ -786,7 +786,7 @@ pub(crate) async fn apply_forwarded_write(
                     match held_record(context, &config, net_handle.node_id(), document_id).await {
                         Ok(record) => record,
                         Err(HeldRecordError::NotFound) => {
-                            return MetadataTransportMessage::ForwardedWriteNotFound;
+                            return MetadataTransportMessage::WriteNotFound;
                         }
                         Err(HeldRecordError::Unavailable(error)) => {
                             warn!(%document_id, %error, "Forwarded metadata delete is unavailable");

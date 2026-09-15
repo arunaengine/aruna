@@ -25,7 +25,7 @@ fn query_validation_allows() {
 #[test]
 fn query_validation_rejects() {
     assert!(matches!(
-        parse_metadata_query(&" ".repeat(METADATA_QUERY_MAX_BYTES + 1)),
+        parse_metadata_query(&" ".repeat(QUERY_MAX_BYTES + 1)),
         Err(MetadataError::InvalidInput(_))
     ));
 }

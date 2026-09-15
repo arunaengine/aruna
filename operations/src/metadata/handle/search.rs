@@ -21,13 +21,13 @@ use ulid::Ulid;
 
 use super::effects::{graph_ids, record_error};
 use super::{
-    LifecycleVisibilityRefresh, METADATA_ENRICH_TASKS, METADATA_REGISTRY_CANDIDATE_LIMIT,
+    LifecycleVisibilityRefresh, METADATA_ENRICH_TASKS, REGISTRY_CANDIDATE_LIMIT,
     MetadataHandle, MetadataInner, MetadataVisibilityCache,
 };
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::driver::DriverContext;
 use crate::metadata::query_cache::ScopeDigest;
-use crate::metadata::search_cursor::{METADATA_SEARCH_MAX_PAGINATION_DEPTH, compare_hits};
+use crate::metadata::search_cursor::{MAX_PAGINATION_DEPTH, compare_hits};
 use crate::metadata::search_enrichment::{hit_title, hit_types};
 
 #[tracing::instrument(
@@ -65,7 +65,7 @@ pub(super) async fn search_local_graphs(
 
     if graph_iris
         .as_ref()
-        .is_some_and(|graphs| graphs.len() > METADATA_REGISTRY_CANDIDATE_LIMIT)
+        .is_some_and(|graphs| graphs.len() > REGISTRY_CANDIDATE_LIMIT)
     {
         return Err(MetadataError::Backend(
             "metadata candidate limit exceeded".to_string(),
@@ -495,7 +495,7 @@ pub(super) fn describe_hit_properties(
 }
 
 pub(super) fn clamp_remote_limit(limit: usize) -> usize {
-    limit.clamp(1, METADATA_SEARCH_MAX_PAGINATION_DEPTH)
+    limit.clamp(1, MAX_PAGINATION_DEPTH)
 }
 
 pub(super) struct AllowedGraphAuthorizer {
@@ -863,7 +863,7 @@ async fn refresh_visibility(
     records: &[MetadataRegistryRecord],
 ) -> Result<LifecycleVisibilityRefresh, MetadataError> {
     let fill_generation = inner.visibility_cache.current_generation();
-    let (deleted_graphs, _) = list_deleted_iris(inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
+    let (deleted_graphs, _) = list_deleted_iris(inner, REGISTRY_CANDIDATE_LIMIT).await?;
     let store_accepted = inner.visibility_cache.refresh_if_current(
         records.iter().map(|record| {
             (

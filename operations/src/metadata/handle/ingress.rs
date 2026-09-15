@@ -784,7 +784,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
             | MetadataTransportMessage::ForwardDeleteDocument { .. }
             | MetadataTransportMessage::ForwardReadDocument { .. }
-            | MetadataTransportMessage::ForwardProfileValidationStatus { .. }) => {
+            | MetadataTransportMessage::ForwardValidationStatus { .. }) => {
                 Box::pin(async {
                     super::super::forward::apply_forwarded_write(context, peer, forward).await
                 })
@@ -819,7 +819,7 @@ impl MetadataHandle {
                 .await
             }
             record @ (MetadataTransportMessage::ForwardJobRecord { .. }
-            | MetadataTransportMessage::ForwardJobRecordPage { .. }) => {
+            | MetadataTransportMessage::ForwardRecordPage { .. }) => {
                 Box::pin(async {
                     crate::jobs::records::serve_job_record(context, peer, record).await
                 })
@@ -848,7 +848,7 @@ impl MetadataHandle {
                 })
                 .await
             }
-            forward @ MetadataTransportMessage::ForwardCreatePlacementPolicy { .. } => {
+            forward @ MetadataTransportMessage::ForwardCreatePolicy { .. } => {
                 Box::pin(async {
                     crate::placement::policy::apply_forwarded_policy(context, peer, forward).await
                 })
@@ -971,16 +971,16 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
             | MetadataTransportMessage::ForwardDeleteDocument { .. }
             | MetadataTransportMessage::ForwardReadDocument { .. }
-            | MetadataTransportMessage::ForwardProfileValidationStatus { .. }
+            | MetadataTransportMessage::ForwardValidationStatus { .. }
             | MetadataTransportMessage::ForwardAuditPage { .. }
             | MetadataTransportMessage::ForwardTokenRevocation { .. }
             | MetadataTransportMessage::ForwardPersistentId { .. }
             | MetadataTransportMessage::ForwardPlacementPolicy { .. }
             | MetadataTransportMessage::ForwardJobRecord { .. }
-            | MetadataTransportMessage::ForwardJobRecordPage { .. }
+            | MetadataTransportMessage::ForwardRecordPage { .. }
             | MetadataTransportMessage::ForwardLaunchOffer { .. }
             | MetadataTransportMessage::ForwardJobSubmission { .. }
-            | MetadataTransportMessage::ForwardCreatePlacementPolicy { .. }
+            | MetadataTransportMessage::ForwardCreatePolicy { .. }
             | MetadataTransportMessage::ForwardSyncPull { .. }
             | MetadataTransportMessage::ForwardListVersions { .. }
             | MetadataTransportMessage::ForwardCreateBucket { .. }

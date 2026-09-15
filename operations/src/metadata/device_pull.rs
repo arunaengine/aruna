@@ -15,7 +15,7 @@ use aruna_core::structs::storage::blob::{
     BlobVersion, BlobVersionState, BucketInfo, VersionKey, object_permission_path,
 };
 use aruna_core::structs::{
-    RemoteHead, SYNC_SOURCE_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPullAck, SyncRefusal,
+    RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPullAck, SyncRefusal,
     SyncVersionPage,
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -262,7 +262,7 @@ async fn delete_target(
         // The marker carries the device version it came from, so a retried
         // delete is recognized as the same one instead of stacking markers.
         .with_metadata(HashMap::from([(
-            SYNC_SOURCE_VERSION_TAG.to_string(),
+            SYNC_VERSION_TAG.to_string(),
             request.source.version.to_string(),
         )])),
         context,
@@ -332,7 +332,7 @@ async fn commit_pull(
     })
     .with_bucket_guard(bucket.clone())
     .with_metadata(HashMap::from([(
-        SYNC_SOURCE_VERSION_TAG.to_string(),
+        SYNC_VERSION_TAG.to_string(),
         request.source.version.to_string(),
     )]));
     let result = drive(operation, context).await.map_err(|error| {
@@ -390,7 +390,7 @@ async fn applied_version(context: &Arc<DriverContext>, request: &PullRequest) ->
             // its tag: only the kind this request asks for is its replay.
             if version
                 .metadata
-                .get(SYNC_SOURCE_VERSION_TAG)
+                .get(SYNC_VERSION_TAG)
                 .is_some_and(|tag| *tag == source)
                 && matches!(version.state, BlobVersionState::Deleted) == request.deleted
                 && let Ok(parsed) = VersionKey::from_bytes(key.as_ref())
@@ -484,7 +484,7 @@ async fn list_heads(
         .collect();
     let next = result.is_truncated.then(|| SyncListCursor {
         key: result.next_key_marker.unwrap_or_default(),
-        version_id: result.next_version_id_marker,
+        version_id: result.next_version_marker,
     });
     SyncVersionPage::new(heads, next).map_err(|error| SyncRefusal::Invalid(error.to_string()))
 }
@@ -759,7 +759,7 @@ mod tests {
             None,
         );
         version.metadata = HashMap::from([(
-            SYNC_SOURCE_VERSION_TAG.to_string(),
+            SYNC_VERSION_TAG.to_string(),
             request.source.version.to_string(),
         )]);
         let key = VersionKey::new(
@@ -795,7 +795,7 @@ mod tests {
         let version_id = Ulid::from_bytes([7; 16]);
         let mut marker = BlobVersion::deleted(SystemTime::UNIX_EPOCH, fixture.auth.user_id);
         marker.metadata = HashMap::from([(
-            SYNC_SOURCE_VERSION_TAG.to_string(),
+            SYNC_VERSION_TAG.to_string(),
             request.source.version.to_string(),
         )]);
         let key = VersionKey::new(&request.target_bucket, &request.target_key, version_id);

@@ -4,7 +4,7 @@ use super::visibility::{group_record, registry_record};
 use super::*;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
-use aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE;
+use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
 use aruna_core::metadata::GraphLifecycleRecord;
 use aruna_core::metadata::MetadataCrateRequest;
 use aruna_core::metadata::MetadataGraphPolicy;
@@ -135,7 +135,7 @@ async fn tombstone_blocks_apply() {
     let bytes = postcard::to_allocvec(&tombstone).expect("tombstone serializes");
     match storage
         .send_storage_effect(StorageEffect::Write {
-            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
             key: graph_lifecycle_key(&record.graph_iri),
             value: ByteView::from(bytes),
             txn_id: None,

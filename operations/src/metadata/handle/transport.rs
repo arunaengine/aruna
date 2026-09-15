@@ -17,7 +17,7 @@ use ulid::Ulid;
 use super::effects::{record_error, record_query_counts};
 use super::{
     METADATA_CHUNK_SIZE, METADATA_ENVELOPE_BYTES, METADATA_IO_TIMEOUT, MetadataHandle,
-    MetadataInner, MetadataRequestError, SYNC_MIRROR_REQUEST_TIMEOUT,
+    MetadataInner, MetadataRequestError, SYNC_MIRROR_TIMEOUT,
 };
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::metadata::protocol::{
@@ -412,7 +412,7 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardPathResolution { .. } => "forward_path_resolution",
         MetadataTransportMessage::ForwardedPathResolution { .. } => "forwarded_path_resolution",
         MetadataTransportMessage::ForwardedWriteDenied { .. } => "forwarded_write_denied",
-        MetadataTransportMessage::ForwardedWriteNotFound => "forwarded_write_not_found",
+        MetadataTransportMessage::WriteNotFound => "forwarded_write_not_found",
         MetadataTransportMessage::ForwardedWriteUnavailable => "forwarded_write_unavailable",
         MetadataTransportMessage::ForwardedDelete => "forwarded_delete",
         MetadataTransportMessage::ForwardExportDocument { .. } => "forward_export_document",
@@ -421,33 +421,33 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::QueryDocument { .. } => "query_document",
         MetadataTransportMessage::DocumentQueryResults { .. } => "document_query_results",
         MetadataTransportMessage::Reject(_) => "reject",
-        MetadataTransportMessage::ForwardedUpdateInvalidInput { .. } => {
+        MetadataTransportMessage::UpdateInvalidInput { .. } => {
             "forwarded_update_invalid_input"
         }
         MetadataTransportMessage::ForwardAuditPage { .. } => "forward_audit_page",
         MetadataTransportMessage::ForwardedAuditPage { .. } => "forwarded_audit_page",
         MetadataTransportMessage::ForwardTokenRevocation { .. } => "forward_token_revocation",
         MetadataTransportMessage::ForwardedTokenRevoked => "forwarded_token_revoked",
-        MetadataTransportMessage::ForwardedTokenRevocationCapacity => {
+        MetadataTransportMessage::TokenRevocationCapacity => {
             "forwarded_token_revocation_capacity"
         }
-        MetadataTransportMessage::ForwardedMetadataHistoryCapacity => {
+        MetadataTransportMessage::MetadataHistoryCapacity => {
             "forwarded_metadata_history_capacity"
         }
         MetadataTransportMessage::ForwardPersistentId { .. } => "forward_persistent_id",
         MetadataTransportMessage::ForwardedPersistentId { .. } => "forwarded_persistent_id",
         MetadataTransportMessage::ForwardPlacementPolicy { .. } => "forward_placement_policy",
         MetadataTransportMessage::ForwardedPlacementPolicy { .. } => "forwarded_placement_policy",
-        MetadataTransportMessage::ForwardCreatePlacementPolicy { .. } => {
+        MetadataTransportMessage::ForwardCreatePolicy { .. } => {
             "forward_create_placement_policy"
         }
-        MetadataTransportMessage::ForwardedPlacementPolicyCreated { .. } => {
+        MetadataTransportMessage::PlacementPolicyCreated { .. } => {
             "forwarded_placement_policy_created"
         }
         MetadataTransportMessage::ForwardJobRecord { .. } => "forward_job_record",
         MetadataTransportMessage::ForwardedJobRecord { .. } => "forwarded_job_record",
-        MetadataTransportMessage::ForwardJobRecordPage { .. } => "forward_job_record_page",
-        MetadataTransportMessage::ForwardedJobRecordPage { .. } => "forwarded_job_record_page",
+        MetadataTransportMessage::ForwardRecordPage { .. } => "forward_job_record_page",
+        MetadataTransportMessage::ForwardedRecordPage { .. } => "forwarded_job_record_page",
         MetadataTransportMessage::ForwardLaunchOffer { .. } => "forward_launch_offer",
         MetadataTransportMessage::ForwardedLaunchOffer { .. } => "forwarded_launch_offer",
         MetadataTransportMessage::ForwardJobSubmission { .. } => "forward_job_submission",
@@ -455,16 +455,16 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedProfileValidation { .. } => {
             "forwarded_profile_validation"
         }
-        MetadataTransportMessage::ForwardProfileValidationStatus { .. } => {
+        MetadataTransportMessage::ForwardValidationStatus { .. } => {
             "forward_profile_validation_status"
         }
-        MetadataTransportMessage::ForwardedProfileValidationStatus { .. } => {
+        MetadataTransportMessage::ForwardedValidationStatus { .. } => {
             "forwarded_profile_validation_status"
         }
         MetadataTransportMessage::ReferencePreflight { .. } => "reference_preflight",
         MetadataTransportMessage::ReferencePreflightResults { .. } => "reference_preflight_results",
         MetadataTransportMessage::ForwardAdminEvent { .. } => "forward_admin_event",
-        MetadataTransportMessage::ForwardedAdminEventQueued => "forwarded_admin_event_queued",
+        MetadataTransportMessage::AdminEventQueued => "forwarded_admin_event_queued",
         MetadataTransportMessage::ForwardGroupCreate { .. } => "forward_group_create",
         MetadataTransportMessage::ForwardedGroupCreated { .. } => "forwarded_group_created",
         MetadataTransportMessage::ForwardSyncPull { .. } => "forward_sync_pull",
@@ -479,7 +479,7 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::FetchedGraphState { .. } => "fetched_graph_state",
         MetadataTransportMessage::ForwardApplyBatch { .. } => "forward_apply_batch",
         MetadataTransportMessage::ForwardedApplyBatch { .. } => "forwarded_apply_batch",
-        MetadataTransportMessage::ForwardedGroupCreateConflict { .. } => {
+        MetadataTransportMessage::GroupCreateConflict { .. } => {
             "forwarded_group_create_conflict"
         }
     }
@@ -869,7 +869,7 @@ impl MetadataHandle {
 pub(super) async fn with_sync_timeout<T>(
     request: impl std::future::Future<Output = Result<T, MetadataRequestError>>,
 ) -> Result<T, MetadataError> {
-    timeout(SYNC_MIRROR_REQUEST_TIMEOUT, request)
+    timeout(SYNC_MIRROR_TIMEOUT, request)
         .await
         .map_err(|_| MetadataError::Backend("sync mirror request timed out".to_string()))?
         .map_err(MetadataRequestError::into_metadata_error)

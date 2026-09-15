@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE;
+use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
 use aruna_core::metadata::GraphLifecycleRecord;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -11,7 +11,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::metadata::repository::{
-    LIST_METADATA_PAGE_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
+    LIST_METADATA_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
 };
 
 #[derive(Debug, PartialEq)]
@@ -78,10 +78,10 @@ impl ListDocumentsOperation {
 
     fn lifecycle_iter_effect(start_after: Option<Key>) -> Effect {
         Effect::Storage(StorageEffect::Iter {
-            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
             prefix: None,
             start: start_after.map(IterStart::After),
-            limit: LIST_METADATA_PAGE_SIZE,
+            limit: LIST_METADATA_SIZE,
             txn_id: None,
         })
     }
@@ -188,7 +188,7 @@ mod tests {
         let storage_handle = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let group_id = Ulid::generate();
 
-        for idx in 0..(crate::metadata::repository::LIST_METADATA_PAGE_SIZE + 5) {
+        for idx in 0..(crate::metadata::repository::LIST_METADATA_SIZE + 5) {
             let document_id = Ulid::generate();
             let now = idx as u64;
             let record = MetadataRegistryRecord {
@@ -236,7 +236,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.len(),
-            crate::metadata::repository::LIST_METADATA_PAGE_SIZE + 5
+            crate::metadata::repository::LIST_METADATA_SIZE + 5
         );
     }
 
@@ -318,7 +318,7 @@ mod tests {
                 prefix: None,
                 start: None,
                 ..
-            })] if key_space == METADATA_GRAPH_LIFECYCLE_KEYSPACE
+            })] if key_space == GRAPH_LIFECYCLE_KEYSPACE
         ));
 
         let effects = operation.step(Event::Storage(StorageEvent::IterResult {

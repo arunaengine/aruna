@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
+use aruna_core::auth::REALMS_LIST_KEY;
 use aruna_core::effects::StoragePriority;
 use aruna_core::events::Event;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, MetadataRoCratePage};
@@ -65,19 +65,19 @@ mod transport;
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_CHUNK_SIZE: usize = 64 * 1024;
 const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
-const SYNC_MIRROR_REQUEST_TIMEOUT: Duration =
+const SYNC_MIRROR_TIMEOUT: Duration =
     RECONCILE_GRACE.saturating_sub(Duration::from_secs(10));
-const METADATA_GRAPH_SYNC_ATTEMPTS: usize = 3;
-const METADATA_GRAPH_SYNC_RETRY_AFTER: Duration = Duration::from_millis(250);
-const SLOW_METADATA_BACKEND_THRESHOLD: Duration = Duration::from_millis(100);
+const GRAPH_SYNC_ATTEMPTS: usize = 3;
+const GRAPH_SYNC_AFTER: Duration = Duration::from_millis(250);
+const METADATA_BACKEND_THRESHOLD: Duration = Duration::from_millis(100);
 // Craqle rebuilds a describe context per hit, so search enrichment overlaps
 // instead of memoizing; the craqle read semaphore is the real concurrency cap.
 const METADATA_ENRICH_TASKS: usize = 8;
-pub(crate) const METADATA_QUERY_MAX_BYTES: usize = 64 * 1024;
-pub(crate) const METADATA_QUERY_MAX_ROWS: usize = 10_000;
-pub(crate) const METADATA_QUERY_MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const QUERY_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const QUERY_MAX_ROWS: usize = 10_000;
+pub(crate) const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const METADATA_QUERY_DEADLINE: Duration = Duration::from_secs(10);
-const METADATA_QUERY_COMMON_PREFIXES: &str = "\
+const QUERY_PREFIXES: &str = "\
 PREFIX schema: <http://schema.org/>\n\
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\
@@ -87,8 +87,8 @@ PREFIX fts: <urn:craqle:fts:>\n";
 // recorded, not just the ones above the slow-call threshold.
 static CRAQLE_LATENCY: LazyLock<aruna_core::telemetry::LatencyAggregator> =
     LazyLock::new(|| aruna_core::telemetry::LatencyAggregator::new("craqle"));
-const METADATA_VISIBILITY_CACHE_TTL: Duration = Duration::from_secs(30);
-pub(crate) const METADATA_REGISTRY_CANDIDATE_LIMIT: usize = 1024;
+const VISIBILITY_CACHE_TTL: Duration = Duration::from_secs(30);
+pub(crate) const REGISTRY_CANDIDATE_LIMIT: usize = 1024;
 
 fn sync_identity_matches(left: &SyncRelationship, right: &SyncRelationship) -> bool {
     left.id == right.id
@@ -202,7 +202,7 @@ impl std::fmt::Display for MetadataRequestError {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MetadataHandleOptions {
     pub search_storage: MetadataSearchStorage,
-    pub document_sync_persist_policy: FjallPersistPolicy,
+    pub sync_persist_policy: FjallPersistPolicy,
     /// Size of the craqle mutation and read permit pools. Defaults to the
     /// host parallelism; set explicitly when cgroup limits make
     /// `available_parallelism` unrepresentative.
@@ -219,7 +219,7 @@ impl MetadataHandleOptions {
     }
 
     pub fn with_sync_policy(mut self, persist_policy: FjallPersistPolicy) -> Self {
-        self.document_sync_persist_policy = persist_policy;
+        self.sync_persist_policy = persist_policy;
         self
     }
 
@@ -256,7 +256,7 @@ struct MetadataInner {
     auth_validation: AuthValidationState,
     net_handle: Option<NetHandle>,
     document_sync_db: Option<fjall::OptimisticTxDatabase>,
-    document_sync_persist_policy: FjallPersistPolicy,
+    sync_persist_policy: FjallPersistPolicy,
     visibility_cache: MetadataVisibilityCache,
     query_cache: MetadataQueryCache,
     profile_cache: ProfileCache,
@@ -305,7 +305,7 @@ impl ArunaValidationState for AuthValidationState {
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
-        match load_auth_state::<HashSet<RealmId>>(&self.storage_handle, TRUSTED_REALMS_LIST_KEY)
+        match load_auth_state::<HashSet<RealmId>>(&self.storage_handle, REALMS_LIST_KEY)
             .await
         {
             Ok(trusted) => trusted.contains(realm_id),
@@ -364,7 +364,7 @@ struct RegistryCacheEntry {
 
 impl RegistryCacheEntry {
     fn snapshot(&mut self) -> Option<Arc<Vec<MetadataRegistryRecord>>> {
-        if self.records.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+        if self.records.len() > REGISTRY_CANDIDATE_LIMIT {
             return None;
         }
         Some(
@@ -376,7 +376,7 @@ impl RegistryCacheEntry {
 
     fn group_snapshot(&mut self, group_id: GroupId) -> Option<Arc<Vec<MetadataRegistryRecord>>> {
         if let Some(records) = self.group_snapshots.get(&group_id) {
-            return (records.len() <= METADATA_REGISTRY_CANDIDATE_LIMIT).then(|| records.clone());
+            return (records.len() <= REGISTRY_CANDIDATE_LIMIT).then(|| records.clone());
         }
         let mut group_records = Vec::new();
         for record in self
@@ -384,7 +384,7 @@ impl RegistryCacheEntry {
             .values()
             .filter(|record| record.group_id == group_id)
         {
-            if group_records.len() == METADATA_REGISTRY_CANDIDATE_LIMIT {
+            if group_records.len() == REGISTRY_CANDIDATE_LIMIT {
                 return None;
             }
             group_records.push(record.clone());
@@ -451,7 +451,7 @@ impl MetadataHandle {
             .with_actor(actor)
             .with_search_storage(metadata_options.search_storage.into())
             .with_graph_store_persist_mode(fjall_persist_mode(
-                metadata_options.document_sync_persist_policy,
+                metadata_options.sync_persist_policy,
             ));
         let options = match document_sync_node {
             Some(document_sync_node) => {
@@ -485,14 +485,14 @@ impl MetadataHandle {
                 storage_handle,
                 net_handle,
                 document_sync_db,
-                document_sync_persist_policy: metadata_options.document_sync_persist_policy,
+                sync_persist_policy: metadata_options.sync_persist_policy,
                 visibility_cache: MetadataVisibilityCache::new(),
                 query_cache: MetadataQueryCache::new(),
                 profile_cache: ProfileCache::new(),
                 craqle_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 craqle_read_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 inbound_frame_bytes: Arc::new(tokio::sync::Semaphore::new(
-                    super::protocol::METADATA_INBOUND_FRAME_BYTES,
+                    super::protocol::INBOUND_FRAME_BYTES,
                 )),
                 deferred_persist_requested: AtomicBool::new(false),
                 deferred_persist_running: AtomicBool::new(false),

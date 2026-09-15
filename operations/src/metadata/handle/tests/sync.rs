@@ -86,7 +86,7 @@ async fn sync_creates_bucket() {
 }
 #[tokio::test(start_paused = true)]
 async fn sync_timeout_fires() {
-    assert!(SYNC_MIRROR_REQUEST_TIMEOUT < RECONCILE_GRACE);
+    assert!(SYNC_MIRROR_TIMEOUT < RECONCILE_GRACE);
     let result =
         with_sync_timeout(std::future::pending::<Result<(), MetadataRequestError>>()).await;
 
@@ -130,7 +130,7 @@ fn sync_defaults_buffered() {
     let options = MetadataHandleOptions::default();
 
     assert_eq!(
-        options.document_sync_persist_policy,
+        options.sync_persist_policy,
         FjallPersistPolicy::Buffer
     );
 }
@@ -142,7 +142,7 @@ fn set_sync_policy() {
 
     assert_eq!(options.search_storage, MetadataSearchStorage::Memory);
     assert_eq!(
-        options.document_sync_persist_policy,
+        options.sync_persist_policy,
         FjallPersistPolicy::SyncAll
     );
 }

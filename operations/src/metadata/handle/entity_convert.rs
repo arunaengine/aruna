@@ -177,7 +177,7 @@ fn property_named_node(property: &str) -> Result<NamedNode, CraqleError> {
         "license" => Ok(vocab::schema_license()),
         "about" => Ok(vocab::schema_about()),
         "conformsTo" => Ok(NamedNode::new_unchecked(
-            super::super::iri_index::DCTERMS_CONFORMS_TO_IRI,
+            super::super::iri_index::DCTERMS_CONFORMS_IRI,
         )),
         other if other.contains("://") => Ok(NamedNode::new_unchecked(other)),
         other if other.contains(':') => expand_compact_iri(other),

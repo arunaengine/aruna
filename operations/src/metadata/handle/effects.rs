@@ -21,7 +21,7 @@ use super::persist::{
 };
 use super::search::list_visible_graphs;
 use super::{
-    CRAQLE_LATENCY, MetadataHandle, MetadataInner, SLOW_METADATA_BACKEND_THRESHOLD,
+    CRAQLE_LATENCY, MetadataHandle, MetadataInner, METADATA_BACKEND_THRESHOLD,
     metadata_graph_fence,
 };
 use crate::metadata::protocol::MetadataReadError;
@@ -66,7 +66,7 @@ impl MetadataHandle {
             return event;
         }
         match effect {
-            MetadataEffect::SyncGraphBestEffort { graph_iri, peers } => {
+            MetadataEffect::SyncBestEffort { graph_iri, peers } => {
                 Event::Metadata(self.sync_best_effort(graph_iri, peers).await)
             }
             MetadataEffect::QueryGraphs {
@@ -143,7 +143,7 @@ impl MetadataHandle {
                 record_elapsed_ms(&span, "elapsed_ms", started);
                 match effect {
                     MetadataEffect::DeleteGraph { .. } => {}
-                    MetadataEffect::SyncGraphBestEffort { graph_iri, peers } => {
+                    MetadataEffect::SyncBestEffort { graph_iri, peers } => {
                         return Some(Event::Metadata(MetadataEvent::GraphSyncScheduled {
                             graph_iri: graph_iri.clone(),
                             peers: peers.clone(),
@@ -236,13 +236,13 @@ pub(super) fn record_error(span: &Span, error: &str) {
 
 pub(super) fn warn_slow_call(operation: &'static str, graph_iri: Option<&str>, duration: Duration) {
     CRAQLE_LATENCY.record(operation, duration);
-    if duration >= SLOW_METADATA_BACKEND_THRESHOLD {
+    if duration >= METADATA_BACKEND_THRESHOLD {
         warn!(
             event = "metadata.backend.slow_call",
             operation,
             graph_iri = graph_iri.unwrap_or("<none>"),
             duration_ms = duration_ms(duration),
-            threshold_ms = duration_ms(SLOW_METADATA_BACKEND_THRESHOLD),
+            threshold_ms = duration_ms(METADATA_BACKEND_THRESHOLD),
             "Slow metadata backend call"
         );
     }
@@ -287,7 +287,7 @@ pub(super) fn metadata_effect_kind(effect: &MetadataEffect) -> &'static str {
         MetadataEffect::UpsertContextualEntity { .. } => "upsert_contextual_entity",
         MetadataEffect::SetGraphPolicy { .. } => "set_graph_policy",
         MetadataEffect::AddGraphPeer { .. } => "add_graph_peer",
-        MetadataEffect::SyncGraphBestEffort { .. } => "sync_best_effort",
+        MetadataEffect::SyncBestEffort { .. } => "sync_best_effort",
         MetadataEffect::GetGraphPolicy { .. } => "get_graph_policy",
         MetadataEffect::ExportRoCrate { .. } => "export_rocrate",
         MetadataEffect::ExportRoCrateSummary { .. } => "export_rocrate_summary",
@@ -370,7 +370,7 @@ pub(super) fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
         | MetadataEffect::UpsertContextualEntity { request } => Some(request.graph_iri.clone()),
         MetadataEffect::SetGraphPolicy { graph_iri, .. }
         | MetadataEffect::AddGraphPeer { graph_iri, .. }
-        | MetadataEffect::SyncGraphBestEffort { graph_iri, .. }
+        | MetadataEffect::SyncBestEffort { graph_iri, .. }
         | MetadataEffect::GetGraphPolicy { graph_iri }
         | MetadataEffect::ExportRoCrate { graph_iri }
         | MetadataEffect::ExportRoCrateSummary { graph_iri }
@@ -1083,7 +1083,7 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
         | MetadataEffect::ExportRoCratePage { .. }) => export_effect(&node, &auth, effect),
         MetadataEffect::SearchGraphs { .. }
         | MetadataEffect::QueryGraphs { .. }
-        | MetadataEffect::SyncGraphBestEffort { .. } => unreachable!("handled asynchronously"),
+        | MetadataEffect::SyncBestEffort { .. } => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs
         | MetadataEffect::ContainsGraph { .. }) => graph_effect(&node, &auth, effect),
