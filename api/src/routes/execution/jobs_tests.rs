@@ -1,7 +1,7 @@
 use super::*;
 use crate::jobs::{
-    MAX_OUTPUT_PREFIXES, mount_permission_path, native_input, native_outputs, output_buckets,
-    validate_output_prefixes, workspace_request,
+    JobRequestError, MAX_OUTPUT_PREFIXES, mount_permission_path, native_input, native_outputs,
+    output_buckets, validate_output_prefixes, workspace_request,
 };
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
@@ -756,9 +756,9 @@ fn range_parses_single() {
 #[test]
 fn forwarded_auth_bounds() {
     assert!(forwarded_job_auth(None).unwrap().is_none());
-    let accepted = ValidatedArunaBearerTokenCarrier::new_for_test("a".repeat(4_096));
+    let accepted = ValidatedBearer::new_for_test("a".repeat(4_096));
     assert!(forwarded_job_auth(Some(accepted)).unwrap().is_some());
-    let rejected = ValidatedArunaBearerTokenCarrier::new_for_test("a".repeat(4_097));
+    let rejected = ValidatedBearer::new_for_test("a".repeat(4_097));
     assert!(matches!(
         forwarded_job_auth(Some(rejected)),
         Err(ServerError::BadRequest)
@@ -1156,7 +1156,7 @@ fn local_names_holder() {
 
     assert!(matches!(
         native_input(input.clone(), ExecutionTarget::Realm),
-        Err(ServerError::BadRequestMessage(_))
+        Err(JobRequestError::BadRequestMessage(_))
     ));
     assert_eq!(
         native_input(input, ExecutionTarget::Local)
@@ -1326,7 +1326,7 @@ fn output_requires_bucket() {
         WorkspaceMode::None,
     )
     .expect_err("a none-mode output has nowhere to land");
-    let ServerError::BadRequestMessage(message) = error else {
+    let JobRequestError::BadRequestMessage(message) = error else {
         panic!("expected a described bad request");
     };
     assert!(message.contains("/out/report.txt"), "{message}");

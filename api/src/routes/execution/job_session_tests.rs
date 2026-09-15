@@ -7,7 +7,7 @@ use aruna_core::compute::{
     AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
     LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, UserSpec,
 };
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
@@ -622,7 +622,7 @@ async fn seed_group(state: &Arc<ServerState>, owner: UserId, member: bool) -> Ul
         owner,
         roles: auth.roles.keys().copied().collect(),
     };
-    let config = DocumentSyncTarget::RealmConfig { realm_id };
+    let config = DocumentTarget::RealmConfig { realm_id };
     let storage = &state.get_ctx().storage_handle;
     write_row(
         storage,
@@ -821,7 +821,7 @@ async fn queues_reference_copy() {
 }
 
 #[tokio::test]
-async fn links_reference_across_groups() {
+async fn link_crosses_groups() {
     // A linked reference is cloned from the source version, so it needs
     // neither the connector in the workspace's group nor any byte.
     let owner = user(2);
@@ -941,7 +941,7 @@ async fn reports_failed_items() {
 }
 
 #[test]
-fn queued_only_is_progress() {
+fn queued_is_progress() {
     // A call that only queued copies still answers 202 instead of the
     // refusal a later item earned.
     let pending = vec![PendingInputResponse {
