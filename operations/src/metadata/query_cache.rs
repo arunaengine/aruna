@@ -14,9 +14,9 @@ use super::api::MetadataFanoutStats;
 
 /// Backstop staleness of a cached result. Matches the visibility cache TTL so
 /// a query never promises fresher data than the listing path does.
-pub(super) const METADATA_QUERY_CACHE_TTL: Duration = Duration::from_secs(30);
-pub(super) const METADATA_QUERY_CACHE_MAX_ENTRIES: usize = 512;
-pub(super) const METADATA_QUERY_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const QUERY_CACHE_TTL: Duration = Duration::from_secs(30);
+pub(super) const CACHE_MAX_ENTRIES: usize = 512;
+pub(super) const CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 const TAG_EAGER: u8 = 1;
 const TAG_LAZY: u8 = 2;
@@ -200,9 +200,9 @@ impl Default for MetadataQueryCache {
 impl MetadataQueryCache {
     pub(super) fn new() -> Self {
         Self::with_limits(
-            METADATA_QUERY_CACHE_MAX_ENTRIES,
-            METADATA_QUERY_CACHE_MAX_BYTES,
-            METADATA_QUERY_CACHE_TTL,
+            CACHE_MAX_ENTRIES,
+            CACHE_MAX_BYTES,
+            QUERY_CACHE_TTL,
         )
     }
 

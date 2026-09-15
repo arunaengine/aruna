@@ -14,13 +14,13 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    COMPUTE_DEPARTURE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
-    JOB_FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    COMPUTE_DEPARTURE_KEYSPACE, SYNC_REVISION_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
+    FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE, METADATA_INDEX_KEYSPACE,
     NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
 };
 use aruna_core::storage_entries::sync_revision_key;
 use aruna_core::structs::storage::node_info::{
-    AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, STORAGE_CLASS_LABEL_PREFIX,
+    AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, CLASS_LABEL_PREFIX,
     node_info_key,
 };
 use aruna_core::structs::storage::routing::BackendCatalog;
@@ -42,7 +42,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::records::keys::kind_prefix;
 use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
-use crate::metadata::repository::{REGISTRY_FILL_PAGE_SIZE, parse_registry_iter};
+use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
 use crate::placement::{build_view, held_buckets};
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
@@ -53,7 +53,7 @@ const SNAPSHOT_PAGE_SIZE: usize = 128;
 
 /// Interval between node-info heartbeat republishes. Peers treat a node's
 /// `heartbeat_at_ms` staleness against this cadence when scoring liveness.
-pub const NODE_INFO_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
+pub const INFO_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Arms (or shortens toward) the periodic node-info heartbeat publish task.
 pub fn schedule_info_publish(after: Duration) -> Effect {
@@ -198,7 +198,7 @@ async fn demand_snapshot(
     let mut unnamed = false;
     let mut start: Option<Key> = None;
     loop {
-        let (page, next) = iter_page(ctx, JOB_FAMILY_PROJECTION_KEYSPACE, None, start).await?;
+        let (page, next) = iter_page(ctx, FAMILY_PROJECTION_KEYSPACE, None, start).await?;
         for (key, value) in &page {
             let Some(family) = nonterminal_family(ctx, key, value).await? else {
                 continue;
@@ -321,7 +321,7 @@ async fn read_family_spec(
     String,
 > {
     let prefix = kind_prefix(family, JobRecordKind::Spec);
-    let (page, _) = iter_page(ctx, JOB_FAMILY_RECORD_KEYSPACE, Some(prefix), None).await?;
+    let (page, _) = iter_page(ctx, FAMILY_RECORD_KEYSPACE, Some(prefix), None).await?;
     for (_, value) in &page {
         if let Ok(envelope) = from_bytes::<JobRecordEnvelope>(value.as_ref())
             && let JobFamilyRecord::Spec(spec) = &envelope.record
@@ -402,7 +402,7 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
     match ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+            key_space: SYNC_REVISION_KEYSPACE.to_string(),
             key: sync_revision_key(&target),
             txn_id: None,
         })
@@ -834,7 +834,7 @@ fn class_labels(catalog: &BackendCatalog) -> BTreeMap<String, String> {
         .into_iter()
         .map(|class| {
             (
-                format!("{STORAGE_CLASS_LABEL_PREFIX}{class}"),
+                format!("{CLASS_LABEL_PREFIX}{class}"),
                 "true".to_string(),
             )
         })
@@ -908,7 +908,7 @@ async fn count_held_documents(
                 key_space: METADATA_INDEX_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.map(IterStart::After),
-                limit: REGISTRY_FILL_PAGE_SIZE,
+                limit: FILL_PAGE_SIZE,
                 txn_id: None,
             })
             .await;
@@ -1068,7 +1068,7 @@ pub async fn restore_info_timer(_storage: &StorageHandle, task_handle: &TaskHand
     if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = task_handle
         .send_effect(Effect::Task(TaskEffect::ShortenTimer {
             key: TaskKey::PublishNodeInfo,
-            after: NODE_INFO_PUBLISH_INTERVAL,
+            after: INFO_PUBLISH_INTERVAL,
         }))
         .await
     {
@@ -1080,7 +1080,7 @@ pub async fn restore_info_timer(_storage: &StorageHandle, task_handle: &TaskHand
 mod tests {
     use super::*;
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
-    use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::storage_entries::metadata_registry_key;
     use aruna_core::structs::storage::node_info::KIND_LABEL_KEY;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -1149,7 +1149,7 @@ mod tests {
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Iter {
-                key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
                 limit: 256,
@@ -1177,10 +1177,10 @@ mod tests {
 
         assert_eq!(labels.len(), 2);
         assert_eq!(
-            labels.get(&format!("{STORAGE_CLASS_LABEL_PREFIX}hot")),
+            labels.get(&format!("{CLASS_LABEL_PREFIX}hot")),
             Some(&"true".to_string())
         );
-        assert!(labels.contains_key(&format!("{STORAGE_CLASS_LABEL_PREFIX}archive")));
+        assert!(labels.contains_key(&format!("{CLASS_LABEL_PREFIX}archive")));
     }
 
     #[test]
@@ -1599,7 +1599,7 @@ mod tests {
             group_id,
             created_by: aruna_core::UserId::nil(realm_id),
             created_at_ms: 1_000,
-            retention_ms: aruna_core::structs::execution::job::DEFAULT_JOB_RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
             payload: aruna_core::structs::execution::job::ExecutionSpec {
                 group_id,
                 name: None,
@@ -1622,7 +1622,7 @@ mod tests {
             spec_digest: [0u8; 32],
             resources,
             retry: aruna_core::structs::execution::job::JobRetryPolicy {
-                max_launches_per_witness: 2,
+                launches_per_witness: 2,
             },
             admission: aruna_core::structs::execution::job::JobAdmissionRecord {
                 submission_id: family.submission_id,
@@ -1673,7 +1673,7 @@ mod tests {
         };
         write_row(
             ctx,
-            JOB_FAMILY_PROJECTION_KEYSPACE,
+            FAMILY_PROJECTION_KEYSPACE,
             Key::from(family.to_bytes().as_slice()),
             postcard::to_allocvec(&cache).unwrap(),
         )
@@ -1683,7 +1683,7 @@ mod tests {
         key.extend_from_slice(&[0u8; 40]);
         write_row(
             ctx,
-            JOB_FAMILY_RECORD_KEYSPACE,
+            FAMILY_RECORD_KEYSPACE,
             Key::from(key.as_slice()),
             postcard::to_allocvec(&record).unwrap(),
         )

@@ -15,10 +15,10 @@ use crate::driver::DriverContext;
 use crate::jobs::workflow::run_crate::PROCESS_PROFILE;
 use crate::metadata::get_document::record_materialized_read;
 
-const GROUP_COUNT_PAGE_SIZE: usize = 1_000;
-const GROUP_PURPOSE_SUMMARY_FANOUT_LIMIT: usize = 8;
+const COUNT_PAGE_SIZE: usize = 1_000;
+const SUMMARY_FANOUT_LIMIT: usize = 8;
 const PROFILE_TYPE_IRI: &str = "http://www.w3.org/ns/dx/prof/Profile";
-const DCTERMS_CONFORMS_TO_IRI: &str = "http://purl.org/dc/terms/conformsTo";
+const DCTERMS_CONFORMS_IRI: &str = "http://purl.org/dc/terms/conformsTo";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GroupDocumentCounts {
@@ -79,7 +79,7 @@ pub async fn count_realm_groups(
                 key_space: GROUP_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.map(IterStart::After),
-                limit: GROUP_COUNT_PAGE_SIZE,
+                limit: COUNT_PAGE_SIZE,
                 txn_id: Some(txn_id),
             })
             .await
@@ -180,7 +180,7 @@ pub async fn count_group_purpose(
             classify_root_summary(&summary, &record.graph_iri)
         }
     }))
-    .buffered(GROUP_PURPOSE_SUMMARY_FANOUT_LIMIT)
+    .buffered(SUMMARY_FANOUT_LIMIT)
     .collect::<Vec<_>>()
     .await;
 
@@ -225,7 +225,7 @@ pub(crate) fn classify_root_summary(
 
     let mut conforms_to_keys = HashSet::from([
         "conformsTo".to_string(),
-        DCTERMS_CONFORMS_TO_IRI.to_string(),
+        DCTERMS_CONFORMS_IRI.to_string(),
     ]);
     collect_conforms_terms(document.get("@context"), &mut conforms_to_keys);
     if root.as_object().is_some_and(|root| {
@@ -290,7 +290,7 @@ fn collect_conforms_terms(value: Option<&Value>, terms: &mut HashSet<String>) {
                     Value::Object(definition) => definition.get("@id").and_then(Value::as_str),
                     _ => None,
                 };
-                if iri == Some(DCTERMS_CONFORMS_TO_IRI) {
+                if iri == Some(DCTERMS_CONFORMS_IRI) {
                     terms.insert(term.clone());
                 }
             }
@@ -466,7 +466,7 @@ mod tests {
         let jsonld = serde_json::json!({
             "@context": [
                 "https://w3id.org/ro/crate/1.2/context",
-                {"purposeProfile": {"@id": DCTERMS_CONFORMS_TO_IRI, "@type": "@id"}}
+                {"purposeProfile": {"@id": DCTERMS_CONFORMS_IRI, "@type": "@id"}}
             ],
             "@graph": [
                 {

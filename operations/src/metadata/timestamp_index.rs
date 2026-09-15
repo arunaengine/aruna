@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::METADATA_UPDATED_INDEX_KEYSPACE;
+use aruna_core::keyspaces::UPDATED_INDEX_KEYSPACE;
 use aruna_core::shutdown::Shutdown;
 use aruna_core::storage_entries::{parse_updated_key, updated_index_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -151,7 +151,7 @@ async fn sweep_bounded(
             if stale.len() >= SWEEP_DELETE_BATCH {
                 deleted += delete_index_keys(
                     context,
-                    METADATA_UPDATED_INDEX_KEYSPACE,
+                    UPDATED_INDEX_KEYSPACE,
                     std::mem::take(&mut stale),
                 )
                 .await?;
@@ -170,7 +170,7 @@ async fn sweep_bounded(
         }
     }
 
-    deleted += delete_index_keys(context, METADATA_UPDATED_INDEX_KEYSPACE, stale).await?;
+    deleted += delete_index_keys(context, UPDATED_INDEX_KEYSPACE, stale).await?;
     Ok(SweepPass {
         deleted,
         next_after: resume,
@@ -198,7 +198,7 @@ pub fn spawn_index_sweep(context: Arc<DriverContext>, shutdown: &Shutdown) {
 
 fn iter_effect(start: IterStart) -> Effect {
     Effect::Storage(StorageEffect::Iter {
-        key_space: METADATA_UPDATED_INDEX_KEYSPACE.to_string(),
+        key_space: UPDATED_INDEX_KEYSPACE.to_string(),
         prefix: None,
         start: Some(start),
         limit: INDEX_SCAN_BATCH,

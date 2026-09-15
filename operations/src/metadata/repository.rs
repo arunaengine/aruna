@@ -5,8 +5,8 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_MATERIALIZATION_STATUS_KEYSPACE,
+    METADATA_AUDIT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
 };
 use aruna_core::metadata::MetadataLifecycleRecord;
 use aruna_core::metadata::{
@@ -31,10 +31,10 @@ use crate::storage_read::{parse_storage_iter, parse_storage_read};
 
 pub use crate::storage_read::StorageReadError;
 
-pub const LIST_METADATA_PAGE_SIZE: usize = 128;
+pub const LIST_METADATA_SIZE: usize = 128;
 // Cache fills sweep whole keyspaces; large pages keep the number of storage
 // actor round trips low (the data volume is small, the trips dominate).
-pub const REGISTRY_FILL_PAGE_SIZE: usize = 8192;
+pub const FILL_PAGE_SIZE: usize = 8192;
 
 pub fn metadata_audit_key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(48);
@@ -54,7 +54,7 @@ pub fn read_registry_effect(group_id: GroupId, document_id: Ulid, txn_id: Option
 
 pub fn read_document_registry(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
-        key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
+        key_space: DOCUMENT_INDEX_KEYSPACE.to_string(),
         key: metadata_document_key(document_id),
         txn_id,
     })
@@ -62,7 +62,7 @@ pub fn read_document_registry(document_id: Ulid, txn_id: Option<TxnId>) -> Effec
 
 pub fn read_status_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
-        key_space: METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
+        key_space: MATERIALIZATION_STATUS_KEYSPACE.to_string(),
         key: materialization_status_key(document_id),
         txn_id,
     })
@@ -70,7 +70,7 @@ pub fn read_status_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
 
 pub fn read_lifecycle_effect(graph_iri: &str, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
-        key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+        key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
         key: graph_lifecycle_key(graph_iri),
         txn_id,
     })
@@ -102,7 +102,7 @@ pub fn delete_registry_effect(
 
 pub fn delete_index_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Delete {
-        key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
+        key_space: DOCUMENT_INDEX_KEYSPACE.to_string(),
         key: metadata_document_key(document_id),
         txn_id,
     })
@@ -117,7 +117,7 @@ pub fn iter_registry_effect(
         key_space: METADATA_INDEX_KEYSPACE.to_string(),
         prefix: Some(metadata_registry_prefix(group_id)),
         start: start_after.map(IterStart::After),
-        limit: LIST_METADATA_PAGE_SIZE,
+        limit: LIST_METADATA_SIZE,
         txn_id,
     })
 }
@@ -368,8 +368,8 @@ mod pure_tests {
     use crate::sync::document_outbox::outbox_key;
     use aruna_core::document::{DocumentChange, DocumentChangeKind};
     use aruna_core::keyspaces::{
-        DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
-        METADATA_UPDATED_INDEX_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
+        SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
+        UPDATED_INDEX_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
     };
     use aruna_core::metadata::MetadataEventPayload;
     use aruna_core::storage_entries::{shard_manifest_key, sync_revision_key, updated_index_key};
@@ -493,12 +493,12 @@ mod pure_tests {
         let manifest_key = shard_manifest_key(&outbox.placement, &outbox.target);
         let expected = vec![
             (METADATA_INDEX_KEYSPACE.to_string(), registry_key.clone()),
-            (METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(), document_key),
+            (DOCUMENT_INDEX_KEYSPACE.to_string(), document_key),
             (METADATA_HOLDERS_KEYSPACE.to_string(), registry_key),
-            (METADATA_UPDATED_INDEX_KEYSPACE.to_string(), updated_key),
+            (UPDATED_INDEX_KEYSPACE.to_string(), updated_key),
             (METADATA_AUDIT_KEYSPACE.to_string(), audit_key),
-            (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), outbox_row_key),
-            (DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(), revision_key),
+            (SYNC_OUTBOX_KEYSPACE.to_string(), outbox_row_key),
+            (SYNC_REVISION_KEYSPACE.to_string(), revision_key),
             (SHARD_MANIFEST_KEYSPACE.to_string(), manifest_key),
         ];
 
@@ -539,12 +539,12 @@ mod pure_tests {
         let audit_key = metadata_audit_key(record.group_id, record.document_id, audit_id);
         let expected = vec![
             (METADATA_INDEX_KEYSPACE.to_string(), registry_key.clone()),
-            (METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(), document_key),
+            (DOCUMENT_INDEX_KEYSPACE.to_string(), document_key),
             (METADATA_HOLDERS_KEYSPACE.to_string(), registry_key),
-            (METADATA_UPDATED_INDEX_KEYSPACE.to_string(), updated_key),
+            (UPDATED_INDEX_KEYSPACE.to_string(), updated_key),
             (METADATA_AUDIT_KEYSPACE.to_string(), audit_key),
             (
-                DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                SYNC_OUTBOX_KEYSPACE.to_string(),
                 outbox_key(&delete),
             ),
         ];
@@ -552,7 +552,7 @@ mod pure_tests {
         assert_eq!(writes.len(), 6);
         assert_eq!(keys(&writes), expected);
         for (key_space, _, _) in &writes {
-            assert_ne!(key_space.as_str(), DOCUMENT_SYNC_REVISION_KEYSPACE);
+            assert_ne!(key_space.as_str(), SYNC_REVISION_KEYSPACE);
             assert_ne!(key_space.as_str(), SHARD_MANIFEST_KEYSPACE);
         }
         Ok(())

@@ -3,11 +3,11 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
-    METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_RAW_REVISION_KEYSPACE,
+    DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE,
+    GRAPH_LIFECYCLE_KEYSPACE, RAW_REVISION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    GraphLifecycleRecord, METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MaterializationState,
+    GraphLifecycleRecord, RAW_BYTES_LIMIT, EVENT_LIMIT, MaterializationState,
     MetadataError, MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
     MetadataMergedRevision, MetadataRawRevision, apply_raw_upsert, raw_context_digest,
     raw_upsert_entity, resolve_raw_revision,
@@ -27,8 +27,8 @@ use crate::driver::DriverContext;
 use crate::metadata::repository::{parse_status_read, read_status_effect};
 
 const RAW_PAGE_SIZE: usize = 1;
-const RAW_EVENT_LIMIT: usize = METADATA_RAW_EVENT_LIMIT as usize;
-const RAW_ENCODED_LIMIT: usize = METADATA_RAW_BYTES_LIMIT as usize;
+const RAW_EVENT_LIMIT: usize = EVENT_LIMIT as usize;
+const RAW_ENCODED_LIMIT: usize = RAW_BYTES_LIMIT as usize;
 
 #[derive(Debug, Default)]
 struct RawLoadBudget {
@@ -217,7 +217,7 @@ async fn raw_deleted(
     let document = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+            key_space: DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
             key: document_lifecycle_key(document_id),
             txn_id,
         })
@@ -240,7 +240,7 @@ async fn raw_deleted(
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
             key: graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(document_id)),
             txn_id,
         })
@@ -309,7 +309,7 @@ pub(crate) async fn prepare_raw_event(
         None => initial_raw_state(context, event).await?,
     };
     let state_write = (
-        METADATA_RAW_REVISION_KEYSPACE.to_string(),
+        RAW_REVISION_KEYSPACE.to_string(),
         raw_revision_key(event.record.document_id),
         ByteView::from(postcard::to_allocvec(&state).map_err(ConversionError::from)?),
     );
@@ -343,7 +343,7 @@ pub(crate) async fn prepare_merged_event(
     });
     let state = merged_raw_state(previous, event, render, findings)?;
     let state_write = (
-        METADATA_RAW_REVISION_KEYSPACE.to_string(),
+        RAW_REVISION_KEYSPACE.to_string(),
         raw_revision_key(event.record.document_id),
         ByteView::from(postcard::to_allocvec(&state).map_err(ConversionError::from)?),
     );
@@ -557,7 +557,7 @@ async fn read_raw_state(
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_RAW_REVISION_KEYSPACE.to_string(),
+            key_space: RAW_REVISION_KEYSPACE.to_string(),
             key: raw_revision_key(document_id),
             txn_id,
         })
@@ -582,7 +582,7 @@ async fn read_raw_event(
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+            key_space: EVENT_LOG_KEYSPACE.to_string(),
             key: event_log_key(document_id, event_id),
             txn_id: None,
         })
@@ -627,7 +627,7 @@ async fn load_raw_events(
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+                key_space: EVENT_LOG_KEYSPACE.to_string(),
                 prefix: Some(prefix.clone()),
                 start: start.take().map(IterStart::After),
                 limit: page_limit,
@@ -926,7 +926,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         writes.push((
-            METADATA_RAW_REVISION_KEYSPACE.to_string(),
+            RAW_REVISION_KEYSPACE.to_string(),
             raw_revision_key(base.record.document_id),
             ByteView::from(postcard::to_allocvec(&cached).unwrap()),
         ));

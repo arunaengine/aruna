@@ -11,15 +11,15 @@ use thiserror::Error;
 
 use super::api::ApiQueryMode;
 
-pub const METADATA_SEARCH_DEFAULT_PAGE_SIZE: usize = 25;
-pub const METADATA_SEARCH_MAX_PAGE_SIZE: usize = 100;
-pub const METADATA_SEARCH_MAX_PAGINATION_DEPTH: usize = 1000;
+pub const SEARCH_PAGE_SIZE: usize = 25;
+pub const SEARCH_MAX_PAGE: usize = 100;
+pub const MAX_PAGINATION_DEPTH: usize = 1000;
 
 const SEARCH_CURSOR_VERSION: u8 = 2;
-const SEARCH_CURSOR_SIGNATURE_CONTEXT: &[u8] = b"aruna.metadata.search.cursor.v2";
+const SIGNATURE_CONTEXT: &[u8] = b"aruna.metadata.search.cursor.v2";
 // Cursors are signed, but keep a resume cap to bound fan-out if a trusted signer
 // issues an unexpectedly large continuation.
-const SEARCH_CURSOR_MAX_RESUME_NODES: usize = 64;
+const MAX_RESUME_NODES: usize = 64;
 
 /// Sort key of the last hit emitted on a page, used as the exact resume point in
 /// the merged, deduplicated ordering.
@@ -183,13 +183,13 @@ impl SignedCursor<SearchCursorPayload> {
             .collect();
         // Never emit more resume entries than decode accepts, or the served
         // cursor 400s on replay; keep the deepest-progress nodes on overflow.
-        if resume.len() > SEARCH_CURSOR_MAX_RESUME_NODES {
+        if resume.len() > MAX_RESUME_NODES {
             resume.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
-            resume.truncate(SEARCH_CURSOR_MAX_RESUME_NODES);
+            resume.truncate(MAX_RESUME_NODES);
         }
         Self::build_signed(
             SEARCH_CURSOR_VERSION,
-            SEARCH_CURSOR_SIGNATURE_CONTEXT,
+            SIGNATURE_CONTEXT,
             fingerprint,
             SearchCursorPayload { watermark, resume },
             signer,
@@ -200,11 +200,11 @@ impl SignedCursor<SearchCursorPayload> {
     pub fn decode(raw: &str, authorized_signers: &[NodeId]) -> Result<Self, SearchCursorError> {
         Self::decode_verified(
             raw,
-            SEARCH_CURSOR_SIGNATURE_CONTEXT,
+            SIGNATURE_CONTEXT,
             authorized_signers,
             |cursor| {
                 if cursor.version != SEARCH_CURSOR_VERSION
-                    || cursor.payload.resume.len() > SEARCH_CURSOR_MAX_RESUME_NODES
+                    || cursor.payload.resume.len() > MAX_RESUME_NODES
                 {
                     Err(CursorEnvelopeError::Invalid)
                 } else {
@@ -598,7 +598,7 @@ mod pure_tests {
         let at_cap = signed_cursor(
             [0u8; 32],
             watermark(),
-            (0..SEARCH_CURSOR_MAX_RESUME_NODES)
+            (0..MAX_RESUME_NODES)
                 .map(|index| (node_id(index as u8), 0))
                 .collect(),
             1,
@@ -607,7 +607,7 @@ mod pure_tests {
 
         // A cursor forged past the cap (bypassing issuance) is still rejected.
         let secret = secret_key(1);
-        let resume: Vec<_> = (0..=SEARCH_CURSOR_MAX_RESUME_NODES)
+        let resume: Vec<_> = (0..=MAX_RESUME_NODES)
             .map(|index| (*node_id(index as u8).as_bytes(), 0u32))
             .collect();
         let mark = watermark();
@@ -616,7 +616,7 @@ mod pure_tests {
             resume,
         };
         let signing_bytes = cursor_signing_bytes(
-            SEARCH_CURSOR_SIGNATURE_CONTEXT,
+            SIGNATURE_CONTEXT,
             SEARCH_CURSOR_VERSION,
             *secret.public().as_bytes(),
             [0u8; 32],
@@ -646,12 +646,12 @@ mod pure_tests {
                 graph_iri: "g".to_string(),
                 subject_iri: "s".to_string(),
             },
-            (0..=SEARCH_CURSOR_MAX_RESUME_NODES)
+            (0..=MAX_RESUME_NODES)
                 .map(|index| (node_id(index as u8), index as u32))
                 .collect(),
             1,
         );
-        assert_eq!(over.payload.resume.len(), SEARCH_CURSOR_MAX_RESUME_NODES);
+        assert_eq!(over.payload.resume.len(), MAX_RESUME_NODES);
         assert!(SearchCursor::decode(&over.encode().unwrap(), &[node_id(1)]).is_ok());
     }
 
@@ -825,7 +825,7 @@ mod pure_tests {
             }],
             None,
             1,
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+            MAX_PAGINATION_DEPTH,
         );
         assert_eq!(page1.hits.len(), 1);
         assert_eq!(page1.hits[0].subject_iri, "./a");
@@ -840,7 +840,7 @@ mod pure_tests {
             }],
             Some(next.watermark),
             1,
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+            MAX_PAGINATION_DEPTH,
         );
         let subjects: Vec<_> = page2
             .hits
@@ -861,7 +861,7 @@ mod pure_tests {
             ],
             saturated: true,
         };
-        let page = paginate(vec![node], None, 2, METADATA_SEARCH_MAX_PAGINATION_DEPTH);
+        let page = paginate(vec![node], None, 2, MAX_PAGINATION_DEPTH);
         assert_eq!(page.hits.len(), 2);
         assert_eq!(page.hits[0].subject_iri, "./a");
         assert_eq!(page.hits[1].subject_iri, "./b");
@@ -892,7 +892,7 @@ mod pure_tests {
             vec![node],
             Some(watermark),
             2,
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+            MAX_PAGINATION_DEPTH,
         );
         assert_eq!(page.hits.len(), 1);
         assert_eq!(page.hits[0].subject_iri, "./c");
@@ -915,7 +915,7 @@ mod pure_tests {
             vec![left, right],
             None,
             1,
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+            MAX_PAGINATION_DEPTH,
         );
         assert_eq!(page.hits.len(), 1);
         assert_eq!(page.hits[0].subject_iri, "./shared");
@@ -944,7 +944,7 @@ mod pure_tests {
             vec![node],
             Some(watermark.clone()),
             2,
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+            MAX_PAGINATION_DEPTH,
         );
         assert!(page.hits.is_empty());
         let next = page.next.expect("saturation keeps paging");
@@ -967,7 +967,7 @@ mod pure_tests {
         let mut emitted = Vec::new();
 
         for _ in 0..4 {
-            let depth = METADATA_SEARCH_MAX_PAGINATION_DEPTH;
+            let depth = MAX_PAGINATION_DEPTH;
             let a_limit = resume_fetch_limit(&resume, node_id(1), 1, depth);
             let b_limit = resume_fetch_limit(&resume, node_id(2), 1, depth);
             let a_page: Vec<_> = a_hits.iter().take(a_limit).cloned().collect();
@@ -1023,7 +1023,7 @@ mod pure_tests {
             vec![node],
             Some(watermark),
             5,
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+            MAX_PAGINATION_DEPTH,
         );
         let subjects: Vec<_> = page.hits.iter().map(|h| h.subject_iri.as_str()).collect();
         assert_eq!(subjects, vec!["./c"]);

@@ -1,11 +1,11 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, METADATA_RAW_BUDGET_KEYSPACE,
+    CREATE_ACCEPTANCE_KEYSPACE, EVENT_LOG_KEYSPACE, RAW_BUDGET_KEYSPACE,
     REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataBatch, MetadataBatchSource,
+    RAW_BYTES_LIMIT, EVENT_LIMIT, MetadataBatch, MetadataBatchSource,
     MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload, MetadataEventRecord,
     MetadataLifecycleRecord, ProfileValidationStatus, RawOriginBudget,
     deterministic_materialization_actor, raw_quotas,
@@ -41,7 +41,7 @@ use crate::metadata::repository::{
 use crate::sync::document_outbox::{outbox_write_entry, schedule_drain_effect};
 use crate::sync::shard_placement::sort_node_ids;
 
-const RAW_EVENT_LIMIT: usize = METADATA_RAW_EVENT_LIMIT as usize;
+const RAW_EVENT_LIMIT: usize = EVENT_LIMIT as usize;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateDocumentConfig {
@@ -481,7 +481,7 @@ impl UpdateDocumentOperation {
             total_bytes = total_bytes
                 .checked_add(value_len)
                 .ok_or(UpdateDocumentError::RawLimit)?;
-            if total_bytes > METADATA_RAW_BYTES_LIMIT {
+            if total_bytes > RAW_BYTES_LIMIT {
                 return Err(UpdateDocumentError::RawLimit);
             }
             if &event == create {
@@ -537,7 +537,7 @@ impl UpdateDocumentOperation {
         let event_bytes = u64::try_from(event_bytes).map_err(|_| UpdateDocumentError::RawLimit)?;
         if history_bytes
             .checked_add(event_bytes)
-            .is_none_or(|bytes| bytes > METADATA_RAW_BYTES_LIMIT)
+            .is_none_or(|bytes| bytes > RAW_BYTES_LIMIT)
         {
             return Err(UpdateDocumentError::RawLimit);
         }
@@ -647,11 +647,11 @@ impl UpdateDocumentOperation {
                 self.fenced = self.fenced_buckets(&record);
                 let mut reads = vec![
                     (
-                        METADATA_RAW_BUDGET_KEYSPACE.to_string(),
+                        RAW_BUDGET_KEYSPACE.to_string(),
                         raw_budget_key(self.config.document_id, self.config.actor.node_id),
                     ),
                     (
-                        METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+                        CREATE_ACCEPTANCE_KEYSPACE.to_string(),
                         create_acceptance_key(self.config.document_id),
                     ),
                 ];
@@ -729,7 +729,7 @@ impl UpdateDocumentOperation {
                 };
                 self.state = UpdateDocumentState::ReadRawEvents;
                 smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+                    key_space: EVENT_LOG_KEYSPACE.to_string(),
                     prefix: Some(event_log_prefix(self.config.document_id)),
                     start: None,
                     limit: RAW_EVENT_LIMIT,
@@ -1003,11 +1003,11 @@ mod pure_tests {
         DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
     };
     use aruna_core::keyspaces::{
-        DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_AUDIT_KEYSPACE,
-        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-        METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
-        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
-        METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_RAW_BUDGET_KEYSPACE,
+        SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE, METADATA_AUDIT_KEYSPACE,
+        DOCUMENT_INDEX_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
+        EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        DOCUMENT_JOB_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+        MATERIALIZATION_STATUS_KEYSPACE, RAW_BUDGET_KEYSPACE,
     };
     use aruna_core::storage_entries::{
         create_acceptance_key, event_log_key, metadata_registry_key, raw_budget_key,
@@ -1193,7 +1193,7 @@ mod pure_tests {
                 | Effect::Metadata(MetadataEffect::UpsertDataEntity { .. })
                 | Effect::Metadata(MetadataEffect::UpsertContextualEntity { .. })
                 | Effect::Metadata(MetadataEffect::MergeBatch { .. })
-                | Effect::Metadata(MetadataEffect::SyncGraphBestEffort { .. }) => {
+                | Effect::Metadata(MetadataEffect::SyncBestEffort { .. }) => {
                     panic!("unexpected graph mutation or sync effect: {effect:?}");
                 }
                 _ => {}
@@ -1263,17 +1263,17 @@ mod pure_tests {
         };
         assert_eq!(*write_txn_id, txn_id);
         for keyspace in [
-            METADATA_EVENT_LOG_KEYSPACE,
+            EVENT_LOG_KEYSPACE,
             METADATA_INDEX_KEYSPACE,
-            METADATA_DOCUMENT_INDEX_KEYSPACE,
+            DOCUMENT_INDEX_KEYSPACE,
             METADATA_AUDIT_KEYSPACE,
-            DOCUMENT_SYNC_OUTBOX_KEYSPACE,
-            DOCUMENT_SYNC_REVISION_KEYSPACE,
-            METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-            METADATA_MATERIALIZATION_STATUS_KEYSPACE,
-            METADATA_MATERIALIZATION_JOB_KEYSPACE,
-            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
-            METADATA_RAW_BUDGET_KEYSPACE,
+            SYNC_OUTBOX_KEYSPACE,
+            SYNC_REVISION_KEYSPACE,
+            DOCUMENT_LIFECYCLE_KEYSPACE,
+            MATERIALIZATION_STATUS_KEYSPACE,
+            MATERIALIZATION_JOB_KEYSPACE,
+            DOCUMENT_JOB_KEYSPACE,
+            RAW_BUDGET_KEYSPACE,
         ] {
             assert!(
                 writes
@@ -1284,7 +1284,7 @@ mod pure_tests {
         }
         let event = writes
             .iter()
-            .find(|(keyspace, _, _)| keyspace == METADATA_EVENT_LOG_KEYSPACE)
+            .find(|(keyspace, _, _)| keyspace == EVENT_LOG_KEYSPACE)
             .map(|(_, _, value)| {
                 postcard::from_bytes::<MetadataEventRecord>(value).expect("update event decodes")
             })
@@ -1292,7 +1292,7 @@ mod pure_tests {
         assert!(expected_payload(&event.payload));
         let outbox = writes
             .iter()
-            .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+            .find(|(keyspace, _, _)| keyspace == SYNC_OUTBOX_KEYSPACE)
             .map(|(_, _, value)| {
                 postcard::from_bytes::<DocumentOutboxRecord>(value).expect("outbox record decodes")
             })
@@ -1301,7 +1301,7 @@ mod pure_tests {
         assert!(matches!(outbox.event, DocumentOutboxEvent::Upsert { .. }));
         let (revision_key, revision): (_, DocumentChange) = writes
             .iter()
-            .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_REVISION_KEYSPACE)
+            .find(|(keyspace, _, _)| keyspace == SYNC_REVISION_KEYSPACE)
             .map(|(_, key, value)| {
                 (
                     key,
@@ -1316,7 +1316,7 @@ mod pure_tests {
         assert_eq!(revision.kind, DocumentChangeKind::Upsert);
         let lifecycle = writes
             .iter()
-            .find(|(keyspace, _, _)| keyspace == METADATA_DOCUMENT_LIFECYCLE_KEYSPACE)
+            .find(|(keyspace, _, _)| keyspace == DOCUMENT_LIFECYCLE_KEYSPACE)
             .map(|(_, _, value)| {
                 postcard::from_bytes::<MetadataLifecycleRecord>(value)
                     .expect("lifecycle source decodes")
@@ -1475,7 +1475,7 @@ mod pure_tests {
             })
             .flatten()
             .filter(|(key_space, _, _)| {
-                key_space == aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE
+                key_space == aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE
             })
             .map(|(_, _, value)| postcard::from_bytes(value.as_ref()).expect("outbox row decodes"))
             .collect()
@@ -1689,7 +1689,7 @@ mod pure_tests {
             .find_map(|effect| match effect {
                 Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => writes
                     .iter()
-                    .find(|(keyspace, _, _)| keyspace == METADATA_RAW_BUDGET_KEYSPACE)
+                    .find(|(keyspace, _, _)| keyspace == RAW_BUDGET_KEYSPACE)
                     .map(|(_, _, value)| value),
                 _ => None,
             })
@@ -1756,7 +1756,7 @@ mod pure_tests {
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
         // The exhausted budget is rejected at the sidecar fence read itself.
-        let effects = operation.step(raw_budget_read(&record, METADATA_RAW_EVENT_LIMIT, 0));
+        let effects = operation.step(raw_budget_read(&record, EVENT_LIMIT, 0));
 
         assert!(
             matches!(

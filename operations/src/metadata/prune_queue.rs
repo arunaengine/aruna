@@ -5,7 +5,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::METADATA_GRAPH_PRUNE_JOB_KEYSPACE;
+use aruna_core::keyspaces::PRUNE_JOB_KEYSPACE;
 use aruna_core::metadata::{GraphLifecycleRecord, GraphPruneRecord, MetadataError};
 use aruna_core::storage_entries::{graph_prune_entry, graph_prune_key};
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -28,11 +28,11 @@ use super::queue_storage::{
 };
 use super::repository::{StorageReadError, parse_lifecycle_read, read_lifecycle_effect};
 
-const PRUNE_SCAN_PAGE_SIZE: usize = 512;
+const PRUNE_PAGE: usize = 512;
 const PRUNE_BATCH_SIZE: usize = 128;
 
-pub const METADATA_GRAPH_PRUNE_POLL_AFTER: Duration = Duration::from_secs(5);
-pub const METADATA_GRAPH_PRUNE_RETRY_AFTER: Duration = Duration::from_secs(1);
+pub const GRAPH_POLL_AFTER: Duration = Duration::from_secs(5);
+pub const GRAPH_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub struct GraphDrainResult {
@@ -93,7 +93,7 @@ pub fn write_prune_effect(
 
 pub fn schedule_prune_drain() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainMetadataGraphPruneQueue,
+        key: TaskKey::DrainPruneQueue,
         after: Duration::ZERO,
     })
 }
@@ -104,7 +104,7 @@ pub async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHand
         Ok(Some(after)) => {
             let event = task_handle
                 .send_effect(Effect::Task(TaskEffect::ResetTimer {
-                    key: TaskKey::DrainMetadataGraphPruneQueue,
+                    key: TaskKey::DrainPruneQueue,
                     after,
                 }))
                 .await;
@@ -120,11 +120,11 @@ pub async fn next_prune_timer(
     storage: &StorageHandle,
 ) -> Result<Option<Duration>, MetadataGraphError> {
     let now_ms = unix_timestamp_millis();
-    let (jobs, has_more_due, next_due_at_ms) = scan_due_prune(storage, now_ms, 1).await?;
+    let (jobs, has_more_due, next_due_ms) = scan_due_prune(storage, now_ms, 1).await?;
     if !jobs.is_empty() || has_more_due {
         return Ok(Some(Duration::ZERO));
     }
-    Ok(next_due_at_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms)))
+    Ok(next_due_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms)))
 }
 
 pub async fn prune_jobs_exist(storage: &StorageHandle) -> Result<bool, MetadataGraphError> {
@@ -132,7 +132,7 @@ pub async fn prune_jobs_exist(storage: &StorageHandle) -> Result<bool, MetadataG
     loop {
         match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                key_space: PRUNE_JOB_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
                 limit: 1,
@@ -188,7 +188,7 @@ pub async fn process_prune_batch(
 ) -> Result<GraphDrainResult, MetadataGraphError> {
     let batch_started = Instant::now();
     let now_ms = unix_timestamp_millis();
-    let (jobs, has_more_due, next_due_at_ms) =
+    let (jobs, has_more_due, next_due_ms) =
         scan_due_prune(&context.storage_handle, now_ms, PRUNE_BATCH_SIZE).await?;
     let scan_elapsed = batch_started.elapsed();
     let job_count = jobs.len();
@@ -231,7 +231,7 @@ pub async fn process_prune_batch(
         next_due_after: if has_more_due {
             Some(Duration::ZERO)
         } else {
-            next_due_at_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms))
+            next_due_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms))
         },
     })
 }
@@ -386,14 +386,14 @@ async fn scan_due_prune(
 ) -> Result<(Vec<(Vec<u8>, GraphPruneRecord)>, bool, Option<u64>), MetadataGraphError> {
     let mut start_after = None;
     let mut jobs = Vec::new();
-    let mut next_due_at_ms = None;
+    let mut next_due_ms = None;
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                key_space: PRUNE_JOB_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
-                limit: PRUNE_SCAN_PAGE_SIZE,
+                limit: PRUNE_PAGE,
                 txn_id: None,
             })
             .await;
@@ -425,23 +425,23 @@ async fn scan_due_prune(
                 {
                     delete_prune_jobs(storage, vec![key]).await?;
                     if existing_job.due_at_ms > now_ms {
-                        next_due_at_ms = min_due_at(next_due_at_ms, existing_job.due_at_ms);
+                        next_due_ms = min_due_at(next_due_ms, existing_job.due_at_ms);
                         continue;
                     }
                     jobs.push((graph_prune_key(&existing_job).to_vec(), existing_job));
                     if jobs.len() >= limit {
-                        return Ok((jobs, true, next_due_at_ms));
+                        return Ok((jobs, true, next_due_ms));
                     }
                     continue;
                 }
                 repair_prune_job(storage, key, &job).await?;
                 if job.due_at_ms > now_ms {
-                    next_due_at_ms = min_due_at(next_due_at_ms, job.due_at_ms);
+                    next_due_ms = min_due_at(next_due_ms, job.due_at_ms);
                     continue;
                 }
                 jobs.push((graph_prune_key(&job).to_vec(), job));
                 if jobs.len() >= limit {
-                    return Ok((jobs, true, next_due_at_ms));
+                    return Ok((jobs, true, next_due_ms));
                 }
                 continue;
             }
@@ -451,28 +451,28 @@ async fn scan_due_prune(
             {
                 delete_prune_jobs(storage, vec![key]).await?;
                 if existing_job.due_at_ms > now_ms {
-                    next_due_at_ms = min_due_at(next_due_at_ms, existing_job.due_at_ms);
+                    next_due_ms = min_due_at(next_due_ms, existing_job.due_at_ms);
                     continue;
                 }
                 jobs.push((graph_prune_key(&existing_job).to_vec(), existing_job));
                 if jobs.len() >= limit {
-                    return Ok((jobs, true, next_due_at_ms));
+                    return Ok((jobs, true, next_due_ms));
                 }
                 continue;
             }
             if job.due_at_ms > now_ms {
-                next_due_at_ms = min_due_at(next_due_at_ms, job.due_at_ms);
+                next_due_ms = min_due_at(next_due_ms, job.due_at_ms);
                 continue;
             }
             jobs.push((key, job));
             if jobs.len() >= limit {
-                return Ok((jobs, true, next_due_at_ms));
+                return Ok((jobs, true, next_due_ms));
             }
         }
 
         match next_start_after {
             Some(next) => start_after = Some(next),
-            None => return Ok((jobs, false, next_due_at_ms)),
+            None => return Ok((jobs, false, next_due_ms)),
         }
     }
 }
@@ -526,7 +526,7 @@ async fn repair_prune_job(
                 storage,
                 txn_id,
                 vec![(
-                    METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                    PRUNE_JOB_KEYSPACE.to_string(),
                     ByteView::from(old_key),
                 )],
             )
@@ -572,10 +572,10 @@ async fn find_decoded_prune(
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                key_space: PRUNE_JOB_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
-                limit: PRUNE_SCAN_PAGE_SIZE,
+                limit: PRUNE_PAGE,
                 txn_id: None,
             })
             .await;
@@ -654,7 +654,7 @@ async fn reschedule_prune_job(
         .filter(|key| key.as_slice() != next_key.as_slice())
         .map(|key| {
             (
-                METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                PRUNE_JOB_KEYSPACE.to_string(),
                 ByteView::from(key.clone()),
             )
         })
@@ -692,7 +692,7 @@ async fn delete_prune_jobs(
         .into_iter()
         .map(|key| {
             (
-                METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                PRUNE_JOB_KEYSPACE.to_string(),
                 ByteView::from(key),
             )
         })
@@ -814,7 +814,7 @@ mod tests {
     async fn index_row_exists(storage: &StorageHandle, key: ByteView) -> bool {
         match storage
             .send_storage_effect(StorageEffect::Read {
-                key_space: aruna_core::keyspaces::METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                key_space: aruna_core::keyspaces::IRI_INDEX_KEYSPACE.to_string(),
                 key,
                 txn_id: None,
             })
@@ -828,7 +828,7 @@ mod tests {
     async fn read_jobs(storage: &StorageHandle) -> Vec<GraphPruneRecord> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                key_space: PRUNE_JOB_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
                 limit: 16,
@@ -847,7 +847,7 @@ mod tests {
     async fn read_job_key(storage: &StorageHandle, key: Vec<u8>) -> Option<GraphPruneRecord> {
         match storage
             .send_storage_effect(StorageEffect::Read {
-                key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                key_space: PRUNE_JOB_KEYSPACE.to_string(),
                 key: ByteView::from(key),
                 txn_id: None,
             })
@@ -957,7 +957,7 @@ mod tests {
         write_entries(
             &storage,
             vec![(
-                aruna_core::keyspaces::METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                aruna_core::keyspaces::IRI_INDEX_KEYSPACE.to_string(),
                 index_key.clone(),
                 ByteView::from(vec![1u8]),
             )],
@@ -1007,7 +1007,7 @@ mod tests {
         write_entries(
             &storage,
             vec![(
-                METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                PRUNE_JOB_KEYSPACE.to_string(),
                 ByteView::from(corrupt_key.clone()),
                 ByteView::from(vec![1, 2, 3]),
             )],
@@ -1029,7 +1029,7 @@ mod tests {
         assert_eq!(result.processed, 0);
         assert!(!result.has_more_due);
         assert!(
-            !storage_key_exists(&storage, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, corrupt_key).await
+            !storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, corrupt_key).await
         );
     }
 
@@ -1044,7 +1044,7 @@ mod tests {
             &storage,
             vec![
                 (
-                    METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                    PRUNE_JOB_KEYSPACE.to_string(),
                     ByteView::from(corrupt_key.clone()),
                     ByteView::from(vec![1, 2, 3]),
                 ),
@@ -1055,7 +1055,7 @@ mod tests {
 
         assert!(prune_jobs_exist(&storage).await.unwrap());
         assert!(
-            !storage_key_exists(&storage, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, corrupt_key).await
+            !storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, corrupt_key).await
         );
     }
 
@@ -1082,7 +1082,7 @@ mod tests {
             &storage,
             vec![
                 (
-                    METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                    PRUNE_JOB_KEYSPACE.to_string(),
                     ByteView::from(misplaced_key.clone()),
                     ByteView::from(postcard::to_allocvec(&future_job).unwrap()),
                 ),
@@ -1097,12 +1097,12 @@ mod tests {
         assert_eq!(jobs, vec![(graph_prune_key(&due_job).to_vec(), due_job)]);
         assert!(!has_more_due);
         assert!(
-            !storage_key_exists(&storage, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, misplaced_key).await
+            !storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, misplaced_key).await
         );
         assert!(
             storage_key_exists(
                 &storage,
-                METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
+                PRUNE_JOB_KEYSPACE,
                 graph_prune_key(&future_job).to_vec(),
             )
             .await
@@ -1133,7 +1133,7 @@ mod tests {
             vec![
                 graph_prune_entry(&future_job).expect("future job entry"),
                 (
-                    METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                    PRUNE_JOB_KEYSPACE.to_string(),
                     ByteView::from(misplaced_key.clone()),
                     ByteView::from(postcard::to_allocvec(&due_job).unwrap()),
                 ),
@@ -1147,7 +1147,7 @@ mod tests {
         assert_eq!(jobs, vec![(graph_prune_key(&due_job).to_vec(), due_job)]);
         assert!(!has_more_due);
         assert!(
-            !storage_key_exists(&storage, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, misplaced_key).await
+            !storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, misplaced_key).await
         );
     }
 
@@ -1176,7 +1176,7 @@ mod tests {
             vec![
                 graph_prune_entry(&future_job).expect("future job entry"),
                 (
-                    METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                    PRUNE_JOB_KEYSPACE.to_string(),
                     ByteView::from(misplaced_key.clone()),
                     ByteView::from(postcard::to_allocvec(&stale_job).unwrap()),
                 ),
@@ -1184,14 +1184,14 @@ mod tests {
         )
         .await;
 
-        let (jobs, has_more_due, next_due_at_ms) =
+        let (jobs, has_more_due, next_due_ms) =
             scan_due_prune(&storage, now_ms, 8).await.unwrap();
 
         assert!(jobs.is_empty());
         assert!(!has_more_due);
-        assert_eq!(next_due_at_ms, Some(future_job.due_at_ms));
+        assert_eq!(next_due_ms, Some(future_job.due_at_ms));
         assert!(
-            !storage_key_exists(&storage, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, misplaced_key).await
+            !storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, misplaced_key).await
         );
         assert_eq!(
             read_job_key(&storage, future_key.to_vec()).await,
@@ -1228,16 +1228,16 @@ mod tests {
         )
         .await;
 
-        let (jobs, has_more_due, next_due_at_ms) =
+        let (jobs, has_more_due, next_due_ms) =
             scan_due_prune(&storage, now_ms, 8).await.unwrap();
 
         assert!(jobs.is_empty());
         assert!(!has_more_due);
-        assert_eq!(next_due_at_ms, Some(future_job.due_at_ms));
+        assert_eq!(next_due_ms, Some(future_job.due_at_ms));
         assert!(
             !storage_key_exists(
                 &storage,
-                METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
+                PRUNE_JOB_KEYSPACE,
                 stale_key.to_vec(),
             )
             .await

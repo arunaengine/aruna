@@ -327,7 +327,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        AUTH_KEYSPACE, GROUP_KEYSPACE, PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
         S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX;
@@ -431,7 +431,7 @@ mod tests {
                 bucket.to_bytes().unwrap().into(),
             ),
             (
-                HASH_PATHS_INDEX_KEYSPACE.to_string(),
+                PATHS_INDEX_KEYSPACE.to_string(),
                 alias.to_bytes().unwrap().into(),
                 Vec::new().into(),
             ),
@@ -574,7 +574,7 @@ mod tests {
             .context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
+                key_space: PATHS_INDEX_KEYSPACE.to_string(),
                 key: alias.to_bytes().unwrap().into(),
                 value: Vec::<u8>::new().into(),
                 txn_id: None,

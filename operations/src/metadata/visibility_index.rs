@@ -10,7 +10,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    METADATA_VISIBILITY_INDEX_KEYSPACE, METADATA_VISIBILITY_STATE_KEYSPACE,
+    VISIBILITY_INDEX_KEYSPACE, VISIBILITY_STATE_KEYSPACE,
 };
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -186,7 +186,7 @@ async fn read_index_datestamp(
     let event = context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: METADATA_VISIBILITY_INDEX_KEYSPACE.to_string(),
+            key_space: VISIBILITY_INDEX_KEYSPACE.to_string(),
             key: index_key(generation, updated_at_ms, document_id),
             txn_id: None,
         }))
@@ -284,7 +284,7 @@ async fn read_state(context: &DriverContext) -> Result<Option<VisibilityState>, 
     let event = context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: METADATA_VISIBILITY_STATE_KEYSPACE.to_string(),
+            key_space: VISIBILITY_STATE_KEYSPACE.to_string(),
             key: state_key(),
             txn_id: None,
         }))
@@ -310,7 +310,7 @@ async fn write_state(
     let event = context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: METADATA_VISIBILITY_STATE_KEYSPACE.to_string(),
+            key_space: VISIBILITY_STATE_KEYSPACE.to_string(),
             key: state_key(),
             value,
             txn_id: None,
@@ -327,7 +327,7 @@ async fn write_state(
 
 fn scan_effect(start: IterStart, limit: usize) -> Effect {
     Effect::Storage(StorageEffect::Iter {
-        key_space: METADATA_VISIBILITY_INDEX_KEYSPACE.to_string(),
+        key_space: VISIBILITY_INDEX_KEYSPACE.to_string(),
         prefix: None,
         start: Some(start),
         limit,
@@ -601,7 +601,7 @@ async fn pass_bounded(
                     pass.max_uplift_ms = pass.max_uplift_ms.max(effective_ms);
                 }
                 writes.push((
-                    METADATA_VISIBILITY_INDEX_KEYSPACE.to_string(),
+                    VISIBILITY_INDEX_KEYSPACE.to_string(),
                     index_key(generation, record.updated_at_ms, record.document_id),
                     ByteView::from(effective_ms.to_be_bytes().to_vec()),
                 ));
@@ -698,7 +698,7 @@ async fn prune_pass(
     if token.is_cancelled() {
         return Ok(PassOutcome::Cancelled);
     }
-    delete_index_keys(context, METADATA_VISIBILITY_INDEX_KEYSPACE, stale).await?;
+    delete_index_keys(context, VISIBILITY_INDEX_KEYSPACE, stale).await?;
     match next {
         Some(next) => state.prune_after = Some(next.as_ref().to_vec()),
         None => {

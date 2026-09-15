@@ -27,12 +27,12 @@ use crate::placement::{draining_former_holders, resolve_shard_holders};
 
 /// Shared realm-scoped topics every node subscribes to (placement is inert on
 /// these; see [`DocumentTarget::sync_topic_id`]).
-pub const SHARED_RESTORE_TOPIC_COUNT: usize = 5;
+pub const RESTORE_TOPIC_COUNT: usize = 5;
 
 fn shared_targets(
     realm_id: RealmId,
     node_id: NodeId,
-) -> [DocumentTarget; SHARED_RESTORE_TOPIC_COUNT] {
+) -> [DocumentTarget; RESTORE_TOPIC_COUNT] {
     [
         DocumentTarget::RealmAuthorization { realm_id },
         DocumentTarget::RealmConfig { realm_id },
@@ -77,9 +77,9 @@ fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<Node
 /// Work units one bounded restore pass may process. A work-unit limit, never a
 /// wall-clock deadline, so the bound holds however many shards share a
 /// co-holder set.
-pub const SHARD_RESTORE_UNIT_BUDGET: usize = 8;
+pub const RESTORE_UNIT_BUDGET: usize = 8;
 /// Topics per work unit; one unit still fills a document sync topic batch.
-pub const SHARD_RESTORE_CHUNK_TOPICS: usize = 64;
+pub const RESTORE_CHUNK_TOPICS: usize = 64;
 
 /// Shortest wait between two bounded recovery passes while work remains local.
 const RECOVERY_RETRY_BASE: Duration = Duration::from_millis(250);
@@ -1207,7 +1207,7 @@ struct RestoreRange {
 
 fn restore_range(cursor: ShardRestoreCursor, units_total: usize) -> RestoreRange {
     let start = cursor.next_unit.min(units_total);
-    let end = (start + SHARD_RESTORE_UNIT_BUDGET).min(units_total);
+    let end = (start + RESTORE_UNIT_BUDGET).min(units_total);
     RestoreRange {
         start,
         end,
@@ -1293,7 +1293,7 @@ impl ShardPlan {
             if topics.is_empty() {
                 return;
             }
-            for chunk in topics.chunks(SHARD_RESTORE_CHUNK_TOPICS) {
+            for chunk in topics.chunks(RESTORE_CHUNK_TOPICS) {
                 units.push(RestoreUnit {
                     kind,
                     peers: peers.clone(),
@@ -1737,7 +1737,7 @@ mod tests {
         let planned = plan_shard_groups(&config, device, realm_id, 0);
         assert_eq!(
             planned.summary.shared_topics,
-            SHARED_RESTORE_TOPIC_COUNT - 2
+            RESTORE_TOPIC_COUNT - 2
         );
         assert!(
             planned
@@ -1760,7 +1760,7 @@ mod tests {
         assert!(
             units
                 .iter()
-                .all(|unit| unit.topics.len() <= SHARD_RESTORE_CHUNK_TOPICS),
+                .all(|unit| unit.topics.len() <= RESTORE_CHUNK_TOPICS),
             "a work unit must never exceed its topic chunk"
         );
         // Grouping keeps a restart at one unit per topic chunk, never one per
@@ -1776,7 +1776,7 @@ mod tests {
     // last processed unit and wraps at the end so no group is skipped forever.
     #[test]
     fn restore_cursor_wraps() {
-        let units_total = SHARD_RESTORE_UNIT_BUDGET * 2 + 3;
+        let units_total = RESTORE_UNIT_BUDGET * 2 + 3;
         let mut cursor = ShardRestoreCursor::default();
         let mut visited = Vec::new();
         for _ in 0..3 {
@@ -1785,7 +1785,7 @@ mod tests {
                 end,
                 wrapped,
             } = restore_range(cursor, units_total);
-            assert!(end - start <= SHARD_RESTORE_UNIT_BUDGET);
+            assert!(end - start <= RESTORE_UNIT_BUDGET);
             visited.extend(start..end);
             cursor.next_unit = if wrapped { 0 } else { end };
             if wrapped {
@@ -1951,7 +1951,7 @@ mod tests {
                 realm_id,
                 discovery_method: DiscoveryMethod::None,
                 relay_method: RelayMethod::None,
-                document_sync_storage_path: Some(dir.path().join("document-sync")),
+                sync_storage_path: Some(dir.path().join("document-sync")),
                 ..NetConfig::default()
             },
             storage.clone(),
