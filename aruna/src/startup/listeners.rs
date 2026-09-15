@@ -461,8 +461,8 @@ mod tests {
     async fn session_exit_reports() {
         use aruna_core::metrics::NodeMetrics;
         use aruna_core::shutdown::Shutdown;
-        use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::identity::realm::RealmId;
 
         // A real session listener that stopped on its shutdown token is
         // reported, never treated as a node failure.
@@ -648,8 +648,8 @@ mod tests {
     async fn session_listener_completes() {
         use aruna_core::metrics::NodeMetrics;
         use aruna_core::shutdown::Shutdown;
-        use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::identity::realm::RealmId;
 
         let temp = tempfile::tempdir().expect("temp dir");
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
@@ -697,8 +697,8 @@ mod tests {
     async fn abort_awaits_children() {
         use aruna_core::metrics::NodeMetrics;
         use aruna_core::shutdown::Shutdown;
-        use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::identity::realm::RealmId;
 
         let temp = tempfile::tempdir().expect("temp dir");
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
@@ -773,7 +773,11 @@ mod pure_tests {
     fn wipe_covers_backends() {
         let backends = aruna_core::structs::storage::backends::NodeBackendsConfig {
             backends: vec![
-                backend("hot", aruna_core::structs::storage::blob::Backend::FileSystem, "/srv/hot"),
+                backend(
+                    "hot",
+                    aruna_core::structs::storage::blob::Backend::FileSystem,
+                    "/srv/hot",
+                ),
                 backend("cold", aruna_core::structs::storage::blob::Backend::S3, ""),
             ],
             default_name: "hot".to_string(),

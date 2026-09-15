@@ -7,14 +7,14 @@ use aruna_core::NodeId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::placement::placement_record::{NodePlacementEntry, PlacementRef};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, WATCH_INTEREST_KEYSPACE};
 use aruna_core::structs::execution::notification_watch::{
     WatchEventKind, WatchEventMask, WatchInterestDigest, WatchInterestEntry, interest_dirty_key,
     interest_node_key,
 };
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::placement::placement_record::{NodePlacementEntry, PlacementRef};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::notifications::watch::interest::publish_watch_interest;
@@ -621,31 +621,34 @@ fn readiness_requires_all() {
         labels: Default::default(),
     });
     config.seed_default_placement();
-    config
-        .placement_handle_ranges
-        .push(aruna_core::structs::placement::placement_record::HandleRange {
+    config.placement_handle_ranges.push(
+        aruna_core::structs::placement::placement_record::HandleRange {
             range_id: ulid::Ulid::from_bytes([3; 16]),
             owner: node_id,
             start: aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE,
             end: aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE
                 + aruna_core::structs::placement::placement_record::HANDLE_RANGE_SIZE,
-        });
+        },
+    );
     // A grant without its JobControl binding is not ready yet.
     assert!(!node_is_ready(&config, node_id));
-    config
-        .placement_bindings
-        .push(aruna_core::structs::placement::placement_record::PlacementBinding {
+    config.placement_bindings.push(
+        aruna_core::structs::placement::placement_record::PlacementBinding {
             handle: aruna_core::structured_id::PlacementHandle::new(
                 aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE,
             )
             .unwrap(),
-            scope: aruna_core::structs::placement::placement_record::PlacementScope::Realm(realm_id),
-            document_class: aruna_core::structs::placement::placement_record::DocumentClass::JobControl,
+            scope: aruna_core::structs::placement::placement_record::PlacementScope::Realm(
+                realm_id,
+            ),
+            document_class:
+                aruna_core::structs::placement::placement_record::DocumentClass::JobControl,
             strategy_id: config.default_strategy_id.unwrap(),
             allocator_range_id: Some(ulid::Ulid::from_bytes([3; 16])),
             allocated_by: Some(node_id),
             allocated_at_ms: Some(1),
-        });
+        },
+    );
     assert!(node_is_ready(&config, node_id));
 }
 

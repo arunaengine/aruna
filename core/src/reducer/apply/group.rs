@@ -28,11 +28,7 @@ impl AdminDocumentState {
                 self.apply_group_assignment(event, role_id, user_id, None);
             }
             AdminDocumentOperation::DisplayNameSet { display_name } => {
-                self.apply_group_field(
-                    event,
-                    DISPLAY_NAME_PATH,
-                    Some(display_name.to_string()),
-                );
+                self.apply_group_field(event, DISPLAY_NAME_PATH, Some(display_name.to_string()));
             }
             AdminDocumentOperation::GroupJoinRequested { request } => {
                 if request.group_id != *group_id

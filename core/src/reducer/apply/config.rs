@@ -24,11 +24,7 @@ impl AdminDocumentState {
                 discovery,
             } => self.apply_config_settings(event, metadata_replication, discovery),
             AdminDocumentOperation::ConfigDescriptionSet { description } => {
-                self.apply_config_setting(
-                    event,
-                    CONFIG_DESCRIPTION_PATH,
-                    description.clone(),
-                );
+                self.apply_config_setting(event, CONFIG_DESCRIPTION_PATH, description.clone());
             }
             AdminDocumentOperation::ConfigQuotaSet { quota } => {
                 self.apply_config_setting(event, CONFIG_QUOTA_PATH, quota_value(quota));
@@ -37,11 +33,7 @@ impl AdminDocumentState {
                 self.apply_config_setting(event, CONFIG_COMPUTE_PATH, compute_value(compute));
             }
             AdminDocumentOperation::ConfigPoliciesSet { policies } => {
-                self.apply_config_setting(
-                    event,
-                    CONFIG_POLICIES_PATH,
-                    policies_value(policies),
-                );
+                self.apply_config_setting(event, CONFIG_POLICIES_PATH, policies_value(policies));
             }
             AdminDocumentOperation::ConfigTokenRevoked {
                 token_hash,

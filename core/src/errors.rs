@@ -1,5 +1,5 @@
-use crate::structs::storage::blob::BackendLocation;
 use crate::structs::execution::source_connector::SourceConnectorKind;
+use crate::structs::storage::blob::BackendLocation;
 use std::array::TryFromSliceError;
 use thiserror::Error;
 

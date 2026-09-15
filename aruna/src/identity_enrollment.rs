@@ -205,12 +205,18 @@ pub(crate) async fn bootstrap_node_state(
     let identity =
         match response.mode {
             OnboardingMode::Management => {
-                let wrapped_key = response.wrapped_realm_key.ok_or(
-                    IdentityError::MissingOnboardingMaterial(OnboardingMode::Management),
-                )?;
-                let wrapped_nonce = response.wrapped_key_nonce.ok_or(
-                    IdentityError::MissingOnboardingMaterial(OnboardingMode::Management),
-                )?;
+                let wrapped_key =
+                    response
+                        .wrapped_realm_key
+                        .ok_or(IdentityError::MissingOnboardingMaterial(
+                            OnboardingMode::Management,
+                        ))?;
+                let wrapped_nonce =
+                    response
+                        .wrapped_key_nonce
+                        .ok_or(IdentityError::MissingOnboardingMaterial(
+                            OnboardingMode::Management,
+                        ))?;
                 let wrapping_public_key = response.wrapping_public_key.ok_or(
                     IdentityError::MissingOnboardingMaterial(OnboardingMode::Management),
                 )?;
@@ -240,9 +246,7 @@ pub(crate) async fn bootstrap_node_state(
                         |error| IdentityError::OnboardingBootstrapFailed(error.to_string()),
                     )?)?;
 
-                PersistedNodeIdentity::Management {
-                    realm_private_pem,
-                }
+                PersistedNodeIdentity::Management { realm_private_pem }
             }
             OnboardingMode::Server => PersistedNodeIdentity::Server {
                 private_key_pem: issuer_signing_key
@@ -302,8 +306,7 @@ pub(crate) async fn refresh_onboarding_bootstrap(
         (
             OnboardingMode::Server,
             PersistedNodeIdentity::Server {
-                private_key_pem,
-                ..
+                private_key_pem, ..
             },
         ) => Some(SigningKey::from_pkcs8_pem(private_key_pem)?),
         (OnboardingMode::Server, _) => {

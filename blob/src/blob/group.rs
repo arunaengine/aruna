@@ -3,9 +3,7 @@ use crate::opendal::build_group_service;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{
-    STORAGE_BACKEND_KEYSPACE, BACKEND_SECRET_KEYSPACE,
-};
+use aruna_core::keyspaces::{BACKEND_SECRET_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
 use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,

@@ -1,10 +1,10 @@
 use crate::egress::EgressGuard;
 use aruna_core::errors::{BlobError, StagingSourceError};
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::storage::blob::Backend;
-use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::storage::blob::Backend;
+use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use opendal::layers::{HttpClientLayer, LoggingLayer, RetryLayer};
@@ -210,7 +210,13 @@ pub(crate) async fn list_staging_source(
     limit: usize,
     recursive: bool,
     files_only: bool,
-) -> Result<(Vec<aruna_core::structs::execution::source_access::SourceEntry>, bool), StagingSourceError> {
+) -> Result<
+    (
+        Vec<aruna_core::structs::execution::source_access::SourceEntry>,
+        bool,
+    ),
+    StagingSourceError,
+> {
     if crate::fs_source::is_local_access(access) {
         return crate::fs_source::list_local(access, offset, limit, recursive, files_only).await;
     }
@@ -235,7 +241,13 @@ async fn list_operator(
     limit: usize,
     recursive: bool,
     files_only: bool,
-) -> Result<(Vec<aruna_core::structs::execution::source_access::SourceEntry>, bool), StagingSourceError> {
+) -> Result<
+    (
+        Vec<aruna_core::structs::execution::source_access::SourceEntry>,
+        bool,
+    ),
+    StagingSourceError,
+> {
     let mut lister = operator
         .lister_with(path)
         .recursive(recursive)
@@ -256,7 +268,9 @@ async fn list_operator(
         }
         let kind = match entry.metadata().mode() {
             EntryMode::FILE => aruna_core::structs::execution::source_access::SourceEntryKind::File,
-            EntryMode::DIR if !files_only => aruna_core::structs::execution::source_access::SourceEntryKind::Directory,
+            EntryMode::DIR if !files_only => {
+                aruna_core::structs::execution::source_access::SourceEntryKind::Directory
+            }
             EntryMode::DIR | EntryMode::Unknown => continue,
         };
         if skipped < offset {

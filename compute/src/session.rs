@@ -22,9 +22,9 @@ use crate::executor::{ExecutorBackend, now_ms};
 use events::{BudgetVerdict, CellBudget, EventRing, SessionEvent};
 
 pub use aruna_core::compute::session::{
-    CellPhase, EndReason, EventKind, HelperEvent, HelperRequest, MAX_CELL_BYTES,
-    MAX_ID_LEN, MAX_QUEUED_CELLS, MAX_RING_EVENTS, MAX_SCRATCH_BYTES, MAX_SUBMITS,
-    MAX_TRACKED_CELLS, SUBMIT_WINDOW, SessionError, SessionPhase,
+    CellPhase, EndReason, EventKind, HelperEvent, HelperRequest, MAX_CELL_BYTES, MAX_ID_LEN,
+    MAX_QUEUED_CELLS, MAX_RING_EVENTS, MAX_SCRATCH_BYTES, MAX_SUBMITS, MAX_TRACKED_CELLS,
+    SUBMIT_WINDOW, SessionError, SessionPhase,
 };
 
 /// Bytes one helper line may carry before the session is torn down.

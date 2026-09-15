@@ -13,18 +13,18 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    REPLICATION_JOB_KEYSPACE, BLOB_VERSIONS_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
-    RELATIONSHIP_OUT_KEYSPACE, USAGE_STATS_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
+    RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
+    USAGE_STATS_KEYSPACE,
 };
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{
     BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, VersionKey, group_permission_path,
 };
-use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-use aruna_core::structs::execution::staging::StagingStrategy;
-use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_core::structs::storage::usage::UsageCounters;
+use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
 use aws_sdk_s3::Client as S3Client;
@@ -544,8 +544,10 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
                 },
             )
             .await?;
-        let source_arn = aruna_core::structs::storage::replication::ArunaArn::parse(&relationship.source)?;
-        let target_arn = aruna_core::structs::storage::replication::ArunaArn::parse(&relationship.target)?;
+        let source_arn =
+            aruna_core::structs::storage::replication::ArunaArn::parse(&relationship.source)?;
+        let target_arn =
+            aruna_core::structs::storage::replication::ArunaArn::parse(&relationship.target)?;
         assert_eq!(source_arn.bucket(), Some(source_bucket));
         assert_eq!(source_arn.key_prefix(), Some("selected/"));
         assert_eq!(target_arn.bucket(), Some(target_bucket));
@@ -1381,13 +1383,9 @@ async fn chain_blocks_cycle() -> TestResult<()> {
                         REPLICATION_OBLIGATION_KEYSPACE,
                     )
                     .await
-                    && keyspace_empty(harness.seed.context.as_ref(), REPLICATION_JOB_KEYSPACE)
+                    && keyspace_empty(harness.seed.context.as_ref(), REPLICATION_JOB_KEYSPACE).await
+                    && keyspace_empty(harness.joiner.context.as_ref(), REPLICATION_JOB_KEYSPACE)
                         .await
-                    && keyspace_empty(
-                        harness.joiner.context.as_ref(),
-                        REPLICATION_JOB_KEYSPACE,
-                    )
-                    .await
             },
         )
         .await?;
@@ -1689,8 +1687,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
                     REPLICATION_OBLIGATION_KEYSPACE,
                 )
                 .await
-                    && keyspace_empty(harness.seed.context.as_ref(), REPLICATION_JOB_KEYSPACE)
-                        .await
+                    && keyspace_empty(harness.seed.context.as_ref(), REPLICATION_JOB_KEYSPACE).await
             },
         )
         .await?;

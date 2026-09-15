@@ -52,11 +52,7 @@ impl AdminDocumentState {
                 self.apply_placement_field(event, placement_strategy_path(strategy_id), None);
             }
             AdminDocumentOperation::ConfigStrategySet { strategy_id } => {
-                self.apply_config_setting(
-                    event,
-                    CONFIG_STRATEGY_PATH,
-                    strategy_id.to_string(),
-                );
+                self.apply_config_setting(event, CONFIG_STRATEGY_PATH, strategy_id.to_string());
             }
             AdminDocumentOperation::JobFamilySet { strategy_id } => {
                 if strategy_id.is_nil() {
@@ -68,11 +64,7 @@ impl AdminDocumentState {
                 {
                     return Err(AdminDocumentError::JobFamilyChanged);
                 }
-                self.apply_config_setting(
-                    event,
-                    JOB_FAMILY_PATH,
-                    strategy_id.to_string(),
-                );
+                self.apply_config_setting(event, JOB_FAMILY_PATH, strategy_id.to_string());
             }
             AdminDocumentOperation::StrategyBindingSet { binding } => {
                 self.apply_placement_field(

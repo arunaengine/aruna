@@ -9,12 +9,11 @@ use crate::NodeId;
 use crate::TopicId;
 use crate::UserId;
 use crate::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
-    EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
+    AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
+    GROUP_KEYSPACE, METADATA_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
 };
-use crate::structs::placement::placement_record::PlacementRef;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::placement::placement_record::PlacementRef;
 use ulid::Ulid;
 
 fn test_ulid(seed: u8) -> Ulid {
@@ -416,10 +415,10 @@ fn node_info_keys() {
 
 #[test]
 fn watch_interest_keys() {
-    use crate::keyspaces::{
-        WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
+    use crate::keyspaces::{WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE};
+    use crate::structs::execution::notification_watch::{
+        interest_node_key, watch_subscription_key,
     };
-    use crate::structs::execution::notification_watch::{interest_node_key, watch_subscription_key};
 
     let realm_id = test_realm(2);
     let node_id = test_node(1);
@@ -456,10 +455,7 @@ fn watch_interest_keys() {
         .sync_topic_id(realm_id, &nil)
     );
 
-    assert_eq!(
-        target.storage_keyspace(),
-        WATCH_INTEREST_KEYSPACE
-    );
+    assert_eq!(target.storage_keyspace(), WATCH_INTEREST_KEYSPACE);
     assert_eq!(
         target.storage_key().as_ref(),
         interest_node_key(realm_id, node_id).as_slice()

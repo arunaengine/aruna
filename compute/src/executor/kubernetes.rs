@@ -1463,8 +1463,7 @@ fn validate_config(config: &KubernetesConfig) -> Result<(), BackendError> {
         ));
     }
     let bounded = |entries: &std::collections::BTreeMap<String, String>| {
-        entries.len() <= MAX_SELECTOR_ENTRIES
-            && entries.keys().all(|key| !key.trim().is_empty())
+        entries.len() <= MAX_SELECTOR_ENTRIES && entries.keys().all(|key| !key.trim().is_empty())
     };
     if !bounded(&config.node_selector) || !bounded(&config.execution_labels) {
         return Err(BackendError::InvalidSpec(format!(

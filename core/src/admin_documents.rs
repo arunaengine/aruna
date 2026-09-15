@@ -6,6 +6,11 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::UserId;
 use crate::structs::identity::auth::{Actor, Permission, Role};
+use crate::structs::identity::realm::{
+    MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmDiscoveryConfig, RealmId,
+    RealmNodeKind,
+};
+use crate::structs::placement::compute_config::RealmComputeConfig;
 use crate::structs::placement::placement_record::{
     BandPool, BindingScope, HandleRange, NodePlacementEntry, PlacementBinding, PlacementOverride,
     PlacementRef, PlacementStrategy, StrategyBinding,
@@ -13,11 +18,6 @@ use crate::structs::placement::placement_record::{
 use crate::structs::placement::placement_transition::{
     CandidatePlacementMap, CompletionProof, TransitionPlan,
 };
-use crate::structs::identity::realm::{
-    MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmDiscoveryConfig, RealmId,
-    RealmNodeKind,
-};
-use crate::structs::placement::compute_config::RealmComputeConfig;
 use crate::types::{GroupId, RoleId};
 
 /// Domain separator for the origin signature over an administrative event.
@@ -353,17 +353,17 @@ mod tests {
     use super::{AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition};
     use crate::NodeId;
     use crate::UserId;
+    use crate::structs::identity::auth::Permission;
+    use crate::structs::identity::realm::{
+        MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmDiscoveryConfig, RealmId,
+        RealmNodeKind,
+    };
+    use crate::structs::placement::compute_config::RealmComputeConfig;
     use crate::structs::placement::placement_record::{
         AffinityEffect, AffinityRule, BandPool, BindingScope, DocumentClass, HandleRange,
         LabelMatch, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementScope,
         PlacementStrategy, StrategyBinding,
     };
-    use crate::structs::identity::realm::{
-        MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind,
-    };
-    use crate::structs::identity::auth::Permission;
-    use crate::structs::placement::compute_config::RealmComputeConfig;
     use crate::structured_id::PlacementHandle;
     use crate::types::{GroupId, RoleId};
     use std::collections::BTreeMap;

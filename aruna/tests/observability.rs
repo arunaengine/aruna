@@ -760,10 +760,10 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::structs::placement::placement_record::PlacementStrategy;
     use aruna_core::structs::identity::realm::{
         RealmConfigDocument, RealmDiscoveryConfig, RealmNodeKind,
     };
+    use aruna_core::structs::placement::placement_record::PlacementStrategy;
 
     let storage = env.open_storage().await;
     let event = storage

@@ -59,9 +59,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_CONTROL_FRAME, checked_frame_len, checked_send_len, read_frame, write_frame,
-    };
+    use super::{MAX_CONTROL_FRAME, checked_frame_len, checked_send_len, read_frame, write_frame};
     use std::io::ErrorKind;
     use tokio::io::AsyncWriteExt;
 

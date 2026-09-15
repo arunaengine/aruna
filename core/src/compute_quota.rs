@@ -2,8 +2,8 @@
 //! physical reservations. Converged excess demand only blocks new admissions; it never cancels work.
 
 use crate::compute::{ExecutorAvailability, ResourceEnvelope};
-use crate::structs::storage::node_info::AdvertisementEpoch;
 use crate::structs::execution::job::{EffectiveResources, JobId, SubmissionId};
+use crate::structs::storage::node_info::AdvertisementEpoch;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

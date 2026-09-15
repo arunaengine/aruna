@@ -35,8 +35,7 @@ pub fn revocation_retained(expires_at: u64, now: u64) -> bool {
 }
 
 pub fn valid_revocation_expiry(expires_at: u64, now: u64) -> bool {
-    expires_at.saturating_sub(now)
-        <= MAX_TOKEN_LIFETIME.saturating_add(REVOCATION_GRACE_SECS)
+    expires_at.saturating_sub(now) <= MAX_TOKEN_LIFETIME.saturating_add(REVOCATION_GRACE_SECS)
 }
 
 /// Whether the signed lifetime of a token stays revocable. Issuance and
@@ -50,7 +49,7 @@ pub fn valid_token_lifetime(iat: u64, exp: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        REVOCATION_GRACE_SECS, REALMS_LIST_KEY, bearer_token_hash, credential_hash,
+        REALMS_LIST_KEY, REVOCATION_GRACE_SECS, bearer_token_hash, credential_hash,
         revocation_live, revocation_retained, valid_revocation_expiry,
     };
 

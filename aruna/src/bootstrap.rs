@@ -3,9 +3,7 @@
 //! Persisted identity and enrollment live in `crate::identity`.
 
 use crate::identity::PersistedNodeState;
-use aruna_api::server_state::{
-    ONBOARDING_SECRET_KEY, load_persisted_state, persist_state,
-};
+use aruna_api::server_state::{ONBOARDING_SECRET_KEY, load_persisted_state, persist_state};
 use aruna_core::document::{DocumentNetEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
@@ -149,9 +147,10 @@ pub async fn prepare_core_documents(
             .as_ref()
             .ok_or("net handle unavailable while checking watch interest genesis")?;
         net_handle
-            .sync_topic_exists(
-                watch_target.sync_topic_id(realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL),
-            )
+            .sync_topic_exists(watch_target.sync_topic_id(
+                realm_id,
+                &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+            ))
             .map_err(|error| format!("failed to check watch interest topic: {error}"))?
     } else {
         true
@@ -220,7 +219,10 @@ pub async fn fetch_core_documents(
             user_documents.push(document);
             continue;
         }
-        let topic = document.sync_topic_id(realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL);
+        let topic = document.sync_topic_id(
+            realm_id,
+            &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+        );
         sync_with_retry(net_handle, topic, bootstrap_peer, &document, timeout).await?;
     }
 
@@ -325,7 +327,10 @@ pub async fn wait_for_placement(
                             .net_handle
                             .as_ref()
                             .ok_or("net handle unavailable")?,
-                        target.sync_topic_id(realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL),
+                        target.sync_topic_id(
+                            realm_id,
+                            &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+                        ),
                         bootstrap_peer,
                         &target,
                         timeout,
@@ -347,7 +352,10 @@ pub async fn wait_for_placement(
 }
 
 /// Node-kind label for the completion log; the owner of a device stays out of it.
-fn kind_label(config: &aruna_core::structs::identity::realm::RealmConfigDocument, node_id: NodeId) -> &'static str {
+fn kind_label(
+    config: &aruna_core::structs::identity::realm::RealmConfigDocument,
+    node_id: NodeId,
+) -> &'static str {
     let node_id = node_id.to_string();
     match config
         .nodes
@@ -362,7 +370,10 @@ fn kind_label(config: &aruna_core::structs::identity::realm::RealmConfigDocument
     }
 }
 
-fn node_is_ready(config: &aruna_core::structs::identity::realm::RealmConfigDocument, node_id: NodeId) -> bool {
+fn node_is_ready(
+    config: &aruna_core::structs::identity::realm::RealmConfigDocument,
+    node_id: NodeId,
+) -> bool {
     // A usable band grant plus its JobControl binding: the node must be able
     // to mint owner-encoded JobIds before it starts serving.
     config.has_node(node_id)
@@ -387,8 +398,9 @@ async fn load_realm_config(
         }))
         .await
     {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .and_then(|bytes| aruna_core::structs::identity::realm::RealmConfigDocument::from_bytes(&bytes).ok()),
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value.and_then(|bytes| {
+            aruna_core::structs::identity::realm::RealmConfigDocument::from_bytes(&bytes).ok()
+        }),
         _ => None,
     }
 }
@@ -478,11 +490,8 @@ pub async fn ensure_onboarding_secret(
     net_secret_key: &[u8; 32],
     realm_id: aruna_core::structs::identity::realm::RealmId,
 ) -> Result<OnboardingSecret, Box<dyn std::error::Error>> {
-    if let Some(encrypted) = load_persisted_state::<EncryptedOnboardingSecret>(
-        driver_ctx,
-        ONBOARDING_SECRET_KEY,
-    )
-    .await
+    if let Some(encrypted) =
+        load_persisted_state::<EncryptedOnboardingSecret>(driver_ctx, ONBOARDING_SECRET_KEY).await
     {
         let nonce = crypto_box::Nonce::from(encrypted.nonce);
         let plaintext = onboarding_secret_box(net_secret_key)

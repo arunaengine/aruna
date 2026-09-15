@@ -9,8 +9,8 @@ use ulid::Ulid;
 
 use crate::id::NodeId;
 use crate::metadata::AuthToken;
-use crate::structs::storage::metadata_registry::MetadataAuditRecord;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::metadata_registry::MetadataAuditRecord;
 use crate::types::GroupId;
 
 pub const AUDIT_KEY_BYTES: usize = 48;

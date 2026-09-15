@@ -12,7 +12,7 @@ use serde_json::json;
 use tokio::io::AsyncRead;
 
 use super::status::task_state;
-use super::{STREAM_BUF_BYTES, KubernetesBackend, SessionChannel, kube_error};
+use super::{KubernetesBackend, STREAM_BUF_BYTES, SessionChannel, kube_error};
 
 /// Bridges standard input and output of one exec to the helper socket. The
 /// exec inherits the container's user and is never privileged.

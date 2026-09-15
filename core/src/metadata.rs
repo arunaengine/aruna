@@ -9,8 +9,8 @@ use crate::NodeId;
 use crate::UserId;
 use crate::errors::StorageError;
 use crate::structs::identity::auth::AuthContext;
-use crate::structs::storage::metadata_registry::{MetadataAuditOperation, MetadataRegistryRecord};
 use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::metadata_registry::{MetadataAuditOperation, MetadataRegistryRecord};
 use crate::types::GroupId;
 
 pub const MAX_TOKEN_LEN: usize = 4096;
@@ -1234,16 +1234,15 @@ pub struct ProfileValidationStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        GraphLifecycleRecord, RAW_BYTES_LIMIT, EVENT_LIMIT,
-        MetadataBearerToken, MetadataClockRelation, MetadataDeleteRecord, MetadataEventPayload,
-        MetadataEventRecord, MetadataLifecycleRecord, MetadataQueryResults,
-        ProfileValidationCompleteness, ProfileValidationSeverity, ProfileValidationState,
-        ProfileValidationStatus, apply_raw_upsert, compare_metadata_clocks, raw_quotas,
-        resolve_raw_revision,
+        EVENT_LIMIT, GraphLifecycleRecord, MetadataBearerToken, MetadataClockRelation,
+        MetadataDeleteRecord, MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
+        MetadataQueryResults, ProfileValidationCompleteness, ProfileValidationSeverity,
+        ProfileValidationState, ProfileValidationStatus, RAW_BYTES_LIMIT, apply_raw_upsert,
+        compare_metadata_clocks, raw_quotas, resolve_raw_revision,
     };
-    use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
-    use crate::structs::placement::placement_record::PlacementRef;
     use crate::structs::identity::realm::RealmId;
+    use crate::structs::placement::placement_record::PlacementRef;
+    use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
     use crate::{NodeId, UserId};
     use craqle::{ActorId, VectorClock};
     use std::collections::BTreeMap;
@@ -1385,15 +1384,7 @@ mod tests {
         let document_id = Ulid::generate();
         assert!(raw_quotas(document_id, &[], node(1), 0).is_none());
         assert!(raw_quotas(document_id, &[node(1)], node(2), 0).is_none());
-        assert!(
-            raw_quotas(
-                document_id,
-                &[node(1)],
-                node(1),
-                RAW_BYTES_LIMIT + 1,
-            )
-            .is_none()
-        );
+        assert!(raw_quotas(document_id, &[node(1)], node(1), RAW_BYTES_LIMIT + 1,).is_none());
     }
 
     #[test]

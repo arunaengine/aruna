@@ -1,20 +1,20 @@
 use crate::audit::AuditPageBatch;
 use crate::effects::{
-    FetchCursor, FrameBoundsError, JobRecordFrame, MAX_RECORD_PAGE, JOB_PAGE_BYTES,
-    ReceiptFrame, encoded_len,
+    FetchCursor, FrameBoundsError, JOB_PAGE_BYTES, JobRecordFrame, MAX_RECORD_PAGE, ReceiptFrame,
+    encoded_len,
 };
 use crate::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
-use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
-use crate::structs::storage::routing::GroupRoutingInputs;
-use crate::structs::placement::placement_policy::{MAX_REF_INPUT, PlacementDecision};
-use crate::structs::placement::policy_document::{PlacementPolicyDocument, PolicyPublication};
-use crate::structs::identity::realm::RealmId;
-use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
 use crate::structs::execution::source_access::{
     ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
+use crate::structs::identity::realm::RealmId;
+use crate::structs::placement::placement_policy::{MAX_REF_INPUT, PlacementDecision};
+use crate::structs::placement::policy_document::{PlacementPolicyDocument, PolicyPublication};
+use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
+use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
+use crate::structs::storage::routing::GroupRoutingInputs;
 use crate::{
     document::DocumentNetEvent,
     errors::{AuthorizationError, DhtError, StorageError, StreamError},

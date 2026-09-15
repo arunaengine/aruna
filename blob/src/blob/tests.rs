@@ -12,12 +12,15 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB,
-    STORAGE_BACKEND_KEYSPACE, BACKEND_SECRET_KEYSPACE,
-    PATHS_INDEX_KEYSPACE,
+    BACKEND_SECRET_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE,
+    PATHS_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::Status;
 use aruna_core::structs::checksum::HASH_BLAKE3;
+use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, HiddenBlobKey,
     ResolvedBackend,
@@ -542,21 +545,25 @@ serve_group_backends = false
     assert_eq!(routing.catalog.class_of("cold"), Some("cold"));
     let snapshot = routing.snapshot(Ulid::from_bytes([1u8; 16]));
     assert_eq!(
-        aruna_core::structs::storage::routing::resolve_backend(&snapshot, "bucket", "archive/one").unwrap(),
+        aruna_core::structs::storage::routing::resolve_backend(&snapshot, "bucket", "archive/one")
+            .unwrap(),
         ResolvedBackend::new(
             BackendRef::Node("cold".to_string()),
             Some("cold".to_string())
         )
     );
     assert_eq!(
-        aruna_core::structs::storage::routing::resolve_backend(&snapshot, "bucket", "other").unwrap(),
+        aruna_core::structs::storage::routing::resolve_backend(&snapshot, "bucket", "other")
+            .unwrap(),
         ResolvedBackend::new(BackendRef::Node("hot".to_string()), None)
     );
     assert_eq!(
         aruna_core::structs::storage::routing::resolve_backend(
-            &snapshot.with_group_default(Some(aruna_core::structs::storage::routing::RoutingTarget::Backend(
-                BackendRef::Group(Ulid::from_bytes([2u8; 16]))
-            ))),
+            &snapshot.with_group_default(Some(
+                aruna_core::structs::storage::routing::RoutingTarget::Backend(BackendRef::Group(
+                    Ulid::from_bytes([2u8; 16])
+                ))
+            )),
             "bucket",
             "other"
         ),
@@ -715,10 +722,7 @@ fn exposes_custom_timeouts() {
         config.timeouts.control_connect_timeout,
         Duration::from_secs(11)
     );
-    assert_eq!(
-        config.timeouts.control_io_timeout,
-        Duration::from_secs(12)
-    );
+    assert_eq!(config.timeouts.control_io_timeout, Duration::from_secs(12));
     assert_eq!(
         config.timeouts.transfer_idle_timeout,
         Duration::from_secs(13)

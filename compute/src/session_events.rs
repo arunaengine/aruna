@@ -3,7 +3,7 @@
 
 pub use aruna_core::compute::session::{EventKind, TRUNCATED_NOTICE};
 use aruna_core::compute::session::{
-    MAX_OUTPUT_BYTES, MAX_CELL_OUTPUTS, MAX_RING_BYTES, MAX_RING_EVENTS,
+    MAX_CELL_OUTPUTS, MAX_OUTPUT_BYTES, MAX_RING_BYTES, MAX_RING_EVENTS,
 };
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -96,9 +96,7 @@ impl CellBudget {
         if self.truncated {
             return BudgetVerdict::Drop;
         }
-        if self.outputs >= MAX_CELL_OUTPUTS
-            || self.bytes.saturating_add(bytes) > MAX_OUTPUT_BYTES
-        {
+        if self.outputs >= MAX_CELL_OUTPUTS || self.bytes.saturating_add(bytes) > MAX_OUTPUT_BYTES {
             self.truncated = true;
             return BudgetVerdict::Truncate;
         }

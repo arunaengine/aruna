@@ -123,9 +123,7 @@ pub enum PersistedNodeIdentity {
     },
     /// Owner-bound device. The owner is copied from the enrollment answer: a
     /// device holds no realm state to read it back from before it has joined.
-    User {
-        owner: UserId,
-    },
+    User { owner: UserId },
 }
 
 impl std::fmt::Debug for PersistedNodeIdentity {
@@ -187,9 +185,7 @@ pub(crate) fn node_capabilities(
     node_state: &PersistedNodeState,
 ) -> Result<(RealmId, NodeCapabilities), IdentityError> {
     match &node_state.identity {
-        PersistedNodeIdentity::Management {
-            realm_private_pem,
-        } => {
+        PersistedNodeIdentity::Management { realm_private_pem } => {
             let realm_signing_key = SigningKey::from_pkcs8_pem(realm_private_pem)?;
             let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
             let realm_verifying_key = realm_signing_key

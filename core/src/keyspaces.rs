@@ -28,10 +28,8 @@ pub const VALIDATION_STATUS_KEYSPACE: &str = "metadata_profile_validation_status
 pub const RAW_REVISION_KEYSPACE: &str = "metadata_raw_revisions";
 pub const RAW_BUDGET_KEYSPACE: &str = "metadata_raw_budgets";
 pub const MATERIALIZATION_JOB_KEYSPACE: &str = "metadata_materialization_jobs";
-pub const DOCUMENT_JOB_KEYSPACE: &str =
-    "metadata_materialization_document_jobs";
-pub const DEAD_LETTER_KEYSPACE: &str =
-    "metadata_materialization_dead_letters";
+pub const DOCUMENT_JOB_KEYSPACE: &str = "metadata_materialization_document_jobs";
+pub const DEAD_LETTER_KEYSPACE: &str = "metadata_materialization_dead_letters";
 pub const MATERIALIZATION_PRUNE_KEYSPACE: &str = "metadata_materialization_prunes";
 pub const DOCUMENT_STATE_KEYSPACE: &str = "admin_document_state";
 pub const DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
