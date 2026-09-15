@@ -1,4 +1,4 @@
-use crate::s3::upload_target::{StatusCheck, UploadTargetError, validate_upload};
+use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::write_cleanup::{WriteCleanup, delete_records_effect};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -8,8 +8,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BlobCleanupWork, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    MultipartUploadStatus,
+    BlobCleanupWork, MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
 };
 use aruna_core::types::{Effects, TxnId, Value};
 use smallvec::smallvec;
@@ -17,7 +16,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum AbortMultipartUploadState {
+pub enum AbortUploadState {
     Init,
     StartMarkTransaction,
     ReadUploadForMark,
@@ -38,7 +37,7 @@ pub enum AbortMultipartUploadState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum AbortMultipartUploadError {
+pub enum AbortUploadError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -61,7 +60,7 @@ pub enum AbortMultipartUploadError {
     NotFinished,
 }
 
-impl From<UploadTargetError> for AbortMultipartUploadError {
+impl From<UploadTargetError> for AbortUploadError {
     fn from(error: UploadTargetError) -> Self {
         match error {
             UploadTargetError::TargetMismatch => Self::UploadTargetMismatch,
@@ -72,7 +71,7 @@ impl From<UploadTargetError> for AbortMultipartUploadError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct AbortMultipartUploadInput {
+pub struct AbortUploadInput {
     pub bucket: String,
     pub key: String,
     pub upload_id: Ulid,
@@ -81,23 +80,23 @@ pub struct AbortMultipartUploadInput {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct AbortMultipartUploadOperation {
-    input: AbortMultipartUploadInput,
-    state: AbortMultipartUploadState,
+pub struct AbortUploadOperation {
+    input: AbortUploadInput,
+    state: AbortUploadState,
     txn_id: Option<TxnId>,
     upload_record: Option<MultipartUpload>,
-    upload_parts: Vec<MultipartUploadPart>,
+    upload_parts: Vec<MultipartPart>,
     cleanup_index: usize,
     skip_status_check: bool,
-    cleanup: WriteCleanup<AbortMultipartUploadError>,
-    output: Option<Result<(), AbortMultipartUploadError>>,
+    cleanup: WriteCleanup<AbortUploadError>,
+    output: Option<Result<(), AbortUploadError>>,
 }
 
-impl AbortMultipartUploadOperation {
-    pub fn new(input: AbortMultipartUploadInput) -> Self {
+impl AbortUploadOperation {
+    pub fn new(input: AbortUploadInput) -> Self {
         Self {
             input,
-            state: AbortMultipartUploadState::Init,
+            state: AbortUploadState::Init,
             txn_id: None,
             upload_record: None,
             upload_parts: Vec::new(),
@@ -117,16 +116,16 @@ impl AbortMultipartUploadOperation {
     /// The terminal state is complete, so the driver never calls `abort` for us;
     /// releasing the transaction here is what keeps it from outliving the
     /// operation. `abort` takes the id, so it cannot run twice.
-    fn emit_error(&mut self, error: AbortMultipartUploadError) -> Effects {
-        self.state = AbortMultipartUploadState::Error;
+    fn emit_error(&mut self, error: AbortUploadError) -> Effects {
+        self.state = AbortUploadState::Error;
         self.output = Some(Err(error));
         self.abort()
     }
 
-    fn schedule_error(&mut self, error: AbortMultipartUploadError) -> Effects {
+    fn schedule_error(&mut self, error: AbortUploadError) -> Effects {
         self.cleanup.set_error(error);
         if self.upload_record.is_some() {
-            self.state = AbortMultipartUploadState::ResetUploadTransaction;
+            self.state = AbortUploadState::ResetUploadTransaction;
             smallvec![Effect::Storage(StorageEffect::StartTransaction {
                 read: false,
             })]
@@ -137,13 +136,13 @@ impl AbortMultipartUploadOperation {
 
     fn emit_pending_error(&mut self) -> Effects {
         let Some(error) = self.cleanup.take_error() else {
-            return self.emit_error(AbortMultipartUploadError::AbortMultipartUploadFailed);
+            return self.emit_error(AbortUploadError::AbortMultipartUploadFailed);
         };
         self.emit_error(error)
     }
 
     fn handle_init(&mut self) -> Effects {
-        self.state = AbortMultipartUploadState::StartMarkTransaction;
+        self.state = AbortUploadState::StartMarkTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
         })]
@@ -151,10 +150,10 @@ impl AbortMultipartUploadOperation {
 
     fn mark_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(AbortMultipartUploadError::InvalidOperationState);
+            return self.emit_error(AbortUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
-        self.state = AbortMultipartUploadState::ReadUploadForMark;
+        self.state = AbortUploadState::ReadUploadForMark;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
@@ -164,10 +163,10 @@ impl AbortMultipartUploadOperation {
 
     fn mark_upload_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(AbortMultipartUploadError::InvalidOperationState);
+            return self.emit_error(AbortUploadError::InvalidOperationState);
         };
         let Some(value) = value else {
-            return self.emit_error(AbortMultipartUploadError::NoSuchUpload);
+            return self.emit_error(AbortUploadError::NoSuchUpload);
         };
         let mut record = match MultipartUpload::from_bytes(value.as_ref()) {
             Ok(record) => record,
@@ -194,7 +193,7 @@ impl AbortMultipartUploadOperation {
             Ok(value) => value,
             Err(err) => return self.emit_error(err.into()),
         };
-        self.state = AbortMultipartUploadState::WriteUploadAborting;
+        self.state = AbortUploadState::WriteUploadAborting;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
@@ -205,13 +204,13 @@ impl AbortMultipartUploadOperation {
 
     fn handle_upload_marked(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.emit_error(AbortMultipartUploadError::InvalidOperationState);
+            return self.emit_error(AbortUploadError::InvalidOperationState);
         };
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(AbortMultipartUploadError::NoTransactionFound);
+            return self.emit_error(AbortUploadError::NoTransactionFound);
         };
 
-        self.state = AbortMultipartUploadState::CommitMarkTransaction;
+        self.state = AbortUploadState::CommitMarkTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -220,11 +219,11 @@ impl AbortMultipartUploadOperation {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
 
-                let prefix = match MultipartUploadPartKey::prefix(self.input.upload_id) {
+                let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
                     Ok(prefix) => prefix,
                     Err(err) => return self.schedule_error(err.into()),
                 };
-                self.state = AbortMultipartUploadState::ReadUploadParts;
+                self.state = AbortUploadState::ReadUploadParts;
                 smallvec![Effect::Storage(StorageEffect::Iter {
                     key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
                     prefix: Some(prefix.into()),
@@ -240,20 +239,20 @@ impl AbortMultipartUploadOperation {
                 self.txn_id = None;
                 self.schedule_error(error.into())
             }
-            _ => self.emit_error(AbortMultipartUploadError::InvalidOperationState),
+            _ => self.emit_error(AbortUploadError::InvalidOperationState),
         }
     }
 
     fn upload_parts_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.schedule_error(AbortMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(AbortUploadError::InvalidOperationState);
         };
 
         self.upload_parts = values
             .into_iter()
-            .filter_map(|(_, value)| MultipartUploadPart::from_bytes(value.as_ref()).ok())
+            .filter_map(|(_, value)| MultipartPart::from_bytes(value.as_ref()).ok())
             .collect();
-        self.state = AbortMultipartUploadState::StartDeleteTransaction;
+        self.state = AbortUploadState::StartDeleteTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
         })]
@@ -261,7 +260,7 @@ impl AbortMultipartUploadOperation {
 
     fn delete_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.schedule_error(AbortMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(AbortUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
         self.delete_upload_records()
@@ -273,7 +272,7 @@ impl AbortMultipartUploadOperation {
                 Ok(effect) => effect,
                 Err(err) => return self.schedule_error(err.into()),
             };
-        self.state = AbortMultipartUploadState::DeleteUploadRecords;
+        self.state = AbortUploadState::DeleteUploadRecords;
         smallvec![effect]
     }
 
@@ -281,7 +280,7 @@ impl AbortMultipartUploadOperation {
         match event {
             Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.write_cleanup_records(),
             Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
-            _ => self.schedule_error(AbortMultipartUploadError::InvalidOperationState),
+            _ => self.schedule_error(AbortUploadError::InvalidOperationState),
         }
     }
 
@@ -302,7 +301,7 @@ impl AbortMultipartUploadOperation {
             ));
         }
 
-        self.state = AbortMultipartUploadState::WriteCleanupRecords;
+        self.state = AbortUploadState::WriteCleanupRecords;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: self.txn_id,
@@ -313,35 +312,35 @@ impl AbortMultipartUploadOperation {
         match event {
             Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                 let Some(txn_id) = self.txn_id else {
-                    return self.schedule_error(AbortMultipartUploadError::NoTransactionFound);
+                    return self.schedule_error(AbortUploadError::NoTransactionFound);
                 };
-                self.state = AbortMultipartUploadState::CommitDeleteTransaction;
+                self.state = AbortUploadState::CommitDeleteTransaction;
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
             Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
-            _ => self.schedule_error(AbortMultipartUploadError::InvalidOperationState),
+            _ => self.schedule_error(AbortUploadError::InvalidOperationState),
         }
     }
 
     fn handle_delete_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.schedule_error(AbortMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(AbortUploadError::InvalidOperationState);
         };
         self.txn_id = None;
         self.upload_record = None;
         self.cleanup_index = 0;
-        self.state = AbortMultipartUploadState::CleanupPartBlobs;
+        self.state = AbortUploadState::CleanupPartBlobs;
         self.next_blob()
     }
 
     fn next_blob(&mut self) -> Effects {
         let Some(part) = self.upload_parts.get(self.cleanup_index) else {
-            self.state = AbortMultipartUploadState::Finish;
+            self.state = AbortUploadState::Finish;
             self.output = Some(Ok(()));
             return smallvec![];
         };
 
-        self.state = AbortMultipartUploadState::CleanupPartBlobs;
+        self.state = AbortUploadState::CleanupPartBlobs;
         smallvec![Effect::Blob(BlobEffect::Delete {
             location: part.location.clone(),
         })]
@@ -353,16 +352,16 @@ impl AbortMultipartUploadOperation {
                 self.cleanup_index += 1;
                 self.next_blob()
             }
-            _ => self.emit_error(AbortMultipartUploadError::InvalidOperationState),
+            _ => self.emit_error(AbortUploadError::InvalidOperationState),
         }
     }
 
     fn reset_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(AbortMultipartUploadError::InvalidOperationState);
+            return self.emit_error(AbortUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
-        self.state = AbortMultipartUploadState::ReadUploadForReset;
+        self.state = AbortUploadState::ReadUploadForReset;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
@@ -372,7 +371,7 @@ impl AbortMultipartUploadOperation {
 
     fn reset_upload_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(AbortMultipartUploadError::InvalidOperationState);
+            return self.emit_error(AbortUploadError::InvalidOperationState);
         };
         let Some(value) = value else {
             return self.txn_id.take().map_or_else(
@@ -390,7 +389,7 @@ impl AbortMultipartUploadOperation {
             Ok(value) => value.into(),
             Err(err) => return self.emit_error(err.into()),
         };
-        self.state = AbortMultipartUploadState::WriteUploadReset;
+        self.state = AbortUploadState::WriteUploadReset;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
@@ -401,27 +400,27 @@ impl AbortMultipartUploadOperation {
 
     fn upload_reset(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.emit_error(AbortMultipartUploadError::InvalidOperationState);
+            return self.emit_error(AbortUploadError::InvalidOperationState);
         };
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(AbortMultipartUploadError::NoTransactionFound);
+            return self.emit_error(AbortUploadError::NoTransactionFound);
         };
-        self.state = AbortMultipartUploadState::CommitResetTransaction;
+        self.state = AbortUploadState::CommitResetTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn handle_reset_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(AbortMultipartUploadError::InvalidOperationState);
+            return self.emit_error(AbortUploadError::InvalidOperationState);
         };
         self.txn_id = None;
         self.emit_pending_error()
     }
 }
 
-impl Operation for AbortMultipartUploadOperation {
+impl Operation for AbortUploadOperation {
     type Output = ();
-    type Error = AbortMultipartUploadError;
+    type Error = AbortUploadError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -429,42 +428,40 @@ impl Operation for AbortMultipartUploadOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            AbortMultipartUploadState::Init => self.handle_init(),
-            AbortMultipartUploadState::StartMarkTransaction => self.mark_started(event),
-            AbortMultipartUploadState::ReadUploadForMark => self.mark_upload_read(event),
-            AbortMultipartUploadState::WriteUploadAborting => self.handle_upload_marked(event),
-            AbortMultipartUploadState::CommitMarkTransaction => self.handle_mark_committed(event),
-            AbortMultipartUploadState::ReadUploadParts => self.upload_parts_read(event),
-            AbortMultipartUploadState::StartDeleteTransaction => self.delete_started(event),
-            AbortMultipartUploadState::DeleteUploadRecords => self.records_deleted(event),
-            AbortMultipartUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
-            AbortMultipartUploadState::CommitDeleteTransaction => {
-                self.handle_delete_committed(event)
-            }
-            AbortMultipartUploadState::CleanupPartBlobs => self.blob_cleaned(event),
-            AbortMultipartUploadState::ResetUploadTransaction => self.reset_started(event),
-            AbortMultipartUploadState::ReadUploadForReset => self.reset_upload_read(event),
-            AbortMultipartUploadState::WriteUploadReset => self.upload_reset(event),
-            AbortMultipartUploadState::CommitResetTransaction => self.handle_reset_committed(event),
-            AbortMultipartUploadState::Finish => smallvec![],
-            AbortMultipartUploadState::Error => self.abort(),
+            AbortUploadState::Init => self.handle_init(),
+            AbortUploadState::StartMarkTransaction => self.mark_started(event),
+            AbortUploadState::ReadUploadForMark => self.mark_upload_read(event),
+            AbortUploadState::WriteUploadAborting => self.handle_upload_marked(event),
+            AbortUploadState::CommitMarkTransaction => self.handle_mark_committed(event),
+            AbortUploadState::ReadUploadParts => self.upload_parts_read(event),
+            AbortUploadState::StartDeleteTransaction => self.delete_started(event),
+            AbortUploadState::DeleteUploadRecords => self.records_deleted(event),
+            AbortUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
+            AbortUploadState::CommitDeleteTransaction => self.handle_delete_committed(event),
+            AbortUploadState::CleanupPartBlobs => self.blob_cleaned(event),
+            AbortUploadState::ResetUploadTransaction => self.reset_started(event),
+            AbortUploadState::ReadUploadForReset => self.reset_upload_read(event),
+            AbortUploadState::WriteUploadReset => self.upload_reset(event),
+            AbortUploadState::CommitResetTransaction => self.handle_reset_committed(event),
+            AbortUploadState::Finish => smallvec![],
+            AbortUploadState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            AbortMultipartUploadState::Finish | AbortMultipartUploadState::Error
+            AbortUploadState::Finish | AbortUploadState::Error
         )
     }
 
     fn expected_error(error: &Self::Error) -> bool {
         matches!(
             error,
-            AbortMultipartUploadError::NoSuchUpload
-                | AbortMultipartUploadError::UploadTargetMismatch
-                | AbortMultipartUploadError::UploadNotOpen
-                | AbortMultipartUploadError::CompletionInProgress
+            AbortUploadError::NoSuchUpload
+                | AbortUploadError::UploadTargetMismatch
+                | AbortUploadError::UploadNotOpen
+                | AbortUploadError::CompletionInProgress
         )
     }
 
@@ -472,7 +469,7 @@ impl Operation for AbortMultipartUploadOperation {
         match self.output {
             Some(Ok(value)) => Ok(value),
             Some(Err(error)) => Err(error),
-            None => Err(AbortMultipartUploadError::NotFinished),
+            None => Err(AbortUploadError::NotFinished),
         }
     }
 
@@ -494,8 +491,8 @@ mod pure_tests {
     use std::collections::HashMap;
     use std::time::SystemTime;
 
-    fn input() -> AbortMultipartUploadInput {
-        AbortMultipartUploadInput {
+    fn input() -> AbortUploadInput {
+        AbortUploadInput {
             bucket: "bucket".to_string(),
             key: "object".to_string(),
             upload_id: Ulid::from_bytes([1u8; 16]),
@@ -503,9 +500,9 @@ mod pure_tests {
         }
     }
 
-    fn marked() -> AbortMultipartUploadOperation {
+    fn marked() -> AbortUploadOperation {
         let input = input();
-        let mut operation = AbortMultipartUploadOperation::new(input);
+        let mut operation = AbortUploadOperation::new(input);
         operation.upload_record = Some(MultipartUpload {
             upload_id: operation.input.upload_id,
             backend: BackendRef::node_default(),
@@ -523,7 +520,7 @@ mod pure_tests {
             completing_since_ms: None,
         });
         operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
-        operation.state = AbortMultipartUploadState::CommitMarkTransaction;
+        operation.state = AbortUploadState::CommitMarkTransaction;
         operation
     }
 
@@ -541,16 +538,11 @@ mod pure_tests {
                 read: false
             })]
         );
-        assert_eq!(
-            operation.state,
-            AbortMultipartUploadState::ResetUploadTransaction
-        );
+        assert_eq!(operation.state, AbortUploadState::ResetUploadTransaction);
         assert_eq!(operation.txn_id, None);
         assert_eq!(
             operation.cleanup.take_error(),
-            Some(AbortMultipartUploadError::StorageError(
-                StorageError::CommitFailed
-            ))
+            Some(AbortUploadError::StorageError(StorageError::CommitFailed))
         );
     }
 
@@ -567,7 +559,7 @@ mod pure_tests {
             effects.as_slice(),
             [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         );
-        assert_eq!(operation.state, AbortMultipartUploadState::Error);
+        assert_eq!(operation.state, AbortUploadState::Error);
         assert_eq!(operation.txn_id, None);
     }
 
@@ -584,22 +576,22 @@ mod pure_tests {
             [Effect::Storage(StorageEffect::Iter { key_space, .. })]
                 if key_space == S3_MULTIPART_UPLOAD_PART_KEYSPACE
         ));
-        assert_eq!(operation.state, AbortMultipartUploadState::ReadUploadParts);
+        assert_eq!(operation.state, AbortUploadState::ReadUploadParts);
         assert_eq!(operation.txn_id, None);
     }
 
     #[test]
     fn queues_cleanup_commit() {
         let location = part_location();
-        let mut operation = AbortMultipartUploadOperation::new(input());
-        operation.upload_parts.push(MultipartUploadPart {
+        let mut operation = AbortUploadOperation::new(input());
+        operation.upload_parts.push(MultipartPart {
             part_number: 1,
             location: location.clone(),
             created_at: SystemTime::UNIX_EPOCH,
         });
         let txn_id = TxnId::from_bytes([5u8; 16]);
         operation.txn_id = Some(txn_id);
-        operation.state = AbortMultipartUploadState::DeleteUploadRecords;
+        operation.state = AbortUploadState::DeleteUploadRecords;
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
             entries: Vec::new(),
@@ -616,10 +608,7 @@ mod pure_tests {
             BlobCleanupWork::from_bytes(writes[0].2.as_ref()).unwrap(),
             BlobCleanupWork::DeleteBlob { location }
         );
-        assert_eq!(
-            operation.state,
-            AbortMultipartUploadState::WriteCleanupRecords
-        );
+        assert_eq!(operation.state, AbortUploadState::WriteCleanupRecords);
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: Vec::new(),
@@ -628,18 +617,15 @@ mod pure_tests {
             effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
         );
-        assert_eq!(
-            operation.state,
-            AbortMultipartUploadState::CommitDeleteTransaction
-        );
+        assert_eq!(operation.state, AbortUploadState::CommitDeleteTransaction);
     }
 
     #[test]
     fn delete_batches_records() {
         // The abort removes every part row and the upload record in one batch
         // inside the delete transaction.
-        let mut operation = AbortMultipartUploadOperation::new(input());
-        operation.upload_parts.push(MultipartUploadPart {
+        let mut operation = AbortUploadOperation::new(input());
+        operation.upload_parts.push(MultipartPart {
             part_number: 1,
             location: part_location(),
             created_at: SystemTime::UNIX_EPOCH,
@@ -664,32 +650,26 @@ mod pure_tests {
         assert!(deletes.iter().any(|(key_space, key)| {
             key_space == S3_MULTIPART_UPLOAD_KEYSPACE && key.as_ref() == upload_key.as_slice()
         }));
-        let part_key = MultipartUploadPartKey::new(operation.input.upload_id, 1)
+        let part_key = MultipartPartKey::new(operation.input.upload_id, 1)
             .to_bytes()
             .unwrap();
         assert!(deletes.iter().any(|(key_space, key)| {
             key_space == S3_MULTIPART_UPLOAD_PART_KEYSPACE && key.as_ref() == part_key.as_slice()
         }));
-        assert_eq!(
-            operation.state,
-            AbortMultipartUploadState::DeleteUploadRecords
-        );
+        assert_eq!(operation.state, AbortUploadState::DeleteUploadRecords);
     }
 
     #[test]
     fn rejects_incomplete() {
-        let operation = AbortMultipartUploadOperation::new(input());
+        let operation = AbortUploadOperation::new(input());
 
-        assert_eq!(
-            operation.finalize(),
-            Err(AbortMultipartUploadError::NotFinished)
-        );
+        assert_eq!(operation.finalize(), Err(AbortUploadError::NotFinished));
     }
 
     #[test]
     fn finalizes_finished() {
-        let mut operation = AbortMultipartUploadOperation::new(input());
-        operation.state = AbortMultipartUploadState::Finish;
+        let mut operation = AbortUploadOperation::new(input());
+        operation.state = AbortUploadState::Finish;
         operation.output = Some(Ok(()));
 
         assert_eq!(operation.finalize(), Ok(()));
