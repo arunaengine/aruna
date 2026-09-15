@@ -1,13 +1,10 @@
-use super::{
-    IncomingVersionReplicationError, IncomingVersionReplicationOperation,
-    IncomingVersionReplicationState, ReceivedBlob,
-};
+use super::{IncomingVersionError, IncomingVersionOperation, IncomingVersionState, ReceivedBlob};
 
 use crate::replication::protocol::{
     MAX_REPLICATION_VALUE_BYTES, MaterializedBlobInfo, ReferenceAdvance, SyncOrigin,
     VersionReplicationManifest, VersionReplicationMessage,
 };
-use crate::replication::queue::LiveReplicationObligationRecord;
+use crate::replication::queue::LiveObligationRecord;
 use crate::s3::purge_fence::PurgeFenceError;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
@@ -21,8 +18,8 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion,
-    BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs, HashPathIndexKey,
-    JobId, MultipartObjectMetadataKey, NodeRouting, QuotaConfig, RealmConfigDocument, RealmId,
+    BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs, HashIndex, JobId,
+    MultipartObjectKey, NodeRouting, QuotaConfig, RealmConfigDocument, RealmId,
     ReclaimCandidateKey, ReplicationItemKind, ReplicationNegotiationResult, RoutingTarget,
     SourceConnectorKind, SourceMetadata, StagingStrategy, StoragePurgeFence, StoragePurgeScope,
     StorageRoutingRule, UsageDelta, VersionSourceBinding, WriteOwner,
@@ -257,8 +254,8 @@ fn advance_fixture() -> (VersionReplicationManifest, BlobVersion, NodeId) {
 fn advance_operation(
     manifest: VersionReplicationManifest,
     publisher: NodeId,
-) -> IncomingVersionReplicationOperation {
-    IncomingVersionReplicationOperation::new(
+) -> IncomingVersionOperation {
+    IncomingVersionOperation::new(
         Ulid::from_bytes([24u8; 16]),
         iroh::SecretKey::from_bytes(&[25u8; 32]).public(),
         test_realm_id(),
@@ -275,7 +272,7 @@ fn assert_advance_invalid(
     let op = advance_operation(manifest, publisher);
     assert_eq!(
         op.validate_advance(&previous),
-        Err(IncomingVersionReplicationError::InvalidReferenceAdvance)
+        Err(IncomingVersionError::InvalidReferenceAdvance)
     );
 }
 
@@ -297,26 +294,20 @@ fn expect_rejected_negotiation(effect: &Effect, expected_reason: &str) {
 
 /// Answers the routing load that follows every destination bucket read.
 fn load_routing(
-    op: &mut IncomingVersionReplicationOperation,
+    op: &mut IncomingVersionOperation,
     inputs: GroupRoutingInputs,
 ) -> aruna_core::types::Effects {
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::LoadDestinationRouting
-    );
+    assert_eq!(op.state, IncomingVersionState::LoadDestinationRouting);
     op.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
         result: Ok(inputs),
     }))
 }
 
-fn advance_version_lookup(op: &mut IncomingVersionReplicationOperation, group_id: Ulid) -> Effect {
+fn advance_version_lookup(op: &mut IncomingVersionOperation, group_id: Ulid) -> Effect {
     op.manifest_policy = Some(op.target_authorization_path(group_id));
     op.writer_policy = Some(op.target_authorization_path(group_id));
     let effects = op.start();
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::ReadDestinationBucket
-    );
+    assert_eq!(op.state, IncomingVersionState::ReadDestinationBucket);
     assert!(matches!(
         effects[0],
         Effect::Storage(StorageEffect::Read { .. })
@@ -327,10 +318,7 @@ fn advance_version_lookup(op: &mut IncomingVersionReplicationOperation, group_id
         value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
     }));
     let mut effects = load_routing(op, GroupRoutingInputs::default());
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::ReadExistingVersion
-    );
+    assert_eq!(op.state, IncomingVersionState::ReadExistingVersion);
     assert_eq!(effects.len(), 1);
     assert!(matches!(
         effects.as_slice(),
@@ -340,12 +328,12 @@ fn advance_version_lookup(op: &mut IncomingVersionReplicationOperation, group_id
     effects.remove(0)
 }
 
-fn advance_blob_lookup(op: &mut IncomingVersionReplicationOperation) -> aruna_core::types::Effects {
+fn advance_blob_lookup(op: &mut IncomingVersionOperation) -> aruna_core::types::Effects {
     let effects = op.step(Event::Storage(StorageEvent::ReadResult {
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadQuotaConfig);
+    assert_eq!(op.state, IncomingVersionState::ReadQuotaConfig);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { .. })]
@@ -355,7 +343,7 @@ fn advance_blob_lookup(op: &mut IncomingVersionReplicationOperation) -> aruna_co
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
+    assert_eq!(op.state, IncomingVersionState::ReadExistingBlob);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { key_space, .. })]
@@ -386,23 +374,23 @@ fn bucket_drift(bucket_info: &BucketInfo) -> Event {
     })
 }
 
-fn start_apply_transaction(op: &mut IncomingVersionReplicationOperation) -> Ulid {
+fn start_apply_transaction(op: &mut IncomingVersionOperation) -> Ulid {
     start_apply_with(op, None)
 }
 
 /// `bucket` must echo what negotiation stored, or None when no bucket was
 /// read; the drift re-check compares the two.
 fn start_apply_with(
-    op: &mut IncomingVersionReplicationOperation,
+    op: &mut IncomingVersionOperation,
     bucket: Option<aruna_core::types::Value>,
 ) -> Ulid {
     let txn_id = Ulid::from_parts(1, 1);
-    op.state = IncomingVersionReplicationState::StartTransaction;
+    op.state = IncomingVersionState::StartTransaction;
     op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
     op.destination_group_id = Some(Ulid::from_parts(2, 2));
 
     let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CheckPurgeFence);
+    assert_eq!(op.state, IncomingVersionState::CheckPurgeFence);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { txn_id: read_txn_id, .. })]
@@ -412,13 +400,13 @@ fn start_apply_with(
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CheckDrift);
+    assert_eq!(op.state, IncomingVersionState::CheckDrift);
     // The apply transaction re-reads the destination default and the local
     // subject before it exposes anything.
     let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
         values: vec![(vec![0u8; 4].into(), bucket), (vec![1u8; 4].into(), None)],
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::VerifyReplaced);
+    assert_eq!(op.state, IncomingVersionState::VerifyReplaced);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { key_space, txn_id: read_txn_id, .. })]
@@ -432,7 +420,7 @@ fn start_apply_with(
         key: vec![0u8; 4].into(),
         value,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadObjectLookup);
+    assert_eq!(op.state, IncomingVersionState::ReadObjectLookup);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { key_space, txn_id: read_txn_id, .. })]
@@ -444,13 +432,13 @@ fn start_apply_with(
 #[test]
 fn purge_fence_rejects() {
     let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(3, 3),
         iroh::SecretKey::from_bytes(&[65; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
         manifest.clone(),
     );
-    op.state = IncomingVersionReplicationState::StartTransaction;
+    op.state = IncomingVersionState::StartTransaction;
     op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
     op.destination_group_id = Some(Ulid::from_parts(4, 4));
     op.step(Event::Storage(StorageEvent::TransactionStarted {
@@ -471,7 +459,7 @@ fn purge_fence_rejects() {
 
     assert!(matches!(
         op.output,
-        Some(Err(IncomingVersionReplicationError::PurgeFence(
+        Some(Err(IncomingVersionError::PurgeFence(
             PurgeFenceError::Suspended
         )))
     ));
@@ -480,7 +468,7 @@ fn purge_fence_rejects() {
 #[test]
 fn existing_version_skips() {
     let manifest = make_manifest(ReplicationItemKind::Materialized);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(6, 6),
         iroh::SecretKey::from_bytes(&[66; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -500,7 +488,7 @@ fn existing_version_skips() {
         key: vec![0u8; 4].into(),
         value: Some(version.to_bytes().unwrap().into()),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert_eq!(effects.len(), 1);
     assert!(matches!(
         message_from_effect(&effects[0]),
@@ -513,7 +501,7 @@ fn existing_version_skips() {
 #[test]
 fn existing_delete_skips() {
     let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(8, 8),
         iroh::SecretKey::from_bytes(&[67; 32]).public(),
         test_realm_id(),
@@ -531,7 +519,7 @@ fn existing_delete_skips() {
         ),
     }));
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
@@ -543,7 +531,7 @@ fn existing_delete_skips() {
 #[test]
 fn reference_requests_metadata() {
     let manifest = make_reference_manifest();
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(9, 9),
         iroh::SecretKey::from_bytes(&[68; 32]).public(),
         test_realm_id(),
@@ -555,7 +543,7 @@ fn reference_requests_metadata() {
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadQuotaConfig);
+    assert_eq!(op.state, IncomingVersionState::ReadQuotaConfig);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { .. })]
@@ -566,7 +554,7 @@ fn reference_requests_metadata() {
         value: None,
     }));
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
@@ -580,7 +568,7 @@ fn reference_writes_version() {
     let manifest = make_reference_manifest();
     let expected_source = manifest.source.clone().unwrap();
     let expected_metadata = manifest.reference_metadata.clone().unwrap();
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(10, 10),
         iroh::SecretKey::from_bytes(&[69; 32]).public(),
         test_realm_id(),
@@ -617,7 +605,7 @@ fn version_binds_publisher() {
     manifest.created_by = forged;
     manifest.auth_context.user_id = forged;
     manifest.writer_auth_context = None;
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(12, 12),
         iroh::SecretKey::from_bytes(&[70; 32]).public(),
         test_realm_id(),
@@ -737,7 +725,7 @@ fn reference_keeps_count() {
     let op = advance_operation(manifest, publisher);
     assert_eq!(
         op.reference_version().unwrap_err(),
-        IncomingVersionReplicationError::MissingReferenceAdvanceCount
+        IncomingVersionError::MissingReferenceAdvanceCount
     );
 }
 
@@ -753,11 +741,11 @@ fn advance_needs_bucket() {
         value: None,
     }));
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(!op.create_attempted);
     expect_rejected_negotiation(
         &effects[0],
-        IncomingVersionReplicationError::DestinationBucketNotFound
+        IncomingVersionError::DestinationBucketNotFound
             .to_string()
             .as_str(),
     );
@@ -793,9 +781,7 @@ fn advance_requires_predecessor() {
         }));
         assert!(matches!(
             op.output,
-            Some(Err(
-                IncomingVersionReplicationError::InvalidReferenceAdvance
-            ))
+            Some(Err(IncomingVersionError::InvalidReferenceAdvance))
         ));
     }
 
@@ -816,9 +802,7 @@ fn advance_requires_predecessor() {
     }));
     assert!(matches!(
         op.output,
-        Some(Err(
-            IncomingVersionReplicationError::InvalidReferenceAdvance
-        ))
+        Some(Err(IncomingVersionError::InvalidReferenceAdvance))
     ));
 }
 
@@ -876,10 +860,10 @@ fn advance_rejects_collision() {
         value: Some(collision.to_bytes().unwrap().into()),
     }));
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
         &effects[0],
-        IncomingVersionReplicationError::InvalidReferenceAdvance
+        IncomingVersionError::InvalidReferenceAdvance
             .to_string()
             .as_str(),
     );
@@ -898,7 +882,7 @@ fn later_head_noop() {
         value: Some(duplicate.to_bytes().unwrap().into()),
     }));
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
@@ -934,7 +918,7 @@ fn later_head_noop() {
     };
     assert_eq!(key_space, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE);
     assert_eq!(*write_txn_id, Some(txn_id));
-    let obligation = LiveReplicationObligationRecord::from_bytes(value).unwrap();
+    let obligation = LiveObligationRecord::from_bytes(value).unwrap();
     assert_eq!(obligation.reference_advance, Some(advance));
     assert_eq!(op.usage_delta().unwrap(), UsageDelta::default());
 
@@ -952,7 +936,7 @@ fn later_head_noop() {
 fn replacement_cleans_metadata() {
     let manifest = make_manifest(ReplicationItemKind::Materialized);
     let version_id = manifest.version_id;
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(14, 14),
         iroh::SecretKey::from_bytes(&[71; 32]).public(),
         test_realm_id(),
@@ -977,9 +961,7 @@ fn replacement_cleans_metadata() {
                 && *effect_txn == Some(txn_id)
     ));
 
-    let part_key = MultipartObjectMetadataKey::part(version_id, 3)
-        .to_bytes()
-        .unwrap();
+    let part_key = MultipartObjectKey::part(version_id, 3).to_bytes().unwrap();
     let mut effects = op.step(Event::Storage(StorageEvent::IterResult {
         values: vec![(part_key.clone().into(), vec![1u8].into())],
         next_start_after: None,
@@ -992,9 +974,7 @@ fn replacement_cleans_metadata() {
         panic!("expected replacement metadata batch delete")
     };
     assert_eq!(effect_txn, Some(txn_id));
-    let summary_key = MultipartObjectMetadataKey::summary(version_id)
-        .to_bytes()
-        .unwrap();
+    let summary_key = MultipartObjectKey::summary(version_id).to_bytes().unwrap();
     assert!(deletes.iter().any(|(key_space, key)| {
         key_space == S3_MULTIPART_OBJECT_METADATA_KEYSPACE && key.as_ref() == summary_key
     }));
@@ -1003,17 +983,13 @@ fn replacement_cleans_metadata() {
     }));
     assert!(deletes.iter().any(|(key_space, key)| {
         key_space == HASH_PATHS_INDEX_KEYSPACE
-            && HashPathIndexKey::from_bytes(key.as_ref())
-                .is_ok_and(|index| index.blake3_hash == [9u8; 32])
+            && HashIndex::from_bytes(key.as_ref()).is_ok_and(|index| index.blake3_hash == [9u8; 32])
     }));
 
     let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
         entries: deletes,
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::WriteReclaimCandidate
-    );
+    assert_eq!(op.state, IncomingVersionState::WriteReclaimCandidate);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Write { key_space, .. })]
@@ -1023,7 +999,7 @@ fn replacement_cleans_metadata() {
     let effects = op.step(Event::Storage(StorageEvent::WriteResult {
         key: vec![0u8; 4].into(),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadObjectLookup);
+    assert_eq!(op.state, IncomingVersionState::ReadObjectLookup);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { key_space, .. })]
@@ -1035,7 +1011,7 @@ fn replacement_cleans_metadata() {
 fn replacement_queues_reclaim() {
     // The copy a replaced materialized version named is unreferenced once
     // the replacement names a different one, and only this enqueue frees it.
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(16, 16),
         iroh::SecretKey::from_bytes(&[72; 32]).public(),
         test_realm_id(),
@@ -1071,7 +1047,7 @@ fn replacement_queues_reclaim() {
 #[test]
 fn replaced_version_fenced() {
     let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(18, 18),
         iroh::SecretKey::from_bytes(&[73; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -1079,7 +1055,7 @@ fn replaced_version_fenced() {
     );
     let prior = BlobVersion::deleted(manifest.created_at, manifest.created_by);
     op.replaced_version = Some(prior);
-    op.state = IncomingVersionReplicationState::StartTransaction;
+    op.state = IncomingVersionState::StartTransaction;
     op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
     op.destination_group_id = Some(Ulid::from_parts(19, 19));
 
@@ -1108,10 +1084,10 @@ fn replaced_version_fenced() {
         value: Some(current.to_bytes().unwrap().into()),
     }));
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
     assert!(matches!(
         op.output,
-        Some(Err(IncomingVersionReplicationError::StorageError(
+        Some(Err(IncomingVersionError::StorageError(
             StorageError::TransactionConflict
         )))
     ));
@@ -1124,7 +1100,7 @@ fn replaced_version_fenced() {
 #[test]
 fn changed_reference_updates() {
     let manifest = make_reference_manifest();
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(21, 21),
         iroh::SecretKey::from_bytes(&[74; 32]).public(),
         test_realm_id(),
@@ -1146,7 +1122,7 @@ fn changed_reference_updates() {
         value: Some(existing.to_bytes().unwrap().into()),
     }));
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
@@ -1162,7 +1138,7 @@ fn hop_limit_rejects() {
         relationship_id: Ulid::from_parts(22, 22),
         hop_count: 5,
     });
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(23, 23),
         iroh::SecretKey::from_bytes(&[75; 32]).public(),
         test_realm_id(),
@@ -1171,12 +1147,10 @@ fn hop_limit_rejects() {
 
     let effects = op.start();
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
         &effects[0],
-        IncomingVersionReplicationError::HopLimitExceeded
-            .to_string()
-            .as_str(),
+        IncomingVersionError::HopLimitExceeded.to_string().as_str(),
     );
 }
 
@@ -1187,7 +1161,7 @@ fn rejects_manifest_size() {
         "metadata".to_string(),
         "x".repeat(MAX_REPLICATION_VALUE_BYTES + 1),
     );
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(24, 24),
         iroh::SecretKey::from_bytes(&[76; 32]).public(),
         test_realm_id(),
@@ -1196,7 +1170,7 @@ fn rejects_manifest_size() {
 
     let effects = op.start();
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
         &effects[0],
         "Failed to convert from str: replication manifest entry is too large",
@@ -1208,7 +1182,7 @@ fn rejects_user_realm() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     manifest.auth_context.user_id =
         UserId::local(Ulid::from_parts(25, 25), RealmId::from_bytes([8u8; 32]));
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(26, 26),
         iroh::SecretKey::from_bytes(&[77; 32]).public(),
         test_realm_id(),
@@ -1217,12 +1191,10 @@ fn rejects_user_realm() {
 
     let effects = op.start();
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
         &effects[0],
-        IncomingVersionReplicationError::RealmMismatch
-            .to_string()
-            .as_str(),
+        IncomingVersionError::RealmMismatch.to_string().as_str(),
     );
 }
 
@@ -1242,7 +1214,7 @@ fn obligation_keeps_origin() {
         )
         .unwrap(),
     );
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(28, 28),
         iroh::SecretKey::from_bytes(&[78; 32]).public(),
         test_realm_id(),
@@ -1255,7 +1227,7 @@ fn obligation_keeps_origin() {
     let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
         panic!("expected live replication obligation write")
     };
-    let obligation = LiveReplicationObligationRecord::from_bytes(value).unwrap();
+    let obligation = LiveObligationRecord::from_bytes(value).unwrap();
     assert_eq!(obligation.origin, Some(origin));
     assert_eq!(obligation.upstream_sources, op.manifest.upstream_sources);
 }
@@ -1294,7 +1266,7 @@ fn obligation_keeps_lineage() {
         panic!("expected live replication obligation write")
     };
     assert_eq!(*write_txn_id, Some(txn_id));
-    let obligation = LiveReplicationObligationRecord::from_bytes(value).unwrap();
+    let obligation = LiveObligationRecord::from_bytes(value).unwrap();
     assert_eq!(obligation.auth_context, reader);
     assert_eq!(obligation.reference_advance, Some(advance));
     assert_eq!(obligation.origin, Some(origin));
@@ -1305,7 +1277,7 @@ fn obligation_keeps_lineage() {
 fn quota_excess_rejects() {
     let manifest = make_manifest(ReplicationItemKind::Materialized);
     let group_id = test_group_id();
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(29, 29),
         iroh::SecretKey::from_bytes(&[79; 32]).public(),
         test_realm_id(),
@@ -1316,7 +1288,7 @@ fn quota_excess_rejects() {
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadQuotaConfig);
+    assert_eq!(op.state, IncomingVersionState::ReadQuotaConfig);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { .. })]
@@ -1333,7 +1305,7 @@ fn quota_excess_rejects() {
         key: vec![0u8; 4].into(),
         value: Some(config_bytes.clone().into()),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::StartQuotaCheck);
+    assert_eq!(op.state, IncomingVersionState::StartQuotaCheck);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::StartTransaction {
@@ -1343,7 +1315,7 @@ fn quota_excess_rejects() {
 
     let txn_id = Ulid::from_parts(30, 30);
     let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::EnforceQuota);
+    assert_eq!(op.state, IncomingVersionState::EnforceQuota);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { txn_id: read_txn_id, .. })]
@@ -1361,14 +1333,14 @@ fn quota_excess_rejects() {
         values: Vec::new(),
         next_start_after: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::FinishQuotaCheck);
+    assert_eq!(op.state, IncomingVersionState::FinishQuotaCheck);
     assert_eq!(
         effects[0],
         Effect::Storage(StorageEffect::AbortTransaction { txn_id })
     );
 
     let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     match message_from_effect(&effects[0]) {
         VersionReplicationMessage::VersionNegotiationResponse(
             ReplicationNegotiationResult::Rejected(reason),
@@ -1385,7 +1357,7 @@ fn full_backend_rejects() {
     let group_id = test_group_id();
     let mut routing = NodeRouting::default();
     routing.catalog = routing.catalog.mark_full(BackendRef::DEFAULT_NODE_NAME);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(31, 31),
         iroh::SecretKey::from_bytes(&[80; 32]).public(),
         test_realm_id(),
@@ -1395,7 +1367,7 @@ fn full_backend_rejects() {
 
     let _effects = advance_version_lookup(&mut op, group_id);
     let effects = advance_blob_lookup(&mut op);
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
+    assert_eq!(op.state, IncomingVersionState::ReadExistingBlob);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { .. })]
@@ -1405,7 +1377,7 @@ fn full_backend_rejects() {
         value: None,
     }));
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     match message_from_effect(&effects[0]) {
         VersionReplicationMessage::VersionNegotiationResponse(
             ReplicationNegotiationResult::Rejected(reason),
@@ -1427,7 +1399,7 @@ fn full_backend_dedupes() {
     let group_id = test_group_id();
     let mut routing = NodeRouting::default();
     routing.catalog = routing.catalog.mark_full(BackendRef::DEFAULT_NODE_NAME);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(32, 32),
         iroh::SecretKey::from_bytes(&[81; 32]).public(),
         test_realm_id(),
@@ -1442,7 +1414,7 @@ fn full_backend_dedupes() {
         value: Some(existing.to_bytes().unwrap().into()),
     }));
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
@@ -1458,7 +1430,7 @@ fn marker_ignores_quota() {
     let group_id = test_group_id();
     let mut routing = NodeRouting::default();
     routing.catalog = routing.catalog.mark_full(BackendRef::DEFAULT_NODE_NAME);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(33, 33),
         iroh::SecretKey::from_bytes(&[82; 32]).public(),
         test_realm_id(),
@@ -1472,7 +1444,7 @@ fn marker_ignores_quota() {
         value: None,
     }));
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
@@ -1485,7 +1457,7 @@ fn marker_ignores_quota() {
 fn stale_pointer_skips() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     manifest.current_version_generation = Some(10);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(34, 34),
         iroh::SecretKey::from_bytes(&[83; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -1498,7 +1470,7 @@ fn stale_pointer_skips() {
         key: vec![0u8; 4].into(),
         value: Some(existing_pointer.to_bytes().unwrap().into()),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
+    assert_eq!(op.state, IncomingVersionState::WriteBlobVersion);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Write { key_space, txn_id: write_txn_id, .. })]
@@ -1512,14 +1484,14 @@ fn stale_pointer_skips() {
 fn rejects_missing_generation() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     manifest.current_version_generation = None;
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(36, 36),
         iroh::SecretKey::from_bytes(&[84; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
         manifest,
     );
     let txn_id = Ulid::from_parts(37, 37);
-    op.state = IncomingVersionReplicationState::StartTransaction;
+    op.state = IncomingVersionState::StartTransaction;
     op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
 
     op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
@@ -1538,12 +1510,10 @@ fn rejects_missing_generation() {
         value: None,
     }));
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
     assert!(matches!(
         &op.output,
-        Some(Err(
-            IncomingVersionReplicationError::MissingCurrentVersionGeneration
-        ))
+        Some(Err(IncomingVersionError::MissingCurrentVersionGeneration))
     ));
     assert!(matches!(
         message_from_effect(&effects[0]),
@@ -1554,7 +1524,7 @@ fn rejects_missing_generation() {
 #[test]
 fn rejects_bad_pointer() {
     let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(38, 38),
         iroh::SecretKey::from_bytes(&[85; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -1567,10 +1537,10 @@ fn rejects_bad_pointer() {
         value: Some(vec![255, 255, 255].into()),
     }));
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
     assert!(matches!(
         &op.output,
-        Some(Err(IncomingVersionReplicationError::ConversionError(_)))
+        Some(Err(IncomingVersionError::ConversionError(_)))
     ));
     assert!(matches!(
         message_from_effect(&effects[0]),
@@ -1582,7 +1552,7 @@ fn rejects_bad_pointer() {
 fn stale_pointer_writes() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     manifest.current_version_generation = Some(1);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(39, 39),
         iroh::SecretKey::from_bytes(&[86; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -1613,7 +1583,7 @@ fn preserves_source_binding() {
         .insert("mtime".to_string(), "1753272000.123456789".to_string());
     let expected_metadata = manifest.metadata.clone();
     manifest.current_version = false;
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(41, 41),
         iroh::SecretKey::from_bytes(&[87; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -1639,7 +1609,7 @@ fn indexes_noncurrent_version() {
     manifest.current_version = false;
     manifest.writer_auth_context = Some(manifest.auth_context.clone());
     let group_id = Ulid::from_parts(44, 44);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(45, 45),
         iroh::SecretKey::from_bytes(&[88; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -1662,7 +1632,7 @@ fn indexes_noncurrent_version() {
         panic!("expected hash path index write")
     };
     assert_eq!(key_space, HASH_PATHS_INDEX_KEYSPACE);
-    let index_key = HashPathIndexKey::from_bytes(key.as_ref()).unwrap();
+    let index_key = HashIndex::from_bytes(key.as_ref()).unwrap();
     assert_eq!(index_key.blake3_hash, [1u8; 32]);
     assert_eq!(index_key.version_id, manifest.version_id);
     assert_eq!(index_key.group_id, group_id);
@@ -1692,10 +1662,7 @@ fn indexes_noncurrent_version() {
     let effects = op.step(Event::Storage(StorageEvent::WriteResult {
         key: vec![0u8; 4].into(),
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::WriteLiveObligation
-    );
+    assert_eq!(op.state, IncomingVersionState::WriteLiveObligation);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Write { key_space, .. })]
@@ -1705,7 +1672,7 @@ fn indexes_noncurrent_version() {
     let effects = op.step(Event::Storage(StorageEvent::WriteResult {
         key: vec![0u8; 4].into(),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::UpdateUsage);
+    assert_eq!(op.state, IncomingVersionState::UpdateUsage);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::BatchRead { .. })]
@@ -1721,7 +1688,7 @@ fn indexes_noncurrent_version() {
     let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: Vec::new(),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CommitTransaction);
+    assert_eq!(op.state, IncomingVersionState::CommitTransaction);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::CommitTransaction { .. })]
@@ -1735,7 +1702,7 @@ fn newer_generation_rollback() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     manifest.version_id = incoming_version_id;
     manifest.current_version_generation = Some(20);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(47, 47),
         iroh::SecretKey::from_bytes(&[89; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -1748,10 +1715,7 @@ fn newer_generation_rollback() {
         key: vec![0u8; 4].into(),
         value: Some(existing_pointer.to_bytes().unwrap().into()),
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::ReadCurrentVersion
-    );
+    assert_eq!(op.state, IncomingVersionState::ReadCurrentVersion);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { key_space, .. })]
@@ -1801,7 +1765,7 @@ fn newer_generation_rollback() {
 fn materialized_restores_object() {
     let mut manifest = make_manifest(ReplicationItemKind::Materialized);
     manifest.current_version_generation = Some(2);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(48, 48),
         iroh::SecretKey::from_bytes(&[90; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -1814,10 +1778,7 @@ fn materialized_restores_object() {
         key: vec![0u8; 4].into(),
         value: Some(existing_pointer.to_bytes().unwrap().into()),
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::ReadCurrentVersion
-    );
+    assert_eq!(op.state, IncomingVersionState::ReadCurrentVersion);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { key_space, .. })]
@@ -1850,7 +1811,7 @@ fn higher_ulid_skips() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     manifest.version_id = incoming_version_id;
     manifest.current_version_generation = Some(7);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(50, 50),
         iroh::SecretKey::from_bytes(&[91; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -1863,7 +1824,7 @@ fn higher_ulid_skips() {
         key: vec![0u8; 4].into(),
         value: Some(existing_pointer.to_bytes().unwrap().into()),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
+    assert_eq!(op.state, IncomingVersionState::WriteBlobVersion);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Write { key_space, .. })]
@@ -1878,7 +1839,7 @@ fn lower_ulid_skips() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     manifest.version_id = incoming_version_id;
     manifest.current_version_generation = Some(7);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(51, 51),
         iroh::SecretKey::from_bytes(&[92; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -1891,7 +1852,7 @@ fn lower_ulid_skips() {
         key: vec![0u8; 4].into(),
         value: Some(existing_pointer.to_bytes().unwrap().into()),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
+    assert_eq!(op.state, IncomingVersionState::WriteBlobVersion);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Write { key_space, .. })]
@@ -1906,7 +1867,7 @@ fn canonical_auth_path() {
     manifest.key = "nested/file.txt".to_string();
     let local_node_id = iroh::SecretKey::from_bytes(&[93; 32]).public();
     let local_realm_id = RealmId::from_bytes([7u8; 32]);
-    let op = IncomingVersionReplicationOperation::new(
+    let op = IncomingVersionOperation::new(
         Ulid::from_parts(52, 52),
         local_node_id,
         local_realm_id,
@@ -1929,7 +1890,7 @@ fn canonical_auth_path() {
 #[test]
 fn mismatch_requests_transfer() {
     let manifest = make_manifest(ReplicationItemKind::Materialized);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(53, 53),
         iroh::SecretKey::from_bytes(&[94; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -1938,7 +1899,7 @@ fn mismatch_requests_transfer() {
 
     let _effects = advance_version_lookup(&mut op, Ulid::from_parts(54, 54));
     let effects = advance_blob_lookup(&mut op);
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
+    assert_eq!(op.state, IncomingVersionState::ReadExistingBlob);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { key_space, .. })]
@@ -1951,7 +1912,7 @@ fn mismatch_requests_transfer() {
         key: vec![0u8; 4].into(),
         value: Some(mismatched_location.to_bytes().unwrap().into()),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
@@ -1963,7 +1924,7 @@ fn mismatch_requests_transfer() {
 #[test]
 fn missing_blob_location() {
     let manifest = make_manifest(ReplicationItemKind::Materialized);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(55, 55),
         iroh::SecretKey::from_bytes(&[95; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -1973,7 +1934,7 @@ fn missing_blob_location() {
     let _effects = advance_version_lookup(&mut op, Ulid::from_parts(56, 56));
     let effects = advance_blob_lookup(&mut op);
 
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
+    assert_eq!(op.state, IncomingVersionState::ReadExistingBlob);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { key_space, .. })]
@@ -1986,11 +1947,8 @@ fn missing_blob_location() {
 fn probe_backend(
     rules: Vec<StorageRoutingRule>,
     inputs: GroupRoutingInputs,
-) -> (
-    IncomingVersionReplicationOperation,
-    aruna_core::types::Effects,
-) {
-    let mut op = IncomingVersionReplicationOperation::new(
+) -> (IncomingVersionOperation, aruna_core::types::Effects) {
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(57, 57),
         iroh::SecretKey::from_bytes(&[96; 32]).public(),
         test_realm_id(),
@@ -2026,7 +1984,7 @@ fn probed_key(effects: &aruna_core::types::Effects) -> Vec<u8> {
 fn refuses_vanished_copy() {
     // The adopted copy is re-read in the transaction, so a sweep that
     // removed it in between must fail the apply instead of committing.
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(58, 58),
         iroh::SecretKey::from_bytes(&[97; 32]).public(),
         test_realm_id(),
@@ -2038,10 +1996,7 @@ fn refuses_vanished_copy() {
     op.existing_blob_location = Some(make_location());
 
     let effects = op.begin_blob_location();
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::VerifyExistingBlob
-    );
+    assert_eq!(op.state, IncomingVersionState::VerifyExistingBlob);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { key_space, txn_id: read_txn, .. })]
@@ -2055,7 +2010,7 @@ fn refuses_vanished_copy() {
 
     assert_eq!(
         op.output,
-        Some(Err(IncomingVersionReplicationError::ExistingBlobChanged))
+        Some(Err(IncomingVersionError::ExistingBlobChanged))
     );
 }
 
@@ -2129,7 +2084,7 @@ fn keeps_loaded_inputs() {
 fn rejects_mismatched_blob() {
     let manifest = make_manifest(ReplicationItemKind::Materialized);
     let stream_id = Ulid::from_parts(60, 60);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         stream_id,
         iroh::SecretKey::from_bytes(&[98; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -2139,22 +2094,19 @@ fn rejects_mismatched_blob() {
     mismatched_location.blob_size += 1;
 
     op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobAndVersion);
-    op.state = IncomingVersionReplicationState::ReceiveBlob;
+    op.state = IncomingVersionState::ReceiveBlob;
 
     let effects = op.step(Event::Blob(BlobEvent::ReplicationFinished {
         location: mismatched_location.clone(),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionApplyRejected(_)
     ));
 
     let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::CleanupReceivedBlob
-    );
+    assert_eq!(op.state, IncomingVersionState::CleanupReceivedBlob);
     assert_eq!(
         effects[0],
         Effect::Blob(BlobEffect::Delete {
@@ -2168,14 +2120,14 @@ fn write_cleanup_rejects() {
     let manifest = make_manifest(ReplicationItemKind::Materialized);
     let stream_id = Ulid::from_parts(61, 61);
     let received = make_location();
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         stream_id,
         iroh::SecretKey::from_bytes(&[99; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
         manifest,
     );
     op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobAndVersion);
-    op.state = IncomingVersionReplicationState::ReceiveBlob;
+    op.state = IncomingVersionState::ReceiveBlob;
 
     let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteCleanup {
         location: received.clone(),
@@ -2186,17 +2138,14 @@ fn write_cleanup_rejects() {
         Some(received.clone())
     );
     assert!(op.received_blob.as_ref().unwrap().cleanup_on_abort);
-    assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionApplyRejected(_)
     ));
 
     let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::CleanupReceivedBlob
-    );
+    assert_eq!(op.state, IncomingVersionState::CleanupReceivedBlob);
     assert_eq!(
         effects[0],
         Effect::Blob(BlobEffect::Delete { location: received })
@@ -2208,7 +2157,7 @@ fn unbuildable_bucket_rejects() {
     // One create attempt, still missing, then reject and close the stream.
     let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     let stream_id = Ulid::from_parts(62, 62);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         stream_id,
         iroh::SecretKey::from_bytes(&[100; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -2222,10 +2171,7 @@ fn unbuildable_bucket_rejects() {
         key: b"bucket".to_vec().into(),
         value: None,
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::CreateDestinationBucket
-    );
+    assert_eq!(op.state, IncomingVersionState::CreateDestinationBucket);
     op.step(Event::SubOperation(SubOperationEvent::BucketCreated {
         result: Err("boom".to_string()),
     }));
@@ -2234,16 +2180,16 @@ fn unbuildable_bucket_rejects() {
         key: b"bucket".to_vec().into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
         &effects[0],
-        IncomingVersionReplicationError::DestinationBucketNotFound
+        IncomingVersionError::DestinationBucketNotFound
             .to_string()
             .as_str(),
     );
 
     let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CloseConnection);
+    assert_eq!(op.state, IncomingVersionState::CloseConnection);
     assert!(matches!(
         effects[0],
         Effect::Blob(BlobEffect::CloseConnection { .. })
@@ -2258,7 +2204,7 @@ fn rejects_denied_writer() {
     manifest.writer_auth_context = Some(manifest.auth_context.clone());
     let stream_id = Ulid::from_parts(63, 63);
     let group_id = Ulid::from_parts(64, 64);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         stream_id,
         iroh::SecretKey::from_bytes(&[101; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -2273,16 +2219,16 @@ fn rejects_denied_writer() {
         value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
     }));
     let effects = load_routing(&mut op, GroupRoutingInputs::default());
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
         &effects[0],
-        IncomingVersionReplicationError::WriterPermissionDenied
+        IncomingVersionError::WriterPermissionDenied
             .to_string()
             .as_str(),
     );
 
     let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CloseConnection);
+    assert_eq!(op.state, IncomingVersionState::CloseConnection);
     assert!(matches!(
         effects[0],
         Effect::Blob(BlobEffect::CloseConnection { .. })
@@ -2294,7 +2240,7 @@ fn rejects_missing_policy() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     manifest.writer_auth_context = Some(manifest.auth_context.clone());
     let group_id = Ulid::from_parts(65, 65);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(66, 66),
         iroh::SecretKey::from_bytes(&[102; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -2308,10 +2254,10 @@ fn rejects_missing_policy() {
         value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
     }));
     let effects = load_routing(&mut op, GroupRoutingInputs::default());
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
         &effects[0],
-        IncomingVersionReplicationError::WriterPermissionDenied
+        IncomingVersionError::WriterPermissionDenied
             .to_string()
             .as_str(),
     );
@@ -2319,7 +2265,7 @@ fn rejects_missing_policy() {
 
 #[test]
 fn rejects_manifest_policy() {
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(67, 67),
         iroh::SecretKey::from_bytes(&[103; 32]).public(),
         test_realm_id(),
@@ -2335,7 +2281,7 @@ fn rejects_manifest_policy() {
     let effects = load_routing(&mut op, GroupRoutingInputs::default());
     expect_rejected_negotiation(
         &effects[0],
-        IncomingVersionReplicationError::ManifestPermissionDenied
+        IncomingVersionError::ManifestPermissionDenied
             .to_string()
             .as_str(),
     );
@@ -2346,7 +2292,7 @@ fn rejects_missing_writer() {
     // Ordinary replication must carry its durable original writer.
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     manifest.writer_auth_context = None;
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(69, 69),
         iroh::SecretKey::from_bytes(&[104; 32]).public(),
         test_realm_id(),
@@ -2355,10 +2301,10 @@ fn rejects_missing_writer() {
 
     let effects = op.start();
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
         &effects[0],
-        IncomingVersionReplicationError::WriterPermissionDenied
+        IncomingVersionError::WriterPermissionDenied
             .to_string()
             .as_str(),
     );
@@ -2372,7 +2318,7 @@ fn rejects_relationship_writer() {
         hop_count: 0,
     });
     manifest.writer_auth_context = None;
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(71, 71),
         iroh::SecretKey::from_bytes(&[105; 32]).public(),
         test_realm_id(),
@@ -2381,10 +2327,10 @@ fn rejects_relationship_writer() {
 
     let effects = op.start();
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
         &effects[0],
-        IncomingVersionReplicationError::WriterPermissionDenied
+        IncomingVersionError::WriterPermissionDenied
             .to_string()
             .as_str(),
     );
@@ -2394,7 +2340,7 @@ fn rejects_relationship_writer() {
 fn allows_writer_policy() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     manifest.writer_auth_context = Some(manifest.auth_context.clone());
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(72, 72),
         iroh::SecretKey::from_bytes(&[106; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -2407,16 +2353,13 @@ fn allows_writer_policy() {
         .with_writer_policy(Some(path));
 
     let _effects = advance_version_lookup(&mut op, group_id);
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::ReadExistingVersion
-    );
+    assert_eq!(op.state, IncomingVersionState::ReadExistingVersion);
 }
 
 #[test]
 fn delete_marker_only() {
     let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(74, 74),
         iroh::SecretKey::from_bytes(&[107; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -2429,7 +2372,7 @@ fn delete_marker_only() {
         value: None,
     }));
 
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
@@ -2441,7 +2384,7 @@ fn delete_marker_only() {
 #[test]
 fn missing_blob_transfer() {
     let manifest = make_manifest(ReplicationItemKind::Materialized);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(76, 76),
         iroh::SecretKey::from_bytes(&[108; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -2450,7 +2393,7 @@ fn missing_blob_transfer() {
 
     let _effects = advance_version_lookup(&mut op, Ulid::from_parts(77, 77));
     let effects = advance_blob_lookup(&mut op);
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
+    assert_eq!(op.state, IncomingVersionState::ReadExistingBlob);
     assert!(matches!(
         effects[0],
         Effect::Storage(StorageEffect::Read { .. })
@@ -2460,7 +2403,7 @@ fn missing_blob_transfer() {
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
@@ -2474,7 +2417,7 @@ fn failure_rejects_first() {
     let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     let stream_id = Ulid::from_parts(78, 78);
     let txn_id = Ulid::from_parts(79, 79);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         stream_id,
         iroh::SecretKey::from_bytes(&[109; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -2482,25 +2425,25 @@ fn failure_rejects_first() {
     );
 
     op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
-    op.state = IncomingVersionReplicationState::ApplyHeadTransition;
+    op.state = IncomingVersionState::ApplyHeadTransition;
     op.txn_id = Some(txn_id);
 
     let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionApplyRejected(_)
     ));
 
     let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::AbortTransaction);
+    assert_eq!(op.state, IncomingVersionState::AbortTransaction);
     assert_eq!(
         effects[0],
         Effect::Storage(StorageEffect::AbortTransaction { txn_id })
     );
 
     let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CloseConnection);
+    assert_eq!(op.state, IncomingVersionState::CloseConnection);
     assert!(matches!(
         effects[0],
         Effect::Blob(BlobEffect::CloseConnection { .. })
@@ -2513,7 +2456,7 @@ fn failure_deletes_blobs() {
     let stream_id = Ulid::from_parts(80, 80);
     let received = make_location();
     let txn_id = Ulid::from_parts(81, 81);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         stream_id,
         iroh::SecretKey::from_bytes(&[110; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -2521,36 +2464,33 @@ fn failure_deletes_blobs() {
     );
     op.negotiation_result =
         Some(aruna_core::structs::ReplicationNegotiationResult::NeedBlobAndVersion);
-    op.state = IncomingVersionReplicationState::WriteBlobLocation;
+    op.state = IncomingVersionState::WriteBlobLocation;
     op.txn_id = Some(txn_id);
     op.received_blob = Some(ReceivedBlob::reserved(received.clone()));
 
     let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionApplyRejected(_)
     ));
 
     let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::AbortTransaction);
+    assert_eq!(op.state, IncomingVersionState::AbortTransaction);
     assert_eq!(
         effects[0],
         Effect::Storage(StorageEffect::AbortTransaction { txn_id })
     );
 
     let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::CleanupReceivedBlob
-    );
+    assert_eq!(op.state, IncomingVersionState::CleanupReceivedBlob);
     assert_eq!(
         effects[0],
         Effect::Blob(BlobEffect::Delete { location: received })
     );
 
     let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
-    assert_eq!(op.state, IncomingVersionReplicationState::CloseConnection);
+    assert_eq!(op.state, IncomingVersionState::CloseConnection);
     assert!(matches!(
         effects[0],
         Effect::Blob(BlobEffect::CloseConnection { .. })
@@ -2562,7 +2502,7 @@ fn unknown_commit_preserves() {
     let manifest = make_manifest(ReplicationItemKind::Materialized);
     let received = make_location();
     let txn_id = Ulid::from_parts(82, 82);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(83, 83),
         iroh::SecretKey::from_bytes(&[111; 32]).public(),
         test_realm_id(),
@@ -2602,7 +2542,7 @@ fn unknown_commit_preserves() {
     let effects = op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"cleanup".to_vec().into(),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CommitTransaction);
+    assert_eq!(op.state, IncomingVersionState::CommitTransaction);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::CommitTransaction { txn_id: id })] if *id == txn_id
@@ -2610,10 +2550,7 @@ fn unknown_commit_preserves() {
     let effects = op.step(Event::Storage(StorageEvent::Error {
         error: StorageError::CommitFailed,
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::ReleaseReservation
-    );
+    assert_eq!(op.state, IncomingVersionState::ReleaseReservation);
     assert_eq!(op.txn_id, None);
     assert!(!op.received_blob.as_ref().unwrap().cleanup_on_abort);
     assert_eq!(
@@ -2625,7 +2562,7 @@ fn unknown_commit_preserves() {
     let effects = op.step(Event::Blob(BlobEvent::ReservationReleased {
         id: release_id,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionApplyRejected(_)
@@ -2647,13 +2584,13 @@ fn unknown_commit_preserves() {
 fn release_after_commit() {
     let received = make_location();
     let id = received.ulid;
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(84, 84),
         iroh::SecretKey::from_bytes(&[112; 32]).public(),
         test_realm_id(),
         make_manifest(ReplicationItemKind::Materialized),
     );
-    op.state = IncomingVersionReplicationState::CommitTransaction;
+    op.state = IncomingVersionState::CommitTransaction;
     op.txn_id = Some(Ulid::from_parts(85, 85));
     op.received_blob = Some(ReceivedBlob::reserved(received));
 
@@ -2664,13 +2601,10 @@ fn release_after_commit() {
         effects.as_slice(),
         [Effect::Blob(BlobEffect::ReleaseReservation { id: observed })] if *observed == id
     ));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::ReleaseReservation
-    );
+    assert_eq!(op.state, IncomingVersionState::ReleaseReservation);
 
     let effects = op.step(Event::Blob(BlobEvent::ReservationReleased { id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ScheduleUsage);
+    assert_eq!(op.state, IncomingVersionState::ScheduleUsage);
     assert_eq!(effects.len(), 1);
 }
 
@@ -2680,37 +2614,34 @@ fn conflict_commit_deletes() {
     let stream_id = Ulid::from_parts(87, 87);
     let received = make_location();
     let txn_id = Ulid::from_parts(88, 88);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         stream_id,
         iroh::SecretKey::from_bytes(&[113; 32]).public(),
         test_realm_id(),
         manifest,
     );
     op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobAndVersion);
-    op.state = IncomingVersionReplicationState::CommitTransaction;
+    op.state = IncomingVersionState::CommitTransaction;
     op.txn_id = Some(txn_id);
     op.received_blob = Some(ReceivedBlob::reserved(received.clone()));
 
     let effects = op.step(Event::Storage(StorageEvent::Error {
         error: StorageError::TransactionConflict,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionApplyRejected(_)
     ));
 
     let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::AbortTransaction);
+    assert_eq!(op.state, IncomingVersionState::AbortTransaction);
     assert_eq!(
         effects[0],
         Effect::Storage(StorageEffect::AbortTransaction { txn_id })
     );
     let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::CleanupReceivedBlob
-    );
+    assert_eq!(op.state, IncomingVersionState::CleanupReceivedBlob);
     assert_eq!(
         effects[0],
         Effect::Blob(BlobEffect::Delete { location: received })
@@ -2721,13 +2652,13 @@ fn conflict_commit_deletes() {
 fn commit_abort_preserves() {
     let received = make_location();
     let txn_id = Ulid::from_parts(89, 89);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(90, 90),
         iroh::SecretKey::from_bytes(&[114; 32]).public(),
         test_realm_id(),
         make_manifest(ReplicationItemKind::Materialized),
     );
-    op.state = IncomingVersionReplicationState::CommitTransaction;
+    op.state = IncomingVersionState::CommitTransaction;
     op.txn_id = Some(txn_id);
     op.received_blob = Some(ReceivedBlob::reserved(received));
 
@@ -2745,7 +2676,7 @@ fn failure_without_delete() {
     let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     let stream_id = Ulid::from_parts(91, 91);
     let txn_id = Ulid::from_parts(92, 92);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         stream_id,
         iroh::SecretKey::from_bytes(&[115; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -2753,25 +2684,25 @@ fn failure_without_delete() {
     );
     op.negotiation_result =
         Some(aruna_core::structs::ReplicationNegotiationResult::NeedVersionOnly);
-    op.state = IncomingVersionReplicationState::ApplyHeadTransition;
+    op.state = IncomingVersionState::ApplyHeadTransition;
     op.txn_id = Some(txn_id);
 
     let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+    assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionApplyRejected(_)
     ));
 
     let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::AbortTransaction);
+    assert_eq!(op.state, IncomingVersionState::AbortTransaction);
     assert_eq!(
         effects[0],
         Effect::Storage(StorageEffect::AbortTransaction { txn_id })
     );
 
     let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CloseConnection);
+    assert_eq!(op.state, IncomingVersionState::CloseConnection);
     assert!(matches!(
         effects[0],
         Effect::Blob(BlobEffect::CloseConnection { .. })
@@ -2783,7 +2714,7 @@ fn commit_preserves_blob() {
     let manifest = make_manifest(ReplicationItemKind::Materialized);
     let stream_id = Ulid::from_parts(93, 93);
     let received = make_location();
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         stream_id,
         iroh::SecretKey::from_bytes(&[116; 32]).public(),
         RealmId::from_bytes([7u8; 32]),
@@ -2791,14 +2722,14 @@ fn commit_preserves_blob() {
     );
     op.negotiation_result =
         Some(aruna_core::structs::ReplicationNegotiationResult::NeedBlobAndVersion);
-    op.state = IncomingVersionReplicationState::RegisterBlobInDht;
+    op.state = IncomingVersionState::RegisterBlobInDht;
     op.received_blob = Some(ReceivedBlob::owned(received));
     op.apply_committed = true;
 
     let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
         txn_id: Ulid::from_parts(94, 94),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::Error);
+    assert_eq!(op.state, IncomingVersionState::Error);
     assert_eq!(effects.len(), 1);
     assert!(matches!(
         effects[0],
@@ -2806,9 +2737,9 @@ fn commit_preserves_blob() {
     ));
 }
 
-fn missing_bucket_op() -> IncomingVersionReplicationOperation {
+fn missing_bucket_op() -> IncomingVersionOperation {
     let manifest = make_manifest(ReplicationItemKind::Materialized);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(95, 95),
         iroh::SecretKey::from_bytes(&[117; 32]).public(),
         test_realm_id(),
@@ -2827,10 +2758,7 @@ fn missing_bucket_op() -> IncomingVersionReplicationOperation {
 #[test]
 fn missing_bucket_autocreates() {
     let op = missing_bucket_op();
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::CreateDestinationBucket
-    );
+    assert_eq!(op.state, IncomingVersionState::CreateDestinationBucket);
     assert!(op.create_attempted);
     let info = op.destination_bucket_info();
     assert_eq!(info.group_id, test_group_id());
@@ -2844,10 +2772,7 @@ fn autocreate_rereads_bucket() {
     let effects = op.step(Event::SubOperation(SubOperationEvent::BucketCreated {
         result: Ok(()),
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::ReadDestinationBucket
-    );
+    assert_eq!(op.state, IncomingVersionState::ReadDestinationBucket);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { key_space, .. })]
@@ -2861,20 +2786,20 @@ fn create_invalid_event() {
     op.step(Event::Storage(StorageEvent::TransactionStarted {
         txn_id: Ulid::from_parts(96, 96),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::Error);
+    assert_eq!(op.state, IncomingVersionState::Error);
 }
 
 /// Constructor-to-finalize trace of a materialized replica: every real
 /// transition runs, from the bucket probe through the blob transfer, the
 /// apply transaction and the committed apply acknowledgement.
 #[test]
-fn materialized_apply_traces_to_finalize() {
+fn materialized_trace() {
     let stream_id = trace_stream_id();
     let txn_id = trace_txn_id();
     let group_id = test_group_id();
     let received = make_location();
     let manifest = make_manifest(ReplicationItemKind::Materialized);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         stream_id,
         iroh::SecretKey::from_bytes(&[0x30; 32]).public(),
         test_realm_id(),
@@ -2886,10 +2811,7 @@ fn materialized_apply_traces_to_finalize() {
     op.writer_policy = Some(op.target_authorization_path(group_id));
 
     let effects = op.start();
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::ReadDestinationBucket
-    );
+    assert_eq!(op.state, IncomingVersionState::ReadDestinationBucket);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { .. })]
@@ -2899,37 +2821,31 @@ fn materialized_apply_traces_to_finalize() {
         key: b"bucket".to_vec().into(),
         value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::LoadDestinationRouting
-    );
+    assert_eq!(op.state, IncomingVersionState::LoadDestinationRouting);
     assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
 
     op.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
         result: Ok(GroupRoutingInputs::default()),
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::ReadExistingVersion
-    );
+    assert_eq!(op.state, IncomingVersionState::ReadExistingVersion);
 
     op.step(Event::Storage(StorageEvent::ReadResult {
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadQuotaConfig);
+    assert_eq!(op.state, IncomingVersionState::ReadQuotaConfig);
 
     op.step(Event::Storage(StorageEvent::ReadResult {
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
+    assert_eq!(op.state, IncomingVersionState::ReadExistingBlob);
 
     let effects = op.step(Event::Storage(StorageEvent::ReadResult {
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
@@ -2938,7 +2854,7 @@ fn materialized_apply_traces_to_finalize() {
     ));
 
     let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ReceiveBlob);
+    assert_eq!(op.state, IncomingVersionState::ReceiveBlob);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Blob(BlobEffect::HandleReplication { stream_id: id, .. })] if *id == stream_id
@@ -2947,7 +2863,7 @@ fn materialized_apply_traces_to_finalize() {
     let effects = op.step(Event::Blob(BlobEvent::ReplicationFinished {
         location: received.clone(),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::StartTransaction);
+    assert_eq!(op.state, IncomingVersionState::StartTransaction);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::StartTransaction {
@@ -2956,7 +2872,7 @@ fn materialized_apply_traces_to_finalize() {
     ));
 
     let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CheckPurgeFence);
+    assert_eq!(op.state, IncomingVersionState::CheckPurgeFence);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { txn_id: Some(id), .. })] if *id == txn_id
@@ -2966,31 +2882,28 @@ fn materialized_apply_traces_to_finalize() {
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CheckDrift);
+    assert_eq!(op.state, IncomingVersionState::CheckDrift);
 
     op.step(bucket_drift(&make_bucket_info(group_id)));
-    assert_eq!(op.state, IncomingVersionReplicationState::VerifyReplaced);
+    assert_eq!(op.state, IncomingVersionState::VerifyReplaced);
 
     op.step(Event::Storage(StorageEvent::ReadResult {
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobLocation);
+    assert_eq!(op.state, IncomingVersionState::WriteBlobLocation);
     assert_eq!(op.received_blob.as_ref().unwrap().location, received);
 
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"location".to_vec().into(),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadObjectLookup);
+    assert_eq!(op.state, IncomingVersionState::ReadObjectLookup);
 
     op.step(Event::Storage(StorageEvent::ReadResult {
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::ApplyHeadTransition
-    );
+    assert_eq!(op.state, IncomingVersionState::ApplyHeadTransition);
 
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"head-index".to_vec().into(),
@@ -2998,7 +2911,7 @@ fn materialized_apply_traces_to_finalize() {
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"version".to_vec().into(),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
+    assert_eq!(op.state, IncomingVersionState::WriteBlobVersion);
 
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"index".to_vec().into(),
@@ -3009,15 +2922,12 @@ fn materialized_apply_traces_to_finalize() {
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"obligation".to_vec().into(),
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::WriteLiveObligation
-    );
+    assert_eq!(op.state, IncomingVersionState::WriteLiveObligation);
 
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"obligation".to_vec().into(),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::UpdateUsage);
+    assert_eq!(op.state, IncomingVersionState::UpdateUsage);
 
     op.step(Event::Storage(StorageEvent::BatchReadResult {
         values: vec![(vec![0].into(), None), (vec![1].into(), None)],
@@ -3025,50 +2935,47 @@ fn materialized_apply_traces_to_finalize() {
     op.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: Vec::new(),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::WriteCleanupRow);
+    assert_eq!(op.state, IncomingVersionState::WriteCleanupRow);
 
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"cleanup".to_vec().into(),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CommitTransaction);
+    assert_eq!(op.state, IncomingVersionState::CommitTransaction);
 
     op.step(Event::Storage(StorageEvent::TransactionCommitted {
         txn_id,
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::ReleaseReservation
-    );
+    assert_eq!(op.state, IncomingVersionState::ReleaseReservation);
 
     op.step(Event::Blob(BlobEvent::ReservationReleased {
         id: received.ulid,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ScheduleUsage);
+    assert_eq!(op.state, IncomingVersionState::ScheduleUsage);
 
     op.step(Event::Task(TaskEvent::TimerScheduled {
         key: TaskKey::PublishUsageSnapshots,
         after: Duration::from_secs(1),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ScheduleLiveDrain);
+    assert_eq!(op.state, IncomingVersionState::ScheduleLiveDrain);
 
     op.step(Event::Task(TaskEvent::TimerScheduled {
         key: TaskKey::DrainBlobReplicationQueue,
         after: Duration::from_secs(1),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::RegisterBlobInDht);
+    assert_eq!(op.state, IncomingVersionState::RegisterBlobInDht);
 
     op.step(Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
         key: DhtKeyId::from_bytes([1u8; 32]),
         remote_attempt_count: 0,
         remote_store_count: 0,
     })));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendApplyComplete);
+    assert_eq!(op.state, IncomingVersionState::SendApplyComplete);
 
     op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CloseConnection);
+    assert_eq!(op.state, IncomingVersionState::CloseConnection);
 
     op.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::Finish);
+    assert_eq!(op.state, IncomingVersionState::Finish);
     assert!(op.is_complete());
 
     let result = op.finalize().expect("trace commits successfully");
@@ -3080,12 +2987,12 @@ fn materialized_apply_traces_to_finalize() {
 /// transferred, the head is cleared and the apply acknowledgement closes
 /// the stream.
 #[test]
-fn delete_marker_apply_traces_to_finalize() {
+fn delete_marker_trace() {
     let stream_id = trace_stream_id();
     let txn_id = trace_txn_id();
     let group_id = test_group_id();
     let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         stream_id,
         iroh::SecretKey::from_bytes(&[0x30; 32]).public(),
         test_realm_id(),
@@ -3108,7 +3015,7 @@ fn delete_marker_apply_traces_to_finalize() {
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
@@ -3117,7 +3024,7 @@ fn delete_marker_apply_traces_to_finalize() {
     ));
 
     op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::StartTransaction);
+    assert_eq!(op.state, IncomingVersionState::StartTransaction);
     op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
     op.step(Event::Storage(StorageEvent::ReadResult {
         key: vec![0u8; 4].into(),
@@ -3128,54 +3035,48 @@ fn delete_marker_apply_traces_to_finalize() {
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ReadObjectLookup);
+    assert_eq!(op.state, IncomingVersionState::ReadObjectLookup);
 
     op.step(Event::Storage(StorageEvent::ReadResult {
         key: vec![0u8; 4].into(),
         value: None,
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::ApplyHeadTransition
-    );
+    assert_eq!(op.state, IncomingVersionState::ApplyHeadTransition);
 
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"head".to_vec().into(),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
+    assert_eq!(op.state, IncomingVersionState::WriteBlobVersion);
 
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"version".to_vec().into(),
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::WriteLiveObligation
-    );
+    assert_eq!(op.state, IncomingVersionState::WriteLiveObligation);
 
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"obligation".to_vec().into(),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CommitTransaction);
+    assert_eq!(op.state, IncomingVersionState::CommitTransaction);
 
     op.step(Event::Storage(StorageEvent::TransactionCommitted {
         txn_id,
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ScheduleUsage);
+    assert_eq!(op.state, IncomingVersionState::ScheduleUsage);
     op.step(Event::Task(TaskEvent::TimerScheduled {
         key: TaskKey::PublishUsageSnapshots,
         after: Duration::from_secs(1),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::ScheduleLiveDrain);
+    assert_eq!(op.state, IncomingVersionState::ScheduleLiveDrain);
     op.step(Event::Task(TaskEvent::TimerScheduled {
         key: TaskKey::DrainBlobReplicationQueue,
         after: Duration::from_secs(1),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendApplyComplete);
+    assert_eq!(op.state, IncomingVersionState::SendApplyComplete);
 
     op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CloseConnection);
+    assert_eq!(op.state, IncomingVersionState::CloseConnection);
     op.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::Finish);
+    assert_eq!(op.state, IncomingVersionState::Finish);
 
     let result = op.finalize().expect("delete marker commits successfully");
     assert!(result.applied);
@@ -3185,10 +3086,10 @@ fn delete_marker_apply_traces_to_finalize() {
 /// A refused negotiation runs constructor-to-finalize without entering the
 /// apply at all and reports `applied: false`.
 #[test]
-fn rejected_negotiation_traces_to_finalize() {
+fn rejected_trace() {
     let stream_id = trace_stream_id();
     let group_id = test_group_id();
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         stream_id,
         iroh::SecretKey::from_bytes(&[0x30; 32]).public(),
         test_realm_id(),
@@ -3206,31 +3107,30 @@ fn rejected_negotiation_traces_to_finalize() {
     let effects = op.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
         result: Ok(GroupRoutingInputs::default()),
     }));
-    assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(&effects[0], "writer_access_denied");
 
     op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::CloseConnection);
+    assert_eq!(op.state, IncomingVersionState::CloseConnection);
     op.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
-    assert_eq!(op.state, IncomingVersionReplicationState::Finish);
+    assert_eq!(op.state, IncomingVersionState::Finish);
 
     let result = op.finalize().expect("rejection is a clean result");
     assert!(!result.applied);
     assert_eq!(result.group_id, Some(group_id));
 }
 
-/// A long apply must stamp the reclaim candidate when the enqueue phase
-/// runs, not when the operation was constructed: the grace window starts at
-/// enqueue, otherwise an operation-start time already older than the grace
-/// would make the sweep treat the copy as immediately reclaimable.
+/// A long apply must stamp the reclaim candidate at the enqueue phase, not at
+/// construction: a grace starting at operation construction could make the sweep
+/// treat an already-old copy as immediately reclaimable.
 #[test]
-fn reclaim_candidate_stamps_enqueue_time_after_long_apply() {
+fn reclaim_uses_enqueue() {
     let started_at = trace_now();
     let enqueued_at = started_at + Duration::from_secs(6 * 60 * 60);
     set_controlled_clock(started_at);
     let manifest = make_manifest(ReplicationItemKind::Materialized);
     let version_id = manifest.version_id;
-    let mut op = IncomingVersionReplicationOperation::new(
+    let mut op = IncomingVersionOperation::new(
         trace_stream_id(),
         iroh::SecretKey::from_bytes(&[0x30; 32]).public(),
         test_realm_id(),
@@ -3248,9 +3148,7 @@ fn reclaim_candidate_stamps_enqueue_time_after_long_apply() {
     ));
 
     op.read_replaced_metadata();
-    let part_key = MultipartObjectMetadataKey::part(version_id, 3)
-        .to_bytes()
-        .unwrap();
+    let part_key = MultipartObjectKey::part(version_id, 3).to_bytes().unwrap();
     op.step(Event::Storage(StorageEvent::IterResult {
         values: vec![(part_key.into(), vec![1u8].into())],
         next_start_after: None,
@@ -3261,10 +3159,7 @@ fn reclaim_candidate_stamps_enqueue_time_after_long_apply() {
     let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
         entries: Vec::new(),
     }));
-    assert_eq!(
-        op.state,
-        IncomingVersionReplicationState::WriteReclaimCandidate
-    );
+    assert_eq!(op.state, IncomingVersionState::WriteReclaimCandidate);
     let [
         Effect::Storage(StorageEffect::Write {
             key_space, value, ..
@@ -3283,16 +3178,16 @@ fn reclaim_candidate_stamps_enqueue_time_after_long_apply() {
 // and every in-flight negotiation, transfer, and commit phase must not report
 // the applied default.
 #[test]
-fn premature_finalize_is_rejected_in_every_nonterminal_state() {
+fn rejects_early_finalize() {
     for state in [
-        IncomingVersionReplicationState::Init,
-        IncomingVersionReplicationState::SendNegotiation,
-        IncomingVersionReplicationState::ReceiveBlob,
-        IncomingVersionReplicationState::CommitTransaction,
-        IncomingVersionReplicationState::ReleaseReservation,
-        IncomingVersionReplicationState::CloseConnection,
+        IncomingVersionState::Init,
+        IncomingVersionState::SendNegotiation,
+        IncomingVersionState::ReceiveBlob,
+        IncomingVersionState::CommitTransaction,
+        IncomingVersionState::ReleaseReservation,
+        IncomingVersionState::CloseConnection,
     ] {
-        let mut op = IncomingVersionReplicationOperation::new(
+        let mut op = IncomingVersionOperation::new(
             trace_stream_id(),
             iroh::SecretKey::from_bytes(&[0x30; 32]).public(),
             test_realm_id(),
@@ -3302,7 +3197,7 @@ fn premature_finalize_is_rejected_in_every_nonterminal_state() {
         op.state = state.clone();
         assert_eq!(
             op.finalize(),
-            Err(IncomingVersionReplicationError::NotFinished),
+            Err(IncomingVersionError::NotFinished),
             "{state:?} must reject finalization"
         );
     }
@@ -3311,17 +3206,14 @@ fn premature_finalize_is_rejected_in_every_nonterminal_state() {
 // A failure recorded through the operation's own failure path reaches
 // finalization as the operation error, not as a successful default.
 #[test]
-fn failed_state_finalizes_to_the_recorded_error() {
-    let mut op = IncomingVersionReplicationOperation::new(
+fn failure_survives_finalize() {
+    let mut op = IncomingVersionOperation::new(
         trace_stream_id(),
         iroh::SecretKey::from_bytes(&[0x30; 32]).public(),
         test_realm_id(),
         make_manifest(ReplicationItemKind::Materialized),
     )
     .with_clock(fixed_trace_clock);
-    op.fail(IncomingVersionReplicationError::RealmMismatch);
-    assert_eq!(
-        op.finalize(),
-        Err(IncomingVersionReplicationError::RealmMismatch)
-    );
+    op.fail(IncomingVersionError::RealmMismatch);
+    assert_eq!(op.finalize(), Err(IncomingVersionError::RealmMismatch));
 }
