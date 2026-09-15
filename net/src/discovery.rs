@@ -10,9 +10,9 @@ use aruna_core::effects::{DhtGetOptions, StorageEffect};
 use aruna_core::events::{DhtEntry, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keys::realm_endpoint_key;
-use aruna_core::structs::{
-    NetworkDiagnosticsState, RealmConfigDocument, RealmEndpointAnnouncement, RealmId,
-    endpoint_signing_bytes,
+use aruna_core::structs::NetworkDiagnosticsState;
+use aruna_core::structs::identity::realm::{
+    RealmConfigDocument, RealmEndpointAnnouncement, RealmId, endpoint_signing_bytes,
 };
 use aruna_core::time::unix_timestamp_secs;
 use aruna_storage::StorageHandle;

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use aruna_core::effects::DhtGetOptions;
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId};
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_storage::StorageHandle;
 use crossfire::{TrySendError, mpsc};
 use iroh::Endpoint;

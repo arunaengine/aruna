@@ -5,7 +5,8 @@
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{LocalFileEvent, LocalFileRefusal};
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{FileStat, SYNC_TRASH_DIR, WriteGuard, weak_fingerprint};
+use aruna_core::structs::execution::offered_directory::{FileStat, weak_fingerprint};
+use aruna_core::structs::{SYNC_TRASH_DIR, WriteGuard};
 use bytes::Bytes;
 use futures::StreamExt;
 use std::path::{Component, Path, PathBuf};
@@ -681,7 +682,9 @@ fn sibling_path(relative: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use crate::fs_source::list_local;
-    use aruna_core::structs::{OFFERED_DIRECTORY_ROOT, ResolvedSourceAccess, SourceConnectorKind};
+    use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_ROOT;
+    use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use std::collections::HashMap;
 
     fn access(root: &Path, path: &str) -> ResolvedSourceAccess {

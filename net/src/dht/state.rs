@@ -6,7 +6,7 @@ use aruna_core::effects::DhtCompletion;
 use aruna_core::events::DhtEntry;
 use aruna_core::id::xor_distance_32;
 use aruna_core::id::{DhtKeyId, NodeId, NodeIdExt};
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use smallvec::SmallVec;
 
 use super::constants::{
@@ -2424,7 +2424,7 @@ mod tests {
     use super::*;
     use crate::test_support::{make_node, make_secret};
     use aruna_core::UserId;
-    use aruna_core::structs::RealmNodeKind;
+    use aruna_core::structs::identity::realm::RealmNodeKind;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 

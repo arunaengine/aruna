@@ -1232,7 +1232,7 @@ async fn lifecycle_upsert_idempotent() {
     let lifecycle = MetadataLifecycleRecord::Upsert {
         event: Box::new(event.clone()),
     };
-    let placement = aruna_core::structs::PlacementRef {
+    let placement = aruna_core::structs::placement::placement_record::PlacementRef {
         strategy_id: Ulid::from_parts(4, 4),
         shard: 3,
     };
@@ -1443,7 +1443,7 @@ async fn stale_sidecars_block() {
         deleted_after_event_id,
     );
     let mut local_change = metadata_lifecycle_change(&local_delete, node(8));
-    local_change.placement = aruna_core::structs::PlacementRef {
+    local_change.placement = aruna_core::structs::placement::placement_record::PlacementRef {
         strategy_id: Ulid::from_parts(25, 1),
         shard: 5,
     };

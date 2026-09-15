@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aruna_core::id::{DhtKeyId, NodeId};
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::{IdEnvironment, SystemEnvironment};
 use parking_lot::Mutex;

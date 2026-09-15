@@ -1,7 +1,7 @@
 use aruna_core::DistributedTraceContext;
 use aruna_core::alpn::Alpn;
 use aruna_core::id::{DhtKeyId, NodeId};
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use serde::{Deserialize, Serialize};
 
 pub const DHT_ALPN: &[u8] = Alpn::Dht.as_bytes();

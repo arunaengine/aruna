@@ -28,13 +28,17 @@ use aruna_core::storage_entries::{
     document_lifecycle_entry, document_lifecycle_key, graph_lifecycle_key, metadata_document_key,
     metadata_registry_key, registry_write_entries, sync_revision_key,
 };
-use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, MetadataRegistryRecord, OidcProviderConfig,
-    Permission, PlacementPolicyDocument, PlacementRef, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
-    SYNC_QUARANTINE_USAGE_KEY, StaticRealmEndpoint, SyncQuarantineRecord, SyncQuarantineUsage,
-    User,
+use aruna_core::structs::identity::auth::{Actor, Permission, Role};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::identity::realm::{
+    OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig,
+    RealmId, RealmNodeKind, StaticRealmEndpoint,
 };
+use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::{SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage};
+use aruna_core::structs::identity::user::User;
 use aruna_core::types::Value;
 use aruna_core::{NodeId, UserId};
 use aruna_storage::FjallPersistPolicy;
@@ -542,7 +546,7 @@ pub(crate) fn metadata_lifecycle_change(
     aruna_core::storage_entries::lifecycle_revision_change(
         lifecycle,
         actor,
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
     )
 }
 
@@ -678,11 +682,11 @@ pub(crate) fn policy_admin(realm_id: RealmId) -> UserId {
 /// One authentic publication of `policy` by node `seed`.
 pub(crate) fn signed_policy_document(
     realm_id: RealmId,
-    policy: &aruna_core::structs::VerifiedPolicy,
+    policy: &aruna_core::structs::placement::placement_policy::VerifiedPolicy,
     seed: u8,
 ) -> PlacementPolicyDocument {
     let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
-    let publication = aruna_core::structs::PolicyPublicationClaim::new(
+    let publication = aruna_core::structs::placement::policy_document::PolicyPublicationClaim::new(
         realm_id,
         policy,
         secret.public(),
@@ -710,7 +714,7 @@ pub(crate) fn policy_realm_view(
         name: "realm_admin".to_string(),
         permissions: HashMap::from([(
             format!("/{realm_id}/admin/**"),
-            aruna_core::structs::Permission::WRITE,
+            aruna_core::structs::identity::auth::Permission::WRITE,
         )]),
         assigned_users: HashSet::from([policy_admin(realm_id)]),
     };
@@ -727,7 +731,7 @@ pub(crate) async fn write_realm_view(
     config: &RealmConfigDocument,
     auth: &RealmAuthorizationDocument,
 ) {
-    let actor = aruna_core::structs::Actor {
+    let actor = aruna_core::structs::identity::auth::Actor {
         node_id: node(1),
         user_id: policy_admin(config.realm_id),
         realm_id: config.realm_id,
@@ -755,8 +759,10 @@ pub(crate) async fn write_realm_view(
         .expect("realm view is stored");
 }
 
-pub(crate) fn policy_fixture(policy_id: Ulid) -> aruna_core::structs::VerifiedPolicy {
-    use aruna_core::structs::{PlacementPolicy, PlacementSelector, VerifiedPolicy};
+pub(crate) fn policy_fixture(policy_id: Ulid) -> aruna_core::structs::placement::placement_policy::VerifiedPolicy {
+    use aruna_core::structs::placement::placement_policy::{
+        PlacementPolicy, PlacementSelector, VerifiedPolicy,
+    };
 
     let policy = PlacementPolicy::new(
         policy_id,
@@ -863,7 +869,9 @@ pub(crate) fn quarantined_reason(records: &[SyncQuarantineRecord], event_id: Uli
 }
 
 pub(crate) fn node_info_bytes(node_id: NodeId, updated_at_ms: u64) -> Vec<u8> {
-    use aruna_core::structs::{AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization};
+    use aruna_core::structs::storage::node_info::{
+        AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization,
+    };
 
     NodeInfoDocument {
         node_id,

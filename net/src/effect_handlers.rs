@@ -11,7 +11,7 @@ use aruna_core::events::{
     PolicyFetchEvent, PolicySignEvent, StreamEvent,
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use parking_lot::Mutex;
 #[cfg(test)]
 use tokio::sync::Notify;

@@ -1,6 +1,6 @@
 use aruna_core::NodeId;
 use aruna_core::alpn::{Alpn, AlpnRole};
-use aruna_core::structs::RealmNodeKind;
+use aruna_core::structs::identity::realm::RealmNodeKind;
 use iroh::Endpoint;
 use iroh::endpoint::{ClosedStream, Connection, ReadError, ReadToEndError, VarInt};
 use parking_lot::{Mutex, RwLock};
@@ -1069,7 +1069,7 @@ mod tests {
 
     fn user_kind() -> RealmNodeKind {
         RealmNodeKind::User {
-            owner: aruna_core::UserId::nil(aruna_core::structs::RealmId::from_bytes([7u8; 32])),
+            owner: aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId::from_bytes([7u8; 32])),
         }
     }
 

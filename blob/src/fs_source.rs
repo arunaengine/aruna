@@ -3,10 +3,13 @@
 //! the check is resolve-and-verify, not a kernel-enforced no-follow open.
 use aruna_core::errors::StagingSourceError;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
-    FileStat, OFFERED_DIRECTORY_ROOT, ResolvedSourceAccess, SourceConnectorKind, SourceEntry,
-    SourceEntryKind, SourceMetadata, weak_fingerprint,
+use aruna_core::structs::execution::offered_directory::{
+    FileStat, OFFERED_DIRECTORY_ROOT, weak_fingerprint,
 };
+use aruna_core::structs::execution::source_access::{
+    ResolvedSourceAccess, SourceEntry, SourceEntryKind, SourceMetadata,
+};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use bytes::Bytes;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};

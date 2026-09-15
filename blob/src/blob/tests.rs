@@ -18,11 +18,18 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::{
-    Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, GroupBackendKind,
-    GroupStorage, GroupStorageSecret, HiddenBlobKey, MultipartPartKey, RealmId, ResolvedBackend,
-    ResolvedSourceAccess, SourceConnectorKind, Status,
+use aruna_core::structs::storage::blob::{
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, HiddenBlobKey,
+    ResolvedBackend,
 };
+use aruna_core::structs::storage::group_backend::{
+    GroupBackendKind, GroupStorage, GroupStorageSecret,
+};
+use aruna_core::structs::storage::multipart::MultipartPartKey;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::Status;
 use aruna_core::{NodeId, UserId};
 use aruna_net::streams::BiStream;
 use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
@@ -499,7 +506,7 @@ async fn copies_across_backends() {
 #[test]
 fn registry_reads_config() {
     // The parsed backends file is the only source of names, classes and rules.
-    let file = aruna_core::structs::BackendsFile::parse(
+    let file = aruna_core::structs::storage::backends::BackendsFile::parse(
         r#"
 [backend.hot]
 type = "filesystem"
@@ -535,25 +542,25 @@ serve_group_backends = false
     assert_eq!(routing.catalog.class_of("cold"), Some("cold"));
     let snapshot = routing.snapshot(Ulid::from_bytes([1u8; 16]));
     assert_eq!(
-        aruna_core::structs::resolve_backend(&snapshot, "bucket", "archive/one").unwrap(),
+        aruna_core::structs::storage::routing::resolve_backend(&snapshot, "bucket", "archive/one").unwrap(),
         ResolvedBackend::new(
             BackendRef::Node("cold".to_string()),
             Some("cold".to_string())
         )
     );
     assert_eq!(
-        aruna_core::structs::resolve_backend(&snapshot, "bucket", "other").unwrap(),
+        aruna_core::structs::storage::routing::resolve_backend(&snapshot, "bucket", "other").unwrap(),
         ResolvedBackend::new(BackendRef::Node("hot".to_string()), None)
     );
     assert_eq!(
-        aruna_core::structs::resolve_backend(
-            &snapshot.with_group_default(Some(aruna_core::structs::RoutingTarget::Backend(
+        aruna_core::structs::storage::routing::resolve_backend(
+            &snapshot.with_group_default(Some(aruna_core::structs::storage::routing::RoutingTarget::Backend(
                 BackendRef::Group(Ulid::from_bytes([2u8; 16]))
             ))),
             "bucket",
             "other"
         ),
-        Err(aruna_core::structs::RoutingError::GroupEgressDisabled)
+        Err(aruna_core::structs::storage::routing::RoutingError::GroupEgressDisabled)
     );
 }
 
@@ -2456,7 +2463,7 @@ async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bo
         updated_at: SystemTime::UNIX_EPOCH,
         created_by: UserId::default(),
         disabled: false,
-        cleanup: aruna_core::structs::CleanupStrategy::Retain,
+        cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
     };
     let mut writes = vec![(
         GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
@@ -2531,7 +2538,7 @@ async fn close_blocks_writes() {
 async fn quarantine_upserts_record() {
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::BLOB_QUARANTINE_KEYSPACE;
-    use aruna_core::structs::{BackendRef, BlobQuarantineRecord};
+    use aruna_core::structs::storage::blob::{BackendRef, BlobQuarantineRecord};
 
     let context = setup_blob_handle(64).await;
     let blake3 = [7u8; 32];

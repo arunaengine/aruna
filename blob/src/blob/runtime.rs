@@ -11,7 +11,9 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{BackendConfig, BackendState, BlobState, MultipartPartKey, Status};
+use aruna_core::structs::storage::blob::BackendConfig;
+use aruna_core::structs::{BackendState, BlobState, Status};
+use aruna_core::structs::storage::multipart::MultipartPartKey;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
@@ -300,7 +302,7 @@ impl BlobHandle {
 
     pub async fn reconcile_reservation(
         &self,
-        location: aruna_core::structs::BackendLocation,
+        location: aruna_core::structs::storage::blob::BackendLocation,
     ) -> Result<bool, BlobError> {
         let effect = BlobEffect::Delete {
             location: location.clone(),
@@ -367,7 +369,7 @@ impl BlobHandle {
     }
 
     /// Node-local routing inputs for callers assembling an operation config.
-    pub fn routing(&self) -> aruna_core::structs::NodeRouting {
+    pub fn routing(&self) -> aruna_core::structs::storage::routing::NodeRouting {
         self.handler.registry.routing()
     }
 
@@ -897,7 +899,7 @@ impl BlobHandler {
         }
         // S3 operators need a bucket; without a pinned one, probe the multipart
         // bucket that startup guarantees.
-        if backend_type == aruna_core::structs::Backend::S3 && !config.contains_key("bucket") {
+        if backend_type == aruna_core::structs::storage::blob::Backend::S3 && !config.contains_key("bucket") {
             match backend.multipart_bucket.as_deref() {
                 Some(bucket) => {
                     config.insert("bucket".to_string(), bucket.to_string());

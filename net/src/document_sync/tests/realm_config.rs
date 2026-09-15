@@ -1987,7 +1987,7 @@ async fn replicates_compute_config() {
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
     let document_target = DocumentTarget::RealmConfig { realm_id };
-    let compute = aruna_core::structs::RealmComputeConfig {
+    let compute = aruna_core::structs::placement::compute_config::RealmComputeConfig {
         witness_base_delay_ms: 4_200,
         catch_up_after_ms: 61_000,
         ..Default::default()

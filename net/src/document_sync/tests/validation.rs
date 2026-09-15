@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn usage_owner_validation() {
-    use aruna_core::structs::UsageCounters;
+    use aruna_core::structs::storage::usage::UsageCounters;
 
     let node_id = node(7);
     let realm_id = RealmId::from_bytes([2u8; 32]);
@@ -56,7 +56,7 @@ fn usage_owner_validation() {
 
 #[test]
 fn watch_interest_validation() {
-    use aruna_core::structs::{WatchEventKind, WatchEventMask};
+    use aruna_core::structs::execution::notification_watch::{WatchEventKind, WatchEventMask};
 
     let node_id = node(7);
     let realm_id = RealmId::from_bytes([12u8; 32]);
@@ -115,7 +115,7 @@ fn watch_interest_validation() {
 #[tokio::test]
 async fn watch_origins_converge() {
     // Independent origins must not lose a replica to arrival-order admission.
-    use aruna_core::structs::{WatchEventKind, WatchEventMask};
+    use aruna_core::structs::execution::notification_watch::{WatchEventKind, WatchEventMask};
 
     let (_left_dir, left) = test_storage();
     let (_right_dir, right) = test_storage();
@@ -197,7 +197,9 @@ async fn watch_origins_converge() {
 fn stale_advertisement_skipped() {
     // A delayed advertisement from an older rejoin epoch must not replace
     // the newer one this node already stored.
-    use aruna_core::structs::{AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization};
+    use aruna_core::structs::storage::node_info::{
+        AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization,
+    };
 
     let document = |membership: u64, publisher: u64| NodeInfoDocument {
         node_id: node(7),
@@ -293,7 +295,7 @@ async fn rejects_forged_publication() {
     let self_authored = PlacementPolicyDocument::new(
         realm_id,
         &policy,
-        aruna_core::structs::PolicyPublicationClaim::new(
+        aruna_core::structs::placement::policy_document::PolicyPublicationClaim::new(
             realm_id,
             &policy,
             secret.public(),
@@ -333,7 +335,7 @@ async fn defers_unknown_authority() {
     let realm_id = RealmId::from_bytes([23u8; 32]);
     let (dir, storage) = test_storage();
     let (config, _) = policy_realm_view(realm_id);
-    let actor = aruna_core::structs::Actor {
+    let actor = aruna_core::structs::identity::auth::Actor {
         node_id: node(1),
         user_id: policy_admin(realm_id),
         realm_id,
@@ -368,9 +370,10 @@ async fn defers_unknown_authority() {
 
 #[test]
 fn binds_policy_target() {
-    use aruna_core::structs::{
-        PlacementPolicy, PlacementSelector, VerifiedPolicy, placement_policy_change,
+    use aruna_core::structs::placement::placement_policy::{
+        PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };
+    use aruna_core::structs::placement::policy_document::placement_policy_change;
 
     let realm_id = RealmId::from_bytes([2u8; 32]);
     let policy_id = Ulid::from_bytes([8u8; 16]);
@@ -418,7 +421,7 @@ fn binds_policy_target() {
 
 #[tokio::test]
 async fn forged_upsert_skipped() {
-    use aruna_core::structs::{WatchEventKind, WatchEventMask};
+    use aruna_core::structs::execution::notification_watch::{WatchEventKind, WatchEventMask};
 
     let (_storage_dir, storage) = test_storage();
     let doc_dir = tempfile::tempdir().expect("doc dir");
@@ -461,7 +464,7 @@ async fn forged_upsert_skipped() {
             updated_at_ms: 1,
         },
         kind: DocumentChangeKind::Upsert,
-        placement: aruna_core::structs::PlacementRef::NIL,
+        placement: aruna_core::structs::placement::placement_record::PlacementRef::NIL,
     };
     let forged_digest = WatchInterestDigest::from_subscriptions(
         forged_node,
@@ -559,7 +562,7 @@ async fn forged_upsert_skipped() {
 
 #[tokio::test]
 async fn forged_watch_skipped() {
-    use aruna_core::structs::{WatchEventKind, WatchEventMask};
+    use aruna_core::structs::execution::notification_watch::{WatchEventKind, WatchEventMask};
 
     let (_storage_dir, storage) = test_storage();
     let doc_dir = tempfile::tempdir().expect("doc dir");
@@ -602,7 +605,7 @@ async fn forged_watch_skipped() {
             updated_at_ms: 1,
         },
         kind,
-        placement: aruna_core::structs::PlacementRef::NIL,
+        placement: aruna_core::structs::placement::placement_record::PlacementRef::NIL,
     };
     let digest = WatchInterestDigest::from_subscriptions(
         local_node,
@@ -718,7 +721,7 @@ async fn forged_watch_skipped() {
 // not `?`-propagated, or every peer's reconcile errors at the op forever.
 #[tokio::test]
 async fn forged_usage_skipped() {
-    use aruna_core::structs::UsageCounters;
+    use aruna_core::structs::storage::usage::UsageCounters;
 
     let (_storage_dir, storage) = test_storage();
     let doc_dir = tempfile::tempdir().expect("doc dir");
@@ -752,7 +755,7 @@ async fn forged_usage_skipped() {
             updated_at_ms: 1,
         },
         kind,
-        placement: aruna_core::structs::PlacementRef::NIL,
+        placement: aruna_core::structs::placement::placement_record::PlacementRef::NIL,
     };
 
     let snapshot = NodeUsageSnapshot {
@@ -838,7 +841,9 @@ async fn forged_usage_skipped() {
 
 #[test]
 fn node_owner_validation() {
-    use aruna_core::structs::{AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization};
+    use aruna_core::structs::storage::node_info::{
+        AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization,
+    };
 
     let node_id = node(7);
     let realm_id = RealmId::from_bytes([2u8; 32]);

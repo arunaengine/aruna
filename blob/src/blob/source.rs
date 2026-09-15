@@ -3,7 +3,7 @@ use crate::opendal::{
     check_staging_source, head_staging_source, list_staging_source, read_staging_source,
 };
 use aruna_core::events::StagingSourceEvent;
-use aruna_core::structs::ResolvedSourceAccess;
+use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 
 impl BlobHandler {
     pub(crate) async fn check_staging_source(

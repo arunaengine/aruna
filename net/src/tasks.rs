@@ -217,7 +217,7 @@ mod tests {
     use super::*;
     use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect};
     use aruna_core::keys::realm_presence_key;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::oneshot;

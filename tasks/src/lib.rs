@@ -1127,14 +1127,14 @@ mod tests {
 
     fn test_key() -> TaskKey {
         TaskKey::RealmPresence {
-            realm_id: aruna_core::structs::RealmId([7u8; 32]),
+            realm_id: aruna_core::structs::identity::realm::RealmId([7u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
         }
     }
 
     fn other_key() -> TaskKey {
         TaskKey::RealmPresence {
-            realm_id: aruna_core::structs::RealmId([8u8; 32]),
+            realm_id: aruna_core::structs::identity::realm::RealmId([8u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
         }
     }
@@ -2040,7 +2040,7 @@ mod decision_tests {
 
     fn key() -> TaskKey {
         TaskKey::RealmPresence {
-            realm_id: aruna_core::structs::RealmId([7u8; 32]),
+            realm_id: aruna_core::structs::identity::realm::RealmId([7u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
         }
     }

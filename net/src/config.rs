@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use ::irokle::net::IrohRuntimeConfig;
 use aruna_core::id::NodeId;
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_storage::FjallPersistPolicy;
 use iroh::{EndpointAddr, TransportAddr};
 

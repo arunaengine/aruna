@@ -7,7 +7,7 @@ fn outsider_reports_rejected() {
     let realm_id = RealmId::from_bytes([61u8; 32]);
     let strategy_id = Ulid::from_parts(1_700, 1);
     let transition_id = Ulid::from_parts(1_701, 1);
-    let mut config = aruna_core::structs::RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    let mut config = aruna_core::structs::identity::realm::RealmConfigDocument::new(realm_id, Vec::new(), 3);
     for (seed, kind) in [
         (1u8, RealmNodeKind::Server),
         (2, RealmNodeKind::Server),
@@ -23,11 +23,11 @@ fn outsider_reports_rejected() {
     }
     config
         .placement_transitions
-        .push(aruna_core::structs::PlacementTransition::new(
-            aruna_core::structs::TransitionPlan {
+        .push(aruna_core::structs::placement::placement_transition::PlacementTransition::new(
+            aruna_core::structs::placement::placement_transition::TransitionPlan {
                 transition_id,
                 strategy_id,
-                buckets: vec![aruna_core::structs::BucketPlan {
+                buckets: vec![aruna_core::structs::placement::placement_transition::BucketPlan {
                     bucket: 0,
                     old_holders: vec![node(1)],
                     target_holders: vec![node(2)],
@@ -74,7 +74,7 @@ fn outsider_reports_rejected() {
     // A proof from a non-target is rejected before any signature check.
     let foreign_proof = {
         let actor = test_actor(4, UserId::nil(realm_id), realm_id);
-        let claim = aruna_core::structs::ProofClaim {
+        let claim = aruna_core::structs::placement::placement_transition::ProofClaim {
             realm_id,
             transition_id,
             strategy_id,
@@ -130,7 +130,7 @@ fn removal_needs_management() {
     // Eviction is an ordinary realm-config admin event, so admission keeps
     // it to Management origins whoever relayed it.
     let realm_id = RealmId::from_bytes([62u8; 32]);
-    let mut config = aruna_core::structs::RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    let mut config = aruna_core::structs::identity::realm::RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.ensure_node(node(1), RealmNodeKind::Management);
     config.ensure_node(node(2), RealmNodeKind::Server);
     let device = node(3);

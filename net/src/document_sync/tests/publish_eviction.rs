@@ -32,7 +32,7 @@ async fn missing_requires_genesis() {
             updated_at_ms: 1,
         },
         kind: DocumentChangeKind::Upsert,
-        placement: aruna_core::structs::PlacementRef::NIL,
+        placement: aruna_core::structs::placement::placement_record::PlacementRef::NIL,
     };
 
     let blocked = service
@@ -83,7 +83,7 @@ async fn blocked_allows_ready() {
     let (_storage_dir, storage) = test_storage();
     let doc_dir = tempfile::tempdir().expect("doc dir");
     let realm_id = RealmId::from_bytes([62; 32]);
-    let placement = aruna_core::structs::PlacementRef::NIL;
+    let placement = aruna_core::structs::placement::placement_record::PlacementRef::NIL;
     let service = DocumentSyncService::open_with_policy(
         test_endpoint(62).await,
         storage,

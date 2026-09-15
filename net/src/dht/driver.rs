@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keyspaces::DHT_KEYSPACE;
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::TxnId;
 use aruna_storage::StorageHandle;
 use aruna_storage::storage::TransactionOwner;
@@ -2928,7 +2928,7 @@ async fn write_stream_response(
 mod tests {
     use super::*;
     use crate::test_support::make_node;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};
 

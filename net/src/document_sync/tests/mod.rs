@@ -19,15 +19,20 @@ use aruna_core::storage_entries::{
     create_acceptance_key, event_log_key, metadata_document_key, metadata_registry_key,
     reducer_conflict_key, reducer_state_key, subject_index_key, subject_index_value,
 };
-use aruna_core::structs::{
-    Actor, BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, Group,
-    GroupAuthorizationDocument, GroupQuotaOverride, HANDLE_BANDS, HandleRange, JobId,
-    METADATA_HANDLE, MetadataReplicationConfig, NodePlacementEntry, Permission, PlacementBinding,
-    PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
-    SYNC_QUARANTINE_MAX_RECORDS, StaticRealmEndpoint, StrategyBinding, SyncQuarantineFamily,
-    SyncQuarantineRecord, UserCapOverride, band_start,
+use aruna_core::structs::identity::auth::{Actor, Permission, Role};
+use aruna_core::structs::placement::placement_record::{
+    BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HandleRange,
+    METADATA_HANDLE, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef,
+    PlacementStrategy, StrategyBinding, band_start,
 };
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{
+    GroupQuotaOverride, MetadataReplicationConfig, QuotaConfig, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, StaticRealmEndpoint,
+    UserCapOverride,
+};
+use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::{SYNC_QUARANTINE_MAX_RECORDS, SyncQuarantineFamily, SyncQuarantineRecord};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::{MetaResourceId, StructuredId, UserId};
 use std::collections::{BTreeMap, HashMap, HashSet};

@@ -730,6 +730,6 @@ async fn recursive_list_truncates() {
 
     assert_eq!(entries.len(), 1);
     assert!(entries[0].path.starts_with("prefix/"));
-    assert_eq!(entries[0].kind, aruna_core::structs::SourceEntryKind::File);
+    assert_eq!(entries[0].kind, aruna_core::structs::execution::source_access::SourceEntryKind::File);
     assert!(truncated);
 }

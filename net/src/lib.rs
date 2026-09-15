@@ -38,10 +38,10 @@ use aruna_core::events::{Event, NetError as CoreNetError, NetEvent, StorageEvent
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::metrics::NotificationWatchMetrics;
-use aruna_core::structs::{
-    NetState, NetworkDiagnosticsState, PlacementRef, RealmConfigDocument, RealmId,
-    WatchInterestEntry, WatchInterestTable,
-};
+use aruna_core::structs::{NetState, NetworkDiagnosticsState};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::execution::notification_watch::{WatchInterestEntry, WatchInterestTable};
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use iroh::address_lookup::memory::MemoryLookup;

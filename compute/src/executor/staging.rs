@@ -5,7 +5,7 @@ use aruna_core::compute::{
     BackendError, InputStream, StagingMode, TaskSpec, has_wildcard, literal_prefix,
     normalize_container_path, paths_overlap,
 };
-use aruna_core::structs::ensure_confined_path;
+use aruna_core::structs::storage::blob::ensure_confined_path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StageLayout {

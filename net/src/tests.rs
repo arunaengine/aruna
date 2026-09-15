@@ -9,10 +9,8 @@ use crate::discovery::{
 use crate::eviction::flush_evicted_documents;
 use crate::test_support::make_secret;
 use aruna_core::events::DhtEntry;
-use aruna_core::structs::{
-    ConnectionAddressStatus, PeerConnectionStatus, RealmEndpointAnnouncement,
-    endpoint_signing_bytes,
-};
+use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus};
+use aruna_core::structs::identity::realm::{RealmEndpointAnnouncement, endpoint_signing_bytes};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
 use std::sync::Arc;
@@ -62,7 +60,7 @@ fn test_evicted_document(seed: u8) -> DocumentEvictedDocument {
             updated_at_ms: seed as u64,
         },
         kind: aruna_core::document::DocumentChangeKind::Delete,
-        placement: aruna_core::structs::PlacementRef::NIL,
+        placement: aruna_core::structs::placement::placement_record::PlacementRef::NIL,
     };
 
     DocumentEvictedDocument {
@@ -71,7 +69,7 @@ fn test_evicted_document(seed: u8) -> DocumentEvictedDocument {
             realm_id: RealmId::from_bytes([seed; 32]),
         },
         event: aruna_core::document::DocumentOutboxEvent::Delete { change },
-        placement: aruna_core::structs::PlacementRef::NIL,
+        placement: aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         allow_genesis: false,
     }
 }
@@ -179,7 +177,7 @@ async fn eviction_waits_handler() {
 /// A tie-break eviction of one locally authored delete on `placement`.
 fn local_eviction(
     service: &DocumentSyncService,
-    placement: aruna_core::structs::PlacementRef,
+    placement: aruna_core::structs::placement::placement_record::PlacementRef,
     evicted: bool,
 ) -> ::irokle::TopicEviction {
     let event_id = ulid::Ulid::from_bytes([31; 16]);
@@ -226,11 +224,11 @@ async fn eviction_registers_buckets() {
     // The entry outlives the hand-off: it is released only once the
     // replacement rows are durable, and it never stalls another bucket.
     let (_dir, service) = eviction_test_service().await;
-    let placement = aruna_core::structs::PlacementRef {
+    let placement = aruna_core::structs::placement::placement_record::PlacementRef {
         strategy_id: ulid::Ulid::from_bytes([31; 16]),
         shard: 1,
     };
-    let elsewhere = aruna_core::structs::PlacementRef {
+    let elsewhere = aruna_core::structs::placement::placement_record::PlacementRef {
         strategy_id: placement.strategy_id,
         shard: 2,
     };
@@ -266,7 +264,7 @@ async fn empty_eviction_unpending() {
     // Irokle writes no record for an eviction with no payloads, so treating
     // one as pending would arm the retry timer against a phantom forever.
     let (_dir, service) = eviction_test_service().await;
-    let placement = aruna_core::structs::PlacementRef::NIL;
+    let placement = aruna_core::structs::placement::placement_record::PlacementRef::NIL;
     assert!(
         service
             .consume_eviction(local_eviction(&service, placement, false))
@@ -753,15 +751,15 @@ async fn config_replaces_peers() -> Result<()> {
     let mut document = RealmConfigDocument::default_for_realm(*handle.realm_id(), Vec::new());
     document.ensure_node(
         handle.node_id(),
-        aruna_core::structs::RealmNodeKind::Management,
+        aruna_core::structs::identity::realm::RealmNodeKind::Management,
     );
-    document.ensure_node(peer_b, aruna_core::structs::RealmNodeKind::Server);
-    document.ensure_node(peer_a, aruna_core::structs::RealmNodeKind::Server);
+    document.ensure_node(peer_b, aruna_core::structs::identity::realm::RealmNodeKind::Server);
+    document.ensure_node(peer_a, aruna_core::structs::identity::realm::RealmNodeKind::Server);
     // A User-kind node must never enter the sync fan-out set.
     let user_node = make_secret(13).public();
     document.ensure_node(
         user_node,
-        aruna_core::structs::RealmNodeKind::User {
+        aruna_core::structs::identity::realm::RealmNodeKind::User {
             owner: aruna_core::UserId::nil(*handle.realm_id()),
         },
     );
@@ -783,7 +781,7 @@ async fn config_replaces_peers() -> Result<()> {
     );
 
     let mut replacement = RealmConfigDocument::default_for_realm(*handle.realm_id(), Vec::new());
-    replacement.ensure_node(peer_b, aruna_core::structs::RealmNodeKind::Server);
+    replacement.ensure_node(peer_b, aruna_core::structs::identity::realm::RealmNodeKind::Server);
 
     let peers = handle.refresh_document_peers(&replacement).await?;
     assert_eq!(peers, vec![peer_b]);

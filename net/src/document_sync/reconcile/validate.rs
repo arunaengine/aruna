@@ -484,7 +484,7 @@ pub(in crate::document_sync) async fn validate_realm_authority(
                     && role.name == "realm_admin"
                     && role.permissions == BTreeMap::from([(
                         format!("/{realm_id}/admin/**"),
-                        aruna_core::structs::Permission::WRITE,
+                        aruna_core::structs::identity::auth::Permission::WRITE,
                     )])
         );
     Ok(if bootstrap {
@@ -804,7 +804,7 @@ pub(in crate::document_sync) fn has_write_permission<'a>(
     path: &str,
     roles: impl IntoIterator<Item = &'a Role>,
 ) -> bool {
-    !user_id.is_nil() && aruna_core::structs::holds_admin_write(user_id, path, roles.into_iter())
+    !user_id.is_nil() && aruna_core::structs::placement::policy_document::holds_admin_write(user_id, path, roles.into_iter())
 }
 
 /// Validates a replicated node-usage snapshot against its target: the payload
@@ -1237,7 +1237,7 @@ fn validate_event_scope(event: &AdminDocumentEvent) -> std::result::Result<(), S
         AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding }
             if matches!(
                 binding.scope,
-                aruna_core::structs::PlacementScope::Realm(binding_realm_id)
+                aruna_core::structs::placement::placement_record::PlacementScope::Realm(binding_realm_id)
                     if binding_realm_id != event.actor.realm_id
             )
     ) {
@@ -1347,7 +1347,7 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
             if *reported_by != event.origin_node_id {
                 return Err("transition report does not come from the node it names".to_string());
             }
-            if frontier.len() > aruna_core::structs::MAX_BARRIER_FRONTIER_BYTES {
+            if frontier.len() > aruna_core::structs::placement::placement_transition::MAX_BARRIER_FRONTIER_BYTES {
                 return Err("transition barrier frontier exceeds its size bound".to_string());
             }
         }
@@ -1359,7 +1359,7 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
             if *reported_by != event.origin_node_id {
                 return Err("transition report does not come from the node it names".to_string());
             }
-            if reason.len() > aruna_core::structs::MAX_STALL_REASON_BYTES {
+            if reason.len() > aruna_core::structs::placement::placement_transition::MAX_STALL_REASON_BYTES {
                 return Err("transition stall reason exceeds its size bound".to_string());
             }
         }

@@ -2,7 +2,7 @@ use crate::error::BlobLibError;
 use crate::framing::{MAX_CONTROL_PLANE_FRAME, read_frame, write_frame};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
-use aruna_core::structs::BackendLocation;
+use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_net::streams::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;

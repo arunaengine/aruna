@@ -1,8 +1,8 @@
 use aruna_core::document::{DocumentEvent, DocumentTarget};
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataLifecycleRecord};
-use aruna_core::structs::{
-    MetadataRegistryRecord, PersistentIdMapping, PlacementPolicyDocument, SyncQuarantineIdentity,
-};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::{PersistentIdMapping, SyncQuarantineIdentity};
+use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
 use tracing::warn;
 
 use crate::document_sync::{

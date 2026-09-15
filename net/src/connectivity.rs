@@ -9,8 +9,8 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::{
     ConnectionAddressState, ConnectionAddressStatus, ConnectionMonitorState,
     NetworkDiagnosticsState, PeerConnectionState, PeerConnectionStatus, ProtocolConnectionState,
-    RealmId,
 };
+use aruna_core::structs::identity::realm::RealmId;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::TransportAddrUsage;
 use iroh::{Endpoint, TransportAddr};

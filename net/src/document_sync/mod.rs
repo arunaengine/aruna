@@ -60,21 +60,35 @@ use aruna_core::storage_entries::{
     stale_conflict_deletes, subject_index_key, subject_index_value, sync_revision_entry,
     sync_revision_key,
 };
+use aruna_core::structs::placement::binding_directory::BindingError;
+use aruna_core::structs::placement::placement_record::{
+    DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, PlacementRef, PlacementScope,
+    PoolAdmission, admit_band_pool, coordinator_spans,
+};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument, owner_group_key};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::execution::notification_watch::{
+    NOTIFICATION_WATCH_INTEREST_BYTES_CAP, NOTIFICATION_WATCH_INTEREST_ENTRY_CAP,
+    NOTIFICATION_WATCH_MAX_PREFIX_LEN, WatchEventMask, WatchInterestDigest, WatchSubscription,
+    interest_dirty_key, interest_node_id, interest_realm_id,
+};
+use aruna_core::structs::storage::node_info::{NodeInfoDocument, reserved_label};
+use aruna_core::structs::storage::usage::{NodeUsageSnapshot, usage_node_id};
 use aruna_core::structs::{
-    BindingError, DocumentClass, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument,
-    HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_INTEREST_BYTES_CAP,
-    NOTIFICATION_WATCH_INTEREST_ENTRY_CAP, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
-    NodeUsageSnapshot, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
-    PersistentIdStatus, PlacementPolicyDocument, PlacementRef, PlacementScope, PoolAdmission,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, Role,
+    PersistentIdKind, PersistentIdMapping, PersistentIdProvider, PersistentIdStatus,
     SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence,
-    SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, User, WatchEventMask,
-    WatchInterestDigest, WatchSubscription, admit_band_pool, build_quarantine_entries,
-    coordinator_spans, interest_dirty_key, interest_node_id, interest_realm_id, owner_group_key,
-    persistent_id_change, persistent_id_key, persistent_id_target, placement_policy_change,
-    placement_policy_target, quarantine_usage_entry, reserved_label, usage_node_id,
+    SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries,
+    persistent_id_change, persistent_id_key, persistent_id_target, quarantine_usage_entry,
+};
+use aruna_core::structs::placement::policy_document::{
+    PlacementPolicyDocument, placement_policy_change, placement_policy_target,
     verify_policy_authority,
 };
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+};
+use aruna_core::structs::identity::auth::Role;
+use aruna_core::structs::identity::user::User;
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::types::{GroupId, RoleId, TxnId, Value};
