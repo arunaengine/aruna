@@ -14,16 +14,16 @@ use crate::connectors::repository::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeleteSourceConnectorInput {
+pub struct DeleteSourceInput {
     pub group_id: GroupId,
     pub connector_id: Ulid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeleteSourceConnectorResult;
+pub struct DeleteSourceResult;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DeleteSourceConnectorState {
+pub enum DeleteSourceState {
     Init,
     ReadConnector,
     ReadSecret,
@@ -37,7 +37,7 @@ pub enum DeleteSourceConnectorState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum DeleteSourceConnectorError {
+pub enum DeleteSourceError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -50,13 +50,13 @@ pub enum DeleteSourceConnectorError {
     DeleteSourceConnectorFailed,
     #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
     InvalidStateEvent {
-        state: DeleteSourceConnectorState,
+        state: DeleteSourceState,
         expected: &'static str,
         received: Event,
     },
 }
 
-impl From<StorageReadError> for DeleteSourceConnectorError {
+impl From<StorageReadError> for DeleteSourceError {
     fn from(value: StorageReadError) -> Self {
         match value {
             StorageReadError::Storage(error) => Self::StorageError(error),
@@ -66,25 +66,25 @@ impl From<StorageReadError> for DeleteSourceConnectorError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct DeleteSourceConnectorOperation {
-    input: DeleteSourceConnectorInput,
-    state: DeleteSourceConnectorState,
+pub struct DeleteSourceOperation {
+    input: DeleteSourceInput,
+    state: DeleteSourceState,
     txn_id: Option<TxnId>,
-    output: Option<Result<DeleteSourceConnectorResult, DeleteSourceConnectorError>>,
+    output: Option<Result<DeleteSourceResult, DeleteSourceError>>,
 }
 
-impl DeleteSourceConnectorOperation {
-    pub fn new(input: DeleteSourceConnectorInput) -> Self {
+impl DeleteSourceOperation {
+    pub fn new(input: DeleteSourceInput) -> Self {
         Self {
             input,
-            state: DeleteSourceConnectorState::Init,
+            state: DeleteSourceState::Init,
             txn_id: None,
             output: None,
         }
     }
 
     fn handle_init(&mut self) -> Effects {
-        self.state = DeleteSourceConnectorState::ReadConnector;
+        self.state = DeleteSourceState::ReadConnector;
         smallvec![read_connector_effect(
             self.input.group_id,
             self.input.connector_id,
@@ -95,10 +95,10 @@ impl DeleteSourceConnectorOperation {
     fn handle_connector_read(&mut self, event: Event) -> Effects {
         match parse_connector_read(event) {
             Ok(Some(_)) => {
-                self.state = DeleteSourceConnectorState::ReadSecret;
+                self.state = DeleteSourceState::ReadSecret;
                 smallvec![read_secret_effect(self.input.connector_id, None)]
             }
-            Ok(None) => self.emit_error(DeleteSourceConnectorError::NotFound),
+            Ok(None) => self.emit_error(DeleteSourceError::NotFound),
             Err(error) => self.emit_error(error.into()),
         }
     }
@@ -113,7 +113,7 @@ impl DeleteSourceConnectorOperation {
             return self.delete_records();
         }
 
-        self.state = DeleteSourceConnectorState::StartTransaction;
+        self.state = DeleteSourceState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
         })]
@@ -126,7 +126,7 @@ impl DeleteSourceConnectorOperation {
                 self.scan_reference_versions(None)
             }
             Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
-            received => self.emit_error(DeleteSourceConnectorError::InvalidStateEvent {
+            received => self.emit_error(DeleteSourceError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
                 received,
@@ -134,23 +134,23 @@ impl DeleteSourceConnectorOperation {
         }
     }
 
-    fn emit_error(&mut self, error: DeleteSourceConnectorError) -> Effects {
-        self.state = DeleteSourceConnectorState::Error;
+    fn emit_error(&mut self, error: DeleteSourceError) -> Effects {
+        self.state = DeleteSourceState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
-    fn abort_with_error(&mut self, error: DeleteSourceConnectorError) -> Effects {
+    fn abort_with_error(&mut self, error: DeleteSourceError) -> Effects {
         let Some(txn_id) = self.txn_id.take() else {
             return self.emit_error(error);
         };
 
-        self.state = DeleteSourceConnectorState::AbortTransaction;
+        self.state = DeleteSourceState::AbortTransaction;
         self.output = Some(Err(error));
         smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
     }
 
-    fn fail_or_abort(&mut self, error: DeleteSourceConnectorError) -> Effects {
+    fn fail_or_abort(&mut self, error: DeleteSourceError) -> Effects {
         if self.txn_id.is_some() {
             self.abort_with_error(error)
         } else {
@@ -163,14 +163,14 @@ impl DeleteSourceConnectorOperation {
             return self.emit_error(StorageError::TransactionNotFound.into());
         };
 
-        self.state = DeleteSourceConnectorState::ScanReferenceVersions;
+        self.state = DeleteSourceState::ScanReferenceVersions;
         smallvec![reference_scan_effect(start_after, Some(txn_id),)]
     }
 
     fn handle_scan_page(&mut self, event: Event) -> Effects {
         match parse_scan_page(event, self.input.connector_id) {
             Ok(ScanStep::Referenced) => {
-                self.abort_with_error(DeleteSourceConnectorError::ReferencedByObjectVersion)
+                self.abort_with_error(DeleteSourceError::ReferencedByObjectVersion)
             }
             Ok(ScanStep::NextPage(start_after)) => self.scan_reference_versions(Some(start_after)),
             Ok(ScanStep::Complete) => self.delete_records(),
@@ -182,15 +182,15 @@ impl DeleteSourceConnectorOperation {
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
-                self.state = DeleteSourceConnectorState::Finish;
-                self.output = Some(Ok(DeleteSourceConnectorResult));
+                self.state = DeleteSourceState::Finish;
+                self.output = Some(Ok(DeleteSourceResult));
                 smallvec![]
             }
             Event::Storage(StorageEvent::Error { error }) => {
                 self.txn_id = None;
                 self.emit_error(error.into())
             }
-            received => self.fail_or_abort(DeleteSourceConnectorError::InvalidStateEvent {
+            received => self.fail_or_abort(DeleteSourceError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                 received,
@@ -202,10 +202,10 @@ impl DeleteSourceConnectorOperation {
         match event {
             Event::Storage(StorageEvent::TransactionAborted { .. })
             | Event::Storage(StorageEvent::Error { .. }) => {
-                self.state = DeleteSourceConnectorState::Error;
+                self.state = DeleteSourceState::Error;
                 smallvec![]
             }
-            received => self.emit_error(DeleteSourceConnectorError::InvalidStateEvent {
+            received => self.emit_error(DeleteSourceError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionAborted)",
                 received,
@@ -225,7 +225,7 @@ impl DeleteSourceConnectorOperation {
             ),
         ];
 
-        self.state = DeleteSourceConnectorState::DeleteRecords;
+        self.state = DeleteSourceState::DeleteRecords;
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
             deletes,
             txn_id: self.txn_id,
@@ -236,7 +236,7 @@ impl DeleteSourceConnectorOperation {
         match event {
             Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                 if let Some(txn_id) = self.txn_id {
-                    self.state = DeleteSourceConnectorState::CommitTransaction;
+                    self.state = DeleteSourceState::CommitTransaction;
                     return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
                 }
             }
@@ -245,7 +245,7 @@ impl DeleteSourceConnectorOperation {
             }
             Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
             received => {
-                return self.fail_or_abort(DeleteSourceConnectorError::InvalidStateEvent {
+                return self.fail_or_abort(DeleteSourceError::InvalidStateEvent {
                     state: self.state.clone(),
                     expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
                     received,
@@ -253,15 +253,15 @@ impl DeleteSourceConnectorOperation {
             }
         }
 
-        self.state = DeleteSourceConnectorState::Finish;
-        self.output = Some(Ok(DeleteSourceConnectorResult));
+        self.state = DeleteSourceState::Finish;
+        self.output = Some(Ok(DeleteSourceResult));
         smallvec![]
     }
 }
 
-impl Operation for DeleteSourceConnectorOperation {
-    type Output = DeleteSourceConnectorResult;
-    type Error = DeleteSourceConnectorError;
+impl Operation for DeleteSourceOperation {
+    type Output = DeleteSourceResult;
+    type Error = DeleteSourceError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -269,43 +269,41 @@ impl Operation for DeleteSourceConnectorOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            DeleteSourceConnectorState::Init => self.handle_init(),
-            DeleteSourceConnectorState::ReadConnector => self.handle_connector_read(event),
-            DeleteSourceConnectorState::ReadSecret => self.handle_secret_read(event),
-            DeleteSourceConnectorState::StartTransaction => self.handle_transaction_started(event),
-            DeleteSourceConnectorState::ScanReferenceVersions => self.handle_scan_page(event),
-            DeleteSourceConnectorState::DeleteRecords => self.handle_records_deleted(event),
-            DeleteSourceConnectorState::CommitTransaction => {
-                self.handle_transaction_committed(event)
-            }
-            DeleteSourceConnectorState::AbortTransaction => self.handle_transaction_aborted(event),
-            DeleteSourceConnectorState::Finish => smallvec![],
-            DeleteSourceConnectorState::Error => self.abort(),
+            DeleteSourceState::Init => self.handle_init(),
+            DeleteSourceState::ReadConnector => self.handle_connector_read(event),
+            DeleteSourceState::ReadSecret => self.handle_secret_read(event),
+            DeleteSourceState::StartTransaction => self.handle_transaction_started(event),
+            DeleteSourceState::ScanReferenceVersions => self.handle_scan_page(event),
+            DeleteSourceState::DeleteRecords => self.handle_records_deleted(event),
+            DeleteSourceState::CommitTransaction => self.handle_transaction_committed(event),
+            DeleteSourceState::AbortTransaction => self.handle_transaction_aborted(event),
+            DeleteSourceState::Finish => smallvec![],
+            DeleteSourceState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            DeleteSourceConnectorState::Finish | DeleteSourceConnectorState::Error
+            DeleteSourceState::Finish | DeleteSourceState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == DeleteSourceConnectorState::Error {
+        if self.state == DeleteSourceState::Error {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(DeleteSourceConnectorError::DeleteSourceConnectorFailed);
+            return Err(DeleteSourceError::DeleteSourceConnectorFailed);
         }
 
         self.output
-            .ok_or(DeleteSourceConnectorError::DeleteSourceConnectorFailed)?
+            .ok_or(DeleteSourceError::DeleteSourceConnectorFailed)?
     }
 
     fn abort(&mut self) -> Effects {
         if let Some(txn_id) = self.txn_id.take() {
-            self.state = DeleteSourceConnectorState::AbortTransaction;
+            self.state = DeleteSourceState::AbortTransaction;
             return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
         }
         smallvec![]
@@ -315,13 +313,9 @@ impl Operation for DeleteSourceConnectorOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::create_connector::{
-        CreateSourceConnectorInput, CreateSourceConnectorOperation,
-    };
+    use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
     use crate::connectors::repository::{parse_secret_read, read_secret_effect};
-    use crate::connectors::resolver::{
-        ResolveVersionSourceBindingInput, ResolveVersionSourceBindingOperation,
-    };
+    use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
     use crate::driver::{DriverContext, drive};
     use crate::staging::descriptor::build_source_binding;
     use aruna_core::effects::IterStart;
@@ -362,7 +356,7 @@ mod tests {
 
     async fn create_connector(context: &DriverContext) -> SourceConnector {
         drive(
-            CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
+            SourceConnectorOperation::new(SourceConnectorInput {
                 group_id: ulid::Ulid::generate(),
                 created_by: Default::default(),
                 name: "dav-source".to_string(),
@@ -388,7 +382,7 @@ mod tests {
 
     async fn create_public_connector(context: &DriverContext) -> SourceConnector {
         drive(
-            CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
+            SourceConnectorOperation::new(SourceConnectorInput {
                 group_id: ulid::Ulid::generate(),
                 created_by: Default::default(),
                 name: "http-source".to_string(),
@@ -479,11 +473,11 @@ mod tests {
         let connector_id = Ulid::from_bytes([2u8; 16]);
         let group_id = Ulid::from_bytes([1u8; 16]);
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
+        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
             group_id,
             connector_id,
         });
-        operation.state = DeleteSourceConnectorState::ReadSecret;
+        operation.state = DeleteSourceState::ReadSecret;
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![].into(),
@@ -527,11 +521,11 @@ mod tests {
     fn reference_aborts_delete() {
         let connector_id = Ulid::from_bytes([2u8; 16]);
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
+        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id,
         });
-        operation.state = DeleteSourceConnectorState::ScanReferenceVersions;
+        operation.state = DeleteSourceState::ScanReferenceVersions;
         operation.txn_id = Some(txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::IterResult {
@@ -553,7 +547,7 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert_eq!(
             operation.finalize(),
-            Err(DeleteSourceConnectorError::ReferencedByObjectVersion)
+            Err(DeleteSourceError::ReferencedByObjectVersion)
         );
     }
 
@@ -562,11 +556,11 @@ mod tests {
         let connector_id = Ulid::from_bytes([2u8; 16]);
         let txn_id = Ulid::from_bytes([3u8; 16]);
         let next_key: Key = vec![9u8].into();
-        let mut operation = DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
+        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id,
         });
-        operation.state = DeleteSourceConnectorState::ScanReferenceVersions;
+        operation.state = DeleteSourceState::ScanReferenceVersions;
         operation.txn_id = Some(txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::IterResult {
@@ -598,11 +592,11 @@ mod tests {
         let connector_id = Ulid::from_bytes([2u8; 16]);
         let txn_id = Ulid::from_bytes([3u8; 16]);
         let next_key: Key = vec![9u8].into();
-        let mut operation = DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
+        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id,
         });
-        operation.state = DeleteSourceConnectorState::ScanReferenceVersions;
+        operation.state = DeleteSourceState::ScanReferenceVersions;
         operation.txn_id = Some(txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::IterResult {
@@ -636,18 +630,18 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert_eq!(
             operation.finalize(),
-            Err(DeleteSourceConnectorError::ReferencedByObjectVersion)
+            Err(DeleteSourceError::ReferencedByObjectVersion)
         );
     }
 
     #[test]
     fn scan_failure_aborts() {
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
+        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id: Ulid::from_bytes([2u8; 16]),
         });
-        operation.state = DeleteSourceConnectorState::ScanReferenceVersions;
+        operation.state = DeleteSourceState::ScanReferenceVersions;
         operation.txn_id = Some(txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
@@ -662,20 +656,20 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert_eq!(
             operation.finalize(),
-            Err(DeleteSourceConnectorError::StorageError(
-                StorageError::ReadError("unexpected event".to_string())
-            ))
+            Err(DeleteSourceError::StorageError(StorageError::ReadError(
+                "unexpected event".to_string()
+            )))
         );
     }
 
     #[test]
     fn commit_failure_reports() {
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
+        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id: Ulid::from_bytes([2u8; 16]),
         });
-        operation.state = DeleteSourceConnectorState::CommitTransaction;
+        operation.state = DeleteSourceState::CommitTransaction;
         operation.txn_id = Some(txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {
@@ -685,20 +679,20 @@ mod tests {
         assert!(operation.txn_id.is_none());
         assert_eq!(
             operation.finalize(),
-            Err(DeleteSourceConnectorError::StorageError(
-                StorageError::ReadError("commit failed".to_string())
-            ))
+            Err(DeleteSourceError::StorageError(StorageError::ReadError(
+                "commit failed".to_string()
+            )))
         );
     }
 
     #[test]
     fn invalid_commit_aborts() {
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
+        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id: Ulid::from_bytes([2u8; 16]),
         });
-        operation.state = DeleteSourceConnectorState::CommitTransaction;
+        operation.state = DeleteSourceState::CommitTransaction;
         operation.txn_id = Some(txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
@@ -713,7 +707,7 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert!(matches!(
             operation.finalize(),
-            Err(DeleteSourceConnectorError::InvalidStateEvent {
+            Err(DeleteSourceError::InvalidStateEvent {
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                 ..
             })
@@ -723,7 +717,7 @@ mod tests {
     #[test]
     fn abort_emits_transaction() {
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
+        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id: Ulid::from_bytes([2u8; 16]),
         });
@@ -753,7 +747,7 @@ mod tests {
         write_reference_version(&context, source.clone()).await;
 
         let result = drive(
-            DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
+            DeleteSourceOperation::new(DeleteSourceInput {
                 group_id: connector.group_id,
                 connector_id: connector.connector_id,
             }),
@@ -761,13 +755,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            result,
-            Err(DeleteSourceConnectorError::ReferencedByObjectVersion)
-        );
+        assert_eq!(result, Err(DeleteSourceError::ReferencedByObjectVersion));
 
         let access = drive(
-            ResolveVersionSourceBindingOperation::new(ResolveVersionSourceBindingInput { source }),
+            ResolveBindingOperation::new(ResolveBindingInput { source }),
             &context,
         )
         .await
@@ -791,7 +782,7 @@ mod tests {
         write_reference_version(&context, source.clone()).await;
 
         drive(
-            DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
+            DeleteSourceOperation::new(DeleteSourceInput {
                 group_id: connector.group_id,
                 connector_id: connector.connector_id,
             }),
@@ -801,7 +792,7 @@ mod tests {
         .unwrap();
 
         let access = drive(
-            ResolveVersionSourceBindingOperation::new(ResolveVersionSourceBindingInput { source }),
+            ResolveBindingOperation::new(ResolveBindingInput { source }),
             &context,
         )
         .await
@@ -819,7 +810,7 @@ mod tests {
         let connector = create_connector(&context).await;
 
         drive(
-            DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
+            DeleteSourceOperation::new(DeleteSourceInput {
                 group_id: connector.group_id,
                 connector_id: connector.connector_id,
             }),

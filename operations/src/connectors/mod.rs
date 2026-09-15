@@ -10,6 +10,6 @@ pub mod secret_config;
 pub mod validation;
 
 pub use resolver::{
-    ResolveSourceConnectorInput, ResolveSourceConnectorOperation, ResolveVersionSourceBindingInput,
-    ResolveVersionSourceBindingOperation, resolve_binding_effect, resolve_connector_effect,
+    ResolveBindingInput, ResolveBindingOperation, ResolveConnectorInput, ResolveConnectorOperation,
+    resolve_binding_effect, resolve_connector_effect,
 };
