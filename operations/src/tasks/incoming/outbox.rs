@@ -93,8 +93,9 @@ pub(super) async fn load_drain_config(
         })
         .await
     {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .and_then(|bytes| aruna_core::structs::identity::realm::RealmConfigDocument::from_bytes(&bytes).ok()),
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value.and_then(|bytes| {
+            aruna_core::structs::identity::realm::RealmConfigDocument::from_bytes(&bytes).ok()
+        }),
         _ => None,
     }
 }
@@ -457,8 +458,7 @@ impl OperationsTaskHandler {
             if closed.deleted > 0 {
                 self.reset_backoff(&retry_key);
             }
-            self.reschedule_timer(retry_key, DEFER_RETRY_AFTER)
-                .await;
+            self.reschedule_timer(retry_key, DEFER_RETRY_AFTER).await;
         } else {
             self.reset_backoff(&retry_key);
         }
@@ -995,8 +995,7 @@ impl OperationsTaskHandler {
             } else {
                 rotation.continuations = 0;
                 self.store_rotation(rotation);
-                self.reschedule_timer(retry_key, DEFER_RETRY_AFTER)
-                    .await;
+                self.reschedule_timer(retry_key, DEFER_RETRY_AFTER).await;
             }
         } else {
             self.close_rotation(retry_key, rotation).await;

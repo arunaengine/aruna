@@ -5,8 +5,8 @@ use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::types::{Effects, GroupId};
 use bytes::Bytes;
 use smallvec::smallvec;
@@ -174,8 +174,7 @@ impl Operation for ReadSourceOperation {
             return Err(ReadSourceError::ReadSourceFailed);
         }
 
-        self.output
-            .ok_or(ReadSourceError::ReadSourceFailed)?
+        self.output.ok_or(ReadSourceError::ReadSourceFailed)?
     }
 
     fn abort(&mut self) -> Effects {

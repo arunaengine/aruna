@@ -4,9 +4,7 @@ use super::{
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, SESSION_OWNER_KEYSPACE,
-};
+use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::types::{Effects, Key};
@@ -241,8 +239,7 @@ impl PurgeSessionsOperation {
                 index.remove(&access_key);
             }
             if index.is_empty() {
-                self.deletes
-                    .push((SESSION_OWNER_KEYSPACE.to_string(), key));
+                self.deletes.push((SESSION_OWNER_KEYSPACE.to_string(), key));
             } else {
                 let value = match encode_index(&index) {
                     Ok(value) => value,

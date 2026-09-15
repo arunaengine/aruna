@@ -5,9 +5,7 @@ use aruna_core::admin_documents::AdminDocumentOperation;
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    SYNC_OUTBOX_KEYSPACE, OUTBOX_INDEX_KEYSPACE,
-};
+use aruna_core::keyspaces::{OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_secs;
@@ -19,8 +17,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 // Size one drain for several full topic batches; every grouped peer receives every topic.
-pub const OUTBOX_DRAIN_SIZE: usize =
-    4 * aruna_net::document_sync::BATCH_TOPIC_LIMIT;
+pub const OUTBOX_DRAIN_SIZE: usize = 4 * aruna_net::document_sync::BATCH_TOPIC_LIMIT;
 const ADMIN_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/admin-operation/";
 const DELETE_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/delete/";
 const UPSERT_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/upsert/";
@@ -71,11 +68,8 @@ fn revocation_index_key(record: &DocumentOutboxRecord) -> Option<Key> {
     let DocumentOutboxEvent::AdminOperation { event, .. } = &record.event else {
         return None;
     };
-    matches!(
-        &event.op,
-        AdminDocumentOperation::ConfigTokenRevoked { .. }
-    )
-    .then(|| outbox_key(record))
+    matches!(&event.op, AdminDocumentOperation::ConfigTokenRevoked { .. })
+        .then(|| outbox_key(record))
 }
 
 pub fn new_outbox_record(
@@ -342,10 +336,7 @@ pub async fn delete_outbox_records(
         let key = ByteView::from(key);
         deletes.push((SYNC_OUTBOX_KEYSPACE.to_string(), key));
         if let Some(index_key) = index_key {
-            deletes.push((
-                OUTBOX_INDEX_KEYSPACE.to_string(),
-                index_key,
-            ));
+            deletes.push((OUTBOX_INDEX_KEYSPACE.to_string(), index_key));
         }
     }
     match storage
@@ -657,7 +648,10 @@ mod tests {
         assert!(decoded.allow_genesis);
         // Upsert mirrors the envelope change's ref, never the admin fallback.
         assert_eq!(decoded.placement, change().placement);
-        assert_ne!(decoded.placement, aruna_core::structs::placement::placement_record::PlacementRef::NIL);
+        assert_ne!(
+            decoded.placement,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL
+        );
     }
 
     #[test]

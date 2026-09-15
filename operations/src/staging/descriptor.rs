@@ -1,9 +1,9 @@
 use aruna_core::NodeId;
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{
     PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
 };
-use aruna_core::structs::execution::source_connector::SourceConnector;
-use aruna_core::structs::execution::source_access::SourceMetadata;
 use ulid::Ulid;
 
 pub fn build_source_descriptor(

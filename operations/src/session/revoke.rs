@@ -282,8 +282,8 @@ impl Operation for RevokeSessionOperation {
 mod pure_tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::auth::SessionKind;
+    use aruna_core::structs::identity::realm::RealmId;
 
     #[test]
     fn revoke_is_idempotent() {

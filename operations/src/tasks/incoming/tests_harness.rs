@@ -16,10 +16,7 @@ fn blocked_batch_waits() {
         ..blocked
     };
     assert_eq!(drain_delay(&blocked), MATERIALIZATION_RETRY_AFTER);
-    assert_eq!(
-        drain_delay(&progressing),
-        NEXT_BATCH_AFTER
-    );
+    assert_eq!(drain_delay(&progressing), NEXT_BATCH_AFTER);
 }
 
 #[test]

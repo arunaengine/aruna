@@ -12,20 +12,20 @@ use aruna_core::errors::{ConversionError, StagingSourceError, StorageError};
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::structs::storage::blob::{
-    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
-};
 use aruna_core::structs::execution::offered_directory::{
     OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,
 };
-use aruna_core::structs::execution::staging::{
-    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
-};
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::execution::source_access::{
     ResolvedSourceAccess, SourceEntry, SourceMetadata,
 };
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::staging::{
+    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{
+    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
+};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, TxnId};
 use std::collections::{BTreeSet, HashMap};
@@ -305,7 +305,10 @@ fn millis_since_epoch(time: SystemTime) -> Option<u64> {
 /// an incomplete fingerprint, which never stands in for reading the bytes.
 fn entry_fingerprint(entry: &SourceEntry) -> String {
     let stat = entry.stat.unwrap_or_else(|| {
-        aruna_core::structs::execution::offered_directory::FileStat::partial(entry.size.unwrap_or_default(), entry.modified)
+        aruna_core::structs::execution::offered_directory::FileStat::partial(
+            entry.size.unwrap_or_default(),
+            entry.modified,
+        )
     });
     aruna_core::structs::execution::offered_directory::weak_fingerprint(&stat)
 }

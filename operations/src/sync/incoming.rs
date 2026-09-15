@@ -14,8 +14,7 @@ use crate::driver::{
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
-    PROJECTION_RETRY_AFTER, project_create_events, project_logged_events,
-    schedule_projection_drain,
+    PROJECTION_RETRY_AFTER, project_create_events, project_logged_events, schedule_projection_drain,
 };
 use crate::metadata::prune_queue::process_graph_tombstones;
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
@@ -43,14 +42,16 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::shutdown::Shutdown;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{HashIndex, bucket_permission_path, object_permission_path};
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
 };
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{
+    HashIndex, bucket_permission_path, object_permission_path,
+};
+use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
@@ -1262,13 +1263,13 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, TASK_TIMER_KEYSPACE};
-    use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
-    use aruna_core::structs::identity::auth::PathRestriction;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::{
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
-    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::identity::auth::PathRestriction;
+    use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -1298,8 +1299,14 @@ mod tests {
         let server = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let user = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let mut config =
-            aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-        config.ensure_node(server, aruna_core::structs::identity::realm::RealmNodeKind::Server);
+            aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(
+                realm_id,
+                Vec::new(),
+            );
+        config.ensure_node(
+            server,
+            aruna_core::structs::identity::realm::RealmNodeKind::Server,
+        );
         config.ensure_node(
             user,
             aruna_core::structs::identity::realm::RealmNodeKind::User {
@@ -1694,8 +1701,14 @@ mod tests {
             net_b.add_peer_addr(net_a.endpoint_addr()).await;
 
             let mut realm =
-                aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-            realm.ensure_node(net_b.node_id(), aruna_core::structs::identity::realm::RealmNodeKind::Server);
+                aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(
+                    realm_id,
+                    Vec::new(),
+                );
+            realm.ensure_node(
+                net_b.node_id(),
+                aruna_core::structs::identity::realm::RealmNodeKind::Server,
+            );
             let owner = UserId::nil(realm_id);
             if device_peer {
                 realm.ensure_node(
@@ -1703,7 +1716,10 @@ mod tests {
                     aruna_core::structs::identity::realm::RealmNodeKind::User { owner },
                 );
             } else {
-                realm.ensure_node(net_a.node_id(), aruna_core::structs::identity::realm::RealmNodeKind::Server);
+                realm.ensure_node(
+                    net_a.node_id(),
+                    aruna_core::structs::identity::realm::RealmNodeKind::Server,
+                );
             }
             let actor = aruna_core::structs::identity::auth::Actor {
                 node_id: net_b.node_id(),

@@ -2,9 +2,7 @@ use super::{S3SessionError, decode_index, encode_index, expiry_key, owner_key};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, SESSION_OWNER_KEYSPACE,
-};
+use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::types::{Effects, Key};

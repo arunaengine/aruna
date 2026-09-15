@@ -3,7 +3,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{USER_SESSION_KEYSPACE, USER_OWNER_KEYSPACE};
+use aruna_core::keyspaces::{USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::user_session::UserSession;
 use aruna_core::types::{Effects, TxnId};
@@ -208,8 +208,8 @@ impl Operation for ListSessionOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::auth::SessionKind;
+    use aruna_core::structs::identity::realm::RealmId;
     use byteview::ByteView;
     use std::collections::BTreeSet;
     use ulid::Ulid;

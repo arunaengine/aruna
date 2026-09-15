@@ -14,17 +14,17 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
-    SOURCE_INDEX_KEYSPACE, SOURCE_SECRET_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
+    SOURCE_SECRET_KEYSPACE,
 };
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
+use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
-use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
-use aruna_core::structs::execution::source_access::SourceMetadata;
-use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use std::time::SystemTime;
@@ -551,19 +551,18 @@ mod tests {
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE,
-        PURGE_FENCE_KEYSPACE, SOURCE_INDEX_KEYSPACE, SOURCE_SECRET_KEYSPACE,
-        USAGE_STATS_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE,
+        SOURCE_INDEX_KEYSPACE, SOURCE_SECRET_KEYSPACE, USAGE_STATS_KEYSPACE,
     };
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::storage::blob::{
-        BlobHeadKey, BlobVersion, CurrentVersionPointer, HashIndex,
-    };
     use aruna_core::structs::execution::job::JobId;
-    use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::structs::execution::source_connector::{
         SourceConnectorKind, SourceConnectorSecret,
     };
+    use aruna_core::structs::storage::blob::{
+        BlobHeadKey, BlobVersion, CurrentVersionPointer, HashIndex,
+    };
+    use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
     use aruna_core::structs::storage::usage::{UsageCounters, global_group_key, usage_group_key};
     use aruna_storage::storage;

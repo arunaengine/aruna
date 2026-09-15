@@ -7,12 +7,12 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{BucketIdentity, CurrentVersionPointer};
 use aruna_core::structs::placement::placement_policy::{
     PlacementPolicyRef, PlacementSubject, PolicyResolution,
 };
 use aruna_core::structs::placement::policy_attachment::PolicyRefMode;
 use aruna_core::structs::placement::policy_document::{group_admin_path, policy_admin_path};
+use aruna_core::structs::storage::blob::{BucketIdentity, CurrentVersionPointer};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use std::collections::BTreeMap;
@@ -321,11 +321,11 @@ mod pure_tests {
     use aruna_core::id::NodeId;
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::AuthContext;
-    use aruna_core::structs::storage::blob::CurrentVersionPointer;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::placement_policy::{
         PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
-    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::CurrentVersionPointer;
     use aruna_core::types::Key;
     use std::collections::BTreeMap;
     use std::time::UNIX_EPOCH;

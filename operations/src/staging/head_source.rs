@@ -4,8 +4,8 @@ use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -172,8 +172,7 @@ impl Operation for HeadSourceOperation {
             return Err(HeadSourceError::HeadSourceFailed);
         }
 
-        self.output
-            .ok_or(HeadSourceError::HeadSourceFailed)?
+        self.output.ok_or(HeadSourceError::HeadSourceFailed)?
     }
 
     fn abort(&mut self) -> Effects {

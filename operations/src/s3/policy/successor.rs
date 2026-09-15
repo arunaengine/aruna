@@ -20,19 +20,19 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobVersion, BlobVersionState, BucketIdentity, CurrentVersionPointer,
-    ManagedCopyKey, ManagedCopyRecord, VersionKey,
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::placement_policy::{
+    PlacementDecision, PlacementPolicyError, PlacementPolicyRef, PlacementSubject,
+    PolicyResolution, evaluate_placement,
 };
 use aruna_core::structs::placement::policy_attachment::{
     BULK_INTENT_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyBlockedReason, PolicyIntent,
     PolicyIntentOutcome, PolicyMutationParams, PolicyMutationRecord, PolicyRefMode,
 };
-use aruna_core::structs::placement::placement_policy::{
-    PlacementDecision, PlacementPolicyError, PlacementPolicyRef, PlacementSubject,
-    PolicyResolution, evaluate_placement,
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BlobVersion, BlobVersionState, BucketIdentity, CurrentVersionPointer,
+    ManagedCopyKey, ManagedCopyRecord, VersionKey,
 };
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -1005,25 +1005,25 @@ mod pure_tests {
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, USAGE_STATS_KEYSPACE,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::structs::identity::auth::{Actor, AuthContext};
-    use aruna_core::structs::storage::blob::{
-        BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
-        ManagedCopyRecord, ManagedCopyState, VersionKey,
-    };
+    use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::identity::auth::{Actor, AuthContext};
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
-    use aruna_core::structs::placement::policy_attachment::{
-        BULK_INTENT_KEYSPACE, PolicyBlockedReason, PolicyIntent, PolicyIntentOutcome,
-        PolicyMutationRecord, PolicyRefMode,
-    };
     use aruna_core::structs::placement::placement_policy::{
         PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, PolicyResolution,
         VerifiedPolicy,
     };
-    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+    use aruna_core::structs::placement::policy_attachment::{
+        BULK_INTENT_KEYSPACE, PolicyBlockedReason, PolicyIntent, PolicyIntentOutcome,
+        PolicyMutationRecord, PolicyRefMode,
+    };
+    use aruna_core::structs::storage::blob::{
+        BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
+        ManagedCopyRecord, ManagedCopyState, VersionKey,
+    };
     use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
     use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
-    use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::types::{Key, TxnId, Value};
     use std::collections::{BTreeMap, HashMap};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1868,7 +1868,8 @@ mod pure_tests {
             aruna_core::structs::execution::staging::VersionSourceBinding {
                 strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
                 descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
-                    kind: aruna_core::structs::execution::source_connector::SourceConnectorKind::Http,
+                    kind:
+                        aruna_core::structs::execution::source_connector::SourceConnectorKind::Http,
                     public_config: HashMap::new(),
                     source_path: "source".to_string(),
                     version_selector: None,

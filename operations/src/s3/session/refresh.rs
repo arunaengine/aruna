@@ -5,12 +5,10 @@ use aruna_core::UserId;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, SESSION_OWNER_KEYSPACE,
-};
+use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::PathRestriction;
-use aruna_core::structs::identity::s3_session::{SESSION_MAX_TTL, S3Session};
+use aruna_core::structs::identity::s3_session::{S3Session, SESSION_MAX_TTL};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use std::time::SystemTime;
@@ -205,11 +203,7 @@ impl RefreshS3Operation {
                     pending.access_key_id.as_bytes().into(),
                     session_bytes.into(),
                 ),
-                (
-                    SESSION_EXPIRY_KEYSPACE.to_string(),
-                    expiry_key,
-                    owner_key,
-                ),
+                (SESSION_EXPIRY_KEYSPACE.to_string(), expiry_key, owner_key,),
             ],
             txn_id: Some(txn_id),
         })]

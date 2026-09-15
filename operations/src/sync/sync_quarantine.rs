@@ -5,7 +5,7 @@
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{SYNC_QUARANTINE_KEYSPACE, QUARANTINE_USAGE_KEYSPACE};
+use aruna_core::keyspaces::{QUARANTINE_USAGE_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use aruna_core::structs::{
     QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage, quarantine_row_entry,
     quarantine_usage_entry,
@@ -397,8 +397,8 @@ mod tests {
     use aruna_core::document::{
         DocumentChange, DocumentChangeKind, DocumentEvent, DocumentSyncRevision, DocumentTarget,
     };
-    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_core::structs::{
         SyncQuarantineCapacity, SyncQuarantineEvidence, SyncQuarantineIdentity,
         SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries,

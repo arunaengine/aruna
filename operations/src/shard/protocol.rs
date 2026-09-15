@@ -2,8 +2,8 @@ use std::ops::Range;
 
 use aruna_core::NodeId;
 use aruna_core::document::{ShardManifest, ShardManifestEntry};
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_net::streams::BiStream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;

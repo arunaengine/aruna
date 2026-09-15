@@ -38,12 +38,7 @@ async fn durable_rearm_loop(
         )
         .await;
         crate::node::node_info::restore_info_timer(&context.storage_handle, &task_handle).await;
-        restore_idle_timer(
-            &context.storage_handle,
-            &task_handle,
-            DELIVERY_RETRY_AFTER,
-        )
-        .await;
+        restore_idle_timer(&context.storage_handle, &task_handle, DELIVERY_RETRY_AFTER).await;
         restore_projection_timer(&context.storage_handle, &task_handle).await;
         // Dead letters retry on a minute-scale backoff, so sweeping every rearm
         // tick would scan the keyspace far more often than it can yield work.
@@ -337,11 +332,8 @@ impl OperationsTaskHandler {
             Ok(false) => {}
             Err(error) => {
                 warn!(task_id = ?TaskKey::PublishWatchInterest, error = %error, "Failed to publish watch interest");
-                self.reschedule_timer(
-                    TaskKey::PublishWatchInterest,
-                    WATCH_PUBLISH_DEBOUNCE,
-                )
-                .await;
+                self.reschedule_timer(TaskKey::PublishWatchInterest, WATCH_PUBLISH_DEBOUNCE)
+                    .await;
             }
         }
     }
@@ -362,18 +354,13 @@ impl OperationsTaskHandler {
         let bulk = self.bulk_context();
         match process_materialization_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
-                self.reschedule_timer(
-                    TaskKey::DrainMaterializationQueue,
-                    drain_delay(&result),
-                )
-                .await;
+                self.reschedule_timer(TaskKey::DrainMaterializationQueue, drain_delay(&result))
+                    .await;
             }
             Ok(result) if result.next_due_after.is_some() => {
                 self.reschedule_timer(
                     TaskKey::DrainMaterializationQueue,
-                    result
-                        .next_due_after
-                        .unwrap_or(MATERIALIZATION_POLL_AFTER),
+                    result.next_due_after.unwrap_or(MATERIALIZATION_POLL_AFTER),
                 )
                 .await;
             }
@@ -410,46 +397,32 @@ impl OperationsTaskHandler {
         let bulk = self.bulk_context();
         match crate::metadata::prune_queue::process_prune_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
-                self.reschedule_timer(
-                    TaskKey::DrainPruneQueue,
-                    std::time::Duration::ZERO,
-                )
-                .await;
+                self.reschedule_timer(TaskKey::DrainPruneQueue, std::time::Duration::ZERO)
+                    .await;
             }
             Ok(result) if result.next_due_after.is_some() => {
                 self.reschedule_timer(
                     TaskKey::DrainPruneQueue,
-                    result
-                        .next_due_after
-                        .unwrap_or(GRAPH_POLL_AFTER),
+                    result.next_due_after.unwrap_or(GRAPH_POLL_AFTER),
                 )
                 .await;
             }
             Ok(_) => match prune_jobs_exist(&bulk.storage_handle).await {
                 Ok(false) => {}
                 Ok(true) => {
-                    self.reschedule_timer(
-                        TaskKey::DrainPruneQueue,
-                        GRAPH_POLL_AFTER,
-                    )
-                    .await;
+                    self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_POLL_AFTER)
+                        .await;
                 }
                 Err(error) => {
                     warn!(task_id = ?TaskKey::DrainPruneQueue, error = ?error, "Failed to probe metadata graph prune jobs");
-                    self.reschedule_timer(
-                        TaskKey::DrainPruneQueue,
-                        GRAPH_RETRY_AFTER,
-                    )
-                    .await;
+                    self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_RETRY_AFTER)
+                        .await;
                 }
             },
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainPruneQueue, error = ?error, "Failed to drain metadata graph prune queue");
-                self.reschedule_timer(
-                    TaskKey::DrainPruneQueue,
-                    GRAPH_RETRY_AFTER,
-                )
-                .await;
+                self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_RETRY_AFTER)
+                    .await;
             }
         }
     }
@@ -459,30 +432,21 @@ impl OperationsTaskHandler {
     pub(super) async fn drain_projection_queue(&self) {
         match drain_projection_queue(&self.context).await {
             Ok(result) if result.has_more => {
-                self.reschedule_timer(
-                    TaskKey::DrainProjectionQueue,
-                    std::time::Duration::ZERO,
-                )
-                .await;
+                self.reschedule_timer(TaskKey::DrainProjectionQueue, std::time::Duration::ZERO)
+                    .await;
             }
             Ok(result) if result.markers_examined == 0 => {
                 if let Err(error) = replay_event_log(&self.context).await {
                     warn!(task_id = ?TaskKey::DrainProjectionQueue, error = ?error, "Failed to replay metadata event log fallback");
-                    self.reschedule_timer(
-                        TaskKey::DrainProjectionQueue,
-                        PROJECTION_RETRY_AFTER,
-                    )
-                    .await;
+                    self.reschedule_timer(TaskKey::DrainProjectionQueue, PROJECTION_RETRY_AFTER)
+                        .await;
                 }
             }
             Ok(_) => {}
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainProjectionQueue, error = ?error, "Failed to drain metadata projection queue");
-                self.reschedule_timer(
-                    TaskKey::DrainProjectionQueue,
-                    PROJECTION_RETRY_AFTER,
-                )
-                .await;
+                self.reschedule_timer(TaskKey::DrainProjectionQueue, PROJECTION_RETRY_AFTER)
+                    .await;
             }
         }
     }
@@ -501,11 +465,8 @@ impl OperationsTaskHandler {
             }
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainReplicationQueue, error = ?error, "Failed to drain blob replication queue");
-                self.reschedule_timer(
-                    TaskKey::DrainReplicationQueue,
-                    REPLICATION_RETRY_AFTER,
-                )
-                .await;
+                self.reschedule_timer(TaskKey::DrainReplicationQueue, REPLICATION_RETRY_AFTER)
+                    .await;
             }
         }
     }
@@ -549,11 +510,8 @@ impl OperationsTaskHandler {
             }
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainRefreshQueue, error = ?error, "Failed to drain reference metadata refresh queue");
-                self.reschedule_timer(
-                    TaskKey::DrainRefreshQueue,
-                    REFRESH_RETRY_AFTER,
-                )
-                .await;
+                self.reschedule_timer(TaskKey::DrainRefreshQueue, REFRESH_RETRY_AFTER)
+                    .await;
             }
         }
     }
@@ -658,8 +616,7 @@ impl OperationsTaskHandler {
 
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             warn!(task_id = ?retry_key, "Cannot drain notification outbox without net handle");
-            self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER)
-                .await;
+            self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER).await;
             return;
         };
         let local_node_id = net_handle.node_id();
@@ -668,15 +625,13 @@ impl OperationsTaskHandler {
             Ok(owner) => owner,
             Err(error) => {
                 warn!(task_id = ?retry_key, error = %error, "Failed to start notification outbox snapshot");
-                self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER)
-                    .await;
+                self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER).await;
                 return;
             }
         };
         let Some(snapshot_txn_id) = snapshot_owner.id() else {
             warn!(task_id = ?retry_key, "Notification outbox snapshot owner missing transaction");
-            self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER)
-                .await;
+            self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER).await;
             return;
         };
 
@@ -852,8 +807,7 @@ impl OperationsTaskHandler {
         }
 
         if retry_needed {
-            self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER)
-                .await;
+            self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER).await;
         } else {
             match read_outbox_batch(&self.context.storage_handle, None, 1, None).await {
                 Ok(batch) if !batch.records.is_empty() || batch.has_more => {
@@ -862,8 +816,7 @@ impl OperationsTaskHandler {
                 Ok(_) => {}
                 Err(error) => {
                     warn!(task_id = ?retry_key, error = %error, "Failed to check for notification outbox records appended during drain");
-                    self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER)
-                        .await;
+                    self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER).await;
                 }
             }
         }

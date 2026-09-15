@@ -67,26 +67,24 @@ use crate::jobs::runtime::JobsRuntime;
 use crate::jobs::store::release_job;
 use crate::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
-    NEXT_BATCH_AFTER, MATERIALIZATION_POLL_AFTER,
-    MATERIALIZATION_RETRY_AFTER, MetadataDrainResult, materialization_jobs_exist,
-    process_materialization_batch, requeue_dead_letters, restore_materialization_timer,
+    MATERIALIZATION_POLL_AFTER, MATERIALIZATION_RETRY_AFTER, MetadataDrainResult, NEXT_BATCH_AFTER,
+    materialization_jobs_exist, process_materialization_batch, requeue_dead_letters,
+    restore_materialization_timer,
 };
 use crate::metadata::projector::{
-    PROJECTION_RETRY_AFTER, drain_projection_queue, project_create_events,
-    project_logged_events, replay_event_log, restore_projection_timer,
+    PROJECTION_RETRY_AFTER, drain_projection_queue, project_create_events, project_logged_events,
+    replay_event_log, restore_projection_timer,
 };
 use crate::metadata::prune_queue::{
-    GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, process_graph_tombstones,
-    prune_jobs_exist,
+    GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, process_graph_tombstones, prune_jobs_exist,
 };
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::node::usage_stats::{refresh_usage_targets, restore_usage_timer};
 use crate::notifications::client::deliver_remote;
 use crate::notifications::inbox::upsert_with_report;
 use crate::notifications::outbox::{
-    DELIVERY_RETRY_AFTER, OUTBOX_BATCH_SIZE,
-    OUTBOX_RETENTION_MS, delete_outbox_records, read_outbox_batch, restore_idle_timer,
-    restore_outbox_timer,
+    DELIVERY_RETRY_AFTER, OUTBOX_BATCH_SIZE, OUTBOX_RETENTION_MS, delete_outbox_records,
+    read_outbox_batch, restore_idle_timer, restore_outbox_timer,
 };
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::prune::{
@@ -100,9 +98,7 @@ use crate::placement::process_placements::{PlacementReconcileStatus, process_sha
 use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
 };
-use crate::replication::queue::{
-    REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer,
-};
+use crate::replication::queue::{REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer};
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::sync::document_outbox::{
     OUTBOX_DRAIN_SIZE, read_outbox_records, read_outbox_tails, restore_outbox_timers,
@@ -111,8 +107,7 @@ use crate::sync::mirror_repair::{
     REPAIR_RETRY_AFTER, process_mirror_repairs, restore_mirror_timer,
 };
 use crate::sync::shard_placement::{
-    DEFER_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX,
-    PLACEMENT_RETRY_AFTER,
+    DEFER_RETRY_AFTER, PLACEMENT_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX,
 };
 use crate::tasks::queue_backoff::{retry_after_ms, retry_delay_ms};
 use crate::tasks::task_persistence::{
@@ -436,7 +431,10 @@ impl OperationsTaskHandler {
 
     /// Whether this node is a device: configured with a kind that holds no
     /// sync topic. Unknown kinds count as infrastructure.
-    fn is_device(&self, config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>) -> bool {
+    fn is_device(
+        &self,
+        config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
+    ) -> bool {
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             return false;
         };
@@ -560,11 +558,7 @@ impl OperationsTaskHandler {
     /// full placement scan up to the placement interval. New holders only need their
     /// co-holders to apply the same config, so the ladder must not cliff to 30s.
     fn placement_retry_after(&self, key: &TaskKey) -> Duration {
-        self.retry_ladder(
-            key,
-            PULL_RETRY_AFTER,
-            PULL_RETRY_MAX,
-        )
+        self.retry_ladder(key, PULL_RETRY_AFTER, PULL_RETRY_MAX)
     }
 
     /// Keeps `base` for the first attempt, then doubles each further one up to

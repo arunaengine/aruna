@@ -7,11 +7,11 @@ use aruna_core::effects::StagingSourceEffect;
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{Event, StagingSourceEvent};
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-use aruna_core::structs::{SyncRelationship, SyncState};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::{SyncRelationship, SyncState};
 use aruna_net::NetHandle;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
 use futures_util::StreamExt;
@@ -25,7 +25,7 @@ use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::connectors::resolver::{ORIGIN_NODE_ID, NATIVE_RELATIONSHIP_ID};
+use crate::connectors::resolver::{NATIVE_RELATIONSHIP_ID, ORIGIN_NODE_ID};
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{

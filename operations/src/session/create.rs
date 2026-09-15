@@ -6,7 +6,7 @@ use aruna_core::compute::Secret;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{USER_SESSION_KEYSPACE, USER_OWNER_KEYSPACE};
+use aruna_core::keyspaces::{USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{NodeCapabilities, SessionKind, SessionRef};
 use aruna_core::structs::identity::realm::RealmId;

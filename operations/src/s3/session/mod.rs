@@ -25,7 +25,7 @@ use aruna_core::events::Event;
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::auth::PathRestriction;
-use aruna_core::structs::identity::s3_session::{SESSION_ACCESS_PREFIX, S3Session};
+use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
 use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
 use rand::distr::Alphanumeric;
