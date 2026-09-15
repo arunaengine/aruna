@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use aruna_core::structs::{AuthContext, Permission, bucket_permission_path};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_operations::driver::drive;
-use aruna_operations::s3::bucket_usage::{
+use aruna_operations::s3::bucket::usage::{
     BucketUsageInput, BucketUsageOperation, BucketUsageOutput,
 };
 use axum::extract::{Path, Query, State};

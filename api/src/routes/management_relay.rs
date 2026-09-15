@@ -283,8 +283,8 @@ fn relay_targets(peers: Vec<String>, installed: Vec<String>) -> Vec<String> {
 /// management node's local store and its status and revoke must return there.
 fn peer_management_urls(
     current: NodeId,
-    config: &aruna_core::structs::RealmConfigDocument,
-    documents: &BTreeMap<NodeId, aruna_core::structs::NodeInfoDocument>,
+    config: &aruna_core::structs::identity::realm::RealmConfigDocument,
+    documents: &BTreeMap<NodeId, aruna_core::structs::storage::node_info::NodeInfoDocument>,
 ) -> Vec<String> {
     let ordered: BTreeMap<NodeId, String> = management_node_urls(config, documents)
         .into_iter()

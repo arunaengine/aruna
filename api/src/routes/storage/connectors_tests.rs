@@ -4,7 +4,7 @@ use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
 };
 use aruna_core::UserId;
-use aruna_core::structs::{Actor, NodeCapabilities};
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -345,7 +345,7 @@ fn openapi_has_connectors() {
 
 async fn setup_state() -> TestState {
     let (storage_dir, storage_handle) = test_storage();
-    let realm_id = aruna_core::structs::RealmId([3u8; 32]);
+    let realm_id = aruna_core::structs::identity::realm::RealmId([3u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
     let user_id = UserId::local(Ulid::generate(), realm_id);
     let other_user_id = UserId::local(Ulid::generate(), realm_id);

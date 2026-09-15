@@ -6,11 +6,14 @@ use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
 use crate::server_state::ServerState;
-use aruna_core::structs::{
-    Actor, AuthContext, CurrentVersionPointer, LabelMatch, PlacementPolicy,
-    PlacementPolicyDocument, PlacementPolicyError, PlacementPolicyRef, PlacementSelector,
-    PolicyBlockedReason, PolicyStatus, VersionKey,
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
+use aruna_core::structs::placement::placement_record::LabelMatch;
+use aruna_core::structs::placement::placement_policy::{
+    PlacementPolicy, PlacementPolicyError, PlacementPolicyRef, PlacementSelector,
 };
+use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
+use aruna_core::structs::placement::policy_attachment::{PolicyBlockedReason, PolicyStatus};
 use aruna_operations::driver::{drive, gate_context, now_ms};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
@@ -28,11 +31,11 @@ use aruna_operations::placement::policy::{
     PolicyForwardError, PolicyGateError, QuarantineError, ResolveQuarantineConfig,
     ResolveQuarantineOperation, create_policy_routed,
 };
-use aruna_operations::s3::bucket_placement::{
+use aruna_operations::s3::bucket::placement::{
     PutPlacementError, PutPlacementInput, PutPlacementOperation,
 };
-use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::object_placement::{
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::object::placement::{
     ObjectPlacementError, ObjectPlacementInput, ObjectPlacementOperation,
 };
 use aruna_operations::s3::policy::bulk::{BulkConfig, BulkError, PolicyBulkOperation};
@@ -364,7 +367,7 @@ impl From<PlacementPolicyRef> for PolicyRefBody {
 /// hold stays a plain reference rather than failing the response.
 async fn named_refs(
     state: &ServerState,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     refs: Vec<PlacementPolicyRef>,
 ) -> ServerResult<Vec<PolicyRefBody>> {
     let names = drive(PolicyNamesOperation::new(realm_id, &refs), &state.get_ctx())
@@ -546,8 +549,8 @@ async fn ensure_placement_read(
     let realm_reader = crate::auth::permission_granted(
         state,
         auth,
-        aruna_core::structs::policy_admin_path(auth.realm_id),
-        aruna_core::structs::Permission::READ,
+        aruna_core::structs::placement::policy_document::policy_admin_path(auth.realm_id),
+        aruna_core::structs::identity::auth::Permission::READ,
     )
     .await?;
     if realm_reader {
@@ -556,8 +559,8 @@ async fn ensure_placement_read(
     crate::auth::ensure_permission(
         state,
         auth,
-        aruna_core::structs::group_admin_path(auth.realm_id, group_id),
-        aruna_core::structs::Permission::READ,
+        aruna_core::structs::placement::policy_document::group_admin_path(auth.realm_id, group_id),
+        aruna_core::structs::identity::auth::Permission::READ,
     )
     .await
 }
@@ -642,28 +645,28 @@ async fn ensure_placement_writer(
     bucket: &str,
 ) -> ServerResult<()> {
     let realm_id = auth.realm_id;
-    let config_admin = aruna_core::structs::policy_admin_path(realm_id);
+    let config_admin = aruna_core::structs::placement::policy_document::policy_admin_path(realm_id);
     if crate::auth::permission_granted(
         state,
         auth,
         config_admin.clone(),
-        aruna_core::structs::Permission::WRITE,
+        aruna_core::structs::identity::auth::Permission::WRITE,
     )
     .await?
     {
         return Ok(());
     }
     let path = match crate::routes::access::groups::get_bucket_group(state, bucket).await? {
-        Some(group_id) => aruna_core::structs::group_admin_path(realm_id, group_id),
+        Some(group_id) => aruna_core::structs::placement::policy_document::group_admin_path(realm_id, group_id),
         None => config_admin,
     };
-    crate::auth::ensure_permission(state, auth, path, aruna_core::structs::Permission::WRITE).await
+    crate::auth::ensure_permission(state, auth, path, aruna_core::structs::identity::auth::Permission::WRITE).await
 }
 
 async fn local_subject(
     state: &ServerState,
-    realm_id: aruna_core::structs::RealmId,
-) -> ServerResult<aruna_core::structs::PlacementSubject> {
+    realm_id: aruna_core::structs::identity::realm::RealmId,
+) -> ServerResult<aruna_core::structs::placement::placement_policy::PlacementSubject> {
     let gate = gate_context(&state.get_ctx(), realm_id, now_ms())
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?
@@ -679,7 +682,7 @@ async fn local_subject(
 async fn bucket_info(
     state: &ServerState,
     bucket: &str,
-) -> ServerResult<aruna_core::structs::BucketInfo> {
+) -> ServerResult<aruna_core::structs::storage::blob::BucketInfo> {
     match drive(
         GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
@@ -1134,14 +1137,14 @@ pub async fn get_object_placement(
     crate::auth::ensure_permission(
         &state,
         &auth,
-        aruna_core::structs::object_permission_path(
+        aruna_core::structs::storage::blob::object_permission_path(
             auth.realm_id,
             info.group_id,
             state.get_node_id(),
             &bucket,
             &query.key,
         ),
-        aruna_core::structs::Permission::READ,
+        aruna_core::structs::identity::auth::Permission::READ,
     )
     .await?;
     let placement = drive(
@@ -1674,11 +1677,11 @@ pub async fn get_placement_diagnostics(
                 key: violation.version.key.clone(),
                 version_id: violation.version.version_id.to_string(),
                 state: match violation.state {
-                    aruna_core::structs::ManagedCopyState::Registered => "registered".to_string(),
-                    aruna_core::structs::ManagedCopyState::Quarantined(_) => {
+                    aruna_core::structs::storage::blob::ManagedCopyState::Registered => "registered".to_string(),
+                    aruna_core::structs::storage::blob::ManagedCopyState::Quarantined(_) => {
                         "quarantined".to_string()
                     }
-                    aruna_core::structs::ManagedCopyState::UnresolvedDeparted => {
+                    aruna_core::structs::storage::blob::ManagedCopyState::UnresolvedDeparted => {
                         "unresolved_departed".to_string()
                     }
                 },

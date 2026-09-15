@@ -4,19 +4,21 @@ use std::sync::{Arc, Mutex};
 use aruna_core::StructuredId;
 use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::{
-    Actor, AuthContext, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
-    ImportRoCrateTarget, JobPayload, MetadataRegistryRecord, Permission, RoCrateMediaType,
-    bucket_permission_path, object_permission_path, user_dedup_key,
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::execution::job::{
+    ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload,
+    RoCrateMediaType, user_dedup_key,
 };
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::jobs::import::{
     CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation, load_rocrate_upload,
 };
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
 use aruna_operations::metadata::create_document::mint_job_document;
-use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::staging::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation,
 };
@@ -625,7 +627,7 @@ async fn fast_metadata_check(
 async fn load_bucket(
     state: &ServerState,
     bucket: &str,
-) -> ServerResult<aruna_core::structs::BucketInfo> {
+) -> ServerResult<aruna_core::structs::storage::blob::BucketInfo> {
     match drive(
         GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),

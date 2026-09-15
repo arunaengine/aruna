@@ -13,10 +13,13 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USER_KEYSPACE,
 };
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-use aruna_core::structs::{
-    Actor, BucketInfo, Group, GroupAuthorizationDocument, NodeCapabilities,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, User,
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
+use aruna_core::structs::identity::user::User;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
@@ -883,7 +886,7 @@ fn search_maps_partiality() {
     let healthy = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
     let failed = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
     let result = ObjectExecution {
-        hits: vec![aruna_operations::s3::search_objects::ObjectInventoryHit {
+        hits: vec![aruna_operations::s3::object::search::ObjectInventoryHit {
             node_id: healthy,
             group_id: Ulid::from_bytes([23u8; 16]),
             bucket: "data".to_string(),

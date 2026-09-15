@@ -14,9 +14,11 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{
-    AuthContext, MetadataRegistryRecord, Permission, PersistentIdFailure, PersistentIdKind,
-    PersistentIdMapping, PersistentIdProvider, PersistentIdStatus,
+    PersistentIdFailure, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
+    PersistentIdStatus,
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::metadata::PersistentIdResolution;
@@ -519,9 +521,9 @@ mod tests {
             false,
             aruna_core::UserId::local(
                 Ulid::from_bytes([4; 16]),
-                aruna_core::structs::RealmId([5; 32]),
+                aruna_core::structs::identity::realm::RealmId([5; 32]),
             ),
-            aruna_core::structs::JobId::from_bytes([6; 16]),
+            aruna_core::structs::execution::job::JobId::from_bytes([6; 16]),
             false,
             "/private/document".to_string(),
             aruna_core::structs::PersistentIdRevision {

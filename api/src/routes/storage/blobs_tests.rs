@@ -10,9 +10,11 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-use aruna_core::structs::CopyOrigin;
-use aruna_core::structs::{
-    Actor, AuthContext, BucketInfo, GroupAuthorizationDocument, NodeCapabilities,
+use aruna_core::structs::storage::blob::CopyOrigin;
+use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_operations::driver::DriverContext;
@@ -370,7 +372,7 @@ async fn setup_bucket(realm_id: RealmId, owner: UserId) -> (TempDir, Arc<ServerS
         aruna_core::keyspaces::GROUP_KEYSPACE,
         ByteView::from(group_id.to_bytes().to_vec()),
         ByteView::from(
-            aruna_core::structs::Group {
+            aruna_core::structs::identity::group::Group {
                 display_name: "blob-group".to_string(),
                 group_id,
                 realm_id,

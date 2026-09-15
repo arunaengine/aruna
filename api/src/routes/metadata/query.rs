@@ -9,7 +9,7 @@ use crate::metadata::{
     map_search_hit, parse_document_id,
 };
 use crate::server_state::ServerState;
-use aruna_core::structs::AuthContext;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::metadata::api::{
     DocumentQueryRequest, MetadataQueryRequest, MetadataSearchRequest,
     query_metadata as run_query_metadata, query_metadata_document as run_query_metadata_document,

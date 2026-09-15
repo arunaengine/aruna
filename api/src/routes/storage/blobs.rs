@@ -1,8 +1,9 @@
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
-use aruna_core::structs::{
-    AuthContext, BucketInfo, CopyOrigin, Permission, bucket_permission_path, object_permission_path,
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{
+    BucketInfo, CopyOrigin, bucket_permission_path, object_permission_path,
 };
 use aruna_operations::blob::holders::{GetHoldersError, GetHoldersOperation};
 use aruna_operations::driver::{drive, drive_until};
@@ -17,7 +18,7 @@ use aruna_operations::replication::queue::QueueBlobOperation;
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
-use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -760,7 +761,7 @@ fn peer_copy(
 async fn holder_nodes(
     ctx: &Arc<aruna_operations::driver::DriverContext>,
     blake3: Option<[u8; 32]>,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     local_node: NodeId,
 ) -> Result<Vec<NodeId>, GetHoldersError> {
     let Some(blake3) = blake3 else {

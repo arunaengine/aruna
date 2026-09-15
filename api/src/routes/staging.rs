@@ -10,21 +10,24 @@ use crate::routes::storage::connectors::ApiConnectorKind;
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
-use aruna_core::structs::{
-    AuthContext, BucketInfo, JobPayload, JobRecord, JobState, Permission, SourceEntry,
-    SourceEntryKind, StagingJobCheckpoint, StagingJobItem, StagingJobPhase, StagingJobPrefix,
-    StagingJobSpec, StagingStrategy, bucket_permission_path,
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
+use aruna_core::structs::execution::job::{
+    JobPayload, JobRecord, JobState, StagingJobCheckpoint, StagingJobItem, StagingJobPhase,
+    StagingJobPrefix, StagingJobSpec,
 };
+use aruna_core::structs::execution::source_access::{SourceEntry, SourceEntryKind};
+use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use aruna_operations::jobs::staging::read_staging_checkpoint;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
-use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::list_objects::{
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,
 };
-use aruna_operations::s3::put_object::PutObjectError;
+use aruna_operations::s3::object::put::PutObjectError;
 use aruna_operations::staging::head_source::HeadSourceError;
 use aruna_operations::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation,
@@ -829,7 +832,7 @@ pub async fn get_staging_job(
 ) -> ServerResult<(StatusCode, Json<StagingJobResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let job_id =
-        aruna_core::structs::JobId::from_str(&job_id).map_err(|_| ServerError::BadRequest)?;
+        aruna_core::structs::execution::job::JobId::from_str(&job_id).map_err(|_| ServerError::BadRequest)?;
     // The owner is the sole 404 authority; a non-owner routes or reports 503.
     let (record, checkpoint) = read_staging_routed(
         &state.get_ctx(),

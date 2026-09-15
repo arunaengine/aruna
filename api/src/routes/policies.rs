@@ -7,7 +7,7 @@ use aruna_core::request_policy::{
     CompiledPolicySet, PolicyDecision, PolicyKind, PolicyRequest, PolicySession, PolicyTraceEntry,
     RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
 };
-use aruna_core::structs::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::groups::set_policies::{SetGroupConfig, SetGroupError, SetGroupOperation};

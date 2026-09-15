@@ -5,10 +5,13 @@ use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::metrics::WatchMetricReason;
-use aruna_core::structs::{
-    AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NotificationClass, NotificationKind,
-    NotificationRecord, Permission, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::execution::notification_watch::{
+    NOTIFICATION_WATCH_MAX_PREFIX_LEN, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
     WatchSubscription, parse_watch_path, watch_resource_path,
+};
+use aruna_core::structs::execution::notification::{
+    NotificationClass, NotificationKind, NotificationRecord,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::dashboard::subscribe_dashboard_changes;
@@ -23,7 +26,7 @@ use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
 use aruna_operations::notifications::watch::authorization::{
     WatchAuthorization, evaluate_watch_creation, watch_permission_path,
 };
-use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};

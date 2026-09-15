@@ -14,7 +14,8 @@ use crate::metadata::{
 };
 use crate::routes::execution::jobs::{job_urls, map_submit_error};
 use crate::server_state::ServerState;
-use aruna_core::structs::{Actor, AuthContext, ExportRoCrateSpec, Permission};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::execution::job::ExportRoCrateSpec;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::jobs::service::submit_export_job;
 use aruna_operations::metadata::api::ExportMetadataRequest;

@@ -9,7 +9,7 @@ use crate::metadata::{
     map_metadata_error, parse_document_id, serialize_jsonld_object,
 };
 use crate::server_state::ServerState;
-use aruna_core::structs::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::metadata::api::GetVisibleRequest;
 use aruna_operations::metadata::forward::route_profile_status as run_profile_validation_status;
 use aruna_operations::metadata::profile_validation::{

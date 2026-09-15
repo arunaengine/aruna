@@ -8,9 +8,9 @@ use aruna_core::onboarding::{
     OnboardingSecretRecord, OnboardingSecretState, RequestedOnboardingMode, issuer_proof_message,
     node_proof_message,
 };
-use aruna_core::structs::{
-    AuthContext, NodeCapabilities, Permission, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-    StaticRealmEndpoint,
+use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
+use aruna_core::structs::identity::realm::{
+    RealmConfigDocument, RealmDiscoveryConfig, RealmId, StaticRealmEndpoint,
 };
 use aruna_core::time::unix_timestamp_secs as now_timestamp;
 use aruna_operations::auth::request_policy::{

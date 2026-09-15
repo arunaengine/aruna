@@ -4,10 +4,12 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, MetadataAuditOperation, MetadataAuditRecord,
-    PlacementRef, RealmConfigDocument, RoCrateLimits,
-};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::storage::metadata_registry::{MetadataAuditOperation, MetadataAuditRecord};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::types::{Key, Value};
 use aruna_operations::metadata::repository::create_outbox_entries;
 use aruna_operations::metadata::visibility_index::{CANDIDATE_BUDGET, rebuild_index};
@@ -51,7 +53,7 @@ async fn fixture(limits: RoCrateLimits) -> Fixture {
         Arc::clone(&ctx),
         realm_id,
         node_id,
-        aruna_core::structs::NodeCapabilities::user_node(realm_id).unwrap(),
+        aruna_core::structs::identity::auth::NodeCapabilities::user_node(realm_id).unwrap(),
         false,
         None,
         aruna_operations::jobs::runtime::JobsRuntime::new(),

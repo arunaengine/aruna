@@ -10,7 +10,7 @@ use crate::metadata::{
     run_document_list, serialize_jsonld_object,
 };
 use crate::server_state::ServerState;
-use aruna_core::structs::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::metadata::api::{
     GetVisibleRequest, MetadataLookupRequest, lookup_metadata_path as run_lookup_metadata_path,

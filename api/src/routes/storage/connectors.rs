@@ -6,10 +6,9 @@ use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::SourceResolutionError;
-use aruna_core::structs::{
-    AuthContext, Permission, ResolvedSourceAccess, SourceConnector, SourceConnectorKind,
-    SourceEntryKind,
-};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceEntryKind};
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_operations::connectors::create_connector::{
     SourceConnectorError, SourceConnectorInput, SourceConnectorOperation,
 };

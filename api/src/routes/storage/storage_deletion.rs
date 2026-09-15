@@ -1,16 +1,15 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use aruna_core::structs::{
-    AuthContext, Permission, StoragePurgeScope, StoragePurgeSpec, bucket_permission_path,
-    object_permission_path,
-};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
+use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JOB_RETENTION_MS;
 use aruna_operations::jobs::service::submit_purge_job;
-use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::list_uploads::{ListUploadsInput, ListUploadsOperation};
-use aruna_operations::s3::list_versions::{
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
+use aruna_operations::s3::object::versions::{
     ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
 use aruna_operations::sync::sync_relationship::{
@@ -480,7 +479,7 @@ pub async fn submit_purge(
 pub(crate) async fn bucket_info(
     state: &ServerState,
     bucket: &str,
-) -> ServerResult<aruna_core::structs::BucketInfo> {
+) -> ServerResult<aruna_core::structs::storage::blob::BucketInfo> {
     match drive(
         GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
@@ -510,7 +509,7 @@ fn scope_permission_path(state: &ServerState, group_id: Ulid, scope: &StoragePur
 
 fn scoped_version_page(
     scope: &StoragePurgeScope,
-    result: aruna_operations::s3::list_versions::ListVersionsResult,
+    result: aruna_operations::s3::object::versions::ListVersionsResult,
 ) -> (Vec<ListVersionsItem>, bool, Option<String>, Option<Ulid>) {
     let mut items = result.items;
     let mut truncated = result.is_truncated;
@@ -532,9 +531,9 @@ fn scoped_version_page(
 
 fn scoped_multipart_page(
     scope: &StoragePurgeScope,
-    result: aruna_operations::s3::list_uploads::ListUploadsResult,
+    result: aruna_operations::s3::multipart::uploads::ListUploadsResult,
 ) -> (
-    Vec<aruna_core::structs::MultipartUpload>,
+    Vec<aruna_core::structs::storage::multipart::MultipartUpload>,
     bool,
     Option<String>,
     Option<Ulid>,

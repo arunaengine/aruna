@@ -1,5 +1,5 @@
 use super::{PolicyRefBody, SelectorBody};
-use aruna_core::structs::{PlacementPolicyRef, PlacementSelector};
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSelector};
 use ulid::Ulid;
 
 #[test]

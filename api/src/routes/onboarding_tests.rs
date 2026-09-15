@@ -18,9 +18,9 @@ use aruna_core::onboarding::{
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::storage_entries::reducer_state_key;
-use aruna_core::structs::{
-    Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-    RealmNodeKind, StaticRealmEndpoint,
+use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
+use aruna_core::structs::identity::realm::{
+    RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, StaticRealmEndpoint,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
@@ -154,7 +154,7 @@ fn declares_dialable_members() {
     assert_eq!(declared, vec![endpoint(server)]);
     assert!(super::declared_endpoints(&config, &server.to_string()).is_empty());
 
-    config.discovery = aruna_core::structs::default_discovery_config();
+    config.discovery = aruna_core::structs::identity::realm::default_discovery_config();
     assert!(super::declared_endpoints(&config, &stranger.to_string()).is_empty());
 }
 

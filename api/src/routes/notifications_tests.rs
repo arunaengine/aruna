@@ -5,10 +5,14 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::metrics::NodeMetrics;
-use aruna_core::structs::{
-    Actor, BucketInfo, GroupAuthorizationDocument, NodeCapabilities, PathRestriction, Permission,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, WatchEvent,
-    WatchEventDetail, watch_resource_path,
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction, Permission};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+};
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, WatchEventDetail, watch_resource_path,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
@@ -194,7 +198,7 @@ async fn install_group_authorization(
     )
     .await;
     // Policy loading resolves the group record before group policies apply.
-    let group = aruna_core::structs::Group {
+    let group = aruna_core::structs::identity::group::Group {
         display_name: "watch-group".to_string(),
         group_id,
         realm_id,

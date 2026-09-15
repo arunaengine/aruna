@@ -9,11 +9,19 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
-    Group, GroupAuthorizationDocument, NodeCapabilities, PlacementPolicy, PlacementPolicyDocument,
-    PlacementPolicyRef, PlacementSelector, PolicyPublicationClaim, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, VerifiedPolicy, VersionKey, placement_policy_key,
+use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
+use aruna_core::structs::storage::blob::{
+    BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
+};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::placement::placement_policy::{
+    PlacementPolicy, PlacementPolicyRef, PlacementSelector, VerifiedPolicy,
+};
+use aruna_core::structs::placement::policy_document::{
+    PlacementPolicyDocument, PolicyPublicationClaim, placement_policy_key,
+};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;

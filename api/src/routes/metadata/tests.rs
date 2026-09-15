@@ -12,7 +12,7 @@ use crate::tests::routes::{
 };
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::MetadataQueryResults;
-use aruna_core::structs::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{
@@ -39,11 +39,14 @@ use aruna_core::metadata::{
     MetadataLifecycleRecord,
 };
 use aruna_core::storage_entries::{materialization_status_entry, registry_delete_entries};
-use aruna_core::structs::{
-    BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, Group,
-    GroupAuthorizationDocument, HashIndex, METADATA_HANDLE, NodeCapabilities,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
-    VersionKey,
+use aruna_core::structs::storage::blob::{
+    BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, HashIndex, VersionKey,
+};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::placement::placement_record::METADATA_HANDLE;
+use aruna_core::structs::identity::auth::{NodeCapabilities, TokenClaims};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{PersistedTaskTimer, TaskKey};
@@ -1153,7 +1156,7 @@ async fn seed_preview_object(test: &TestState) -> Value {
     crate_value["@graph"].as_array_mut().unwrap().push(json!({
         "@id": format!(
             "{}{}",
-            aruna_core::structs::ARUNA_DATA_PREFIX,
+            aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX,
             hex::encode(hash)
         ),
         "@type": "File",
@@ -1174,7 +1177,7 @@ async fn grant_anonymous_read(test: &TestState) {
     let role_id = Ulid::generate();
     realm_auth.roles.insert(
         role_id,
-        aruna_core::structs::Role {
+        aruna_core::structs::identity::auth::Role {
             role_id,
             name: "everyone".to_string(),
             permissions: std::collections::HashMap::from([(
@@ -1219,7 +1222,7 @@ async fn preview_lists_restricted() {
     assert_eq!(
         restricted.permission_path.as_deref(),
         Some(
-            aruna_core::structs::object_permission_path(
+            aruna_core::structs::storage::blob::object_permission_path(
                 test.state.get_realm_id(),
                 test.group_id,
                 test.state.get_node_id(),

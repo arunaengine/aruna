@@ -16,10 +16,11 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::GROUP_KEYSPACE;
-use aruna_core::structs::{
-    Actor, AuthContext, DocumentClass, Group, NodeCapabilities, PlacementScope, QuotaConfig,
-    RealmId, UsageCounters,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
+use aruna_core::structs::placement::placement_record::{DocumentClass, PlacementScope};
+use aruna_core::structs::identity::group::Group;
+use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
+use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, allocate_placement_binding,
@@ -293,7 +294,9 @@ fn openapi_includes_info() {
 
 async fn seed_usage_state(state: &Arc<ServerState>) {
     use aruna_core::keyspaces::{USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
-    use aruna_core::structs::{NodeUsageSnapshot, global_shard_key, usage_global_key};
+    use aruna_core::structs::storage::usage::{
+        NodeUsageSnapshot, global_shard_key, usage_global_key,
+    };
 
     let ctx = state.get_ctx();
     // This node's live local total.
@@ -301,7 +304,7 @@ async fn seed_usage_state(state: &Arc<ServerState>) {
         .send_storage_effect(StorageEffect::Write {
             key_space: USAGE_STATS_KEYSPACE.to_string(),
             key: global_shard_key(0).into(),
-            value: aruna_core::structs::UsageCounters {
+            value: aruna_core::structs::storage::usage::UsageCounters {
                 buckets: 2,
                 ..Default::default()
             }
@@ -319,7 +322,7 @@ async fn seed_usage_state(state: &Arc<ServerState>) {
             key: usage_global_key(remote).into(),
             value: NodeUsageSnapshot {
                 node_id: remote,
-                counters: aruna_core::structs::UsageCounters {
+                counters: aruna_core::structs::storage::usage::UsageCounters {
                     buckets: 3,
                     ..Default::default()
                 },
@@ -376,7 +379,8 @@ async fn usage_requires_auth() {
 #[tokio::test]
 async fn usage_counts_documents() {
     use aruna_core::storage_entries::registry_write_entries;
-    use aruna_core::structs::{MetadataRegistryRecord, PlacementRef};
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
 
     let storage_dir = tempdir().unwrap();
     let metadata_dir = tempdir().unwrap();
@@ -471,7 +475,7 @@ fn quota_warning_unlimited() {
         default_group_quota_bytes: Some(1_000),
         grace_factor_percent: 110,
         warn_threshold_percent: 85,
-        group_overrides: vec![aruna_core::structs::GroupQuotaOverride {
+        group_overrides: vec![aruna_core::structs::identity::realm::GroupQuotaOverride {
             group_id: unlimited_group,
             quota_bytes: None,
             grace_factor_percent: None,
@@ -1315,7 +1319,9 @@ async fn management_urls_follow() {
     // The published document names the url a device follows; without one a management
     // node falls back to its own interface, and a server node lists others but not itself.
     use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
-    use aruna_core::structs::{NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key};
+    use aruna_core::structs::storage::node_info::{
+        NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
+    };
 
     let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
     state
@@ -1337,7 +1343,7 @@ async fn management_urls_follow() {
             heartbeat_at_ms: 1_700_000_000_000,
         },
         updated_at_ms: 1_700_000_000_500,
-        epoch: aruna_core::structs::AdvertisementEpoch {
+        epoch: aruna_core::structs::storage::node_info::AdvertisementEpoch {
             membership_generation: 1,
             publisher_generation: 1,
             observed_at_ms: 1_700_000_000_500,
@@ -1369,7 +1375,9 @@ async fn management_urls_follow() {
 #[tokio::test]
 async fn realm_node_details() {
     use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
-    use aruna_core::structs::{NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key};
+    use aruna_core::structs::storage::node_info::{
+        NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
+    };
 
     let (state, realm_id, admin, _tempdir) = setup_management_state().await;
     let node_id = state.get_node_id();
@@ -1378,7 +1386,7 @@ async fn realm_node_details() {
     // the default location/weight. Publish a node info document for it too.
     let mut docker = aruna_core::compute::ExecutorCapability::new(
         "docker".to_string(),
-        aruna_core::structs::PlacementSubject {
+        aruna_core::structs::placement::placement_policy::PlacementSubject {
             node_id,
             generation: 1,
             location: "eu-west".to_string(),
@@ -1405,7 +1413,7 @@ async fn realm_node_details() {
             heartbeat_at_ms: 1_700_000_000_000,
         },
         updated_at_ms: 1_700_000_000_500,
-        epoch: aruna_core::structs::AdvertisementEpoch {
+        epoch: aruna_core::structs::storage::node_info::AdvertisementEpoch {
             membership_generation: 1,
             publisher_generation: 1,
             observed_at_ms: 1_700_000_000_500,
@@ -1599,9 +1607,9 @@ async fn device_never_connected() {
     .unwrap();
     let device = iroh::SecretKey::from_bytes(&[43u8; 32]).public();
     for node_id in [device, state.get_node_id()] {
-        config.nodes.push(aruna_core::structs::RealmNode {
+        config.nodes.push(aruna_core::structs::identity::realm::RealmNode {
             node_id: node_id.to_string(),
-            kind: aruna_core::structs::RealmNodeKind::User { owner },
+            kind: aruna_core::structs::identity::realm::RealmNodeKind::User { owner },
         });
     }
 
@@ -1646,9 +1654,9 @@ async fn reports_device_seen() {
     let recent = iroh::SecretKey::from_bytes(&[44u8; 32]).public();
     let stale = iroh::SecretKey::from_bytes(&[45u8; 32]).public();
     for node_id in [recent, stale, state.get_node_id()] {
-        config.nodes.push(aruna_core::structs::RealmNode {
+        config.nodes.push(aruna_core::structs::identity::realm::RealmNode {
             node_id: node_id.to_string(),
-            kind: aruna_core::structs::RealmNodeKind::User { owner },
+            kind: aruna_core::structs::identity::realm::RealmNodeKind::User { owner },
         });
     }
     let now_ms = 1_000_000;
