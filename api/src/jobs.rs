@@ -1,6 +1,6 @@
 //! Transport-independent job admission and session lookup. REST and MCP both
-//! build a command and call here; each transport maps the outcome to its own
-//! status or tool result.
+//! build a command and call here; each transport maps the returned outcome to
+//! its own status or tool result.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -11,13 +11,16 @@ use aruna_core::compute::runtimes::SESSION_MOUNT_PREFIX_TAG;
 use aruna_core::id::NodeId;
 use aruna_core::scheduling::MAX_PLAN_INPUTS;
 use aruna_core::structs::{
-    AuthContext, CollisionPolicy, ComputeResources, ExecutionSpec, InputMode, InputSelection,
-    InputSource, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, NodeCapabilities,
-    OutputDestination, OutputSelection, Permission, WorkspaceMode, WorkspaceOutput,
-    bucket_permission_path, group_permission_path,
+    AuthContext, CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec, InputMode,
+    InputSelection, InputSource, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS,
+    NodeCapabilities, OutputDestination, OutputSelection, Permission, WorkspaceMode,
+    WorkspaceOutput, bucket_permission_path, group_permission_path,
 };
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
+use aruna_operations::device::compute::{
+    LocalExecutionConfig, LocalExecutionError, submit_local_execution,
+};
+use aruna_operations::jobs::JobRouteError;
 use aruna_operations::jobs::command::{
     AcceptedExecution, CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
     ExecutionTarget, InputMode as CommandInputMode, SubmitExecutionCommand,
@@ -26,20 +29,127 @@ use aruna_operations::jobs::command::{
 use aruna_operations::jobs::lifecycle::routing::session_job;
 use aruna_operations::jobs::lifecycle::submit_external_job;
 use aruna_operations::jobs::service::read_owned_job;
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::jobs::submit::SubmitJobError;
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use ulid::Ulid;
 
-use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_auth};
-use crate::error::{ServerError, ServerResult};
-use crate::routes::device::require_owner;
-use crate::routes::jobs::{
-    forwarded_job_auth, hex32, map_job_route, map_local_error, map_submit_error, parse_job_id,
-};
+use crate::auth::{ValidatedBearer, require_owner, require_unrestricted_auth};
+use crate::error::ServerError;
 use crate::server_state::ServerState;
 use aruna_operations::driver::drive;
 
 /// An output path count bound shared with the transport documentation.
 pub(crate) const MAX_OUTPUT_PREFIXES: usize = 32;
+
+/// The transport-independent outcome of a refused admission or session read.
+/// Each transport maps it to its own status or tool result.
+#[derive(Debug)]
+pub(crate) enum JobRequestError {
+    /// Malformed caller input with no reason beyond "bad request".
+    BadRequest,
+    /// Malformed caller input whose reason the caller can act on.
+    BadRequestMessage(String),
+    Unauthorized,
+    Forbidden,
+    NotFound,
+    /// A refused plan, limit or composition.
+    Conflict(String),
+    /// The idempotency key is bound to a different plan.
+    JobPlanConflict(String),
+    /// Standing compute quota refused the admission.
+    ComputeQuotaDenied(aruna_core::compute_quota::QuotaDenied),
+    /// A retryable dependency did not answer.
+    ServiceUnavailableReason(String),
+    /// A fault that is not the caller's to fix.
+    InternalError(String),
+}
+
+impl JobRequestError {
+    /// Folds a refusal raised by a shared authorization or forwarding helper;
+    /// the transports never see the helper's own error type.
+    fn from_server(error: ServerError) -> Self {
+        match error {
+            ServerError::BadRequest => Self::BadRequest,
+            ServerError::BadRequestReason(message) | ServerError::BadRequestMessage(message) => {
+                Self::BadRequestMessage(message)
+            }
+            ServerError::Unauthorized => Self::Unauthorized,
+            ServerError::Forbidden => Self::Forbidden,
+            ServerError::NotFound => Self::NotFound,
+            ServerError::ServiceUnavailable => {
+                Self::ServiceUnavailableReason("Service unavailable".to_string())
+            }
+            ServerError::ServiceUnavailableReason(message) => {
+                Self::ServiceUnavailableReason(message)
+            }
+            other => Self::InternalError(other.to_string()),
+        }
+    }
+
+    /// Categorizes an admission refusal from the job store.
+    fn from_submit(error: SubmitJobError) -> Self {
+        match error {
+            SubmitJobError::JobPlanConflict { existing_job_id } => Self::JobPlanConflict(format!(
+                "idempotency key already bound to job {existing_job_id}"
+            )),
+            SubmitJobError::ActiveJobLimit { limit } => {
+                Self::Conflict(format!("active job limit of {limit} reached"))
+            }
+            SubmitJobError::InvalidWorkspace(_) => Self::BadRequest,
+            SubmitJobError::TooManyOutputs { limit } => {
+                Self::BadRequestMessage(format!("a job may declare at most {limit} outputs"))
+            }
+            SubmitJobError::Composition(CompositionError::KeyConflict(key)) => {
+                Self::Conflict(format!("composition key conflict on {key}"))
+            }
+            SubmitJobError::Composition(other) => Self::BadRequestMessage(other.to_string()),
+            SubmitJobError::ClockHealth(_) => {
+                Self::ServiceUnavailableReason("structured_id_clock_unhealthy".to_string())
+            }
+            SubmitJobError::PlacementUnavailable(_) => {
+                Self::ServiceUnavailableReason("job_placement_unavailable".to_string())
+            }
+            SubmitJobError::QuotaDenied(denied) => Self::ComputeQuotaDenied(denied),
+            SubmitJobError::AuthorityDenied => Self::Forbidden,
+            other => Self::InternalError(other.to_string()),
+        }
+    }
+
+    /// Categorizes a refusal of a local device execution.
+    fn from_local(error: LocalExecutionError) -> Self {
+        match error {
+            LocalExecutionError::NotADevice => Self::BadRequestMessage(
+                "target `local` is served by a user device only".to_string(),
+            ),
+            LocalExecutionError::NotOwner => Self::Forbidden,
+            LocalExecutionError::Paused | LocalExecutionError::NoExecutor => {
+                Self::Conflict(error.to_string())
+            }
+            LocalExecutionError::Unsupported(_)
+            | LocalExecutionError::InputNotLocal { .. }
+            | LocalExecutionError::InputRefused { .. } => {
+                Self::BadRequestMessage(error.to_string())
+            }
+            LocalExecutionError::Unavailable(_) => {
+                Self::ServiceUnavailableReason(error.to_string())
+            }
+            LocalExecutionError::Submit(error) => Self::from_submit(error),
+        }
+    }
+
+    /// Categorizes a routed session read that did not answer.
+    fn from_route(error: JobRouteError) -> Self {
+        match error {
+            JobRouteError::Unauthorized => Self::Unauthorized,
+            JobRouteError::Forbidden => Self::Forbidden,
+            JobRouteError::NotFound => Self::NotFound,
+            JobRouteError::Unavailable(_) => {
+                Self::ServiceUnavailableReason("job_read_unavailable".to_string())
+            }
+            JobRouteError::Internal(message) => Self::InternalError(message),
+        }
+    }
+}
 
 /// The transport-independent admission decision shared by REST and MCP. The
 /// outcome carries the application answer; each transport maps it to its own
@@ -47,26 +157,28 @@ pub(crate) const MAX_OUTPUT_PREFIXES: usize = 32;
 pub(crate) async fn admit_execution(
     state: &ServerState,
     auth: Option<AuthContext>,
-    bearer: Option<ValidatedArunaBearerTokenCarrier>,
+    bearer: Option<ValidatedBearer>,
     mut command: SubmitExecutionCommand,
     extras: PolicyRequestExtras,
-) -> ServerResult<AcceptedExecution> {
+) -> Result<AcceptedExecution, JobRequestError> {
     command
         .resolve_session(
             bearer
                 .as_ref()
                 .map(|bearer| bearer.expires_at_secs().saturating_mul(1_000)),
         )
-        .map_err(|error| ServerError::BadRequestMessage(error.to_string()))?;
+        .map_err(|error| JobRequestError::BadRequestMessage(error.to_string()))?;
     let target = command.target.unwrap_or_default();
     let auth = match target {
-        ExecutionTarget::Realm => require_unrestricted_auth(state, auth)?,
+        ExecutionTarget::Realm => {
+            require_unrestricted_auth(state, auth).map_err(JobRequestError::from_server)?
+        }
         ExecutionTarget::Local => local_auth(state, auth).await?,
     };
-    let group_id = Ulid::from_string(&command.group_id).map_err(|_| ServerError::BadRequest)?;
+    let group_id = Ulid::from_string(&command.group_id).map_err(|_| JobRequestError::BadRequest)?;
     let (workspace_mode, workspace_bucket) = workspace_request(command.workspace.take())?;
     if command.image.trim().is_empty() {
-        return Err(ServerError::BadRequest);
+        return Err(JobRequestError::BadRequest);
     }
     // RAM above i64::MAX would wrap negative in the Docker HostConfig cast.
     if command.cpu_cores == Some(0)
@@ -74,7 +186,7 @@ pub(crate) async fn admit_execution(
             .ram_bytes
             .is_some_and(|bytes| bytes == 0 || i64::try_from(bytes).is_err())
     {
-        return Err(ServerError::BadRequest);
+        return Err(JobRequestError::BadRequest);
     }
     let output_prefixes = validate_output_prefixes(std::mem::take(&mut command.output_prefixes))?;
     crate::auth::ensure_permission_with(
@@ -84,10 +196,11 @@ pub(crate) async fn admit_execution(
         Permission::WRITE,
         extras.clone(),
     )
-    .await?;
+    .await
+    .map_err(JobRequestError::from_server)?;
 
     if command.inputs.len() > MAX_PLAN_INPUTS || command.outputs.len() > MAX_EXECUTION_OUTPUTS {
-        return Err(ServerError::BadRequest);
+        return Err(JobRequestError::BadRequest);
     }
     // Destination-key overlaps are the composition's collision policy to resolve.
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(command.inputs.len());
@@ -97,7 +210,7 @@ pub(crate) async fn admit_execution(
             .iter()
             .any(|existing| existing.container_path == input.container_path)
         {
-            return Err(ServerError::BadRequest);
+            return Err(JobRequestError::BadRequest);
         }
         inputs.push(input);
     }
@@ -122,7 +235,8 @@ pub(crate) async fn admit_execution(
             Permission::WRITE,
             extras.clone(),
         )
-        .await?;
+        .await
+        .map_err(JobRequestError::from_server)?;
     }
 
     let spec = ExecutionSpec {
@@ -162,10 +276,11 @@ pub(crate) async fn admit_execution(
                 workspace_mode,
                 workspace_bucket,
                 state.rocrate_limits().artifact_retention_ms,
-                forwarded_job_auth(bearer)?,
+                crate::metadata::forwarded_auth_token(bearer)
+                    .map_err(JobRequestError::from_server)?,
             )
             .await
-            .map_err(map_submit_error)?;
+            .map_err(JobRequestError::from_submit)?;
             AcceptedExecution {
                 job_id: result.job_id,
                 created: result.created,
@@ -181,13 +296,18 @@ pub(crate) async fn admit_execution(
 
 /// The owner of this device, for a run that must stay on this machine. A node
 /// that serves no device plane refuses the target itself, not the caller.
-async fn local_auth(state: &ServerState, auth: Option<AuthContext>) -> ServerResult<AuthContext> {
+async fn local_auth(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+) -> Result<AuthContext, JobRequestError> {
     if !matches!(state.node_capabilities(), NodeCapabilities::User { .. }) {
-        return Err(ServerError::BadRequestMessage(
+        return Err(JobRequestError::BadRequestMessage(
             "target `local` is served by a user device only".to_string(),
         ));
     }
-    require_owner(state, auth).await
+    require_owner(state, auth)
+        .await
+        .map_err(JobRequestError::from_server)
 }
 
 async fn local_submit(
@@ -196,7 +316,7 @@ async fn local_submit(
     spec: ExecutionSpec,
     idempotency_key: Option<String>,
     workspace_mode: WorkspaceMode,
-) -> ServerResult<AcceptedExecution> {
+) -> Result<AcceptedExecution, JobRequestError> {
     let context = state.get_ctx();
     let result = submit_local_execution(
         &context,
@@ -210,7 +330,7 @@ async fn local_submit(
         },
     )
     .await
-    .map_err(map_local_error)?;
+    .map_err(JobRequestError::from_local)?;
     // A replay answers with the state the device already reduced for that job.
     let state = read_owned_job(&context, auth.user_id, result.job_id)
         .await
@@ -232,10 +352,10 @@ pub(crate) async fn owned_session_job(
     state: &ServerState,
     auth: &AuthContext,
     raw_job_id: &str,
-) -> ServerResult<(JobRecord, Option<JobId>)> {
+) -> Result<(JobRecord, Option<JobId>), JobRequestError> {
     session_job(&state.get_ctx(), auth.user_id, parse_job_id(raw_job_id)?)
         .await
-        .map_err(map_job_route)
+        .map_err(JobRequestError::from_route)
 }
 
 /// The caller's live session on this node, for callers that have no coded
@@ -244,18 +364,18 @@ pub(crate) async fn caller_session(
     state: &ServerState,
     auth: &AuthContext,
     raw_job_id: &str,
-) -> ServerResult<Arc<Session>> {
+) -> Result<Arc<Session>, JobRequestError> {
     let (record, physical_job_id) = owned_session_job(state, auth, raw_job_id).await?;
     if record.owner_node_id != state.get_node_id() {
-        return Err(ServerError::NotFound);
+        return Err(JobRequestError::NotFound);
     }
-    let job_id = physical_job_id.ok_or(ServerError::NotFound)?;
+    let job_id = physical_job_id.ok_or(JobRequestError::NotFound)?;
     state
         .get_ctx()
         .compute_handle
         .as_ref()
         .and_then(|registry| registry.sessions().get(&job_id.to_string()))
-        .ok_or(ServerError::NotFound)
+        .ok_or(JobRequestError::NotFound)
 }
 
 /// A blank label carries no more than an absent one, so it is stored as absent.
@@ -277,7 +397,7 @@ pub(crate) fn mount_permission_path(bucket_path: String, prefix: &str) -> String
 /// An omitted workspace block runs without a bucket of the run's own.
 pub(crate) fn workspace_request(
     workspace: Option<WorkspaceSpec>,
-) -> ServerResult<(WorkspaceMode, Option<String>)> {
+) -> Result<(WorkspaceMode, Option<String>), JobRequestError> {
     let Some(workspace) = workspace else {
         return Ok((WorkspaceMode::None, None));
     };
@@ -286,7 +406,7 @@ pub(crate) fn workspace_request(
         (CommandWorkspaceMode::Existing, Some(bucket)) if !bucket.trim().is_empty() => {
             Ok((WorkspaceMode::Existing, Some(bucket)))
         }
-        _ => Err(ServerError::BadRequest),
+        _ => Err(JobRequestError::BadRequest),
     }
 }
 
@@ -299,19 +419,19 @@ async fn validate_owned_bucket(
     group_id: Ulid,
     bucket: &str,
     extras: PolicyRequestExtras,
-) -> ServerResult<()> {
+) -> Result<(), JobRequestError> {
     let info = match drive(
-        GetBucketInfoOperation::new(bucket.to_string()),
+        GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
     )
     .await
     {
         Ok(info) => info,
-        Err(GetBucketInfoError::NotFound) => return Err(ServerError::BadRequest),
-        Err(error) => return Err(ServerError::InternalError(error.to_string())),
+        Err(GetBucketError::NotFound) => return Err(JobRequestError::BadRequest),
+        Err(error) => return Err(JobRequestError::InternalError(error.to_string())),
     };
     if info.group_id != group_id {
-        return Err(ServerError::BadRequest);
+        return Err(JobRequestError::BadRequest);
     }
     crate::auth::ensure_permission_with(
         state,
@@ -321,15 +441,16 @@ async fn validate_owned_bucket(
         extras,
     )
     .await
+    .map_err(JobRequestError::from_server)
 }
 
 /// Canonical absolute container path or 400.
-fn container_path(path: &str) -> ServerResult<String> {
-    let normalized = normalize_container_path(path).map_err(|_| ServerError::BadRequest)?;
+fn container_path(path: &str) -> Result<String, JobRequestError> {
+    let normalized = normalize_container_path(path).map_err(|_| JobRequestError::BadRequest)?;
     normalized
         .to_str()
         .map(str::to_string)
-        .ok_or(ServerError::BadRequest)
+        .ok_or(JobRequestError::BadRequest)
 }
 
 /// Native inputs land in the container at the given path, defaulting to
@@ -337,18 +458,18 @@ fn container_path(path: &str) -> ServerResult<String> {
 pub(crate) fn native_input(
     input: ExecutionInput,
     target: ExecutionTarget,
-) -> ServerResult<InputSelection> {
+) -> Result<InputSelection, JobRequestError> {
     if input.dest_key.is_empty() {
-        return Err(ServerError::BadRequest);
+        return Err(JobRequestError::BadRequest);
     }
     // A realm submission resolves its inputs through the planner, which stores
     // the holder itself; naming one there would claim an unverified value.
     let source_node_id = match (&input.source_node_id, target) {
         (Some(node_id), ExecutionTarget::Local) => {
-            Some(NodeId::from_str(node_id).map_err(|_| ServerError::BadRequest)?)
+            Some(NodeId::from_str(node_id).map_err(|_| JobRequestError::BadRequest)?)
         }
         (Some(_), ExecutionTarget::Realm) => {
-            return Err(ServerError::BadRequestMessage(
+            return Err(JobRequestError::BadRequestMessage(
                 "source_node_id is only accepted by a local run".to_string(),
             ));
         }
@@ -392,9 +513,12 @@ enum MappedOutput {
     Workspace(WorkspaceOutput),
 }
 
-fn native_output(output: ExecutionOutput, mode: WorkspaceMode) -> ServerResult<MappedOutput> {
+fn native_output(
+    output: ExecutionOutput,
+    mode: WorkspaceMode,
+) -> Result<MappedOutput, JobRequestError> {
     if output.dest_key.is_empty() {
-        return Err(ServerError::BadRequest);
+        return Err(JobRequestError::BadRequest);
     }
     let container_path = container_path(&output.container_path)?;
     let bucket = output
@@ -417,7 +541,7 @@ fn native_output(output: ExecutionOutput, mode: WorkspaceMode) -> ServerResult<M
             container_path,
             dest_key: output.dest_key,
         })),
-        (None, WorkspaceMode::None) => Err(ServerError::BadRequestMessage(format!(
+        (None, WorkspaceMode::None) => Err(JobRequestError::BadRequestMessage(format!(
             "output `{container_path}` needs a bucket when `workspace.mode` is `none`"
         ))),
     }
@@ -428,7 +552,7 @@ fn native_output(output: ExecutionOutput, mode: WorkspaceMode) -> ServerResult<M
 pub(crate) fn native_outputs(
     outputs: Vec<ExecutionOutput>,
     mode: WorkspaceMode,
-) -> ServerResult<(Vec<OutputSelection>, Vec<WorkspaceOutput>)> {
+) -> Result<(Vec<OutputSelection>, Vec<WorkspaceOutput>), JobRequestError> {
     let mut explicit: Vec<OutputSelection> = Vec::new();
     let mut workspace: Vec<WorkspaceOutput> = Vec::new();
     let mut paths: Vec<String> = Vec::with_capacity(outputs.len());
@@ -439,7 +563,7 @@ pub(crate) fn native_outputs(
             MappedOutput::Workspace(output) => &output.container_path,
         };
         if paths.iter().any(|existing| existing == path) {
-            return Err(ServerError::BadRequest);
+            return Err(JobRequestError::BadRequest);
         }
         paths.push(path.clone());
         match mapped {
@@ -448,7 +572,7 @@ pub(crate) fn native_outputs(
                     .iter()
                     .any(|existing| existing.destination == output.destination)
                 {
-                    return Err(ServerError::BadRequest);
+                    return Err(JobRequestError::BadRequest);
                 }
                 explicit.push(output);
             }
@@ -457,7 +581,7 @@ pub(crate) fn native_outputs(
                     .iter()
                     .any(|existing| existing.dest_key == output.dest_key)
                 {
-                    return Err(ServerError::BadRequest);
+                    return Err(JobRequestError::BadRequest);
                 }
                 workspace.push(output);
             }
@@ -478,9 +602,11 @@ pub(crate) fn output_buckets(workspace: Option<&str>, outputs: &[OutputSelection
     buckets
 }
 
-pub(crate) fn validate_output_prefixes(prefixes: Vec<String>) -> ServerResult<Vec<String>> {
+pub(crate) fn validate_output_prefixes(
+    prefixes: Vec<String>,
+) -> Result<Vec<String>, JobRequestError> {
     if prefixes.len() > MAX_OUTPUT_PREFIXES || prefixes.iter().any(String::is_empty) {
-        return Err(ServerError::BadRequest);
+        return Err(JobRequestError::BadRequest);
     }
     let mut deduplicated = Vec::with_capacity(prefixes.len());
     for prefix in prefixes {
@@ -489,4 +615,13 @@ pub(crate) fn validate_output_prefixes(prefixes: Vec<String>) -> ServerResult<Ve
         }
     }
     Ok(deduplicated)
+}
+
+/// A caller-supplied job id; a malformed id is absence to a reader.
+pub(crate) fn parse_job_id(raw: &str) -> Result<JobId, JobRequestError> {
+    JobId::from_str(raw).map_err(|_| JobRequestError::NotFound)
+}
+
+pub(crate) fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
