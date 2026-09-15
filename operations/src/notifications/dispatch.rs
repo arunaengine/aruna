@@ -1,6 +1,6 @@
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::metrics::WatchAuthorizationMetricReason;
+use aruna_core::metrics::WatchMetricReason;
 use aruna_core::structs::{
     NotificationClass, NotificationKind, NotificationRecord, WatchAuthorizationBinding,
     WatchEventMask, WatchInterestEntry, WatchSubscription,
@@ -30,7 +30,7 @@ use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_UNAVAILABLE, WatchSubscriptionError, create_holder_watch,
     delete_holder_watch,
 };
-use crate::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
+use crate::realm::get_config::{GetConfigError, GetConfigOperation};
 
 /// Outcome of serving a user's inbox read op through the resolved holder.
 /// Keeps holder resolution and net orchestration out of the REST layer so the
@@ -55,7 +55,7 @@ pub enum WatchDispatchError {
     #[error("notification watch subscription cap reached")]
     CapExceeded,
     #[error("{WATCH_SUBSCRIPTION_UNAUTHORIZED}: {}", .0.as_str())]
-    Unauthorized(WatchAuthorizationMetricReason),
+    Unauthorized(WatchMetricReason),
     #[error("holder proxy failed: {0}")]
     Remote(String),
     #[error("{0}")]
@@ -86,7 +86,7 @@ pub async fn resolve_user_holder(
 /// names the net handle's channel type directly.
 pub type InboxWakeReceiver = broadcast::Receiver<UserId>;
 
-pub fn record_watch_denial(context: &DriverContext, reason: WatchAuthorizationMetricReason) {
+pub fn record_watch_denial(context: &DriverContext, reason: WatchMetricReason) {
     if let Some(net_handle) = context.net_handle.as_ref() {
         net_handle
             .notification_watch_metrics()
@@ -110,10 +110,10 @@ async fn resolve_holder(
     context: &DriverContext,
     recipient: UserId,
 ) -> Result<NodeId, NotificationDispatchError> {
-    let config = drive(GetRealmConfigOperation::new(recipient.realm_id), context)
+    let config = drive(GetConfigOperation::new(recipient.realm_id), context)
         .await
         .map_err(|error| match error {
-            GetRealmConfigError::DocumentNotFound => NotificationDispatchError::Unavailable,
+            GetConfigError::DocumentNotFound => NotificationDispatchError::Unavailable,
             other => NotificationDispatchError::Internal(other.to_string()),
         })?;
     match resolve_inbox_holder(&recipient, &config) {
@@ -402,7 +402,7 @@ pub async fn create_for_user(
             } else if let Some(reason) = reason
                 .strip_prefix(WATCH_SUBSCRIPTION_UNAUTHORIZED)
                 .and_then(|value| value.strip_prefix(": "))
-                .and_then(WatchAuthorizationMetricReason::parse)
+                .and_then(WatchMetricReason::parse)
             {
                 WatchDispatchError::Unauthorized(reason)
             } else if reason.starts_with(WATCH_SUBSCRIPTION_UNAVAILABLE) {

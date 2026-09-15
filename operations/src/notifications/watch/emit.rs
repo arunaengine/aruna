@@ -14,7 +14,7 @@ use crate::notifications::watch::interest::mark_interest_dirty;
 use crate::notifications::watch::subscriptions::{
     WatchSubscriptionError, list_realm_subscriptions,
 };
-use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetConfigOperation;
 
 /// Post-commit, best-effort emission of an origin watch event. Matches the
 /// in-memory interest table plus local durable subscriptions, then expands for
@@ -121,7 +121,7 @@ async fn include_local_holder(
     local_node_id: aruna_core::NodeId,
     holders: &mut Vec<aruna_core::NodeId>,
 ) -> Result<aruna_core::structs::RealmConfigDocument, String> {
-    let realm_config = drive(GetRealmConfigOperation::new(event.realm_id), context)
+    let realm_config = drive(GetConfigOperation::new(event.realm_id), context)
         .await
         .map_err(|error| error.to_string())?;
     let subscriptions =

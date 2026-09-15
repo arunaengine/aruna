@@ -1,5 +1,5 @@
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -333,7 +333,7 @@ impl QuotaGate {
             self.phase = QuotaGatePhase::ReadRealmConfig;
             return smallvec![Effect::Storage(StorageEffect::Read {
                 key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: DocumentSyncTarget::RealmConfig { realm_id }.storage_key(),
+                key: DocumentTarget::RealmConfig { realm_id }.storage_key(),
                 txn_id: Some(txn_id),
             })];
         }
@@ -437,7 +437,7 @@ impl QuotaGate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum LoadUsageCountersState {
+enum LoadCountersState {
     Init,
     ReadCounter,
     ReadGlobal,
@@ -446,7 +446,7 @@ enum LoadUsageCountersState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum LoadUsageCountersError {
+pub enum LoadCountersError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -466,33 +466,33 @@ pub enum LoadUsageCountersError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct LoadUsageCountersOperation {
+pub struct LoadCountersOperation {
     key: Vec<u8>,
-    state: LoadUsageCountersState,
-    output: Option<Result<UsageCounters, LoadUsageCountersError>>,
+    state: LoadCountersState,
+    output: Option<Result<UsageCounters, LoadCountersError>>,
 }
 
-impl LoadUsageCountersOperation {
+impl LoadCountersOperation {
     pub fn new(key: Vec<u8>) -> Self {
         Self {
             key,
-            state: LoadUsageCountersState::Init,
+            state: LoadCountersState::Init,
             output: None,
         }
     }
 
-    fn finish(&mut self, result: Result<UsageCounters, LoadUsageCountersError>) -> Effects {
+    fn finish(&mut self, result: Result<UsageCounters, LoadCountersError>) -> Effects {
         self.state = if result.is_ok() {
-            LoadUsageCountersState::Finish
+            LoadCountersState::Finish
         } else {
-            LoadUsageCountersState::Error
+            LoadCountersState::Error
         };
         self.output = Some(result);
         smallvec![]
     }
 
     fn unexpected_event(&mut self, expected: &'static str, received: Event) -> Effects {
-        self.finish(Err(LoadUsageCountersError::UnexpectedEvent {
+        self.finish(Err(LoadCountersError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
             received,
@@ -523,13 +523,13 @@ impl LoadUsageCountersOperation {
     }
 }
 
-impl Operation for LoadUsageCountersOperation {
+impl Operation for LoadCountersOperation {
     type Output = UsageCounters;
-    type Error = LoadUsageCountersError;
+    type Error = LoadCountersError;
 
     fn start(&mut self) -> Effects {
         if self.key.as_slice() == USAGE_GLOBAL_KEY {
-            self.state = LoadUsageCountersState::ReadGlobal;
+            self.state = LoadCountersState::ReadGlobal;
             let reads = global_shard_keys()
                 .into_iter()
                 .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.into()))
@@ -539,7 +539,7 @@ impl Operation for LoadUsageCountersOperation {
                 txn_id: None,
             })]
         } else {
-            self.state = LoadUsageCountersState::ReadCounter;
+            self.state = LoadCountersState::ReadCounter;
             smallvec![Effect::Storage(StorageEffect::Read {
                 key_space: USAGE_STATS_KEYSPACE.to_string(),
                 key: self.key.clone().into(),
@@ -550,23 +550,23 @@ impl Operation for LoadUsageCountersOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            LoadUsageCountersState::ReadCounter => self.handle_counter_read(event),
-            LoadUsageCountersState::ReadGlobal => self.handle_global_read(event),
-            LoadUsageCountersState::Init
-            | LoadUsageCountersState::Finish
-            | LoadUsageCountersState::Error => self.unexpected_event("no event", event),
+            LoadCountersState::ReadCounter => self.handle_counter_read(event),
+            LoadCountersState::ReadGlobal => self.handle_global_read(event),
+            LoadCountersState::Init | LoadCountersState::Finish | LoadCountersState::Error => {
+                self.unexpected_event("no event", event)
+            }
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            LoadUsageCountersState::Finish | LoadUsageCountersState::Error
+            LoadCountersState::Finish | LoadCountersState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(LoadUsageCountersError::NotFinished)?
+        self.output.ok_or(LoadCountersError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -574,9 +574,7 @@ impl Operation for LoadUsageCountersOperation {
     }
 }
 
-fn sum_global_usage(
-    values: Vec<(Key, Option<Value>)>,
-) -> Result<UsageCounters, LoadUsageCountersError> {
+fn sum_global_usage(values: Vec<(Key, Option<Value>)>) -> Result<UsageCounters, LoadCountersError> {
     let mut total = UsageCounters::default();
 
     for (_, value) in values {
@@ -591,7 +589,7 @@ fn sum_global_usage(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RebuildUsageStatsState {
+pub enum RebuildStatsState {
     Init,
     ScanBuckets,
     ScanBlobs,
@@ -607,7 +605,7 @@ pub enum RebuildUsageStatsState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum RebuildUsageStatsError {
+pub enum RebuildStatsError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -616,7 +614,7 @@ pub enum RebuildUsageStatsError {
     CounterError(#[from] UsageCounterError),
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
     InvalidStateEvent {
-        state: RebuildUsageStatsState,
+        state: RebuildStatsState,
         expected: &'static str,
         received: Event,
     },
@@ -628,8 +626,8 @@ pub enum RebuildUsageStatsError {
 /// are missing and as a repair tool, never concurrently with writes. An object is
 /// live when its head points at a non-delete version.
 #[derive(Debug, PartialEq)]
-pub struct RebuildUsageStatsOperation {
-    state: RebuildUsageStatsState,
+pub struct RebuildStatsOperation {
+    state: RebuildStatsState,
     txn_id: Option<TxnId>,
     bucket_groups: HashMap<String, GroupId>,
     blob_sizes: HashMap<Vec<u8>, u64>,
@@ -643,21 +641,21 @@ pub struct RebuildUsageStatsOperation {
     /// Materialized versions whose blob location row is gone; their bytes
     /// cannot be recounted, so the rebuilt totals are low by that much.
     orphan_versions: u64,
-    output: Option<Result<UsageCounters, RebuildUsageStatsError>>,
+    output: Option<Result<UsageCounters, RebuildStatsError>>,
 }
 
-impl Default for RebuildUsageStatsOperation {
+impl Default for RebuildStatsOperation {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RebuildUsageStatsOperation {
+impl RebuildStatsOperation {
     const SCAN_LIMIT: usize = 1_000;
 
     pub fn new() -> Self {
         Self {
-            state: RebuildUsageStatsState::Init,
+            state: RebuildStatsState::Init,
             txn_id: None,
             bucket_groups: HashMap::new(),
             blob_sizes: HashMap::new(),
@@ -673,8 +671,8 @@ impl RebuildUsageStatsOperation {
         }
     }
 
-    fn emit_error(&mut self, error: RebuildUsageStatsError) -> Effects {
-        self.state = RebuildUsageStatsState::Error;
+    fn emit_error(&mut self, error: RebuildStatsError) -> Effects {
+        self.state = RebuildStatsState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
@@ -691,11 +689,11 @@ impl RebuildUsageStatsOperation {
 
     fn scan_keyspace(&self) -> Option<&'static str> {
         match self.state {
-            RebuildUsageStatsState::ScanBuckets => Some(S3_BUCKET_KEYSPACE),
-            RebuildUsageStatsState::ScanBlobs => Some(BLOB_LOCATIONS_KEYSPACE),
-            RebuildUsageStatsState::ScanHeads => Some(BLOB_HEAD_KEYSPACE),
-            RebuildUsageStatsState::ScanVersions => Some(BLOB_VERSIONS_KEYSPACE),
-            RebuildUsageStatsState::ScanCounters => Some(USAGE_STATS_KEYSPACE),
+            RebuildStatsState::ScanBuckets => Some(S3_BUCKET_KEYSPACE),
+            RebuildStatsState::ScanBlobs => Some(BLOB_LOCATIONS_KEYSPACE),
+            RebuildStatsState::ScanHeads => Some(BLOB_HEAD_KEYSPACE),
+            RebuildStatsState::ScanVersions => Some(BLOB_VERSIONS_KEYSPACE),
+            RebuildStatsState::ScanCounters => Some(USAGE_STATS_KEYSPACE),
             _ => None,
         }
     }
@@ -714,9 +712,9 @@ impl RebuildUsageStatsOperation {
             .or_default()
     }
 
-    fn consume_values(&mut self, values: &[(Key, Value)]) -> Result<(), RebuildUsageStatsError> {
+    fn consume_values(&mut self, values: &[(Key, Value)]) -> Result<(), RebuildStatsError> {
         match self.state {
-            RebuildUsageStatsState::ScanBuckets => {
+            RebuildStatsState::ScanBuckets => {
                 for (key, value) in values {
                     let info = BucketInfo::from_bytes(value.as_ref())?;
                     let bucket = String::from_utf8(key.to_vec()).map_err(ConversionError::from)?;
@@ -730,7 +728,7 @@ impl RebuildUsageStatsOperation {
                     self.bucket_groups.insert(bucket, info.group_id);
                 }
             }
-            RebuildUsageStatsState::ScanBlobs => {
+            RebuildStatsState::ScanBlobs => {
                 for (key, value) in values {
                     let location = BackendLocation::from_bytes(value.as_ref())?;
                     if location.staging || location.partial {
@@ -753,7 +751,7 @@ impl RebuildUsageStatsOperation {
                     self.blob_sizes.insert(hash.to_vec(), location.blob_size);
                 }
             }
-            RebuildUsageStatsState::ScanHeads => {
+            RebuildStatsState::ScanHeads => {
                 for (key, value) in values {
                     let head_key = BlobHeadKey::from_bytes(key.as_ref())?;
                     let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
@@ -761,7 +759,7 @@ impl RebuildUsageStatsOperation {
                         .insert((head_key.bucket, head_key.key), pointer.version_id);
                 }
             }
-            RebuildUsageStatsState::ScanVersions => {
+            RebuildStatsState::ScanVersions => {
                 for (key, value) in values {
                     let version = BlobVersion::from_bytes(value.as_ref())?;
                     let version_key = VersionKey::from_bytes(key.as_ref())?;
@@ -815,7 +813,7 @@ impl RebuildUsageStatsOperation {
                     }
                 }
             }
-            RebuildUsageStatsState::ScanCounters => {
+            RebuildStatsState::ScanCounters => {
                 self.existing_counter_keys
                     .extend(values.iter().map(|(key, _)| key.to_vec()));
             }
@@ -826,30 +824,30 @@ impl RebuildUsageStatsOperation {
 
     fn next_scan(&mut self) -> Effects {
         let next = match self.state {
-            RebuildUsageStatsState::ScanBuckets => RebuildUsageStatsState::ScanBlobs,
-            RebuildUsageStatsState::ScanBlobs => RebuildUsageStatsState::ScanHeads,
-            RebuildUsageStatsState::ScanHeads => RebuildUsageStatsState::ScanVersions,
-            RebuildUsageStatsState::ScanVersions => {
+            RebuildStatsState::ScanBuckets => RebuildStatsState::ScanBlobs,
+            RebuildStatsState::ScanBlobs => RebuildStatsState::ScanHeads,
+            RebuildStatsState::ScanHeads => RebuildStatsState::ScanVersions,
+            RebuildStatsState::ScanVersions => {
                 if self.orphan_versions > 0 {
                     warn!(
                         versions = self.orphan_versions,
                         "rebuilt usage omits versions without a blob location row"
                     );
                 }
-                RebuildUsageStatsState::ScanCounters
+                RebuildStatsState::ScanCounters
             }
-            RebuildUsageStatsState::ScanCounters => {
-                self.state = RebuildUsageStatsState::StartWriteTransaction;
+            RebuildStatsState::ScanCounters => {
+                self.state = RebuildStatsState::StartWriteTransaction;
                 return smallvec![Effect::Storage(StorageEffect::StartTransaction {
                     read: false
                 })];
             }
-            _ => return self.emit_error(RebuildUsageStatsError::RebuildFailed),
+            _ => return self.emit_error(RebuildStatsError::RebuildFailed),
         };
         self.state = next;
         let key_space = match self.scan_keyspace() {
             Some(key_space) => key_space,
-            None => return self.emit_error(RebuildUsageStatsError::RebuildFailed),
+            None => return self.emit_error(RebuildStatsError::RebuildFailed),
         };
         smallvec![self.iter_effect(key_space, None)]
     }
@@ -860,7 +858,7 @@ impl RebuildUsageStatsOperation {
             next_start_after,
         }) = event
         else {
-            return self.emit_error(RebuildUsageStatsError::InvalidStateEvent {
+            return self.emit_error(RebuildStatsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
                 received: event,
@@ -874,7 +872,7 @@ impl RebuildUsageStatsOperation {
         if let Some(start_after) = next_start_after {
             let key_space = match self.scan_keyspace() {
                 Some(key_space) => key_space,
-                None => return self.emit_error(RebuildUsageStatsError::RebuildFailed),
+                None => return self.emit_error(RebuildStatsError::RebuildFailed),
             };
             return smallvec![self.iter_effect(key_space, Some(start_after))];
         }
@@ -884,7 +882,7 @@ impl RebuildUsageStatsOperation {
 
     fn handle_write_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(RebuildUsageStatsError::InvalidStateEvent {
+            return self.emit_error(RebuildStatsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
                 received: event,
@@ -931,7 +929,7 @@ impl RebuildUsageStatsOperation {
             .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.clone().into()))
             .collect();
 
-        self.state = RebuildUsageStatsState::WriteCounters;
+        self.state = RebuildStatsState::WriteCounters;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: Some(txn_id),
@@ -940,82 +938,82 @@ impl RebuildUsageStatsOperation {
 
     fn handle_counters_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.emit_error(RebuildUsageStatsError::InvalidStateEvent {
+            return self.emit_error(RebuildStatsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchWriteResult)",
                 received: event,
             });
         };
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(RebuildUsageStatsError::RebuildFailed);
+            return self.emit_error(RebuildStatsError::RebuildFailed);
         };
         if !self.stale_counter_deletes.is_empty() {
-            self.state = RebuildUsageStatsState::DeleteStaleCounters;
+            self.state = RebuildStatsState::DeleteStaleCounters;
             return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                 deletes: std::mem::take(&mut self.stale_counter_deletes),
                 txn_id: Some(txn_id),
             })];
         }
-        self.state = RebuildUsageStatsState::CommitTransaction;
+        self.state = RebuildStatsState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn handle_stale_deleted(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-            return self.emit_error(RebuildUsageStatsError::InvalidStateEvent {
+            return self.emit_error(RebuildStatsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
                 received: event,
             });
         };
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(RebuildUsageStatsError::RebuildFailed);
+            return self.emit_error(RebuildStatsError::RebuildFailed);
         };
-        self.state = RebuildUsageStatsState::CommitTransaction;
+        self.state = RebuildStatsState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(RebuildUsageStatsError::InvalidStateEvent {
+            return self.emit_error(RebuildStatsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                 received: event,
             });
         };
-        self.state = RebuildUsageStatsState::Finish;
+        self.state = RebuildStatsState::Finish;
         self.output = Some(Ok(self.global));
         smallvec![]
     }
 }
 
-impl Operation for RebuildUsageStatsOperation {
+impl Operation for RebuildStatsOperation {
     type Output = UsageCounters;
-    type Error = RebuildUsageStatsError;
+    type Error = RebuildStatsError;
 
     fn start(&mut self) -> Effects {
-        self.state = RebuildUsageStatsState::ScanBuckets;
+        self.state = RebuildStatsState::ScanBuckets;
         smallvec![self.iter_effect(S3_BUCKET_KEYSPACE, None)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(RebuildUsageStatsError::StorageError(error));
+            return self.emit_error(RebuildStatsError::StorageError(error));
         }
 
         match self.state {
-            RebuildUsageStatsState::Init => self.start(),
-            RebuildUsageStatsState::ScanBuckets
-            | RebuildUsageStatsState::ScanBlobs
-            | RebuildUsageStatsState::ScanHeads
-            | RebuildUsageStatsState::ScanVersions
-            | RebuildUsageStatsState::ScanCounters => self.handle_page(event),
-            RebuildUsageStatsState::StartWriteTransaction => self.handle_write_started(event),
-            RebuildUsageStatsState::WriteCounters => self.handle_counters_written(event),
-            RebuildUsageStatsState::DeleteStaleCounters => self.handle_stale_deleted(event),
-            RebuildUsageStatsState::CommitTransaction => self.handle_transaction_committed(event),
-            RebuildUsageStatsState::Finish | RebuildUsageStatsState::Error => {
-                self.emit_error(RebuildUsageStatsError::InvalidStateEvent {
+            RebuildStatsState::Init => self.start(),
+            RebuildStatsState::ScanBuckets
+            | RebuildStatsState::ScanBlobs
+            | RebuildStatsState::ScanHeads
+            | RebuildStatsState::ScanVersions
+            | RebuildStatsState::ScanCounters => self.handle_page(event),
+            RebuildStatsState::StartWriteTransaction => self.handle_write_started(event),
+            RebuildStatsState::WriteCounters => self.handle_counters_written(event),
+            RebuildStatsState::DeleteStaleCounters => self.handle_stale_deleted(event),
+            RebuildStatsState::CommitTransaction => self.handle_transaction_committed(event),
+            RebuildStatsState::Finish | RebuildStatsState::Error => {
+                self.emit_error(RebuildStatsError::InvalidStateEvent {
                     state: self.state.clone(),
                     expected: "no event",
                     received: event,
@@ -1027,7 +1025,7 @@ impl Operation for RebuildUsageStatsOperation {
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            RebuildUsageStatsState::Finish | RebuildUsageStatsState::Error
+            RebuildStatsState::Finish | RebuildStatsState::Error
         )
     }
 
@@ -1035,7 +1033,7 @@ impl Operation for RebuildUsageStatsOperation {
         match self.output {
             Some(Ok(counters)) => Ok(counters),
             Some(Err(error)) => Err(error),
-            None => Err(RebuildUsageStatsError::RebuildFailed),
+            None => Err(RebuildStatsError::RebuildFailed),
         }
     }
 
@@ -1073,17 +1071,17 @@ impl PublishedUsage {
         !self.global && self.groups.is_empty()
     }
 
-    fn targets(&self, realm_id: RealmId, node_id: NodeId) -> Vec<DocumentSyncTarget> {
+    fn targets(&self, realm_id: RealmId, node_id: NodeId) -> Vec<DocumentTarget> {
         let mut targets = Vec::with_capacity(self.groups.len() + usize::from(self.global));
         if self.global {
-            targets.push(DocumentSyncTarget::NodeUsage {
+            targets.push(DocumentTarget::NodeUsage {
                 realm_id,
                 node_id,
                 group_id: None,
             });
         }
         for group_id in &self.groups {
-            targets.push(DocumentSyncTarget::NodeUsage {
+            targets.push(DocumentTarget::NodeUsage {
                 realm_id,
                 node_id,
                 group_id: Some(*group_id),
@@ -1520,7 +1518,7 @@ async fn active_usage_nodes(ctx: &DriverContext) -> Result<Option<HashSet<NodeId
         return Ok(None);
     };
     let realm_id = *net_handle.realm_id();
-    let key = DocumentSyncTarget::RealmConfig { realm_id }.storage_key();
+    let key = DocumentTarget::RealmConfig { realm_id }.storage_key();
     match ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -1629,20 +1627,20 @@ pub async fn recompute_usage_summary(
 pub async fn refresh_usage_targets(
     ctx: &DriverContext,
     local_node_id: NodeId,
-    targets: &[DocumentSyncTarget],
+    targets: &[DocumentTarget],
 ) {
     let mut include_global = false;
     let mut groups = BTreeSet::new();
     let mut realm_config_changed = false;
     for target in targets {
         match target {
-            DocumentSyncTarget::NodeUsage { group_id, .. } => match group_id {
+            DocumentTarget::NodeUsage { group_id, .. } => match group_id {
                 Some(group_id) => {
                     groups.insert(*group_id);
                 }
                 None => include_global = true,
             },
-            DocumentSyncTarget::RealmConfig { .. } => {
+            DocumentTarget::RealmConfig { .. } => {
                 realm_config_changed = true;
             }
             _ => {}
@@ -2071,12 +2069,9 @@ mod tests {
         };
         write_counters(&ctx, usage_group_key(group_id), group).await;
 
-        let loaded = drive(
-            LoadUsageCountersOperation::new(usage_group_key(group_id)),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let loaded = drive(LoadCountersOperation::new(usage_group_key(group_id)), &ctx)
+            .await
+            .unwrap();
         assert_eq!(loaded, group);
 
         let shard_zero = UsageCounters {
@@ -2092,12 +2087,9 @@ mod tests {
         write_counters(&ctx, global_shard_key(0), shard_zero).await;
         write_counters(&ctx, global_shard_key(1), shard_one).await;
 
-        let loaded = drive(
-            LoadUsageCountersOperation::new(USAGE_GLOBAL_KEY.to_vec()),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let loaded = drive(LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec()), &ctx)
+            .await
+            .unwrap();
         let mut expected = UsageCounters::default();
         expected.add(&shard_zero).unwrap();
         expected.add(&shard_one).unwrap();
@@ -2115,7 +2107,7 @@ mod tests {
         )
         .await;
         let loaded = drive(
-            LoadUsageCountersOperation::new(USAGE_GLOBAL_KEY.to_vec()),
+            LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec()),
             &stale_global_ctx,
         )
         .await
@@ -2275,9 +2267,7 @@ mod tests {
             .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
             .await;
 
-        let global = drive(RebuildUsageStatsOperation::new(), &ctx)
-            .await
-            .unwrap();
+        let global = drive(RebuildStatsOperation::new(), &ctx).await.unwrap();
 
         // live.txt, ref.txt, and shared.bin are live; gone.txt ends on a delete marker.
         assert_eq!(global.buckets, 2);
@@ -2341,8 +2331,8 @@ mod tests {
                 .to_bytes()
                 .unwrap(),
         );
-        let mut operation = RebuildUsageStatsOperation::new();
-        operation.state = RebuildUsageStatsState::ScanVersions;
+        let mut operation = RebuildStatsOperation::new();
+        operation.state = RebuildStatsState::ScanVersions;
         operation
             .bucket_groups
             .insert("target".to_string(), group_id);
@@ -2394,9 +2384,7 @@ mod tests {
             })
             .await;
 
-        drive(RebuildUsageStatsOperation::new(), &ctx)
-            .await
-            .unwrap();
+        drive(RebuildStatsOperation::new(), &ctx).await.unwrap();
 
         assert!(read_optional_counters(&ctx, stale_key).await.is_none());
         assert!(
@@ -2659,9 +2647,7 @@ mod tests {
         write_node_stat(&ctx, snapshot_key.clone(), snapshot.to_bytes().unwrap()).await;
         write_node_stat(&ctx, NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec(), Vec::new()).await;
 
-        drive(RebuildUsageStatsOperation::new(), &ctx)
-            .await
-            .unwrap();
+        drive(RebuildStatsOperation::new(), &ctx).await.unwrap();
 
         assert_eq!(
             read_node_stat(&ctx, snapshot_key).await,
@@ -2751,7 +2737,7 @@ mod tests {
         write_node_stat(&ctx, dirty_group_key(group_id), generation).await;
 
         // Corrupt the realm config document so replication fails hard.
-        let config_key = DocumentSyncTarget::RealmConfig { realm_id }.storage_key();
+        let config_key = DocumentTarget::RealmConfig { realm_id }.storage_key();
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -2810,7 +2796,7 @@ mod tests {
                 .is_none()
         );
 
-        let config_key = DocumentSyncTarget::RealmConfig { realm_id }.storage_key();
+        let config_key = DocumentTarget::RealmConfig { realm_id }.storage_key();
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -3065,12 +3051,12 @@ mod tests {
             &ctx,
             local,
             &[
-                DocumentSyncTarget::NodeUsage {
+                DocumentTarget::NodeUsage {
                     realm_id: RealmId::from_bytes([9u8; 32]),
                     node_id: remote,
                     group_id: None,
                 },
-                DocumentSyncTarget::NodeUsage {
+                DocumentTarget::NodeUsage {
                     realm_id: RealmId::from_bytes([9u8; 32]),
                     node_id: remote,
                     group_id: Some(group_id),
@@ -3103,21 +3089,21 @@ mod tests {
             })
         };
 
-        let mut load = LoadUsageCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
+        let mut load = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
         load.step(stray());
         assert!(matches!(
             load.finalize(),
-            Err(LoadUsageCountersError::UnexpectedEvent { .. })
+            Err(LoadCountersError::UnexpectedEvent { .. })
         ));
 
-        let mut rebuild = RebuildUsageStatsOperation::new();
+        let mut rebuild = RebuildStatsOperation::new();
         rebuild.start();
         rebuild.step(stray());
         rebuild.step(stray());
         assert!(matches!(
             rebuild.finalize(),
-            Err(RebuildUsageStatsError::InvalidStateEvent {
-                state: RebuildUsageStatsState::Error,
+            Err(RebuildStatsError::InvalidStateEvent {
+                state: RebuildStatsState::Error,
                 ..
             })
         ));

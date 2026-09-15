@@ -5,7 +5,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
 };
-use aruna_core::metrics::WatchAuthorizationMetricReason;
+use aruna_core::metrics::WatchMetricReason;
 use aruna_core::structs::{
     NotificationRecord, RealmId, WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription,
     watch_retry_key, watch_retry_prefix, watch_subscription_key,
@@ -622,10 +622,7 @@ async fn stage_watch_expansion(
                 continue;
             }
             Ok(WatchAuthorization::Unavailable(error)) | Err(error) => {
-                record_delivery_suppression(
-                    context,
-                    WatchAuthorizationMetricReason::AuthorizationUnavailable,
-                );
+                record_delivery_suppression(context, WatchMetricReason::AuthorizationUnavailable);
                 return Err(UpsertFailure::Fatal(error));
             }
         }
@@ -642,10 +639,7 @@ async fn stage_watch_expansion(
                 record_delivery_suppression(context, reason.metric_reason());
             }
             Ok(WatchAuthorization::Unavailable(error)) | Err(error) => {
-                record_delivery_suppression(
-                    context,
-                    WatchAuthorizationMetricReason::AuthorizationUnavailable,
-                );
+                record_delivery_suppression(context, WatchMetricReason::AuthorizationUnavailable);
                 return Err(UpsertFailure::Fatal(error));
             }
         }
@@ -712,7 +706,7 @@ async fn abort_transaction(context: &DriverContext, txn_id: TxnId) {
         .await;
 }
 
-fn record_delivery_suppression(context: &DriverContext, reason: WatchAuthorizationMetricReason) {
+fn record_delivery_suppression(context: &DriverContext, reason: WatchMetricReason) {
     if let Some(net_handle) = context.net_handle.as_ref() {
         net_handle
             .notification_watch_metrics()

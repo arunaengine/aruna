@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -32,7 +32,7 @@ use crate::notifications::watch::expand::drain_watch_events;
 use crate::notifications::watch::subscriptions::{
     WatchSubscriptionError, list_realm_subscriptions,
 };
-use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetConfigOperation;
 use crate::storage_read::scan_all;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
@@ -171,10 +171,10 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
     }
 
     let mut writes: Vec<(KeySpace, Key, Value)> = Vec::with_capacity(realms.len() * 2);
-    let mut targets: Vec<(RealmId, DocumentSyncTarget)> = Vec::with_capacity(realms.len());
+    let mut targets: Vec<(RealmId, DocumentTarget)> = Vec::with_capacity(realms.len());
     let mut authorization_retries = Vec::new();
     for realm_id in &realms {
-        let realm_config = drive(GetRealmConfigOperation::new(*realm_id), ctx)
+        let realm_config = drive(GetConfigOperation::new(*realm_id), ctx)
             .await
             .map_err(|error| format!("failed to read realm config for watch interest: {error}"))?;
         if let Err(error) = drain_watch_events(ctx, *realm_id, &realm_config, node_id).await {
@@ -229,7 +229,7 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
         }
         targets.push((
             *realm_id,
-            DocumentSyncTarget::WatchInterest {
+            DocumentTarget::WatchInterest {
                 realm_id: *realm_id,
                 node_id,
             },
@@ -583,7 +583,7 @@ pub async fn rebuild_interest_table(storage: &StorageHandle) -> WatchInterestTab
 /// Refreshes the in-memory watch-interest cache for realms whose interest or
 /// membership changed and schedules rebuilds when replicated subscriptions or
 /// placement changed; shared by every reconcile handler.
-pub async fn refresh_target_interest(ctx: &DriverContext, targets: &[DocumentSyncTarget]) {
+pub async fn refresh_target_interest(ctx: &DriverContext, targets: &[DocumentTarget]) {
     let Some(net_handle) = ctx.net_handle.as_ref() else {
         return;
     };
@@ -591,19 +591,19 @@ pub async fn refresh_target_interest(ctx: &DriverContext, targets: &[DocumentSyn
     let mut dirty_realms: BTreeSet<RealmId> = BTreeSet::new();
     for target in targets {
         match target {
-            DocumentSyncTarget::WatchInterest { realm_id, .. } => {
+            DocumentTarget::WatchInterest { realm_id, .. } => {
                 realms.insert(*realm_id);
             }
-            DocumentSyncTarget::WatchSubscription { owner, .. } => {
+            DocumentTarget::WatchSubscription { owner, .. } => {
                 dirty_realms.insert(owner.realm_id);
             }
-            DocumentSyncTarget::GroupAuthorization { .. } => {
+            DocumentTarget::GroupAuthorization { .. } => {
                 dirty_realms.insert(*net_handle.realm_id());
             }
-            DocumentSyncTarget::RealmAuthorization { realm_id } => {
+            DocumentTarget::RealmAuthorization { realm_id } => {
                 dirty_realms.insert(*realm_id);
             }
-            DocumentSyncTarget::RealmConfig { realm_id } => {
+            DocumentTarget::RealmConfig { realm_id } => {
                 realms.insert(*realm_id);
                 dirty_realms.insert(*realm_id);
             }
@@ -1406,7 +1406,7 @@ mod tests {
             &[watch_owner],
         )
         .await;
-        refresh_target_interest(&ctx, &[DocumentSyncTarget::GroupAuthorization { group_id }]).await;
+        refresh_target_interest(&ctx, &[DocumentTarget::GroupAuthorization { group_id }]).await;
 
         assert!(read_marker(&ctx, realm_id).await.is_some());
         assert!(
@@ -1443,7 +1443,7 @@ mod tests {
         )
         .await;
 
-        let target = DocumentSyncTarget::WatchInterest {
+        let target = DocumentTarget::WatchInterest {
             realm_id,
             node_id: holder,
         };
@@ -1479,7 +1479,7 @@ mod tests {
         }
         refresh_target_interest(
             &ctx,
-            &[DocumentSyncTarget::WatchInterest {
+            &[DocumentTarget::WatchInterest {
                 realm_id,
                 node_id: retained,
             }],
@@ -1495,7 +1495,7 @@ mod tests {
         );
 
         install_realm_config(&ctx, realm_id, &[retained]).await;
-        refresh_target_interest(&ctx, &[DocumentSyncTarget::RealmConfig { realm_id }]).await;
+        refresh_target_interest(&ctx, &[DocumentTarget::RealmConfig { realm_id }]).await;
 
         assert_eq!(
             net.watch_interest_snapshot().matching_nodes(

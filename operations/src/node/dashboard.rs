@@ -1,4 +1,4 @@
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use tokio::sync::watch;
 
 use crate::driver::DriverContext;
@@ -20,20 +20,20 @@ pub fn notify_dashboard_change(context: &DriverContext) {
     }
 }
 
-pub(crate) fn targets_change_dashboard(targets: &[DocumentSyncTarget]) -> bool {
+pub(crate) fn targets_change_dashboard(targets: &[DocumentTarget]) -> bool {
     targets.iter().any(|target| {
         matches!(
             target,
-            DocumentSyncTarget::Group { .. }
-                | DocumentSyncTarget::GroupAuthorization { .. }
-                | DocumentSyncTarget::RealmAuthorization { .. }
-                | DocumentSyncTarget::RealmConfig { .. }
-                | DocumentSyncTarget::User { .. }
-                | DocumentSyncTarget::MetadataRegistry { .. }
-                | DocumentSyncTarget::MetadataCreateEvent { .. }
-                | DocumentSyncTarget::MetadataDocumentLifecycle { .. }
-                | DocumentSyncTarget::MetadataGraphLifecycle { .. }
-                | DocumentSyncTarget::NodeUsage { .. }
+            DocumentTarget::Group { .. }
+                | DocumentTarget::GroupAuthorization { .. }
+                | DocumentTarget::RealmAuthorization { .. }
+                | DocumentTarget::RealmConfig { .. }
+                | DocumentTarget::User { .. }
+                | DocumentTarget::MetadataRegistry { .. }
+                | DocumentTarget::MetadataCreateEvent { .. }
+                | DocumentTarget::MetadataDocumentLifecycle { .. }
+                | DocumentTarget::MetadataGraphLifecycle { .. }
+                | DocumentTarget::NodeUsage { .. }
         )
     })
 }
@@ -53,24 +53,24 @@ mod pure_tests {
         let user_id = UserId::new(Ulid::from_parts(4, 1), realm_id);
         let document_id = Ulid::from_parts(5, 1);
         let relevant = [
-            DocumentSyncTarget::Group { group_id },
-            DocumentSyncTarget::GroupAuthorization { group_id },
-            DocumentSyncTarget::RealmAuthorization { realm_id },
-            DocumentSyncTarget::RealmConfig { realm_id },
-            DocumentSyncTarget::User { user_id },
-            DocumentSyncTarget::MetadataRegistry {
+            DocumentTarget::Group { group_id },
+            DocumentTarget::GroupAuthorization { group_id },
+            DocumentTarget::RealmAuthorization { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
+            DocumentTarget::User { user_id },
+            DocumentTarget::MetadataRegistry {
                 group_id,
                 document_id,
             },
-            DocumentSyncTarget::MetadataCreateEvent {
+            DocumentTarget::MetadataCreateEvent {
                 document_id,
                 event_id: Ulid::from_parts(6, 1),
             },
-            DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
-            DocumentSyncTarget::MetadataGraphLifecycle {
+            DocumentTarget::MetadataDocumentLifecycle { document_id },
+            DocumentTarget::MetadataGraphLifecycle {
                 graph_iri: "https://example.test/graph".to_string(),
             },
-            DocumentSyncTarget::NodeUsage {
+            DocumentTarget::NodeUsage {
                 realm_id,
                 node_id,
                 group_id: None,
@@ -83,12 +83,12 @@ mod pure_tests {
         );
 
         let ignored = [
-            DocumentSyncTarget::WatchInterest { realm_id, node_id },
-            DocumentSyncTarget::WatchSubscription {
+            DocumentTarget::WatchInterest { realm_id, node_id },
+            DocumentTarget::WatchSubscription {
                 owner: user_id,
                 watch_id: Ulid::from_parts(7, 1),
             },
-            DocumentSyncTarget::NodeInfo { realm_id, node_id },
+            DocumentTarget::NodeInfo { realm_id, node_id },
         ];
         assert!(!targets_change_dashboard(&ignored));
     }
