@@ -1,5 +1,5 @@
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
@@ -8,10 +8,10 @@ use aruna_core::keyspaces::{
     METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_MATERIALIZATION_STATUS_KEYSPACE,
 };
-use aruna_core::metadata::MetadataDocumentLifecycleRecord;
+use aruna_core::metadata::MetadataLifecycleRecord;
 use aruna_core::metadata::{
-    MetadataCreateEventRecord, MetadataGraphLifecycleRecord, MetadataMaterializationJobRecord,
-    MetadataMaterializationStatusRecord,
+    GraphLifecycleRecord, MaterializationStatusRecord, MetadataEventRecord,
+    MetadataMaterializationRecord,
 };
 pub use aruna_core::storage_entries::{
     create_event_entry, create_projection_entries, document_job_entry, document_lifecycle_entry,
@@ -123,7 +123,7 @@ pub fn iter_registry_effect(
 }
 
 pub fn write_graph_lifecycle(
-    record: &MetadataGraphLifecycleRecord,
+    record: &GraphLifecycleRecord,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     let (key_space, key, value) = graph_lifecycle_entry(record)?;
@@ -136,7 +136,7 @@ pub fn write_graph_lifecycle(
 }
 
 pub fn write_document_lifecycle(
-    record: &MetadataDocumentLifecycleRecord,
+    record: &MetadataLifecycleRecord,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     let (key_space, key, value) = document_lifecycle_entry(record)?;
@@ -149,7 +149,7 @@ pub fn write_document_lifecycle(
 }
 
 pub fn write_lifecycle_revision(
-    record: &MetadataDocumentLifecycleRecord,
+    record: &MetadataLifecycleRecord,
     delete_actor: NodeId,
     placement: aruna_core::structs::PlacementRef,
     txn_id: Option<TxnId>,
@@ -198,7 +198,7 @@ pub fn write_create_effect(
     record: &MetadataRegistryRecord,
     audit: &MetadataAuditRecord,
     audit_id: Ulid,
-    outbox: Option<&DocumentSyncOutboxRecord>,
+    outbox: Option<&DocumentOutboxRecord>,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     let writes = create_outbox_entries(record, audit, audit_id, outbox)?;
@@ -213,7 +213,7 @@ pub fn create_outbox_entries(
     record: &MetadataRegistryRecord,
     audit: &MetadataAuditRecord,
     audit_id: Ulid,
-    outbox: Option<&DocumentSyncOutboxRecord>,
+    outbox: Option<&DocumentOutboxRecord>,
 ) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
     let mut writes = registry_write_entries(record)?;
     writes.push((
@@ -239,24 +239,24 @@ pub fn create_outbox_entries(
 }
 
 fn outbox_lifecycle_upsert(
-    outbox: &DocumentSyncOutboxRecord,
+    outbox: &DocumentOutboxRecord,
 ) -> Result<
     Option<(
-        MetadataDocumentLifecycleRecord,
-        aruna_core::document::DocumentSyncChange,
+        MetadataLifecycleRecord,
+        aruna_core::document::DocumentChange,
     )>,
     ConversionError,
 > {
     if !matches!(
         &outbox.target,
-        DocumentSyncTarget::MetadataDocumentLifecycle { .. }
+        DocumentTarget::MetadataDocumentLifecycle { .. }
     ) {
         return Ok(None);
     }
-    let DocumentSyncOutboxEvent::Upsert { bytes, change } = &outbox.event else {
+    let DocumentOutboxEvent::Upsert { bytes, change } = &outbox.event else {
         return Ok(None);
     };
-    let lifecycle: MetadataDocumentLifecycleRecord = postcard::from_bytes(bytes)?;
+    let lifecycle: MetadataLifecycleRecord = postcard::from_bytes(bytes)?;
     Ok(Some((lifecycle, *change)))
 }
 
@@ -264,9 +264,9 @@ pub fn create_materialization_entries(
     record: &MetadataRegistryRecord,
     audit: &MetadataAuditRecord,
     audit_id: Ulid,
-    outbox: Option<&DocumentSyncOutboxRecord>,
-    materialization_status: &MetadataMaterializationStatusRecord,
-    materialization_job: &MetadataMaterializationJobRecord,
+    outbox: Option<&DocumentOutboxRecord>,
+    materialization_status: &MaterializationStatusRecord,
+    materialization_job: &MetadataMaterializationRecord,
 ) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
     let mut writes = create_outbox_entries(record, audit, audit_id, outbox)?;
     writes.push(materialization_status_entry(materialization_status)?);
@@ -276,11 +276,11 @@ pub fn create_materialization_entries(
 }
 
 pub fn event_projection_entries(
-    event: &MetadataCreateEventRecord,
+    event: &MetadataEventRecord,
     audit: &MetadataAuditRecord,
-    outbox: Option<&DocumentSyncOutboxRecord>,
-    materialization_status: &MetadataMaterializationStatusRecord,
-    materialization_job: &MetadataMaterializationJobRecord,
+    outbox: Option<&DocumentOutboxRecord>,
+    materialization_status: &MaterializationStatusRecord,
+    materialization_job: &MetadataMaterializationRecord,
 ) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
     let mut writes = vec![create_event_entry(event)?];
     writes.extend(create_materialization_entries(
@@ -304,7 +304,7 @@ pub fn parse_registry_read(
 
 pub fn parse_status_read(
     event: Event,
-) -> Result<Option<MetadataMaterializationStatusRecord>, StorageReadError> {
+) -> Result<Option<MaterializationStatusRecord>, StorageReadError> {
     parse_storage_read(event, |bytes| {
         postcard::from_bytes(bytes).map_err(ConversionError::from)
     })
@@ -312,7 +312,7 @@ pub fn parse_status_read(
 
 pub fn parse_lifecycle_read(
     event: Event,
-) -> Result<Option<MetadataGraphLifecycleRecord>, StorageReadError> {
+) -> Result<Option<GraphLifecycleRecord>, StorageReadError> {
     parse_storage_read(event, |bytes| {
         postcard::from_bytes(bytes).map_err(ConversionError::from)
     })
@@ -366,12 +366,12 @@ mod pure_tests {
     use super::*;
     use crate::metadata::projector::create_outbox_record;
     use crate::sync::document_outbox::outbox_key;
-    use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind};
+    use aruna_core::document::{DocumentChange, DocumentChangeKind};
     use aruna_core::keyspaces::{
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
         METADATA_UPDATED_INDEX_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
     };
-    use aruna_core::metadata::MetadataCreateEventPayload;
+    use aruna_core::metadata::MetadataEventPayload;
     use aruna_core::storage_entries::{shard_manifest_key, sync_revision_key, updated_index_key};
     use aruna_core::structs::{MetadataAuditOperation, PlacementRef, RealmId};
 
@@ -382,7 +382,7 @@ mod pure_tests {
     fn outbox_fixture() -> (
         MetadataRegistryRecord,
         MetadataAuditRecord,
-        DocumentSyncOutboxRecord,
+        DocumentOutboxRecord,
     ) {
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let group_id = Ulid::from_bytes([4; 16]);
@@ -423,12 +423,12 @@ mod pure_tests {
             occurred_at_ms: 2,
             details: None,
         };
-        let create_event = MetadataCreateEventRecord {
+        let create_event = MetadataEventRecord {
             event_id,
             record: record.clone(),
             user_id: Default::default(),
             node_id: node(1),
-            payload: MetadataCreateEventPayload::Scaffold {
+            payload: MetadataEventPayload::Scaffold {
                 name: "Outbox Batch".to_string(),
                 description: "Repository batch regression".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -447,7 +447,7 @@ mod pure_tests {
         record: &MetadataRegistryRecord,
         audit: &MetadataAuditRecord,
         audit_id: Ulid,
-        outbox: &DocumentSyncOutboxRecord,
+        outbox: &DocumentOutboxRecord,
     ) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
         create_outbox_entries(record, audit, audit_id, Some(outbox))
     }
@@ -456,7 +456,7 @@ mod pure_tests {
         record: &MetadataRegistryRecord,
         audit: &MetadataAuditRecord,
         audit_id: Ulid,
-        outbox: &DocumentSyncOutboxRecord,
+        outbox: &DocumentOutboxRecord,
         txn_id: Option<TxnId>,
     ) -> Result<Effect, ConversionError> {
         write_create_effect(record, audit, audit_id, Some(outbox), txn_id)
@@ -517,14 +517,14 @@ mod pure_tests {
     fn delete_outbox_batch() -> Result<(), ConversionError> {
         let (record, audit, outbox) = outbox_fixture();
         let audit_id = Ulid::from_bytes([11; 16]);
-        let DocumentSyncOutboxEvent::Upsert { change, .. } = &outbox.event else {
+        let DocumentOutboxEvent::Upsert { change, .. } = &outbox.event else {
             panic!("fixture outbox is an upsert");
         };
         let change = *change;
-        let delete = DocumentSyncOutboxRecord {
-            event: DocumentSyncOutboxEvent::Delete {
-                change: DocumentSyncChange {
-                    kind: DocumentSyncChangeKind::Delete,
+        let delete = DocumentOutboxRecord {
+            event: DocumentOutboxEvent::Delete {
+                change: DocumentChange {
+                    kind: DocumentChangeKind::Delete,
                     ..change
                 },
             },

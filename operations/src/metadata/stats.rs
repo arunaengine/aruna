@@ -20,7 +20,7 @@ const PROFILE_TYPE_IRI: &str = "http://www.w3.org/ns/dx/prof/Profile";
 const DCTERMS_CONFORMS_TO_IRI: &str = "http://purl.org/dc/terms/conformsTo";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct GroupDocumentPurposeCounts {
+pub struct GroupDocumentCounts {
     pub dataset_count: u64,
     pub profile_count: u64,
     pub process_run_count: u64,
@@ -142,7 +142,7 @@ pub async fn count_group_purpose(
     context: &DriverContext,
     realm_id: RealmId,
     group_id: GroupId,
-) -> Result<Option<GroupDocumentPurposeCounts>, MetadataApiError> {
+) -> Result<Option<GroupDocumentCounts>, MetadataApiError> {
     let Some(metadata_handle) = context.metadata_handle.clone() else {
         return Ok(None);
     };
@@ -183,7 +183,7 @@ pub async fn count_group_purpose(
     .collect::<Vec<_>>()
     .await;
 
-    let mut counts = GroupDocumentPurposeCounts::default();
+    let mut counts = GroupDocumentCounts::default();
     for classification in classifications {
         match classification? {
             DocumentPurpose::Profile => counts.profile_count += 1,
@@ -322,7 +322,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::metadata::{
-        MetadataApplyRoCrateRequest, MetadataEffect, MetadataEvent, MetadataGraphLifecycleRecord,
+        ApplyRoCrateRequest, GraphLifecycleRecord, MetadataEffect, MetadataEvent,
         MetadataGraphPolicy, MetadataRequestDurability,
     };
     use aruna_core::storage_entries::{graph_lifecycle_entry, registry_write_entries};
@@ -477,7 +477,7 @@ mod tests {
         let handle = fixture.context.metadata_handle.as_ref().unwrap();
         match handle
             .send_metadata_effect(MetadataEffect::ApplyRoCrate {
-                request: MetadataApplyRoCrateRequest {
+                request: ApplyRoCrateRequest {
                     graph_iri: record.graph_iri.clone(),
                     jsonld: jsonld.to_string(),
                     policy: MetadataGraphPolicy {
@@ -547,7 +547,7 @@ mod tests {
         let deleted = registry_record(fixture.realm_id, group_id, true);
         write_record(&fixture, &kept).await;
         write_record(&fixture, &deleted).await;
-        let tombstone = MetadataGraphLifecycleRecord::deleted(
+        let tombstone = GraphLifecycleRecord::deleted(
             deleted.graph_iri.clone(),
             fixture.realm_id,
             group_id,
@@ -657,7 +657,7 @@ mod tests {
             count_group_purpose(&fixture.context, fixture.realm_id, group_id)
                 .await
                 .expect("purpose count succeeds"),
-            Some(GroupDocumentPurposeCounts {
+            Some(GroupDocumentCounts {
                 dataset_count: 1,
                 profile_count: 1,
                 process_run_count: 1,

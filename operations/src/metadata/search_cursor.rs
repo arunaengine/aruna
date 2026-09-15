@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::api::MetadataApiQueryMode;
+use super::api::ApiQueryMode;
 
 pub const METADATA_SEARCH_DEFAULT_PAGE_SIZE: usize = 25;
 pub const METADATA_SEARCH_MAX_PAGE_SIZE: usize = 100;
@@ -233,7 +233,7 @@ impl SignedCursor<SearchCursorPayload> {
 pub fn query_fingerprint(
     query: &str,
     graph_iris: Option<&[String]>,
-    mode: Option<MetadataApiQueryMode>,
+    mode: Option<ApiQueryMode>,
     conforms_to: Option<&str>,
     group_id: Option<GroupId>,
 ) -> [u8; 32] {
@@ -272,11 +272,11 @@ pub fn query_fingerprint(
     *hasher.finalize().as_bytes()
 }
 
-fn mode_byte(mode: Option<MetadataApiQueryMode>) -> u8 {
+fn mode_byte(mode: Option<ApiQueryMode>) -> u8 {
     match mode {
         None => 0,
-        Some(MetadataApiQueryMode::Local) => 1,
-        Some(MetadataApiQueryMode::Distributed) => 2,
+        Some(ApiQueryMode::Local) => 1,
+        Some(ApiQueryMode::Distributed) => 2,
     }
 }
 
@@ -657,53 +657,35 @@ mod pure_tests {
 
     #[test]
     fn fingerprint_binds_query() {
-        let base = query_fingerprint(
-            "alpha",
-            None,
-            Some(MetadataApiQueryMode::Distributed),
-            None,
-            None,
-        );
+        let base = query_fingerprint("alpha", None, Some(ApiQueryMode::Distributed), None, None);
         assert_eq!(
             base,
-            query_fingerprint(
-                "alpha",
-                None,
-                Some(MetadataApiQueryMode::Distributed),
-                None,
-                None
-            )
+            query_fingerprint("alpha", None, Some(ApiQueryMode::Distributed), None, None)
         );
         assert_ne!(
             base,
-            query_fingerprint(
-                "beta",
-                None,
-                Some(MetadataApiQueryMode::Distributed),
-                None,
-                None
-            )
+            query_fingerprint("beta", None, Some(ApiQueryMode::Distributed), None, None)
         );
         assert_ne!(
             base,
             query_fingerprint(
                 "alpha",
                 Some(&["g".to_string()]),
-                Some(MetadataApiQueryMode::Distributed),
+                Some(ApiQueryMode::Distributed),
                 None,
                 None
             )
         );
         assert_ne!(
             base,
-            query_fingerprint("alpha", None, Some(MetadataApiQueryMode::Local), None, None)
+            query_fingerprint("alpha", None, Some(ApiQueryMode::Local), None, None)
         );
         assert_ne!(
             base,
             query_fingerprint(
                 "alpha",
                 None,
-                Some(MetadataApiQueryMode::Distributed),
+                Some(ApiQueryMode::Distributed),
                 Some("https://w3id.org/ro/crate/1.2"),
                 None
             )
@@ -714,7 +696,7 @@ mod pure_tests {
             query_fingerprint(
                 "alpha",
                 None,
-                Some(MetadataApiQueryMode::Distributed),
+                Some(ApiQueryMode::Distributed),
                 None,
                 Some(group)
             )
@@ -723,14 +705,14 @@ mod pure_tests {
             query_fingerprint(
                 "alpha",
                 None,
-                Some(MetadataApiQueryMode::Distributed),
+                Some(ApiQueryMode::Distributed),
                 None,
                 Some(group)
             ),
             query_fingerprint(
                 "alpha",
                 None,
-                Some(MetadataApiQueryMode::Distributed),
+                Some(ApiQueryMode::Distributed),
                 None,
                 Some(GroupId::from_bytes([8u8; 16]))
             )
