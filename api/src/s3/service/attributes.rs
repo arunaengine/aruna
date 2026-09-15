@@ -1,17 +1,14 @@
-//! Object-attribute decoding and response shaping for the S3 adapter.
-//!
-//! `GetObjectAttributes` asks for an explicit subset of attributes and, for
-//! multipart objects, a bounded page of parts. Both the request mask and the
-//! response shape are assembled here so the trait implementation stays a thin
-//! mapping and the missing-version fallback keeps using the read path.
+//! Object-attribute decoding and response shaping for the S3 adapter. The
+//! `GetObjectAttributes` mask and its response shape live here so the trait impl
+//! stays a thin mapping and a missing version still falls back to the read path.
 
 use super::response::ObjectResponseFields;
 use crate::s3::checksum::{ChecksumSelection, EncodedChecksums, encode_checksums};
 use crate::s3::util::{checksum_response_hashes, map_checksum_type};
 use aruna_core::structs::MultipartObjectPart;
-use aruna_operations::s3::get_attributes::GetObjectAttributesResult;
-use aruna_operations::s3::get_object::ObjectInfo;
-use aruna_operations::s3::list_parts::ListPartsOperation;
+use aruna_operations::s3::multipart::parts::ListPartsOperation;
+use aruna_operations::s3::object::attributes::GetAttributesResult;
+use aruna_operations::s3::object::get::ObjectInfo;
 use s3s::dto::{
     Checksum, ChecksumType, GetObjectAttributesOutput, GetObjectAttributesParts, ObjectAttributes,
     ObjectPart, StorageClass,
@@ -57,7 +54,7 @@ impl RequestedAttributes {
 
 /// The requested part-number marker. A negative marker is rejected and a value
 /// beyond the part-number domain saturates, matching the listing convention.
-pub(super) fn parse_part_number_marker(marker: Option<i32>) -> S3Result<Option<u16>> {
+pub(super) fn parse_part_marker(marker: Option<i32>) -> S3Result<Option<u16>> {
     match marker {
         None => Ok(None),
         Some(marker) if marker < 0 => Err(s3_error!(InvalidArgument, "Invalid part-number-marker")),
@@ -81,7 +78,7 @@ pub(super) fn parse_max_parts(max_parts: Option<i32>) -> S3Result<usize> {
 /// extended hashes stay absent, as AWS reports them.
 pub(super) fn attributes_checksum(
     remote: Option<&ObjectInfo>,
-    result: &GetObjectAttributesResult,
+    result: &GetAttributesResult,
 ) -> Option<Checksum> {
     let composite_hashes = result
         .summary
@@ -125,7 +122,7 @@ fn storage_checksum(encoded: EncodedChecksums) -> Checksum {
 /// One page of the multipart part list, marker-filtered and truncated with the
 /// same fallback the listing uses when `max_parts` empties the page.
 pub(super) fn attributes_parts(
-    result: &GetObjectAttributesResult,
+    result: &GetAttributesResult,
     requested_marker: Option<i32>,
     marker: Option<u16>,
     max_parts: usize,
@@ -186,7 +183,7 @@ pub(super) fn attributes_parts(
 pub(super) fn attributes_output(
     requested: RequestedAttributes,
     response_fields: ObjectResponseFields,
-    result: &GetObjectAttributesResult,
+    result: &GetAttributesResult,
     checksum: Option<Checksum>,
     object_parts: Option<GetObjectAttributesParts>,
 ) -> GetObjectAttributesOutput {
@@ -216,8 +213,8 @@ mod tests {
     use aruna_core::structs::{MultipartChecksumType, MultipartObjectSummary};
     use std::collections::HashMap;
 
-    fn result(part_count: usize, parts: Vec<MultipartObjectPart>) -> GetObjectAttributesResult {
-        GetObjectAttributesResult {
+    fn result(part_count: usize, parts: Vec<MultipartObjectPart>) -> GetAttributesResult {
+        GetAttributesResult {
             location: None,
             source_metadata: None,
             version_created_at: None,
@@ -271,14 +268,11 @@ mod tests {
 
     #[test]
     fn parses_part_marker() {
-        assert_eq!(parse_part_number_marker(None).unwrap(), None);
-        assert_eq!(parse_part_number_marker(Some(3)).unwrap(), Some(3));
+        assert_eq!(parse_part_marker(None).unwrap(), None);
+        assert_eq!(parse_part_marker(Some(3)).unwrap(), Some(3));
+        assert_eq!(parse_part_marker(Some(i32::MAX)).unwrap(), Some(u16::MAX));
         assert_eq!(
-            parse_part_number_marker(Some(i32::MAX)).unwrap(),
-            Some(u16::MAX)
-        );
-        assert_eq!(
-            *parse_part_number_marker(Some(-1)).unwrap_err().code(),
+            *parse_part_marker(Some(-1)).unwrap_err().code(),
             s3s::S3ErrorCode::InvalidArgument
         );
     }
@@ -301,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn paginates_parts_in_order() {
+    fn paginates_parts() {
         let result = result(3, vec![part(1, 10), part(2, 20), part(3, 30)]);
         let page = attributes_parts(&result, None, None, 2).unwrap();
         assert_eq!(page.total_parts_count, Some(3));
@@ -318,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn marker_filters_and_limits() {
+    fn marker_filters_parts() {
         let result = result(3, vec![part(1, 10), part(2, 20), part(3, 30)]);
         let page = attributes_parts(&result, Some(1), Some(1), 10).unwrap();
         assert_eq!(page.part_number_marker, Some(1));
@@ -334,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_page_advances_by_marker() {
+    fn zero_page_advances() {
         let result = result(2, vec![part(1, 10), part(2, 20)]);
         let page = attributes_parts(&result, Some(1), Some(1), 0).unwrap();
         assert_eq!(page.is_truncated, Some(true));

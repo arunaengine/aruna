@@ -10,7 +10,7 @@ mod response;
 
 use self::attributes::{
     RequestedAttributes, attributes_checksum, attributes_output, attributes_parts, parse_max_parts,
-    parse_part_number_marker,
+    parse_part_marker,
 };
 use self::response::{attach_reference_refresh, object_metadata, reference_metadata_refresh};
 
@@ -59,49 +59,43 @@ use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::{
     DriverContext, bucket_snapshot, drive, drive_until, gate_context, now_ms, routing_snapshot,
 };
-use aruna_operations::s3::abort_upload::{
-    AbortMultipartUploadInput as AMUI, AbortMultipartUploadOperation,
+use aruna_operations::s3::bucket::cors::{DeleteCorsOperation, GetCorsOperation, PutCorsOperation};
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
+use aruna_operations::s3::bucket::get::GetBucketOperation;
+use aruna_operations::s3::bucket::list::{ListBucketsInput as LBI, ListBucketsOperation};
+use aruna_operations::s3::multipart::abort::{AbortUploadInput as AMUI, AbortUploadOperation};
+use aruna_operations::s3::multipart::complete::{
+    CompleteUploadInput as CMUI, CompleteUploadOperation,
 };
-use aruna_operations::s3::bucket_cors::{
-    DeleteBucketCorsOperation, GetBucketCorsOperation, PutBucketCorsOperation,
+use aruna_operations::s3::multipart::create::{
+    CreateMultipartInput as CMPI, CreateMultipartOperation,
 };
-use aruna_operations::s3::complete_upload::{
-    CompleteMultipartUploadInput as CMUI, CompleteMultipartUploadOperation,
+use aruna_operations::s3::multipart::part_copy::{
+    PartCopyInput as UploadPartCopyData, upload_part_copy,
 };
-use aruna_operations::s3::copy_object::{
+use aruna_operations::s3::multipart::part_upload::{UploadPartInput as UPI, UploadPartOperation};
+use aruna_operations::s3::multipart::parts::{ListPartsInput as LPI, ListPartsOperation};
+use aruna_operations::s3::multipart::uploads::{ListUploadsInput as LMUI, ListUploadsOperation};
+use aruna_operations::s3::object::attributes::{
+    GetAttributesInput as GOAI, GetAttributesOperation,
+};
+use aruna_operations::s3::object::copy::{
     CopyObjectInput as CopyObjectData, CopyReferences, copy_object,
 };
-use aruna_operations::s3::copy_part::{
-    UploadPartCopyInput as UploadPartCopyData, upload_part_copy,
+use aruna_operations::s3::object::delete::{DeleteObjectInput as DOI, DeleteObjectOperation};
+use aruna_operations::s3::object::delete_bulk::{
+    BulkDeleteEntry, BulkDeleteInput as DOSI, delete_objects,
 };
-use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::create_upload::{
-    CreateMultipartUploadInput as CMPI, CreateMultipartUploadOperation,
+use aruna_operations::s3::object::get::{
+    GetObjectInput as GOI, get_object_info, get_object_routed,
 };
-use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
-use aruna_operations::s3::delete_object::{DeleteObjectInput as DOI, DeleteObjectOperation};
-use aruna_operations::s3::delete_objects::{
-    DeleteObjectsEntry, DeleteObjectsInput as DOSI, delete_objects,
-};
-use aruna_operations::s3::get_attributes::{
-    GetObjectAttributesInput as GOAI, GetObjectAttributesOperation,
-};
-use aruna_operations::s3::get_bucket::GetBucketInfoOperation;
-use aruna_operations::s3::get_object::{GetObjectInput as GOI, get_object_info, get_object_routed};
-use aruna_operations::s3::head_object::{HeadObjectInput as HOI, HeadObjectOperation};
-use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
-use aruna_operations::s3::list_objects::{ListObjectsV2Input as LOV2I, ListObjectsV2Operation};
-use aruna_operations::s3::list_parts::{ListPartsInput as LPI, ListPartsOperation};
-use aruna_operations::s3::list_uploads::{
-    ListMultipartUploadsInput as LMUI, ListMultipartUploadsOperation,
-};
-use aruna_operations::s3::list_versions::{
-    ListObjectVersionsInput as LOVI, ListObjectVersionsOperation,
-};
-use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation};
-use aruna_operations::s3::upload_part::{UploadPartInput as UPI, UploadPartOperation};
+use aruna_operations::s3::object::head::{HeadObjectInput as HOI, HeadObjectOperation};
+use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListBucketOperation};
+use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectOperation};
+use aruna_operations::s3::object::versions::{ListVersionsInput as LOVI, ListVersionsOperation};
 use aruna_operations::sync::mirror_repair::{
-    SyncMirrorRepairIntent, kick_mirror_repair, stage_mirror_delete, stage_mirror_reconcile,
+    SyncMirrorIntent, kick_mirror_repair, stage_mirror_delete, stage_mirror_reconcile,
 };
 use aruna_operations::sync::sync_relationship::SyncRelationshipDirection;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -355,7 +349,7 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
 
-        drive(GetBucketInfoOperation::new(req.input.bucket), &self.state)
+        drive(GetBucketOperation::new(req.input.bucket), &self.state)
             .await
             .map_err(IntoS3Error::into_s3_error)?;
 
@@ -374,7 +368,7 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
 
-        drive(GetBucketInfoOperation::new(req.input.bucket), &self.state)
+        drive(GetBucketOperation::new(req.input.bucket), &self.state)
             .await
             .map_err(IntoS3Error::into_s3_error)?;
 
@@ -503,7 +497,7 @@ impl S3 for ArunaS3Service {
         let config = parse_bucket_cors(req.input.cors_configuration.clone())?;
 
         drive(
-            PutBucketCorsOperation::new(req.input.bucket.clone(), config),
+            PutCorsOperation::new(req.input.bucket.clone(), config),
             &self.state,
         )
         .await
@@ -523,12 +517,9 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
-        let config = drive(
-            GetBucketCorsOperation::new(req.input.bucket.clone()),
-            &self.state,
-        )
-        .await
-        .map_err(IntoS3Error::into_s3_error)?;
+        let config = drive(GetCorsOperation::new(req.input.bucket.clone()), &self.state)
+            .await
+            .map_err(IntoS3Error::into_s3_error)?;
 
         Ok(S3Response::new(map_bucket_cors(config)))
     }
@@ -546,7 +537,7 @@ impl S3 for ArunaS3Service {
         })?;
 
         drive(
-            DeleteBucketCorsOperation::new(req.input.bucket.clone()),
+            DeleteCorsOperation::new(req.input.bucket.clone()),
             &self.state,
         )
         .await
@@ -575,10 +566,10 @@ impl S3 for ArunaS3Service {
         let requested_continuation_token = req.input.continuation_token.clone();
         let continuation_token = Self::decode_list_token(requested_continuation_token.as_deref())?;
         let max_keys = match req.input.max_keys {
-            None => ListObjectsV2Operation::DEFAULT_MAX_KEYS,
+            None => ListBucketOperation::DEFAULT_MAX_KEYS,
             Some(max_keys) => usize::try_from(max_keys)
                 .map_err(|_| s3_error!(InvalidArgument, "max-keys must be non-negative"))?
-                .min(ListObjectsV2Operation::DEFAULT_MAX_KEYS),
+                .min(ListBucketOperation::DEFAULT_MAX_KEYS),
         };
         let bucket = req.input.bucket.clone();
         let prefix = req.input.prefix.clone();
@@ -682,10 +673,10 @@ impl S3 for ArunaS3Service {
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let max_keys = match req.input.max_keys {
-            None => ListObjectsV2Operation::DEFAULT_MAX_KEYS,
+            None => ListBucketOperation::DEFAULT_MAX_KEYS,
             Some(max_keys) => usize::try_from(max_keys)
                 .map_err(|_| s3_error!(InvalidArgument, "max-keys must be non-negative"))?
-                .min(ListObjectsV2Operation::DEFAULT_MAX_KEYS),
+                .min(ListBucketOperation::DEFAULT_MAX_KEYS),
         };
         let bucket = req.input.bucket.clone();
         let prefix = req.input.prefix.clone();
@@ -1073,7 +1064,7 @@ impl S3 for ArunaS3Service {
         let gate = gate_context(&self.state, self.realm_id, now_ms())
             .await
             .map_err(gate_context_error)?;
-        let mut operation = CreateMultipartUploadOperation::new(CMPI {
+        let mut operation = CreateMultipartOperation::new(CMPI {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
             group_id,
@@ -1326,7 +1317,7 @@ impl S3 for ArunaS3Service {
         let gate = gate_context(&self.state, self.realm_id, now_ms())
             .await
             .map_err(gate_context_error)?;
-        let mut operation = CompleteMultipartUploadOperation::new(CMUI {
+        let mut operation = CompleteUploadOperation::new(CMUI {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
             upload_id,
@@ -1406,7 +1397,7 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
-        let operation = AbortMultipartUploadOperation::new(AMUI {
+        let operation = AbortUploadOperation::new(AMUI {
             bucket: req.input.bucket,
             key: req.input.key,
             upload_id,
@@ -1563,7 +1554,7 @@ impl S3 for ArunaS3Service {
 
         let requested = RequestedAttributes::from_request(&req.input.object_attributes)?;
         let requested_part_number_marker = req.input.part_number_marker;
-        let part_number_marker = parse_part_number_marker(requested_part_number_marker)?;
+        let part_number_marker = parse_part_marker(requested_part_number_marker)?;
         let max_parts = parse_max_parts(req.input.max_parts)?;
         let version_id = parse_version_id(req.input.version_id)?;
         let bucket = req.input.bucket.clone();
@@ -1575,7 +1566,7 @@ impl S3 for ArunaS3Service {
             .unwrap_or(user_access.group_id);
 
         let result = drive(
-            GetObjectAttributesOperation::new(GOAI {
+            GetAttributesOperation::new(GOAI {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id,
@@ -1823,14 +1814,14 @@ impl S3 for ArunaS3Service {
         let upload_id_marker =
             parse_upload_marker(key_marker.as_deref(), requested_upload_id_marker.as_deref())?;
         let max_uploads = match req.input.max_uploads {
-            None => ListMultipartUploadsOperation::DEFAULT_MAX_UPLOADS,
+            None => ListUploadsOperation::DEFAULT_MAX_UPLOADS,
             Some(max_uploads) => usize::try_from(max_uploads)
                 .map_err(|_| s3_error!(InvalidArgument, "max-uploads must be non-negative"))?
-                .min(ListMultipartUploadsOperation::DEFAULT_MAX_UPLOADS),
+                .min(ListUploadsOperation::DEFAULT_MAX_UPLOADS),
         };
 
         let result = drive(
-            ListMultipartUploadsOperation::new(LMUI {
+            ListUploadsOperation::new(LMUI {
                 bucket: bucket.clone(),
                 prefix: prefix.clone(),
                 delimiter: delimiter.clone(),
@@ -1875,10 +1866,10 @@ impl S3 for ArunaS3Service {
             ),
         };
         let max_keys = match req.input.max_keys {
-            None => ListObjectVersionsOperation::DEFAULT_MAX_KEYS,
+            None => ListVersionsOperation::DEFAULT_MAX_KEYS,
             Some(max_keys) => usize::try_from(max_keys)
                 .map_err(|_| s3_error!(InvalidArgument, "max-keys must be non-negative"))?
-                .min(ListObjectVersionsOperation::DEFAULT_MAX_KEYS),
+                .min(ListVersionsOperation::DEFAULT_MAX_KEYS),
         };
         let group_id = bucket_info
             .as_ref()
@@ -1886,7 +1877,7 @@ impl S3 for ArunaS3Service {
             .unwrap_or(user_access.group_id);
 
         let result = drive(
-            ListObjectVersionsOperation::new(LOVI {
+            ListVersionsOperation::new(LOVI {
                 bucket: bucket.clone(),
                 prefix: prefix.clone(),
                 delimiter: delimiter.clone(),
@@ -2067,7 +2058,7 @@ impl S3 for ArunaS3Service {
                 continue;
             }
 
-            entries.push(DeleteObjectsEntry {
+            entries.push(BulkDeleteEntry {
                 key: object.key,
                 version_id,
             });
@@ -2167,7 +2158,7 @@ impl S3 for ArunaS3Service {
                             .await;
                         kick_mirror_repair(&self.state).await;
                         if self.remove_sync_mirror(created).await {
-                            self.clear_mirror_repair(created, SyncMirrorRepairIntent::Delete)
+                            self.clear_mirror_repair(created, SyncMirrorIntent::Delete)
                                 .await;
                         }
                     }
@@ -2190,14 +2181,14 @@ impl S3 for ArunaS3Service {
                             .await;
                         kick_mirror_repair(&self.state).await;
                         if self.remove_sync_mirror(created).await {
-                            self.clear_mirror_repair(created, SyncMirrorRepairIntent::Delete)
+                            self.clear_mirror_repair(created, SyncMirrorIntent::Delete)
                                 .await;
                         }
                     }
                 }
                 return Err(error);
             }
-            self.clear_mirror_repair(relationship, SyncMirrorRepairIntent::Reconcile)
+            self.clear_mirror_repair(relationship, SyncMirrorIntent::Reconcile)
                 .await;
             stored.push(relationship.clone());
         }
@@ -2213,7 +2204,7 @@ impl S3 for ArunaS3Service {
             .await?;
             kick_mirror_repair(&self.state).await;
             if self.remove_sync_mirror(&relationship).await {
-                self.clear_mirror_repair(&relationship, SyncMirrorRepairIntent::Delete)
+                self.clear_mirror_repair(&relationship, SyncMirrorIntent::Delete)
                     .await;
             }
         }
@@ -2266,7 +2257,7 @@ impl S3 for ArunaS3Service {
             .await?;
             kick_mirror_repair(&self.state).await;
             if self.remove_sync_mirror(&relationship).await {
-                self.clear_mirror_repair(&relationship, SyncMirrorRepairIntent::Delete)
+                self.clear_mirror_repair(&relationship, SyncMirrorIntent::Delete)
                     .await;
             }
         }

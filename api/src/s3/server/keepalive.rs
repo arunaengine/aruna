@@ -1,10 +1,6 @@
-//! Streaming response for a slow CompleteMultipartUpload.
-//!
-//! AWS answers a completion that takes longer than a normal response with the
-//! 200 head first, whitespace while it works and the XML document last. The
-//! body is wrapped by [`super::body::ResponseBody`], which keeps the response
-//! lifetime attached and touches both activity watchers on every filler, so
-//! the long wait cannot be mistaken for a stalled stream.
+//! Streaming response for a slow CompleteMultipartUpload: the 200 head first,
+//! whitespace while it works, the XML document last. [`super::body::ResponseBody`]
+//! wraps it and touches both activity watchers on every filler.
 
 use super::activity::STREAM_PROGRESS_BYTES;
 use bytes::Bytes;
@@ -223,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn keepalive_distinct_from_idle() {
+    fn keepalive_independent() {
         // The keepalive cadence is independent of the connection idle bound and
         // its filler is one full stream progress unit.
         assert_eq!(KEEPALIVE_AFTER, Duration::from_secs(5));

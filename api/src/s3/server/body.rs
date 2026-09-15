@@ -1,10 +1,6 @@
-//! Request and response bodies of the S3 listener.
-//!
-//! Request bodies report progress and, for DeleteObjects, capture a bounded
-//! prefix so the handler can validate the checksum without buffering an object
-//! stream. Response bodies own a [`ResponseLifetime`]: every permit, the
-//! active-request accounting and the local lease stay attached to the stream
-//! and are released once, on completion, error or drop.
+//! Request and response bodies of the S3 listener. Request bodies report
+//! progress (and capture a bounded DeleteObjects prefix); response bodies own a
+//! [`ResponseLifetime`] released once, on completion, error, or drop.
 
 use super::activity::{ActiveRequestGuard, ConnectionActivity};
 use crate::rate_limit::LocalLease;
@@ -83,7 +79,7 @@ pub(super) fn wrap_request_body(
     capture: Option<DeleteObjectsBody>,
 ) -> s3s::Body {
     match capture {
-        Some(captured) => s3s::Body::http_body_unsync(CaptureDeleteObjectsBody {
+        Some(captured) => s3s::Body::http_body_unsync(CaptureObjectsBody {
             inner: Box::pin(body),
             captured,
             activity: stream.clone(),
@@ -99,7 +95,7 @@ pub(super) fn wrap_request_body(
     }
 }
 
-struct CaptureDeleteObjectsBody {
+struct CaptureObjectsBody {
     inner: Pin<Box<Incoming>>,
     captured: DeleteObjectsBody,
     activity: Arc<ConnectionActivity>,
@@ -107,7 +103,7 @@ struct CaptureDeleteObjectsBody {
     ended: bool,
 }
 
-impl hyper::body::Body for CaptureDeleteObjectsBody {
+impl hyper::body::Body for CaptureObjectsBody {
     type Data = hyper::body::Bytes;
     type Error = s3s::StdError;
 
@@ -171,7 +167,7 @@ impl hyper::body::Body for CaptureDeleteObjectsBody {
     }
 }
 
-impl Drop for CaptureDeleteObjectsBody {
+impl Drop for CaptureObjectsBody {
     fn drop(&mut self) {
         self.activity.stop();
     }
@@ -234,10 +230,9 @@ impl Drop for TrackRequestBody {
     }
 }
 
-/// Everything that must stay owned until the response stream finishes: the
-/// egress permit, the active-request accounting and the local rate-limit lease.
-/// It is attached to whichever body serves the response, so no permit is
-/// released merely because headers were built.
+/// Everything owned until the response stream finishes: the egress permit, the
+/// active-request accounting and the local rate-limit lease. It attaches to
+/// whichever body serves the response, so headers alone release nothing.
 pub(super) struct ResponseLifetime {
     egress: Option<OwnedSemaphorePermit>,
     active: Option<ActiveRequestGuard>,
@@ -493,7 +488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn holds_lifetime_while_body_open() {
+    async fn body_holds_lifetime() {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let activity = Arc::new(ConnectionActivity::default());
         activity.mark_request();
@@ -536,7 +531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn releases_lifetime_on_error() {
+    async fn error_releases_lifetime() {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let activity = Arc::new(ConnectionActivity::default());
         activity.begin_request();

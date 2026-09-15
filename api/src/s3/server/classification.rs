@@ -1,9 +1,6 @@
-//! Request classification for the S3 listener.
-//!
-//! Everything the request path needs before it may parse or store anything is
-//! derived here in one pass: the bucket, the CORS preflight inputs, the
-//! DeleteObjects body shape and whether the request belongs to the bulk data
-//! lane. The stage stays synchronous and free of I/O.
+//! Request classification for the S3 listener: bucket, CORS preflight inputs,
+//! DeleteObjects body shape, and lane assignment in one synchronous, I/O-free
+//! pass before anything may parse or store a request.
 
 use crate::s3::cors::parse_requested_headers;
 use crate::s3::server::body::DELETE_OBJECTS_MAX_BODY;
@@ -481,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_preflight_and_bodies() {
+    fn classifies_requests() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::ORIGIN,
