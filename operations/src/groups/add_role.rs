@@ -1,8 +1,8 @@
 use aruna_core::UserId;
 use aruna_core::admin_documents::{
-    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
 };
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -39,7 +39,7 @@ use aruna_core::structs::Permission;
 use aruna_core::structs::ResourceEvent;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AddGroupRoleConfig {
+pub struct AddRoleConfig {
     pub auth_context: AuthContext,
     pub actor: Actor,
     pub realm_id: RealmId,
@@ -48,16 +48,16 @@ pub struct AddGroupRoleConfig {
 }
 
 #[derive(PartialEq)]
-pub struct AddGroupRoleOperation {
-    input: AddGroupRoleConfig,
+pub struct AddRoleOperation {
+    input: AddRoleConfig,
     /// Bucket the authorization rows publish onto, read inside the write
     /// transaction.
     fence: crate::placement::fence::WriteFence,
-    state: AddGroupRoleState,
-    output: Option<Result<(Group, GroupAuthorizationDocument), AddGroupRoleError>>,
+    state: AddRoleState,
+    output: Option<Result<(Group, GroupAuthorizationDocument), AddRoleError>>,
 }
 
-impl std::fmt::Debug for AddGroupRoleOperation {
+impl std::fmt::Debug for AddRoleOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AddRoleOperation")
             .field("input", &self.input)
@@ -68,7 +68,7 @@ impl std::fmt::Debug for AddGroupRoleOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum AddGroupRoleState {
+pub enum AddRoleState {
     Init,
     Auth,
     StartTransaction,
@@ -132,13 +132,13 @@ pub enum AddGroupRoleState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum AddGroupRoleError {
+pub enum AddRoleError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
-    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
+    AdminDocumentError(#[from] AdminDocumentError),
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
     #[error("No transaction found")]
@@ -163,7 +163,7 @@ pub enum AddGroupRoleError {
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: AddGroupRoleState,
+        state: AddRoleState,
         expected: &'static str,
         got: String,
     },
@@ -175,19 +175,19 @@ fn reserved_role_name(name: &str) -> bool {
     RESERVED_GROUP_ROLE_NAMES.contains(&name.trim())
 }
 
-impl AddGroupRoleOperation {
-    pub fn new(input: AddGroupRoleConfig) -> Self {
-        AddGroupRoleOperation {
+impl AddRoleOperation {
+    pub fn new(input: AddRoleConfig) -> Self {
+        AddRoleOperation {
             input,
             fence: Default::default(),
-            state: AddGroupRoleState::Init,
+            state: AddRoleState::Init,
             output: None,
         }
     }
 
-    fn validate_role(&self) -> Result<(), AddGroupRoleError> {
+    fn validate_role(&self) -> Result<(), AddRoleError> {
         if reserved_role_name(&self.input.role.name) {
-            return Err(AddGroupRoleError::ReservedRoleName);
+            return Err(AddRoleError::ReservedRoleName);
         }
 
         if self
@@ -197,7 +197,7 @@ impl AddGroupRoleOperation {
             .iter()
             .any(|user| user.is_nil() && !user.is_nil_in(self.input.realm_id))
         {
-            return Err(AddGroupRoleError::InvalidAssignedUser);
+            return Err(AddRoleError::InvalidAssignedUser);
         }
 
         if self.input.role.is_public(self.input.realm_id)
@@ -208,7 +208,7 @@ impl AddGroupRoleOperation {
                 .values()
                 .any(|permission| permission != &Permission::READ)
         {
-            return Err(AddGroupRoleError::InvalidPublicRole);
+            return Err(AddRoleError::InvalidPublicRole);
         }
 
         let subtree_root = aruna_core::permission_path::role_subtree_root(
@@ -222,7 +222,7 @@ impl AddGroupRoleOperation {
             .keys()
             .any(|pattern| !aruna_core::permission_path::role_path_confined(pattern, &subtree_root))
         {
-            return Err(AddGroupRoleError::UnconfinedRolePath);
+            return Err(AddRoleError::UnconfinedRolePath);
         }
 
         Ok(())
@@ -232,7 +232,7 @@ impl AddGroupRoleOperation {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
             return self.unexpected_event(
-                AddGroupRoleState::Auth,
+                AddRoleState::Auth,
                 "Event::SubOperation(SuboperationEvent::AuthorizationResult)",
                 got,
             );
@@ -247,14 +247,14 @@ impl AddGroupRoleOperation {
     fn emit_start_transaction(
         &mut self,
         auth_result: Result<bool, AuthorizationError>,
-    ) -> Result<Effects, AddGroupRoleError> {
+    ) -> Result<Effects, AddRoleError> {
         if auth_result? {
-            self.state = AddGroupRoleState::StartTransaction;
+            self.state = AddRoleState::StartTransaction;
             Ok(smallvec![Effect::Storage(
                 StorageEffect::StartTransaction { read: false }
             )])
         } else {
-            Err(AddGroupRoleError::Unauthorized)
+            Err(AddRoleError::Unauthorized)
         }
     }
 
@@ -262,7 +262,7 @@ impl AddGroupRoleOperation {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
-                AddGroupRoleState::StartTransaction,
+                AddRoleState::StartTransaction,
                 "Event::Storage(StorageEvent::TransactionStarted)",
                 got,
             );
@@ -273,8 +273,8 @@ impl AddGroupRoleOperation {
         }
     }
 
-    fn emit_get_group(&mut self, txn_id: TxnId) -> Result<Effects, AddGroupRoleError> {
-        self.state = AddGroupRoleState::GetGroup { txn_id };
+    fn emit_get_group(&mut self, txn_id: TxnId) -> Result<Effects, AddRoleError> {
+        self.state = AddRoleState::GetGroup { txn_id };
         let key = self.input.group_id.to_bytes().into();
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
             key_space: GROUP_KEYSPACE.to_string(),
@@ -303,10 +303,10 @@ impl AddGroupRoleOperation {
         &mut self,
         group: Option<ByteView>,
         txn_id: TxnId,
-    ) -> Result<Effects, AddGroupRoleError> {
-        let group = Group::from_bytes(&group.ok_or_else(|| AddGroupRoleError::GroupNotFound)?)?;
+    ) -> Result<Effects, AddRoleError> {
+        let group = Group::from_bytes(&group.ok_or_else(|| AddRoleError::GroupNotFound)?)?;
 
-        self.state = AddGroupRoleState::GetAuthDocAndAdminState { txn_id, group };
+        self.state = AddRoleState::GetAuthDocAndAdminState { txn_id, group };
 
         let target = AdminDocumentTarget::Group {
             group_id: self.input.group_id,
@@ -369,9 +369,9 @@ impl AddGroupRoleOperation {
         auth_doc: Option<ByteView>,
         reducer_state_value: Option<ByteView>,
         realm_config_value: Option<ByteView>,
-    ) -> Result<Effects, AddGroupRoleError> {
+    ) -> Result<Effects, AddRoleError> {
         let mut auth_doc =
-            super::parse_auth_record(auth_doc)?.ok_or(AddGroupRoleError::GroupNotFound)?;
+            super::parse_auth_record(auth_doc)?.ok_or(AddRoleError::GroupNotFound)?;
         let target = AdminDocumentTarget::Group {
             group_id: self.input.group_id,
         };
@@ -386,12 +386,12 @@ impl AddGroupRoleOperation {
             .as_ref()
             .is_some_and(|state| state.target != target)
         {
-            return Err(AdminDocumentReducerError::TargetMismatch.into());
+            return Err(AdminDocumentError::TargetMismatch.into());
         }
 
         let mut reducer_state = previous_reducer_state
             .clone()
-            .unwrap_or_else(|| AdminDocumentReducerState::new(target));
+            .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
         let members_before = group_members(&auth_doc);
         materialize_group_role(&mut group, &mut auth_doc, &self.input.role, &reducer_state);
@@ -415,7 +415,7 @@ impl AddGroupRoleOperation {
             ),
             reducer_state_entry(&reducer_state)?,
         ];
-        let document_target = DocumentSyncTarget::GroupAuthorization {
+        let document_target = DocumentTarget::GroupAuthorization {
             group_id: self.input.group_id,
         };
         let realm_config = realm_config_value
@@ -437,7 +437,7 @@ impl AddGroupRoleOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::admin(event.clone()),
+                DocumentOutboxEvent::admin(event.clone()),
                 placement,
                 false,
             )
@@ -446,7 +446,7 @@ impl AddGroupRoleOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = AddGroupRoleState::WriteGroupAuthDocAndAdminState {
+        self.state = AddRoleState::WriteGroupAuthDocAndAdminState {
             txn_id,
             group,
             auth_doc,
@@ -461,8 +461,8 @@ impl AddGroupRoleOperation {
         })])
     }
 
-    fn handle_document_write(&mut self, event: Event, state: AddGroupRoleState) -> Effects {
-        let AddGroupRoleState::WriteGroupAuthDocAndAdminState {
+    fn handle_document_write(&mut self, event: Event, state: AddRoleState) -> Effects {
+        let AddRoleState::WriteGroupAuthDocAndAdminState {
             txn_id,
             group,
             auth_doc,
@@ -484,7 +484,7 @@ impl AddGroupRoleOperation {
         };
 
         if !stale_conflict_delete_keys.is_empty() {
-            self.state = AddGroupRoleState::DeleteStaleAdminConflicts {
+            self.state = AddRoleState::DeleteStaleAdminConflicts {
                 txn_id,
                 group,
                 auth_doc,
@@ -538,7 +538,7 @@ impl AddGroupRoleOperation {
         if self.fence.is_empty() {
             return self.emit_commit(txn_id, group, auth_doc, admin_outbox_written, new_members);
         }
-        self.state = AddGroupRoleState::ReadBucketFence {
+        self.state = AddRoleState::ReadBucketFence {
             txn_id,
             group,
             auth_doc,
@@ -569,7 +569,7 @@ impl AddGroupRoleOperation {
             );
         };
         if !self.fence.admits(&values) {
-            return self.fail(AddGroupRoleError::PlacementFenced);
+            return self.fail(AddRoleError::PlacementFenced);
         }
         self.emit_commit(txn_id, group, auth_doc, admin_outbox_written, new_members)
     }
@@ -582,7 +582,7 @@ impl AddGroupRoleOperation {
         admin_outbox_written: bool,
         new_members: Vec<UserId>,
     ) -> Effects {
-        self.state = AddGroupRoleState::CommitTransaction {
+        self.state = AddRoleState::CommitTransaction {
             txn_id,
             group,
             auth_doc,
@@ -609,7 +609,7 @@ impl AddGroupRoleOperation {
             );
         };
         if admin_outbox_written {
-            self.state = AddGroupRoleState::ScheduleAdminDocumentOutboxDrain {
+            self.state = AddRoleState::ScheduleAdminDocumentOutboxDrain {
                 group,
                 auth_doc,
                 new_members,
@@ -646,12 +646,12 @@ impl AddGroupRoleOperation {
         auth_doc: GroupAuthorizationDocument,
         new_members: Vec<UserId>,
     ) -> Effects {
-        self.state = AddGroupRoleState::AnnounceGroupDoc {
+        self.state = AddRoleState::AnnounceGroupDoc {
             group: group.clone(),
             auth_doc: auth_doc.clone(),
             new_members,
         };
-        let document = DocumentSyncTarget::Group {
+        let document = DocumentTarget::Group {
             group_id: group.group_id,
         };
         smallvec![replicate_documents_effect(
@@ -677,14 +677,14 @@ impl AddGroupRoleOperation {
             );
         };
         if let Err(error) = result {
-            return self.fail(AddGroupRoleError::TopicAnnouncement(error));
+            return self.fail(AddRoleError::TopicAnnouncement(error));
         }
-        self.state = AddGroupRoleState::AnnounceAuthDoc {
+        self.state = AddRoleState::AnnounceAuthDoc {
             group: group.clone(),
             auth_doc: auth_doc.clone(),
             new_members,
         };
-        let document = DocumentSyncTarget::GroupAuthorization {
+        let document = DocumentTarget::GroupAuthorization {
             group_id: group.group_id,
         };
         smallvec![replicate_documents_effect(
@@ -710,7 +710,7 @@ impl AddGroupRoleOperation {
             );
         };
         if let Err(error) = result {
-            return self.fail(AddGroupRoleError::TopicAnnouncement(error));
+            return self.fail(AddRoleError::TopicAnnouncement(error));
         }
         self.emit_membership_notice(group, auth_doc, new_members)
     }
@@ -739,11 +739,11 @@ impl AddGroupRoleOperation {
             })
             .collect::<Vec<_>>();
         if !records.is_empty() {
-            self.state = AddGroupRoleState::EmitNotifications { group, auth_doc };
+            self.state = AddRoleState::EmitNotifications { group, auth_doc };
             return smallvec![emit_notifications_effect(records)];
         }
 
-        self.state = AddGroupRoleState::Finish;
+        self.state = AddRoleState::Finish;
         self.output = Some(Ok((group, auth_doc)));
         smallvec![]
     }
@@ -753,32 +753,32 @@ impl AddGroupRoleOperation {
         group: Group,
         auth_doc: GroupAuthorizationDocument,
     ) -> Effects {
-        self.state = AddGroupRoleState::Finish;
+        self.state = AddRoleState::Finish;
         self.output = Some(Ok((group, auth_doc)));
         smallvec![]
     }
 
-    fn fail(&mut self, err: AddGroupRoleError) -> Effects {
-        self.state = AddGroupRoleState::Error;
+    fn fail(&mut self, err: AddRoleError) -> Effects {
+        self.state = AddRoleState::Error;
         self.output = Some(Err(err));
         self.abort()
     }
 
-    fn fail_with_cleanup(&mut self, err: AddGroupRoleError, cleanup_effects: Effects) -> Effects {
-        self.state = AddGroupRoleState::Error;
+    fn fail_with_cleanup(&mut self, err: AddRoleError, cleanup_effects: Effects) -> Effects {
+        self.state = AddRoleState::Error;
         self.output = Some(Err(err));
         cleanup_effects
     }
 
     fn unexpected_event(
         &mut self,
-        state: AddGroupRoleState,
+        state: AddRoleState,
         expected: &'static str,
         got: String,
     ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
-            AddGroupRoleError::UnexpectedEvent {
+            AddRoleError::UnexpectedEvent {
                 state,
                 expected,
                 got,
@@ -796,17 +796,17 @@ impl AddGroupRoleOperation {
     }
 }
 
-impl Operation for AddGroupRoleOperation {
+impl Operation for AddRoleOperation {
     type Output = (Group, GroupAuthorizationDocument);
 
-    type Error = AddGroupRoleError;
+    type Error = AddRoleError;
 
     fn start(&mut self) -> Effects {
         if let Err(error) = self.validate_role() {
             return self.fail(error);
         }
 
-        self.state = AddGroupRoleState::Auth;
+        self.state = AddRoleState::Auth;
 
         let auth_config = CheckPermissionsConfig {
             auth_context: self.input.auth_context.clone(),
@@ -832,16 +832,16 @@ impl Operation for AddGroupRoleOperation {
         };
 
         match self.state.clone() {
-            AddGroupRoleState::Auth => self.handle_authorization(event),
-            AddGroupRoleState::StartTransaction => self.handle_start_transaction(event),
-            AddGroupRoleState::GetGroup { txn_id } => self.handle_get_group(event, txn_id),
-            AddGroupRoleState::GetAuthDocAndAdminState { txn_id, group } => {
+            AddRoleState::Auth => self.handle_authorization(event),
+            AddRoleState::StartTransaction => self.handle_start_transaction(event),
+            AddRoleState::GetGroup { txn_id } => self.handle_get_group(event, txn_id),
+            AddRoleState::GetAuthDocAndAdminState { txn_id, group } => {
                 self.handle_auth_read(event, txn_id, group)
             }
-            state @ AddGroupRoleState::WriteGroupAuthDocAndAdminState { .. } => {
+            state @ AddRoleState::WriteGroupAuthDocAndAdminState { .. } => {
                 self.handle_document_write(event, state)
             }
-            AddGroupRoleState::DeleteStaleAdminConflicts {
+            AddRoleState::DeleteStaleAdminConflicts {
                 txn_id,
                 group,
                 auth_doc,
@@ -855,7 +855,7 @@ impl Operation for AddGroupRoleOperation {
                 admin_outbox_written,
                 new_members,
             ),
-            AddGroupRoleState::ReadBucketFence {
+            AddRoleState::ReadBucketFence {
                 txn_id,
                 group,
                 auth_doc,
@@ -869,7 +869,7 @@ impl Operation for AddGroupRoleOperation {
                 admin_outbox_written,
                 new_members,
             ),
-            AddGroupRoleState::CommitTransaction {
+            AddRoleState::CommitTransaction {
                 group,
                 auth_doc,
                 admin_outbox_written,
@@ -882,49 +882,46 @@ impl Operation for AddGroupRoleOperation {
                 admin_outbox_written,
                 new_members,
             ),
-            AddGroupRoleState::ScheduleAdminDocumentOutboxDrain {
+            AddRoleState::ScheduleAdminDocumentOutboxDrain {
                 group,
                 auth_doc,
                 new_members,
             } => self.handle_drain_schedule(event, group, auth_doc, new_members),
-            AddGroupRoleState::AnnounceGroupDoc {
+            AddRoleState::AnnounceGroupDoc {
                 group,
                 auth_doc,
                 new_members,
             } => self.handle_group_announce(event, group, auth_doc, new_members),
-            AddGroupRoleState::AnnounceAuthDoc {
+            AddRoleState::AnnounceAuthDoc {
                 group,
                 auth_doc,
                 new_members,
             } => self.handle_auth_announce(event, group, auth_doc, new_members),
-            AddGroupRoleState::EmitNotifications { group, auth_doc } => {
+            AddRoleState::EmitNotifications { group, auth_doc } => {
                 self.handle_emit_notifications(group, auth_doc)
             }
-            AddGroupRoleState::Init | AddGroupRoleState::Finish | AddGroupRoleState::Error => {
+            AddRoleState::Init | AddRoleState::Finish | AddRoleState::Error => {
                 smallvec![]
             }
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            AddGroupRoleState::Finish | AddGroupRoleState::Error
-        )
+        matches!(self.state, AddRoleState::Finish | AddRoleState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| AddGroupRoleError::NotFinished)?
+        self.output.ok_or_else(|| AddRoleError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            AddGroupRoleState::GetGroup { txn_id }
-            | AddGroupRoleState::GetAuthDocAndAdminState { txn_id, .. }
-            | AddGroupRoleState::WriteGroupAuthDocAndAdminState { txn_id, .. }
-            | AddGroupRoleState::DeleteStaleAdminConflicts { txn_id, .. }
-            | AddGroupRoleState::ReadBucketFence { txn_id, .. }
-            | AddGroupRoleState::CommitTransaction { txn_id, .. } => {
+            AddRoleState::GetGroup { txn_id }
+            | AddRoleState::GetAuthDocAndAdminState { txn_id, .. }
+            | AddRoleState::WriteGroupAuthDocAndAdminState { txn_id, .. }
+            | AddRoleState::DeleteStaleAdminConflicts { txn_id, .. }
+            | AddRoleState::ReadBucketFence { txn_id, .. }
+            | AddRoleState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
 
@@ -934,14 +931,14 @@ impl Operation for AddGroupRoleOperation {
 }
 
 fn apply_reducer_updates(
-    state: &mut AdminDocumentReducerState,
-    input: &AddGroupRoleConfig,
-) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
+    state: &mut AdminDocumentState,
+    input: &AddRoleConfig,
+) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut admin_events = Vec::new();
     let event = state.apply_operation(
         &input.actor,
         AdminDocumentOperation::GroupRoleCreated {
-            role: AdminDocumentRoleDefinition::from(&input.role),
+            role: AdminRoleDefinition::from(&input.role),
         },
     )?;
     admin_events.push(event);
@@ -964,7 +961,7 @@ fn materialize_group_role(
     group: &mut Group,
     auth_doc: &mut GroupAuthorizationDocument,
     role: &Role,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
 ) {
     if !reducer_state
         .materialized_group_roles()
@@ -1026,28 +1023,22 @@ pub mod test {
     use std::collections::{HashMap, HashSet};
 
     use crate::driver::{DriverContext, drive};
-    use crate::groups::add_member::{AddUserToGroupInput, AddUserToGroupOperation};
-    use crate::groups::add_role::{
-        AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation, AddGroupRoleState,
-    };
+    use crate::groups::add_member::{AddUserInput, AddUserOperation};
+    use crate::groups::add_role::{AddRoleConfig, AddRoleError, AddRoleOperation, AddRoleState};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
     use aruna_core::admin_documents::{
-        AdminDocumentDot, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+        AdminDocumentDot, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
-    use aruna_core::document::{
-        DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
-    };
+    use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::reducer::{
-        AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
-    };
+    use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
     use aruna_core::structs::{
         Actor, AuthContext, Group, GroupAuthorizationDocument, NotificationOutboxRecord,
@@ -1168,7 +1159,7 @@ pub mod test {
         };
 
         for name in ["admin", "user", " admin "] {
-            let mut operation = AddGroupRoleOperation::new(AddGroupRoleConfig {
+            let mut operation = AddRoleOperation::new(AddRoleConfig {
                 auth_context: aruna_core::structs::AuthContext {
                     user_id,
                     realm_id,
@@ -1190,10 +1181,7 @@ pub mod test {
             });
 
             assert!(operation.start().is_empty());
-            assert_eq!(
-                operation.finalize(),
-                Err(AddGroupRoleError::ReservedRoleName)
-            );
+            assert_eq!(operation.finalize(), Err(AddRoleError::ReservedRoleName));
         }
     }
 
@@ -1209,7 +1197,7 @@ pub mod test {
         };
 
         for permission in [Permission::WRITE, Permission::DENY] {
-            let mut operation = AddGroupRoleOperation::new(AddGroupRoleConfig {
+            let mut operation = AddRoleOperation::new(AddRoleConfig {
                 auth_context: aruna_core::structs::AuthContext {
                     user_id,
                     realm_id,
@@ -1231,10 +1219,7 @@ pub mod test {
             });
 
             assert!(operation.start().is_empty());
-            assert_eq!(
-                operation.finalize(),
-                Err(AddGroupRoleError::InvalidPublicRole)
-            );
+            assert_eq!(operation.finalize(), Err(AddRoleError::InvalidPublicRole));
         }
     }
 
@@ -1249,7 +1234,7 @@ pub mod test {
             user_id,
             realm_id,
         };
-        let mut operation = AddGroupRoleOperation::new(AddGroupRoleConfig {
+        let mut operation = AddRoleOperation::new(AddRoleConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id,
                 realm_id,
@@ -1271,10 +1256,7 @@ pub mod test {
         });
 
         assert!(operation.start().is_empty());
-        assert_eq!(
-            operation.finalize(),
-            Err(AddGroupRoleError::InvalidAssignedUser)
-        );
+        assert_eq!(operation.finalize(), Err(AddRoleError::InvalidAssignedUser));
     }
 
     #[test]
@@ -1297,7 +1279,7 @@ pub mod test {
             format!("/{realm_id}/g/*/data/**"),
             format!("{realm_id}/g/{group_id}/data/**"),
         ] {
-            let mut operation = AddGroupRoleOperation::new(AddGroupRoleConfig {
+            let mut operation = AddRoleOperation::new(AddRoleConfig {
                 auth_context: aruna_core::structs::AuthContext {
                     user_id,
                     realm_id,
@@ -1316,10 +1298,7 @@ pub mod test {
             });
 
             assert!(operation.start().is_empty());
-            assert_eq!(
-                operation.finalize(),
-                Err(AddGroupRoleError::UnconfinedRolePath)
-            );
+            assert_eq!(operation.finalize(), Err(AddRoleError::UnconfinedRolePath));
         }
     }
 
@@ -1349,7 +1328,7 @@ pub mod test {
             realm_id,
         };
         let role_id = Ulid::generate();
-        let add_role_input = AddGroupRoleConfig {
+        let add_role_input = AddRoleConfig {
             auth_context: auth_context.clone(),
             actor: actor.clone(),
             realm_id,
@@ -1381,19 +1360,19 @@ pub mod test {
             origin_node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
             origin_seq: 1,
         };
-        let mut previous_state = AdminDocumentReducerState::new(target.clone());
+        let mut previous_state = AdminDocumentState::new(target.clone());
         previous_state.clock.advance(add_dot.origin_node_id, 1);
         previous_state.clock.advance(remove_dot.origin_node_id, 1);
         previous_state.conflicts.insert(
             conflict_path.clone(),
-            AdminDocumentConflict {
+            AdminConflict {
                 path: conflict_path.clone(),
                 values: vec![
-                    AdminDocumentConflictValue {
+                    AdminConflictValue {
                         value: Some(user_id.to_string()),
                         dot: add_dot,
                     },
-                    AdminDocumentConflictValue {
+                    AdminConflictValue {
                         value: None,
                         dot: remove_dot,
                     },
@@ -1407,13 +1386,13 @@ pub mod test {
                 .to_vec(),
         )];
 
-        let mut add_role_operation = AddGroupRoleOperation::new(add_role_input.clone());
-        assert_eq!(add_role_operation.state, AddGroupRoleState::Init);
+        let mut add_role_operation = AddRoleOperation::new(add_role_input.clone());
+        assert_eq!(add_role_operation.state, AddRoleState::Init);
 
         let effects = add_role_operation.start();
         let auth_effect = effects.first().unwrap();
         assert!(matches!(auth_effect, Effect::SubOperation(_)));
-        assert_eq!(add_role_operation.state, AddGroupRoleState::Auth);
+        assert_eq!(add_role_operation.state, AddRoleState::Auth);
         let effects = add_role_operation.step(Event::SubOperation(
             aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
         ));
@@ -1423,10 +1402,7 @@ pub mod test {
             txn_effect,
             &Effect::Storage(aruna_core::effects::StorageEffect::StartTransaction { read: false })
         );
-        assert_eq!(
-            add_role_operation.state,
-            AddGroupRoleState::StartTransaction
-        );
+        assert_eq!(add_role_operation.state, AddRoleState::StartTransaction);
 
         let txn_id = TxnId::generate();
         let effects = add_role_operation.step(Event::Storage(
@@ -1441,10 +1417,7 @@ pub mod test {
                 txn_id: Some(txn_id)
             })
         );
-        assert_eq!(
-            add_role_operation.state,
-            AddGroupRoleState::GetGroup { txn_id }
-        );
+        assert_eq!(add_role_operation.state, AddRoleState::GetGroup { txn_id });
 
         let effects = add_role_operation.step(Event::Storage(
             aruna_core::events::StorageEvent::ReadResult {
@@ -1472,7 +1445,7 @@ pub mod test {
         );
         assert_eq!(
             add_role_operation.state,
-            AddGroupRoleState::GetAuthDocAndAdminState {
+            AddRoleState::GetAuthDocAndAdminState {
                 txn_id,
                 group: group.clone()
             }
@@ -1518,7 +1491,7 @@ pub mod test {
                     .iter()
                     .find(|(keyspace, _, _)| keyspace == ADMIN_DOCUMENT_STATE_KEYSPACE)
                     .expect("reducer state write is included");
-                let outbox_records: Vec<DocumentSyncOutboxRecord> = writes
+                let outbox_records: Vec<DocumentOutboxRecord> = writes
                     .iter()
                     .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
                     .map(|(_, _, value)| postcard::from_bytes(value.as_ref()).unwrap())
@@ -1529,7 +1502,7 @@ pub mod test {
                 let stored_auth_doc =
                     GroupAuthorizationDocument::from_bytes(auth_write.2.as_ref()).unwrap();
                 let stored_group_doc = Group::from_bytes(group_write.2.as_ref()).unwrap();
-                let reducer_state: aruna_core::reducer::AdminDocumentReducerState =
+                let reducer_state: aruna_core::reducer::AdminDocumentState =
                     postcard::from_bytes(reducer_state_write.2.as_ref()).unwrap();
                 assert_eq!(stored_auth_doc, mutated_auth_doc);
                 assert_eq!(stored_group_doc, mutated_group);
@@ -1540,15 +1513,15 @@ pub mod test {
                 );
                 assert!(!reducer_state.conflicts.contains_key(&conflict_path));
                 assert!(outbox_records.iter().any(|record| {
-                    record.target == (DocumentSyncTarget::GroupAuthorization { group_id })
+                    record.target == (DocumentTarget::GroupAuthorization { group_id })
                         && matches!(
                             &record.event,
-                            DocumentSyncOutboxEvent::AdminOperation { event, .. }
+                            DocumentOutboxEvent::AdminOperation { event, .. }
                                 if event.target == target
                                     && matches!(
                                         &event.op,
                                         AdminDocumentOperation::GroupRoleCreated { role }
-                                            if role == &AdminDocumentRoleDefinition::from(&add_role_input.role)
+                                            if role == &AdminRoleDefinition::from(&add_role_input.role)
                                     )
                         )
                 }));
@@ -1557,7 +1530,7 @@ pub mod test {
         }
         assert_eq!(
             add_role_operation.state,
-            AddGroupRoleState::WriteGroupAuthDocAndAdminState {
+            AddRoleState::WriteGroupAuthDocAndAdminState {
                 txn_id,
                 group: mutated_group.clone(),
                 auth_doc: mutated_auth_doc.clone(),
@@ -1606,7 +1579,7 @@ pub mod test {
         }
         assert_eq!(
             add_role_operation.state,
-            AddGroupRoleState::CommitTransaction {
+            AddRoleState::CommitTransaction {
                 txn_id,
                 group: mutated_group.clone(),
                 auth_doc: mutated_auth_doc.clone(),
@@ -1621,7 +1594,7 @@ pub mod test {
         assert!(matches!(effects.first(), Some(Effect::Task(_))));
         assert_eq!(
             add_role_operation.state,
-            AddGroupRoleState::ScheduleAdminDocumentOutboxDrain {
+            AddRoleState::ScheduleAdminDocumentOutboxDrain {
                 group: mutated_group.clone(),
                 auth_doc: mutated_auth_doc.clone(),
                 new_members: Vec::new(),
@@ -1633,7 +1606,7 @@ pub mod test {
             after: std::time::Duration::ZERO,
         }));
         assert!(effects.is_empty());
-        assert_eq!(add_role_operation.state, AddGroupRoleState::Finish);
+        assert_eq!(add_role_operation.state, AddRoleState::Finish);
         assert_eq!(
             add_role_operation.finalize().unwrap(),
             (mutated_group, mutated_auth_doc)
@@ -1646,7 +1619,7 @@ pub mod test {
         let (actor, group, auth_doc) = setup_group(&context).await;
         let second_admin = UserId::local(Ulid::generate(), actor.realm_id);
         drive(
-            AddUserToGroupOperation::new(AddUserToGroupInput {
+            AddUserOperation::new(AddUserInput {
                 actor: actor.clone(),
                 group_id: group.group_id,
                 user_id: second_admin,
@@ -1659,7 +1632,7 @@ pub mod test {
 
         let member = UserId::local(Ulid::generate(), actor.realm_id);
         drive(
-            AddGroupRoleOperation::new(AddGroupRoleConfig {
+            AddRoleOperation::new(AddRoleConfig {
                 auth_context: auth_context(&actor),
                 actor: actor.clone(),
                 realm_id: actor.realm_id,
@@ -1700,7 +1673,7 @@ pub mod test {
         let (actor, group, _auth_doc) = setup_group(&context).await;
 
         drive(
-            AddGroupRoleOperation::new(AddGroupRoleConfig {
+            AddRoleOperation::new(AddRoleConfig {
                 auth_context: auth_context(&actor),
                 actor: actor.clone(),
                 realm_id: actor.realm_id,
@@ -1758,7 +1731,7 @@ pub mod test {
 
     /// Steps an add-role to the bucket fence read and answers it with `closed`.
     fn step_to_fence(
-        operation: &mut AddGroupRoleOperation,
+        operation: &mut AddRoleOperation,
         actor: &Actor,
         group: &Group,
         auth_doc: &GroupAuthorizationDocument,
@@ -1843,7 +1816,7 @@ pub mod test {
         // every admin row, so the drain can bound the predecessor set.
         let (actor, group, auth_doc) = fixture();
         let txn_id = TxnId::generate();
-        let mut operation = AddGroupRoleOperation::new(AddGroupRoleConfig {
+        let mut operation = AddRoleOperation::new(AddRoleConfig {
             auth_context: auth_context(&actor),
             actor: actor.clone(),
             realm_id: actor.realm_id,
@@ -1864,7 +1837,7 @@ pub mod test {
         // commit a row the drained bucket can no longer publish.
         let (actor, group, auth_doc) = fixture();
         let txn_id = TxnId::generate();
-        let mut operation = AddGroupRoleOperation::new(AddGroupRoleConfig {
+        let mut operation = AddRoleOperation::new(AddRoleConfig {
             auth_context: auth_context(&actor),
             actor: actor.clone(),
             realm_id: actor.realm_id,
@@ -1882,7 +1855,7 @@ pub mod test {
         );
         assert_eq!(
             operation.finalize().unwrap_err(),
-            AddGroupRoleError::PlacementFenced
+            AddRoleError::PlacementFenced
         );
     }
 }

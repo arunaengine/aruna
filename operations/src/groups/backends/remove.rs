@@ -9,7 +9,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorageBackend, MultipartUpload,
+    BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorage, MultipartUpload,
 };
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
@@ -70,10 +70,7 @@ pub async fn remove_drained_backends(context: &DriverContext) -> Result<usize, S
 
 /// Every disabled backend nothing is currently holding, with the hold
 /// generation the later claim has to still match.
-fn idle_backends(
-    context: &DriverContext,
-    disabled: Vec<GroupStorageBackend>,
-) -> Vec<(GroupStorageBackend, u64)> {
+fn idle_backends(context: &DriverContext, disabled: Vec<GroupStorage>) -> Vec<(GroupStorage, u64)> {
     let Some(blob_handle) = context.blob_handle.as_ref() else {
         // Nothing in this process can run a blob effect, so nothing to exclude.
         return disabled.into_iter().map(|record| (record, 0)).collect();
@@ -88,7 +85,7 @@ fn idle_backends(
         .collect()
 }
 
-async fn disabled_backends(context: &DriverContext) -> Result<Vec<GroupStorageBackend>, String> {
+async fn disabled_backends(context: &DriverContext) -> Result<Vec<GroupStorage>, String> {
     let mut disabled = Vec::new();
     let mut start_after = None;
     loop {
@@ -102,7 +99,7 @@ async fn disabled_backends(context: &DriverContext) -> Result<Vec<GroupStorageBa
         )
         .await?;
         for (_, value) in values {
-            match GroupStorageBackend::from_bytes(value.as_ref()) {
+            match GroupStorage::from_bytes(value.as_ref()) {
                 Ok(record) if record.disabled => disabled.push(record),
                 Ok(_) => {}
                 Err(error) => warn!(error = %error, "Skipping undecodable storage backend record"),
@@ -278,7 +275,7 @@ impl RemoveBackendOperation {
     }
 
     fn handle_record(&mut self, event: Event) -> Effects {
-        let record = match parse_read(event, GroupStorageBackend::from_bytes) {
+        let record = match parse_read(event, GroupStorage::from_bytes) {
             Ok(Some(record)) if record.group_id == self.group_id && record.disabled => record,
             Ok(_) => return self.fail(RemoveBackendError::NotRemovable),
             Err(error) => return self.fail(error.into()),
@@ -411,7 +408,7 @@ impl Operation for RemoveBackendOperation {
 mod tests {
     use super::*;
     use aruna_core::structs::{
-        BackendLocation, CleanupStrategy, GroupBackendKind, GroupStorageBackendSecret,
+        BackendLocation, CleanupStrategy, GroupBackendKind, GroupStorageSecret,
         MultipartUploadStatus,
     };
     use aruna_core::types::Key;
@@ -430,8 +427,8 @@ mod tests {
         }
     }
 
-    fn record(backend_id: Ulid, disabled: bool) -> GroupStorageBackend {
-        GroupStorageBackend {
+    fn record(backend_id: Ulid, disabled: bool) -> GroupStorage {
+        GroupStorage {
             backend_id,
             group_id: Ulid::from_bytes([1u8; 16]),
             name: "tenant".to_string(),
@@ -470,7 +467,7 @@ mod tests {
             context,
             GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
             backend_key(backend_id),
-            GroupStorageBackendSecret {
+            GroupStorageSecret {
                 backend_id,
                 secret_config: HashMap::new(),
                 updated_at: SystemTime::UNIX_EPOCH,

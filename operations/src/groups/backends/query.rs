@@ -3,7 +3,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::GroupStorageBackend;
+use aruna_core::structs::GroupStorage;
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -12,7 +12,7 @@ use ulid::Ulid;
 const LIST_PAGE_SIZE: usize = 128;
 
 #[derive(Debug, Error, PartialEq)]
-pub enum GroupBackendQueryError {
+pub enum GroupQueryError {
     #[error(transparent)]
     Read(#[from] RecordReadError),
     #[error("query never completed")]
@@ -30,13 +30,13 @@ enum QueryState {
 /// Reads one backend record. The caller checks that the record's group matches
 /// the authorized one; the key itself carries no group.
 #[derive(Debug, PartialEq)]
-pub struct GetGroupBackendOperation {
+pub struct GetBackendOperation {
     backend_id: Ulid,
     state: QueryState,
-    output: Option<Result<Option<GroupStorageBackend>, GroupBackendQueryError>>,
+    output: Option<Result<Option<GroupStorage>, GroupQueryError>>,
 }
 
-impl GetGroupBackendOperation {
+impl GetBackendOperation {
     pub fn new(backend_id: Ulid) -> Self {
         Self {
             backend_id,
@@ -52,9 +52,9 @@ impl GetGroupBackendOperation {
     }
 }
 
-impl Operation for GetGroupBackendOperation {
-    type Output = Option<GroupStorageBackend>;
-    type Error = GroupBackendQueryError;
+impl Operation for GetBackendOperation {
+    type Output = Option<GroupStorage>;
+    type Error = GroupQueryError;
 
     fn start(&mut self) -> Effects {
         self.state = QueryState::Reading;
@@ -69,7 +69,7 @@ impl Operation for GetGroupBackendOperation {
         match self.state {
             QueryState::Init => self.start(),
             QueryState::Reading => {
-                match parse_read(event, GroupStorageBackend::from_bytes) {
+                match parse_read(event, GroupStorage::from_bytes) {
                     Ok(record) => {
                         self.state = QueryState::Finish;
                         self.output = Some(Ok(record));
@@ -90,8 +90,7 @@ impl Operation for GetGroupBackendOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(GroupBackendQueryError::Incomplete))
+        self.output.unwrap_or(Err(GroupQueryError::Incomplete))
     }
 
     fn abort(&mut self) -> Effects {
@@ -102,14 +101,14 @@ impl Operation for GetGroupBackendOperation {
 /// Lists a group's backends from the group-prefixed index, so one tenant's
 /// listing never walks another's records.
 #[derive(Debug, PartialEq)]
-pub struct ListGroupBackendsOperation {
+pub struct ListBackendsOperation {
     group_id: GroupId,
     state: QueryState,
-    found: Vec<GroupStorageBackend>,
-    output: Option<Result<Vec<GroupStorageBackend>, GroupBackendQueryError>>,
+    found: Vec<GroupStorage>,
+    output: Option<Result<Vec<GroupStorage>, GroupQueryError>>,
 }
 
-impl ListGroupBackendsOperation {
+impl ListBackendsOperation {
     pub fn new(group_id: GroupId) -> Self {
         Self {
             group_id,
@@ -136,9 +135,9 @@ impl ListGroupBackendsOperation {
     }
 }
 
-impl Operation for ListGroupBackendsOperation {
-    type Output = Vec<GroupStorageBackend>;
-    type Error = GroupBackendQueryError;
+impl Operation for ListBackendsOperation {
+    type Output = Vec<GroupStorage>;
+    type Error = GroupQueryError;
 
     fn start(&mut self) -> Effects {
         self.state = QueryState::Reading;
@@ -148,7 +147,7 @@ impl Operation for ListGroupBackendsOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             QueryState::Init => self.start(),
-            QueryState::Reading => match parse_iter(event, GroupStorageBackend::from_bytes) {
+            QueryState::Reading => match parse_iter(event, GroupStorage::from_bytes) {
                 Ok((records, next_start_after)) => {
                     self.found.extend(
                         records
@@ -177,8 +176,7 @@ impl Operation for ListGroupBackendsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(GroupBackendQueryError::Incomplete))
+        self.output.unwrap_or(Err(GroupQueryError::Incomplete))
     }
 
     fn abort(&mut self) -> Effects {
@@ -190,18 +188,18 @@ impl Operation for ListGroupBackendsOperation {
 mod pure_tests {
     use super::super::RecordReadError;
     use super::super::{index_key, index_prefix};
-    use super::{GetGroupBackendOperation, GroupBackendQueryError, ListGroupBackendsOperation};
+    use super::{GetBackendOperation, GroupQueryError, ListBackendsOperation};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::GROUP_STORAGE_BACKEND_INDEX_KEYSPACE;
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{GroupBackendKind, GroupStorageBackend};
+    use aruna_core::structs::{GroupBackendKind, GroupStorage};
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
 
-    fn record(group_id: Ulid) -> GroupStorageBackend {
-        GroupStorageBackend {
+    fn record(group_id: Ulid) -> GroupStorage {
+        GroupStorage {
             backend_id: Ulid::from_bytes([9u8; 16]),
             group_id,
             name: "tenant".to_string(),
@@ -217,7 +215,7 @@ mod pure_tests {
 
     #[test]
     fn reads_absent_record() {
-        let mut operation = GetGroupBackendOperation::new(Ulid::from_bytes([9u8; 16]));
+        let mut operation = GetBackendOperation::new(Ulid::from_bytes([9u8; 16]));
         operation.start();
 
         operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -233,7 +231,7 @@ mod pure_tests {
         // The index prefix is what keeps another tenant's records out.
         let group_id = Ulid::from_bytes([1u8; 16]);
         let mine = record(group_id);
-        let mut operation = ListGroupBackendsOperation::new(group_id);
+        let mut operation = ListBackendsOperation::new(group_id);
         let effects = operation.start();
 
         let [
@@ -270,17 +268,17 @@ mod pure_tests {
             })
         };
 
-        let mut get = GetGroupBackendOperation::new(Ulid::from_bytes([9u8; 16]));
+        let mut get = GetBackendOperation::new(Ulid::from_bytes([9u8; 16]));
         get.start();
         get.step(stray());
         get.step(stray());
         assert!(matches!(
             get.finalize(),
-            Err(GroupBackendQueryError::Read(RecordReadError::Unexpected))
+            Err(GroupQueryError::Read(RecordReadError::Unexpected))
         ));
 
         let group_id = Ulid::from_bytes([1u8; 16]);
-        let mut list = ListGroupBackendsOperation::new(group_id);
+        let mut list = ListBackendsOperation::new(group_id);
         list.start();
         list.step(Event::Storage(StorageEvent::IterResult {
             values: Vec::new(),
@@ -289,7 +287,7 @@ mod pure_tests {
         list.step(stray());
         assert!(matches!(
             list.finalize(),
-            Err(GroupBackendQueryError::Read(RecordReadError::Unexpected))
+            Err(GroupQueryError::Read(RecordReadError::Unexpected))
         ));
     }
 }
