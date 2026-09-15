@@ -2,7 +2,7 @@ use super::*;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
+    DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::structs::{
@@ -10,9 +10,7 @@ use aruna_core::structs::{
     SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries, quarantine_usage_entry,
 };
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::realm::claim_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-};
+use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_storage::storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -62,7 +60,7 @@ async fn setup() -> Fixture {
     .await
     .unwrap();
     drive(
-        ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput { actor }),
+        ClaimInitialOperation::new(ClaimInitialInput { actor }),
         context.as_ref(),
     )
     .await
@@ -92,13 +90,13 @@ async fn setup() -> Fixture {
     }
 }
 
-fn event(index: u8) -> DocumentSyncEvent {
-    DocumentSyncEvent::Delete {
+fn event(index: u8) -> DocumentEvent {
+    DocumentEvent::Delete {
         event_id: Ulid::from_bytes([index; 16]),
-        target: DocumentSyncTarget::RealmConfig {
+        target: DocumentTarget::RealmConfig {
             realm_id: RealmId([9; 32]),
         },
-        change: DocumentSyncChange {
+        change: DocumentChange {
             base: None,
             current: DocumentSyncRevision {
                 generation: 1,
@@ -106,7 +104,7 @@ fn event(index: u8) -> DocumentSyncEvent {
                 actor: NodeId::from_bytes(&[1u8; 32]).unwrap(),
                 updated_at_ms: 1,
             },
-            kind: DocumentSyncChangeKind::Delete,
+            kind: DocumentChangeKind::Delete,
             placement: PlacementRef::NIL,
         },
     }

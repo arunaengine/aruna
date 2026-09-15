@@ -1,5 +1,5 @@
 use super::*;
-use crate::tests::fixtures::routes::{
+use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state as build_state,
     test_storage, write_doc,
 };
@@ -179,10 +179,7 @@ fn filters_prefix_overlap() {
 async fn lists_stored_relationship() {
     let (_storage_dir, state, auth, relationship) = test_state().await;
     drive(
-        StoreSyncRelationshipOperation::new(
-            relationship.clone(),
-            SyncRelationshipDirection::Outgoing,
-        ),
+        StoreRelationshipOperation::new(relationship.clone(), SyncRelationshipDirection::Outgoing),
         &state.get_ctx(),
     )
     .await
@@ -229,10 +226,7 @@ async fn refuses_foreign_pause() {
     // Only the creator may pause a relationship, even with realm auth.
     let (_storage_dir, state, mut auth, relationship) = test_state().await;
     drive(
-        StoreSyncRelationshipOperation::new(
-            relationship.clone(),
-            SyncRelationshipDirection::Outgoing,
-        ),
+        StoreRelationshipOperation::new(relationship.clone(), SyncRelationshipDirection::Outgoing),
         &state.get_ctx(),
     )
     .await
@@ -242,9 +236,7 @@ async fn refuses_foreign_pause() {
     let error = update_sync(
         State(state),
         Extension(Some(auth)),
-        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-            "sync-test-token",
-        ))),
+        Extension(Some(ValidatedBearer::new_for_test("sync-test-token"))),
         Path(relationship.id.to_string()),
         Json(UpdateSyncRequest {
             reference_handling: None,
@@ -268,10 +260,7 @@ fn local_relationship(node_id: NodeId) -> SyncRelationship {
 
 async fn store_link(state: &ServerState, relationship: &SyncRelationship) {
     drive(
-        StoreSyncRelationshipOperation::new(
-            relationship.clone(),
-            SyncRelationshipDirection::Outgoing,
-        ),
+        StoreRelationshipOperation::new(relationship.clone(), SyncRelationshipDirection::Outgoing),
         &state.get_ctx(),
     )
     .await
@@ -287,9 +276,7 @@ async fn patch(
     update_sync(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-            "sync-test-token",
-        ))),
+        Extension(Some(ValidatedBearer::new_for_test("sync-test-token"))),
         Path(relationship.id.to_string()),
         Json(request),
     )
@@ -467,9 +454,7 @@ async fn accepts_unrestricted_create() {
     let (status, _) = create_sync(
         State(state),
         Extension(Some(auth)),
-        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-            "sync-test-token",
-        ))),
+        Extension(Some(ValidatedBearer::new_for_test("sync-test-token"))),
         Json(create_request(test_node(3))),
     )
     .await
@@ -511,9 +496,7 @@ async fn mirror_denies_create() {
     let error = create_sync(
         State(state),
         Extension(Some(auth)),
-        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-            "sync-test-token",
-        ))),
+        Extension(Some(ValidatedBearer::new_for_test("sync-test-token"))),
         Json(create_request(test_node(3))),
     )
     .await
@@ -527,10 +510,7 @@ async fn delete_preserve_detaches() {
     relationship.set_reference_handling(ReferenceHandling::Preserve);
     relationship.set_reference_handling(ReferenceHandling::Materialize);
     drive(
-        StoreSyncRelationshipOperation::new(
-            relationship.clone(),
-            SyncRelationshipDirection::Outgoing,
-        ),
+        StoreRelationshipOperation::new(relationship.clone(), SyncRelationshipDirection::Outgoing),
         &state.get_ctx(),
     )
     .await
@@ -549,7 +529,7 @@ async fn delete_preserve_detaches() {
 
     // The outgoing record survives as a detached serving stub ...
     let stored = drive(
-        GetSyncRelationshipOperation::new(relationship.id, SyncRelationshipDirection::Outgoing),
+        GetRelationshipOperation::new(relationship.id, SyncRelationshipDirection::Outgoing),
         &state.get_ctx(),
     )
     .await
@@ -580,10 +560,7 @@ async fn delete_preserve_detaches() {
 async fn delete_stages_repair() {
     let (_storage_dir, state, auth, relationship) = test_state().await;
     drive(
-        StoreSyncRelationshipOperation::new(
-            relationship.clone(),
-            SyncRelationshipDirection::Outgoing,
-        ),
+        StoreRelationshipOperation::new(relationship.clone(), SyncRelationshipDirection::Outgoing),
         &state.get_ctx(),
     )
     .await
@@ -623,10 +600,7 @@ async fn delete_stages_repair() {
 async fn delete_respects_policy() {
     let (_storage_dir, state, auth, relationship) = test_state().await;
     drive(
-        StoreSyncRelationshipOperation::new(
-            relationship.clone(),
-            SyncRelationshipDirection::Outgoing,
-        ),
+        StoreRelationshipOperation::new(relationship.clone(), SyncRelationshipDirection::Outgoing),
         &state.get_ctx(),
     )
     .await

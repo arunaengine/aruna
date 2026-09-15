@@ -87,7 +87,7 @@ async fn store(ctx: &DriverContext, writes: Vec<(String, Key, Value)>) {
 async fn seed_scopes(fixture: &Fixture) {
     let realm_id = fixture.realm_id;
     let config = RealmConfigDocument::new(realm_id, Vec::new(), 1);
-    let target = aruna_core::document::DocumentSyncTarget::RealmConfig { realm_id };
+    let target = aruna_core::document::DocumentTarget::RealmConfig { realm_id };
     store(
         &fixture.ctx,
         vec![(

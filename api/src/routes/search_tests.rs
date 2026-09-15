@@ -1,8 +1,7 @@
 use super::*;
 use crate::error::ServerError;
 use crate::metadata::{
-    CreateMetadataRequest, CreateMetadataScaffoldRequest, MetadataQueryMode,
-    ReplaceMetadataRoCrateRequest,
+    CreateMetadataRequest, CreateScaffoldRequest, MetadataQueryMode, ReplaceRoCrateRequest,
 };
 use crate::routes::metadata::documents::create_metadata_document;
 use crate::routes::metadata::rocrate::replace_metadata_rocrate;
@@ -259,17 +258,15 @@ async fn create_doc(fx: &Fixture, group_id: Ulid, path: &str, name: &str) -> Str
         State(fx.state.clone()),
         Extension(Some(fx.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: group_id.to_string(),
-                path: path.to_string(),
-                name: name.to_string(),
-                description: "desc".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: true,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: group_id.to_string(),
+            path: path.to_string(),
+            name: name.to_string(),
+            description: "desc".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: true,
+        })),
     )
     .await
     .unwrap();
@@ -309,7 +306,7 @@ async fn attach_file(fx: &Fixture, document_id: &str, name: &str) {
         Extension(Some(fx.auth.clone())),
         Extension(None),
         Path(document_id.to_string()),
-        Json(ReplaceMetadataRoCrateRequest {
+        Json(ReplaceRoCrateRequest {
             rocrate,
             public: Some(true),
         }),
@@ -870,9 +867,9 @@ async fn search_requires_auth() {
         State(fx.state.clone()),
         Extension(None),
         Extension(None),
-        Query(ObjectSearchParams {
+        Query(ObjectParams {
             q: "reads".to_string(),
-            mode: Some(ObjectSearchMode::Local),
+            mode: Some(ObjectMode::Local),
             ..Default::default()
         }),
     )
@@ -885,7 +882,7 @@ async fn search_requires_auth() {
 fn search_maps_partiality() {
     let healthy = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
     let failed = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
-    let result = ObjectSearchExecution {
+    let result = ObjectExecution {
         hits: vec![aruna_operations::s3::search_objects::ObjectInventoryHit {
             node_id: healthy,
             group_id: Ulid::from_bytes([23u8; 16]),
@@ -898,13 +895,11 @@ fn search_maps_partiality() {
         }],
         next_cursor: Some("opaque".to_string()),
         as_of: SystemTime::UNIX_EPOCH,
-        partitions: vec![
-            aruna_operations::metadata::api::ObjectSearchPartitionCoverage {
-                node_id: healthy,
-                observed_at: SystemTime::UNIX_EPOCH,
-                truncated: true,
-            },
-        ],
+        partitions: vec![aruna_operations::metadata::api::ObjectPartitionCoverage {
+            node_id: healthy,
+            observed_at: SystemTime::UNIX_EPOCH,
+            truncated: true,
+        }],
         fanout_stats: aruna_operations::metadata::api::MetadataFanoutStats {
             nodes_queried: 2,
             nodes_failed: 1,
@@ -915,9 +910,9 @@ fn search_maps_partiality() {
         complete: false,
     };
 
-    let response = map_search_response(result, ObjectSearchMode::DistributedBestEffort);
+    let response = map_search_response(result, ObjectMode::DistributedBestEffort);
     assert_eq!(response.hits.len(), 1);
-    assert_eq!(response.coverage.scope, ObjectSearchScope::Realm);
+    assert_eq!(response.coverage.scope, ObjectScope::Realm);
     assert!(!response.coverage.complete);
     assert!(response.coverage.truncated);
     assert_eq!(response.coverage.nodes_failed, 1);

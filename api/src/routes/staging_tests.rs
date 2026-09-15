@@ -1,6 +1,6 @@
 use super::*;
 use crate::openapi::ApiDoc;
-use crate::tests::fixtures::routes::{
+use crate::tests::routes::{
     seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
 };
 use aruna_core::UserId;
@@ -17,7 +17,7 @@ use aruna_core::structs::{
     VersionSourceBinding,
 };
 use aruna_operations::driver::DriverContext;
-use aruna_operations::replication::queue::{LiveReplicationObligationRecord, live_obligation_key};
+use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -53,7 +53,7 @@ async fn snapshot_requires_read() {
     let result = snapshot_blob(
         test.state.clone(),
         test.auth_without_source_read,
-        StageBlobTargetRequest {
+        StageTargetRequest {
             group_id: test.bucket_group_id.to_string(),
             connector_id: test.connector_id.to_string(),
             source_path: test.source_path,
@@ -73,7 +73,7 @@ async fn reference_auth_succeeds() {
     let result = reference_blob(
         test.state.clone(),
         test.auth_with_source_read,
-        StageBlobTargetRequest {
+        StageTargetRequest {
             group_id: test.bucket_group_id.to_string(),
             connector_id: test.connector_id.to_string(),
             source_path: test.source_path,
@@ -147,7 +147,7 @@ async fn references_list_bindings() {
         .unwrap();
     assert_eq!(external.size, 64);
     assert!(external.referenced);
-    assert_eq!(external.kind, Some(ApiSourceConnectorKind::Http));
+    assert_eq!(external.kind, Some(ApiConnectorKind::Http));
     assert_eq!(external.source_path.as_deref(), Some("remote/file.txt"));
     let connector_id = test.connector_id.to_string();
     assert_eq!(
@@ -163,7 +163,7 @@ async fn references_list_bindings() {
         .unwrap();
     assert_eq!(native.size, 128);
     assert!(native.referenced);
-    assert_eq!(native.kind, Some(ApiSourceConnectorKind::ArunaNative));
+    assert_eq!(native.kind, Some(ApiConnectorKind::ArunaNative));
     assert_eq!(native.source_path.as_deref(), Some("source-bucket/native"));
     assert_eq!(native.connector_id, None);
     let origin_node_id = origin.to_string();
@@ -204,7 +204,7 @@ async fn queue_failure_repairable() {
     )
     .await;
 
-    let obligation = LiveReplicationObligationRecord::new(
+    let obligation = LiveObligationRecord::new(
         test.state.get_node_id(),
         test.auth_with_source_read.clone(),
         test.bucket.clone(),

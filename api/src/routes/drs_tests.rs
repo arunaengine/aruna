@@ -1,12 +1,12 @@
 use super::{
-    DrsBulkObjectsRequestBody, GetObjectError, MAX_BULK_OBJECT_IDS, RequestedObjectId,
-    ResolveOutcome, ResolvedObject, W3ID_DATA_PREFIX, build_object_response, download_error,
-    drs_denied_error, encode_component, get_authorizations, get_object, parse_object_id,
-    post_objects, resolve_object, routed_deadline,
+    DrsBulkBody, GetObjectError, MAX_BULK_OBJECT_IDS, RequestedObjectId, ResolveOutcome,
+    ResolvedObject, W3ID_DATA_PREFIX, build_object_response, download_error, drs_denied_error,
+    encode_component, get_authorizations, get_object, parse_object_id, post_objects,
+    resolve_object, routed_deadline,
 };
 use crate::openapi::ApiDoc;
 use crate::server_state::ServerState;
-use crate::tests::fixtures::routes::{
+use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state as build_state,
     test_storage,
 };
@@ -209,7 +209,7 @@ fn anonymous_denial_concealed() {
 }
 
 #[test]
-fn parses_canonical_w3id() {
+fn parses_w3id() {
     let expected_hash = [
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
         0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
@@ -411,7 +411,7 @@ async fn caps_bulk_ids() {
         Extension(None),
         ConnectInfo("127.0.0.1:1".parse().unwrap()),
         HeaderMap::new(),
-        axum::Json(DrsBulkObjectsRequestBody { object_ids }),
+        axum::Json(DrsBulkBody { object_ids }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
