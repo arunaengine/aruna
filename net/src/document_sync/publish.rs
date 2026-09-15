@@ -5,16 +5,16 @@ impl DocumentSyncService {
         &self,
         documents: Vec<DocumentSyncPublish>,
         peers: Vec<NodeId>,
-    ) -> DocumentSyncNetEvent {
+    ) -> DocumentNetEvent {
         let targets = documents
             .iter()
             .map(|document| document.target().clone())
             .collect::<Vec<_>>();
         match self.publish_events(documents, peers).await {
             Ok(outcome) if outcome.retry_indices.is_empty() => {
-                DocumentSyncNetEvent::DocumentsPublished { targets }
+                DocumentNetEvent::DocumentsPublished { targets }
             }
-            Ok(outcome) if outcome.published_indices.is_empty() => DocumentSyncNetEvent::Error {
+            Ok(outcome) if outcome.published_indices.is_empty() => DocumentNetEvent::Error {
                 target: outcome
                     .retry_indices
                     .first()
@@ -23,29 +23,29 @@ impl DocumentSyncService {
                     .retry_error
                     .unwrap_or_else(|| "Document sync topic not ready".to_string()),
             },
-            Ok(outcome) => DocumentSyncNetEvent::DocumentsPartiallyPublished {
+            Ok(outcome) => DocumentNetEvent::DocumentsPartiallyPublished {
                 published_indices: outcome.published_indices,
                 retry_indices: outcome.retry_indices,
                 error: outcome
                     .retry_error
                     .unwrap_or_else(|| "Document sync topic not ready".to_string()),
             },
-            Err(error) => DocumentSyncNetEvent::Error {
+            Err(error) => DocumentNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             },
         }
     }
 
-    pub async fn reconcile_documents_event(&self) -> DocumentSyncNetEvent {
+    pub async fn reconcile_documents_event(&self) -> DocumentNetEvent {
         match self.reconcile_documents().await {
-            Ok(result) => DocumentSyncNetEvent::DocumentsReconciled {
+            Ok(result) => DocumentNetEvent::DocumentsReconciled {
                 applied: result.applied(),
                 targets: result.targets,
                 metadata_create_events: result.metadata_create_events,
                 metadata_graph_tombstones: result.metadata_graph_tombstones,
             },
-            Err(error) => DocumentSyncNetEvent::Error {
+            Err(error) => DocumentNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             },
@@ -56,13 +56,13 @@ impl DocumentSyncService {
         &self,
         topic_id: ::irokle::TopicId,
         peers: Vec<NodeId>,
-    ) -> DocumentSyncNetEvent {
+    ) -> DocumentNetEvent {
         match self.has_topic(topic_id) {
             Ok(true) => {
                 let selection = match self.sync_peer_selection(&peers, &topic_id) {
                     Ok(selection) => selection,
                     Err(error) => {
-                        return DocumentSyncNetEvent::Error {
+                        return DocumentNetEvent::Error {
                             target: None,
                             error: error.to_string(),
                         };
@@ -70,7 +70,7 @@ impl DocumentSyncService {
                 };
                 self.log_peer_selection(topic_id, &selection);
                 if let Err(error) = self.allow_sync_peers(&selection.peers) {
-                    return DocumentSyncNetEvent::Error {
+                    return DocumentNetEvent::Error {
                         target: None,
                         error: error.to_string(),
                     };
@@ -78,19 +78,19 @@ impl DocumentSyncService {
                 let round = selection.round;
                 let result = self.sync_topic(topic_id, selection).await;
                 if let Err(error) = self.advance_cursor(topic_id, round) {
-                    return DocumentSyncNetEvent::Error {
+                    return DocumentNetEvent::Error {
                         target: None,
                         error: error.to_string(),
                     };
                 }
                 if let Err(error) = result {
                     if let Err(persist_error) = self.flush_database() {
-                        return DocumentSyncNetEvent::Error {
+                        return DocumentNetEvent::Error {
                             target: None,
                             error: persist_error.to_string(),
                         };
                     }
-                    return DocumentSyncNetEvent::Error {
+                    return DocumentNetEvent::Error {
                         target: None,
                         error: error.to_string(),
                     };
@@ -101,33 +101,33 @@ impl DocumentSyncService {
                     if let Err(persist_error) = self.flush_database() {
                         warn!(%persist_error, %topic_id, "Failed to persist document sync bootstrap cleanup");
                     }
-                    return DocumentSyncNetEvent::Error {
+                    return DocumentNetEvent::Error {
                         target: None,
                         error: error.to_string(),
                     };
                 }
             }
             Err(error) => {
-                return DocumentSyncNetEvent::Error {
+                return DocumentNetEvent::Error {
                     target: None,
                     error: error.to_string(),
                 };
             }
         }
         if let Err(error) = self.flush_database() {
-            return DocumentSyncNetEvent::Error {
+            return DocumentNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             };
         }
         match self.reconcile_document_topics([topic_id]).await {
-            Ok(result) => DocumentSyncNetEvent::DocumentsReconciled {
+            Ok(result) => DocumentNetEvent::DocumentsReconciled {
                 applied: result.applied(),
                 targets: result.targets,
                 metadata_create_events: result.metadata_create_events,
                 metadata_graph_tombstones: result.metadata_graph_tombstones,
             },
-            Err(error) => DocumentSyncNetEvent::Error {
+            Err(error) => DocumentNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             },
@@ -138,7 +138,7 @@ impl DocumentSyncService {
         &self,
         topic_ids: Vec<::irokle::TopicId>,
         peers: Vec<NodeId>,
-    ) -> DocumentSyncNetEvent {
+    ) -> DocumentNetEvent {
         let sync_started = Instant::now();
         let target_count = topic_ids.len();
 
@@ -163,7 +163,7 @@ impl DocumentSyncService {
                     }
                 }
                 Err(error) => {
-                    return DocumentSyncNetEvent::Error {
+                    return DocumentNetEvent::Error {
                         target: None,
                         error: error.to_string(),
                     };
@@ -172,7 +172,7 @@ impl DocumentSyncService {
         }
 
         if bootstrap_cursor_dirty && let Err(error) = self.flush_database() {
-            return DocumentSyncNetEvent::Error {
+            return DocumentNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             };
@@ -182,7 +182,7 @@ impl DocumentSyncService {
         let topic_ids = topic_ids_out;
         let peer_sync_started = Instant::now();
         if let Err(error) = self.sync_topics(topic_ids.clone(), &peers).await {
-            return DocumentSyncNetEvent::Error {
+            return DocumentNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             };
@@ -191,7 +191,7 @@ impl DocumentSyncService {
 
         let flush_started = Instant::now();
         if let Err(error) = self.flush_database() {
-            return DocumentSyncNetEvent::Error {
+            return DocumentNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             };
@@ -211,14 +211,14 @@ impl DocumentSyncService {
                     total_ms = duration_ms(sync_started.elapsed()),
                     "Document sync batch summary"
                 );
-                DocumentSyncNetEvent::DocumentsReconciled {
+                DocumentNetEvent::DocumentsReconciled {
                     applied: result.applied(),
                     targets: result.targets,
                     metadata_create_events: result.metadata_create_events,
                     metadata_graph_tombstones: result.metadata_graph_tombstones,
                 }
             }
-            Err(error) => DocumentSyncNetEvent::Error {
+            Err(error) => DocumentNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             },
@@ -267,7 +267,7 @@ impl DocumentSyncService {
                     bytes,
                     change,
                     ..
-                } => DocumentSyncEvent::Upsert {
+                } => DocumentEvent::Upsert {
                     event_id,
                     target,
                     bytes,
@@ -278,7 +278,7 @@ impl DocumentSyncService {
                     target,
                     change,
                     ..
-                } => DocumentSyncEvent::Delete {
+                } => DocumentEvent::Delete {
                     event_id,
                     target,
                     change,
@@ -309,7 +309,7 @@ impl DocumentSyncService {
                             }
                         },
                     };
-                    DocumentSyncEvent::AdminOperation {
+                    DocumentEvent::AdminOperation {
                         target,
                         event,
                         placement,
@@ -430,7 +430,7 @@ impl DocumentSyncService {
             // Fast path for brand-new topics: genesis and first event in one
             // transaction; a lost genesis race falls back to the two-step flow.
             let genesis = TopicGenesis {
-                event_type_id: DocumentSyncEvent::TYPE_ID.to_string(),
+                event_type_id: DocumentEvent::TYPE_ID.to_string(),
                 initial_peers: sync_peers.clone(),
                 replication_policy: ReplicationPolicy::all(),
             };
@@ -472,7 +472,7 @@ impl DocumentSyncService {
         let oplog = Oplog::with_storage(self.node.storage().clone());
         let actor_id = ::irokle::actor_id_for(topic_id, self.node.peer_id());
         let envelope = EventEnvelope {
-            type_id: DocumentSyncEvent::TYPE_ID.to_string(),
+            type_id: DocumentEvent::TYPE_ID.to_string(),
             payload: payload.into(),
         };
         let op = self.publish_event_op(
@@ -553,11 +553,11 @@ impl DocumentSyncService {
                 .topic_state(&topic_id)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?
             {
-                if state.event_type_id != DocumentSyncEvent::TYPE_ID {
+                if state.event_type_id != DocumentEvent::TYPE_ID {
                     return Err(NetError::Bootstrap(format!(
                         "Document sync topic {topic_id} has event type {}, expected {}",
                         state.event_type_id,
-                        DocumentSyncEvent::TYPE_ID
+                        DocumentEvent::TYPE_ID
                     )));
                 }
                 let missing_peers = self
@@ -591,7 +591,7 @@ impl DocumentSyncService {
 
             let actor_id = ::irokle::actor_id_for(topic_id, self.node.peer_id());
             let genesis = TopicGenesis {
-                event_type_id: DocumentSyncEvent::TYPE_ID.to_string(),
+                event_type_id: DocumentEvent::TYPE_ID.to_string(),
                 initial_peers: self.eligible_peers(peers.iter().copied(), Some(topic_id)),
                 replication_policy: ReplicationPolicy::all(),
             };

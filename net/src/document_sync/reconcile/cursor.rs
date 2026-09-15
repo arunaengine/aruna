@@ -301,7 +301,7 @@ pub(in crate::document_sync) fn process_summary_responses(
             SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {
                 responded_topics.insert(summary.topic_id);
                 if let Some(event_type_id) = summary.event_type_id.as_deref()
-                    && event_type_id != DocumentSyncEvent::TYPE_ID
+                    && event_type_id != DocumentEvent::TYPE_ID
                 {
                     warn!(
                         %peer,

@@ -1,7 +1,7 @@
 use super::*;
 
 pub(in crate::document_sync) fn target_write_entry(
-    target: DocumentSyncTarget,
+    target: DocumentTarget,
     value: Value,
 ) -> (String, ByteView, Value) {
     (
@@ -13,8 +13,8 @@ pub(in crate::document_sync) fn target_write_entry(
 
 pub(in crate::document_sync) async fn apply_create_event(
     storage: &StorageHandle,
-    event: &MetadataCreateEventRecord,
-    target: DocumentSyncTarget,
+    event: &MetadataEventRecord,
+    target: DocumentTarget,
     bytes: Vec<u8>,
 ) -> Result<()> {
     for _ in 0..2 {
@@ -61,7 +61,7 @@ pub(in crate::document_sync) async fn apply_create_event(
 
 pub(in crate::document_sync) fn overlay_group_state(
     group: &mut Group,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
 ) {
     if !reducer_state
         .conflicts
@@ -86,7 +86,7 @@ pub(in crate::document_sync) fn overlay_group_state(
     overlay_group_roles(group, reducer_state);
 }
 
-fn overlay_group_roles(group: &mut Group, reducer_state: &AdminDocumentReducerState) {
+fn overlay_group_roles(group: &mut Group, reducer_state: &AdminDocumentState) {
     for path in reducer_state.conflicts.keys() {
         if let Some(role_id) = parse_group_role(path) {
             group.roles.remove(&role_id);
@@ -104,7 +104,7 @@ fn overlay_group_roles(group: &mut Group, reducer_state: &AdminDocumentReducerSt
     }
 }
 
-fn group_metadata_conflicted(reducer_state: &AdminDocumentReducerState) -> bool {
+fn group_metadata_conflicted(reducer_state: &AdminDocumentState) -> bool {
     reducer_state
         .conflicts
         .contains_key(GROUP_DISPLAY_NAME_PATH)
@@ -114,7 +114,7 @@ fn group_metadata_conflicted(reducer_state: &AdminDocumentReducerState) -> bool 
 
 pub(in crate::document_sync) fn materialized_group(
     group_id: Ulid,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
 ) -> Option<Group> {
     if group_metadata_conflicted(reducer_state) {
         return None;
@@ -134,7 +134,7 @@ pub(in crate::document_sync) fn materialized_group(
 
 pub(in crate::document_sync) fn overlay_group_role(
     auth_doc: &mut GroupAuthorizationDocument,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
     role_id: RoleId,
 ) {
     overlay_group_assignments(auth_doc, reducer_state, Some(role_id));
@@ -142,7 +142,7 @@ pub(in crate::document_sync) fn overlay_group_role(
 
 fn overlay_group_assignments(
     auth_doc: &mut GroupAuthorizationDocument,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
     only_role_id: Option<RoleId>,
 ) {
     for path in reducer_state.conflicts.keys() {
@@ -181,7 +181,7 @@ fn overlay_group_assignments(
 
 pub(in crate::document_sync) fn overlay_realm_role(
     auth_doc: &mut RealmAuthorizationDocument,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
     role_id: RoleId,
 ) {
     overlay_realm_assignments(auth_doc, reducer_state, Some(role_id));
@@ -189,7 +189,7 @@ pub(in crate::document_sync) fn overlay_realm_role(
 
 fn overlay_realm_assignments(
     auth_doc: &mut RealmAuthorizationDocument,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
     only_role_id: Option<RoleId>,
 ) {
     for path in reducer_state.conflicts.keys() {
@@ -228,7 +228,7 @@ fn overlay_realm_assignments(
 
 pub(in crate::document_sync) fn overlay_realm_config(
     config: &mut RealmConfigDocument,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
     now: u64,
     now_ms: u64,
     revocation_index: Option<&RevocationIndex>,
@@ -335,7 +335,7 @@ pub(in crate::document_sync) fn overlay_realm_config(
 
 pub(in crate::document_sync) fn materialized_realm_config(
     realm_id: RealmId,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
     now: u64,
     now_ms: u64,
     revocation_index: Option<&RevocationIndex>,
@@ -380,7 +380,7 @@ pub(in crate::document_sync) fn materialized_realm_config(
 pub(in crate::document_sync) fn needs_revocation_index(
     is_revocation: bool,
     config_present: bool,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
     now: u64,
 ) -> bool {
     is_revocation || !config_present || reducer_state.revocation_compaction_due(now)
@@ -398,22 +398,20 @@ fn remove_oidc_provider(config: &mut RealmConfigDocument, provider_id: &str) {
 }
 
 pub(in crate::document_sync) fn reduced_admin_target(
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
 ) -> Option<AdminDocumentTarget> {
     match target {
-        DocumentSyncTarget::User { user_id } => {
-            Some(AdminDocumentTarget::User { user_id: *user_id })
-        }
-        DocumentSyncTarget::Group { group_id } => Some(AdminDocumentTarget::Group {
+        DocumentTarget::User { user_id } => Some(AdminDocumentTarget::User { user_id: *user_id }),
+        DocumentTarget::Group { group_id } => Some(AdminDocumentTarget::Group {
             group_id: *group_id,
         }),
-        DocumentSyncTarget::GroupAuthorization { group_id } => Some(AdminDocumentTarget::Group {
+        DocumentTarget::GroupAuthorization { group_id } => Some(AdminDocumentTarget::Group {
             group_id: *group_id,
         }),
-        DocumentSyncTarget::RealmAuthorization { realm_id } => Some(AdminDocumentTarget::Realm {
+        DocumentTarget::RealmAuthorization { realm_id } => Some(AdminDocumentTarget::Realm {
             realm_id: *realm_id,
         }),
-        DocumentSyncTarget::RealmConfig { realm_id } => Some(AdminDocumentTarget::RealmConfig {
+        DocumentTarget::RealmConfig { realm_id } => Some(AdminDocumentTarget::RealmConfig {
             realm_id: *realm_id,
         }),
         _ => None,

@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ::irokle::{Event as _, Storage as _};
-use aruna_core::document::{DocumentSyncEvent, DocumentSyncReconcileResult, DocumentSyncTarget};
+use aruna_core::document::{DocumentEvent, DocumentReconcileResult, DocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{
     DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, METADATA_CREATE_ACCEPTANCE_KEYSPACE,
 };
-use aruna_core::metadata::MetadataCreateEventRecord;
+use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::storage_entries::{
     create_acceptance_entry, create_acceptance_key, create_projection_entries,
     shard_manifest_entry, sync_revision_entry,
@@ -21,9 +21,9 @@ use crate::document_sync::storage::{
     replace_batch_in, start_storage_transaction, transaction_read,
 };
 use crate::document_sync::{
-    DOCUMENT_SYNC_FRAME_LEN_LIMIT, DeferredTopicRegistrationOutcome, DocumentSyncDependency,
-    DocumentSyncService, MetadataPlacementFence, MetadataPlacementOutcome,
-    PendingMetadataCreateApply, SyncRejection,
+    DOCUMENT_SYNC_FRAME_LEN_LIMIT, DeferredRegistrationOutcome, DocumentSyncDependency,
+    DocumentSyncService, MetadataPlacementFence, MetadataPlacementOutcome, PendingCreateApply,
+    SyncRejection,
 };
 use crate::error::{NetError, Result};
 
@@ -44,7 +44,7 @@ struct ReconcileBatch {
     cursor_key: ByteView,
     cursor: ::irokle::ActorClock,
     rejections: Vec<SyncRejection>,
-    events: Vec<(DocumentSyncEvent, ::irokle::ActorId, u64)>,
+    events: Vec<(DocumentEvent, ::irokle::ActorId, u64)>,
 }
 
 /// Topics still to reconcile plus the persisted dependency registry that gates
@@ -63,13 +63,13 @@ impl DocumentSyncService {
     pub(in crate::document_sync) async fn reconcile_document_topics(
         &self,
         topic_ids: impl IntoIterator<Item = ::irokle::TopicId>,
-    ) -> Result<DocumentSyncReconcileResult> {
+    ) -> Result<DocumentReconcileResult> {
         let _reconcile_guard = self.reconcile_lock.lock().await;
         let mut work = self.pending_reconcile_work(topic_ids).await?;
         let mut applied_targets = Vec::new();
         let mut metadata_create_events = Vec::new();
         let mut metadata_graph_tombstones = Vec::new();
-        let mut pending_metadata_creates: Vec<PendingMetadataCreateApply> = Vec::new();
+        let mut pending_metadata_creates: Vec<PendingCreateApply> = Vec::new();
         let mut deferred_cursor_writes: Vec<(::irokle::TopicId, (String, ByteView, Value))> =
             Vec::new();
         let mut deferred_rejections: Vec<SyncRejection> = Vec::new();
@@ -93,7 +93,7 @@ impl DocumentSyncService {
                 for dependency in outcome.cross_topic {
                     if matches!(
                         register_deferred_topic(&mut work.deferred_topics, dependency, topic_id),
-                        DeferredTopicRegistrationOutcome::CapacityExceeded
+                        DeferredRegistrationOutcome::CapacityExceeded
                     ) {
                         warn!(
                             %topic_id,
@@ -180,7 +180,7 @@ impl DocumentSyncService {
             )
             .await?;
         }
-        Ok(DocumentSyncReconcileResult {
+        Ok(DocumentReconcileResult {
             targets: applied_targets,
             metadata_create_events,
             metadata_graph_tombstones,
@@ -241,7 +241,7 @@ impl DocumentSyncService {
         else {
             return Ok(None);
         };
-        if topic.event_type_id != DocumentSyncEvent::TYPE_ID {
+        if topic.event_type_id != DocumentEvent::TYPE_ID {
             return Ok(None);
         }
         // The cursor self-heals here: a lost or failed eviction callback cannot
@@ -331,12 +331,12 @@ impl DocumentSyncService {
 
     async fn apply_create_batch(
         &self,
-        pending: Vec<PendingMetadataCreateApply>,
+        pending: Vec<PendingCreateApply>,
         cursor_writes: Vec<(::irokle::TopicId, (String, ByteView, Value))>,
         mut rejections: Vec<SyncRejection>,
         deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<::irokle::TopicId>>,
-        applied_targets: &mut Vec<DocumentSyncTarget>,
-        metadata_create_events: &mut Vec<MetadataCreateEventRecord>,
+        applied_targets: &mut Vec<DocumentTarget>,
+        metadata_create_events: &mut Vec<MetadataEventRecord>,
     ) -> Result<()> {
         if pending.is_empty() && cursor_writes.is_empty() && rejections.is_empty() {
             return Ok(());
@@ -388,7 +388,7 @@ impl DocumentSyncService {
         let mut writes = Vec::with_capacity(candidates.len() * 3 + cursor_writes.len());
         let mut accepted = Vec::with_capacity(candidates.len());
         let mut accepted_candidates = Vec::with_capacity(candidates.len());
-        let mut create_acceptances: BTreeMap<Ulid, MetadataCreateEventRecord> = BTreeMap::new();
+        let mut create_acceptances: BTreeMap<Ulid, MetadataEventRecord> = BTreeMap::new();
         let mut deferred_cursor_topics = BTreeSet::new();
         for (apply, entries) in candidates {
             let fenced = match create_fence_txn(&self.storage, &apply.record, txn_id).await {
@@ -434,7 +434,7 @@ impl DocumentSyncService {
                     deferred_cursor_topics.insert(apply.identity.topic);
                     if matches!(
                         register_deferred_topic(deferred_topics, dependency, apply.identity.topic),
-                        DeferredTopicRegistrationOutcome::CapacityExceeded
+                        DeferredRegistrationOutcome::CapacityExceeded
                     ) {
                         warn!(
                             topic_id = %apply.identity.topic,
@@ -490,7 +490,7 @@ impl DocumentSyncService {
                 };
                 let event = match value
                     .as_deref()
-                    .map(postcard::from_bytes::<MetadataCreateEventRecord>)
+                    .map(postcard::from_bytes::<MetadataEventRecord>)
                     .transpose()
                 {
                     Ok(event) => event,

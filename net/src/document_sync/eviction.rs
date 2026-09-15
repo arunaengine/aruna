@@ -12,7 +12,7 @@ impl DocumentSyncService {
     /// Decodes a genesis tie-break eviction into outbox events to re-emit with
     /// `allow_genesis: false`, preserving ids where the format can. Control ops
     /// and whole-document admin payloads carry nothing a peer can accept.
-    pub fn decode_eviction(&self, eviction: TopicEviction) -> Vec<DocumentSyncEvictedDocument> {
+    pub fn decode_eviction(&self, eviction: TopicEviction) -> Vec<DocumentEvictedDocument> {
         self.clear_cursor(eviction.topic_id);
         if let Err(error) = self.flush_database() {
             warn!(%error, topic_id = %eviction.topic_id, "Failed to persist document sync fan-out cursor reset");
@@ -23,7 +23,7 @@ impl DocumentSyncService {
                 // Non-event control op (e.g. AddPeer/RemovePeer): nothing to re-emit.
                 continue;
             };
-            let event = match envelope.decode_event::<DocumentSyncEvent>() {
+            let event = match envelope.decode_event::<DocumentEvent>() {
                 Ok(event) => event,
                 Err(error) => {
                     warn!(
@@ -36,16 +36,16 @@ impl DocumentSyncService {
                 }
             };
             match event {
-                DocumentSyncEvent::AdminOperation {
+                DocumentEvent::AdminOperation {
                     target,
                     event,
                     placement,
                     origin_signature,
                 } => {
-                    documents.push(DocumentSyncEvictedDocument {
+                    documents.push(DocumentEvictedDocument {
                         event_id: event.event_id,
                         target,
-                        event: DocumentSyncOutboxEvent::AdminOperation {
+                        event: DocumentOutboxEvent::AdminOperation {
                             event,
                             origin_signature: Some(origin_signature),
                         },
@@ -53,7 +53,7 @@ impl DocumentSyncService {
                         allow_genesis: false,
                     });
                 }
-                DocumentSyncEvent::Upsert {
+                DocumentEvent::Upsert {
                     event_id,
                     target,
                     bytes,
@@ -67,15 +67,15 @@ impl DocumentSyncService {
                         );
                         continue;
                     }
-                    documents.push(DocumentSyncEvictedDocument {
+                    documents.push(DocumentEvictedDocument {
                         event_id,
                         target,
                         placement: change.placement,
-                        event: DocumentSyncOutboxEvent::Upsert { bytes, change },
+                        event: DocumentOutboxEvent::Upsert { bytes, change },
                         allow_genesis: false,
                     });
                 }
-                DocumentSyncEvent::Delete {
+                DocumentEvent::Delete {
                     event_id,
                     target,
                     change,
@@ -88,11 +88,11 @@ impl DocumentSyncService {
                         );
                         continue;
                     }
-                    documents.push(DocumentSyncEvictedDocument {
+                    documents.push(DocumentEvictedDocument {
                         event_id,
                         target,
                         placement: change.placement,
-                        event: DocumentSyncOutboxEvent::Delete { change },
+                        event: DocumentOutboxEvent::Delete { change },
                         allow_genesis: false,
                     });
                 }
