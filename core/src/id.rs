@@ -6,13 +6,13 @@ use ulid::Ulid;
 
 pub type NodeId = iroh::PublicKey;
 
-pub const SHORT_DISPLAY_ID_CHARS: usize = 8;
+pub const DISPLAY_ID_CHARS: usize = 8;
 pub const HEX_PREFIX_BYTES: usize = 8;
 
 pub fn short_display_id(id: impl fmt::Display) -> String {
     id.to_string()
         .chars()
-        .take(SHORT_DISPLAY_ID_CHARS)
+        .take(DISPLAY_ID_CHARS)
         .collect()
 }
 

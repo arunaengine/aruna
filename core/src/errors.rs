@@ -22,7 +22,7 @@ pub enum AuthorizationError {
     #[error("No group found")]
     GroupNotFound,
     #[error("Authorization document not found")]
-    AuthDocNotFound,
+    DocNotFound,
     #[error("Creating Group did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -240,9 +240,9 @@ pub enum ConversionError {
     #[error(transparent)]
     FromSliceError(#[from] TryFromSliceError),
     #[error(transparent)]
-    PublicKeyConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
+    PublicConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
     #[error(transparent)]
-    PrivateKeyConversionError(#[from] ed25519_dalek::pkcs8::Error),
+    PrivateConversionError(#[from] ed25519_dalek::pkcs8::Error),
     #[error("Invalid string `{0}` for Operation")]
     InvalidOperationConversion(String),
     #[error("RO-Crate conversion error: {0}")]
@@ -252,7 +252,7 @@ pub enum ConversionError {
     #[error(transparent)]
     AdvertisementError(#[from] crate::compute::AdvertisementError),
     #[error("policy refs must be sorted and deduplicated")]
-    NonCanonicalPolicyRefs,
+    NonCanonicalRefs,
     /// A monotonic head generation must never wrap: a wrapped pointer would
     /// compare equal to an older one and silently win the convergent order.
     #[error("object head generation is exhausted")]
@@ -283,10 +283,10 @@ impl PartialEq for ConversionError {
             (Self::FromSliceError(left), Self::FromSliceError(right)) => {
                 left.to_string() == right.to_string()
             }
-            (Self::PublicKeyConversionError(left), Self::PublicKeyConversionError(right)) => {
+            (Self::PublicConversionError(left), Self::PublicConversionError(right)) => {
                 left == right
             }
-            (Self::PrivateKeyConversionError(left), Self::PrivateKeyConversionError(right)) => {
+            (Self::PrivateConversionError(left), Self::PrivateConversionError(right)) => {
                 left == right
             }
             (Self::InvalidOperationConversion(left), Self::InvalidOperationConversion(right)) => {
@@ -295,7 +295,7 @@ impl PartialEq for ConversionError {
             (Self::RoCrateError(left), Self::RoCrateError(right)) => left == right,
             (Self::PlacementPolicyError(left), Self::PlacementPolicyError(right)) => left == right,
             (Self::AdvertisementError(left), Self::AdvertisementError(right)) => left == right,
-            (Self::NonCanonicalPolicyRefs, Self::NonCanonicalPolicyRefs) => true,
+            (Self::NonCanonicalRefs, Self::NonCanonicalRefs) => true,
             (Self::HeadGenerationExhausted, Self::HeadGenerationExhausted) => true,
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }

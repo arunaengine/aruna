@@ -1,6 +1,6 @@
 use crate::audit::AuditPageBatch;
 use crate::effects::{
-    FetchCursor, FrameBoundsError, JobRecordFrame, MAX_JOB_RECORD_PAGE, MAX_JOB_RECORD_PAGE_BYTES,
+    FetchCursor, FrameBoundsError, JobRecordFrame, MAX_RECORD_PAGE, JOB_PAGE_BYTES,
     ReceiptFrame, encoded_len,
 };
 use crate::errors::{BlobError, SourceResolutionError, StagingSourceError};
@@ -8,7 +8,7 @@ use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
 use crate::structs::storage::routing::GroupRoutingInputs;
-use crate::structs::placement::placement_policy::{MAX_POLICY_REF_INPUT, PlacementDecision};
+use crate::structs::placement::placement_policy::{MAX_REF_INPUT, PlacementDecision};
 use crate::structs::placement::policy_document::{PlacementPolicyDocument, PolicyPublication};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
@@ -58,7 +58,7 @@ pub enum SubOperationEvent {
     SourceConnectorResolved {
         result: Box<Result<ResolvedSourceConnector, SourceResolutionError>>,
     },
-    VersionSourceAccessResolved {
+    VersionAccessResolved {
         result: Result<ResolvedSourceAccess, SourceResolutionError>,
     },
     ReplicationItemResult {
@@ -287,10 +287,10 @@ pub struct JobRecordPage(Vec<JobRecordFrame>);
 
 impl JobRecordPage {
     pub fn new(records: Vec<JobRecordFrame>) -> Result<Self, FrameBoundsError> {
-        if records.len() > MAX_JOB_RECORD_PAGE {
+        if records.len() > MAX_RECORD_PAGE {
             return Err(FrameBoundsError::RecordCount);
         }
-        if encoded_len(&records)? > MAX_JOB_RECORD_PAGE_BYTES {
+        if encoded_len(&records)? > JOB_PAGE_BYTES {
             return Err(FrameBoundsError::PageBytes);
         }
         Ok(Self(records))
@@ -299,7 +299,7 @@ impl JobRecordPage {
     /// Rejects an oversized frame before it is decoded, so a peer cannot force
     /// the allocation of a page it is not allowed to send.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, FrameBoundsError> {
-        if bytes.len() > MAX_JOB_RECORD_PAGE_BYTES {
+        if bytes.len() > JOB_PAGE_BYTES {
             return Err(FrameBoundsError::PageBytes);
         }
         Self::new(postcard::from_bytes(bytes)?)
@@ -403,7 +403,7 @@ impl DeclinedPolicy {
             | PlacementDecision::Denied { policy_ids } => policy_ids.len(),
             PlacementDecision::InvalidInput { .. } => 0,
         };
-        match listed <= MAX_POLICY_REF_INPUT {
+        match listed <= MAX_REF_INPUT {
             true => Ok(Self(decision)),
             false => Err(FrameBoundsError::RecordCount),
         }
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn rejects_wide_page() {
-        let records = vec![frame(1, 8); MAX_JOB_RECORD_PAGE + 1];
+        let records = vec![frame(1, 8); MAX_RECORD_PAGE + 1];
         assert_eq!(
             JobRecordPage::new(records.clone()),
             Err(FrameBoundsError::RecordCount)
@@ -533,7 +533,7 @@ mod tests {
             JobRecordPage::new(records),
             Err(FrameBoundsError::PageBytes)
         );
-        let frame = vec![0u8; MAX_JOB_RECORD_PAGE_BYTES + 1];
+        let frame = vec![0u8; JOB_PAGE_BYTES + 1];
         assert_eq!(
             JobRecordPage::from_bytes(&frame),
             Err(FrameBoundsError::PageBytes)
