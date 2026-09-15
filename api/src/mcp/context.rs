@@ -3,13 +3,13 @@ use super::{
     server_error, tool_extras,
 };
 use aruna_core::structs::{AuthContext, Group, Permission, Role};
+use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
-use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::list_groups::ListGroupOperation;
-use aruna_operations::metadata::stats::count_group_documents_by_purpose;
-use aruna_operations::read_realm_authorization::ReadRealmAuthorizationOperation;
-use aruna_operations::read_user_document::{ReadUserDocumentError, ReadUserDocumentOperation};
-use aruna_operations::request_policy::PolicyRequestExtras;
+use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
+use aruna_operations::groups::list_groups::ListGroupOperation;
+use aruna_operations::metadata::stats::count_group_purpose;
+use aruna_operations::realm::read_authorization::ReadAuthorizationOperation;
+use aruna_operations::users::read_document::{ReadUserError, ReadUserOperation};
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
@@ -69,10 +69,8 @@ pub struct DatasetCountsOutput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct GroupIdInput {
-    /// The group's bare 26-character ULID, for example
-    /// `01JZ8Y6T0K4W7M2N9Q5R3S8V1X`. Call `list_groups` or `whoami` for the ids
-    /// the caller belongs to, or read `group_id` from a `search` hit. This is
-    /// not the `<ulid>@<realm>` form a user id uses.
+    /// Bare group ULID. Use `list_groups`, `whoami`, or a search result to find it.
+    /// This is distinct from a user's `<ulid>@<realm>` identifier.
     pub group_id: String,
 }
 
@@ -102,15 +100,12 @@ impl McpServer {
     ) -> Result<Json<WhoamiOutput>, CallToolResult> {
         let auth = request_auth(&parts)?;
         authorize_read(self, &auth, empty_extras("whoami")).await?;
-        let user = drive(
-            ReadUserDocumentOperation::new(auth.user_id),
-            &self.state.get_ctx(),
-        )
-        .await
-        .map_err(map_user_error)?;
+        let user = drive(ReadUserOperation::new(auth.user_id), &self.state.get_ctx())
+            .await
+            .map_err(map_user_error)?;
         let groups = member_groups(self, &auth).await?;
         let realm = drive(
-            ReadRealmAuthorizationOperation::new(self.state.get_realm_id()),
+            ReadAuthorizationOperation::new(self.state.get_realm_id()),
             &self.state.get_ctx(),
         )
         .await
@@ -173,17 +168,16 @@ impl McpServer {
         };
         let mut groups = Vec::new();
         for group in member_groups(self, &auth).await? {
-            let counts =
-                count_group_documents_by_purpose(&self.state.get_ctx(), realm_id, group.group_id)
-                    .await
-                    .map_err(internal_error)?
-                    .ok_or_else(|| {
-                        explained(
-                            crate::error::ServerError::ServiceUnavailable,
-                            "this node has no metadata subsystem, so dataset counts are \
+            let counts = count_group_purpose(&self.state.get_ctx(), realm_id, group.group_id)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    explained(
+                        crate::error::ServerError::ServiceUnavailable,
+                        "this node has no metadata subsystem, so dataset counts are \
                              unavailable here; call get_node_info",
-                        )
-                    })?;
+                    )
+                })?;
             total.dataset_count += counts.dataset_count;
             total.profile_count += counts.profile_count;
             total.process_run_count += counts.process_run_count;
@@ -397,92 +391,22 @@ fn map_role(role: Role) -> RoleOutput {
     }
 }
 
-fn map_user_error(error: ReadUserDocumentError) -> CallToolResult {
+fn map_user_error(error: ReadUserError) -> CallToolResult {
     match error {
-        ReadUserDocumentError::NotFound => server_error(crate::error::ServerError::NotFound),
-        ReadUserDocumentError::StorageError(error) => internal_error(error),
-        ReadUserDocumentError::ConversionError(error) => internal_error(error),
-        ReadUserDocumentError::UnexpectedEvent {
+        ReadUserError::NotFound => server_error(crate::error::ServerError::NotFound),
+        ReadUserError::StorageError(error) => internal_error(error),
+        ReadUserError::ConversionError(error) => internal_error(error),
+        ReadUserError::UnexpectedEvent {
             state,
             expected,
             got,
         } => internal_error(format!(
             "unexpected user read event in {state}: expected {expected}, got {got}"
         )),
-        ReadUserDocumentError::NotFinished => internal_error("user read did not finish"),
+        ReadUserError::NotFinished => internal_error("user read did not finish"),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::{HashMap, HashSet};
-
-    fn body(result: CallToolResult) -> serde_json::Value {
-        assert_eq!(result.is_error, Some(true));
-        result
-            .structured_content
-            .expect("a tool error carries the structured body")
-    }
-
-    #[test]
-    fn group_argument_reasons() {
-        let text = body(group_argument("bad").unwrap_err());
-        assert_eq!(text["code"], "Bad request");
-        assert!(
-            text["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("list_groups")
-        );
-        assert!(group_argument(&Ulid::generate().to_string()).is_ok());
-    }
-
-    #[test]
-    fn group_error_maps() {
-        let missing = body(group_error(crate::error::ServerError::NotFound));
-        assert!(
-            missing["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("list_groups")
-        );
-        let forbidden = body(group_error(crate::error::ServerError::Forbidden));
-        assert!(
-            forbidden["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("membership")
-        );
-    }
-
-    #[test]
-    fn map_role_permissions() {
-        let role_id = Ulid::generate();
-        let role = Role {
-            role_id,
-            name: "writer".to_string(),
-            permissions: HashMap::from([("/realm/g/x/**".to_string(), Permission::WRITE)]),
-            assigned_users: HashSet::new(),
-        };
-        let output = map_role(role);
-        assert_eq!(output.role_id, role_id.to_string());
-        assert_eq!(output.name, "writer");
-        assert_eq!(
-            output.permissions.get("/realm/g/x/**").map(String::as_str),
-            Some("Write")
-        );
-    }
-
-    #[test]
-    fn maps_user_error() {
-        assert_eq!(
-            body(map_user_error(ReadUserDocumentError::NotFound))["code"],
-            "Not found"
-        );
-        assert_eq!(
-            body(map_user_error(ReadUserDocumentError::NotFinished))["code"],
-            "Internal error"
-        );
-    }
-}
+#[path = "context_tests.rs"]
+mod pure_tests;

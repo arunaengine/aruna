@@ -12,11 +12,11 @@ use utoipa_axum::routes;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::AuthContext;
-use aruna_operations::device::status::{
+use aruna_operations::device::sync_status::{
     DatasetRow, DocumentRow, SyncStatus, start_sync_run, sync_status,
 };
 
-use super::require_owner;
+use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()

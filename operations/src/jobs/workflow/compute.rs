@@ -30,7 +30,7 @@ pub fn recovery_action(evidence: &ReconcileEvidence) -> RecoveryAction {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use aruna_core::compute::{
         AdoptableEvidence, ArtifactEvidence, AttemptStatus, BackendError, ReconcileEvidence,
         ResumePoint, TombstoneEvidence,

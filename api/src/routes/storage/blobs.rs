@@ -1,0 +1,793 @@
+use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::server_state::ServerState;
+use aruna_core::NodeId;
+use aruna_core::structs::{
+    AuthContext, BucketInfo, CopyOrigin, Permission, bucket_permission_path, object_permission_path,
+};
+use aruna_operations::blob::holders::{GetHoldersError, GetHoldersOperation};
+use aruna_operations::driver::{drive, drive_until};
+use aruna_operations::replication::locations::{
+    LocationSummaryError, LocationSummaryOperation, QueuedNodesOperation, QueuedReplicas,
+    RelationshipNodesOperation, RemoteLocationOperation,
+};
+use aruna_operations::replication::protocol::{
+    CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest, ReplicationMode,
+};
+use aruna_operations::replication::queue::QueueBlobOperation;
+use aruna_operations::replication::version_replication::{
+    ReplicateScopeInput, ReplicateScopeTarget,
+};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::{Extension, Json};
+use futures_util::{StreamExt, stream};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
+use tracing::warn;
+use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+
+#[derive(OpenApi)]
+#[openapi(
+    tags((name = "data/blobs", description = "Blob management and replication"))
+)]
+pub struct BlobsApiDoc;
+
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(BlobsApiDoc::openapi())
+        .routes(routes!(replicate_blob))
+        .routes(routes!(blob_locations))
+}
+
+/// Replication targets are few and operator-controlled, so the fan-out stays
+/// small; the deadline keeps an offline target from holding the answer.
+const LOCATION_FANOUT_LIMIT: usize = 8;
+const LOCATION_SUMMARY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Ceilings on the whole request. The queued scan alone can name far more
+/// destinations than a caller will wait for, so the request bounds its own work
+/// rather than trusting the candidate list to stay small.
+const LOCATION_CANDIDATE_LIMIT: usize = 64;
+const LOCATION_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+
+/// One place a copy can be: the node, and the bucket and key it stores it
+/// under. A sync relationship maps the key, so one node can be several.
+type Destination = (NodeId, String, String);
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReplicateBlobRequest {
+    pub bucket: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReplicateBlobResponse {
+    pub bucket: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    pub target_node_id: String,
+}
+
+async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
+    match drive(
+        GetBucketOperation::new(bucket.to_string()),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(bucket_info) => Ok(bucket_info),
+        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
+        Err(err) => Err(ServerError::InternalError(err.to_string())),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/blobs/replicate",
+    tag = "data/blobs",
+    summary = "Queue a replication copy onto another node",
+    description = r#"Durably queues replication of a bucket, object or version onto another node.
+
+**Authentication**: realm bearer token with WRITE on the object when `path` is given, and WRITE on
+the whole bucket when it is not.
+
+**Behavior**
+- The 202 means the job is durable on this node and nothing more: no bytes are copied yet, and the
+  copy may still fail or be retried in the background.
+- Progress is observed through `GET /data/blobs/locations`; the response only echoes the accepted
+  scope.
+- No `path` replicates the whole bucket, a `path` replicates that object, and a `path` with
+  `version_id` replicates exactly that version.
+- Delete markers are included in the queued work.
+- Submitting the same scope again queues the work again, so the request is not idempotent."#,
+    request_body(
+        content = ReplicateBlobRequest,
+        description = "Replication scope and the hex id of the destination node",
+        example = json!({
+            "bucket": "lab-raw",
+            "path": "runs/2026-04-09/reads.fastq.gz",
+            "version_id": "01JABCDEF0123456789ABCDEFG",
+            "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978"
+        })
+    ),
+    responses(
+        (
+            status = 202,
+            description = "Replication work was durably queued; no bytes have been copied yet",
+            body = ReplicateBlobResponse,
+            example = json!({
+                "bucket": "lab-raw",
+                "path": "runs/2026-04-09/reads.fastq.gz",
+                "version_id": "01JABCDEF0123456789ABCDEFG",
+                "target_node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978"
+            })
+        ),
+        (status = 400, description = "Malformed destination node id or version id, or a version_id sent without a path", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the bucket or object", body = ErrorResponse),
+        (status = 404, description = "Bucket unknown to this node", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn replicate_blob(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<ReplicateBlobRequest>,
+) -> ServerResult<(StatusCode, Json<ReplicateBlobResponse>)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    if auth.realm_id != state.get_realm_id() {
+        return Err(ServerError::Forbidden);
+    }
+
+    let bucket_info = load_bucket(&state, &request.bucket).await?;
+
+    let permission_path = match request.path.as_deref() {
+        Some(path) => object_permission_path(
+            state.get_realm_id(),
+            bucket_info.group_id,
+            state.get_node_id(),
+            &request.bucket,
+            path,
+        ),
+        None => bucket_permission_path(
+            state.get_realm_id(),
+            bucket_info.group_id,
+            state.get_node_id(),
+            &request.bucket,
+        ),
+    };
+
+    crate::auth::ensure_permission(&state, &auth, permission_path, Permission::WRITE).await?;
+
+    let node_id = NodeId::from_str(&request.node_id).map_err(|_| ServerError::BadRequest)?;
+    let target = match (request.path.as_deref(), request.version_id.as_deref()) {
+        (None, None) => ReplicateScopeTarget::Bucket,
+        (None, Some(_)) => return Err(ServerError::BadRequest),
+        (Some(path), None) => ReplicateScopeTarget::Object {
+            key: path.to_string(),
+        },
+        (Some(path), Some(version_id)) => ReplicateScopeTarget::Version {
+            key: path.to_string(),
+            version_id: ulid::Ulid::from_string(version_id).map_err(|_| ServerError::BadRequest)?,
+        },
+    };
+
+    let path = match &target {
+        ReplicateScopeTarget::Bucket => None,
+        ReplicateScopeTarget::Prefix(prefix) => Some(prefix.clone()),
+        ReplicateScopeTarget::Object { key } | ReplicateScopeTarget::Version { key, .. } => {
+            Some(key.clone())
+        }
+    };
+    let version_id = match &target {
+        ReplicateScopeTarget::Version { version_id, .. } => Some(version_id.to_string()),
+        _ => None,
+    };
+    let input = ReplicateScopeInput {
+        bucket: request.bucket,
+        target,
+        target_node_id: node_id,
+        auth_context: auth,
+        replicate_delete_markers: true,
+        mode: ReplicationMode::OnDemand,
+    };
+    let response = ReplicateBlobResponse {
+        bucket: input.bucket.clone(),
+        path: path.clone(),
+        version_id: version_id.clone(),
+        target_node_id: input.target_node_id.to_string(),
+    };
+    let queue_result = drive(QueueBlobOperation::new(input, None), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    if !queue_result.scheduled {
+        warn!(
+            bucket = %response.bucket,
+            path = ?response.path,
+            version_id = ?response.version_id,
+            target_node = %response.target_node_id,
+            "On-demand replication job persisted but drain scheduling was not acknowledged"
+        );
+    }
+
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BlobLocationsQuery {
+    pub bucket: String,
+    pub path: String,
+    #[serde(default)]
+    pub version_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlobCopyState {
+    Present,
+    Pending,
+    Unreachable,
+    /// The node holds this bucket under access rules the caller does not pass,
+    /// so it refused to say whether a copy is there.
+    Denied,
+    /// The version exists but carries no bytes anywhere: a delete marker, or a
+    /// version that only references content held elsewhere.
+    NotStored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlobCopyStorage {
+    NodeManaged,
+    GroupBackend,
+}
+
+/// Why the holding node has this copy, as that node recorded it when the copy
+/// was registered.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlobCopyOrigin {
+    /// A client wrote the object on that node.
+    Write,
+    /// A bucket sync relationship placed the copy there.
+    Sync,
+    /// An explicit copy request placed it there.
+    Replicate,
+    /// A compute job staged the bytes there to run against them.
+    Staging,
+    /// A read-driven reference advance materialized the bytes there.
+    Reference,
+    /// The node recorded no cause, or did not report one.
+    Unknown,
+}
+
+/// Whether the holding node would serve this copy under the rules the version
+/// carries. It names no rule either way.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlobCopyCompliance {
+    Allowed,
+    /// The node holds the copy but is not serving it, because it no longer
+    /// matches the rules the copy carries.
+    Quarantined,
+    Unknown,
+}
+
+impl From<CopyOrigin> for BlobCopyOrigin {
+    fn from(value: CopyOrigin) -> Self {
+        match value {
+            CopyOrigin::Write => Self::Write,
+            CopyOrigin::Sync { .. } => Self::Sync,
+            CopyOrigin::Replicate => Self::Replicate,
+            CopyOrigin::Staging => Self::Staging,
+            CopyOrigin::Reference => Self::Reference,
+            CopyOrigin::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<CopyCompliance> for BlobCopyCompliance {
+    fn from(value: CopyCompliance) -> Self {
+        match value {
+            CopyCompliance::Allowed => Self::Allowed,
+            CopyCompliance::Quarantined => Self::Quarantined,
+            CopyCompliance::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// One copy of a version at one destination. A node reached under several
+/// destination paths has one entry per path, so `node_id` may repeat and only
+/// the whole `(node_id, bucket, key)` triple identifies an entry.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BlobCopyResponse {
+    pub node_id: String,
+    pub local: bool,
+    /// Bucket this copy is stored under on that node, which a sync relationship
+    /// can map away from the requested one.
+    pub bucket: String,
+    /// Key this copy is stored under on that node.
+    pub key: String,
+    pub state: BlobCopyState,
+    pub storage: Option<BlobCopyStorage>,
+    pub storage_class: Option<String>,
+    pub group_backend_id: Option<String>,
+    pub group_backend_name: Option<String>,
+    pub origin: BlobCopyOrigin,
+    /// The relationship that placed the copy; set only when `origin` is `sync`.
+    pub sync_relationship_id: Option<String>,
+    pub compliance: BlobCopyCompliance,
+}
+
+/// Why an answer could not cover every node that might hold a copy.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocationScanLimit {
+    /// The queued-replication scan hit its page cap before the keyspace ended.
+    QueuedScanTruncated,
+    /// The queued-replication scan itself failed, so no queued copy is known.
+    QueuedScanFailed,
+    /// The sync-relationship scan failed, so the destinations a relationship
+    /// will place a copy on are unknown.
+    RelationshipScanFailed,
+    /// Queued job records could not be decoded and were skipped.
+    QueuedRecordUnreadable,
+    /// More candidate nodes than one request asks; the rest were not asked.
+    CandidateCapReached,
+    /// The holder index could not be queried, so copies outside the current
+    /// configuration and queue are unknown.
+    HolderLookupFailed,
+    /// A node the holder index names holds the bytes but knows no copy under
+    /// the bucket and key it was asked about, so its copy list may be short.
+    HolderPathUnknown,
+    /// A node gave no answer, so whether it holds a copy stays unknown.
+    HolderUnreachable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BlobLocationsResponse {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: String,
+    pub copies: Vec<BlobCopyResponse>,
+    /// Every node that might hold a copy was enumerated and asked. When false,
+    /// a copy may be missing from `copies` rather than genuinely absent.
+    pub complete: bool,
+    /// What stopped the search from covering everything; empty when `complete`.
+    pub limits: Vec<LocationScanLimit>,
+}
+
+fn pending_copy(destination: &Destination, state: BlobCopyState) -> BlobCopyResponse {
+    let (node_id, bucket, key) = destination;
+    BlobCopyResponse {
+        node_id: node_id.to_string(),
+        local: false,
+        bucket: bucket.clone(),
+        key: key.clone(),
+        state,
+        storage: None,
+        storage_class: None,
+        group_backend_id: None,
+        group_backend_name: None,
+        origin: BlobCopyOrigin::Unknown,
+        sync_relationship_id: None,
+        compliance: BlobCopyCompliance::Unknown,
+    }
+}
+
+fn copy_response(
+    destination: &Destination,
+    local: bool,
+    summary: LocationSummary,
+) -> BlobCopyResponse {
+    let base = BlobCopyResponse {
+        local,
+        origin: summary.origin.into(),
+        sync_relationship_id: match summary.origin {
+            CopyOrigin::Sync { relationship_id } => Some(relationship_id.to_string()),
+            _ => None,
+        },
+        compliance: summary.compliance.into(),
+        ..pending_copy(destination, BlobCopyState::Pending)
+    };
+    let unstored = summary.version_id.is_some() && !summary.materialized;
+    match summary.storage.filter(|_| summary.held) {
+        Some(LocationCopyStorage::NodeManaged { storage_class }) => BlobCopyResponse {
+            state: BlobCopyState::Present,
+            storage: Some(BlobCopyStorage::NodeManaged),
+            storage_class,
+            ..base
+        },
+        Some(LocationCopyStorage::GroupBackend { backend_id, name }) => BlobCopyResponse {
+            state: BlobCopyState::Present,
+            storage: Some(BlobCopyStorage::GroupBackend),
+            group_backend_id: Some(backend_id.to_string()),
+            group_backend_name: name,
+            ..base
+        },
+        None if unstored => BlobCopyResponse {
+            state: BlobCopyState::NotStored,
+            ..base
+        },
+        None => base,
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/blobs/locations",
+    tag = "data/blobs",
+    summary = "List the nodes holding one object version",
+    description = r#"Lists every node that holds or is expected to hold one object version.
+
+**Authentication**: realm bearer token with READ on the object.
+
+**Behavior**
+- This node asks every destination that might hold a copy: the destinations a sync relationship
+  maps this key to, the bucket's configured replication targets, the destinations with queued
+  replication work, and the nodes the durable holder index names for these bytes.
+- One entry is returned per destination, so a node reached under two bucket-and-key pairs appears
+  twice; copies are ordered local first, then by node, bucket and key.
+- Every answered copy carries the `origin` the holding node recorded when it registered the copy,
+  the `sync_relationship_id` when that origin is a bucket sync, and a `compliance` verdict. A copy
+  the holding node holds but refuses to serve because it no longer matches the rules the version
+  carries is listed as `present` with compliance `quarantined` rather than omitted; no rule is
+  named either way. A destination that has not answered yet reports all three as unknown.
+- A destination that does not answer never fails the request: the reply stays 200 with `complete`
+  false and the reason in `limits`, and a copy may then be missing rather than genuinely absent.
+
+**Limits**
+- At most 64 destinations are asked, 8 at a time, each with a 5 second answer window inside a 30
+  second budget for the whole request."#,
+    params(
+        ("bucket" = String, Query, description = "Bucket holding the object, as known to this node"),
+        ("path" = String, Query, description = "Object key within the bucket, without a leading slash"),
+        ("version_id" = Option<String>, Query, description = "Version to inspect as a ULID; defaults to the current version")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Copies of one version; a false complete means limits names what the search could not cover",
+            body = BlobLocationsResponse,
+            example = json!({
+                "bucket": "lab-raw",
+                "key": "runs/2026-04-09/reads.fastq.gz",
+                "version_id": "01JABCDEF0123456789ABCDEFG",
+                "copies": [
+                    {
+                        "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                        "local": true,
+                        "bucket": "lab-raw",
+                        "key": "runs/2026-04-09/reads.fastq.gz",
+                        "state": "present",
+                        "storage": "node-managed",
+                        "storage_class": "standard",
+                        "group_backend_id": null,
+                        "group_backend_name": null,
+                        "origin": "write",
+                        "sync_relationship_id": null,
+                        "compliance": "allowed"
+                    },
+                    {
+                        "node_id": "2a3b4c5d6e7f89900a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f6789",
+                        "local": false,
+                        "bucket": "lab-mirror",
+                        "key": "runs/2026-04-09/reads.fastq.gz",
+                        "state": "pending",
+                        "storage": null,
+                        "storage_class": null,
+                        "group_backend_id": null,
+                        "group_backend_name": null,
+                        "origin": "unknown",
+                        "sync_relationship_id": null,
+                        "compliance": "unknown"
+                    }
+                ],
+                "complete": false,
+                "limits": ["holder-unreachable"]
+            })
+        ),
+        (status = 400, description = "Malformed version id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or the caller lacks READ on the object", body = ErrorResponse),
+        (status = 404, description = "The bucket is unknown to this node, or the object has no such version", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn blob_locations(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<BlobLocationsQuery>,
+) -> ServerResult<Json<BlobLocationsResponse>> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    if auth.realm_id != state.get_realm_id() {
+        return Err(ServerError::Forbidden);
+    }
+    let ctx = state.get_ctx();
+    let local_node = state.get_node_id();
+    let version_id = query
+        .version_id
+        .as_deref()
+        .map(ulid::Ulid::from_string)
+        .transpose()
+        .map_err(|_| ServerError::BadRequest)?;
+    crate::auth::ensure_permission(
+        &state,
+        &auth,
+        object_permission_path(
+            state.get_realm_id(),
+            load_bucket(&state, &query.bucket).await?.group_id,
+            local_node,
+            &query.bucket,
+            &query.path,
+        ),
+        Permission::READ,
+    )
+    .await?;
+    let request = LocationSummaryRequest {
+        realm_id: state.get_realm_id(),
+        bucket: query.bucket.clone(),
+        key: query.path.clone(),
+        version_id,
+        auth_context: auth,
+    };
+    let local = drive(
+        LocationSummaryOperation::new_local(local_node, request.clone()).with_policy(true),
+        ctx.as_ref(),
+    )
+    .await
+    .map_err(|error| match error {
+        LocationSummaryError::Denied => ServerError::Forbidden,
+        LocationSummaryError::BucketNotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+    let Some(resolved) = local.summary.version_id else {
+        return Err(ServerError::NotFound);
+    };
+    let blake3 = local.blake3;
+    let delete_marker = local.delete_marker;
+
+    let here = (local_node, query.bucket.clone(), query.path.clone());
+    let mut copies = vec![copy_response(&here, true, local.summary)];
+    let mut limits = Vec::new();
+    let mut candidates: BTreeSet<Destination> = BTreeSet::new();
+    let mut expected: BTreeSet<Destination> = BTreeSet::new();
+    let mut capped = false;
+    // Relationship candidates come first because only they carry the stored copy path.
+    match drive(
+        RelationshipNodesOperation::new(
+            local_node,
+            query.bucket.clone(),
+            query.path.clone(),
+            delete_marker,
+        ),
+        ctx.as_ref(),
+    )
+    .await
+    {
+        Ok(targets) => {
+            for target in targets {
+                let destination = (target.node_id, target.bucket, target.key);
+                expected.insert(destination.clone());
+                capped |= !add_candidate(&mut candidates, destination);
+            }
+        }
+        Err(error) => {
+            warn!(
+                bucket = %query.bucket,
+                key = %query.path,
+                error = %error,
+                "Sync relationship scan failed; relationship copies are unknown"
+            );
+            limits.push(LocationScanLimit::RelationshipScanFailed);
+        }
+    }
+    let queued = match drive(
+        QueuedNodesOperation::new(
+            query.bucket.clone(),
+            query.path.clone(),
+            resolved,
+            delete_marker,
+        ),
+        ctx.as_ref(),
+    )
+    .await
+    {
+        Ok(queued) => queued,
+        Err(error) => {
+            warn!(
+                bucket = %query.bucket,
+                key = %query.path,
+                error = %error,
+                "Queued replication scan failed; queued copies are unknown"
+            );
+            limits.push(LocationScanLimit::QueuedScanFailed);
+            QueuedReplicas::default()
+        }
+    };
+    // Queue and holder entries use the source path; rewritten relationships already added theirs.
+    for node_id in queued.nodes.iter().filter(|node| **node != local_node) {
+        let destination = (*node_id, query.bucket.clone(), query.path.clone());
+        expected.insert(destination.clone());
+        capped |= !add_candidate(&mut candidates, destination);
+    }
+    // The holder index retains stored copies no longer present in configuration or the queue.
+    match holder_nodes(&ctx, blake3, state.get_realm_id(), local_node).await {
+        Ok(holders) => {
+            for node_id in holders {
+                let destination = (node_id, query.bucket.clone(), query.path.clone());
+                capped |= !add_candidate(&mut candidates, destination);
+            }
+        }
+        Err(error) => {
+            warn!(
+                bucket = %query.bucket,
+                key = %query.path,
+                error = %error,
+                "Blob holder lookup failed; copies outside the configuration are unknown"
+            );
+            limits.push(LocationScanLimit::HolderLookupFailed);
+        }
+    }
+    if queued.truncated {
+        warn!(
+            bucket = %query.bucket,
+            key = %query.path,
+            "Queued replication scan hit its page cap; queued copies may be missing"
+        );
+        limits.push(LocationScanLimit::QueuedScanTruncated);
+    }
+    if queued.skipped > 0 {
+        warn!(
+            bucket = %query.bucket,
+            key = %query.path,
+            skipped = queued.skipped,
+            "Queued replication records could not be decoded"
+        );
+        limits.push(LocationScanLimit::QueuedRecordUnreadable);
+    }
+    if capped {
+        warn!(
+            bucket = %query.bucket,
+            key = %query.path,
+            "More candidate nodes than the per-request cap; some were not asked"
+        );
+        limits.push(LocationScanLimit::CandidateCapReached);
+    }
+
+    // One deadline for the whole fan-out, so a wall of stalled peers costs the
+    // caller the deadline rather than the deadline times the candidate count.
+    let deadline = Instant::now() + LOCATION_REQUEST_DEADLINE;
+    let answers = stream::iter(candidates.into_iter().map(|destination| {
+        let (node_id, bucket, key) = destination.clone();
+        let request = LocationSummaryRequest {
+            bucket,
+            key,
+            version_id: Some(resolved),
+            ..request.clone()
+        };
+        let ctx = ctx.clone();
+        async move {
+            let answer = drive_until(
+                RemoteLocationOperation::new(node_id, request),
+                ctx.as_ref(),
+                deadline.min(Instant::now() + LOCATION_SUMMARY_TIMEOUT),
+            )
+            .await;
+            (destination, answer)
+        }
+    }))
+    .buffer_unordered(LOCATION_FANOUT_LIMIT)
+    .collect::<Vec<_>>()
+    .await;
+
+    // A node asked under several destination paths keeps one entry per path;
+    // only a node no path answered for is short of a copy it may hold.
+    let mut asked: BTreeSet<NodeId> = BTreeSet::new();
+    let mut answered: BTreeSet<NodeId> = BTreeSet::new();
+    let mut unreachable = false;
+    for (destination, answer) in answers {
+        asked.insert(destination.0);
+        let Some(copy) = peer_copy(&destination, expected.contains(&destination), answer) else {
+            continue;
+        };
+        answered.insert(destination.0);
+        unreachable |= copy.state == BlobCopyState::Unreachable;
+        copies.push(copy);
+    }
+    if unreachable {
+        limits.push(LocationScanLimit::HolderUnreachable);
+    }
+    if asked.iter().any(|node| !answered.contains(node)) {
+        warn!(
+            bucket = %query.bucket,
+            key = %query.path,
+            "A holder answered under no path it knows; copies may be missing"
+        );
+        limits.push(LocationScanLimit::HolderPathUnknown);
+    }
+    copies.sort_by(|left, right| {
+        (!left.local, &left.node_id, &left.bucket, &left.key).cmp(&(
+            !right.local,
+            &right.node_id,
+            &right.bucket,
+            &right.key,
+        ))
+    });
+
+    Ok(Json(BlobLocationsResponse {
+        bucket: query.bucket,
+        key: query.path,
+        version_id: resolved.to_string(),
+        copies,
+        complete: limits.is_empty(),
+        limits,
+    }))
+}
+
+/// The copy to report for one peer's answer. `None` drops a holder-index
+/// candidate that does not hold this version under the path it was asked
+/// about, which the answer admits as `HolderPathUnknown`.
+fn peer_copy(
+    destination: &Destination,
+    expected: bool,
+    answer: Result<LocationSummary, LocationSummaryError>,
+) -> Option<BlobCopyResponse> {
+    match answer {
+        Ok(summary) if !summary.held && !expected => None,
+        Ok(summary) => Some(copy_response(destination, false, summary)),
+        Err(LocationSummaryError::Denied) => Some(pending_copy(destination, BlobCopyState::Denied)),
+        Err(error) => {
+            warn!(node = %destination.0, error = %error, "Location summary peer gave no answer");
+            Some(pending_copy(destination, BlobCopyState::Unreachable))
+        }
+    }
+}
+
+/// Nodes the durable holder index says store these bytes. A version with no
+/// materialized content has no hash and therefore no holders.
+async fn holder_nodes(
+    ctx: &Arc<aruna_operations::driver::DriverContext>,
+    blake3: Option<[u8; 32]>,
+    realm_id: aruna_core::structs::RealmId,
+    local_node: NodeId,
+) -> Result<Vec<NodeId>, GetHoldersError> {
+    let Some(blake3) = blake3 else {
+        return Ok(Vec::new());
+    };
+    drive_until(
+        GetHoldersOperation::new(blake3, realm_id, local_node),
+        ctx.as_ref(),
+        Instant::now() + LOCATION_SUMMARY_TIMEOUT,
+    )
+    .await
+}
+
+/// Adds one destination unless the request is already at its cap, which counts
+/// destinations rather than nodes because each one is a separate question.
+/// `false` means the destination was dropped, which the answer has to admit.
+fn add_candidate(candidates: &mut BTreeSet<Destination>, destination: Destination) -> bool {
+    if candidates.contains(&destination) {
+        return true;
+    }
+    if candidates.len() >= LOCATION_CANDIDATE_LIMIT {
+        return false;
+    }
+    candidates.insert(destination);
+    true
+}
+
+#[cfg(test)]
+#[path = "blobs_tests.rs"]
+mod tests;

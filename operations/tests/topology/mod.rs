@@ -1,19 +1,5 @@
-//! Realm fixture with more sync-eligible nodes than the placement replication
-//! factor, plus a User-kind node that holds nothing at all.
-//!
-//! Fixtures sized at or below the replication factor make every node a holder of
-//! every bucket, which silently collapses non-holder coverage. [`Topology`] keeps
-//! `management > replication_factor` and derives holders the way production does:
-//! a create stamps the best-ranked bucket its origin already holds
-//! ([`choose_origin_bucket`], DECISIONS D3), so holdership is proved against that
-//! stamped [`PlacementRef`] and never against a blind document hash.
-//!
-//! Only metadata document buckets are replica-capped. Group, user, auth and
-//! registry documents are bound to the `everywhere` strategy (DECISIONS B1), so
-//! every sync-eligible node holds them and a non-holder of one is not a reachable
-//! state: this fixture cannot express it and must not pretend to. A User-kind node
-//! is never sync-eligible, holds no bucket of any strategy, and is therefore the
-//! one origin that reaches the D10 forwarding path.
+//! Realm fixture with more sync-eligible nodes than the placement replication factor, plus a
+//! User-kind node that holds nothing at all.
 
 #![allow(dead_code)]
 
@@ -25,43 +11,47 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use aruna_blob::blob::BlobHandler;
-use aruna_core::admin_document_reducer::AdminDocumentReducerState;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
-use aruna_core::document::DocumentSyncTarget;
-use aruna_core::document::{DocumentSyncEffect, DocumentSyncNetEvent, DocumentSyncPublish};
+use aruna_core::document::DocumentTarget;
+use aruna_core::document::{DocumentEffect, DocumentNetEvent, DocumentSyncPublish};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
+use aruna_core::reducer::AdminDocumentState;
 use aruna_core::structs::{
     Actor, AuthContext, Backend, BackendConfig, GroupAuthorizationDocument, MetadataRegistryRecord,
     NodePlacementEntry, PlacementRef, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     RealmNodeKind, TokenClaims, TransitionLimits,
 };
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
-use aruna_operations::announce_realm_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-};
-use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::expand_placement::expand_realm_placement;
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
-use aruna_operations::mutate_realm_placement::{
-    MutateRealmPlacementConfig, RealmPlacementMutation, drive_realm_placement_mutation,
+use aruna_operations::groups::add_member::{AddUserInput, AddUserOperation};
+use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_operations::metadata::create_document::{
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
+use aruna_operations::metadata::projector::replay_event_log;
+use aruna_operations::metadata::{AuthToken, MetadataHandle};
+use aruna_operations::placement::expand_placement::expand_realm_placement;
 use aruna_operations::placement::transition::{TransitionRequest, plan_transition};
 use aruna_operations::placement::{
     PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject,
     resolve_shard_holders, strategy_for_target,
 };
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::realm::announce_presence::{
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
+};
+use aruna_operations::realm::mutate_placement::{
+    MutatePlacementConfig, RealmPlacementMutation, drive_placement_mutation,
+};
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
@@ -111,15 +101,8 @@ pub struct Topology {
 }
 
 impl Topology {
-    /// Spawns a meshed realm of `management` Management nodes and `users`
-    /// User-kind nodes, with a default placement strategy of
-    /// `replication_factor` holders.
-    ///
-    /// The realm id is a verifying key, so the fixture can mint the bearer tokens
-    /// a forwarded write re-validates. Panics unless
-    /// `management > replication_factor`: a fixture at or below the factor cannot
-    /// express a non-holder and would quietly void every assertion this module
-    /// exists to make.
+    /// Spawns a meshed realm of `management` Management nodes and `users` User-kind nodes, with
+    /// a default placement strategy of `replication_factor` holders.
     pub async fn spawn(
         management: usize,
         users: usize,
@@ -151,7 +134,7 @@ impl Topology {
         let signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
         tracing::info!(
-            realm_config_topic = %DocumentSyncTarget::RealmConfig { realm_id }
+            realm_config_topic = %DocumentTarget::RealmConfig { realm_id }
                 .sync_topic_id(realm_id, &PlacementRef::NIL),
             "spawned realm"
         );
@@ -172,7 +155,7 @@ impl Topology {
             hang_cap(
                 "announce realm presence",
                 drive(
-                    AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                    AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                         realm_id,
                         node_id: node.node_id(),
                         schedule_refresh: true,
@@ -239,14 +222,14 @@ impl Topology {
 
     /// A bearer token for [`Topology::user_id`], signed by the realm key that the
     /// realm id is. A holder re-validates this before applying a forwarded write.
-    pub fn bearer_token(&self) -> MetadataAuthToken {
-        MetadataAuthToken::bearer(self.bearer_string()).expect("token is within the length bound")
+    pub fn bearer_token(&self) -> AuthToken {
+        AuthToken::bearer(self.bearer_string()).expect("token is within the length bound")
     }
 
     /// A bearer token for another realm principal, for fixtures that need a second
     /// authorized caller.
-    pub fn bearer_for(&self, user_id: UserId) -> MetadataAuthToken {
-        MetadataAuthToken::bearer(self.bearer_string_for(user_id))
+    pub fn bearer_for(&self, user_id: UserId) -> AuthToken {
+        AuthToken::bearer(self.bearer_string_for(user_id))
             .expect("token is within the length bound")
     }
 
@@ -274,7 +257,7 @@ impl Topology {
         hang_cap(
             "grant_group_user",
             drive(
-                AddUserToGroupOperation::new(AddUserToGroupInput {
+                AddUserOperation::new(AddUserInput {
                     actor: self.actor(self.node(0)),
                     group_id,
                     user_id,
@@ -310,7 +293,7 @@ impl Topology {
     }
 
     /// The raw signed JWT backing [`Topology::bearer_token`], for callers that pass
-    /// a bearer string rather than a [`MetadataAuthToken`].
+    /// a bearer string rather than a [`AuthToken`].
     pub fn bearer_string(&self) -> String {
         self.bearer_string_for(self.user_id)
     }
@@ -378,12 +361,37 @@ impl Topology {
         Ok(group.group_id)
     }
 
-    /// The bucket a create on `origin` stamps (D3): the best-ranked bucket the
-    /// origin already holds, chosen on `(realm_id, group_id, path)`. The origin is
-    /// therefore always a holder of what it creates.
-    ///
-    /// `None` when the origin holds no bucket of the governing strategy - a
-    /// User-kind node, which is the only origin that reaches the D10 forward.
+    pub async fn create_document(
+        &self,
+        node: &TestNode,
+        group_id: Ulid,
+        document_id: Ulid,
+        document_path: &str,
+        description: &str,
+    ) -> TestResult<PlacementRef> {
+        let created = drive(
+            CreateDocumentOperation::new(CreateDocumentConfig {
+                actor: self.actor(node),
+                group_id,
+                document_id,
+                document_path: document_path.to_string(),
+                public: false,
+                payload: CreateDocumentPayload::Scaffold {
+                    name: document_path.to_string(),
+                    description: description.to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: None,
+                },
+            }),
+            node.context.as_ref(),
+        )
+        .await?;
+        replay_event_log(node.context.as_ref()).await?;
+        Ok(created.record.placement)
+    }
+
+    /// The bucket a create on `origin` stamps (D3): the best-ranked bucket the origin already
+    /// holds, chosen on `(realm_id, group_id, path)`.
     pub fn origin_placement(
         &self,
         origin: &TestNode,
@@ -392,7 +400,7 @@ impl Topology {
         document_path: &str,
     ) -> Option<PlacementRef> {
         let path = MetadataRegistryRecord::normalize_document_path(document_path);
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let target = DocumentTarget::MetadataDocumentLifecycle { document_id };
         let (strategy, _) = strategy_for_target(
             &self.config,
             &target,
@@ -446,11 +454,6 @@ impl Topology {
     }
 
     /// Proves `node_id` holds nothing of `placement` and returns the holder set.
-    ///
-    /// The proof is exact, not statistical: holders are a pure function of the
-    /// replicated realm config and the stamped bucket, so the resolver is re-run
-    /// here. It also asserts the strategy capped the holder set below the count of
-    /// sync-eligible nodes, which is what makes "non-holder" meaningful at all.
     pub fn assert_not_holder(&self, node_id: NodeId, placement: &PlacementRef) -> Vec<NodeId> {
         let holders = self.holders(placement);
         assert!(
@@ -557,8 +560,8 @@ impl Topology {
         // driver re-drives a conflicted mutation itself.
         self.config = hang_cap(
             "placement mutation",
-            drive_realm_placement_mutation(
-                MutateRealmPlacementConfig { actor, mutation },
+            drive_placement_mutation(
+                MutatePlacementConfig { actor, mutation },
                 None,
                 node.context.as_ref(),
             ),
@@ -690,13 +693,10 @@ impl Topology {
                 let mut pending = 0;
                 for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
                     let config = read_realm_config(node, realm_id).await?;
-                    // A record that is gone was released after cutting every
-                    // bucket over; `start_transition` already waited for it to
-                    // replicate, so absence here is completion.
+                    // A record that is gone was released after cutting every bucket over.
                     if let Some(transition) = config.transition(&transition_id) {
-                        // An aborted record is terminal: its incomplete
-                        // buckets either advanced under a rival plan or will
-                        // never move; nothing further can be awaited on it.
+                        // An aborted record is terminal: its incomplete buckets either advanced
+                        // under a rival plan or will never move.
                         if !matches!(
                             transition.status,
                             aruna_core::structs::TransitionStatus::Aborted
@@ -812,10 +812,9 @@ impl Topology {
         Ok(())
     }
 
-    /// Spawns, meshes, announces, and registers one more node, then runs the
-    /// production onboarding expansion: it publishes a map naming the joiner and
-    /// starts a transition for every bucket that only grows. The joiner holds
-    /// nothing until that transition completes.
+    /// Spawns, meshes, announces, and registers one more node, then runs the production
+    /// onboarding expansion: it publishes a map naming the joiner and starts a transition for
+    /// every bucket that only grows.
     pub async fn spawn_late_node(&mut self, kind: RealmNodeKind) -> TestResult<NodeId> {
         let node = spawn_node(self.realm_id, kind.clone()).await?;
         let node_id = node.node_id();
@@ -826,7 +825,7 @@ impl Topology {
         hang_cap(
             "announce late realm presence",
             drive(
-                AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                     realm_id: self.realm_id,
                     node_id,
                     schedule_refresh: true,
@@ -851,36 +850,34 @@ impl Topology {
         }
         self.apply_config(config).await?;
         // Production onboarding admits the joiner to the shared realm topics
-        // (`bootstrap_onboarding_finalize`); mirror it, or the joiner's own
-        // published events are refused by every peer and only reach the realm
-        // through incidental back-pulls of push sessions.
-        let shared_topic = DocumentSyncTarget::RealmConfig {
+        // (`bootstrap_onboarding_finalize`).
+        let shared_topic = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         }
         .sync_topic_id(self.realm_id, &PlacementRef::NIL);
         self.nodes[0]
             .net
-            .ensure_document_sync_topics(&[shared_topic], vec![node_id])?;
+            .ensure_sync_topics(&[shared_topic], vec![node_id])?;
         self.nodes[0]
             .net
-            .allow_document_sync_peers(&[shared_topic], vec![node_id])?;
+            .allow_topic_peers(&[shared_topic], vec![node_id])?;
 
         // The joiner runs the startup hook and joins the realm-config topic, as
         // a freshly started node does; without it no admin event reaches it.
         let node = self.find(node_id);
-        aruna_operations::startup::restore_shard_subscriptions(
+        aruna_operations::node::startup::restore_shard_subscriptions(
             &node.context,
             node_id,
             self.realm_id,
         )
         .await;
-        let topic = DocumentSyncTarget::RealmConfig {
+        let topic = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         }
         .sync_topic_id(self.realm_id, &PlacementRef::NIL);
         node.net
             .send_effect(Effect::Net(NetEffect::DocumentSync(
-                DocumentSyncEffect::SyncDocuments {
+                DocumentEffect::SyncDocuments {
                     topics: vec![topic],
                     peers: Vec::new(),
                 },
@@ -932,7 +929,7 @@ impl Topology {
                 config.to_bytes(&actor)?,
             )
             .await?;
-            node.net.refresh_realm_peers_from_document(&config).await?;
+            node.net.refresh_document_peers(&config).await?;
         }
         self.config = config;
         Ok(())
@@ -1003,11 +1000,13 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
         compute_handle: None,
     });
 
-    initialize_net_incoming(context.clone());
-    initialize_task_incoming(
+    initialize_incoming_fixture(context.clone());
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new_paused(),
+        &shutdown,
     )
     .await;
 
@@ -1071,7 +1070,7 @@ async fn install_realm_config(
     // pinned to a published map, exactly as a bootstrapped realm is.
     config.snapshot_candidate_map();
 
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
     let trusted = HashSet::from([realm_id]);
     for node in nodes {
         let actor = Actor {
@@ -1087,8 +1086,7 @@ async fn install_realm_config(
         )
         .await?;
         // The realm authorization document a permission check reads first, and the
-        // trusted-realm list a forwarded caller's bearer token validates against:
-        // both are per-node local state in production too.
+        // trusted-realm list a forwarded caller's bearer token validates against.
         write(
             node,
             AUTH_KEYSPACE,
@@ -1103,17 +1101,14 @@ async fn install_realm_config(
             postcard::to_allocvec(&trusted)?,
         )
         .await?;
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
 
-    // Admin operations ride the shared realm-config topic, which needs a genesis
-    // before anything can publish onto it. The last node seeds it so node zero,
-    // which the tests mutate through, starts from an empty origin sequence.
+    // Admin operations ride the shared realm-config topic, which needs a genesis before
+    // anything can publish onto it.
     seed_config_topic(nodes, realm_id, &config).await?;
 
-    // Activations must be reducer-owned to advance: a literal seed is only the
-    // bootstrap value. One explicit admin op per strategy hands ownership over,
-    // materializing the same epoch-1 activations the seed wrote.
+    // Activations must be reducer-owned to advance: a literal seed is only the bootstrap value.
     let strategy_ids: Vec<Ulid> = config
         .strategies
         .iter()
@@ -1122,8 +1117,8 @@ async fn install_realm_config(
     for strategy_id in strategy_ids {
         hang_cap(
             "initialize activations",
-            drive_realm_placement_mutation(
-                MutateRealmPlacementConfig {
+            drive_placement_mutation(
+                MutatePlacementConfig {
                     actor: Actor {
                         node_id: nodes[0].node_id(),
                         user_id,
@@ -1156,17 +1151,13 @@ async fn install_realm_config(
     )
     .await?;
 
-    // The startup hook, exactly as the binary runs it after loading the config: it
-    // joins the shared realm topics and reconciles the held shard topics. Nothing
-    // can be published onto a shard topic before its rank-0 holder has minted the
-    // genesis, so without this every write onto a bucket defers forever. A node
-    // whose rank-0 co-holder has not minted one yet leaves it for the next pass, so
-    // run until the reconciler reports clean rather than a fixed number of passes.
+    // The startup hook, exactly as the binary runs it after loading the config: it joins the
+    // shared realm topics and reconciles the held shard topics.
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "shard placement reconciliation never reported clean",
         || async {
             join_all(nodes.iter().map(|node| {
-                aruna_operations::startup::restore_shard_subscriptions(
+                aruna_operations::node::startup::restore_shard_subscriptions(
                     &node.context,
                     node.node_id(),
                     realm_id,
@@ -1174,7 +1165,7 @@ async fn install_realm_config(
             }))
             .await;
             let outcomes = join_all(nodes.iter().map(|node| {
-                aruna_operations::process_placements::process_shard_placements(
+                aruna_operations::placement::process_placements::process_shard_placements(
                     &node.context,
                     realm_id,
                     node.node_id(),
@@ -1198,25 +1189,23 @@ async fn seed_config_topic(
     realm_id: RealmId,
     config: &RealmConfigDocument,
 ) -> TestResult<()> {
-    // A User-kind node seeds when the fixture has one: it never submits an admin
-    // operation, so the genesis it publishes cannot collide with a later event
-    // from the same actor log.
+    // A User-kind node seeds when the fixture has one: it never submits an admin operation, so
+    // the genesis it publishes cannot collide with a later event from the same actor log.
     let seeder = nodes
         .iter()
         .find(|node| !node.is_sync_eligible())
         .or_else(|| nodes.last())
         .ok_or("topology has no nodes")?;
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     let placement =
-        aruna_operations::placement::placement_ref_for_target(config, &target, Default::default());
+        aruna_operations::placement::target_placement_ref(config, &target, Default::default());
     let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: seeder.node_id(),
         user_id: aruna_core::UserId::nil(realm_id),
         realm_id,
     };
-    let mut reducer_state =
-        AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+    let mut reducer_state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
     let event = reducer_state.apply_operation(
         &actor,
         AdminDocumentOperation::RealmConfigNodePlacementSet {
@@ -1229,13 +1218,12 @@ async fn seed_config_topic(
     )?;
     // Persist the state the seed event advanced, or the seeder's next mutation
     // would reuse origin sequence one and fork its own actor log.
-    let (key_space, key, value) =
-        aruna_core::storage_entries::admin_document_reducer_state_write_entry(&reducer_state)?;
+    let (key_space, key, value) = aruna_core::storage_entries::reducer_state_entry(&reducer_state)?;
     write(seeder, &key_space, key.to_vec(), value.to_vec()).await?;
     match seeder
         .net
         .send_effect(Effect::Net(NetEffect::DocumentSync(
-            DocumentSyncEffect::PublishDocuments {
+            DocumentEffect::PublishDocuments {
                 documents: vec![DocumentSyncPublish::AdminOperation {
                     target: target.clone(),
                     event: Box::new(event),
@@ -1248,7 +1236,7 @@ async fn seed_config_topic(
         )))
         .await
     {
-        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished { .. })) => {}
+        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsPublished { .. })) => {}
         other => return Err(format!("unexpected config topic seed publish: {other:?}").into()),
     }
     for node in nodes {
@@ -1258,14 +1246,14 @@ async fn seed_config_topic(
         match node
             .net
             .send_effect(Effect::Net(NetEffect::DocumentSync(
-                DocumentSyncEffect::SyncDocuments {
+                DocumentEffect::SyncDocuments {
                     topics: vec![topic],
                     peers: Vec::new(),
                 },
             )))
             .await
         {
-            Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
+            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled {
                 ..
             })) => {}
             other => return Err(format!("unexpected config topic seed sync: {other:?}").into()),
@@ -1280,7 +1268,7 @@ async fn seed_config_topic(
 async fn reconcile_nodes(
     nodes: &[TestNode],
     realm_id: RealmId,
-) -> Vec<aruna_operations::process_placements::PlacementReconcileOutcome> {
+) -> Vec<aruna_operations::placement::process_placements::PlacementReconcileOutcome> {
     join_all(nodes.iter().map(|node| {
         let span = tracing::info_span!(
             "node_pass",
@@ -1289,7 +1277,7 @@ async fn reconcile_nodes(
         async move {
             let started = std::time::Instant::now();
             let outcome = tracing::Instrument::instrument(
-                aruna_operations::process_placements::process_shard_placements(
+                aruna_operations::placement::process_placements::process_shard_placements(
                     &node.context,
                     realm_id,
                     node.node_id(),
@@ -1320,20 +1308,20 @@ pub async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
             node = %&node.node_id().to_string()[..8]
         );
         tracing::Instrument::instrument(
-            aruna_operations::task_incoming::drive_document_sync_outbox_drain(node.context.clone()),
+            aruna_operations::tasks::incoming::drive_sync_drain(node.context.clone()),
             span,
         )
     }))
     .await;
     let topic =
-        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
+        DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
     join_all(
         nodes
             .iter()
             .filter(|node| node.is_sync_eligible())
             .map(|node| {
                 node.net.send_effect(Effect::Net(NetEffect::DocumentSync(
-                    DocumentSyncEffect::SyncDocuments {
+                    DocumentEffect::SyncDocuments {
                         topics: vec![topic],
                         peers: Vec::new(),
                     },

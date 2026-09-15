@@ -1,8 +1,6 @@
-//! Rebuilding one family's projection from its immutable records.
-//!
-//! The projection is a cache with a bounded revision, never authority: it is
-//! deleted-and-rebuilt safe, it is invalidated by every append, and the mutable
-//! job row it bridges into is a local view of it, not its owner.
+//! Rebuilding one family's projection from its immutable records. The projection
+//! is a cache with a bounded revision, never authority: it is delete-and-rebuild
+//! safe, invalidated by every append, and the bridged job row is only a local view.
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};

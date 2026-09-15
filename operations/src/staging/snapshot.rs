@@ -3,19 +3,19 @@ use crate::driver::{
     routing_snapshot,
 };
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::staging::descriptor::build_version_source_binding;
-use crate::staging::read_source::{
-    ReadStagingSourceError, ReadStagingSourceInput, ReadStagingSourceOperation,
-};
+use crate::staging::descriptor::build_source_binding;
+use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
+use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, PathRestriction,
     RealmId, SourceConnector, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
 };
-use aruna_core::types::{GroupId, Key, NodeId, UserId, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -49,7 +49,7 @@ use aruna_core::structs::{BackendLocation, BlobLocationKey};
 #[derive(Debug, Error, PartialEq)]
 pub enum MaterializeSnapshotError {
     #[error(transparent)]
-    Read(#[from] ReadStagingSourceError),
+    Read(#[from] ReadSourceError),
     #[error(transparent)]
     Write(#[from] PutObjectError),
     #[error(transparent)]
@@ -67,7 +67,7 @@ pub async fn stage_snapshot_blob(
     input: MaterializeSnapshotInput,
 ) -> Result<MaterializeSnapshotResult, MaterializeSnapshotError> {
     let read_result = drive(
-        ReadStagingSourceOperation::new(ReadStagingSourceInput {
+        ReadSourceOperation::new(ReadSourceInput {
             group_id: input.group_id,
             connector_id: input.connector_id,
             source_path: input.source_path.clone(),
@@ -77,7 +77,7 @@ pub async fn stage_snapshot_blob(
     )
     .await?;
 
-    let mut version_source = build_version_source_binding(
+    let mut version_source = build_source_binding(
         StagingStrategy::Snapshot,
         &read_result.connector,
         &read_result.metadata,
@@ -137,10 +137,7 @@ pub async fn stage_snapshot_blob(
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
-    let put_result = drive(operation, context)
-        .await
-        .and_then(|result| result.transpose())?;
-    let put_result = put_result.ok_or(PutObjectError::PutObjectFailed)?;
+    let put_result = drive(operation, context).await?;
 
     Ok(MaterializeSnapshotResult {
         connector: read_result.connector,
@@ -221,9 +218,7 @@ async fn read_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::staging::test_utils::{
-        create_http_connector, create_test_bucket, setup_driver_context,
-    };
+    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use axum::Router;
     use axum::routing::get;
     use tokio::net::TcpListener;

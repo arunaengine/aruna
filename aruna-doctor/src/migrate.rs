@@ -1,10 +1,10 @@
-//! Re-encodes stored rows written before a field was added: job-family rows
-//! that embed a physical execution result without stdout and stderr tails, and
-//! realm configuration documents without the compute catch-up wait. Safe to
-//! repeat: a row already in the current shape is left untouched.
+//! Re-encodes legacy job results and realm configs missing current fields.
+//! Current rows remain unchanged and the derived projection cache is cleared.
+//! The migration is safe to repeat.
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
+use aruna_core::NodeId;
 use aruna_core::keyspaces::{
     JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
     JOB_FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
@@ -16,7 +16,6 @@ use aruna_core::structs::{
     RealmConfigDocument, RealmId, ResultMessage, SubmissionClaim, SubmissionId,
     WitnessBudgetRecord,
 };
-use aruna_core::types::NodeId;
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};
@@ -531,9 +530,8 @@ mod tests {
 
     #[test]
     fn rewrites_realm_configs() {
-        // A document stored before the catch-up wait or before the session idle
-        // timeout must decode again with the defaults, and a current document
-        // must stay byte-identical.
+        // Legacy documents decode with defaults for catch-up and session idle timeouts.
+        // Current documents remain byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let document = RealmConfigDocument::new(REALM, Vec::new(), 3);

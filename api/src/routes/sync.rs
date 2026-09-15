@@ -1,6 +1,5 @@
 use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission, ensure_permission_with,
-    require_unrestricted_realm_auth,
+    ValidatedBearer, ensure_permission, ensure_permission_with, require_unrestricted_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
@@ -8,25 +7,25 @@ use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{
     ArunaArn, AuthContext, BucketInfo, Permission, ReferenceHandling, SyncMode, SyncRelationship,
-    SyncState, SyncStatusSnapshot, blob_bucket_permission_path, ensure_confined_relative_path,
+    SyncState, SyncStatusSnapshot, bucket_permission_path, ensure_confined_path,
 };
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::MetadataAuthToken;
+use aruna_operations::metadata::AuthToken;
 use aruna_operations::replication::protocol::ReplicationMode;
-use aruna_operations::replication::queue::{QueueBlobReplicationOperation, relationship_job_stats};
+use aruna_operations::replication::queue::{QueueBlobOperation, relationship_job_stats};
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
-use aruna_operations::request_policy::PolicyRequestExtras;
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use aruna_operations::sync_mirror_repair::{
-    SyncMirrorRepairIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
-    request_sync_mirror_create, stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use aruna_operations::sync::mirror_repair::{
+    SyncMirrorIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
+    request_mirror_create, stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
 };
-use aruna_operations::sync_relationship::{
-    DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, ListSyncRelationshipsOperation,
-    StoreSyncRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
+use aruna_operations::sync::sync_relationship::{
+    DeleteRelationshipOperation, GetRelationshipOperation, ListRelationshipsOperation,
+    StoreRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
     create_sync_relationship, remove_outgoing_relationship,
 };
 use axum::extract::{Path, Query, State};
@@ -322,10 +321,10 @@ node checks WRITE on the target bucket before it accepts its half of the relatio
 pub async fn create_sync(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateSyncRequest>,
 ) -> ServerResult<(StatusCode, Json<SyncRelationshipResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     validate_endpoint(&request.source.bucket, request.source.prefix.as_deref())?;
     validate_endpoint(&request.target.bucket, request.target.prefix.as_deref())?;
@@ -354,7 +353,7 @@ pub async fn create_sync(
     ensure_permission(
         &state,
         &auth,
-        blob_bucket_permission_path(
+        bucket_permission_path(
             state.get_realm_id(),
             source_info.group_id,
             state.get_node_id(),
@@ -426,7 +425,7 @@ pub async fn create_sync(
         }
         kick_mirror_repair(&context).await;
         if remove_mirror(&state, &relationship).await {
-            clear_repair(&state, &relationship, SyncMirrorRepairIntent::Delete).await;
+            clear_repair(&state, &relationship, SyncMirrorIntent::Delete).await;
         }
         return Err(error);
     }
@@ -443,13 +442,13 @@ pub async fn create_sync(
             .await;
             kick_mirror_repair(&context).await;
             if remove_mirror(&state, &relationship).await {
-                clear_repair(&state, &relationship, SyncMirrorRepairIntent::Delete).await;
+                clear_repair(&state, &relationship, SyncMirrorIntent::Delete).await;
             }
         }
         return Err(error);
     }
 
-    clear_repair(&state, &relationship, SyncMirrorRepairIntent::Reconcile).await;
+    clear_repair(&state, &relationship, SyncMirrorIntent::Reconcile).await;
 
     Ok((StatusCode::CREATED, Json(map_relationship(&relationship))))
 }
@@ -522,7 +521,7 @@ pub async fn list_sync(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(params): Query<SyncListParams>,
 ) -> ServerResult<Json<SyncListResponse>> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     if params.bucket.as_deref().is_some_and(str::is_empty)
         || params.prefix.as_deref().is_some_and(str::is_empty)
     {
@@ -632,7 +631,7 @@ pub async fn get_sync(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
 ) -> ServerResult<Json<SyncDetailResponse>> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let (relationship, _) = load_relationship(&state, id).await?;
     ensure_creator(&auth, &relationship)?;
@@ -736,11 +735,11 @@ creator may change a relationship, and READ on the source bucket is checked as w
 pub async fn update_sync(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(id): Path<String>,
     Json(request): Json<UpdateSyncRequest>,
 ) -> ServerResult<Json<SyncRelationshipResponse>> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let id = parse_id(&id)?;
     let mut relationship =
@@ -806,7 +805,7 @@ pub async fn update_sync(
             return Err(error);
         }
     };
-    clear_repair(&state, &updated, SyncMirrorRepairIntent::Reconcile).await;
+    clear_repair(&state, &updated, SyncMirrorIntent::Reconcile).await;
     // Nothing was queued while the relationship was not enabled, so resuming it
     // has to catch up on the versions written in the meantime.
     if !was_enabled && updated.state == SyncState::Enabled {
@@ -861,7 +860,7 @@ pub async fn run_sync(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<SyncRunResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let mut relationship =
         get_relationship(&state, id, SyncRelationshipDirection::Outgoing).await?;
@@ -925,7 +924,7 @@ pub async fn delete_sync(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let (relationship, direction) = load_relationship(&state, id).await?;
     ensure_creator(&auth, &relationship)?;
@@ -936,9 +935,7 @@ pub async fn delete_sync(
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
     match direction {
-        // Reference relationships leave a detached serving stub behind so
-        // that data retained by the target stays readable; other modes are
-        // removed outright.
+        // References retain a serving stub for target-held data; other modes are removed.
         SyncRelationshipDirection::Outgoing => {
             remove_outgoing_relationship(&context, relationship.clone())
                 .await
@@ -950,7 +947,7 @@ pub async fn delete_sync(
     }
     kick_mirror_repair(&context).await;
     if remove_mirror(&state, &relationship).await {
-        clear_repair(&state, &relationship, SyncMirrorRepairIntent::Delete).await;
+        clear_repair(&state, &relationship, SyncMirrorIntent::Delete).await;
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -973,10 +970,8 @@ fn validate_endpoint(bucket: &str, prefix: Option<&str>) -> ServerResult<()> {
                 "prefix must be non-empty when provided".to_string(),
             ));
         }
-        // Replicated keys inherit the prefix via the sync key mapping, so the
-        // same confinement rules as object keys must hold here; otherwise
-        // replication produces keys that normal S3 operations reject.
-        ensure_confined_relative_path(StdPath::new(prefix))
+        // Replicated prefixes must obey object-key confinement to remain readable through S3.
+        ensure_confined_path(StdPath::new(prefix))
             .map_err(|error| ServerError::BadRequestReason(format!("invalid prefix: {error}")))?;
     }
     Ok(())
@@ -997,14 +992,13 @@ fn make_endpoint(
 
 async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
     match drive(
-        GetBucketInfoOperation::new(bucket.to_string()),
+        GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
     )
     .await
-    .and_then(|result| result.transpose())
     {
-        Ok(Some(bucket_info)) => Ok(bucket_info),
-        Ok(None) | Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Ok(bucket_info) => Ok(bucket_info),
+        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
         Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
 }
@@ -1022,7 +1016,7 @@ async fn ensure_source_read(
     ensure_permission(
         state,
         auth,
-        blob_bucket_permission_path(
+        bucket_permission_path(
             state.get_realm_id(),
             bucket_info.group_id,
             state.get_node_id(),
@@ -1048,7 +1042,7 @@ async fn ensure_sync_write(
     ensure_permission_with(
         state,
         auth,
-        blob_bucket_permission_path(
+        bucket_permission_path(
             state.get_realm_id(),
             bucket_info.group_id,
             state.get_node_id(),
@@ -1063,7 +1057,7 @@ async fn ensure_sync_write(
 async fn create_mirror(
     state: &ServerState,
     auth: &AuthContext,
-    bearer: &ValidatedArunaBearerTokenCarrier,
+    bearer: &ValidatedBearer,
     source_group_id: Ulid,
     relationship: SyncRelationship,
 ) -> ServerResult<()> {
@@ -1076,7 +1070,7 @@ async fn create_mirror(
         ensure_permission_with(
             state,
             auth,
-            blob_bucket_permission_path(
+            bucket_permission_path(
                 state.get_realm_id(),
                 bucket_info.group_id,
                 state.get_node_id(),
@@ -1091,9 +1085,9 @@ async fn create_mirror(
             .map(|_| ());
     }
 
-    let auth_token = MetadataAuthToken::bearer(bearer.as_str().to_string())
+    let auth_token = AuthToken::bearer(bearer.as_str().to_string())
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
-    request_sync_mirror_create(
+    request_mirror_create(
         &state.get_ctx(),
         relationship.target.node_id,
         auth_token,
@@ -1118,7 +1112,7 @@ async fn remove_mirror(state: &ServerState, relationship: &SyncRelationship) -> 
 async fn clear_repair(
     state: &ServerState,
     relationship: &SyncRelationship,
-    expected: SyncMirrorRepairIntent,
+    expected: SyncMirrorIntent,
 ) {
     let context = state.get_ctx();
     if let Err(error) = clear_mirror_repair(&context, relationship, expected).await {
@@ -1164,7 +1158,7 @@ async fn queue_relationship(
         .map(|prefix| ReplicateScopeTarget::Prefix(prefix.to_string()))
         .unwrap_or(ReplicateScopeTarget::Bucket);
     let result = drive(
-        QueueBlobReplicationOperation::new_relationship(
+        QueueBlobOperation::new_relationship(
             ReplicateScopeInput {
                 bucket: bucket.to_string(),
                 target,
@@ -1190,7 +1184,7 @@ async fn store_relationship(
     direction: SyncRelationshipDirection,
 ) -> ServerResult<SyncRelationship> {
     drive(
-        StoreSyncRelationshipOperation::new(relationship, direction),
+        StoreRelationshipOperation::new(relationship, direction),
         &state.get_ctx(),
     )
     .await
@@ -1203,7 +1197,7 @@ async fn delete_relationship(
     direction: SyncRelationshipDirection,
 ) -> ServerResult<()> {
     drive(
-        DeleteSyncRelationshipOperation::new(relationship, direction),
+        DeleteRelationshipOperation::new(relationship, direction),
         &state.get_ctx(),
     )
     .await
@@ -1216,7 +1210,7 @@ async fn list_relationships(
     bucket: Option<String>,
 ) -> ServerResult<Vec<SyncRelationship>> {
     drive(
-        ListSyncRelationshipsOperation::new(direction, bucket),
+        ListRelationshipsOperation::new(direction, bucket),
         &state.get_ctx(),
     )
     .await
@@ -1238,7 +1232,7 @@ async fn get_relationship(
     direction: SyncRelationshipDirection,
 ) -> ServerResult<SyncRelationship> {
     drive(
-        GetSyncRelationshipOperation::new(id, direction),
+        GetRelationshipOperation::new(id, direction),
         &state.get_ctx(),
     )
     .await
@@ -1254,7 +1248,7 @@ async fn load_relationship(
     id: Ulid,
 ) -> ServerResult<(SyncRelationship, SyncRelationshipDirection)> {
     match drive(
-        GetSyncRelationshipOperation::new(id, SyncRelationshipDirection::Outgoing),
+        GetRelationshipOperation::new(id, SyncRelationshipDirection::Outgoing),
         &state.get_ctx(),
     )
     .await
@@ -1368,740 +1362,5 @@ fn map_time(value: Option<SystemTime>) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use aruna_core::UserId;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
-        SYNC_MIRROR_REPAIR_KEYSPACE,
-    };
-    use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, NodeCapabilities, PathRestriction,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    };
-    use aruna_operations::driver::DriverContext;
-    use aruna_operations::jobs::runtime::JobsRuntime;
-    use aruna_storage::storage::FjallStorage;
-    use tempfile::TempDir;
-
-    fn test_node(seed: u8) -> NodeId {
-        iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
-    fn test_realm() -> RealmId {
-        RealmId::from_bytes(
-            ed25519_dalek::SigningKey::from_bytes(&[1u8; 32])
-                .verifying_key()
-                .to_bytes(),
-        )
-    }
-
-    fn test_group() -> Ulid {
-        Ulid::from_bytes([6u8; 16])
-    }
-
-    fn test_relationship() -> SyncRelationship {
-        let realm_id = test_realm();
-        SyncRelationship {
-            id: Ulid::from_bytes([2u8; 16]),
-            source: ArunaArn::s3_object_prefix(realm_id, test_node(3), "source", "selected/")
-                .unwrap(),
-            target: ArunaArn::s3_object_prefix(realm_id, test_node(4), "target", "replica/")
-                .unwrap(),
-            mode: SyncMode::Continuous,
-            reference_handling: Default::default(),
-            reference_serving: false,
-            replicate_deletes: true,
-            created_by: UserId::local(Ulid::from_bytes([5u8; 16]), realm_id),
-            created_at: SystemTime::UNIX_EPOCH,
-            state: SyncState::Enabled,
-            status: SyncStatusSnapshot::default(),
-        }
-    }
-
-    async fn test_state() -> (TempDir, Arc<ServerState>, AuthContext, SyncRelationship) {
-        let storage_dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
-        let relationship = test_relationship();
-        let realm_id = relationship.source.realm_id;
-        let node_id = relationship.source.node_id;
-        let state = Arc::new(
-            ServerState::new(
-                Arc::new(DriverContext {
-                    storage_handle: storage,
-                    net_handle: None,
-                    blob_handle: None,
-                    metadata_handle: None,
-                    task_handle: None,
-                    compute_handle: None,
-                }),
-                realm_id,
-                node_id,
-                NodeCapabilities::user_node(realm_id).unwrap(),
-                false,
-                None,
-                JobsRuntime::new(),
-            )
-            .await,
-        );
-        let actor = Actor {
-            node_id,
-            user_id: relationship.created_by,
-            realm_id,
-        };
-        let group_id = test_group();
-        let storage = &state.get_ctx().storage_handle;
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let group_auth = GroupAuthorizationDocument::new_default_group_doc(
-            relationship.created_by,
-            realm_id,
-            group_id,
-        );
-        let group = aruna_core::structs::Group {
-            display_name: "sync-test".to_string(),
-            group_id,
-            realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner: relationship.created_by,
-        };
-        // Request-policy loading fails closed without the realm config document.
-        for (key_space, key, value) in [
-            (
-                REALM_CONFIG_KEYSPACE,
-                realm_id.as_bytes().to_vec(),
-                RealmConfigDocument::default_for_realm(realm_id, Vec::new())
-                    .to_bytes(&actor)
-                    .unwrap(),
-            ),
-            (
-                AUTH_KEYSPACE,
-                realm_id.as_bytes().to_vec(),
-                realm_auth.to_bytes(&actor).unwrap(),
-            ),
-            (
-                AUTH_KEYSPACE,
-                group_id.to_bytes().to_vec(),
-                group_auth.to_bytes(&actor).unwrap(),
-            ),
-            (
-                GROUP_KEYSPACE,
-                group_id.to_bytes().to_vec(),
-                group.to_bytes(&actor).unwrap(),
-            ),
-        ] {
-            storage
-                .send_storage_effect(StorageEffect::Write {
-                    key_space: key_space.to_string(),
-                    key: key.into(),
-                    value: value.into(),
-                    txn_id: None,
-                })
-                .await;
-        }
-        for bucket in ["source", "target"] {
-            storage
-                .send_storage_effect(StorageEffect::Write {
-                    key_space: S3_BUCKET_KEYSPACE.to_string(),
-                    key: bucket.as_bytes().to_vec().into(),
-                    value: BucketInfo {
-                        group_id,
-                        created_at: SystemTime::UNIX_EPOCH,
-                        created_by: relationship.created_by,
-                        cors_configuration: None,
-                        storage_routing: Vec::new(),
-                        placement_policies: Vec::new(),
-                        placement_policy_generation: 0,
-                    }
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-                    txn_id: None,
-                })
-                .await;
-        }
-        let auth = AuthContext {
-            user_id: relationship.created_by,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        };
-        (storage_dir, state, auth, relationship)
-    }
-
-    fn create_request(target_node: NodeId) -> CreateSyncRequest {
-        CreateSyncRequest {
-            source: SyncSourceRequest {
-                bucket: "source".to_string(),
-                prefix: None,
-            },
-            target: SyncTargetRequest {
-                node_id: target_node.to_string(),
-                bucket: "target".to_string(),
-                prefix: None,
-            },
-            mode: ApiSyncMode::Once,
-            reference_handling: ApiReferenceHandling::default(),
-            replicate_deletes: false,
-        }
-    }
-
-    #[test]
-    fn rejects_workspace_endpoints() {
-        assert!(validate_endpoint("ws-temporary", None).is_err());
-        assert!(validate_endpoint("bucket", Some("")).is_err());
-        assert!(validate_endpoint("bucket/name", None).is_err());
-        assert!(validate_endpoint("bucket", Some("selected/")).is_ok());
-    }
-
-    #[test]
-    fn rejects_unsafe_prefixes() {
-        assert!(validate_endpoint("bucket", Some("../escape")).is_err());
-        assert!(validate_endpoint("bucket", Some("nested/../escape")).is_err());
-        assert!(validate_endpoint("bucket", Some("/absolute")).is_err());
-        assert!(validate_endpoint("bucket", Some("with\u{7}control")).is_err());
-        assert!(validate_endpoint("bucket", Some("nested/prefix/")).is_ok());
-    }
-
-    #[test]
-    fn serializes_canonical_arns() {
-        let relationship = test_relationship();
-        let response = map_relationship(&relationship);
-
-        assert_eq!(
-            ArunaArn::parse(&response.source).unwrap(),
-            relationship.source
-        );
-        assert_eq!(
-            ArunaArn::parse(&response.target).unwrap(),
-            relationship.target
-        );
-    }
-
-    #[test]
-    fn filters_prefix_overlap() {
-        let relationship = test_relationship();
-        let results = filter_relationships(
-            vec![relationship.clone()],
-            relationship.created_by,
-            SyncRelationshipDirection::Outgoing,
-            Some("selected/nested"),
-        );
-        assert_eq!(results.len(), 1);
-
-        let results = filter_relationships(
-            vec![relationship.clone()],
-            relationship.created_by,
-            SyncRelationshipDirection::Outgoing,
-            Some("other"),
-        );
-        assert!(results.is_empty());
-    }
-
-    #[tokio::test]
-    async fn lists_stored_relationship() {
-        let (_storage_dir, state, auth, relationship) = test_state().await;
-        drive(
-            StoreSyncRelationshipOperation::new(
-                relationship.clone(),
-                SyncRelationshipDirection::Outgoing,
-            ),
-            &state.get_ctx(),
-        )
-        .await
-        .unwrap();
-
-        let Json(response) = list_sync(
-            State(state),
-            Extension(Some(auth)),
-            Query(SyncListParams::default()),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.outgoing.len(), 1);
-        assert!(response.incoming.is_empty());
-        assert_eq!(
-            ArunaArn::parse(&response.outgoing[0].source).unwrap(),
-            relationship.source
-        );
-    }
-
-    #[test]
-    fn state_toggles_link() {
-        // Pausing and resuming are the only state changes a caller may request,
-        // and resuming a stalled relationship clears its recorded failure.
-        let mut relationship = test_relationship();
-        assert!(apply_state(&mut relationship, SyncState::Paused));
-        assert_eq!(relationship.state, SyncState::Paused);
-        assert!(!apply_state(&mut relationship, SyncState::Paused));
-
-        relationship.state = SyncState::Failed {
-            reason: "peer gone".to_string(),
-        };
-        relationship.status.last_error = Some("peer gone".to_string());
-        relationship.status.counters.consecutive_failures = 3;
-        assert!(apply_state(&mut relationship, SyncState::Enabled));
-        assert_eq!(relationship.state, SyncState::Enabled);
-        assert!(relationship.status.last_error.is_none());
-        assert_eq!(relationship.status.counters.consecutive_failures, 0);
-    }
-
-    #[tokio::test]
-    async fn refuses_foreign_pause() {
-        // Only the creator may pause a relationship, even with realm auth.
-        let (_storage_dir, state, mut auth, relationship) = test_state().await;
-        drive(
-            StoreSyncRelationshipOperation::new(
-                relationship.clone(),
-                SyncRelationshipDirection::Outgoing,
-            ),
-            &state.get_ctx(),
-        )
-        .await
-        .unwrap();
-        auth.user_id = UserId::local(Ulid::from_bytes([9u8; 16]), auth.realm_id);
-
-        let error = update_sync(
-            State(state),
-            Extension(Some(auth)),
-            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-                "sync-test-token",
-            ))),
-            Path(relationship.id.to_string()),
-            Json(UpdateSyncRequest {
-                reference_handling: None,
-                state: Some(ApiSyncState::Paused),
-            }),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(error, ServerError::Forbidden));
-    }
-
-    /// Both ends on the fixture node, so the mirror write stays local.
-    fn local_relationship(node_id: NodeId) -> SyncRelationship {
-        let mut relationship = test_relationship();
-        relationship.target =
-            ArunaArn::s3_object_prefix(relationship.source.realm_id, node_id, "target", "replica/")
-                .unwrap();
-        relationship
-    }
-
-    async fn store_link(state: &ServerState, relationship: &SyncRelationship) {
-        drive(
-            StoreSyncRelationshipOperation::new(
-                relationship.clone(),
-                SyncRelationshipDirection::Outgoing,
-            ),
-            &state.get_ctx(),
-        )
-        .await
-        .unwrap();
-    }
-
-    async fn patch(
-        state: &Arc<ServerState>,
-        auth: &AuthContext,
-        relationship: &SyncRelationship,
-        request: UpdateSyncRequest,
-    ) -> ServerResult<Json<SyncRelationshipResponse>> {
-        update_sync(
-            State(state.clone()),
-            Extension(Some(auth.clone())),
-            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-                "sync-test-token",
-            ))),
-            Path(relationship.id.to_string()),
-            Json(request),
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn resume_queues_backfill() {
-        // Nothing is queued while a relationship is paused, so versions written
-        // in the meantime only replicate if resuming catches up on them.
-        let (_storage_dir, state, auth, _) = test_state().await;
-        let mut relationship = local_relationship(state.get_node_id());
-        relationship.state = SyncState::Paused;
-        store_link(&state, &relationship).await;
-        assert_eq!(load_job_stats(&state, relationship.id).await.unwrap().0, 0);
-
-        let Json(response) = patch(
-            &state,
-            &auth,
-            &relationship,
-            UpdateSyncRequest {
-                reference_handling: None,
-                state: Some(ApiSyncState::Enabled),
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.state, "enabled");
-        assert_eq!(load_job_stats(&state, relationship.id).await.unwrap().0, 1);
-    }
-
-    #[tokio::test]
-    async fn edit_skips_backfill() {
-        // An enabled relationship already queues its own work, so an unrelated
-        // edit must not enqueue a full pass over its scope.
-        let (_storage_dir, state, auth, _) = test_state().await;
-        let relationship = local_relationship(state.get_node_id());
-        store_link(&state, &relationship).await;
-
-        let Json(response) = patch(
-            &state,
-            &auth,
-            &relationship,
-            UpdateSyncRequest {
-                reference_handling: Some(ApiReferenceHandling::Preserve),
-                state: None,
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.reference_handling, ApiReferenceHandling::Preserve);
-        assert_eq!(load_job_stats(&state, relationship.id).await.unwrap().0, 0);
-    }
-
-    #[tokio::test]
-    async fn rejects_invalid_id() {
-        let (_storage_dir, state, auth, _) = test_state().await;
-        let error = get_sync(
-            State(state),
-            Extension(Some(auth)),
-            Path("invalid".to_string()),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(error, ServerError::BadRequestReason(_)));
-    }
-
-    #[tokio::test]
-    async fn rejects_restricted_run() {
-        for restrictions in [
-            Some(vec![PathRestriction {
-                pattern: "/restricted/**".to_string(),
-                permission: Permission::READ,
-            }]),
-            Some(Vec::new()),
-        ] {
-            let (_storage_dir, state, mut auth, relationship) = test_state().await;
-            auth.path_restrictions = restrictions;
-            let error = run_sync(
-                State(state),
-                Extension(Some(auth)),
-                Path(relationship.id.to_string()),
-            )
-            .await
-            .unwrap_err();
-            assert!(matches!(error, ServerError::Forbidden));
-        }
-    }
-
-    #[tokio::test]
-    async fn rejects_restricted_control() {
-        for restrictions in [
-            Some(vec![PathRestriction {
-                pattern: "/restricted/**".to_string(),
-                permission: Permission::READ,
-            }]),
-            Some(Vec::new()),
-        ] {
-            let (_storage_dir, state, mut auth, _) = test_state().await;
-            auth.path_restrictions = restrictions;
-
-            assert!(matches!(
-                list_sync(
-                    State(state.clone()),
-                    Extension(Some(auth.clone())),
-                    Query(SyncListParams::default()),
-                )
-                .await,
-                Err(ServerError::Forbidden)
-            ));
-            assert!(matches!(
-                get_sync(
-                    State(state.clone()),
-                    Extension(Some(auth.clone())),
-                    Path("invalid".to_string()),
-                )
-                .await,
-                Err(ServerError::Forbidden)
-            ));
-            assert!(matches!(
-                update_sync(
-                    State(state.clone()),
-                    Extension(Some(auth.clone())),
-                    Extension(None),
-                    Path("invalid".to_string()),
-                    Json(UpdateSyncRequest {
-                        reference_handling: Some(ApiReferenceHandling::Materialize),
-                        state: None,
-                    }),
-                )
-                .await,
-                Err(ServerError::Forbidden)
-            ));
-            assert!(matches!(
-                delete_sync(
-                    State(state),
-                    Extension(Some(auth)),
-                    Path("invalid".to_string()),
-                )
-                .await,
-                Err(ServerError::Forbidden)
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn rejects_restricted_create() {
-        for restrictions in [
-            Some(vec![PathRestriction {
-                pattern: "/restricted/**".to_string(),
-                permission: Permission::READ,
-            }]),
-            Some(Vec::new()),
-        ] {
-            let (_storage_dir, state, mut auth, _) = test_state().await;
-            auth.path_restrictions = restrictions;
-            let error = create_sync(
-                State(state.clone()),
-                Extension(Some(auth)),
-                Extension(None),
-                Json(create_request(test_node(3))),
-            )
-            .await
-            .unwrap_err();
-            assert!(matches!(error, ServerError::Forbidden));
-        }
-    }
-
-    #[tokio::test]
-    async fn accepts_unrestricted_create() {
-        let (_storage_dir, state, auth, _) = test_state().await;
-        let (status, _) = create_sync(
-            State(state),
-            Extension(Some(auth)),
-            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-                "sync-test-token",
-            ))),
-            Json(create_request(test_node(3))),
-        )
-        .await
-        .unwrap();
-        assert_eq!(status, StatusCode::CREATED);
-    }
-
-    #[tokio::test]
-    async fn mirror_denies_create() {
-        let (_storage_dir, state, auth, _) = test_state().await;
-        let actor = Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: auth.realm_id,
-        };
-        let mut group_auth = GroupAuthorizationDocument::new_default_group_doc(
-            auth.user_id,
-            auth.realm_id,
-            test_group(),
-        );
-        group_auth
-            .policies
-            .push(aruna_core::request_policy::RequestPolicy {
-                policy_id: Ulid::generate(),
-                name: "deny-sync-create".to_string(),
-                kind: aruna_core::request_policy::PolicyKind::Deny,
-                when: None,
-                expression: "operation == 's3.PutBucketReplication'".to_string(),
-                enabled: true,
-            });
-        state
-            .get_ctx()
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: AUTH_KEYSPACE.to_string(),
-                key: test_group().to_bytes().to_vec().into(),
-                value: group_auth.to_bytes(&actor).unwrap().into(),
-                txn_id: None,
-            })
-            .await;
-
-        let error = create_sync(
-            State(state),
-            Extension(Some(auth)),
-            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-                "sync-test-token",
-            ))),
-            Json(create_request(test_node(3))),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(error, ServerError::Forbidden));
-    }
-
-    #[tokio::test]
-    async fn delete_preserve_detaches() {
-        let (_storage_dir, state, auth, mut relationship) = test_state().await;
-        relationship.set_reference_handling(ReferenceHandling::Preserve);
-        relationship.set_reference_handling(ReferenceHandling::Materialize);
-        drive(
-            StoreSyncRelationshipOperation::new(
-                relationship.clone(),
-                SyncRelationshipDirection::Outgoing,
-            ),
-            &state.get_ctx(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            delete_sync(
-                State(state.clone()),
-                Extension(Some(auth.clone())),
-                Path(relationship.id.to_string()),
-            )
-            .await
-            .unwrap(),
-            StatusCode::NO_CONTENT
-        );
-
-        // The outgoing record survives as a detached serving stub ...
-        let stored = drive(
-            GetSyncRelationshipOperation::new(relationship.id, SyncRelationshipDirection::Outgoing),
-            &state.get_ctx(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(stored.state, SyncState::Detached);
-
-        // ... but the management API treats the relationship as removed.
-        assert!(matches!(
-            get_sync(
-                State(state.clone()),
-                Extension(Some(auth.clone())),
-                Path(relationship.id.to_string()),
-            )
-            .await,
-            Err(ServerError::NotFound)
-        ));
-        let Json(listed) = list_sync(
-            State(state),
-            Extension(Some(auth)),
-            Query(SyncListParams::default()),
-        )
-        .await
-        .unwrap();
-        assert!(listed.outgoing.is_empty());
-    }
-
-    #[tokio::test]
-    async fn delete_stages_repair() {
-        let (_storage_dir, state, auth, relationship) = test_state().await;
-        drive(
-            StoreSyncRelationshipOperation::new(
-                relationship.clone(),
-                SyncRelationshipDirection::Outgoing,
-            ),
-            &state.get_ctx(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            delete_sync(
-                State(state.clone()),
-                Extension(Some(auth)),
-                Path(relationship.id.to_string()),
-            )
-            .await
-            .unwrap(),
-            StatusCode::NO_CONTENT
-        );
-
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = state
-            .get_ctx()
-            .storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
-                key: relationship.id.to_bytes().to_vec().into(),
-                txn_id: None,
-            })
-            .await
-        else {
-            panic!("missing mirror repair read result");
-        };
-        assert!(value.is_some());
-        assert!(matches!(
-            get_relationship(&state, relationship.id, SyncRelationshipDirection::Outgoing,).await,
-            Err(ServerError::NotFound)
-        ));
-    }
-
-    #[tokio::test]
-    async fn delete_respects_policy() {
-        let (_storage_dir, state, auth, relationship) = test_state().await;
-        drive(
-            StoreSyncRelationshipOperation::new(
-                relationship.clone(),
-                SyncRelationshipDirection::Outgoing,
-            ),
-            &state.get_ctx(),
-        )
-        .await
-        .unwrap();
-
-        let actor = Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: auth.realm_id,
-        };
-        let mut group_auth = GroupAuthorizationDocument::new_default_group_doc(
-            auth.user_id,
-            auth.realm_id,
-            test_group(),
-        );
-        group_auth
-            .policies
-            .push(aruna_core::request_policy::RequestPolicy {
-                policy_id: Ulid::generate(),
-                name: "deny-sync-delete".to_string(),
-                kind: aruna_core::request_policy::PolicyKind::Deny,
-                when: None,
-                expression: "operation == 's3.DeleteBucketReplication'".to_string(),
-                enabled: true,
-            });
-        state
-            .get_ctx()
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: AUTH_KEYSPACE.to_string(),
-                key: test_group().to_bytes().to_vec().into(),
-                value: group_auth.to_bytes(&actor).unwrap().into(),
-                txn_id: None,
-            })
-            .await;
-
-        let error = delete_sync(
-            State(state.clone()),
-            Extension(Some(auth)),
-            Path(relationship.id.to_string()),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(error, ServerError::Forbidden));
-        assert!(
-            get_relationship(&state, relationship.id, SyncRelationshipDirection::Outgoing,)
-                .await
-                .is_ok()
-        );
-    }
-}
+#[path = "sync_tests.rs"]
+mod tests;

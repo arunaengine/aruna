@@ -1,10 +1,6 @@
-//! Responder-local coverage of a bucket default.
-//!
-//! Setting a bucket default governs versions minted after it; it never rewrites
-//! what is already stored. This scan therefore reports what THIS node observes
-//! about its own current heads, with the exact refs and generation it compared
-//! against, and says so in its limits. Historical versions are a separate,
-//! diagnostic scope that no bulk action targets.
+//! Responder-local coverage of a bucket default: a default only governs versions
+//! minted after it, so this scan reports what THIS node observes of its current
+//! heads and its compared refs/generation. Historical versions are diagnostic.
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -24,7 +20,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 
 /// Upper bound on one page, so a scan can never walk a whole bucket at once.
 pub const COVERAGE_PAGE_LIMIT: usize = 256;
@@ -626,19 +622,21 @@ impl Operation for PolicyCoverageOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         AttachmentGap, CopyState, CoverageError, CoverageInput, CoverageLimit, CoverageReport,
         CoverageScope, PolicyCoverageOperation,
     };
+    use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
         AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, ManagedCopyRecord, ManagedCopyState, PlacementPolicyRef, RealmId,
         VersionKey,
     };
-    use aruna_core::types::{Key, NodeId, UserId};
+    use aruna_core::types::Key;
     use std::collections::HashMap;
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;

@@ -1,10 +1,6 @@
 //! Writes one remote version into a synced folder and records what happened.
 //!
-//! The guard travels with the write: the adapter refuses the rename when the
-//! file no longer carries the bytes the decision was taken on, and the refusal
-//! becomes a pending entry the owner resolves explicitly. When the write is an
-//! explicit owner action, its audit row is committed in the same transaction as
-//! the base row that records it.
+//! A rename whose bytes changed leaves a pending entry; the action's audit joins its base row.
 
 use std::sync::Arc;
 
@@ -18,8 +14,8 @@ use aruna_core::structs::{
     ActionOutcome, AuthContext, EntrySide, EntryState, PendingMark, ReplaceReason,
     SyncActionRecord, SyncBase, SyncedBytes, SyncedFolder, VersionedObjectArn, WriteGuard,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, TxnId, Value};
-use aruna_core::util::unix_timestamp_millis;
 use bytes::Bytes;
 use smallvec::smallvec;
 use thiserror::Error;

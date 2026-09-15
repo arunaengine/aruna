@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
@@ -18,40 +20,36 @@ use aruna_core::structs::{
     MultipartChecksumType, MultipartUpload, MultipartUploadStatus, PathRestriction, Permission,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, RoutingSnapshot,
     StoragePurgeCheckpoint, StoragePurgeScope, StoragePurgeSpec, VersionKey,
-    blob_bucket_permission_path,
+    bucket_permission_path,
 };
-use aruna_core::types::{GroupId, NodeId, UserId};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::GroupId;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::{
     ClaimOutcome, claim_job, complete_job, insert_job, put_purge_checkpoint, transition_to_running,
 };
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
-use aruna_operations::s3::complete_multipart_upload::{
-    CompleteMultipartUploadError, CompleteMultipartUploadInput, CompleteMultipartUploadOperation,
+use aruna_operations::s3::complete_upload::{
+    CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
 };
 use aruna_operations::s3::copy_object::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
+use aruna_operations::s3::copy_part::{PartCopyError, PartCopyInput, upload_part_copy};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::create_multipart_upload::{
-    CreateMultipartUploadError, CreateMultipartUploadInput, CreateMultipartUploadOperation,
+use aruna_operations::s3::create_upload::{
+    CreateMultipartError, CreateMultipartInput, CreateMultipartOperation,
 };
 use aruna_operations::s3::delete_object::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
 };
-use aruna_operations::s3::delete_objects::{
-    DeleteObjectsEntry, DeleteObjectsInput, delete_objects,
-};
+use aruna_operations::s3::delete_objects::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
 use aruna_operations::s3::purge_fence::{PurgeFenceError, acquire_purge_fence, fence_key};
 use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::s3::upload_part::{UploadPartError, UploadPartInput, UploadPartOperation};
-use aruna_operations::s3::upload_part_copy::{
-    UploadPartCopyError, UploadPartCopyInput, upload_part_copy,
-};
 use aruna_storage::{StorageHandle, storage};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -90,8 +88,8 @@ async fn setup_context() -> TestContext {
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(node_id, RealmNodeKind::Server);
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(user_id, realm_id, group_id);
     let group = Group {
         display_name: "purge".to_string(),
         group_id,
@@ -143,8 +141,6 @@ async fn setup_context() -> TestContext {
         &driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     TestContext {
@@ -195,7 +191,7 @@ fn put_operation(context: &TestContext, key: &str, bytes: &[u8]) -> PutObjectOpe
 }
 
 #[tokio::test]
-async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
+async fn scoped_fence_isolates() {
     let context = setup_context().await;
     let upload = seed_upload(
         &context.driver.storage_handle,
@@ -257,7 +253,7 @@ async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
     assert!(matches!(
         upload_part_copy(
             &context.driver,
-            UploadPartCopyInput {
+            PartCopyInput {
                 source_bucket: "bucket".to_string(),
                 source_key: "source.txt".to_string(),
                 source_version_id: None,
@@ -274,14 +270,14 @@ async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
             },
         )
         .await,
-        Err(UploadPartCopyError::UploadPart(
-            UploadPartError::PurgeFence(PurgeFenceError::Suspended)
-        ))
+        Err(PartCopyError::UploadPart(UploadPartError::PurgeFence(
+            PurgeFenceError::Suspended
+        )))
     ));
 
     assert!(matches!(
         drive(
-            CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+            CreateMultipartOperation::new(CreateMultipartInput {
                 bucket: "bucket".to_string(),
                 key: "blocked/new-upload.bin".to_string(),
                 group_id: context.group_id,
@@ -292,9 +288,7 @@ async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
             &context.driver,
         )
         .await,
-        Err(CreateMultipartUploadError::PurgeFence(
-            PurgeFenceError::Suspended
-        ))
+        Err(CreateMultipartError::PurgeFence(PurgeFenceError::Suspended))
     ));
 
     assert!(matches!(
@@ -319,7 +313,7 @@ async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
 
     assert!(matches!(
         drive(
-            CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+            CompleteUploadOperation::new(CompleteUploadInput {
                 bucket: upload.bucket.clone(),
                 key: upload.key.clone(),
                 upload_id: upload.upload_id,
@@ -338,9 +332,7 @@ async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
             &context.driver,
         )
         .await,
-        Err(CompleteMultipartUploadError::PurgeFence(
-            PurgeFenceError::Suspended
-        ))
+        Err(CompleteUploadError::PurgeFence(PurgeFenceError::Suspended))
     ));
 
     assert!(matches!(
@@ -361,9 +353,9 @@ async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
     ));
     let batch = delete_objects(
         &context.driver,
-        DeleteObjectsInput {
+        BulkDeleteInput {
             bucket: "bucket".to_string(),
-            entries: vec![DeleteObjectsEntry {
+            entries: vec![BulkDeleteEntry {
                 key: "blocked/batch-delete.txt".to_string(),
                 version_id: None,
             }],
@@ -381,7 +373,7 @@ async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
     ));
 
     let outside_upload = drive(
-        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+        CreateMultipartOperation::new(CreateMultipartInput {
             bucket: "bucket".to_string(),
             key: "allowed/outside.bin".to_string(),
             group_id: context.group_id,
@@ -392,8 +384,6 @@ async fn scoped_fence_rejects_racing_writes_without_freezing_other_prefixes() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap()
     .record;
     assert_eq!(outside_upload.key, "allowed/outside.bin");
@@ -427,7 +417,7 @@ async fn purge_checks_objects() {
     .await;
     let mut auth_context = auth(&context);
     auth_context.path_restrictions = Some(vec![PathRestriction {
-        pattern: blob_bucket_permission_path(
+        pattern: bucket_permission_path(
             context.realm_id,
             context.group_id,
             context.node_id,
@@ -471,7 +461,7 @@ async fn purge_checks_objects() {
 }
 
 #[tokio::test]
-async fn purge_resumes_aborts_uploads_preserves_prefix_neighbors_and_deletes_bucket() {
+async fn purge_resumes_cleanly() {
     let context = setup_context().await;
     let target_old = Ulid::generate();
     let target_current = Ulid::generate();
@@ -553,8 +543,6 @@ async fn purge_resumes_aborts_uploads_preserves_prefix_neighbors_and_deletes_buc
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let first = purge_result(run_storage_purge(&prefix_job, &prefix_spec).await);

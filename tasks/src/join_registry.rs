@@ -1,8 +1,5 @@
-//! Keyed detached work that a later caller can join.
-//!
-//! A long operation started by one request must survive that request: the work
-//! runs detached under a key, a concurrent caller for the same key shares the
-//! running task, and a finished value stays joinable for a retention window.
+//! Keyed detached work that survives its initiating request.
+//! Concurrent callers share work, and finished values remain briefly joinable.
 
 use std::collections::HashMap;
 use std::future::Future;

@@ -1,4 +1,5 @@
 use super::{S3SessionError, decode_index, encode_index, expiry_key, owner_key};
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -6,12 +7,12 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::S3Session;
-use aruna_core::types::{Effects, Key, UserId};
+use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
-pub struct RevokeS3SessionConfig {
+pub struct RevokeS3Config {
     pub access_key: String,
     pub user_identity: UserId,
     pub issued_by: [u8; 32],
@@ -31,8 +32,8 @@ enum RevokeSessionState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct RevokeS3SessionOperation {
-    config: RevokeS3SessionConfig,
+pub struct RevokeS3Operation {
+    config: RevokeS3Config,
     owner_key: Option<Key>,
     deletes: Vec<(String, Key)>,
     txn_id: Option<Ulid>,
@@ -40,8 +41,8 @@ pub struct RevokeS3SessionOperation {
     output: Result<(), S3SessionError>,
 }
 
-impl RevokeS3SessionOperation {
-    pub fn new(config: RevokeS3SessionConfig) -> Self {
+impl RevokeS3Operation {
+    pub fn new(config: RevokeS3Config) -> Self {
         Self {
             config,
             owner_key: None,
@@ -206,7 +207,7 @@ impl RevokeS3SessionOperation {
     }
 }
 
-impl Operation for RevokeS3SessionOperation {
+impl Operation for RevokeS3Operation {
     type Output = ();
     type Error = S3SessionError;
 

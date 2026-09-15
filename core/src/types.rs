@@ -1,9 +1,12 @@
+//! Crate-wide aliases for the operation contract: effects, transaction and
+//! storage key types, and the ULID aliases; name [`crate::id`] and
+//! [`crate::user_id`] or the crate-root exports for the type-safe identifiers.
+
 use byteview::ByteView;
 use smallvec::SmallVec;
 use ulid::Ulid;
 
 use crate::effects::Effect;
-pub use crate::user_id::UserId;
 
 /// Operations consume events and emit effects; handles execute effects and
 /// return `Event` result values. Durable domain event records originate from
@@ -15,6 +18,3 @@ pub type Value = ByteView;
 pub type KeySpace = String;
 pub type GroupId = Ulid;
 pub type RoleId = Ulid;
-
-// Re-export the new type-safe identifiers
-pub use crate::id::{DhtKeyId, NodeId, NodeIdExt, TopicId};

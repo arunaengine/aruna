@@ -7,11 +7,11 @@ use aruna_core::structs::{BucketInfo, CopyJobSpec, JobError, JobResultPayload};
 
 use super::executor::{JobContext, JobRunOutcome};
 use crate::driver::drive;
-use crate::get_realm_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetConfigOperation;
 use crate::s3::copy_object::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_tracked,
 };
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use crate::s3::get_object::GetObjectError;
 use crate::s3::head_object::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::put_object::PutObjectError;
@@ -34,7 +34,7 @@ pub async fn run_copy_job(ctx: &JobContext, spec: &CopyJobSpec) -> JobRunOutcome
         return permanent("a bucket changed its group after the copy was queued");
     }
     let quota_ceiling = match drive(
-        GetRealmConfigOperation::new(spec.auth_context.realm_id),
+        GetConfigOperation::new(spec.auth_context.realm_id),
         &ctx.driver,
     )
     .await
@@ -112,7 +112,6 @@ async fn source_length(ctx: &JobContext, spec: &CopyJobSpec) -> Option<u64> {
         &ctx.driver,
     )
     .await
-    .ok()??
     .ok()?;
     head.location
         .as_ref()
@@ -125,12 +124,9 @@ async fn source_length(ctx: &JobContext, spec: &CopyJobSpec) -> Option<u64> {
 }
 
 async fn live_bucket(ctx: &JobContext, bucket: &str) -> Result<BucketInfo, JobRunOutcome> {
-    match drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver).await {
-        Ok(Some(Ok(info))) => Ok(info),
-        Ok(Some(Err(GetBucketInfoError::NotFound))) | Ok(None) => {
-            Err(permanent("a bucket of the copy no longer exists"))
-        }
-        Ok(Some(Err(error))) => Err(retryable(error.to_string())),
+    match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
+        Ok(info) => Ok(info),
+        Err(GetBucketError::NotFound) => Err(permanent("a bucket of the copy no longer exists")),
         Err(error) => Err(retryable(error.to_string())),
     }
 }
@@ -167,14 +163,16 @@ mod tests {
         full_context, seed_bucket, spawn_reference_server, write_version,
     };
     use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
-    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::UserId;
+    use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::id::NodeId;
     use aruna_core::structs::{
         Actor, AuthContext, BlobVersion, JobErrorKind, JobId, JobProgress,
         PortableSourceDescriptor, RealmConfigDocument, RealmId, SourceConnectorKind,
         SourceMetadata, StagingStrategy, VersionSourceBinding,
     };
-    use aruna_core::types::{GroupId, NodeId, UserId};
+    use aruna_core::types::GroupId;
     use futures_util::StreamExt;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -197,7 +195,7 @@ mod tests {
         let group_id = Ulid::generate();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
         let user_id = UserId::local(Ulid::generate(), realm_id);
-        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let target = DocumentTarget::RealmConfig { realm_id };
         let actor = Actor {
             node_id,
             user_id: UserId::nil(realm_id),
@@ -321,8 +319,6 @@ mod tests {
         )
         .await
         .unwrap()
-        .unwrap()
-        .unwrap()
         .blob;
         let mut read = Vec::new();
         while let Some(chunk) = blob.next().await {
@@ -368,9 +364,6 @@ mod tests {
             &ctx.driver,
         )
         .await;
-        assert!(
-            !matches!(missing, Ok(Some(Ok(_)))),
-            "nothing landed under the destination key"
-        );
+        assert!(missing.is_err(), "nothing landed under the destination key");
     }
 }

@@ -1,10 +1,8 @@
 use crate::NodeId;
-use crate::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
-};
+use crate::UserId;
+use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
 use crate::structs::{JobId, MetadataRegistryRecord, PlacementRef};
-use crate::types::UserId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -56,10 +54,9 @@ pub struct PersistentIdFailure {
     pub recorded_at_ms: u64,
 }
 
-/// Provenance of the transition that produced a mapping's current status. It
-/// lives in the replicated row rather than being minted per holder so every
-/// holder records byte-identical sync and shard-manifest revisions whatever the
-/// order the transitions arrive in.
+/// Provenance of the transition that produced a mapping's current status. It lives in the replicated
+/// row rather than being minted per holder so every holder records byte-identical sync and
+/// shard-manifest revisions whatever the order the transitions arrive in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PersistentIdRevision {
     pub event_id: Ulid,
@@ -67,15 +64,8 @@ pub struct PersistentIdRevision {
     pub occurred_at_ms: u64,
 }
 
-/// STATE-PERSISTENT-ID-MAPPING: binds one typed w3id intent to a document.
-///
-/// Ordinary documents use `https://w3id.org/aruna/{document_id}` and Profiles
-/// use `https://w3id.org/aruna/profile/{document_id}` as their sole primary PID.
-/// The row is still keyed 1:1 by `document_id`, so one automatic intent and every
-/// retry converge here. Once written it is never removed: normal deletion moves
-/// it to `Tombstoned`, while exceptional administration moves it to
-/// `AdminWithdrawn`; either retirement is a permanent 410 and can never be
-/// replaced by an accepted-but-delayed mint.
+/// Binds one document to its typed w3id intent and primary PID. The row is permanent and one-to-one.
+/// Deletion or withdrawal becomes a permanent 410; retries and revivals cannot reuse the identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PersistentIdMapping {
     pub pid: String,
@@ -227,11 +217,8 @@ impl PersistentIdMapping {
         true
     }
 
-    /// Fold a replicated mapping into the local one. Retirement always absorbs
-    /// non-terminal work, Active absorbs stale requested/processing/failure rows,
-    /// and otherwise the later transition revision wins. Provenance keeps its
-    /// earliest timestamp. The identity tuple must match exactly, so a future
-    /// provider can never overwrite this one-document intent accidentally.
+    /// Retirement absorbs nonterminal states, Active absorbs stale work, then the later revision wins.
+    /// Provenance keeps its earliest time, and identity tuples must match exactly.
     pub fn merge(&mut self, incoming: &Self) -> bool {
         if incoming.target != self.target
             || incoming.pid != self.pid
@@ -308,8 +295,8 @@ pub fn persistent_id_key(document_id: Ulid) -> Vec<u8> {
     document_id.to_bytes().to_vec()
 }
 
-pub fn persistent_id_target(document_id: Ulid) -> DocumentSyncTarget {
-    DocumentSyncTarget::PersistentIdMapping { document_id }
+pub fn persistent_id_target(document_id: Ulid) -> DocumentTarget {
+    DocumentTarget::PersistentIdMapping { document_id }
 }
 
 /// Sync change a mapping row publishes and records. Derived purely from the row,
@@ -318,8 +305,8 @@ pub fn persistent_id_target(document_id: Ulid) -> DocumentSyncTarget {
 pub fn persistent_id_change(
     mapping: &PersistentIdMapping,
     placement: PlacementRef,
-) -> DocumentSyncChange {
-    DocumentSyncChange {
+) -> DocumentChange {
+    DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: mapping.revision.occurred_at_ms,
@@ -327,14 +314,14 @@ pub fn persistent_id_change(
             actor: mapping.revision.actor,
             updated_at_ms: mapping.revision.occurred_at_ms,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement,
     }
 }
 
 /// Internal job payload for an idempotent PID registration.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MintPersistentIdSpec {
+pub struct MintPersistentSpec {
     pub document_id: Ulid,
     pub minted_by: UserId,
 }
@@ -401,7 +388,7 @@ mod tests {
 
     // Administrative withdrawal is permanent and keeps its required evidence.
     #[test]
-    fn admin_withdraw_is_permanent() {
+    fn admin_withdraw_permanent() {
         let id = Ulid::from_bytes([1; 16]);
         let mut mapping = active_mapping(id, revision(1, 5));
         assert!(mapping.admin_withdraw(user(), "invalid registration".into(), revision(2, 10)));
@@ -467,7 +454,7 @@ mod tests {
         assert_eq!(change.current.generation, 42);
         assert_eq!(change.current.event_id, Ulid::from_bytes([7; 16]));
         assert_eq!(change.current.actor, node(7));
-        assert_eq!(change.kind, DocumentSyncChangeKind::Upsert);
+        assert_eq!(change.kind, DocumentChangeKind::Upsert);
         assert_eq!(change.placement, placement);
     }
 
@@ -481,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_profile_has_one_typed_provider_identity() {
+    fn requested_profile_identity() {
         let id = Ulid::from_bytes([8; 16]);
         let mapping = PersistentIdMapping::requested(
             id,

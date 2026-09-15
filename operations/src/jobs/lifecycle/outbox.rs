@@ -1,9 +1,6 @@
 //! Replication of locally published records to the other family holders.
-//!
-//! The append-only store queues every record this node authored and proved
-//! against the replicated chain. Delivery is asynchronous and needs no quorum:
-//! every current holder eventually accepts the immutable record, and an
-//! unreachable family leaves the entry queued instead of losing the record.
+//! Delivery is asynchronous and needs no quorum: every current holder eventually
+//! accepts the immutable record, and an unreachable family leaves it queued.
 
 use std::time::Duration;
 
@@ -12,13 +9,14 @@ use aruna_core::effects::{
     StorageEffect,
 };
 use aruna_core::events::{Event, JobRecordEvent, NetEvent, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE, NODE_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{JobRecordEnvelope, JobRecordKey, PlacementRef, RealmId};
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, Key, NodeId};
+use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use tracing::{debug, warn};
 
@@ -506,7 +504,7 @@ async fn read_record(context: &DriverContext, key: &Key) -> Option<JobRecordFram
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::{Family, node};
+    use crate::tests::records::{Family, node};
     use aruna_core::types::Value;
 
     #[test]

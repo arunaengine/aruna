@@ -8,8 +8,8 @@ ___
 
 <p align="center">
     <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./img/aruna_white_font.png">
-    <img alt="Aruna logo" src="./img/aruna_dark_font.png" width="70%">
+    <source media="(prefers-color-scheme: dark)" srcset="./img/logo_white.png">
+    <img alt="Aruna logo" src="./img/logo_dark.png" width="70%">
     </picture>
 </p>
 
@@ -73,7 +73,7 @@ The quickest way to try Aruna is a local 3-node demo deployment.
 
 #### For local builds:
 
-- Rust `1.97.1` (see [rust-toolchain.toml](rust-toolchain.toml), for source builds)
+- Rust `1.98.1` (see [rust-toolchain.toml](rust-toolchain.toml), for source builds)
 - OpenSSL development headers
 - `mold` linker
 
@@ -98,6 +98,12 @@ The default example configuration exposes:
 
 - the REST API and Swagger UI on `http://127.0.0.1:3000/swagger-ui`
 - the S3 endpoint on `http://127.0.0.1:1337`
+
+The repository also tracks a `.env` holding a demonstration profile whose keys are
+published. A node refuses to start when it still finds one of those keys, and names
+it. Replace them with your own, or pass `--dangerously-use-default-env` (or set
+`ARUNA_DANGEROUSLY_USE_DEFAULT_ENV=1`) to start anyway, which logs a warning per key.
+A non-secret shipped value, such as a bind address, is only warned about.
 
 ### Evaluate a local cluster
 
@@ -202,6 +208,11 @@ and Cilium treats that traffic as its reserved `ingress` entity, which no `ipBlo
 CiliumNetworkPolicy with `toEntities: [ingress]` on the S3 port, selecting pods labelled
 `aruna-engine.org/network: s3`, opens it. DNS egress is allowed by port with no peer, because a
 node-local resolver runs on a host address that is neither a pod nor a CIDR peer.
+
+Kubernetes workspaces and sessions need a pod-reachable endpoint in `ARUNA_COMPUTE_S3_URL`
+or `S3_PUBLIC_URL`. `ARUNA_COMPUTE_K8S_S3_PORT` defaults to that URL's explicit or known
+scheme port, falling back to 443. `ARUNA_COMPUTE_LOCAL_ONLY` disables workspaces and
+sessions for that executor.
 
 The session images are built from `scripts/session-python` and `scripts/session-deno`, which share
 the helper in `scripts/session-helper`. Build them with their `build.sh`; the runtime catalog names

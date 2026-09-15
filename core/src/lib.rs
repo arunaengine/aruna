@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 
-pub mod admin_document_reducer;
+//! Domain types, events, effects, keyspaces, and the operation contract
+//! shared by every crate.
 pub mod admin_documents;
 pub mod alpn;
 pub mod audit;
@@ -24,6 +25,7 @@ pub mod metrics;
 pub mod onboarding;
 pub mod operation;
 pub mod permission_path;
+pub mod reducer;
 pub mod request_policy;
 pub mod scheduling;
 pub mod shutdown;
@@ -33,17 +35,19 @@ pub mod structs;
 pub mod structured_id;
 pub mod task;
 pub mod telemetry;
+pub mod time;
 pub mod trace_context;
 pub mod types;
 pub mod user_id;
 pub mod user_profile;
-pub mod user_update_validation;
-pub mod util;
+pub mod user_validation;
+
+#[cfg(test)]
+mod tests;
 
 pub use document::{
-    DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEffect,
-    DocumentSyncEvent, DocumentSyncEvictedDocument, DocumentSyncNetEvent, DocumentSyncRevision,
-    DocumentSyncTarget,
+    DocumentApplyDecision, DocumentChange, DocumentChangeKind, DocumentEffect, DocumentEvent,
+    DocumentEvictedDocument, DocumentNetEvent, DocumentSyncRevision, DocumentTarget,
 };
 pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
 pub use keyspaces::*;

@@ -18,7 +18,9 @@ use crate::structs::{
     EffectiveResources, MAX_EXECUTOR_KIND_LEN, PlacementPolicyError, PlacementSubject,
 };
 
+#[path = "compute_runtimes.rs"]
 pub mod runtimes;
+#[path = "compute_session.rs"]
 pub mod session;
 
 pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -862,12 +864,6 @@ pub struct LogTails {
     pub stderr_total: u64,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LogStream {
-    Stdout,
-    Stderr,
 }
 
 pub struct TaskOutput {

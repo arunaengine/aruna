@@ -1,8 +1,6 @@
 //! Owner-driven wipe of the device this node runs on.
-//!
-//! Realm-side eviction is a separate, earlier step: the desktop calls
-//! `DELETE /users/me/devices/{id}` on a management node so the realm drops the
-//! membership, then asks this node to erase what it holds locally.
+//! Realm-side eviction is an earlier, separate step: the desktop calls
+//! `DELETE /users/me/devices/{id}` on a management node, then asks this node to erase.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -227,15 +225,13 @@ fn purge_root(root: &Path, failed: &mut Vec<PathBuf>) {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
-        DeviceWipe, WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation, WipeDeviceState, purge,
+        DeviceWipe, WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation, WipeDeviceState,
     };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
-    use std::fs;
-    use tempfile::tempdir;
 
     fn node() -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[8u8; 32]).public()
@@ -282,7 +278,7 @@ mod tests {
         });
         operation.start();
         operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: ulid::Ulid::generate(),
+            txn_id: ulid::Ulid::from_parts(1, 1),
         }));
         assert_eq!(operation.state, WipeDeviceState::Error);
         assert!(matches!(
@@ -290,6 +286,28 @@ mod tests {
             Err(WipeDeviceError::UnexpectedEvent { .. })
         ));
     }
+
+    #[test]
+    fn arms_once() {
+        let wipe = DeviceWipe::new(
+            vec![std::path::PathBuf::from("/tmp/aruna-wipe-test")],
+            Vec::new(),
+        );
+        assert!(!wipe.is_armed());
+        wipe.arm();
+        assert!(wipe.is_armed());
+        assert_eq!(wipe.roots().len(), 1);
+        assert!(wipe.unsupported().is_empty());
+    }
+}
+
+/// Filesystem-boundary coverage for the purge walk; kept out of the pure
+/// selection because it mutates a temporary filesystem.
+#[cfg(test)]
+mod tests {
+    use super::purge;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn erases_root_contents() {
@@ -308,18 +326,5 @@ mod tests {
         let root = tempdir().unwrap();
         let missing = root.path().join("gone");
         assert!(purge(&[missing]).is_empty());
-    }
-
-    #[test]
-    fn arms_once() {
-        let wipe = DeviceWipe::new(
-            vec![std::path::PathBuf::from("/tmp/aruna-wipe-test")],
-            Vec::new(),
-        );
-        assert!(!wipe.is_armed());
-        wipe.arm();
-        assert!(wipe.is_armed());
-        assert_eq!(wipe.roots().len(), 1);
-        assert!(wipe.unsupported().is_empty());
     }
 }

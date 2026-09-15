@@ -11,13 +11,14 @@ use aruna_core::audit::{
 };
 use aruna_core::effects::{AuditPageEffect, Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
-use aruna_core::metadata::MetadataAuthToken;
+use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AuthContext, MetadataAuditRecord, Permission, RealmConfigDocument, RealmId,
 };
-use aruna_core::types::{Effects, GroupId, Key, NodeId, Value};
+use aruna_core::types::{Effects, GroupId, Key, Value};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
@@ -27,10 +28,10 @@ use ulid::Ulid;
 
 use super::api::load_realm_config;
 use super::protocol::{MetadataReadError, MetadataTransportMessage};
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive_until};
-use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::PolicyRequestExtras;
+use crate::placement::selector::select_top_peers;
 
 pub const MAX_AUDIT_PAGE_SIZE: usize = MAX_AUDIT_RECORDS;
 pub const DEFAULT_AUDIT_PAGE_SIZE: usize = 50;
@@ -188,7 +189,7 @@ fn parse_audit_page(
 /// keyspace scan and returns the raw page. The serving node runs it to answer a
 /// peer, and the aggregator reuses the same scan for its own local page.
 #[derive(Debug, PartialEq)]
-pub struct LocalAuditPageOperation {
+pub struct LocalPageOperation {
     realm_id: RealmId,
     group_id: GroupId,
     document_id: Option<Ulid>,
@@ -198,7 +199,7 @@ pub struct LocalAuditPageOperation {
     output: Option<Result<AuditPageResponse, ListAuditError>>,
 }
 
-impl LocalAuditPageOperation {
+impl LocalPageOperation {
     pub fn new(
         realm_id: RealmId,
         group_id: GroupId,
@@ -231,7 +232,7 @@ impl LocalAuditPageOperation {
     }
 }
 
-impl Operation for LocalAuditPageOperation {
+impl Operation for LocalPageOperation {
     type Output = AuditPageResponse;
     type Error = ListAuditError;
 
@@ -339,36 +340,14 @@ fn select_peers<I>(peers: I, limit: usize, scope: &[u8]) -> PeerSelection
 where
     I: IntoIterator<Item = NodeId>,
 {
-    let limit = limit.min(MAX_AUDIT_PEERS);
-    let mut selected = BTreeSet::new();
     let mut omitted = BTreeSet::new();
     let mut missing_count = 0usize;
-    for node in peers {
-        if selected.iter().any(|(_, candidate)| *candidate == node) {
-            continue;
-        }
-        let score = neg_log2_q48(selector_hash(ROLE_NODE, scope, node.as_bytes()));
-        if selected.len() < limit {
-            selected.insert((score, node));
-            continue;
-        }
-        let Some(worst) = selected.last().copied() else {
-            remember_peer(&mut omitted, node);
-            missing_count = missing_count.saturating_add(1);
-            continue;
-        };
-        if (score, node) < worst {
-            selected.remove(&worst);
-            remember_peer(&mut omitted, worst.1);
-            missing_count = missing_count.saturating_add(1);
-            selected.insert((score, node));
-        } else {
-            remember_peer(&mut omitted, node);
-            missing_count = missing_count.saturating_add(1);
-        }
-    }
+    let selected = select_top_peers(peers, scope, limit.min(MAX_AUDIT_PEERS), |node| {
+        remember_peer(&mut omitted, node);
+        missing_count = missing_count.saturating_add(1);
+    });
     PeerSelection {
-        selected: selected.into_iter().map(|(_, node)| node).collect(),
+        selected,
         omitted,
         missing_count,
     }
@@ -387,7 +366,7 @@ pub struct ListAuditOperation {
     peers: Vec<NodeId>,
     start_after: Option<Vec<u8>>,
     limit: usize,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
     config_digest: [u8; 32],
     state: FanState,
     started: bool,
@@ -410,7 +389,7 @@ impl ListAuditOperation {
         peers: I,
         start_after: Option<Vec<u8>>,
         limit: usize,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         config_digest: [u8; 32],
     ) -> Self
     where
@@ -674,7 +653,7 @@ pub async fn list_audit(
     context: &DriverContext,
     realm_id: RealmId,
     local_node: NodeId,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
     request: ListAuditRequest,
     deadline: tokio::time::Instant,
 ) -> Result<AuditAggregate, ListAuditError> {
@@ -840,7 +819,7 @@ async fn local_audit_result(
         .map_err(|_| MetadataReadError::Unavailable)?;
     auth_result?;
 
-    let operation = LocalAuditPageOperation::new(
+    let operation = LocalPageOperation::new(
         realm_id,
         request.group_id,
         request.document_id,
@@ -910,7 +889,7 @@ mod tests {
     use super::{
         AUDIT_DEADLINE_SECS, AUDIT_INBOUND_ADMISSION, AUDIT_INBOUND_LIMIT,
         AUDIT_OUTBOUND_ADMISSION, AUDIT_OUTBOUND_LIMIT, AuditPageEntry, AuditPageResponse, Effect,
-        Event, ListAuditError, ListAuditOperation, ListAuditRequest, LocalAuditPageOperation,
+        Event, ListAuditError, ListAuditOperation, ListAuditRequest, LocalPageOperation,
         MAX_AUDIT_CURSOR_CHARS, MAX_AUDIT_PAGE_SIZE, MAX_AUDIT_PEERS, MetadataReadError, NetEffect,
         NetEvent, Operation, StorageEvent, audit_member, audit_scope, authorize_admin,
         decode_cursor, drive_until, encode_cursor, list_audit, select_peers,
@@ -922,7 +901,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-    use aruna_core::metadata::MetadataAuthToken;
+    use aruna_core::metadata::AuthToken;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
         Actor, AuthContext, Group, GroupAuthorizationDocument, RealmAuthorizationDocument,
@@ -979,7 +958,7 @@ mod tests {
     }
 
     fn batch(
-        node: aruna_core::types::NodeId,
+        node: aruna_core::id::NodeId,
         realm_id: RealmId,
         group_id: Ulid,
         document_id: Option<Ulid>,
@@ -1008,7 +987,7 @@ mod tests {
     fn peers_share_effect() {
         // Every peer is asked in one adapter round: with one effect per peer the
         // runner contacts them serially and unreachable nodes add up to a timeout.
-        let unique: Vec<aruna_core::types::NodeId> = (1u8..=3)
+        let unique: Vec<aruna_core::id::NodeId> = (1u8..=3)
             .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
             .collect();
         let mut peers = unique.clone();
@@ -1399,7 +1378,7 @@ mod tests {
     fn silent_peer_missing() {
         // A peer the adapter did not answer for must still be reported missing
         // instead of leaving the page looking complete.
-        let peers: Vec<aruna_core::types::NodeId> = (4u8..=5)
+        let peers: Vec<aruna_core::id::NodeId> = (4u8..=5)
             .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
             .collect();
         let mut operation = ListAuditOperation::new(
@@ -1603,7 +1582,7 @@ mod tests {
             peers,
             None,
             10,
-            Some(MetadataAuthToken::bearer("test").unwrap()),
+            Some(AuthToken::bearer("test").unwrap()),
             [3u8; 32],
         );
         operation.start();
@@ -1715,9 +1694,9 @@ mod tests {
             user_id,
             realm_id,
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let mut group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+            GroupAuthorizationDocument::default_group_doc(user_id, realm_id, group_id);
         group_auth.policies.push(RequestPolicy {
             policy_id: Ulid::from_bytes([12u8; 16]),
             name: "deny-audit".to_string(),
@@ -1900,7 +1879,7 @@ mod tests {
         }
 
         let first = crate::driver::drive(
-            LocalAuditPageOperation::new(realm_id, group_id, None, None, 2),
+            LocalPageOperation::new(realm_id, group_id, None, None, 2),
             &context,
         )
         .await
@@ -1909,7 +1888,7 @@ mod tests {
         let cursor = first.next_start_after.expect("more records");
 
         let second = crate::driver::drive(
-            LocalAuditPageOperation::new(realm_id, group_id, None, Some(cursor), 2),
+            LocalPageOperation::new(realm_id, group_id, None, Some(cursor), 2),
             &context,
         )
         .await
@@ -1918,7 +1897,7 @@ mod tests {
         assert_eq!(second.records[0].record.document_id, second_doc);
 
         let filtered = crate::driver::drive(
-            LocalAuditPageOperation::new(realm_id, group_id, Some(second_doc), None, 50),
+            LocalPageOperation::new(realm_id, group_id, Some(second_doc), None, 50),
             &context,
         )
         .await
@@ -1926,7 +1905,7 @@ mod tests {
         assert_eq!(filtered.records.len(), 1);
 
         let foreign = crate::driver::drive(
-            LocalAuditPageOperation::new(realm_id, Ulid::from_bytes([99u8; 16]), None, None, 50),
+            LocalPageOperation::new(realm_id, Ulid::from_bytes([99u8; 16]), None, None, 50),
             &context,
         )
         .await

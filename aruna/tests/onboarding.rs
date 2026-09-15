@@ -2,7 +2,8 @@
 #![recursion_limit = "256"]
 mod shared;
 
-use aruna::config::{PersistedNodeIdentity, StartupMode};
+use aruna::config::StartupMode;
+use aruna::identity::PersistedNodeIdentity;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -10,16 +11,14 @@ use aruna_core::handle::Handle;
 use aruna_core::onboarding::{OnboardingMode, OnboardingPhase};
 use aruna_core::structs::{Actor, User};
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::node_info::read_node_info_document;
+use aruna_operations::node::node_info::read_info_document;
 use aruna_operations::placement::build_view;
-use aruna_operations::register_or_get_oidc_user::{
-    RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
-};
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
 use byteview::ByteView;
 use shared::{
-    TestResult, create_onboarding_secret_via_http, shutdown_pair, spawn_joiner_node,
-    spawn_seed_node, wait_for_realm_nodes,
+    TestResult, create_onboarding_secret, shutdown_pair, spawn_joiner_node, spawn_seed_node,
+    wait_realm_nodes,
 };
 
 async fn read_user(
@@ -44,10 +43,10 @@ async fn read_user(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> TestResult<()> {
+async fn joiner_bootstraps_documents() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let _user = drive(
-        RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
+        ResolveOidcOperation::new(ResolveOidcInput {
             actor: Actor {
                 node_id: seed.net.node_id(),
                 user_id: seed.user_id,
@@ -61,8 +60,7 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
         seed.context.as_ref(),
     )
     .await?;
-    let onboarding_secret =
-        create_onboarding_secret_via_http(&seed, OnboardingMode::Server).await?;
+    let onboarding_secret = create_onboarding_secret(&seed, OnboardingMode::Server).await?;
     let expected_user = read_user(seed.context.as_ref(), seed.user_id)
         .await
         .expect("seed user should exist");
@@ -81,10 +79,10 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
             .expect("joiner user should be bootstrapped"),
         expected_user
     );
-    let issuer_info = read_node_info_document(&joiner.context.storage_handle, seed.net.node_id())
+    let issuer_info = read_info_document(&joiner.context.storage_handle, seed.net.node_id())
         .await?
         .expect("issuer node info should be fetched from the onboarding ticket");
-    let seed_info = read_node_info_document(&seed.context.storage_handle, seed.net.node_id())
+    let seed_info = read_info_document(&seed.context.storage_handle, seed.net.node_id())
         .await?
         .expect("seed fixture should publish issuer node info");
     assert_eq!(issuer_info.node_id, seed_info.node_id);
@@ -96,7 +94,7 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
     assert_eq!(issuer_info.utilization.documents_held, Some(0));
     assert!(issuer_info.utilization.load_permille.is_some());
     let realm_config = drive(
-        GetRealmConfigOperation::new(joiner.config.realm_id),
+        GetConfigOperation::new(joiner.config.realm_id),
         joiner.context.as_ref(),
     )
     .await?;
@@ -106,10 +104,9 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
         .find(|node| node.node_id == joiner.config.node_id)
         .expect("joiner should be in the placement view")
         .labels;
-    let joiner_info =
-        read_node_info_document(&joiner.context.storage_handle, joiner.config.node_id)
-            .await?
-            .expect("joiner startup should seed its node info after fetching realm config");
+    let joiner_info = read_info_document(&joiner.context.storage_handle, joiner.config.node_id)
+        .await?
+        .expect("joiner startup should seed its node info after fetching realm config");
     assert_eq!(joiner_info.node_id, joiner.config.node_id);
     assert_eq!(joiner_info.labels, selector_labels);
     assert_eq!(joiner_info.labels.get("fixture").unwrap(), "joiner");
@@ -124,7 +121,7 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
     assert_eq!(joiner_info.utilization.documents_held, Some(0));
     assert!(joiner_info.utilization.load_permille.is_some());
 
-    wait_for_realm_nodes(
+    wait_realm_nodes(
         &[seed.context.as_ref(), joiner.context.as_ref()],
         &joiner.config.realm_id,
         2,
@@ -137,12 +134,11 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
 
 #[tokio::test(flavor = "multi_thread")]
 async fn second_joiner_onboards() -> TestResult<()> {
-    // The second joiner is admitted to no shard topic while the first joiner's
-    // placement expansion is in flight, so its user documents cannot be pulled
-    // from the seed yet; onboarding must complete regardless.
+    // While the first placement expands, the second joiner cannot fetch shard documents.
+    // Its onboarding must still complete.
     let seed = spawn_seed_node().await?;
     let _user = drive(
-        RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
+        ResolveOidcOperation::new(ResolveOidcInput {
             actor: Actor {
                 node_id: seed.net.node_id(),
                 user_id: seed.user_id,
@@ -157,12 +153,12 @@ async fn second_joiner_onboards() -> TestResult<()> {
     )
     .await?;
 
-    let first_secret = create_onboarding_secret_via_http(&seed, OnboardingMode::Server).await?;
+    let first_secret = create_onboarding_secret(&seed, OnboardingMode::Server).await?;
     let first = spawn_joiner_node(&seed, first_secret).await?;
-    let second_secret = create_onboarding_secret_via_http(&seed, OnboardingMode::Server).await?;
+    let second_secret = create_onboarding_secret(&seed, OnboardingMode::Server).await?;
     let second = spawn_joiner_node(&seed, second_secret).await?;
 
-    wait_for_realm_nodes(
+    wait_realm_nodes(
         &[
             seed.context.as_ref(),
             first.context.as_ref(),
@@ -178,10 +174,9 @@ async fn second_joiner_onboards() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn server_onboarding_bootstraps_joiner_over_http_and_completes() -> TestResult<()> {
+async fn server_joiner_completes() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
-    let onboarding_secret =
-        create_onboarding_secret_via_http(&seed, OnboardingMode::Server).await?;
+    let onboarding_secret = create_onboarding_secret(&seed, OnboardingMode::Server).await?;
 
     let joiner = spawn_joiner_node(&seed, onboarding_secret).await?;
 
@@ -196,7 +191,7 @@ async fn server_onboarding_bootstraps_joiner_over_http_and_completes() -> TestRe
         PersistedNodeIdentity::Server { .. }
     ));
 
-    wait_for_realm_nodes(
+    wait_realm_nodes(
         &[seed.context.as_ref(), joiner.context.as_ref()],
         &joiner.config.realm_id,
         2,

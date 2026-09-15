@@ -1,6 +1,6 @@
 use crate::server_state::ServerState;
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
@@ -157,7 +157,7 @@ impl PortalSecurity {
         }
 
         match drive(
-            GetRealmConfigOperation::new(self.state.get_realm_id()),
+            GetConfigOperation::new(self.state.get_realm_id()),
             &self.state.get_ctx(),
         )
         .await
@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn img_src_allows_s3() {
+    fn allows_s3_images() {
         let policy = content_security_policy(&origins(&["https://s3.test"], &["https://s3.test"]));
 
         assert!(policy.contains("img-src 'self' data: blob: https://s3.test"));

@@ -7,16 +7,14 @@ use crate::rate_limit::LocalKey;
 use crate::server_state::ServerState;
 use aruna_core::structs::{
     ArunaArn, ArunaArnType, AuthContext, BackendLocation, Permission, SourceMetadata,
-    VersionedObjectArn, W3idDataIdentifier, blob_object_permission_path,
+    VersionedObjectArn, W3idIdentifier, object_permission_path,
 };
-use aruna_operations::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
+use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::driver::{drive, drive_until};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::replication::location_summary::{
-    LocationSummaryError, RemoteLocationSummaryOperation,
-};
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use aruna_operations::replication::protocol::LocationSummaryRequest;
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::body::Body;
@@ -53,15 +51,15 @@ const BULK_PROBE_CONCURRENCY: usize = 8;
     tags((name = "drs", description = "GA4GH DRS content access")),
     components(
         schemas(
-            DrsServiceInfoResponse,
+            DrsServiceResponse,
             DrsAuthorizationsResponse,
             DrsObjectResponse,
             DrsChecksum,
             DrsAccessMethod,
             DrsAccessUrl,
-            DrsBulkObjectsRequestBody,
-            DrsBulkObjectsResponse,
-            DrsBulkObjectItem,
+            DrsBulkBody,
+            DrsBulk,
+            DrsBulkItem,
             DrsErrorPayload
         )
     )
@@ -81,7 +79,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct DrsServiceInfoResponse {
+#[schema(as = DrsServiceInfoResponse)]
+pub struct DrsServiceResponse {
     id: String,
     name: String,
     r#type: DrsServiceType,
@@ -162,17 +161,20 @@ pub struct DrsAccessMethod {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct DrsBulkObjectsRequestBody {
+#[schema(as = DrsBulkObjectsRequestBody)]
+pub struct DrsBulkBody {
     object_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct DrsBulkObjectsResponse {
-    objects: Vec<DrsBulkObjectItem>,
+#[schema(as = DrsBulkObjectsResponse)]
+pub struct DrsBulk {
+    objects: Vec<DrsBulkItem>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct DrsBulkObjectItem {
+#[schema(as = DrsBulkObjectItem)]
+pub struct DrsBulkItem {
     object_id: String,
     result: Value,
 }
@@ -240,7 +242,7 @@ enum ResolveOutcome {
     responses((
         status = 200,
         description = "GA4GH service-info document for this node",
-        body = DrsServiceInfoResponse,
+        body = DrsServiceResponse,
         example = json!({
             "id": "org.aruna.9xC3nQ2vRk5tYbW0aZ7pLmJ4hS6dF8gT1uV3wX5yZ2c",
             "name": "Aruna Realm 9xC3nQ2vRk5tYbW0aZ7pLmJ4hS6dF8gT1uV3wX5yZ2c",
@@ -262,11 +264,11 @@ pub async fn get_service_info(
     State(state): State<Arc<ServerState>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
-) -> (StatusCode, Json<DrsServiceInfoResponse>) {
+) -> (StatusCode, Json<DrsServiceResponse>) {
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     (
         StatusCode::OK,
-        Json(DrsServiceInfoResponse {
+        Json(DrsServiceResponse {
             id: format!("org.aruna.{}", state.get_realm_id()),
             name: format!("Aruna Realm {}", state.get_realm_id()),
             r#type: DrsServiceType {
@@ -417,7 +419,7 @@ pub async fn get_object(
 ) -> Response {
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let anonymous = auth.is_none();
-    let auth = match drs_auth_or_anonymous(state.as_ref(), auth) {
+    let auth = match drs_auth(state.as_ref(), auth) {
         Ok(auth) => auth,
         Err(error) => return error.into_response(),
     };
@@ -459,7 +461,7 @@ anonymous caller resolves only publicly readable objects.
 - An unreadable object is 403 for a token-bearing caller and 404 for an anonymous one.
 - An object that could not be serialized is 500."#,
     request_body(
-        content = DrsBulkObjectsRequestBody,
+        content = DrsBulkBody,
         description = "The DRS identifiers to resolve, in any of the forms the single-object lookup accepts",
         example = json!({
             "object_ids": [
@@ -469,7 +471,7 @@ anonymous caller resolves only publicly readable objects.
         })
     ),
     responses(
-        (status = 200, description = "One entry per requested identifier, in request order, each holding either the resolved object or a per-identifier error", body = DrsBulkObjectsResponse, example = json!({
+        (status = 200, description = "One entry per requested identifier, in request order, each holding either the resolved object or a per-identifier error", body = DrsBulk, example = json!({
             "objects": [
                 {
                     "object_id": "https://w3id.org/aruna/data/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
@@ -519,7 +521,7 @@ pub async fn post_objects(
     Extension(auth): Extension<Option<AuthContext>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
-    Json(body): Json<DrsBulkObjectsRequestBody>,
+    Json(body): Json<DrsBulkBody>,
 ) -> Response {
     if body.object_ids.len() > MAX_BULK_OBJECT_IDS {
         return DrsError::bad_request(format!(
@@ -529,7 +531,7 @@ pub async fn post_objects(
     }
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let anonymous = auth.is_none();
-    let auth = match drs_auth_or_anonymous(state.as_ref(), auth) {
+    let auth = match drs_auth(state.as_ref(), auth) {
         Ok(auth) => auth,
         Err(error) => return error.into_response(),
     };
@@ -540,7 +542,7 @@ pub async fn post_objects(
     let node = state.as_ref();
     let auth = &auth;
     let base_url = &base_url;
-    let objects: Vec<DrsBulkObjectItem> = futures_util::stream::iter(body.object_ids)
+    let objects: Vec<DrsBulkItem> = futures_util::stream::iter(body.object_ids)
         .map(|object_id| async move {
             let result = match resolve_object(node, auth, &object_id, deadline).await {
                 Ok(ResolveOutcome::Found(resolved)) => serde_json::to_value(build_object_response(
@@ -562,12 +564,12 @@ pub async fn post_objects(
                     json!({ "status_code": error.status.as_u16(), "msg": error.message })
                 }
             };
-            DrsBulkObjectItem { object_id, result }
+            DrsBulkItem { object_id, result }
         })
         .buffered(BULK_PROBE_CONCURRENCY)
         .collect()
         .await;
-    drs_json_response(StatusCode::OK, DrsBulkObjectsResponse { objects })
+    drs_json_response(StatusCode::OK, DrsBulk { objects })
 }
 
 /// Maps a source read failure onto its DRS status: an observation the source no
@@ -640,7 +642,7 @@ pub async fn download_object(
     Query(query): Query<DownloadQuery>,
 ) -> Response {
     let anonymous = auth.is_none();
-    let Ok(auth) = drs_auth_or_anonymous(state.as_ref(), auth) else {
+    let Ok(auth) = drs_auth(state.as_ref(), auth) else {
         return drs_error(StatusCode::NOT_FOUND, "DRS object not found");
     };
     let resolved =
@@ -692,9 +694,8 @@ pub async fn download_object(
     )
     .await
     {
-        Ok(Some(Ok(result))) => result,
-        Ok(None) => return drs_error(StatusCode::NOT_FOUND, "DRS object not found"),
-        Ok(Some(Err(error))) | Err(error) => return download_error(error),
+        Ok(result) => result,
+        Err(error) => return download_error(error),
     };
 
     let location = result.location.unwrap_or(resolved_location);
@@ -777,10 +778,7 @@ fn require_drs_auth(
 /// Requests without a bearer token resolve as the Everyone principal. Public
 /// roles are then the only grants that can make an object readable; denied
 /// anonymous lookups are mapped to 404 at the route layer.
-fn drs_auth_or_anonymous(
-    state: &ServerState,
-    auth: Option<AuthContext>,
-) -> Result<AuthContext, DrsError> {
+fn drs_auth(state: &ServerState, auth: Option<AuthContext>) -> Result<AuthContext, DrsError> {
     match auth {
         Some(_) => require_drs_auth(state, auth),
         None => Ok(AuthContext::anonymous(state.get_realm_id())),
@@ -807,7 +805,7 @@ async fn resolve_object(
     object_id: &str,
     deadline: Instant,
 ) -> Result<ResolveOutcome, DrsError> {
-    match parse_requested_object_id(object_id)? {
+    match parse_object_id(object_id)? {
         RequestedObjectId::CanonicalW3id(hash) => {
             resolve_content_hash(state, auth, object_id, None, &hash).await
         }
@@ -832,7 +830,7 @@ async fn resolve_routed(
     deadline: Instant,
 ) -> Result<ResolveOutcome, DrsError> {
     let context = state.get_ctx();
-    let config = match drive(GetRealmConfigOperation::new(arn.realm_id), &context).await {
+    let config = match drive(GetConfigOperation::new(arn.realm_id), &context).await {
         Ok(config) => config,
         Err(_) => return Ok(ResolveOutcome::Unavailable),
     };
@@ -841,7 +839,7 @@ async fn resolve_routed(
         return Ok(ResolveOutcome::Unavailable);
     }
     let summary = drive_until(
-        RemoteLocationSummaryOperation::new(
+        RemoteLocationOperation::new(
             arn.node_id,
             LocationSummaryRequest {
                 realm_id: arn.realm_id,
@@ -897,16 +895,14 @@ async fn resolve_versioned(
     }
 
     let bucket_info = match drive(
-        GetBucketInfoOperation::new(arn.bucket.clone()),
+        GetBucketOperation::new(arn.bucket.clone()),
         &state.get_ctx(),
     )
     .await
     {
-        Ok(Some(Ok(info))) => info,
-        Ok(Some(Err(GetBucketInfoError::NotFound)))
-        | Err(GetBucketInfoError::NotFound)
-        | Ok(None) => return Ok(ResolveOutcome::NotFound),
-        Ok(Some(Err(error))) | Err(error) => {
+        Ok(info) => info,
+        Err(GetBucketError::NotFound) => return Ok(ResolveOutcome::NotFound),
+        Err(error) => {
             return Err(DrsError::internal(error.to_string()));
         }
     };
@@ -921,19 +917,13 @@ async fn resolve_versioned(
     )
     .await
     {
-        Ok(Some(Ok(result))) => result,
-        Ok(Some(Err(
+        Ok(result) => result,
+        Err(
             HeadObjectError::NoSuchKey
             | HeadObjectError::NoSuchVersion
             | HeadObjectError::DeleteMarker,
-        )))
-        | Err(
-            HeadObjectError::NoSuchKey
-            | HeadObjectError::NoSuchVersion
-            | HeadObjectError::DeleteMarker,
-        )
-        | Ok(None) => return Ok(ResolveOutcome::NotFound),
-        Ok(Some(Err(error))) | Err(error) => {
+        ) => return Ok(ResolveOutcome::NotFound),
+        Err(error) => {
             return Err(DrsError::internal(error.to_string()));
         }
     };
@@ -941,14 +931,14 @@ async fn resolve_versioned(
         return Ok(ResolveOutcome::NotFound);
     };
 
-    let path = blob_object_permission_path(
+    let path = object_permission_path(
         arn.realm_id,
         bucket_info.group_id,
         arn.node_id,
         &arn.bucket,
         &arn.key,
     );
-    if !can_read_permission_path(state, auth, &path).await? {
+    if !can_read_path(state, auth, &path).await? {
         return Ok(ResolveOutcome::Denied);
     }
 
@@ -979,12 +969,9 @@ async fn resolve_content_hash(
         return Ok(ResolveOutcome::NotFound);
     }
 
-    let mappings = drive(
-        ResolveBlobPermissionPathsOperation::new(*hash),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| DrsError::internal(error.to_string()))?;
+    let mappings = drive(ResolvePathsOperation::new(*hash), &state.get_ctx())
+        .await
+        .map_err(|error| DrsError::internal(error.to_string()))?;
     debug!(?mappings);
 
     let mut any_mapping_on_this_node = false;
@@ -1000,7 +987,7 @@ async fn resolve_content_hash(
         let allowed = match &last_permission_check {
             Some((cached_path, allowed)) if cached_path == &path => *allowed,
             _ => {
-                let allowed = can_read_permission_path(state, auth, &path).await?;
+                let allowed = can_read_path(state, auth, &path).await?;
                 last_permission_check = Some((path.clone(), allowed));
                 allowed
             }
@@ -1019,21 +1006,15 @@ async fn resolve_content_hash(
         )
         .await
         {
-            Ok(Some(Ok(result))) => result,
-            Ok(Some(Err(
+            Ok(result) => result,
+            Err(
                 HeadObjectError::NoSuchKey
                 | HeadObjectError::NoSuchVersion
                 | HeadObjectError::DeleteMarker,
-            )))
-            | Err(
-                HeadObjectError::NoSuchKey
-                | HeadObjectError::NoSuchVersion
-                | HeadObjectError::DeleteMarker,
-            )
-            | Ok(None) => {
+            ) => {
                 continue;
             }
-            Ok(Some(Err(error))) | Err(error) => {
+            Err(error) => {
                 debug!(head_object_error = ?error);
                 return Err(DrsError::internal(error.to_string()));
             }
@@ -1065,7 +1046,7 @@ async fn resolve_content_hash(
     }
 }
 
-async fn can_read_permission_path(
+async fn can_read_path(
     state: &ServerState,
     auth: &AuthContext,
     path: &str,
@@ -1077,13 +1058,13 @@ async fn can_read_permission_path(
     }
 }
 
-fn parse_requested_object_id(object_id: &str) -> Result<RequestedObjectId, DrsError> {
+fn parse_object_id(object_id: &str) -> Result<RequestedObjectId, DrsError> {
     if object_id.starts_with(W3ID_DATA_PREFIX) {
-        return match W3idDataIdentifier::parse(object_id)
+        return match W3idIdentifier::parse(object_id)
             .map_err(|error| DrsError::bad_request(error.to_string()))?
         {
-            W3idDataIdentifier::ContentHash(hash) => Ok(RequestedObjectId::CanonicalW3id(hash)),
-            W3idDataIdentifier::VersionedObject(arn) => Ok(RequestedObjectId::VersionedObject(arn)),
+            W3idIdentifier::ContentHash(hash) => Ok(RequestedObjectId::CanonicalW3id(hash)),
+            W3idIdentifier::VersionedObject(arn) => Ok(RequestedObjectId::VersionedObject(arn)),
         };
     }
 
@@ -1188,630 +1169,5 @@ impl IntoResponse for DrsError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        DrsBulkObjectsRequestBody, GetObjectError, MAX_BULK_OBJECT_IDS, RequestedObjectId,
-        ResolveOutcome, ResolvedObject, W3ID_DATA_PREFIX, build_object_response, download_error,
-        drs_denied_error, encode_component, get_authorizations, get_object,
-        parse_requested_object_id, post_objects, resolve_object, routed_deadline,
-    };
-    use crate::openapi::ApiDoc;
-    use crate::server_state::ServerState;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
-        REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
-    };
-    use aruna_core::structs::{
-        Actor, AuthContext, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BucketInfo,
-        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmId, SourceMetadata, VersionKey, VersionedObjectArn,
-    };
-    use aruna_core::{NodeId, UserId};
-    use aruna_operations::driver::DriverContext;
-    use aruna_storage::storage::FjallStorage;
-    use axum::Extension;
-    use axum::body::to_bytes;
-    use axum::extract::{ConnectInfo, Path, State};
-    use axum::http::{HeaderMap, StatusCode};
-    use std::collections::HashMap;
-    use std::str::FromStr;
-    use std::sync::Arc;
-    use std::time::SystemTime;
-    use tempfile::TempDir;
-    use ulid::Ulid;
-
-    fn materialized_location(blake3: [u8; 32]) -> BackendLocation {
-        let mut hashes = HashMap::new();
-        hashes.insert("blake3".to_string(), blake3.to_vec());
-        hashes.insert("sha256".to_string(), vec![0xabu8; 32]);
-        BackendLocation {
-            backend: BackendRef::node_default(),
-            storage_class: None,
-            root: "/tmp".to_string(),
-            storage_bucket: "objects".to_string(),
-            backend_path: "blob.bin".to_string(),
-            ulid: Ulid::from_bytes([2u8; 16]),
-            compressed: false,
-            encrypted: false,
-            created_by: UserId::nil(RealmId([3u8; 32])),
-            created_at: SystemTime::UNIX_EPOCH,
-            staging: false,
-            partial: false,
-            blob_size: 42,
-            hashes,
-        }
-    }
-
-    fn test_realm_id() -> RealmId {
-        RealmId::from_bytes(
-            *ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
-                .verifying_key()
-                .as_bytes(),
-        )
-    }
-
-    fn test_node_id() -> NodeId {
-        NodeId::from_str("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6")
-            .unwrap()
-    }
-
-    async fn test_state() -> (TempDir, Arc<ServerState>) {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        let ctx = Arc::new(DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
-        let state = ServerState::new(
-            ctx,
-            test_realm_id(),
-            test_node_id(),
-            NodeCapabilities::user_node(test_realm_id()).expect("capabilities"),
-            false,
-            None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
-        )
-        .await;
-        (dir, Arc::new(state))
-    }
-
-    async fn write_fixture(state: &ServerState, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        match state
-            .get_ctx()
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key: key.into(),
-                value: value.into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected fixture write event: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn authorizations_shape() {
-        let (_dir, state) = test_state().await;
-        let response = get_authorizations(State(state), Path("object/id".to_string())).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-            serde_json::json!({
-                "drs_object_id": "object/id",
-                "supported_types": ["BearerAuth"],
-                "passport_auth_issuers": [],
-                "bearer_auth_issuers": []
-            })
-        );
-    }
-
-    async fn seed_version(state: &ServerState) -> (AuthContext, AuthContext, VersionedObjectArn) {
-        let realm_id = state.get_realm_id();
-        let node_id = state.get_node_id();
-        let group_id = Ulid::from_bytes([4u8; 16]);
-        let owner = UserId::new(Ulid::from_bytes([5u8; 16]), realm_id);
-        let denied = UserId::new(Ulid::from_bytes([6u8; 16]), realm_id);
-        let actor = Actor {
-            node_id,
-            user_id: owner,
-            realm_id,
-        };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
-        let group = Group {
-            display_name: "drs-group".to_string(),
-            group_id,
-            realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner,
-        };
-        // Request-policy loading fails closed without the realm config, the group
-        // record, and the group auth document.
-        write_fixture(
-            state,
-            REALM_CONFIG_KEYSPACE,
-            realm_id.as_bytes().to_vec(),
-            RealmConfigDocument::default_for_realm(realm_id, Vec::new())
-                .to_bytes(&actor)
-                .expect("realm config serializes"),
-        )
-        .await;
-        write_fixture(
-            state,
-            GROUP_KEYSPACE,
-            group_id.to_bytes().to_vec(),
-            group.to_bytes(&actor).expect("group serializes"),
-        )
-        .await;
-        write_fixture(
-            state,
-            AUTH_KEYSPACE,
-            realm_id.as_bytes().to_vec(),
-            realm_auth.to_bytes(&actor).expect("realm auth serializes"),
-        )
-        .await;
-        write_fixture(
-            state,
-            AUTH_KEYSPACE,
-            group_id.to_bytes().to_vec(),
-            group_auth.to_bytes(&actor).expect("group auth serializes"),
-        )
-        .await;
-
-        let bucket = "mybucket";
-        let key = "path/file @ 1.txt";
-        let version = Ulid::from_bytes([7u8; 16]);
-        let hash = [0x33u8; 32];
-        let location = materialized_location(hash);
-        let bucket_info = BucketInfo {
-            group_id,
-            created_at: SystemTime::UNIX_EPOCH,
-            created_by: owner,
-            cors_configuration: None,
-            storage_routing: Vec::new(),
-            placement_policies: Vec::new(),
-            placement_policy_generation: 0,
-        };
-        write_fixture(
-            state,
-            S3_BUCKET_KEYSPACE,
-            bucket.as_bytes().to_vec(),
-            bucket_info.to_bytes().expect("bucket serializes"),
-        )
-        .await;
-        write_fixture(
-            state,
-            BLOB_VERSIONS_KEYSPACE,
-            VersionKey::new(bucket, key, version)
-                .to_bytes()
-                .expect("version key serializes"),
-            BlobVersion::materialized(
-                hash,
-                BackendRef::node_default(),
-                SystemTime::UNIX_EPOCH,
-                owner,
-                None,
-            )
-            .to_bytes()
-            .expect("version serializes"),
-        )
-        .await;
-        write_fixture(
-            state,
-            BLOB_LOCATIONS_KEYSPACE,
-            BlobLocationKey::new(hash, location.backend.clone()).to_bytes(),
-            location.to_bytes().expect("location serializes"),
-        )
-        .await;
-
-        (
-            AuthContext {
-                user_id: owner,
-                realm_id,
-                path_restrictions: None,
-                session: None,
-            },
-            AuthContext {
-                user_id: denied,
-                realm_id,
-                path_restrictions: None,
-                session: None,
-            },
-            VersionedObjectArn::new(realm_id, node_id, bucket, key, version)
-                .expect("versioned ARN"),
-        )
-    }
-
-    #[test]
-    fn anonymous_drs_denied_error_matches_unknown_object() {
-        let anonymous = drs_denied_error(true);
-        assert_eq!(anonymous.status, axum::http::StatusCode::NOT_FOUND);
-        assert_eq!(anonymous.message, "DRS object not found");
-
-        let authenticated = drs_denied_error(false);
-        assert_eq!(authenticated.status, axum::http::StatusCode::FORBIDDEN);
-        assert_eq!(authenticated.message, "Forbidden");
-    }
-
-    #[test]
-    fn parses_canonical_w3id_object_id() {
-        let expected_hash = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
-            0x1c, 0x1d, 0x1e, 0x1f,
-        ];
-        let parsed = parse_requested_object_id(
-            "https://w3id.org/aruna/data/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        )
-        .unwrap();
-
-        match parsed {
-            RequestedObjectId::CanonicalW3id(hash) => assert_eq!(hash, expected_hash),
-            RequestedObjectId::ContentHashArn { .. } => panic!("expected canonical w3id id"),
-            RequestedObjectId::VersionedObject(_) => panic!("expected canonical w3id id"),
-        }
-    }
-
-    #[test]
-    fn parses_content_hash_arn_preserving_realm_node_and_hash() {
-        let realm_id = test_realm_id();
-        let node_id = test_node_id();
-        let arn = format!(
-            "arn:aruna:{realm_id}:{node_id}:ch/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-        );
-
-        let parsed = parse_requested_object_id(&arn).unwrap();
-
-        match parsed {
-            RequestedObjectId::ContentHashArn {
-                realm_id: parsed_realm_id,
-                node_id: parsed_node_id,
-                hash,
-            } => {
-                assert_eq!(parsed_realm_id, realm_id);
-                assert_eq!(parsed_node_id, node_id);
-                assert_eq!(
-                    hash,
-                    [
-                        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
-                        0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-                        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-                    ]
-                );
-            }
-            RequestedObjectId::CanonicalW3id(_) => panic!("expected content-hash arn"),
-            RequestedObjectId::VersionedObject(_) => panic!("expected content-hash arn"),
-        }
-    }
-
-    #[test]
-    fn rejects_malformed_version() {
-        let realm_id = test_realm_id();
-        let node_id = test_node_id();
-        let bare = format!("arn:aruna:{realm_id}:{node_id}:s3/mybucket/path/file.txt@invalid");
-
-        for object_id in [bare.clone(), format!("{W3ID_DATA_PREFIX}{bare}")] {
-            let error = parse_requested_object_id(&object_id)
-                .err()
-                .expect("malformed version should be rejected");
-            assert_eq!(error.status, StatusCode::BAD_REQUEST);
-            assert!(
-                error
-                    .message
-                    .contains("versioned object ARN has an invalid ULID")
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn resolves_versioned_ids() {
-        let (_dir, state) = test_state().await;
-        let (auth, _, arn) = seed_version(state.as_ref()).await;
-
-        for object_id in [arn.to_string(), arn.to_w3id()] {
-            let outcome = resolve_object(state.as_ref(), &auth, &object_id, routed_deadline())
-                .await
-                .expect("version resolves");
-            let ResolveOutcome::Found(resolved) = outcome else {
-                panic!("expected resolved version");
-            };
-            assert_eq!(resolved.bucket, arn.bucket);
-            assert_eq!(resolved.key, arn.key);
-            assert_eq!(resolved.version_id, arn.version);
-            assert_eq!(resolved.group_id, Ulid::from_bytes([4u8; 16]));
-        }
-    }
-
-    #[tokio::test]
-    async fn rejects_nonlocal_version() {
-        let (_dir, state) = test_state().await;
-        let auth = AuthContext {
-            user_id: UserId::new(Ulid::from_bytes([5u8; 16]), state.get_realm_id()),
-            realm_id: state.get_realm_id(),
-            path_restrictions: None,
-            session: None,
-        };
-        let other_node = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
-        let other_realm = RealmId::from_bytes(
-            *ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
-                .verifying_key()
-                .as_bytes(),
-        );
-        let version = Ulid::from_bytes([7u8; 16]);
-        // A foreign realm is definitive absence; a foreign node is only unproven.
-        let cases = [
-            (
-                VersionedObjectArn::new(
-                    other_realm,
-                    state.get_node_id(),
-                    "mybucket",
-                    "path/file.txt",
-                    version,
-                )
-                .unwrap(),
-                StatusCode::NOT_FOUND,
-            ),
-            (
-                VersionedObjectArn::new(
-                    state.get_realm_id(),
-                    other_node,
-                    "mybucket",
-                    "path/file.txt",
-                    version,
-                )
-                .unwrap(),
-                StatusCode::SERVICE_UNAVAILABLE,
-            ),
-        ];
-
-        for (arn, expected) in cases {
-            let response = get_object(
-                State(state.clone()),
-                Extension(Some(auth.clone())),
-                ConnectInfo("127.0.0.1:1".parse().unwrap()),
-                HeaderMap::new(),
-                Path(arn.to_string()),
-            )
-            .await;
-            assert_eq!(response.status(), expected);
-            let body = to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("response body");
-            let payload: serde_json::Value =
-                serde_json::from_slice(&body).expect("typed error body");
-            assert_eq!(payload["status_code"], expected.as_u16());
-        }
-    }
-
-    #[tokio::test]
-    async fn enforces_version_auth() {
-        let (_dir, state) = test_state().await;
-        let (_, denied, arn) = seed_version(state.as_ref()).await;
-
-        let outcome = resolve_object(state.as_ref(), &denied, &arn.to_string(), routed_deadline())
-            .await
-            .expect("authorization resolves");
-        assert!(matches!(outcome, ResolveOutcome::Denied));
-    }
-
-    #[tokio::test]
-    async fn returns_missing_version() {
-        let (_dir, state) = test_state().await;
-        let (auth, _, arn) = seed_version(state.as_ref()).await;
-        let missing = VersionedObjectArn::new(
-            arn.realm_id,
-            arn.node_id,
-            arn.bucket,
-            arn.key,
-            Ulid::from_bytes([8u8; 16]),
-        )
-        .unwrap();
-
-        let response = get_object(
-            State(state),
-            Extension(Some(auth)),
-            ConnectInfo("127.0.0.1:1".parse().unwrap()),
-            HeaderMap::new(),
-            Path(missing.to_string()),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("response body");
-        let payload: serde_json::Value = serde_json::from_slice(&body).expect("typed error body");
-        assert_eq!(payload["status_code"], 404);
-        assert_eq!(payload["msg"], "DRS object not found");
-    }
-
-    #[tokio::test]
-    async fn caps_bulk_ids() {
-        // An uncapped list would let one anonymous request spend a routed probe
-        // per identifier, so the cap is refused before anything is resolved.
-        let (_dir, state) = test_state().await;
-        let id = format!("{W3ID_DATA_PREFIX}{}", hex::encode([1u8; 32]));
-        let object_ids = std::iter::repeat_n(id, MAX_BULK_OBJECT_IDS + 1).collect();
-
-        let response = post_objects(
-            State(state),
-            Extension(None),
-            ConnectInfo("127.0.0.1:1".parse().unwrap()),
-            HeaderMap::new(),
-            axum::Json(DrsBulkObjectsRequestBody { object_ids }),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn materialized_canonical_w3id_response_omits_aliases_and_keeps_download_method() {
-        let blake3 = [0x11u8; 32];
-        let canonical_w3id = format!("{W3ID_DATA_PREFIX}{}", hex::encode(blake3));
-        let resolved = ResolvedObject {
-            bucket: "mybucket".to_string(),
-            key: "path/file.txt".to_string(),
-            group_id: Ulid::from_bytes([4u8; 16]),
-            version_id: Ulid::from_bytes([5u8; 16]),
-            canonical_w3id: canonical_w3id.clone(),
-            requested_id: canonical_w3id.clone(),
-            size: 42,
-            hashes: materialized_location(blake3).hashes.into_iter().collect(),
-            location: Some(materialized_location(blake3)),
-            source_metadata: Some(SourceMetadata {
-                content_length: 42,
-                content_type: Some("application/octet-stream".to_string()),
-                etag: Some("etag-from-materialized".to_string()),
-                last_modified: None,
-                source_version: None,
-            }),
-        };
-
-        let response = build_object_response("https://drs.example.test", &resolved);
-
-        assert!(response.aliases.is_empty());
-        assert_eq!(response.id, canonical_w3id);
-        assert_eq!(response.checksums.len(), 2);
-        assert!(
-            response
-                .checksums
-                .iter()
-                .any(|checksum| checksum.kind == "blake3"
-                    && checksum.checksum == hex::encode(blake3))
-        );
-        assert!(
-            response
-                .checksums
-                .iter()
-                .any(|checksum| checksum.kind == "sha256" && checksum.checksum == "ab".repeat(32))
-        );
-        assert_eq!(response.access_methods.len(), 1);
-        assert_eq!(response.access_methods[0].kind, "https");
-        assert_eq!(
-            response.access_methods[0].access_url.as_ref().unwrap().url,
-            format!(
-                "https://drs.example.test/api/v1/ga4gh/drs/v1/download?object_id={}",
-                encode_component(&canonical_w3id)
-            )
-        );
-    }
-
-    #[test]
-    fn materialized_content_hash_arn_response_exposes_canonical_alias() {
-        let realm_id = test_realm_id();
-        let node_id = test_node_id();
-        let blake3 = [0x22u8; 32];
-        let canonical_w3id = format!("{W3ID_DATA_PREFIX}{}", hex::encode(blake3));
-        let requested_id = format!("arn:aruna:{realm_id}:{node_id}:ch/{}", hex::encode(blake3));
-        let resolved = ResolvedObject {
-            bucket: "mybucket".to_string(),
-            key: "path/file.txt".to_string(),
-            group_id: Ulid::from_bytes([6u8; 16]),
-            version_id: Ulid::from_bytes([7u8; 16]),
-            canonical_w3id: canonical_w3id.clone(),
-            requested_id: requested_id.clone(),
-            size: 42,
-            hashes: materialized_location(blake3).hashes.into_iter().collect(),
-            location: Some(materialized_location(blake3)),
-            source_metadata: Some(SourceMetadata {
-                content_length: 42,
-                content_type: Some("application/octet-stream".to_string()),
-                etag: Some("etag-from-materialized".to_string()),
-                last_modified: None,
-                source_version: None,
-            }),
-        };
-
-        let response = build_object_response("https://drs.example.test", &resolved);
-
-        assert_eq!(response.id, requested_id);
-        assert_eq!(response.aliases, vec![canonical_w3id.clone()]);
-        assert_eq!(response.checksums.len(), 2);
-        assert_eq!(response.access_methods.len(), 1);
-        assert_eq!(
-            response.access_methods[0].access_url.as_ref().unwrap().url,
-            format!(
-                "https://drs.example.test/api/v1/ga4gh/drs/v1/download?object_id={}",
-                encode_component(&requested_id)
-            )
-        );
-    }
-
-    // A lost historical observation is not a server fault, drift is transient,
-    // and an exhausted binding needs a rebind: three distinct statuses.
-    #[test]
-    fn maps_reference_errors() {
-        for (error, status) in [
-            (
-                GetObjectError::HistoricalReferenceUnavailable,
-                StatusCode::NOT_FOUND,
-            ),
-            (
-                GetObjectError::ReferenceSourceChanged,
-                StatusCode::SERVICE_UNAVAILABLE,
-            ),
-            (
-                GetObjectError::ReferenceAdvanceExhausted,
-                StatusCode::CONFLICT,
-            ),
-            (GetObjectError::NoSuchKey, StatusCode::NOT_FOUND),
-            (
-                GetObjectError::GetObjectFailed,
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ),
-        ] {
-            assert_eq!(download_error(error).status(), status);
-        }
-    }
-
-    // Operators reading the spec must see the reference statuses the route can
-    // actually return.
-    #[test]
-    fn download_declares_statuses() {
-        let openapi = ApiDoc::openapi();
-        let responses = &openapi
-            .paths
-            .paths
-            .get("/ga4gh/drs/v1/download")
-            .expect("download path")
-            .get
-            .as_ref()
-            .expect("download operation")
-            .responses
-            .responses;
-        for status in ["404", "409", "503"] {
-            assert!(responses.contains_key(status), "missing {status}");
-        }
-    }
-
-    #[test]
-    fn drs_openapi_includes_service_and_object_paths() {
-        let openapi = ApiDoc::openapi();
-        assert!(
-            openapi
-                .paths
-                .paths
-                .contains_key("/ga4gh/drs/v1/service-info")
-        );
-        assert!(openapi.paths.paths.contains_key("/ga4gh/drs/v1/objects"));
-        assert!(
-            openapi
-                .paths
-                .paths
-                .contains_key("/ga4gh/drs/v1/objects/{object_id}")
-        );
-        assert!(openapi.paths.paths.contains_key("/ga4gh/drs/v1/download"));
-        let _ = W3ID_DATA_PREFIX;
-    }
-}
+#[path = "drs_tests.rs"]
+mod tests;

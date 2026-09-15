@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::endpoint;
+use crate::endpoint_screening;
 use aruna_core::structs::{OFFERED_DIRECTORY_BUCKET, SourceConnectorKind};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceConnectorValidationRules {
+pub struct SourceConnectorRules {
     pub required_public_keys: &'static [&'static str],
     pub allowed_public_keys: &'static [&'static str],
     pub allowed_secret_keys: &'static [&'static str],
@@ -117,12 +117,12 @@ pub fn validate_connector_input(
     }
 
     if let Some(endpoint) = public_config.get("endpoint")
-        && !endpoint::is_canonical(endpoint)
+        && !endpoint_screening::is_canonical(endpoint)
     {
         return Err(ValidationError::AmbiguousEndpoint(endpoint.clone()));
     }
     if let Some(bucket) = public_config.get("bucket")
-        && endpoint::breaks_authority(bucket)
+        && endpoint_screening::breaks_authority(bucket)
     {
         return Err(ValidationError::UnsafeBucket(bucket.clone()));
     }
@@ -153,34 +153,34 @@ pub fn validate_connector_input(
     Ok(())
 }
 
-pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorValidationRules {
+pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorRules {
     match kind {
-        SourceConnectorKind::Http => SourceConnectorValidationRules {
+        SourceConnectorKind::Http => SourceConnectorRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
             allowed_secret_keys: &["username", "password", "token"],
         },
-        SourceConnectorKind::S3 => SourceConnectorValidationRules {
+        SourceConnectorKind::S3 => SourceConnectorRules {
             required_public_keys: &["bucket", "endpoint"],
             allowed_public_keys: &["bucket", "endpoint", "region", "root", S3_SKIP_SIGNATURE],
             allowed_secret_keys: &["access_key_id", "secret_access_key"],
         },
-        SourceConnectorKind::Webdav => SourceConnectorValidationRules {
+        SourceConnectorKind::Webdav => SourceConnectorRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
             allowed_secret_keys: &["username", "password", "token"],
         },
-        SourceConnectorKind::Ftp => SourceConnectorValidationRules {
+        SourceConnectorKind::Ftp => SourceConnectorRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
             allowed_secret_keys: &["user", "password"],
         },
-        SourceConnectorKind::ArunaNative => SourceConnectorValidationRules {
+        SourceConnectorKind::ArunaNative => SourceConnectorRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "realm_id", "default_node_id"],
             allowed_secret_keys: &["bearer_token", "access_key", "secret_key"],
         },
-        SourceConnectorKind::LocalDirectory => SourceConnectorValidationRules {
+        SourceConnectorKind::LocalDirectory => SourceConnectorRules {
             required_public_keys: &[OFFERED_DIRECTORY_BUCKET],
             allowed_public_keys: &[OFFERED_DIRECTORY_BUCKET],
             allowed_secret_keys: &[],
@@ -189,7 +189,7 @@ pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorValidat
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     #[test]
@@ -206,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_public_key() {
+    fn unknown_public_rejected() {
         let err = validate_connector_input(
             "http",
             SourceConnectorKind::Http,
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_required_public_key() {
+    fn missing_public_rejected() {
         let err = validate_connector_input(
             "s3",
             SourceConnectorKind::S3,
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_secret_key() {
+    fn unknown_secret_rejected() {
         let err = validate_connector_input(
             "webdav",
             SourceConnectorKind::Webdav,
@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_aruna_native_connector_kind() {
+    fn unsupported_native_rejected() {
         let err = validate_connector_input(
             "native",
             SourceConnectorKind::ArunaNative,

@@ -1,7 +1,5 @@
-//! Progress-detecting convergence waits and a per-poll hang cap, shared by the
-//! multi-node integration tests. A slow-but-converging run keeps waiting; a
-//! stuck run fails after a lost-progress window, and a deadlocked poll panics
-//! naming its own context instead of hanging until the CI job timeout.
+//! Progress-detecting convergence waits and a per-poll hang cap, shared by the multi-node
+//! integration tests.
 
 #![allow(dead_code)]
 
@@ -22,14 +20,7 @@ pub const NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Polls `check` until it reports zero still-pending units. The lost-progress
-/// deadline resets whenever the pending count strictly decreases, so the wait
-/// fails only after `NO_PROGRESS_TIMEOUT` with no step forward, never at a fixed
-/// wall-clock budget. `context` names the wait in the lost-progress error. A
-/// single poll exceeding `HANG_CAP` is treated as a deadlock and panics.
-///
-/// Generic over the caller's error so both `Box<dyn Error>` and its `Send + Sync`
-/// variant can flow through unchanged.
+/// Polls until no work remains, resetting the deadline after each observed decrease.
 pub async fn wait_for_convergence<F, Fut, E>(context: &str, check: F) -> Result<(), E>
 where
     F: Fn() -> Fut,

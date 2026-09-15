@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::replication::util::dht_registration_effect;
+use crate::replication::dht_registration::dht_registration_effect;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
@@ -11,8 +11,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, COMPLETION_DEADLINE_MS,
-    GroupStorageBackend, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    MultipartUploadStatus, RealmId, RoCrateLimits, WriteOwner,
+    GroupStorage, MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus, RealmId,
+    RoCrateLimits, WriteOwner,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
@@ -20,9 +20,9 @@ use tracing::{error, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::group_backends::{backend_key, parse_read};
+use crate::groups::backends::{backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
-use crate::s3::abort_multipart_upload::{AbortMultipartUploadInput, AbortMultipartUploadOperation};
+use crate::s3::abort_upload::{AbortUploadInput, AbortUploadOperation};
 
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
@@ -115,7 +115,7 @@ fn cleanup_row_write(work: &BlobCleanupWork, key: &Key) -> Option<Effect> {
     }
 }
 
-pub fn schedule_blob_cleanup_effect() -> Effect {
+pub fn schedule_cleanup_effect() -> Effect {
     Effect::Task(TaskEffect::ShortenTimer {
         key: TaskKey::DrainBlobCleanupQueue,
         after: Duration::ZERO,
@@ -249,7 +249,7 @@ pub async fn sweep_stale_uploads(
     for record in stale {
         let upload_id = record.upload_id;
         match drive(
-            AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
+            AbortUploadOperation::new(AbortUploadInput {
                 bucket: record.bucket,
                 key: record.key,
                 upload_id,
@@ -292,7 +292,7 @@ async fn is_removed_backend(context: &DriverContext, backend: &BackendRef) -> bo
             txn_id: None,
         })
         .await;
-    matches!(parse_read(event, GroupStorageBackend::from_bytes), Ok(None))
+    matches!(parse_read(event, GroupStorage::from_bytes), Ok(None))
 }
 
 async fn delete_cleanup_rows(
@@ -425,7 +425,7 @@ async fn owns_write(
             part_number,
         } => (
             S3_MULTIPART_UPLOAD_PART_KEYSPACE,
-            MultipartUploadPartKey::new(*upload_id, *part_number)
+            MultipartPartKey::new(*upload_id, *part_number)
                 .to_bytes()
                 .ok()?
                 .into(),
@@ -448,7 +448,7 @@ async fn owns_write(
     };
     let owned = match owner {
         WriteOwner::Blob { .. } => BackendLocation::from_bytes(&value).ok()?,
-        WriteOwner::UploadPart { .. } => MultipartUploadPart::from_bytes(&value).ok()?.location,
+        WriteOwner::UploadPart { .. } => MultipartPart::from_bytes(&value).ok()?.location,
     };
     Some(owned.same_object(location))
 }
@@ -458,13 +458,13 @@ mod tests {
     use super::{CLEANUP_PAGE_SIZE, MAX_CLEANUP_RETRIES, PendingCleanup, process_cleanup_batch};
     use crate::driver::DriverContext;
     use crate::jobs::store::iter_prefix_page;
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
     use aruna_core::structs::{
         BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, RoCrateLimits, WriteOwner,
     };
-    use aruna_core::types::UserId;
     use aruna_storage::storage::{FjallStorage, StorageHandle};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -681,9 +681,8 @@ mod tests {
 
     #[tokio::test]
     async fn unowned_write_deletes() {
-        // Without a location row naming this copy the commit never landed, so
-        // the bytes have to go; this context has no blob handle, so the delete
-        // fails and the row stays for the next drain.
+        // Without a location row the commit never landed, so the bytes must
+        // go; no blob handle here, so the delete fails and the row waits.
         let (_dir, storage, context) = setup_context();
         let BlobCleanupWork::DeleteBlob { location } =
             BlobCleanupWork::from_bytes(&delete_work()).unwrap()

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fast contract test for the seven public Just recipes. It never starts a real
+# Fast contract test for the ten public Just recipes. It never starts a real
 # service: stub binaries and fake prerequisite commands cover every path.
 set -uo pipefail
 
@@ -158,7 +158,7 @@ run_cluster() {
     ARUNA_TEST_DEPLOY_DOCTOR_BIN="$STUB_DIR/aruna-doctor" \
     ARUNA_TEST_DEPLOY_BASE_PORT="${ARUNA_TEST_DEPLOY_BASE_PORT:-$BASE_PORT}" \
     ARUNA_TEST_DEPLOY_READY_TIMEOUT_SECS=1 \
-    bash "$ROOT_DIR/scripts/local_cluster_deploy.sh" "$@" 2>&1
+    bash "$ROOT_DIR/scripts/cluster_start.sh" "$@" 2>&1
 }
 
 run_compose() {
@@ -193,8 +193,8 @@ test_recipe_list() {
       | sort \
       | tr '\n' ' '
   )"
-  check_eq "recipe list is exactly the seven public recipes" \
-    "local local-cluster local-cluster-oidc local-new preview preview-no-oidc stop " "$names"
+  check_eq "recipe list is exactly the ten public recipes" \
+    "check lint local local-cluster local-cluster-oidc local-new preview preview-no-oidc stop test " "$names"
 }
 
 test_dry_runs() {
@@ -223,7 +223,7 @@ test_dry_runs() {
   output="$(cd "$ROOT_DIR" && just --dry-run preview-no-oidc 2>&1)"
   check_lacks "preview-no-oidc omits keycloak" "$output" "--with-keycloak"
   output="$(cd "$ROOT_DIR" && just --dry-run stop 2>&1)"
-  check_has "stop runs the stop script" "$output" "bash scripts/local_cluster_stop.sh"
+  check_has "stop runs the stop script" "$output" "bash scripts/cluster_stop.sh"
 }
 
 test_help_text() {
@@ -235,8 +235,8 @@ test_help_text() {
   check_has "compose help documents --new" "$output" "--new"
   check_has "compose help documents ops readiness" "$output" "/readyz"
 
-  output="$(bash "$ROOT_DIR/scripts/local_cluster_deploy.sh" --help 2>&1)"
-  check_has "cluster help names the real script" "$output" "bash scripts/local_cluster_deploy.sh"
+  output="$(bash "$ROOT_DIR/scripts/cluster_start.sh" --help 2>&1)"
+  check_has "cluster help names the real script" "$output" "bash scripts/cluster_start.sh"
   check_has "cluster help documents --node-count" "$output" "--node-count N"
   check_has "cluster help documents --portal-dir" "$output" "--portal-dir P"
   check_has "cluster help documents --auto-portal-dir" "$output" "--auto-portal-dir"
@@ -244,10 +244,10 @@ test_help_text() {
   check_has "cluster help documents the deployment root" "$output" "ARUNA_TEST_DEPLOY_ROOT"
   check_has "cluster help names the stop recipe" "$output" "just stop"
 
-  output="$(bash "$ROOT_DIR/scripts/local_cluster_stop.sh" --help 2>&1)"
-  check_has "stop help names the real script" "$output" "bash scripts/local_cluster_stop.sh"
+  output="$(bash "$ROOT_DIR/scripts/cluster_stop.sh" --help 2>&1)"
+  check_has "stop help names the real script" "$output" "bash scripts/cluster_stop.sh"
   check_has "stop help documents the deployment root" "$output" "ARUNA_TEST_DEPLOY_ROOT"
-  output="$(bash "$ROOT_DIR/scripts/local_cluster_stop.sh" --bogus 2>&1 || true)"
+  output="$(bash "$ROOT_DIR/scripts/cluster_stop.sh" --bogus 2>&1 || true)"
   check_has "unknown stop argument is rejected" "$output" "unknown argument: --bogus"
 }
 
@@ -352,17 +352,17 @@ test_preflight_paths() {
   local output
 
   output="$(PATH="$MIN_BIN" ARUNA_TEST_DEPLOY_ROOT="$DEPLOY_ROOT" \
-    bash "$ROOT_DIR/scripts/local_cluster_deploy.sh" --node-count 2 2>&1)"
+    bash "$ROOT_DIR/scripts/cluster_start.sh" --node-count 2 2>&1)"
   check_has "missing cargo is reported" "$output" "missing required command: cargo"
 
   output="$(PATH="$MIN_BIN" ARUNA_TEST_DEPLOY_ROOT="$DEPLOY_ROOT" ARUNA_TEST_DEPLOY_SKIP_BUILD=1 \
-    bash "$ROOT_DIR/scripts/local_cluster_deploy.sh" --node-count 2 2>&1)"
+    bash "$ROOT_DIR/scripts/cluster_start.sh" --node-count 2 2>&1)"
   check_has "skip-build still requires curl" "$output" "missing required command: curl"
 
   output="$(PATH="$MIN_BIN:$FAKE_BIN" ARUNA_TEST_DEPLOY_ROOT="$DEPLOY_ROOT" \
     ARUNA_TEST_DEPLOY_SKIP_BUILD=1 \
     ARUNA_TEST_DEPLOY_ARUNA_BIN="$WORK_DIR/absent-binary" \
-    bash "$ROOT_DIR/scripts/local_cluster_deploy.sh" --node-count 2 2>&1)"
+    bash "$ROOT_DIR/scripts/cluster_start.sh" --node-count 2 2>&1)"
   check_has "skip-build verifies the built binaries" "$output" "missing binary:"
 
   output="$(FAKE_MISSING_IMAGE=1 run_compose)"
@@ -443,8 +443,22 @@ test_static_gates() {
     fi
   done
 
+  for script in "$ROOT_DIR"/scripts/compute-helper/build.sh \
+    "$ROOT_DIR"/scripts/session-deno/build.sh \
+    "$ROOT_DIR"/scripts/session-python/build.sh \
+    "$ROOT_DIR"/scripts/session-helper/session-start; do
+    if output="$(sh -n "$script" 2>&1)"; then
+      pass "sh -n $(basename "$script")"
+    else
+      fail "sh -n $(basename "$script")" "$output"
+    fi
+  done
+
   if command -v shellcheck >/dev/null 2>&1; then
-    if output="$(cd "$ROOT_DIR" && shellcheck scripts/*.sh scripts/tests/*.sh 2>&1)"; then
+    if output="$(cd "$ROOT_DIR" \
+      && shellcheck scripts/*.sh scripts/tests/*.sh \
+      && shellcheck --shell=sh scripts/compute-helper/build.sh scripts/session-deno/build.sh \
+        scripts/session-python/build.sh scripts/session-helper/session-start 2>&1)"; then
       pass "shellcheck"
     else
       fail "shellcheck" "$output"

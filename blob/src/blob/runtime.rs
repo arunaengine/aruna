@@ -11,7 +11,7 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{BackendConfig, BackendState, BlobState, MultipartUploadPartKey, Status};
+use aruna_core::structs::{BackendConfig, BackendState, BlobState, MultipartPartKey, Status};
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
@@ -20,11 +20,12 @@ use bytes::Bytes;
 use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Duration, Instant, interval, timeout};
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 // Bounds concurrent transfers so overload queues instead of exhausting fds.
@@ -173,7 +174,7 @@ impl Handle for BlobHandle {
         match effect {
             Effect::Blob(blob_effect) => self.send_blob_effect(blob_effect).await,
             Effect::StagingSource(staging_source_effect) => {
-                self.send_staging_source_effect(staging_source_effect).await
+                self.send_staging_effect(staging_source_effect).await
             }
             Effect::LocalFile(file_effect) => self.send_file_effect(file_effect).await,
             _ => Event::Blob(BlobEvent::Error(BlobError::InvalidEffect)),
@@ -340,7 +341,7 @@ impl BlobHandle {
         })
     }
 
-    pub async fn send_staging_source_effect(&self, effect: StagingSourceEffect) -> Event {
+    pub async fn send_staging_effect(&self, effect: StagingSourceEffect) -> Event {
         let staging_source_event = match effect {
             StagingSourceEffect::Check { access } => {
                 self.handler.check_staging_source(access).await
@@ -493,13 +494,23 @@ impl BlobHandler {
             rejected_writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes_in_flight: Arc::new(AtomicUsize::new(0)),
             writes_drained: Arc::new(tokio::sync::Notify::new()),
+            monitor_cancel: CancellationToken::new(),
+            monitor_task: Arc::new(StdMutex::new(None)),
         };
         blob_handler.ensure_multipart_bucket().await?;
         blob_handler.probe_all_backends().await;
         let status_handler = blob_handler.clone();
-        tokio::spawn(async move {
-            status_handler.monitor_backend_status().await;
+        let monitor_cancel = blob_handler.monitor_cancel.clone();
+        let monitor_task = tokio::spawn(async move {
+            tokio::select! {
+                _ = status_handler.monitor_backend_status() => {}
+                _ = monitor_cancel.cancelled() => {}
+            }
         });
+        *blob_handler
+            .monitor_task
+            .lock()
+            .expect("blob monitor task lock poisoned") = Some(monitor_task);
 
         Ok(BlobHandle::new(blob_handler))
     }
@@ -507,6 +518,9 @@ impl BlobHandler {
     pub(super) fn close_writes(&self) {
         let _guard = self.close_lock.write().expect("blob close lock poisoned");
         self.closed.store(true, Ordering::SeqCst);
+        // The monitor holds a handler clone; stop it so cleanup can release the
+        // storage handle instead of leaving a detached task behind.
+        self.monitor_cancel.cancel();
     }
 
     pub(super) fn writes_closed(&self) -> bool {
@@ -515,6 +529,16 @@ impl BlobHandler {
 
     pub(super) async fn drain_writes(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
+        self.monitor_cancel.cancel();
+        let monitor_task = self
+            .monitor_task
+            .lock()
+            .expect("blob monitor task lock poisoned")
+            .take();
+        if let Some(task) = monitor_task {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let _ = tokio::time::timeout(remaining, task).await;
+        }
         loop {
             if self.writes_in_flight.load(Ordering::Acquire) == 0 {
                 return true;
@@ -567,7 +591,7 @@ impl BlobHandler {
                 blob,
             } => {
                 Box::pin(self.write_blob_part(
-                    MultipartUploadPartKey::new(upload_id, part_number),
+                    MultipartPartKey::new(upload_id, part_number),
                     resolved,
                     created_by,
                     compressed,
@@ -673,10 +697,10 @@ impl BlobHandler {
     }
 
     pub async fn open_connection(&self, node_id: NodeId) -> BlobEvent {
-        match super::control_plane::with_control_plane_timeout(
+        match super::control_plane::with_timeout(
             self.net.open_stream(node_id, Alpn::Bao),
-            self.control_plane_connect_timeout(),
-            super::ControlPlaneTimeoutKind::Connection,
+            self.connect_timeout(),
+            super::ControlPlaneKind::Connection,
             "opening bao replication stream",
         )
         .await
@@ -698,10 +722,10 @@ impl BlobHandler {
         let mut stream = stream.lock().await;
         let sx = &mut stream.0;
 
-        if let Err(event) = super::control_plane::send_framed_message_with_timeout(
+        if let Err(event) = super::control_plane::send_framed_message(
             sx,
             &payload,
-            self.control_plane_io_timeout(),
+            self.io_timeout(),
             "sending control-plane message",
         )
         .await
@@ -720,9 +744,9 @@ impl BlobHandler {
         let mut stream = stream.lock().await;
         let rx = &mut stream.1;
 
-        let buf = match super::control_plane::read_framed_message_with_timeout(
+        let buf = match super::control_plane::read_framed_message(
             rx,
-            self.control_plane_io_timeout(),
+            self.io_timeout(),
             "reading control-plane message",
         )
         .await

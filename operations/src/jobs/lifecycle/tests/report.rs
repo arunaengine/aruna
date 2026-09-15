@@ -1,18 +1,18 @@
 //! What the external surfaces read back from one family, including the
 //! responder-local diagnostics that stay outside the projection digest.
 
+use aruna_core::UserId;
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::structs::{
     AuthContext, JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobState,
     PhysicalExecutionState, SubmissionId,
 };
-use aruna_core::types::UserId;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::report::{AuditPaging, AuditRange, family_audit, family_report};
-use crate::jobs::records::tests::fixture::{Family, REALM, context, user};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::tests::records::{Family, REALM, context, user};
 
 async fn append(context: &DriverContext, family: &Family, envelope: JobRecordEnvelope) {
     let record = JobRecordFrame::new(envelope).expect("bounded record");

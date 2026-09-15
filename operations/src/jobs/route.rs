@@ -1,10 +1,11 @@
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, JobControlEffect, NetEffect};
 use aruna_core::events::{Event, JobControlEvent, NetEvent, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{JobId, JobOwnerError, RealmConfigDocument, RealmId};
-use aruna_core::types::{Effects, NodeId};
+use aruna_core::types::Effects;
 use smallvec::smallvec;
 
 use super::protocol::JobRouteError;
@@ -110,7 +111,7 @@ impl Operation for JobRouteOperation {
             return self.send(responder);
         }
         smallvec![read_effect(
-            &DocumentSyncTarget::RealmConfig {
+            &DocumentTarget::RealmConfig {
                 realm_id: self.realm_id,
             },
             None,
@@ -177,17 +178,17 @@ impl Operation for JobRouteOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::jobs::{JobKind, JobResponse, JobStatusView};
-    use aruna_core::metadata::MetadataAuthToken;
+    use aruna_core::metadata::AuthToken;
     use aruna_core::structs::{
         AuthContext, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange,
         JobProgress, JobState, PlacementBinding, PlacementScope, WorkspaceMode,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
-    use aruna_core::types::UserId;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
@@ -244,8 +245,8 @@ mod tests {
         }
     }
 
-    fn token(realm_id: RealmId) -> MetadataAuthToken {
-        MetadataAuthToken::internal(AuthContext {
+    fn token(realm_id: RealmId) -> AuthToken {
+        AuthToken::internal(AuthContext {
             user_id: user(realm_id),
             realm_id,
             path_restrictions: None,

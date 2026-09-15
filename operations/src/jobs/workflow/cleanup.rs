@@ -4,7 +4,7 @@ use aruna_core::structs::{AttemptIntent, JobError, JobErrorKind, JobId, JobResul
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{JobMutationError, authorize_cleanup, record_attempt_tombstone};
 use crate::driver::drive;
-use crate::s3::revoke_user_access::{RevokeUserAccessError, RevokeUserAccessOperation};
+use crate::s3::revoke_access::{RevokeUserError, RevokeUserOperation};
 
 pub async fn run_terminal_cleanup(
     ctx: &JobContext,
@@ -22,16 +22,13 @@ pub async fn run_terminal_cleanup(
 
 async fn revoke_credential(ctx: &JobContext, access_key: &str) -> Result<(), JobError> {
     match drive(
-        RevokeUserAccessOperation::new(access_key.to_string()),
+        RevokeUserOperation::new(access_key.to_string()),
         &ctx.driver,
     )
     .await
     {
-        Ok(Some(Ok(_)))
-        | Ok(None)
-        | Ok(Some(Err(RevokeUserAccessError::NotFound)))
-        | Err(RevokeUserAccessError::NotFound) => Ok(()),
-        Ok(Some(Err(error))) | Err(error) => Err(revoke_error(error)),
+        Ok(_) | Err(RevokeUserError::NotFound) => Ok(()),
+        Err(error) => Err(revoke_error(error)),
     }
 }
 
@@ -96,7 +93,7 @@ async fn cleanup_attempt(
 
 /// A live workspace key outlives a terminal job, so no revocation failure is
 /// treated as permanent: the only proven-final case is `NotFound`, already Ok.
-fn revoke_error(error: RevokeUserAccessError) -> JobError {
+fn revoke_error(error: RevokeUserError) -> JobError {
     JobError::retryable(format!("workspace credential revoke failed: {error}"))
 }
 
@@ -129,6 +126,7 @@ mod tests {
 
     use aruna_compute::ExecutorBackend;
     use aruna_compute::ExecutorRegistry;
+    use aruna_core::UserId;
     use aruna_core::compute::{
         AttemptRef, AttemptStatus, CancelEvidence, FenceContext, LogLimits, LogTails, NOBODY,
         ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, UserSpec,
@@ -140,7 +138,6 @@ mod tests {
         ExecutionSpec, JobClaim, JobPayload, JobProgress, JobRecord, JobState, RealmId, UserAccess,
         VersionKey, WorkspaceMode,
     };
-    use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
@@ -151,8 +148,8 @@ mod tests {
     use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::{insert_job, record_attempt_intent};
     use crate::s3::create_bucket::CreateBucketOperation;
-    use crate::s3::get_bucket_info::GetBucketInfoOperation;
-    use crate::s3::get_user_access::GetUserAccessOperation;
+    use crate::s3::get_access::GetAccessOperation;
+    use crate::s3::get_bucket::GetBucketOperation;
 
     struct StubBackend {
         kind: ExecutorKind,
@@ -394,8 +391,6 @@ mod tests {
             &ctx.driver,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
 
         if with_object {
@@ -430,10 +425,9 @@ mod tests {
     }
 
     async fn bucket_exists(ctx: &JobContext, bucket: &str) -> bool {
-        matches!(
-            drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver).await,
-            Ok(Some(Ok(_)))
-        )
+        drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver)
+            .await
+            .is_ok()
     }
 
     async fn write_access(storage: &StorageHandle, access: &UserAccess) {
@@ -542,10 +536,11 @@ mod tests {
                 JobRunOutcome::Succeeded(JobResultPayload::Cleanup)
             ));
         }
-        let stored = drive(GetUserAccessOperation::new(access.access_key), &ctx.driver)
-            .await
-            .unwrap();
-        assert!(stored.is_none());
+        let stored = drive(GetAccessOperation::new(access.access_key), &ctx.driver).await;
+        assert!(matches!(
+            stored,
+            Err(crate::s3::get_access::GetAccessError::NotFound)
+        ));
     }
 
     #[tokio::test]

@@ -15,22 +15,21 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::types::GroupId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::announce_realm_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-};
-use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
-};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
-use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::materialization_queue::metadata_materialization_jobs_exist;
-use aruna_operations::metadata::projector::project_metadata_create_events_from_log;
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::metadata::create_document::{
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+};
+use aruna_operations::metadata::get_document::GetDocumentOperation;
+use aruna_operations::metadata::materialization_queue::materialization_jobs_exist;
+use aruna_operations::metadata::projector::project_logged_events;
+use aruna_operations::realm::announce_presence::{
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
+};
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::realm::get_nodes::GetNodesOperation;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -180,14 +179,10 @@ fn convergence_gate() -> Result<(), BoxError> {
     Ok(())
 }
 
-// Exercises the production trigger chain end to end: create operation +
-// projection wake (same call the API create handler debounces into), then the
-// outbox drain timer, irokle publish/fan-out, and peer-side reconcile +
-// projection + materialization. Converged means every node's registry holds
-// every document and no materialization jobs remain anywhere.
+// Exercises the production trigger chain end to end.
 #[test]
 #[ignore]
-fn production_path_convergence_gate() -> Result<(), BoxError> {
+fn production_convergence_gate() -> Result<(), BoxError> {
     init_logging();
     let runtime = make_runtime()?;
     let (seconds, total) = runtime.block_on(async {
@@ -222,7 +217,7 @@ fn production_path_convergence_gate() -> Result<(), BoxError> {
             .collect();
         let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|n| n.context.clone()).collect();
         wait_for_visibility(&contexts, &pairs, Duration::from_millis(200), started).await?;
-        wait_for_empty_materialization_queues(&contexts).await?;
+        wait_empty_queues(&contexts).await?;
         let seconds = started.elapsed().as_secs_f64();
         shutdown_nodes(nodes).await;
         Ok::<(f64, usize), BoxError>((seconds, total))
@@ -239,13 +234,11 @@ fn production_path_convergence_gate() -> Result<(), BoxError> {
     Ok(())
 }
 
-async fn wait_for_empty_materialization_queues(
-    contexts: &[Arc<DriverContext>],
-) -> Result<(), BoxError> {
+async fn wait_empty_queues(contexts: &[Arc<DriverContext>]) -> Result<(), BoxError> {
     wait_for_convergence("materialization queues never drained", || async {
         let mut busy = 0usize;
         for context in contexts {
-            if metadata_materialization_jobs_exist(&context.storage_handle)
+            if materialization_jobs_exist(&context.storage_handle)
                 .await
                 .map_err(|error| format!("materialization probe failed: {error:?}"))?
             {
@@ -292,7 +285,7 @@ async fn churn_convergence_body() -> Result<f64, BoxError> {
 
     wire_peers(&nodes).await;
     for (index, node) in nodes.iter().enumerate() {
-        let op = AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+        let op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
             realm_id,
             node_id: node.net.node_id(),
             schedule_refresh: true,
@@ -310,7 +303,7 @@ async fn churn_convergence_body() -> Result<f64, BoxError> {
             drive(op, node.context.as_ref()).await?;
         }
     }
-    wait_for_realm_node_convergence(&nodes, &realm_id).await?;
+    wait_node_convergence(&nodes, &realm_id).await?;
     install_realm_config(&nodes, &realm_id).await?;
 
     let group_id = Ulid::generate();
@@ -349,7 +342,7 @@ async fn churn_convergence_body() -> Result<f64, BoxError> {
         other.net.add_peer_addr(node2.net.endpoint_addr()).await;
     }
     drive(
-        AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+        AnnouncePresenceOperation::new(AnnouncePresenceConfig {
             realm_id,
             node_id: node2.net.node_id(),
             schedule_refresh: true,
@@ -379,8 +372,8 @@ fn node_targets(nodes: &[TestNode]) -> Vec<(NodeId, Arc<DriverContext>)> {
         .collect()
 }
 
-fn scaffold_payload(label: &str, writer: usize, index: usize) -> CreateMetadataDocumentPayload {
-    CreateMetadataDocumentPayload::Scaffold {
+fn scaffold_payload(label: &str, writer: usize, index: usize) -> CreateDocumentPayload {
+    CreateDocumentPayload::Scaffold {
         name: format!("Bench Dataset {label}-{writer}-{index}"),
         description: "Throughput benchmark document".to_string(),
         date_published: "2026-06-10".to_string(),
@@ -388,7 +381,7 @@ fn scaffold_payload(label: &str, writer: usize, index: usize) -> CreateMetadataD
     }
 }
 
-fn rocrate_payload(document_id: Ulid) -> CreateMetadataDocumentPayload {
+fn rocrate_payload(document_id: Ulid) -> CreateDocumentPayload {
     let jsonld = format!(
         r#"{{
   "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -410,7 +403,7 @@ fn rocrate_payload(document_id: Ulid) -> CreateMetadataDocumentPayload {
   ]
 }}"#
     );
-    CreateMetadataDocumentPayload::RoCrate { jsonld }
+    CreateDocumentPayload::RoCrate { jsonld }
 }
 
 async fn run_writer(
@@ -425,12 +418,9 @@ async fn run_writer(
     let mut pending = 0usize;
     let mut created = Vec::with_capacity(count);
 
-    let config = drive(
-        GetRealmConfigOperation::new(realm_id),
-        targets[0].1.as_ref(),
-    )
-    .await
-    .map_err(|error| format!("realm config load failed: {error:?}"))?;
+    let config = drive(GetConfigOperation::new(realm_id), targets[0].1.as_ref())
+        .await
+        .map_err(|error| format!("realm config load failed: {error:?}"))?;
 
     for index in 0..count {
         let slot = (writer + index) % targets.len();
@@ -450,16 +440,14 @@ async fn run_writer(
             rocrate_payload(document_id)
         };
         let result = drive(
-            CreateMetadataDocumentOperation::new_for_generated_document_id(
-                CreateMetadataDocumentConfig {
-                    actor,
-                    group_id,
-                    document_id,
-                    document_path,
-                    public: true,
-                    payload,
-                },
-            ),
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+                actor,
+                group_id,
+                document_id,
+                document_path,
+                public: true,
+                payload,
+            }),
             context.as_ref(),
         )
         .await
@@ -486,7 +474,7 @@ async fn flush_projection_batches(
             continue;
         }
         let drained: Vec<(Ulid, Ulid)> = std::mem::take(batch);
-        project_metadata_create_events_from_log(targets[slot].1.as_ref(), drained)
+        project_logged_events(targets[slot].1.as_ref(), drained)
             .await
             .map_err(|error| format!("projection failed: {error:?}"))?;
     }
@@ -511,7 +499,7 @@ async fn wait_for_visibility(
             let mut still_missing = Vec::new();
             for &(group_id, document_id) in missing.iter() {
                 if drive(
-                    GetMetadataDocumentOperation::new(group_id, document_id),
+                    GetDocumentOperation::new(group_id, document_id),
                     context.as_ref(),
                 )
                 .await
@@ -547,7 +535,7 @@ async fn build_realm_nodes(realm_id: &RealmId, count: usize) -> Result<Vec<TestN
 
     for node in &nodes {
         drive(
-            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                 realm_id: *realm_id,
                 node_id: node.net.node_id(),
                 schedule_refresh: true,
@@ -557,7 +545,7 @@ async fn build_realm_nodes(realm_id: &RealmId, count: usize) -> Result<Vec<TestN
         .await?;
     }
 
-    wait_for_realm_node_convergence(&nodes, realm_id).await?;
+    wait_node_convergence(&nodes, realm_id).await?;
     install_realm_config(&nodes, realm_id).await?;
     Ok(nodes)
 }
@@ -624,11 +612,13 @@ async fn spawn_node_with(
         compute_handle: None,
     });
 
-    initialize_net_incoming(context.clone());
-    initialize_task_incoming(
+    initialize_incoming_fixture(context.clone());
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    start_task_queues(
         context.clone(),
         task_handle.clone(),
         aruna_operations::jobs::runtime::JobsRuntime::new(),
+        &shutdown,
     )
     .await;
 
@@ -688,12 +678,12 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: &RealmId) -> Result<
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
+        aruna_operations::placement::process_placements::process_shard_placements(
             &node.context,
             *realm_id,
             node.net.node_id(),
@@ -703,20 +693,12 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: &RealmId) -> Result<
     Ok(())
 }
 
-async fn wait_for_realm_node_convergence(
-    nodes: &[TestNode],
-    realm_id: &RealmId,
-) -> Result<(), BoxError> {
+async fn wait_node_convergence(nodes: &[TestNode], realm_id: &RealmId) -> Result<(), BoxError> {
     let expected: HashSet<_> = nodes.iter().map(|node| node.net.node_id()).collect();
     wait_for_convergence("realm nodes did not converge", || async {
         let mut pending = 0;
         for node in nodes {
-            match drive(
-                GetRealmNodesOperation::new(*realm_id),
-                node.context.as_ref(),
-            )
-            .await
-            {
+            match drive(GetNodesOperation::new(*realm_id), node.context.as_ref()).await {
                 Ok(realm_nodes) if realm_nodes == expected => {}
                 _ => pending += 1,
             }

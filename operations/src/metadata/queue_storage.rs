@@ -7,7 +7,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 #[derive(Debug, Error)]
-pub(super) enum MetadataQueueStorageError {
+pub(super) enum MetadataQueueError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error("unexpected storage event while processing metadata queue: {0}")]
@@ -16,36 +16,32 @@ pub(super) enum MetadataQueueStorageError {
 
 pub(super) async fn start_write_transaction(
     storage: &StorageHandle,
-) -> Result<Ulid, MetadataQueueStorageError> {
+) -> Result<Ulid, MetadataQueueError> {
     match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataQueueStorageError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 pub(super) async fn commit_storage_transaction(
     storage: &StorageHandle,
     txn_id: Ulid,
-) -> Result<(), MetadataQueueStorageError> {
+) -> Result<(), MetadataQueueError> {
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataQueueStorageError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
-pub(super) async fn abort_storage_transaction_best_effort(
+pub(super) async fn abort_storage_transaction(
     storage: &StorageHandle,
     txn_id: Ulid,
     storage_error_message: &'static str,

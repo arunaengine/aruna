@@ -1,15 +1,11 @@
-//! The sans-I/O append of one immutable job record.
-//!
-//! Every check runs before the record becomes visible: frame bounds at decode,
-//! the publisher signature, the record kind's author rule against this node's
-//! own holder view, the family placement derived from the submission, the
-//! dependency evidence already stored here, and the canonical digest. The
-//! writes of one append commit in a single transaction.
+//! The sans-I/O append of one immutable job record. Every check runs before it
+//! becomes visible: frame bounds, signature, the kind's author rule, placement,
+//! stored evidence, and the digest. All writes of one append commit atomically.
 
 use std::collections::{BTreeMap, VecDeque};
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -153,7 +149,7 @@ impl AppendRecordOperation {
     /// unrelated to this family and must not conflict every append.
     fn read_config(&mut self) -> Effects {
         self.state = AppendState::ReadConfig;
-        let config = DocumentSyncTarget::RealmConfig {
+        let config = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
         smallvec![Effect::Storage(StorageEffect::Read {

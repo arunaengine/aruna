@@ -1,15 +1,13 @@
-use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission, parse_group_id, require_realm_auth,
-};
+use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::metadata::map_metadata_api_error;
+use crate::metadata::map_api_error;
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, MetadataAuditOperation, Permission};
+use aruna_operations::forward::routing::is_user_origin;
 use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::audit::{
     AUDIT_DEADLINE_SECS, ListAuditError, ListAuditRequest, list_audit as gather_audit,
 };
-use aruna_operations::metadata::forward::is_user_origin;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -170,7 +168,7 @@ forwards the read under the caller's own token and every peer re-checks that sam
 pub async fn list_audit(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<(StatusCode, Json<AuditPageResponse>)> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(AUDIT_DEADLINE_SECS);
@@ -188,7 +186,7 @@ pub async fn list_audit(
     )
     .await
     .map_err(|_| ServerError::ServiceUnavailable)?
-    .map_err(map_metadata_api_error)?;
+    .map_err(map_api_error)?;
     // A device holds no audit rows of its own, so this read is pure fan-out and
     // every peer re-checks the same group-admin authority on the caller's token.
     if !user_origin {
@@ -210,12 +208,12 @@ pub async fn list_audit(
         let carrier = bearer_token.as_ref().ok_or(ServerError::Unauthorized)?;
         Some(
             forwarded_bearer(Some(carrier.as_str()))
-                .map_err(map_metadata_api_error)?
+                .map_err(map_api_error)?
                 .ok_or(ServerError::Unauthorized)?,
         )
     } else {
         forwarded_bearer(bearer_token.as_ref().map(|carrier| carrier.as_str()))
-            .map_err(map_metadata_api_error)?
+            .map_err(map_api_error)?
     };
     let page = gather_audit(
         ctx.as_ref(),

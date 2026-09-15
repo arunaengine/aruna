@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use aruna_core::UserId;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     SYNC_ACTION_LOG_KEYSPACE, SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE,
     SYNCED_FOLDER_KEYSPACE,
@@ -10,14 +12,14 @@ use aruna_core::structs::{
     AuthContext, EntryState, FolderMode, FolderState, RealmId, RemoteBinding, SyncActionRecord,
     SyncBase, SyncPageLimit, SyncRefusal, SyncedFolder,
 };
-use aruna_core::types::{GroupId, Key, NodeId, UserId};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::get_realm_config::GetRealmConfigOperation;
 use crate::metadata::protocol::MetadataTransportMessage;
+use crate::realm::get_config::GetConfigOperation;
 use crate::staging::offered_directory::{
     OfferDirectoryInput, OfferedDirectoryError, WithdrawOfferInput, offer_directory, withdraw_offer,
 };
@@ -105,11 +107,11 @@ pub async fn bind_folder(
     {
         return Err(FolderError::BucketBound(local_bucket));
     }
-    let config = drive(GetRealmConfigOperation::new(input.realm_id), context)
+    let config = drive(GetConfigOperation::new(input.realm_id), context)
         .await
         .map_err(|_| FolderError::Unavailable)?;
     let eligible = config
-        .sync_eligible_node_ids()
+        .sync_eligible_nodes()
         .map_err(|_| FolderError::Unavailable)?;
     if !eligible.contains(&input.remote.node_id) {
         return Err(FolderError::NotRealmNode(input.remote.node_id));
@@ -129,7 +131,7 @@ pub async fn bind_folder(
             .request_forwarded_write(
                 input.remote.node_id,
                 MetadataTransportMessage::ForwardCreateBucket {
-                    auth_token: aruna_core::metadata::MetadataAuthToken::internal(auth.clone()),
+                    auth_token: aruna_core::metadata::AuthToken::internal(auth.clone()),
                     bucket: input.remote.bucket.clone(),
                     group_id: input.group_id,
                 },
@@ -269,12 +271,9 @@ pub async fn read_bound(
         .ok_or(FolderError::NotFound)
 }
 
-/// Stops syncing one folder. Nothing on the owner's filesystem is touched: the
-/// device only withdraws what it published about the directory.
+/// Stops syncing one folder; the owner's filesystem is untouched.
 ///
-/// The binding is marked `Deleting` first and removed last, so a crash or a
-/// failure in the middle leaves a folder that the next call resumes instead of
-/// an orphaned offer, outbox row or audit log with nothing pointing at it.
+/// Marked `Deleting` first and removed last, so a crash mid-way leaves work the next call resumes.
 pub async fn unbind_folder(
     context: &Arc<DriverContext>,
     folder_id: Ulid,
@@ -531,8 +530,8 @@ pub async fn list_transfers(context: &Arc<DriverContext>) -> Result<Vec<SyncUplo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::device::context;
     use aruna_core::structs::{EntrySide, SyncedBytes};
-    use aruna_storage::FjallStorage;
 
     #[test]
     fn refuses_nested_roots() {
@@ -593,28 +592,12 @@ mod tests {
         }
     }
 
-    async fn context() -> (tempfile::TempDir, Arc<DriverContext>) {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        (
-            dir,
-            Arc::new(DriverContext {
-                storage_handle: storage,
-                net_handle: None,
-                blob_handle: None,
-                metadata_handle: None,
-                task_handle: None,
-                compute_handle: None,
-            }),
-        )
-    }
-
-    // An unbind interrupted after its state was persisted must finish on the
-    // next call: the binding is the durable handle on the cleanup, so it may
-    // never be missing while rows it owns are still there.
+    // An unbind interrupted after its state was persisted must finish on the next
+    // call: the binding is the durable handle on the cleanup while its rows remain.
     #[tokio::test]
     async fn resumes_interrupted_unbind() {
         let (_dir, context) = context().await;
+        let context = Arc::new(context);
         let folder = bound_folder(FolderState::Deleting);
         store_folder(&context, &folder).await.expect("row stored");
         let row = super::super::repository::base_entry(folder.folder_id, "note.txt", &base_row())
@@ -647,6 +630,7 @@ mod tests {
     #[tokio::test]
     async fn marks_folder_deleting() {
         let (_dir, context) = context().await;
+        let context = Arc::new(context);
         let folder = bound_folder(FolderState::Active);
         store_folder(&context, &folder).await.expect("row stored");
 

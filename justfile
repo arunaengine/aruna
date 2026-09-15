@@ -1,4 +1,41 @@
-# Single-node compose stack with Keycloak; prints the REST, Swagger and Keycloak urls plus ADMIN_TOKEN.
+# Formatting and Clippy with the pinned nightly toolchain, as CI runs them.
+lint:
+	cargo +nightly-2026-09-14 fmt --all -- --check
+	cargo +nightly-2026-09-14 clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+# Static structure, naming, and comment style check; no toolchain or build.
+style:
+	python3 scripts/dev/check_style.py
+
+# Workspace tests and doctests, as the CI tests job runs them.
+test:
+	cargo nextest run --workspace --all-targets --all-features --locked --profile ci
+	cargo test --workspace --all-features --locked --doc
+
+# The fast editing loop: selects the aruna-core and aruna-operations lib test
+# targets, still compiles their transitive dependencies, and executes only the
+# audited no-I/O state-machine, pure, decision and reducer tests.
+test-fast:
+	cargo nextest run -p aruna-core -p aruna-operations --lib --locked --profile fast
+
+# The same selection across every workspace target; compiles more than it runs.
+test-fast-workspace:
+	cargo nextest run --workspace --all-targets --all-features --locked --profile fast
+
+# Compile every supported feature selection, as the CI feature checks run them.
+check:
+	cargo check --workspace --locked
+	cargo check --workspace --all-targets --all-features --locked
+	cargo check -p aruna-compute --all-targets --no-default-features --locked
+	cargo check -p aruna-compute --all-targets --no-default-features --features docker --locked
+	cargo check -p aruna-compute --all-targets --no-default-features --features apptainer --locked
+	cargo check -p aruna-compute --all-targets --no-default-features --features kubernetes --locked
+	cargo check -p aruna --all-targets --no-default-features --locked
+	cargo check -p aruna --all-targets --no-default-features --features docker --locked
+	cargo check -p aruna --all-targets --no-default-features --features apptainer --locked
+	cargo check -p aruna --all-targets --no-default-features --features kubernetes --locked
+
+# Single-node stack with Keycloak; prints service URLs and ADMIN_TOKEN.
 local:
 	bash scripts/local_deploy.sh
 
@@ -6,22 +43,22 @@ local:
 local-new:
 	bash scripts/local_deploy.sh --new
 
-# Realm of N local nodes without OIDC; prints per-node API, S3 and ops urls plus the admin credentials.
+# Local realm without OIDC; prints per-node service URLs and admin credentials.
 local-cluster nodes="3":
-	bash scripts/local_cluster_deploy.sh --node-count {{nodes}}
+	bash scripts/cluster_start.sh --node-count {{nodes}}
 
-# Realm of N local nodes with Keycloak; adds the OIDC issuer and the test logins to the printed summary.
+# Local realm with Keycloak; prints service URLs, OIDC issuer and test logins.
 local-cluster-oidc nodes="3":
-	bash scripts/local_cluster_deploy.sh --with-keycloak --node-count {{nodes}}
+	bash scripts/cluster_start.sh --with-keycloak --node-count {{nodes}}
 
-# Realm of N local nodes with Keycloak and the portal on its own port per node; prints every url and login.
+# Local realm with Keycloak and a portal per node; prints service URLs and logins.
 preview portal_dir=env_var_or_default("ARUNA_TEST_DEPLOY_PORTAL_DIR", "") nodes="3":
-	bash scripts/local_cluster_deploy.sh --with-keycloak --node-count "{{nodes}}" --auto-portal-dir --portal-dir "{{portal_dir}}"
+	bash scripts/cluster_start.sh --with-keycloak --node-count "{{nodes}}" --auto-portal-dir --portal-dir "{{portal_dir}}"
 
 # Same without Keycloak, so the portal runs in guest mode; prints every url and the admin credentials.
 preview-no-oidc portal_dir=env_var_or_default("ARUNA_TEST_DEPLOY_PORTAL_DIR", "") nodes="3":
-	bash scripts/local_cluster_deploy.sh --node-count "{{nodes}}" --auto-portal-dir --portal-dir "{{portal_dir}}"
+	bash scripts/cluster_start.sh --node-count "{{nodes}}" --auto-portal-dir --portal-dir "{{portal_dir}}"
 
-# Stops whatever a cluster recipe left running: the deploy script, every node by pid file, then Keycloak.
+# Stops the cluster script, its nodes identified by pid files, and Keycloak.
 stop:
-	bash scripts/local_cluster_stop.sh
+	bash scripts/cluster_stop.sh

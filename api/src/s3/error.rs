@@ -1,32 +1,30 @@
 use crate::s3::checksum::checksum_mismatch_error;
-use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
+use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::structs::RoutingError;
 use aruna_operations::blob::managed_copy::ManagedCopyError;
 use aruna_operations::driver::{GateContextError, RoutingInputsError};
-use aruna_operations::placement_policy::PolicyGateError;
-use aruna_operations::s3::abort_multipart_upload::AbortMultipartUploadError;
-use aruna_operations::s3::bucket_cors::{
-    DeleteBucketCorsError, GetBucketCorsError, PutBucketCorsError,
-};
-use aruna_operations::s3::complete_multipart_upload::CompleteMultipartUploadError;
-use aruna_operations::s3::copy_object::CopyObjectError;
-use aruna_operations::s3::create_bucket::CreateBucketError;
-use aruna_operations::s3::create_multipart_upload::CreateMultipartUploadError;
-use aruna_operations::s3::delete_bucket::DeleteBucketError;
-use aruna_operations::s3::delete_object::DeleteObjectError;
-use aruna_operations::s3::get_bucket_info::GetBucketInfoError;
-use aruna_operations::s3::get_object::GetObjectError;
-use aruna_operations::s3::get_object_attributes::GetObjectAttributesError;
-use aruna_operations::s3::head_object::HeadObjectError;
-use aruna_operations::s3::list_buckets::ListBucketsError;
-use aruna_operations::s3::list_multipart_uploads::ListMultipartUploadsError;
-use aruna_operations::s3::list_object_versions::ListObjectVersionsError;
-use aruna_operations::s3::list_objects_v2::ListObjectsV2Error;
-use aruna_operations::s3::list_parts::ListPartsError;
+use aruna_operations::placement::policy::PolicyGateError;
+use aruna_operations::s3::bucket::cors::{DeleteCorsError, GetCorsError, PutCorsError};
+use aruna_operations::s3::bucket::create::CreateBucketError;
+use aruna_operations::s3::bucket::delete::DeleteBucketError;
+use aruna_operations::s3::bucket::get::GetBucketError;
+use aruna_operations::s3::bucket::list::ListBucketsError;
+use aruna_operations::s3::multipart::abort::AbortUploadError;
+use aruna_operations::s3::multipart::complete::CompleteUploadError;
+use aruna_operations::s3::multipart::create::CreateMultipartError;
+use aruna_operations::s3::multipart::part_copy::PartCopyError;
+use aruna_operations::s3::multipart::part_upload::UploadPartError;
+use aruna_operations::s3::multipart::parts::ListPartsError;
+use aruna_operations::s3::multipart::uploads::ListUploadsError;
+use aruna_operations::s3::object::attributes::GetAttributesError;
+use aruna_operations::s3::object::copy::CopyObjectError;
+use aruna_operations::s3::object::delete::DeleteObjectError;
+use aruna_operations::s3::object::get::GetObjectError;
+use aruna_operations::s3::object::head::HeadObjectError;
+use aruna_operations::s3::object::list::ListBucketError;
+use aruna_operations::s3::object::put::PutObjectError;
+use aruna_operations::s3::object::versions::ListVersionsError;
 use aruna_operations::s3::purge_fence::PurgeFenceError;
-use aruna_operations::s3::put_object::PutObjectError;
-use aruna_operations::s3::upload_part::UploadPartError;
-use aruna_operations::s3::upload_part_copy::UploadPartCopyError;
 use s3s::{S3Error, S3ErrorCode, s3_error};
 use std::fmt::Display;
 use tracing::warn;
@@ -80,7 +78,7 @@ fn placement_unavailable_error() -> S3Error {
     error
 }
 
-fn purge_in_progress_error() -> S3Error {
+fn purge_progress_error() -> S3Error {
     let mut error = S3Error::with_message(
         S3ErrorCode::Custom("PurgeInProgress".into()),
         "Writes to this object scope are temporarily suspended while a permanent purge is in progress; retry later."
@@ -158,7 +156,7 @@ pub(crate) fn gate_context_error(error: GateContextError) -> S3Error {
     }
 }
 
-fn no_such_upload_error() -> S3Error {
+fn missing_upload_error() -> S3Error {
     s3_error!(NoSuchUpload, "The specified upload does not exist.")
 }
 
@@ -180,11 +178,11 @@ fn incomplete_body_error() -> S3Error {
     )
 }
 
-fn no_such_key_error() -> S3Error {
+fn missing_key_error() -> S3Error {
     s3_error!(NoSuchKey, "The specified key does not exist.")
 }
 
-fn no_such_version_error() -> S3Error {
+fn missing_version_error() -> S3Error {
     s3_error!(NoSuchVersion, "The specified version does not exist.")
 }
 
@@ -195,31 +193,31 @@ fn delete_marker_error() -> S3Error {
     )
 }
 
-fn bucket_not_found_error() -> S3Error {
+fn missing_bucket_error() -> S3Error {
     s3_error!(NoSuchBucket, "The specified bucket does not exist.")
 }
 
-fn bucket_already_exists_error() -> S3Error {
+fn existing_bucket_error() -> S3Error {
     s3_error!(BucketAlreadyExists, "Bucket already exists")
 }
 
-fn bucket_not_empty_error() -> S3Error {
+fn nonempty_bucket_error() -> S3Error {
     s3_error!(
         BucketNotEmpty,
         "The bucket you tried to delete is not empty."
     )
 }
 
-fn cors_configuration_not_found_error() -> S3Error {
+fn missing_cors_error() -> S3Error {
     s3_error!(NoSuchCORSConfiguration, "CORS configuration not found")
 }
 
-fn checksum_mismatch_s3_error(algorithm: &'static str, operation: &'static str) -> S3Error {
+fn checksum_mismatch_logged(algorithm: &'static str, operation: &'static str) -> S3Error {
     warn!(algorithm, "Checksum mismatch during {}", operation);
     checksum_mismatch_error()
 }
 
-fn missing_expected_checksum_s3_error(algorithm: &'static str, operation: &'static str) -> S3Error {
+fn missing_checksum_error(algorithm: &'static str, operation: &'static str) -> S3Error {
     warn!(algorithm, "Missing checksum during {}", operation);
     s3_error!(InternalError, "Missing stored checksum")
 }
@@ -238,7 +236,7 @@ pub(crate) trait IntoS3Error {
 impl IntoS3Error for CreateBucketError {
     fn into_s3_error(self) -> S3Error {
         match self {
-            CreateBucketError::BucketAlreadyExists => bucket_already_exists_error(),
+            CreateBucketError::BucketAlreadyExists => existing_bucket_error(),
             err => internal_error(err),
         }
     }
@@ -250,7 +248,7 @@ impl IntoS3Error for ListBucketsError {
     }
 }
 
-impl IntoS3Error for ListObjectsV2Error {
+impl IntoS3Error for ListBucketError {
     fn into_s3_error(self) -> S3Error {
         internal_error(self)
     }
@@ -261,19 +259,19 @@ impl IntoS3Error for ListPartsError {
         match self {
             ListPartsError::NoSuchUpload
             | ListPartsError::UploadTargetMismatch
-            | ListPartsError::UploadNotOpen => no_such_upload_error(),
+            | ListPartsError::UploadNotOpen => missing_upload_error(),
             err => internal_error(err),
         }
     }
 }
 
-impl IntoS3Error for ListMultipartUploadsError {
+impl IntoS3Error for ListUploadsError {
     fn into_s3_error(self) -> S3Error {
         internal_error(self)
     }
 }
 
-impl IntoS3Error for ListObjectVersionsError {
+impl IntoS3Error for ListVersionsError {
     fn into_s3_error(self) -> S3Error {
         internal_error(self)
     }
@@ -283,10 +281,10 @@ impl IntoS3Error for PutObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
             PutObjectError::ChecksumMismatch(algorithm) => {
-                checksum_mismatch_s3_error(algorithm, "PutObject")
+                checksum_mismatch_logged(algorithm, "PutObject")
             }
             PutObjectError::MissingExpectedChecksum(algorithm) => {
-                missing_expected_checksum_s3_error(algorithm, "PutObject")
+                missing_checksum_error(algorithm, "PutObject")
             }
             PutObjectError::QuotaExceeded { limit, usage } => quota_exceeded_error(limit, usage),
             PutObjectError::RoutingFailed(RoutingError::BackendFull(backend)) => {
@@ -296,22 +294,20 @@ impl IntoS3Error for PutObjectError {
             PutObjectError::WriteFailed(message) => write_failed_error(&message, "PutObject"),
             PutObjectError::PolicyGate(ref error) => policy_gate_error(error, "PutObject"),
             PutObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
-            PutObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_in_progress_error(),
+            PutObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
             PutObjectError::UsageUpdateError(_) => usage_accounting_error(),
             err => internal_error(err),
         }
     }
 }
 
-impl IntoS3Error for CreateMultipartUploadError {
+impl IntoS3Error for CreateMultipartError {
     fn into_s3_error(self) -> S3Error {
         match self {
-            CreateMultipartUploadError::RoutingFailed(RoutingError::BackendFull(backend)) => {
+            CreateMultipartError::RoutingFailed(RoutingError::BackendFull(backend)) => {
                 backend_full_error(&backend.to_string())
             }
-            CreateMultipartUploadError::PurgeFence(PurgeFenceError::Suspended) => {
-                purge_in_progress_error()
-            }
+            CreateMultipartError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
             err => internal_error(err),
         }
     }
@@ -322,104 +318,102 @@ impl IntoS3Error for UploadPartError {
         match self {
             UploadPartError::NoSuchUpload
             | UploadPartError::UploadTargetMismatch
-            | UploadPartError::UploadNotOpen => no_such_upload_error(),
+            | UploadPartError::UploadNotOpen => missing_upload_error(),
             UploadPartError::ChecksumMismatch(algorithm) => {
-                checksum_mismatch_s3_error(algorithm, "UploadPart")
+                checksum_mismatch_logged(algorithm, "UploadPart")
             }
             UploadPartError::IncompleteBody => incomplete_body_error(),
             UploadPartError::WriteFailed(message) => write_failed_error(&message, "UploadPart"),
             UploadPartError::PolicyGateError(ref error) => policy_gate_error(error, "UploadPart"),
-            UploadPartError::PurgeFence(PurgeFenceError::Suspended) => purge_in_progress_error(),
+            UploadPartError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
             err => internal_error(err),
         }
     }
 }
 
-impl IntoS3Error for UploadPartCopyError {
+impl IntoS3Error for PartCopyError {
     fn into_s3_error(self) -> S3Error {
         match self {
-            UploadPartCopyError::Get(err) => err.into_s3_error(),
-            UploadPartCopyError::UploadPart(err) => err.into_s3_error(),
-            UploadPartCopyError::PreconditionFailed => s3_error!(
+            PartCopyError::Get(err) => err.into_s3_error(),
+            PartCopyError::UploadPart(err) => err.into_s3_error(),
+            PartCopyError::PreconditionFailed => s3_error!(
                 PreconditionFailed,
                 "At least one of the preconditions you specified did not hold."
             ),
             // A policy error names the ids it conflicts on, which a client must
             // never learn: the refusal is reported without them.
-            UploadPartCopyError::Policy(_) => placement_denied_error("UploadPartCopy"),
-            UploadPartCopyError::Gate(err) => gate_context_error(err),
+            PartCopyError::Policy(_) => placement_denied_error("UploadPartCopy"),
+            PartCopyError::Gate(err) => gate_context_error(err),
         }
     }
 }
 
-impl IntoS3Error for CompleteMultipartUploadError {
+impl IntoS3Error for CompleteUploadError {
     fn into_s3_error(self) -> S3Error {
         match self {
-            CompleteMultipartUploadError::NoSuchUpload
-            | CompleteMultipartUploadError::UploadTargetMismatch
-            | CompleteMultipartUploadError::UploadNotOpen => no_such_upload_error(),
-            CompleteMultipartUploadError::CompletionInProgress => completion_lease_error(),
-            CompleteMultipartUploadError::MissingParts => {
+            CompleteUploadError::NoSuchUpload
+            | CompleteUploadError::UploadTargetMismatch
+            | CompleteUploadError::UploadNotOpen => missing_upload_error(),
+            CompleteUploadError::CompletionInProgress => completion_lease_error(),
+            CompleteUploadError::MissingParts => {
                 s3_error!(InvalidRequest, "You must specify at least one part.")
             }
-            CompleteMultipartUploadError::InvalidObjectSize => s3_error!(
+            CompleteUploadError::InvalidObjectSize => s3_error!(
                 InvalidRequest,
                 "The provided object size does not match the uploaded parts."
             ),
-            CompleteMultipartUploadError::EntityTooSmall => s3_error!(
+            CompleteUploadError::EntityTooSmall => s3_error!(
                 EntityTooSmall,
                 "Your proposed upload is smaller than the minimum allowed object size."
             ),
-            CompleteMultipartUploadError::MissingPartEtag => {
+            CompleteUploadError::MissingPartEtag => {
                 s3_error!(InvalidPart, "The part ETag could not be validated.")
             }
-            CompleteMultipartUploadError::InvalidPart => {
+            CompleteUploadError::InvalidPart => {
                 s3_error!(
                     InvalidPart,
                     "One or more of the specified parts could not be found."
                 )
             }
-            CompleteMultipartUploadError::InvalidPartOrder => {
+            CompleteUploadError::InvalidPartOrder => {
                 s3_error!(
                     InvalidPartOrder,
                     "The list of parts was not in ascending order."
                 )
             }
-            CompleteMultipartUploadError::ChecksumMismatch(algorithm) => {
-                checksum_mismatch_s3_error(algorithm, "CompleteMultipartUpload")
+            CompleteUploadError::ChecksumMismatch(algorithm) => {
+                checksum_mismatch_logged(algorithm, "CompleteMultipartUpload")
             }
-            CompleteMultipartUploadError::ChecksumContractMismatch => s3_error!(
+            CompleteUploadError::ChecksumContractMismatch => s3_error!(
                 InvalidRequest,
                 "CompleteMultipartUpload checksum headers do not match the multipart upload initiation."
             ),
-            CompleteMultipartUploadError::PartEtagMismatch => {
+            CompleteUploadError::PartEtagMismatch => {
                 s3_error!(
                     InvalidPart,
                     "The part ETag did not match the uploaded part."
                 )
             }
-            CompleteMultipartUploadError::QuotaExceeded { limit, usage } => {
+            CompleteUploadError::QuotaExceeded { limit, usage } => {
                 quota_exceeded_error(limit, usage)
             }
-            CompleteMultipartUploadError::PolicyGate(ref error) => {
+            CompleteUploadError::PolicyGate(ref error) => {
                 policy_gate_error(error, "CompleteMultipartUpload")
             }
-            CompleteMultipartUploadError::ManagedCopyError(ref error) => managed_copy_error(error),
-            CompleteMultipartUploadError::PurgeFence(PurgeFenceError::Suspended) => {
-                purge_in_progress_error()
-            }
+            CompleteUploadError::ManagedCopyError(ref error) => managed_copy_error(error),
+            CompleteUploadError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
             err => internal_error(err),
         }
     }
 }
 
-impl IntoS3Error for AbortMultipartUploadError {
+impl IntoS3Error for AbortUploadError {
     fn into_s3_error(self) -> S3Error {
         match self {
-            AbortMultipartUploadError::NoSuchUpload
-            | AbortMultipartUploadError::UploadTargetMismatch
-            | AbortMultipartUploadError::UploadNotOpen => no_such_upload_error(),
-            AbortMultipartUploadError::CompletionInProgress => completion_lease_error(),
+            AbortUploadError::NoSuchUpload
+            | AbortUploadError::UploadTargetMismatch
+            | AbortUploadError::UploadNotOpen => missing_upload_error(),
+            AbortUploadError::CompletionInProgress => completion_lease_error(),
             err => internal_error(err),
         }
     }
@@ -429,7 +423,7 @@ impl IntoS3Error for GetObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
             GetObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
-            GetObjectError::NoSuchVersion => no_such_version_error(),
+            GetObjectError::NoSuchVersion => missing_version_error(),
             GetObjectError::HistoricalReferenceUnavailable => {
                 s3_error!(
                     NoSuchVersion,
@@ -451,14 +445,33 @@ impl IntoS3Error for GetObjectError {
                     "Governed content is not served on a user node."
                 )
             }
+            GetObjectError::HolderAccessDenied => {
+                s3_error!(
+                    AccessDenied,
+                    "Access to the object was denied by its holder."
+                )
+            }
+            // No holder served and at least one failed: a fault a retry may
+            // clear, never object absence.
+            GetObjectError::HoldersUnavailable => {
+                s3_error!(
+                    ServiceUnavailable,
+                    "The object bytes are currently unavailable from every holder."
+                )
+            }
+            GetObjectError::HolderIntegrityFailure => {
+                s3_error!(
+                    InternalError,
+                    "A holder returned object bytes that failed integrity verification."
+                )
+            }
             GetObjectError::DeleteMarker => delete_marker_error(),
-            GetObjectError::NoSuchKey => no_such_key_error(),
+            GetObjectError::NoSuchKey => missing_key_error(),
             GetObjectError::InvalidRange => {
                 s3_error!(InvalidRange, "The requested range is not satisfiable.")
             }
             GetObjectError::ResolveReferenceError(error) => match error {
-                SourceConnectorResolutionError::ResolveFailed
-                | SourceConnectorResolutionError::NotFound => {
+                SourceResolutionError::ResolveFailed | SourceResolutionError::NotFound => {
                     s3_error!(
                         ServiceUnavailable,
                         "Reference source is currently unavailable"
@@ -502,12 +515,11 @@ impl IntoS3Error for HeadObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
             HeadObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
-            HeadObjectError::NoSuchVersion => no_such_version_error(),
+            HeadObjectError::NoSuchVersion => missing_version_error(),
             HeadObjectError::DeleteMarker => delete_marker_error(),
-            HeadObjectError::NoSuchKey => no_such_key_error(),
+            HeadObjectError::NoSuchKey => missing_key_error(),
             HeadObjectError::ResolveReferenceError(error) => match error {
-                SourceConnectorResolutionError::ResolveFailed
-                | SourceConnectorResolutionError::NotFound => {
+                SourceResolutionError::ResolveFailed | SourceResolutionError::NotFound => {
                     s3_error!(
                         ServiceUnavailable,
                         "Reference source is currently unavailable"
@@ -529,13 +541,13 @@ impl IntoS3Error for HeadObjectError {
     }
 }
 
-impl IntoS3Error for GetObjectAttributesError {
+impl IntoS3Error for GetAttributesError {
     fn into_s3_error(self) -> S3Error {
         match self {
-            GetObjectAttributesError::ManagedCopyError(ref error) => managed_copy_error(error),
-            GetObjectAttributesError::NoSuchVersion => no_such_version_error(),
-            GetObjectAttributesError::DeleteMarker => delete_marker_error(),
-            GetObjectAttributesError::NoSuchKey => no_such_key_error(),
+            GetAttributesError::ManagedCopyError(ref error) => managed_copy_error(error),
+            GetAttributesError::NoSuchVersion => missing_version_error(),
+            GetAttributesError::DeleteMarker => delete_marker_error(),
+            GetAttributesError::NoSuchKey => missing_key_error(),
             err => internal_error(err),
         }
     }
@@ -544,18 +556,18 @@ impl IntoS3Error for GetObjectAttributesError {
 impl IntoS3Error for DeleteObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
-            DeleteObjectError::NoSuchVersion => no_such_version_error(),
-            DeleteObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_in_progress_error(),
+            DeleteObjectError::NoSuchVersion => missing_version_error(),
+            DeleteObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
             DeleteObjectError::UsageUpdateError(_) => usage_accounting_error(),
             err => internal_error(err),
         }
     }
 }
 
-impl IntoS3Error for GetBucketInfoError {
+impl IntoS3Error for GetBucketError {
     fn into_s3_error(self) -> S3Error {
         match self {
-            GetBucketInfoError::NotFound => bucket_not_found_error(),
+            GetBucketError::NotFound => missing_bucket_error(),
             err => internal_error(err),
         }
     }
@@ -564,36 +576,36 @@ impl IntoS3Error for GetBucketInfoError {
 impl IntoS3Error for DeleteBucketError {
     fn into_s3_error(self) -> S3Error {
         match self {
-            DeleteBucketError::NotFound => bucket_not_found_error(),
-            DeleteBucketError::NotEmpty => bucket_not_empty_error(),
+            DeleteBucketError::NotFound => missing_bucket_error(),
+            DeleteBucketError::NotEmpty => nonempty_bucket_error(),
             err => internal_error(err),
         }
     }
 }
 
-impl IntoS3Error for PutBucketCorsError {
+impl IntoS3Error for PutCorsError {
     fn into_s3_error(self) -> S3Error {
         match self {
-            PutBucketCorsError::NotFound => bucket_not_found_error(),
+            PutCorsError::NotFound => missing_bucket_error(),
             err => internal_error(err),
         }
     }
 }
 
-impl IntoS3Error for GetBucketCorsError {
+impl IntoS3Error for GetCorsError {
     fn into_s3_error(self) -> S3Error {
         match self {
-            GetBucketCorsError::BucketNotFound => bucket_not_found_error(),
-            GetBucketCorsError::CorsNotFound => cors_configuration_not_found_error(),
+            GetCorsError::BucketNotFound => missing_bucket_error(),
+            GetCorsError::CorsNotFound => missing_cors_error(),
             err => internal_error(err),
         }
     }
 }
 
-impl IntoS3Error for DeleteBucketCorsError {
+impl IntoS3Error for DeleteCorsError {
     fn into_s3_error(self) -> S3Error {
         match self {
-            DeleteBucketCorsError::NotFound => bucket_not_found_error(),
+            DeleteCorsError::NotFound => missing_bucket_error(),
             err => internal_error(err),
         }
     }
@@ -602,6 +614,7 @@ impl IntoS3Error for DeleteBucketCorsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::errors::BlobError;
 
     #[test]
     fn maps_incomplete_body() {
@@ -637,7 +650,10 @@ mod tests {
     #[test]
     fn maps_backend_write() {
         for error in [
-            PutObjectError::BlobWriteFailed("No space left on device".to_string()).into_s3_error(),
+            PutObjectError::BlobWriteFailed(BlobError::WriteError(
+                "No space left on device".to_string(),
+            ))
+            .into_s3_error(),
             UploadPartError::BlobWriteFailed("No space left on device".to_string()).into_s3_error(),
         ] {
             assert_eq!(*error.code(), S3ErrorCode::InternalError);
@@ -645,10 +661,10 @@ mod tests {
     }
 
     #[test]
-    fn maps_purge_fence_as_retryable() {
+    fn purge_fence_retryable() {
         for error in [
             PutObjectError::PurgeFence(PurgeFenceError::Suspended).into_s3_error(),
-            CompleteMultipartUploadError::PurgeFence(PurgeFenceError::Suspended).into_s3_error(),
+            CompleteUploadError::PurgeFence(PurgeFenceError::Suspended).into_s3_error(),
             DeleteObjectError::PurgeFence(PurgeFenceError::Suspended).into_s3_error(),
         ] {
             assert_eq!(*error.code(), S3ErrorCode::Custom("PurgeInProgress".into()));
@@ -666,6 +682,22 @@ mod tests {
         let refused = GetObjectError::GovernedUnavailable.into_s3_error();
         assert_eq!(*refused.code(), S3ErrorCode::AccessDenied);
         assert_eq!(refused.status_code(), Some(http::StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn maps_holder_failures() {
+        let denied = GetObjectError::HolderAccessDenied.into_s3_error();
+        assert_eq!(*denied.code(), S3ErrorCode::AccessDenied);
+
+        let unavailable = GetObjectError::HoldersUnavailable.into_s3_error();
+        assert_eq!(*unavailable.code(), S3ErrorCode::ServiceUnavailable);
+
+        let integrity = GetObjectError::HolderIntegrityFailure.into_s3_error();
+        assert_eq!(*integrity.code(), S3ErrorCode::InternalError);
+        assert_eq!(
+            integrity.message(),
+            Some("A holder returned object bytes that failed integrity verification.")
+        );
     }
 
     // The three reference failures are distinct to a client: gone (404), retry
@@ -696,8 +728,8 @@ mod tests {
     #[test]
     fn maps_completion_lease() {
         for error in [
-            CompleteMultipartUploadError::CompletionInProgress.into_s3_error(),
-            AbortMultipartUploadError::CompletionInProgress.into_s3_error(),
+            CompleteUploadError::CompletionInProgress.into_s3_error(),
+            AbortUploadError::CompletionInProgress.into_s3_error(),
         ] {
             assert_eq!(*error.code(), S3ErrorCode::OperationAborted);
             assert_eq!(error.status_code(), Some(http::StatusCode::CONFLICT));
@@ -713,8 +745,8 @@ mod tests {
     fn maps_not_open() {
         for error in [
             UploadPartError::UploadNotOpen.into_s3_error(),
-            CompleteMultipartUploadError::UploadNotOpen.into_s3_error(),
-            AbortMultipartUploadError::UploadNotOpen.into_s3_error(),
+            CompleteUploadError::UploadNotOpen.into_s3_error(),
+            AbortUploadError::UploadNotOpen.into_s3_error(),
         ] {
             assert_eq!(*error.code(), S3ErrorCode::NoSuchUpload);
         }
@@ -723,24 +755,20 @@ mod tests {
     #[test]
     fn maps_complete_errors() {
         assert_eq!(
-            *CompleteMultipartUploadError::MissingParts
+            *CompleteUploadError::MissingParts.into_s3_error().code(),
+            S3ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            *CompleteUploadError::InvalidObjectSize
                 .into_s3_error()
                 .code(),
             S3ErrorCode::InvalidRequest
         );
         assert_eq!(
-            *CompleteMultipartUploadError::InvalidObjectSize
-                .into_s3_error()
-                .code(),
-            S3ErrorCode::InvalidRequest
-        );
-        assert_eq!(
-            *CompleteMultipartUploadError::MissingPartEtag
-                .into_s3_error()
-                .code(),
+            *CompleteUploadError::MissingPartEtag.into_s3_error().code(),
             S3ErrorCode::InvalidPart
         );
-        let entity_too_small = CompleteMultipartUploadError::EntityTooSmall.into_s3_error();
+        let entity_too_small = CompleteUploadError::EntityTooSmall.into_s3_error();
         assert_eq!(*entity_too_small.code(), S3ErrorCode::EntityTooSmall);
         assert_eq!(
             entity_too_small.status_code(),
@@ -779,7 +807,7 @@ mod tests {
     fn maps_usage_failure() {
         // The counter fault must not leak a Rust error string to an S3 client.
         let error = DeleteObjectError::UsageUpdateError(
-            aruna_operations::usage_stats::UsageUpdateError::UnexpectedEvent(
+            aruna_operations::node::usage_stats::UsageUpdateError::UnexpectedEvent(
                 aruna_core::events::Event::Blob(aruna_core::events::BlobEvent::DeleteFinished),
             ),
         )

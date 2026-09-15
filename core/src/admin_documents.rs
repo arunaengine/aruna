@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::UserId;
 use crate::structs::{
     Actor, BandPool, BindingScope, CandidatePlacementMap, CompletionProof, HandleRange,
     MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
@@ -11,7 +12,7 @@ use crate::structs::{
     RealmComputeConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StrategyBinding,
     TransitionPlan,
 };
-use crate::types::{GroupId, RoleId, UserId};
+use crate::types::{GroupId, RoleId};
 
 /// Domain separator for the origin signature over an administrative event.
 pub const ADMIN_DOCUMENT_EVENT_DOMAIN: &str = "aruna-admin-document-event-v1";
@@ -60,13 +61,13 @@ pub enum AdminDocumentTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdminDocumentRoleDefinition {
+pub struct AdminRoleDefinition {
     pub role_id: RoleId,
     pub name: String,
     pub permissions: BTreeMap<String, Permission>,
 }
 
-impl From<&Role> for AdminDocumentRoleDefinition {
+impl From<&Role> for AdminRoleDefinition {
     fn from(role: &Role) -> Self {
         Self {
             role_id: role.role_id,
@@ -80,7 +81,7 @@ impl From<&Role> for AdminDocumentRoleDefinition {
     }
 }
 
-impl From<Role> for AdminDocumentRoleDefinition {
+impl From<Role> for AdminRoleDefinition {
     fn from(role: Role) -> Self {
         Self::from(&role)
     }
@@ -127,13 +128,13 @@ pub enum AdminDocumentOperation {
         user_id: UserId,
     },
     GroupRoleCreated {
-        role: AdminDocumentRoleDefinition,
+        role: AdminRoleDefinition,
     },
     GroupRoleRemoved {
         role_id: RoleId,
     },
     RealmRoleCreated {
-        role: AdminDocumentRoleDefinition,
+        role: AdminRoleDefinition,
     },
     RealmConfigNodeEnsured {
         node_id: NodeId,
@@ -304,8 +305,9 @@ pub enum AdminDocumentOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget};
+    use super::{AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition};
     use crate::NodeId;
+    use crate::UserId;
     use crate::structs::{
         AffinityEffect, AffinityRule, BandPool, BindingScope, DocumentClass, HandleRange,
         LabelMatch, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
@@ -313,7 +315,7 @@ mod tests {
         RealmComputeConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
     };
     use crate::structured_id::PlacementHandle;
-    use crate::types::{GroupId, RoleId, UserId};
+    use crate::types::{GroupId, RoleId};
     use std::collections::BTreeMap;
     use ulid::Ulid;
 
@@ -333,8 +335,8 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    fn role_definition(role_id: RoleId) -> AdminDocumentRoleDefinition {
-        AdminDocumentRoleDefinition {
+    fn role_definition(role_id: RoleId) -> AdminRoleDefinition {
+        AdminRoleDefinition {
             role_id,
             name: "admin".to_string(),
             permissions: BTreeMap::from([("/dataset/**".to_string(), Permission::READ)]),
@@ -370,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_document_operations_roundtrip() {
+    fn admin_document_roundtrip() {
         let role_id = role_id(1);
         let assigned_user_id = user_id(2);
         let realm_id = RealmId::from_bytes([9; 32]);
@@ -560,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_document_targets_roundtrip() {
+    fn admin_targets_roundtrip() {
         let realm_id = RealmId::from_bytes([9; 32]);
         let targets = [
             AdminDocumentTarget::Group {
@@ -629,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_config_node_ensured_operation_roundtrips() {
+    fn realm_config_roundtrips() {
         let operation = AdminDocumentOperation::RealmConfigNodeEnsured {
             node_id: node(3),
             kind: RealmNodeKind::Server,
@@ -639,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_config_oidc_provider_operations_roundtrip() {
+    fn realm_config_roundtrip() {
         let operations = [
             AdminDocumentOperation::RealmConfigOidcProviderUpserted {
                 provider: oidc_provider("default"),
@@ -655,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_config_settings_operation_roundtrips() {
+    fn realm_settings_roundtrips() {
         let operation = AdminDocumentOperation::RealmConfigSettingsSet {
             metadata_replication: MetadataReplicationConfig::new(3),
             discovery: RealmDiscoveryConfig::Static {
@@ -667,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn group_created_operation_roundtrips() {
+    fn group_created_roundtrips() {
         let operation = AdminDocumentOperation::GroupCreated {
             realm_id: RealmId::from_bytes([9; 32]),
             display_name: "Engineering".to_string(),
@@ -678,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_config_description_operation_roundtrips() {
+    fn realm_description_roundtrips() {
         let operation = AdminDocumentOperation::RealmConfigDescriptionSet {
             description: "Demo Realm".to_string(),
         };

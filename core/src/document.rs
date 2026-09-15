@@ -4,6 +4,7 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::UserId;
 use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
@@ -12,20 +13,18 @@ use crate::keyspaces::{
     NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE,
     PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USER_KEYSPACE,
 };
-use crate::metadata::{MetadataCreateEventRecord, MetadataGraphLifecycleRecord};
-use crate::storage_entries::{
-    metadata_document_lifecycle_key, metadata_event_log_key, metadata_graph_lifecycle_key,
-};
+use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
+use crate::storage_entries::{document_lifecycle_key, event_log_key, graph_lifecycle_key};
 use crate::structs::{
-    PLACEMENT_EPOCH_PAD, PlacementRef, RealmId, node_info_storage_key, node_usage_global_key,
-    node_usage_group_key, persistent_id_key, placement_policy_key, watch_interest_node_key,
+    PLACEMENT_EPOCH_PAD, PlacementRef, RealmId, interest_node_key, node_info_key,
+    persistent_id_key, placement_policy_key, usage_global_key, usage_snapshot_key,
     watch_subscription_key,
 };
-use crate::types::{GroupId, Key, UserId};
+use crate::types::{GroupId, Key};
 use crate::{NodeId, TopicId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum DocumentSyncTarget {
+pub enum DocumentTarget {
     Group {
         group_id: GroupId,
     },
@@ -55,10 +54,9 @@ pub enum DocumentSyncTarget {
     MetadataGraphLifecycle {
         graph_iri: String,
     },
-    /// The document's w3id PID mapping. Rides the document-lifecycle placement so
-    /// the PID authority is co-located with the document's holders, but keeps its
-    /// own keyspace: the registry row is deleted with the document while the
-    /// mapping must survive it to serve a permanent 410.
+    /// The document's w3id PID mapping. Rides the document-lifecycle placement so the PID authority is
+    /// co-located with the document's holders, but keeps its own keyspace: the registry row is deleted with
+    /// the document while the mapping must survive it to serve a permanent 410.
     PersistentIdMapping {
         document_id: Ulid,
     },
@@ -86,9 +84,8 @@ pub enum DocumentSyncTarget {
     },
 }
 
-/// A shard whose sync topic the local node is an authoritative holder of and
-/// whose co-holder membership is still being topped up. Keyed by
-/// realm ‖ strategy ‖ pad ‖ shard(be); one record per shard, not per
+/// A shard whose sync topic the local node is an authoritative holder of and whose co-holder membership
+/// is still being topped up. Keyed by realm ‖ strategy ‖ pad ‖ shard(be); one record per shard, not per
 /// document (every document in the shard rides the same topic).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingShardPlacement {
@@ -99,21 +96,16 @@ pub struct PendingShardPlacement {
     pub authoritative_node_id: NodeId,
 }
 
-/// One holder-manifest row: a shard-classed document the local node holds and
-/// the revision it holds it at. A delete keeps the row with the delete
-/// revision (a tombstone), mirroring the lifecycle sidecar. Keyed per entry in
-/// [`SHARD_MANIFEST_KEYSPACE`](crate::keyspaces::SHARD_MANIFEST_KEYSPACE) so the
-/// hot write path never reads-modifies-writes a blob.
+/// One held shard document and revision. Deletes remain as tombstone rows matching lifecycle sidecars.
+/// Per-entry keys avoid a read-modify-write blob on the hot write path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardManifestEntry {
-    pub target: DocumentSyncTarget,
+    pub target: DocumentTarget,
     pub revision: DocumentSyncRevision,
 }
 
-/// A node's authoritative statement of what it holds for one shard: the entry
-/// set (from a prefix scan of the manifest keyspace), the irokle topic digest
-/// and persisted cursor, and provenance. Assembled on demand, never doc-synced
-/// (a new holder fetches a co-holder's over the shard ALPN and compares).
+/// Authoritative shard inventory, topic digest, cursor, and provenance assembled from local state.
+/// It is fetched from a co-holder over shard ALPN and is never document-synchronized.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardManifest {
     pub placement: PlacementRef,
@@ -125,12 +117,12 @@ pub struct ShardManifest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DocumentSyncOutboxRecord {
+pub struct DocumentOutboxRecord {
     pub outbox_id: Ulid,
     pub node_id: NodeId,
-    pub target: DocumentSyncTarget,
+    pub target: DocumentTarget,
     pub peers: Vec<NodeId>,
-    pub event: DocumentSyncOutboxEvent,
+    pub event: DocumentOutboxEvent,
     /// Placement reference this record rides under: for `Upsert`/`Delete` the
     /// envelope change's ref, for `AdminOperation` the target's resolved ref.
     /// Does not affect the outbox FIFO key.
@@ -146,7 +138,7 @@ pub struct DocumentSyncOutboxRecord {
     pub allow_genesis: bool,
 }
 
-impl DocumentSyncOutboxRecord {
+impl DocumentOutboxRecord {
     /// Stamps the generation the bucket's write fence admitted this row at.
     pub fn fenced_at(mut self, generation: u64) -> Self {
         self.generation = generation;
@@ -155,10 +147,10 @@ impl DocumentSyncOutboxRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DocumentSyncOutboxEvent {
+pub enum DocumentOutboxEvent {
     Upsert {
         bytes: Vec<u8>,
-        change: DocumentSyncChange,
+        change: DocumentChange,
     },
     AdminOperation {
         event: Box<AdminDocumentEvent>,
@@ -168,11 +160,11 @@ pub enum DocumentSyncOutboxEvent {
         origin_signature: Option<iroh::Signature>,
     },
     Delete {
-        change: DocumentSyncChange,
+        change: DocumentChange,
     },
 }
 
-impl DocumentSyncOutboxEvent {
+impl DocumentOutboxEvent {
     /// Admin record originated by this node; the publisher signs the envelope.
     pub fn admin(event: AdminDocumentEvent) -> Self {
         Self::AdminOperation {
@@ -190,15 +182,14 @@ impl DocumentSyncOutboxEvent {
     }
 }
 
-/// A payload recovered from a genesis tie-break, journalled until its
-/// replacement outbox row is durable. `event_id` is the evicted event's own id,
-/// so repeating the recovery rewrites one stable outbox row instead of adding a
-/// duplicate.
+/// A payload recovered from a genesis tie-break, journalled until its replacement outbox row is
+/// durable. `event_id` is the evicted event's own id, so repeating the recovery rewrites one stable
+/// outbox row instead of adding a duplicate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DocumentSyncEvictedDocument {
+pub struct DocumentEvictedDocument {
     pub event_id: Ulid,
-    pub target: DocumentSyncTarget,
-    pub event: DocumentSyncOutboxEvent,
+    pub target: DocumentTarget,
+    pub event: DocumentOutboxEvent,
     pub placement: PlacementRef,
     pub allow_genesis: bool,
 }
@@ -212,30 +203,30 @@ pub struct DocumentSyncRevision {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DocumentSyncChange {
+pub struct DocumentChange {
     pub base: Option<DocumentSyncRevision>,
     pub current: DocumentSyncRevision,
-    pub kind: DocumentSyncChangeKind,
+    pub kind: DocumentChangeKind,
     pub placement: PlacementRef,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentSyncConflict {
-    pub target: DocumentSyncTarget,
-    pub local_change: Option<DocumentSyncChange>,
+    pub target: DocumentTarget,
+    pub local_change: Option<DocumentChange>,
     pub local_bytes: Option<Vec<u8>>,
-    pub incoming_change: DocumentSyncChange,
+    pub incoming_change: DocumentChange,
     pub incoming_bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DocumentSyncChangeKind {
+pub enum DocumentChangeKind {
     Upsert,
     Delete,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DocumentSyncApplyDecision {
+pub enum DocumentApplyDecision {
     Apply,
     SkipStale,
     SkipTombstoned,
@@ -246,13 +237,13 @@ pub enum DocumentSyncApplyDecision {
 pub enum DocumentSyncPublish {
     Upsert {
         event_id: Ulid,
-        target: DocumentSyncTarget,
+        target: DocumentTarget,
         bytes: Vec<u8>,
-        change: DocumentSyncChange,
+        change: DocumentChange,
         allow_genesis: bool,
     },
     AdminOperation {
-        target: DocumentSyncTarget,
+        target: DocumentTarget,
         event: Box<AdminDocumentEvent>,
         placement: PlacementRef,
         allow_genesis: bool,
@@ -261,27 +252,27 @@ pub enum DocumentSyncPublish {
     },
     Delete {
         event_id: Ulid,
-        target: DocumentSyncTarget,
-        change: DocumentSyncChange,
+        target: DocumentTarget,
+        change: DocumentChange,
         allow_genesis: bool,
     },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DocumentSyncReconcileResult {
-    pub targets: Vec<DocumentSyncTarget>,
-    pub metadata_create_events: Vec<MetadataCreateEventRecord>,
-    pub metadata_graph_tombstones: Vec<MetadataGraphLifecycleRecord>,
+pub struct DocumentReconcileResult {
+    pub targets: Vec<DocumentTarget>,
+    pub metadata_create_events: Vec<MetadataEventRecord>,
+    pub metadata_graph_tombstones: Vec<GraphLifecycleRecord>,
 }
 
-impl DocumentSyncReconcileResult {
+impl DocumentReconcileResult {
     pub fn applied(&self) -> usize {
         self.targets.len()
     }
 }
 
 impl DocumentSyncPublish {
-    pub fn target(&self) -> &DocumentSyncTarget {
+    pub fn target(&self) -> &DocumentTarget {
         match self {
             Self::Upsert { target, .. }
             | Self::Delete { target, .. }
@@ -305,7 +296,7 @@ impl DocumentSyncPublish {
     }
 }
 
-impl DocumentSyncOutboxEvent {
+impl DocumentOutboxEvent {
     pub fn kind(&self) -> &'static [u8] {
         match self {
             Self::Upsert { .. } => b"upsert",
@@ -315,47 +306,47 @@ impl DocumentSyncOutboxEvent {
     }
 }
 
-pub fn compare_document_sync_revisions(
+pub fn compare_sync_revisions(
     local: &DocumentSyncRevision,
     remote: &DocumentSyncRevision,
 ) -> Ordering {
     local.cmp(remote)
 }
 
-pub fn document_sync_apply_decision(
-    local: Option<&DocumentSyncChange>,
-    incoming: &DocumentSyncChange,
-) -> DocumentSyncApplyDecision {
+pub fn sync_apply_decision(
+    local: Option<&DocumentChange>,
+    incoming: &DocumentChange,
+) -> DocumentApplyDecision {
     let Some(local) = local else {
-        return DocumentSyncApplyDecision::Apply;
+        return DocumentApplyDecision::Apply;
     };
 
     if incoming.current == local.current {
         return if incoming.kind == local.kind {
-            DocumentSyncApplyDecision::Apply
+            DocumentApplyDecision::Apply
         } else {
-            DocumentSyncApplyDecision::Conflict
+            DocumentApplyDecision::Conflict
         };
     }
 
-    if local.kind == DocumentSyncChangeKind::Delete
-        && incoming.kind == DocumentSyncChangeKind::Upsert
+    if local.kind == DocumentChangeKind::Delete
+        && incoming.kind == DocumentChangeKind::Upsert
         && incoming.base.as_ref() != Some(&local.current)
     {
-        return DocumentSyncApplyDecision::SkipTombstoned;
+        return DocumentApplyDecision::SkipTombstoned;
     }
 
     match incoming.current.generation.cmp(&local.current.generation) {
-        Ordering::Less => DocumentSyncApplyDecision::SkipStale,
-        Ordering::Equal => DocumentSyncApplyDecision::Conflict,
+        Ordering::Less => DocumentApplyDecision::SkipStale,
+        Ordering::Equal => DocumentApplyDecision::Conflict,
         Ordering::Greater if incoming.base.as_ref() == Some(&local.current) => {
-            DocumentSyncApplyDecision::Apply
+            DocumentApplyDecision::Apply
         }
-        Ordering::Greater => DocumentSyncApplyDecision::Conflict,
+        Ordering::Greater => DocumentApplyDecision::Conflict,
     }
 }
 
-impl DocumentSyncTarget {
+impl DocumentTarget {
     /// Admin documents (user, group, and realm authorization/config) replicate
     /// only as `AdminOperation` events over their shared topic; they never take
     /// placements or sync as whole documents.
@@ -384,7 +375,7 @@ impl DocumentSyncTarget {
             | Self::MetadataDocumentLifecycle { document_id }
             | Self::PersistentIdMapping { document_id } => TopicId::metadata(*document_id),
             Self::MetadataGraphLifecycle { graph_iri } => {
-                TopicId::metadata(metadata_graph_lifecycle_topic_id(graph_iri))
+                TopicId::metadata(graph_lifecycle_topic(graph_iri))
             }
             Self::NodeUsage { realm_id, .. } => TopicId::realm(*realm_id),
             Self::WatchInterest { realm_id, .. } => TopicId::realm(*realm_id),
@@ -434,34 +425,31 @@ impl DocumentSyncTarget {
             Self::MetadataCreateEvent {
                 document_id,
                 event_id,
-            } => metadata_event_log_key(*document_id, *event_id),
-            Self::MetadataDocumentLifecycle { document_id } => {
-                metadata_document_lifecycle_key(*document_id)
-            }
-            Self::MetadataGraphLifecycle { graph_iri } => metadata_graph_lifecycle_key(graph_iri),
+            } => event_log_key(*document_id, *event_id),
+            Self::MetadataDocumentLifecycle { document_id } => document_lifecycle_key(*document_id),
+            Self::MetadataGraphLifecycle { graph_iri } => graph_lifecycle_key(graph_iri),
             Self::PersistentIdMapping { document_id } => {
                 ByteView::from(persistent_id_key(*document_id))
             }
             Self::NodeUsage {
                 node_id, group_id, ..
             } => match group_id {
-                Some(group_id) => ByteView::from(node_usage_group_key(*group_id, *node_id)),
-                None => ByteView::from(node_usage_global_key(*node_id)),
+                Some(group_id) => ByteView::from(usage_snapshot_key(*group_id, *node_id)),
+                None => ByteView::from(usage_global_key(*node_id)),
             },
             Self::WatchInterest { realm_id, node_id } => {
-                ByteView::from(watch_interest_node_key(*realm_id, *node_id))
+                ByteView::from(interest_node_key(*realm_id, *node_id))
             }
             Self::WatchSubscription { owner, watch_id } => {
                 watch_subscription_key(*owner, *watch_id)
             }
-            Self::NodeInfo { node_id, .. } => ByteView::from(node_info_storage_key(*node_id)),
+            Self::NodeInfo { node_id, .. } => ByteView::from(node_info_key(*node_id)),
             Self::PlacementPolicy { policy_id } => ByteView::from(placement_policy_key(*policy_id)),
         }
     }
 
-    /// Whether this target's records ride a shard topic (group, user,
-    /// metadata classes) rather than a shared realm-scoped domain topic.
-    /// Shard topics are join-only for everyone but the shard's rank-0
+    /// Whether this target's records ride a shard topic (group, user, metadata classes) rather than a
+    /// shared realm-scoped domain topic. Shard topics are join-only for everyone but the shard's rank-0
     /// holder, which creates the genesis eagerly.
     pub fn uses_shard_topic(&self) -> bool {
         matches!(
@@ -478,12 +466,8 @@ impl DocumentSyncTarget {
         )
     }
 
-    /// Sync topic this target's records ride. Shard-classed targets (group,
-    /// user, metadata) derive one topic per `(strategy, shard)` from the
-    /// placement; shared realm-scoped targets keep their per-domain topic and
-    /// ignore the placement. A NIL placement on a shard-classed target is a bug
-    /// (the emitter failed to stamp a real ref) — it is asserted in debug and
-    /// warned in release, never silently accepted.
+    /// Returns a placement-derived topic for shard-classed targets and a shared domain topic otherwise.
+    /// A missing shard placement is an emitter bug: debug builds assert and release builds warn.
     pub fn sync_topic_id(&self, realm_id: RealmId, placement: &PlacementRef) -> irokle::TopicId {
         if self.uses_shard_topic() {
             if *placement == PlacementRef::NIL {
@@ -498,11 +482,11 @@ impl DocumentSyncTarget {
             }
             shard_topic_id(realm_id, placement)
         } else {
-            self.shared_sync_topic_id()
+            self.shared_topic_id()
         }
     }
 
-    fn shared_sync_topic_id(&self) -> irokle::TopicId {
+    fn shared_topic_id(&self) -> irokle::TopicId {
         let mut bytes = b"aruna-document-topic-v1".to_vec();
         bytes.extend_from_slice(&self.topic_id().to_bytes());
         match self {
@@ -522,10 +506,7 @@ impl DocumentSyncTarget {
             // Realm-shared: every node subscribes so an access key created on any
             // node replicates to all, making the credential valid realm-wide.
             other => {
-                debug_assert!(
-                    false,
-                    "shared_sync_topic_id on shard-classed target {other:?}"
-                );
+                debug_assert!(false, "shared_topic_id on shard-classed target {other:?}");
                 bytes.extend_from_slice(b"/shard-misroute");
             }
         }
@@ -533,11 +514,8 @@ impl DocumentSyncTarget {
     }
 }
 
-/// Sync topic a shard's records ride, derived from the realm, strategy, and
-/// shard (no config lookup at the net layer). Holders, maps, and activations
-/// never enter it, so a full turnover keeps one topic. Mirrors the
-/// `TopicId::hash` idiom [`DocumentSyncTarget::sync_topic_id`] uses, which
-/// routes every shard-classed target here.
+/// Derives a stable topic from realm, strategy, and shard without network-layer config lookup.
+/// Holder or epoch turnover does not change it; all shard-classed targets use this derivation.
 pub fn shard_topic_id(realm_id: RealmId, placement: &PlacementRef) -> irokle::TopicId {
     let mut bytes = b"aruna-shard-topic-v1".to_vec();
     bytes.extend_from_slice(realm_id.as_bytes());
@@ -547,7 +525,7 @@ pub fn shard_topic_id(realm_id: RealmId, placement: &PlacementRef) -> irokle::To
     irokle::TopicId::hash(bytes)
 }
 
-fn metadata_graph_lifecycle_topic_id(graph_iri: &str) -> Ulid {
+fn graph_lifecycle_topic(graph_iri: &str) -> Ulid {
     let hash = blake3::hash(graph_iri.as_bytes());
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&hash.as_bytes()[..16]);
@@ -556,15 +534,15 @@ fn metadata_graph_lifecycle_topic_id(graph_iri: &str) -> Ulid {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]
 #[irokle(type_id = "aruna.document.v3")]
-pub enum DocumentSyncEvent {
+pub enum DocumentEvent {
     Upsert {
         event_id: Ulid,
-        target: DocumentSyncTarget,
+        target: DocumentTarget,
         bytes: Vec<u8>,
-        change: DocumentSyncChange,
+        change: DocumentChange,
     },
     AdminOperation {
-        target: DocumentSyncTarget,
+        target: DocumentTarget,
         event: Box<AdminDocumentEvent>,
         placement: PlacementRef,
         /// The origin's signature over the envelope. Carried on the wire so a
@@ -573,13 +551,13 @@ pub enum DocumentSyncEvent {
     },
     Delete {
         event_id: Ulid,
-        target: DocumentSyncTarget,
-        change: DocumentSyncChange,
+        target: DocumentTarget,
+        change: DocumentChange,
     },
 }
 
-impl DocumentSyncEvent {
-    pub fn target(&self) -> &DocumentSyncTarget {
+impl DocumentEvent {
+    pub fn target(&self) -> &DocumentTarget {
         match self {
             Self::Upsert { target, .. }
             | Self::Delete { target, .. }
@@ -596,7 +574,7 @@ impl DocumentSyncEvent {
 
     /// Placement the event rides under: the envelope change's ref for
     /// `Upsert`/`Delete`, the stamped admin ref for `AdminOperation`. Feeds
-    /// [`DocumentSyncTarget::sync_topic_id`] on both publish and reconcile.
+    /// [`DocumentTarget::sync_topic_id`] on both publish and reconcile.
     pub fn placement(&self) -> PlacementRef {
         match self {
             Self::Upsert { change, .. } | Self::Delete { change, .. } => change.placement,
@@ -606,7 +584,7 @@ impl DocumentSyncEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DocumentSyncEffect {
+pub enum DocumentEffect {
     PublishDocuments {
         documents: Vec<DocumentSyncPublish>,
         peers: Vec<NodeId>,
@@ -622,9 +600,9 @@ pub enum DocumentSyncEffect {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DocumentSyncNetEvent {
+pub enum DocumentNetEvent {
     DocumentsPublished {
-        targets: Vec<DocumentSyncTarget>,
+        targets: Vec<DocumentTarget>,
     },
     DocumentsPartiallyPublished {
         published_indices: Vec<usize>,
@@ -633,669 +611,16 @@ pub enum DocumentSyncNetEvent {
     },
     DocumentsReconciled {
         applied: usize,
-        targets: Vec<DocumentSyncTarget>,
-        metadata_create_events: Vec<MetadataCreateEventRecord>,
-        metadata_graph_tombstones: Vec<MetadataGraphLifecycleRecord>,
+        targets: Vec<DocumentTarget>,
+        metadata_create_events: Vec<MetadataEventRecord>,
+        metadata_graph_tombstones: Vec<GraphLifecycleRecord>,
     },
     Error {
-        target: Option<DocumentSyncTarget>,
+        target: Option<DocumentTarget>,
         error: String,
     },
 }
 
 #[cfg(test)]
-mod tests {
-    use std::cmp::Ordering;
-
-    use super::{
-        DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent,
-        DocumentSyncOutboxEvent, DocumentSyncPublish, DocumentSyncRevision, DocumentSyncTarget,
-        compare_document_sync_revisions, document_sync_apply_decision, shard_topic_id,
-    };
-    use crate::NodeId;
-    use crate::TopicId;
-    use crate::keyspaces::{
-        AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-        METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
-        REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
-    };
-    use crate::structs::PlacementRef;
-    use crate::structs::RealmId;
-    use crate::types::UserId;
-    use ulid::Ulid;
-
-    fn test_ulid(seed: u8) -> Ulid {
-        Ulid::from_bytes([seed; 16])
-    }
-
-    fn test_node(seed: u8) -> NodeId {
-        iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
-    fn revision(generation: u64, event_seed: u8, actor_seed: u8) -> DocumentSyncRevision {
-        DocumentSyncRevision {
-            generation,
-            event_id: test_ulid(event_seed),
-            actor: test_node(actor_seed),
-            updated_at_ms: u64::from(event_seed),
-        }
-    }
-
-    fn change(
-        kind: DocumentSyncChangeKind,
-        base: Option<DocumentSyncRevision>,
-        generation: u64,
-        event_seed: u8,
-        actor_seed: u8,
-    ) -> DocumentSyncChange {
-        DocumentSyncChange {
-            base,
-            current: revision(generation, event_seed, actor_seed),
-            kind,
-            placement: crate::structs::PlacementRef::NIL,
-        }
-    }
-
-    fn test_realm(seed: u8) -> RealmId {
-        RealmId::from_bytes([seed; 32])
-    }
-
-    fn graph_topic_ulid(graph_iri: &str) -> Ulid {
-        let hash = blake3::hash(graph_iri.as_bytes());
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&hash.as_bytes()[..16]);
-        Ulid::from_bytes(bytes)
-    }
-
-    fn graph_lifecycle_key(graph_iri: &str) -> Vec<u8> {
-        blake3::hash(graph_iri.as_bytes()).as_bytes().to_vec()
-    }
-
-    #[test]
-    fn document_sync_target_domain_topic_mapping_is_stable() {
-        let group_id = test_ulid(1);
-        let realm_id = test_realm(2);
-        let user_id = UserId::new(test_ulid(3), realm_id);
-        let document_id = test_ulid(4);
-        let event_id = test_ulid(5);
-        let graph_iri = "https://example.com/graphs/stable";
-
-        let cases = [
-            (
-                DocumentSyncTarget::Group { group_id },
-                TopicId::group(group_id),
-            ),
-            (
-                DocumentSyncTarget::GroupAuthorization { group_id },
-                TopicId::group(group_id),
-            ),
-            (
-                DocumentSyncTarget::RealmAuthorization { realm_id },
-                TopicId::realm(realm_id),
-            ),
-            (
-                DocumentSyncTarget::RealmConfig { realm_id },
-                TopicId::realm(realm_id),
-            ),
-            (
-                DocumentSyncTarget::User { user_id },
-                TopicId::users(realm_id),
-            ),
-            (
-                DocumentSyncTarget::MetadataRegistry {
-                    group_id,
-                    document_id,
-                },
-                TopicId::metadata(document_id),
-            ),
-            (
-                DocumentSyncTarget::MetadataCreateEvent {
-                    document_id,
-                    event_id,
-                },
-                TopicId::metadata(document_id),
-            ),
-            (
-                DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
-                TopicId::metadata(document_id),
-            ),
-            (
-                DocumentSyncTarget::MetadataGraphLifecycle {
-                    graph_iri: graph_iri.to_string(),
-                },
-                TopicId::metadata(graph_topic_ulid(graph_iri)),
-            ),
-        ];
-
-        for (target, expected_topic) in cases {
-            assert_eq!(target.topic_id(), expected_topic, "{target:?}");
-        }
-    }
-
-    #[test]
-    fn document_sync_target_storage_mapping_is_stable() {
-        let group_id = test_ulid(1);
-        let realm_id = test_realm(2);
-        let user_id = UserId::new(test_ulid(3), realm_id);
-        let document_id = test_ulid(4);
-        let event_id = test_ulid(5);
-        let graph_iri = "https://example.com/graphs/stable";
-
-        let mut user_key = Vec::with_capacity(48);
-        user_key.extend_from_slice(realm_id.as_bytes());
-        user_key.extend_from_slice(&user_id.user_ulid.to_bytes());
-
-        let mut registry_key = Vec::with_capacity(32);
-        registry_key.extend_from_slice(&group_id.to_bytes());
-        registry_key.extend_from_slice(&document_id.to_bytes());
-
-        let mut event_key = Vec::with_capacity(32);
-        event_key.extend_from_slice(&document_id.to_bytes());
-        event_key.extend_from_slice(&event_id.to_bytes());
-
-        let cases = [
-            (
-                DocumentSyncTarget::Group { group_id },
-                GROUP_KEYSPACE,
-                group_id.to_bytes().to_vec(),
-            ),
-            (
-                DocumentSyncTarget::GroupAuthorization { group_id },
-                AUTH_KEYSPACE,
-                group_id.to_bytes().to_vec(),
-            ),
-            (
-                DocumentSyncTarget::RealmAuthorization { realm_id },
-                AUTH_KEYSPACE,
-                realm_id.as_bytes().to_vec(),
-            ),
-            (
-                DocumentSyncTarget::RealmConfig { realm_id },
-                REALM_CONFIG_KEYSPACE,
-                realm_id.as_bytes().to_vec(),
-            ),
-            (
-                DocumentSyncTarget::User { user_id },
-                USER_KEYSPACE,
-                user_key,
-            ),
-            (
-                DocumentSyncTarget::MetadataRegistry {
-                    group_id,
-                    document_id,
-                },
-                METADATA_INDEX_KEYSPACE,
-                registry_key,
-            ),
-            (
-                DocumentSyncTarget::MetadataCreateEvent {
-                    document_id,
-                    event_id,
-                },
-                METADATA_EVENT_LOG_KEYSPACE,
-                event_key,
-            ),
-            (
-                DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
-                METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-                document_id.to_bytes().to_vec(),
-            ),
-            (
-                DocumentSyncTarget::MetadataGraphLifecycle {
-                    graph_iri: graph_iri.to_string(),
-                },
-                METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-                graph_lifecycle_key(graph_iri),
-            ),
-        ];
-
-        for (target, expected_keyspace, expected_key) in cases {
-            assert_eq!(target.storage_keyspace(), expected_keyspace, "{target:?}");
-            assert_eq!(
-                target.storage_key().as_ref(),
-                expected_key.as_slice(),
-                "{target:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn shard_classed_targets_ride_shard_topics_shared_targets_ride_domain_topics() {
-        let group_id = test_ulid(1);
-        let realm_id = test_realm(2);
-        let document_id = test_ulid(4);
-        let event_id = test_ulid(5);
-        let placement_a = PlacementRef {
-            strategy_id: test_ulid(9),
-            shard: 3,
-        };
-        let placement_b = PlacementRef {
-            shard: 4,
-            ..placement_a
-        };
-
-        // Group and its authorization are one logical subject: with the same
-        // placement they ride a single shard topic, derived purely from it.
-        let group = DocumentSyncTarget::Group { group_id };
-        let group_auth = DocumentSyncTarget::GroupAuthorization { group_id };
-        assert_eq!(
-            group.sync_topic_id(realm_id, &placement_a),
-            group_auth.sync_topic_id(realm_id, &placement_a)
-        );
-        assert_eq!(
-            group.sync_topic_id(realm_id, &placement_a),
-            shard_topic_id(realm_id, &placement_a)
-        );
-        assert_ne!(
-            group.sync_topic_id(realm_id, &placement_a),
-            group.sync_topic_id(realm_id, &placement_b)
-        );
-
-        // The three metadata variants of one document collapse onto its shard.
-        let registry = DocumentSyncTarget::MetadataRegistry {
-            group_id,
-            document_id,
-        };
-        let create = DocumentSyncTarget::MetadataCreateEvent {
-            document_id,
-            event_id,
-        };
-        let lifecycle = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-        assert_eq!(
-            registry.sync_topic_id(realm_id, &placement_a),
-            create.sync_topic_id(realm_id, &placement_a)
-        );
-        assert_eq!(
-            registry.sync_topic_id(realm_id, &placement_a),
-            lifecycle.sync_topic_id(realm_id, &placement_a)
-        );
-
-        // Shared realm-scoped targets keep their per-domain topics and ignore
-        // the placement entirely.
-        let realm_auth = DocumentSyncTarget::RealmAuthorization { realm_id };
-        let realm_config = DocumentSyncTarget::RealmConfig { realm_id };
-        assert_eq!(realm_auth.topic_id(), realm_config.topic_id());
-        assert_ne!(
-            realm_auth.sync_topic_id(realm_id, &placement_a),
-            realm_config.sync_topic_id(realm_id, &placement_a)
-        );
-        assert_eq!(
-            realm_config.sync_topic_id(realm_id, &placement_a),
-            realm_config.sync_topic_id(realm_id, &placement_b)
-        );
-        assert_ne!(
-            realm_config.sync_topic_id(realm_id, &placement_a),
-            shard_topic_id(realm_id, &placement_a)
-        );
-    }
-
-    #[test]
-    fn shard_topic_identity() {
-        let realm_id = test_realm(2);
-        let placement = PlacementRef {
-            strategy_id: test_ulid(4),
-            shard: 5,
-        };
-        // Fixed inputs → fixed topic id: the stage-2 cross-node canary. A change
-        // here means co-holders would derive different shard topics.
-        assert_eq!(
-            shard_topic_id(realm_id, &placement).to_string(),
-            "b375275475edc34ab568776cea1fdf4053e57458816e8ed35c5925e3caa07cf4"
-        );
-
-        // A second pinned vector guards the pad slot: shard 0 of the nil
-        // strategy is the bootstrap topic every node derives before any config.
-        assert_eq!(
-            shard_topic_id(test_realm(1), &PlacementRef::NIL).to_string(),
-            "50b84e3436901b73ce31928007b79483807c50a12827539f2265e8a5d9bcc575"
-        );
-
-        // Realm, strategy, and shard are the only inputs that move the topic.
-        let other_shard = PlacementRef {
-            shard: 6,
-            ..placement
-        };
-        let other_strategy = PlacementRef {
-            strategy_id: test_ulid(5),
-            ..placement
-        };
-        assert_ne!(
-            shard_topic_id(realm_id, &placement),
-            shard_topic_id(realm_id, &other_shard)
-        );
-        assert_ne!(
-            shard_topic_id(realm_id, &placement),
-            shard_topic_id(realm_id, &other_strategy)
-        );
-        assert_ne!(
-            shard_topic_id(realm_id, &placement),
-            shard_topic_id(test_realm(3), &placement)
-        );
-    }
-
-    #[test]
-    fn node_usage_targets_share_one_realm_topic_and_map_to_snapshot_keys() {
-        use crate::keyspaces::USAGE_NODE_STATS_KEYSPACE;
-        use crate::structs::{node_usage_global_key, node_usage_group_key};
-
-        let realm_id = test_realm(2);
-        let node_id = test_node(1);
-        let group_id = test_ulid(4);
-
-        let global = DocumentSyncTarget::NodeUsage {
-            realm_id,
-            node_id,
-            group_id: None,
-        };
-        let group = DocumentSyncTarget::NodeUsage {
-            realm_id,
-            node_id,
-            group_id: Some(group_id),
-        };
-
-        // Both map onto the realm domain topic and the single shared sync topic.
-        let nil = PlacementRef::NIL;
-        assert_eq!(global.topic_id(), TopicId::realm(realm_id));
-        assert_eq!(global.topic_id(), group.topic_id());
-        assert_eq!(
-            global.sync_topic_id(realm_id, &nil),
-            group.sync_topic_id(realm_id, &nil)
-        );
-
-        // A different node's usage rides the very same shared topic.
-        let other = DocumentSyncTarget::NodeUsage {
-            realm_id,
-            node_id: test_node(9),
-            group_id: None,
-        };
-        assert_eq!(
-            global.sync_topic_id(realm_id, &nil),
-            other.sync_topic_id(realm_id, &nil)
-        );
-        // But is distinct from the realm-config topic on the same domain.
-        assert_ne!(
-            global.sync_topic_id(realm_id, &nil),
-            DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &nil)
-        );
-
-        assert_eq!(global.storage_keyspace(), USAGE_NODE_STATS_KEYSPACE);
-        assert_eq!(
-            global.storage_key().as_ref(),
-            node_usage_global_key(node_id).as_slice()
-        );
-        assert_eq!(
-            group.storage_key().as_ref(),
-            node_usage_group_key(group_id, node_id).as_slice()
-        );
-    }
-
-    #[test]
-    fn node_info_targets_share_one_realm_topic_and_map_to_node_keys() {
-        use crate::keyspaces::NODE_INFO_KEYSPACE;
-        use crate::structs::node_info_storage_key;
-
-        let realm_id = test_realm(2);
-        let node_id = test_node(1);
-        let target = DocumentSyncTarget::NodeInfo { realm_id, node_id };
-
-        // Rides the realm domain topic and one shared sync topic across nodes.
-        let nil = PlacementRef::NIL;
-        assert_eq!(target.topic_id(), TopicId::realm(realm_id));
-        let other = DocumentSyncTarget::NodeInfo {
-            realm_id,
-            node_id: test_node(9),
-        };
-        assert_eq!(
-            target.sync_topic_id(realm_id, &nil),
-            other.sync_topic_id(realm_id, &nil)
-        );
-        // Distinct from the node-usage and watch-interest topics on the same realm.
-        assert_ne!(
-            target.sync_topic_id(realm_id, &nil),
-            DocumentSyncTarget::NodeUsage {
-                realm_id,
-                node_id,
-                group_id: None,
-            }
-            .sync_topic_id(realm_id, &nil)
-        );
-        assert_ne!(
-            target.sync_topic_id(realm_id, &nil),
-            DocumentSyncTarget::WatchInterest { realm_id, node_id }.sync_topic_id(realm_id, &nil)
-        );
-
-        assert_eq!(target.storage_keyspace(), NODE_INFO_KEYSPACE);
-        assert_eq!(
-            target.storage_key().as_ref(),
-            node_info_storage_key(node_id).as_slice()
-        );
-    }
-
-    #[test]
-    fn watch_interest_targets_share_one_realm_topic_and_map_to_digest_keys() {
-        use crate::keyspaces::{
-            NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
-        };
-        use crate::structs::{watch_interest_node_key, watch_subscription_key};
-
-        let realm_id = test_realm(2);
-        let node_id = test_node(1);
-        let other = DocumentSyncTarget::WatchInterest {
-            realm_id,
-            node_id: test_node(9),
-        };
-        let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
-        let owner = UserId::new(test_ulid(10), realm_id);
-        let subscription = DocumentSyncTarget::WatchSubscription {
-            owner,
-            watch_id: test_ulid(11),
-        };
-
-        // Rides the realm domain topic and one shared sync topic across nodes.
-        let nil = PlacementRef::NIL;
-        assert_eq!(target.topic_id(), TopicId::realm(realm_id));
-        assert_eq!(
-            target.sync_topic_id(realm_id, &nil),
-            other.sync_topic_id(realm_id, &nil)
-        );
-        assert_eq!(
-            target.sync_topic_id(realm_id, &nil),
-            subscription.sync_topic_id(realm_id, &nil)
-        );
-        // Distinct from the node-usage topic that shares the same realm domain.
-        assert_ne!(
-            target.sync_topic_id(realm_id, &nil),
-            DocumentSyncTarget::NodeUsage {
-                realm_id,
-                node_id,
-                group_id: None,
-            }
-            .sync_topic_id(realm_id, &nil)
-        );
-
-        assert_eq!(
-            target.storage_keyspace(),
-            NOTIFICATION_WATCH_INTEREST_KEYSPACE
-        );
-        assert_eq!(
-            target.storage_key().as_ref(),
-            watch_interest_node_key(realm_id, node_id).as_slice()
-        );
-        assert_eq!(
-            subscription.storage_keyspace(),
-            NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE
-        );
-        assert_eq!(
-            subscription.storage_key().as_ref(),
-            watch_subscription_key(owner, test_ulid(11)).as_ref()
-        );
-    }
-
-    #[test]
-    fn upsert_uses_upsert_kind_and_helpers() {
-        let event_id = test_ulid(10);
-        let target = DocumentSyncTarget::RealmConfig {
-            realm_id: test_realm(11),
-        };
-        let change = change(DocumentSyncChangeKind::Upsert, None, 1, 12, 1);
-        let outbox = DocumentSyncOutboxEvent::Upsert {
-            bytes: vec![1, 2],
-            change,
-        };
-        let publish = DocumentSyncPublish::Upsert {
-            event_id,
-            target: target.clone(),
-            bytes: vec![1, 2],
-            change,
-            allow_genesis: true,
-        };
-        let event = DocumentSyncEvent::Upsert {
-            event_id,
-            target: target.clone(),
-            bytes: vec![1, 2],
-            change,
-        };
-
-        assert_eq!(outbox.kind(), b"upsert");
-        assert_eq!(publish.target(), &target);
-        assert_eq!(publish.event_id(), event_id);
-        assert!(publish.allow_genesis());
-        assert_eq!(event.target(), &target);
-        assert_eq!(event.event_id(), event_id);
-    }
-
-    #[test]
-    fn delete_uses_delete_kind_and_helpers() {
-        let event_id = test_ulid(13);
-        let target = DocumentSyncTarget::RealmConfig {
-            realm_id: test_realm(14),
-        };
-        let change = change(DocumentSyncChangeKind::Delete, None, 2, 15, 1);
-        let outbox = DocumentSyncOutboxEvent::Delete { change };
-        let publish = DocumentSyncPublish::Delete {
-            event_id,
-            target: target.clone(),
-            change,
-            allow_genesis: false,
-        };
-        let event = DocumentSyncEvent::Delete {
-            event_id,
-            target: target.clone(),
-            change,
-        };
-
-        assert_eq!(outbox.kind(), b"delete");
-        assert_eq!(publish.target(), &target);
-        assert_eq!(publish.event_id(), event_id);
-        assert!(!publish.allow_genesis());
-        assert_eq!(event.target(), &target);
-        assert_eq!(event.event_id(), event_id);
-    }
-
-    #[test]
-    fn document_sync_revision_comparator_is_stable() {
-        let older = revision(1, 9, 1);
-        let newer = revision(2, 1, 1);
-        let same_generation_a = revision(2, 1, 1);
-        let same_generation_b = revision(2, 2, 1);
-
-        assert_eq!(
-            compare_document_sync_revisions(&older, &newer),
-            Ordering::Less
-        );
-        assert_eq!(
-            compare_document_sync_revisions(&newer, &older),
-            Ordering::Greater
-        );
-        assert_eq!(
-            compare_document_sync_revisions(&newer, &same_generation_a),
-            Ordering::Equal
-        );
-        assert_eq!(
-            compare_document_sync_revisions(&same_generation_a, &same_generation_b),
-            Ordering::Less
-        );
-    }
-
-    #[test]
-    fn document_sync_apply_decision_applies_new_and_successor_changes() {
-        let local = change(DocumentSyncChangeKind::Upsert, None, 1, 1, 1);
-        let incoming = change(DocumentSyncChangeKind::Upsert, Some(local.current), 2, 2, 1);
-
-        assert_eq!(
-            document_sync_apply_decision(None, &local),
-            DocumentSyncApplyDecision::Apply
-        );
-        assert_eq!(
-            document_sync_apply_decision(Some(&local), &incoming),
-            DocumentSyncApplyDecision::Apply
-        );
-        assert_eq!(
-            document_sync_apply_decision(Some(&local), &local),
-            DocumentSyncApplyDecision::Apply
-        );
-    }
-
-    #[test]
-    fn document_sync_apply_decision_skips_stale_and_tombstoned_changes() {
-        let stale = change(DocumentSyncChangeKind::Upsert, None, 1, 1, 1);
-        let newer = change(DocumentSyncChangeKind::Upsert, Some(stale.current), 2, 2, 1);
-        let tombstone = change(DocumentSyncChangeKind::Delete, Some(stale.current), 2, 3, 1);
-
-        assert_eq!(
-            document_sync_apply_decision(Some(&newer), &stale),
-            DocumentSyncApplyDecision::SkipStale
-        );
-        assert_eq!(
-            document_sync_apply_decision(Some(&tombstone), &stale),
-            DocumentSyncApplyDecision::SkipTombstoned
-        );
-    }
-
-    #[test]
-    fn document_sync_apply_decision_conflicts_on_unobserved_changes() {
-        let local = change(DocumentSyncChangeKind::Upsert, None, 1, 1, 1);
-        let same_generation = change(DocumentSyncChangeKind::Upsert, None, 1, 2, 2);
-        let unobserved_newer = change(DocumentSyncChangeKind::Delete, None, 2, 3, 2);
-
-        assert_eq!(
-            document_sync_apply_decision(Some(&local), &same_generation),
-            DocumentSyncApplyDecision::Conflict
-        );
-        assert_eq!(
-            document_sync_apply_decision(Some(&local), &unobserved_newer),
-            DocumentSyncApplyDecision::Conflict
-        );
-    }
-
-    #[test]
-    fn metadata_document_lifecycle_target_is_document_scoped() {
-        let document_id = test_ulid(4);
-        let lifecycle = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-        let create = DocumentSyncTarget::MetadataCreateEvent {
-            document_id,
-            event_id: test_ulid(5),
-        };
-
-        assert_eq!(lifecycle.topic_id(), create.topic_id());
-        assert_eq!(lifecycle.storage_key().as_ref(), document_id.to_bytes());
-    }
-
-    #[test]
-    fn metadata_document_lifecycle_topic_is_shared_by_upsert_and_delete() {
-        let realm_id = test_realm(2);
-        let document_id = test_ulid(4);
-        let placement = PlacementRef {
-            strategy_id: test_ulid(9),
-            shard: 2,
-        };
-        let upsert_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-        let delete_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-
-        assert_eq!(upsert_target.topic_id(), delete_target.topic_id());
-        assert_eq!(
-            upsert_target.sync_topic_id(realm_id, &placement),
-            delete_target.sync_topic_id(realm_id, &placement)
-        );
-    }
-}
+#[path = "document_tests.rs"]
+mod tests;

@@ -1,15 +1,12 @@
-//! Exact local capacity held for one accepted execution.
-//!
-//! Advertised availability is stale telemetry that only ranks a target. This is
-//! the authoritative admission: the reservation, the signed receipt, and the
-//! record that makes both visible commit in one transaction, so two concurrent
-//! offers can never oversubscribe the same backend and no work ever starts
-//! before its receipt is durable.
+//! Exact local capacity held for one accepted execution: the reservation, the
+//! signed receipt, and the record making both visible commit in one transaction,
+//! so concurrent offers cannot oversubscribe and no work starts before its receipt.
 
 use aruna_core::compute::ResourceEnvelope;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
     JOB_RESERVATION_KEYSPACE,
@@ -19,7 +16,7 @@ use aruna_core::structs::{
     EffectiveResources, JobFamilyRecord, JobId, JobRecord, LaunchIntent, RealmConfigDocument,
     RealmId, RecordVerdict,
 };
-use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
+use aruna_core::types::{Effects, Key, TxnId, Value};
 
 use smallvec::smallvec;
 use tracing::{debug, warn};
@@ -194,7 +191,7 @@ impl ReserveExecutionOperation {
 
     fn read_config(&mut self) -> Effects {
         self.state = ReserveState::ReadConfig;
-        let target = DocumentSyncTarget::RealmConfig {
+        let target = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
         smallvec![Effect::Storage(StorageEffect::Read {
@@ -652,7 +649,7 @@ impl Operation for ReleaseExecutionOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::errors::StorageError;
 
@@ -661,7 +658,7 @@ mod tests {
         // An event this state cannot accept must fail the release and close its
         // transaction instead of being ignored.
         let txn_id = TxnId::generate();
-        let mut operation = ReleaseExecutionOperation::new(Ulid::generate());
+        let mut operation = ReleaseExecutionOperation::new(Ulid::from_parts(1, 1));
         operation.state = ReleaseState::Read { txn_id };
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
@@ -683,7 +680,7 @@ mod tests {
     fn release_aborts_txn() {
         // A dropped release must never leak the write transaction it opened.
         let txn_id = TxnId::generate();
-        let mut operation = ReleaseExecutionOperation::new(Ulid::generate());
+        let mut operation = ReleaseExecutionOperation::new(Ulid::from_parts(2, 2));
         operation.state = ReleaseState::Delete { txn_id };
 
         assert!(matches!(
@@ -692,7 +689,7 @@ mod tests {
                 if *aborted == txn_id
         ));
         assert!(
-            ReleaseExecutionOperation::new(Ulid::generate())
+            ReleaseExecutionOperation::new(Ulid::from_parts(3, 3))
                 .abort()
                 .is_empty()
         );
@@ -702,7 +699,7 @@ mod tests {
     fn rejects_commit_error() {
         // A failed durable release must remain a retryable error.
         let txn_id = TxnId::generate();
-        let mut operation = ReleaseExecutionOperation::new(Ulid::generate());
+        let mut operation = ReleaseExecutionOperation::new(Ulid::from_parts(4, 4));
         operation.state = ReleaseState::Commit { txn_id };
         operation.outcome = Some(Ok(true));
 

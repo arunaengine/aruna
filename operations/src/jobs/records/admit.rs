@@ -1,9 +1,6 @@
-//! The pure admission decision of the append-only store.
-//!
-//! Nothing here performs I/O: it takes the records this node already stored,
-//! the pending records it retained, and one candidate, and returns exactly what
-//! must become visible. Admitting a record can only ever admit more pending
-//! records, never rewrite or remove a stored one.
+//! The pure admission decision of the append-only store. Nothing here performs
+//! I/O: stored records, retained pending records, and one candidate decide what
+//! becomes visible. Admission can only admit more pending records, never rewrite.
 
 use std::collections::BTreeMap;
 
@@ -225,9 +222,8 @@ fn cascade(
                     plan.cleared.push(*key);
                     settled.push(*key);
                 }
-                // A record that stays pending keeps its row, with one more
-                // attempt spent, so an unresolvable one cannot be retried
-                // forever.
+                // A record that stays pending keeps its row, with one more attempt spent, so
+                // an unresolvable one cannot be retried forever.
                 Admission::Pending(need) => {
                     let attempts = row.attempts.saturating_add(1);
                     if attempts >= MAX_PENDING_ATTEMPTS {
@@ -284,9 +280,8 @@ fn admit_one(
         Ok(RecordVerdict::Authentic) => Admission::Authentic,
         Ok(RecordVerdict::LocalEvidence) => Admission::Local,
         Ok(RecordVerdict::MissingEvidence(kind)) => Admission::Pending(PendingNeed::Evidence(kind)),
-        // Holder authority is relative to a view that moves with membership: a
-        // member this view does not rank is retained and judged again, while a
-        // non-member can never become a holder and is refused outright.
+        // Holder authority moves with membership: an unranked member is judged again,
+        // while a non-member can never become a holder and is refused outright.
         Err(JobRecordError::NotHolder(_)) if view.is_member(candidate.published_by) => {
             Admission::Pending(PendingNeed::HolderView)
         }

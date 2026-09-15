@@ -4,7 +4,7 @@ mod shared;
 
 use reqwest::{Response, StatusCode};
 use serde_json::{Value, json};
-use shared::{TestResult, create_bearer_token, create_group_via_http, spawn_seed_node};
+use shared::{TestResult, create_bearer_token, create_group_http, spawn_seed_node};
 
 async fn response_json(response: Response, expected: StatusCode) -> TestResult<Value> {
     let status = response.status();
@@ -24,7 +24,7 @@ async fn admin_job_flow() -> TestResult<()> {
             seed.capabilities.clone(),
         )
         .await?;
-        let group = create_group_via_http(&seed.base_url, &bearer, "job-api-flow").await?;
+        let group = create_group_http(&seed.base_url, &bearer, "job-api-flow").await?;
         let client = reqwest::Client::new();
 
         let config_url = format!("{}/api/v1/compute/config", seed.base_url);

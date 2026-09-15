@@ -6,9 +6,10 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::UserId;
 use crate::errors::StorageError;
 use crate::structs::{AuthContext, MetadataAuditOperation, MetadataRegistryRecord, RealmId};
-use crate::types::{GroupId, UserId};
+use crate::types::GroupId;
 
 pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
 
@@ -21,10 +22,9 @@ pub fn is_builtin_profile(iri: &str) -> bool {
     iri == PROCESS_RUN_CRATE_PROFILE_IRI
 }
 
-/// Supported RO-Crate specification IRIs and the remaining RO-Crate community
-/// profiles (workflow run crates, Workflow RO-Crate) are version markers, not
-/// Profiles. A built-in Profile is deliberately not a marker: it has to reach
-/// validation as a Profile tag for its embedded shapes to run.
+/// Supported RO-Crate specification IRIs and the remaining RO-Crate community profiles (workflow run
+/// crates, Workflow RO-Crate) are version markers, not Profiles. A built-in Profile is deliberately not
+/// a marker: it has to reach validation as a Profile tag for its embedded shapes to run.
 pub fn is_rocrate_specification(iri: &str) -> bool {
     !is_builtin_profile(iri)
         && (matches!(
@@ -39,7 +39,7 @@ mod specification_tests {
     use super::{PROCESS_RUN_CRATE_PROFILE_IRI, is_builtin_profile, is_rocrate_specification};
 
     #[test]
-    fn community_profiles_are_markers() {
+    fn community_profiles_markers() {
         assert!(is_rocrate_specification("https://w3id.org/ro/crate/1.3"));
         assert!(is_rocrate_specification(
             "https://w3id.org/ro/wfrun/workflow/0.5"
@@ -64,13 +64,13 @@ mod specification_tests {
 
 /// Credential a forwarded metadata or job-control request carries to the holder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetadataAuthToken {
+pub enum AuthToken {
     Bearer(MetadataBearerToken),
     Internal(AuthContext),
 }
 
-impl MetadataAuthToken {
-    pub fn bearer(token: impl Into<String>) -> Result<Self, MetadataAuthTokenError> {
+impl AuthToken {
+    pub fn bearer(token: impl Into<String>) -> Result<Self, AuthTokenError> {
         MetadataBearerToken::new(token).map(Self::Bearer)
     }
 
@@ -90,10 +90,10 @@ impl std::fmt::Debug for MetadataBearerToken {
 }
 
 impl MetadataBearerToken {
-    pub fn new(token: impl Into<String>) -> Result<Self, MetadataAuthTokenError> {
+    pub fn new(token: impl Into<String>) -> Result<Self, AuthTokenError> {
         let token = token.into();
         if token.len() > MAX_METADATA_BEARER_TOKEN_LEN {
-            return Err(MetadataAuthTokenError {
+            return Err(AuthTokenError {
                 length: token.len(),
             });
         }
@@ -115,22 +115,11 @@ impl<'de> Deserialize<'de> for MetadataBearerToken {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetadataAuthTokenError {
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("metadata bearer token length {length} exceeds maximum {MAX_METADATA_BEARER_TOKEN_LEN}")]
+pub struct AuthTokenError {
     length: usize,
 }
-
-impl std::fmt::Display for MetadataAuthTokenError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "metadata bearer token length {} exceeds maximum {}",
-            self.length, MAX_METADATA_BEARER_TOKEN_LEN
-        )
-    }
-}
-
-impl std::error::Error for MetadataAuthTokenError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataGraphPolicy {
@@ -149,22 +138,19 @@ impl MetadataGraphPolicy {
 /// Durability policy for metadata backend mutations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataRequestDurability {
-    /// Persist the metadata backend before acknowledging the request.
-    ///
-    /// The local flush strength is controlled by `ARUNA_FJALL_PERSIST_MODE`:
-    /// `buffer` flushes to OS buffers, while `sync_all` waits for Fjall's
-    /// data-and-metadata fsync path.
+    /// Persist the metadata backend before acknowledging the request. The local flush strength is
+    /// controlled by `ARUNA_FJALL_PERSIST_MODE`: `buffer` flushes to OS buffers, while `sync_all` waits for
+    /// Fjall's data-and-metadata fsync path.
     #[default]
     Durable,
-    /// Use when the metadata event has already been accepted by the WAL path.
-    ///
-    /// Craqle/document-sync projection persistence may be deferred, but this does not
-    /// upgrade the WAL write beyond the configured Fjall persist mode.
+    /// Use when the metadata event has already been accepted by the WAL path. Craqle/document-sync
+    /// projection persistence may be deferred, but this does not upgrade the WAL write beyond the
+    /// configured Fjall persist mode.
     WalAlreadyDurable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataCreateCrateRequest {
+pub struct MetadataCrateRequest {
     pub graph_iri: String,
     pub name: String,
     pub description: String,
@@ -178,7 +164,7 @@ pub struct MetadataCreateCrateRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetadataCreateEventPayload {
+pub enum MetadataEventPayload {
     Scaffold {
         name: String,
         description: String,
@@ -231,7 +217,7 @@ impl MetadataBatchSource {
     }
 }
 
-impl MetadataCreateEventPayload {
+impl MetadataEventPayload {
     pub fn audit_operation(&self) -> MetadataAuditOperation {
         match self {
             Self::Scaffold { .. } | Self::RoCrate { .. } => MetadataAuditOperation::Create,
@@ -265,12 +251,12 @@ impl MetadataCreateEventPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataCreateEventRecord {
+pub struct MetadataEventRecord {
     pub event_id: Ulid,
     pub record: MetadataRegistryRecord,
     pub user_id: UserId,
     pub node_id: NodeId,
-    pub payload: MetadataCreateEventPayload,
+    pub payload: MetadataEventPayload,
     pub occurred_at_ms: u64,
 }
 
@@ -297,7 +283,7 @@ pub const METADATA_RAW_EVENT_LIMIT: u32 = 1024;
 pub const METADATA_RAW_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataRawOriginBudget {
+pub struct RawOriginBudget {
     pub document_id: Ulid,
     pub node_id: NodeId,
     pub event_limit: u32,
@@ -311,7 +297,7 @@ pub fn raw_quotas(
     origins: &[NodeId],
     creator: NodeId,
     create_bytes: u64,
-) -> Option<Vec<MetadataRawOriginBudget>> {
+) -> Option<Vec<RawOriginBudget>> {
     if create_bytes > METADATA_RAW_BYTES_LIMIT || origins.is_empty() {
         return None;
     }
@@ -338,7 +324,7 @@ pub fn raw_quotas(
                 event_share + u32::from(index < u64::from(event_remainder)) + u32::from(creator);
             let byte_limit =
                 byte_share + u64::from(index < byte_remainder) + u64::from(creator) * create_bytes;
-            Some(MetadataRawOriginBudget {
+            Some(RawOriginBudget {
                 document_id,
                 node_id,
                 event_limit,
@@ -365,15 +351,13 @@ pub fn raw_context_digest(jsonld: &str) -> Result<[u8; 32], MetadataError> {
     Ok(*blake3::hash(raw_context.context.get().as_bytes()).as_bytes())
 }
 
-/// The crate text an event installs as the raw base, if it is a base event.
-///
-/// A batch event answers with its authored crate: the replay only serves a
-/// document until its first merge renders the graph.
-pub fn raw_base_jsonld(payload: &MetadataCreateEventPayload) -> Option<&str> {
+/// The crate text an event installs as the raw base, if it is a base event. A batch event answers with
+/// its authored crate: the replay only serves a document until its first merge renders the graph.
+pub fn raw_base_jsonld(payload: &MetadataEventPayload) -> Option<&str> {
     match payload {
-        MetadataCreateEventPayload::RoCrate { jsonld }
-        | MetadataCreateEventPayload::ReplaceRoCrate { jsonld }
-        | MetadataCreateEventPayload::ApplyBatch {
+        MetadataEventPayload::RoCrate { jsonld }
+        | MetadataEventPayload::ReplaceRoCrate { jsonld }
+        | MetadataEventPayload::ApplyBatch {
             authored: MetadataBatchSource::ReplaceRoCrate { jsonld },
             ..
         } => Some(jsonld),
@@ -382,15 +366,15 @@ pub fn raw_base_jsonld(payload: &MetadataCreateEventPayload) -> Option<&str> {
 }
 
 /// The entity an event upserts onto the raw base, and whether the root links it.
-pub fn raw_upsert_entity(payload: &MetadataCreateEventPayload) -> Option<(&str, bool)> {
+pub fn raw_upsert_entity(payload: &MetadataEventPayload) -> Option<(&str, bool)> {
     match payload {
-        MetadataCreateEventPayload::UpsertDataEntity { jsonld }
-        | MetadataCreateEventPayload::ApplyBatch {
+        MetadataEventPayload::UpsertDataEntity { jsonld }
+        | MetadataEventPayload::ApplyBatch {
             authored: MetadataBatchSource::UpsertDataEntity { jsonld },
             ..
         } => Some((jsonld, true)),
-        MetadataCreateEventPayload::UpsertContextualEntity { jsonld }
-        | MetadataCreateEventPayload::ApplyBatch {
+        MetadataEventPayload::UpsertContextualEntity { jsonld }
+        | MetadataEventPayload::ApplyBatch {
             authored: MetadataBatchSource::UpsertContextualEntity { jsonld },
             ..
         } => Some((jsonld, false)),
@@ -399,7 +383,7 @@ pub fn raw_upsert_entity(payload: &MetadataCreateEventPayload) -> Option<(&str, 
 }
 
 pub fn resolve_raw_revision(
-    events: &[MetadataCreateEventRecord],
+    events: &[MetadataEventRecord],
 ) -> Result<Option<MetadataRawRevision>, MetadataError> {
     let Some(base) = events
         .iter()
@@ -664,16 +648,12 @@ fn link_raw_entity(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetadataDocumentLifecycleRecord {
-    Upsert {
-        event: Box<MetadataCreateEventRecord>,
-    },
-    Delete {
-        event: MetadataDocumentDeleteRecord,
-    },
+pub enum MetadataLifecycleRecord {
+    Upsert { event: Box<MetadataEventRecord> },
+    Delete { event: MetadataDeleteRecord },
 }
 
-impl MetadataDocumentLifecycleRecord {
+impl MetadataLifecycleRecord {
     pub fn document_id(&self) -> Ulid {
         match self {
             Self::Upsert { event } => event.record.document_id,
@@ -690,9 +670,9 @@ impl MetadataDocumentLifecycleRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataDocumentDeleteRecord {
+pub struct MetadataDeleteRecord {
     pub event_id: Ulid,
-    pub tombstone: MetadataGraphLifecycleRecord,
+    pub tombstone: GraphLifecycleRecord,
     pub deleted_after_event_id: Ulid,
 }
 
@@ -706,20 +686,20 @@ pub fn deterministic_materialization_actor(event_id: Ulid) -> [u8; 32] {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetadataMaterializationState {
+pub enum MaterializationState {
     Pending,
     Materialized,
     Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataMaterializationStatusRecord {
+pub struct MaterializationStatusRecord {
     pub document_id: Ulid,
     pub event_id: Ulid,
     pub graph_iri: String,
     pub context_digest: Option<[u8; 32]>,
     pub dataset_digest: Option<[u8; 32]>,
-    pub state: MetadataMaterializationState,
+    pub state: MaterializationState,
     pub attempts: u32,
     /// Application-level failures only; infrastructure errors retry without
     /// counting so an overloaded node never gives up on a document.
@@ -729,7 +709,7 @@ pub struct MetadataMaterializationStatusRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataIriReferenceIndexRecord {
+pub struct IriIndexRecord {
     pub document_id: Ulid,
     pub document_cursor: Ulid,
     pub predicate_iri: String,
@@ -737,15 +717,15 @@ pub struct MetadataIriReferenceIndexRecord {
     pub subject_iris: Vec<String>,
 }
 
-impl MetadataMaterializationStatusRecord {
-    pub fn pending(event: &MetadataCreateEventRecord, updated_at_ms: u64) -> Self {
+impl MaterializationStatusRecord {
+    pub fn pending(event: &MetadataEventRecord, updated_at_ms: u64) -> Self {
         Self {
             document_id: event.record.document_id,
             event_id: event.event_id,
             graph_iri: event.record.graph_iri.clone(),
             context_digest: None,
             dataset_digest: None,
-            state: MetadataMaterializationState::Pending,
+            state: MaterializationState::Pending,
             attempts: 0,
             failures: 0,
             last_error: None,
@@ -755,7 +735,7 @@ impl MetadataMaterializationStatusRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataMaterializationJobRecord {
+pub struct MetadataMaterializationRecord {
     pub document_id: Ulid,
     pub event_id: Ulid,
     pub due_at_ms: u64,
@@ -772,8 +752,8 @@ pub struct MetadataMaterializationJobRecord {
 /// A job that exhausted its failure budget. Kept so the queue drain can pick it
 /// up again later: parking must never silently drop a document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataMaterializationDeadLetterRecord {
-    pub job: MetadataMaterializationJobRecord,
+pub struct DeadLetterRecord {
+    pub job: MetadataMaterializationRecord,
     pub last_error: String,
     pub parked_at_ms: u64,
     /// How often this job has been parked; drives the requeue backoff.
@@ -781,8 +761,8 @@ pub struct MetadataMaterializationDeadLetterRecord {
     pub requeue_at_ms: u64,
 }
 
-impl MetadataMaterializationJobRecord {
-    pub fn new(event: &MetadataCreateEventRecord, due_at_ms: u64) -> Self {
+impl MetadataMaterializationRecord {
+    pub fn new(event: &MetadataEventRecord, due_at_ms: u64) -> Self {
         Self {
             document_id: event.record.document_id,
             event_id: event.event_id,
@@ -795,14 +775,14 @@ impl MetadataMaterializationJobRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataGraphPruneJobRecord {
+pub struct GraphPruneRecord {
     pub graph_iri: String,
     pub due_at_ms: u64,
     pub attempts: u32,
     pub last_error: Option<String>,
 }
 
-impl MetadataGraphPruneJobRecord {
+impl GraphPruneRecord {
     pub fn new(graph_iri: String, due_at_ms: u64) -> Self {
         Self {
             graph_iri,
@@ -814,7 +794,7 @@ impl MetadataGraphPruneJobRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataApplyRoCrateRequest {
+pub struct ApplyRoCrateRequest {
     pub graph_iri: String,
     pub jsonld: String,
     pub policy: MetadataGraphPolicy,
@@ -825,7 +805,7 @@ pub struct MetadataApplyRoCrateRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataUpsertEntityRequest {
+pub struct UpsertEntityRequest {
     pub graph_iri: String,
     pub jsonld: String,
     #[serde(default)]
@@ -928,21 +908,21 @@ pub struct MetadataBatch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetadataGraphLifecycleStatus {
+pub enum GraphLifecycleStatus {
     Deleted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataGraphLifecycleRecord {
+pub struct GraphLifecycleRecord {
     pub graph_iri: String,
     pub realm_id: RealmId,
     pub group_id: GroupId,
     pub document_id: Ulid,
-    pub status: MetadataGraphLifecycleStatus,
+    pub status: GraphLifecycleStatus,
     pub updated_at_ms: u64,
 }
 
-impl MetadataGraphLifecycleRecord {
+impl GraphLifecycleRecord {
     pub fn deleted(
         graph_iri: String,
         realm_id: RealmId,
@@ -955,13 +935,13 @@ impl MetadataGraphLifecycleRecord {
             realm_id,
             group_id,
             document_id,
-            status: MetadataGraphLifecycleStatus::Deleted,
+            status: GraphLifecycleStatus::Deleted,
             updated_at_ms,
         }
     }
 
     pub fn is_deleted(&self) -> bool {
-        matches!(self.status, MetadataGraphLifecycleStatus::Deleted)
+        matches!(self.status, GraphLifecycleStatus::Deleted)
     }
 }
 
@@ -985,22 +965,22 @@ impl MetadataQueryResults {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataEffect {
     ValidateCreateCrate {
-        request: MetadataCreateCrateRequest,
+        request: MetadataCrateRequest,
     },
     ValidateRoCrate {
-        request: MetadataApplyRoCrateRequest,
+        request: ApplyRoCrateRequest,
     },
     CreateCrate {
-        request: MetadataCreateCrateRequest,
+        request: MetadataCrateRequest,
     },
     ApplyRoCrate {
-        request: MetadataApplyRoCrateRequest,
+        request: ApplyRoCrateRequest,
     },
     UpsertDataEntity {
-        request: MetadataUpsertEntityRequest,
+        request: UpsertEntityRequest,
     },
     UpsertContextualEntity {
-        request: MetadataUpsertEntityRequest,
+        request: UpsertEntityRequest,
     },
     SetGraphPolicy {
         graph_iri: String,
@@ -1168,7 +1148,7 @@ pub enum MetadataError {
     #[error("metadata validation failed: {0:?}")]
     Validation(Vec<MetadataValidationViolation>),
     #[error("metadata profile validation failed: {0:?}")]
-    ProfileValidation(Vec<MetadataProfileValidationFinding>),
+    ProfileValidation(Vec<ProfileValidationFinding>),
     #[error("metadata graph not found")]
     GraphNotFound,
     /// Durability failure while persisting backend state. Infrastructure, not the
@@ -1193,7 +1173,7 @@ pub struct MetadataValidationViolation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MetadataProfileValidationSeverity {
+pub enum ProfileValidationSeverity {
     Violation,
     Warning,
     Info,
@@ -1201,27 +1181,27 @@ pub enum MetadataProfileValidationSeverity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MetadataProfileValidationCompleteness {
+pub enum ProfileValidationCompleteness {
     Complete,
     Incomplete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataProfileValidationFinding {
+pub struct ProfileValidationFinding {
     pub code: String,
-    pub severity: MetadataProfileValidationSeverity,
+    pub severity: ProfileValidationSeverity,
     pub focus_node: Option<String>,
     pub path: Option<String>,
     pub rule: String,
     pub message: String,
     /// Registry event id of the evaluated Profile revision, or `builtin`.
     pub profile_revision: Option<String>,
-    pub completeness: MetadataProfileValidationCompleteness,
+    pub completeness: ProfileValidationCompleteness,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MetadataProfileValidationState {
+pub enum ProfileValidationState {
     NotProfiled,
     Valid,
     Invalid,
@@ -1229,19 +1209,19 @@ pub enum MetadataProfileValidationState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataProfileValidationStatus {
+pub struct ProfileValidationStatus {
     pub document_id: Ulid,
     /// The last event merged into the validated render; display only.
     pub dataset_revision: Ulid,
-    pub state: MetadataProfileValidationState,
+    pub state: ProfileValidationState,
     /// Absent for a built-in Profile, which no registry row defines.
     pub profile_id: Option<Ulid>,
     pub profile_iri: Option<String>,
     pub profile_revision: Option<String>,
     pub evaluator: String,
     pub validated_at_ms: Option<u64>,
-    pub findings: Vec<MetadataProfileValidationFinding>,
-    pub completeness: MetadataProfileValidationCompleteness,
+    pub findings: Vec<ProfileValidationFinding>,
+    pub completeness: ProfileValidationCompleteness,
     pub stale_reason: Option<String>,
     /// Digest of the validated render. Freshness is keyed by this, because a
     /// merge can leave the displayed revision behind the newest event.
@@ -1251,13 +1231,12 @@ pub struct MetadataProfileValidationStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataBearerToken,
-        MetadataClockRelation, MetadataCreateEventPayload, MetadataCreateEventRecord,
-        MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
-        MetadataGraphLifecycleRecord, MetadataProfileValidationCompleteness,
-        MetadataProfileValidationSeverity, MetadataProfileValidationState,
-        MetadataProfileValidationStatus, MetadataQueryResults, apply_raw_upsert,
-        compare_metadata_clocks, raw_quotas, resolve_raw_revision,
+        GraphLifecycleRecord, METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT,
+        MetadataBearerToken, MetadataClockRelation, MetadataDeleteRecord, MetadataEventPayload,
+        MetadataEventRecord, MetadataLifecycleRecord, MetadataQueryResults,
+        ProfileValidationCompleteness, ProfileValidationSeverity, ProfileValidationState,
+        ProfileValidationStatus, apply_raw_upsert, compare_metadata_clocks, raw_quotas,
+        resolve_raw_revision,
     };
     use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use crate::{NodeId, UserId};
@@ -1266,7 +1245,7 @@ mod tests {
     use ulid::Ulid;
 
     #[test]
-    fn compares_metadata_vector_clocks() {
+    fn compares_metadata_clocks() {
         let empty = VectorClock::default();
         let local = VectorClock(BTreeMap::from([(ActorId::from_bytes([1u8; 32]), 2)]));
         let remote = VectorClock(BTreeMap::from([(ActorId::from_bytes([1u8; 32]), 1)]));
@@ -1291,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_query_results_kind_labels_variants() {
+    fn metadata_query_variants() {
         assert_eq!(
             MetadataQueryResults::Solutions(Vec::new()).kind(),
             "solutions"
@@ -1304,7 +1283,7 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    fn create_event(document_id: Ulid, event_id: Ulid) -> MetadataCreateEventRecord {
+    fn create_event(document_id: Ulid, event_id: Ulid) -> MetadataEventRecord {
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let group_id = Ulid::generate();
         let document_path = "datasets/lifecycle";
@@ -1328,12 +1307,12 @@ mod tests {
             establishing_event_id: event_id,
             last_event_id: event_id,
         };
-        MetadataCreateEventRecord {
+        MetadataEventRecord {
             event_id,
             record,
             user_id: UserId::local(Ulid::generate(), realm_id),
             node_id: node(1),
-            payload: MetadataCreateEventPayload::Scaffold {
+            payload: MetadataEventPayload::Scaffold {
                 name: "Lifecycle".to_string(),
                 description: "Lifecycle envelope".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -1347,8 +1326,8 @@ mod tests {
         document_id: Ulid,
         event_id: Ulid,
         updated_at_ms: u64,
-        payload: MetadataCreateEventPayload,
-    ) -> MetadataCreateEventRecord {
+        payload: MetadataEventPayload,
+    ) -> MetadataEventRecord {
         let mut event = create_event(document_id, event_id);
         event.record.updated_at_ms = updated_at_ms;
         event.record.last_event_id = event_id;
@@ -1444,7 +1423,7 @@ mod tests {
                 document_id,
                 base_id,
                 2,
-                MetadataCreateEventPayload::RoCrate {
+                MetadataEventPayload::RoCrate {
                     jsonld: base.to_string(),
                 },
             ),
@@ -1452,7 +1431,7 @@ mod tests {
                 document_id,
                 context_id,
                 3,
-                MetadataCreateEventPayload::UpsertContextualEntity {
+                MetadataEventPayload::UpsertContextualEntity {
                     jsonld: serde_json::json!({
                         "@id": "#person",
                         "@type": "Person",
@@ -1465,7 +1444,7 @@ mod tests {
                 document_id,
                 data_id,
                 4,
-                MetadataCreateEventPayload::UpsertDataEntity {
+                MetadataEventPayload::UpsertDataEntity {
                     jsonld: serde_json::json!({
                         "@id": "data/file.txt",
                         "@type": "File",
@@ -1507,7 +1486,7 @@ mod tests {
                 document_id,
                 newer_id,
                 10,
-                MetadataCreateEventPayload::RoCrate {
+                MetadataEventPayload::RoCrate {
                     jsonld: document("winner"),
                 },
             ),
@@ -1515,7 +1494,7 @@ mod tests {
                 document_id,
                 later_id,
                 9,
-                MetadataCreateEventPayload::ReplaceRoCrate {
+                MetadataEventPayload::ReplaceRoCrate {
                     jsonld: document("later event"),
                 },
             ),
@@ -1536,7 +1515,7 @@ mod tests {
             document_id,
             event_id,
             1,
-            MetadataCreateEventPayload::RoCrate {
+            MetadataEventPayload::RoCrate {
                 jsonld: jsonld.to_string(),
             },
         )];
@@ -1626,19 +1605,19 @@ mod tests {
     }
 
     #[test]
-    fn metadata_document_lifecycle_upsert_wraps_create_event() {
+    fn metadata_document_event() {
         let document_id = Ulid::generate();
         let event_id = Ulid::generate();
         let create = create_event(document_id, event_id);
 
-        let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+        let lifecycle = MetadataLifecycleRecord::Upsert {
             event: Box::new(create.clone()),
         };
 
         assert_eq!(lifecycle.document_id(), document_id);
         assert_eq!(lifecycle.event_id(), event_id);
         assert_eq!(
-            postcard::from_bytes::<MetadataDocumentLifecycleRecord>(
+            postcard::from_bytes::<MetadataLifecycleRecord>(
                 &postcard::to_allocvec(&lifecycle).expect("lifecycle serializes")
             )
             .expect("lifecycle decodes"),
@@ -1647,23 +1626,18 @@ mod tests {
     }
 
     #[test]
-    fn metadata_document_lifecycle_delete_carries_tombstone_and_fence() {
+    fn metadata_document_fence() {
         let document_id = Ulid::generate();
         let event_id = Ulid::generate();
         let deleted_after_event_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let group_id = Ulid::generate();
         let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
-        let tombstone = MetadataGraphLifecycleRecord::deleted(
-            graph_iri.clone(),
-            realm_id,
-            group_id,
-            document_id,
-            2,
-        );
+        let tombstone =
+            GraphLifecycleRecord::deleted(graph_iri.clone(), realm_id, group_id, document_id, 2);
 
-        let lifecycle = MetadataDocumentLifecycleRecord::Delete {
-            event: MetadataDocumentDeleteRecord {
+        let lifecycle = MetadataLifecycleRecord::Delete {
+            event: MetadataDeleteRecord {
                 event_id,
                 tombstone: tombstone.clone(),
                 deleted_after_event_id,
@@ -1672,7 +1646,7 @@ mod tests {
 
         assert_eq!(lifecycle.document_id(), document_id);
         assert_eq!(lifecycle.event_id(), event_id);
-        let MetadataDocumentLifecycleRecord::Delete { event } = lifecycle else {
+        let MetadataLifecycleRecord::Delete { event } = lifecycle else {
             panic!("expected delete lifecycle record");
         };
         assert_eq!(event.tombstone, tombstone);
@@ -1695,27 +1669,27 @@ mod tests {
         #[derive(serde::Serialize)]
         struct LegacyFinding {
             code: String,
-            severity: MetadataProfileValidationSeverity,
+            severity: ProfileValidationSeverity,
             focus_node: Option<String>,
             path: Option<String>,
             rule: String,
             message: String,
             profile_revision: Option<Ulid>,
-            completeness: MetadataProfileValidationCompleteness,
+            completeness: ProfileValidationCompleteness,
         }
 
         #[derive(serde::Serialize)]
         struct LegacyStatus {
             document_id: Ulid,
             dataset_revision: Ulid,
-            state: MetadataProfileValidationState,
+            state: ProfileValidationState,
             profile_id: Option<Ulid>,
             profile_iri: Option<String>,
             profile_revision: Option<Ulid>,
             evaluator: String,
             validated_at_ms: Option<u64>,
             findings: Vec<LegacyFinding>,
-            completeness: MetadataProfileValidationCompleteness,
+            completeness: ProfileValidationCompleteness,
             stale_reason: Option<String>,
             dataset_digest: Option<[u8; 32]>,
         }
@@ -1724,7 +1698,7 @@ mod tests {
         let legacy = LegacyStatus {
             document_id: Ulid::generate(),
             dataset_revision: Ulid::generate(),
-            state: MetadataProfileValidationState::Invalid,
+            state: ProfileValidationState::Invalid,
             profile_id: Some(Ulid::generate()),
             profile_iri: Some("https://example.org/profile".to_string()),
             profile_revision: Some(revision),
@@ -1732,21 +1706,21 @@ mod tests {
             validated_at_ms: Some(7),
             findings: vec![LegacyFinding {
                 code: "missing".to_string(),
-                severity: MetadataProfileValidationSeverity::Violation,
+                severity: ProfileValidationSeverity::Violation,
                 focus_node: None,
                 path: None,
                 rule: "rule".to_string(),
                 message: "message".to_string(),
                 profile_revision: Some(revision),
-                completeness: MetadataProfileValidationCompleteness::Complete,
+                completeness: ProfileValidationCompleteness::Complete,
             }],
-            completeness: MetadataProfileValidationCompleteness::Complete,
+            completeness: ProfileValidationCompleteness::Complete,
             stale_reason: None,
             dataset_digest: Some([3u8; 32]),
         };
 
         let bytes = postcard::to_allocvec(&legacy).unwrap();
-        let decoded: MetadataProfileValidationStatus = postcard::from_bytes(&bytes).unwrap();
+        let decoded: ProfileValidationStatus = postcard::from_bytes(&bytes).unwrap();
 
         assert_eq!(decoded.profile_revision, Some(revision.to_string()));
         assert_eq!(

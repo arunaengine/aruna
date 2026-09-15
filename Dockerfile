@@ -1,7 +1,6 @@
-# Build Stage
 # glibc, not musl: musl's `cmsghdr` is 4-byte aligned, so noq-udp's receive
 # timestamp decode trips its alignment assertion and aborts the process.
-FROM rust:1.97.1-trixie@sha256:1bcff4befb740599103a2c7cb51058e14479b2e35e3a34a3f0dc4ede09927488 AS builder
+FROM rust:1.98.1-trixie@sha256:462a9af3c54fb4718850d3c602fc0e54452c20b1c12a4e4080fdb001d4b9acbf AS builder
 WORKDIR /build
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 # mold and clang back `.cargo/config.toml`, which only applies to the gnu target.
@@ -24,9 +23,8 @@ COPY --from=builder /build/target/release/aruna .
 COPY --from=builder /build/target/release/aruna-doctor .
 COPY --from=builder /build/target/bin/iroh-doctor .
 COPY --from=builder /portal/ /run/portal/
-# PORTAL_MODE is deliberately not baked in: a real env var would beat the
-# mounted /run/.env (dotenv never overrides process env), silently pinning
-# the portal off. PORTAL_DIR only points at the embedded copy.
+# Leave PORTAL_MODE unset: process env would override mounted /run/.env and pin the portal off.
+# PORTAL_DIR points at the embedded copy.
 ENV PORTAL_DIR=/run/portal
 
 CMD [ "/run/aruna" ]

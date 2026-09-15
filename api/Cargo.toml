@@ -65,6 +65,7 @@ s3s = { workspace = true }
 
 [dev-dependencies]
 aruna-net = { workspace = true }
+tracing-subscriber = { workspace = true }
 aruna-storage = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",

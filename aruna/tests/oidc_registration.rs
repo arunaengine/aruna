@@ -12,16 +12,14 @@ use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
 use aruna_core::structs::{Actor, NodeCapabilities, OidcProviderConfig, User, oidc_subject_key};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::announce_realm_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-};
-use aruna_operations::claim_initial_realm_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-};
-use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::realm::announce_presence::{
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
+};
+use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::Json;
@@ -202,11 +200,13 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
-    initialize_net_incoming(context.clone());
-    initialize_task_incoming(
+    initialize_incoming_fixture(context.clone());
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
+        &shutdown,
     )
     .await;
 
@@ -232,7 +232,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
     .await
     .unwrap();
     drive(
-        ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+        ClaimInitialOperation::new(ClaimInitialInput {
             actor: Actor {
                 node_id: net.node_id(),
                 user_id: bootstrap_user,
@@ -244,7 +244,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
     .await
     .unwrap();
     drive(
-        AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+        AnnouncePresenceOperation::new(AnnouncePresenceConfig {
             realm_id,
             node_id: net.node_id(),
             schedule_refresh: false,
@@ -297,7 +297,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
 }
 
 #[tokio::test]
-async fn oidc_registration_route_creates_user_indexes_and_token() {
+async fn registration_creates_token() {
     let issuer = "https://issuer.example";
     let kid = "main-key";
     let signing_key = generate_signing_key();

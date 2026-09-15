@@ -6,6 +6,7 @@ use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, NODE_SUBJECT_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_NODE_STATS_KEYSPACE,
     USAGE_STATS_KEYSPACE,
@@ -15,38 +16,33 @@ use aruna_core::structs::{
     AuthContext, Backend, BackendConfig, BlobHeadKey, BucketInfo, CurrentVersionPointer,
     GroupQuotaOverride, MultipartChecksumType, NODE_SUBJECT_KEY, NodeSubjectRecord,
     NodeUsageSnapshot, PlacementSubject, PolicyRefMode, QuotaConfig, RealmId, RoutingSnapshot,
-    UsageCounters, node_usage_group_key, usage_global_shard_keys, usage_group_key,
+    UsageCounters, global_shard_keys, usage_group_key, usage_snapshot_key,
 };
-use aruna_core::types::NodeId;
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::blob::blob_keyspace_helper::HeadAliasContext;
+use aruna_operations::blob::records::HeadAliasContext;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::s3::abort_multipart_upload::{
-    AbortMultipartUploadInput, AbortMultipartUploadOperation,
-};
-use aruna_operations::s3::complete_multipart_upload::{
-    CompleteMultipartPart, CompleteMultipartUploadError, CompleteMultipartUploadInput,
-    CompleteMultipartUploadOperation, CompleteMultipartUploadResult,
+use aruna_operations::node::usage_stats::RebuildStatsOperation;
+use aruna_operations::s3::abort_upload::{AbortUploadInput, AbortUploadOperation};
+use aruna_operations::s3::complete_upload::{
+    CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
+    CompleteUploadResult,
 };
 use aruna_operations::s3::copy_object::{
-    CopyObjectInput, CopyObjectResultData, CopyReferences, CopySourceConditions,
+    CopyObjectInput, CopyReferences, CopyResultData, CopySourceConditions,
 };
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::create_multipart_upload::{
-    CreateMultipartUploadInput, CreateMultipartUploadOperation,
-};
+use aruna_operations::s3::create_upload::{CreateMultipartInput, CreateMultipartOperation};
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{
     DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
 use aruna_operations::s3::policy_successor::{
-    MintPolicySuccessorOperation, SuccessorOutcome, SuccessorPlan,
+    MintSuccessorOperation, SuccessorOutcome, SuccessorPlan,
 };
 use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use aruna_operations::s3::upload_part::{UploadPartInput, UploadPartOperation, UploadPartResult};
-use aruna_operations::usage_stats::RebuildUsageStatsOperation;
 use aruna_storage::storage;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -126,8 +122,6 @@ async fn create_bucket(h: &Harness, bucket: &str, group_id: Ulid) {
         &h.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 }
 
@@ -162,8 +156,6 @@ async fn put_object(
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
 }
 
 async fn delete_object(
@@ -187,13 +179,11 @@ async fn delete_object(
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
 }
 
 async fn create_upload(h: &Harness, bucket: &str, key: &str, group_id: Ulid) -> Ulid {
     drive(
-        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+        CreateMultipartOperation::new(CreateMultipartInput {
             bucket: bucket.to_string(),
             key: key.to_string(),
             group_id,
@@ -204,8 +194,6 @@ async fn create_upload(h: &Harness, bucket: &str, key: &str, group_id: Ulid) -> 
         &h.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap()
     .record
     .upload_id
@@ -236,8 +224,6 @@ async fn upload_part(
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
 }
 
 async fn complete_upload(
@@ -247,9 +233,9 @@ async fn complete_upload(
     upload_id: Ulid,
     parts: &[UploadPartResult],
     object_size: u64,
-) -> CompleteMultipartUploadResult {
+) -> CompleteUploadResult {
     drive(
-        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+        CompleteUploadOperation::new(CompleteUploadInput {
             bucket: bucket.to_string(),
             key: key.to_string(),
             upload_id,
@@ -277,11 +263,9 @@ async fn complete_upload(
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
 }
 
-async fn read_all_usage_stats(ctx: &DriverContext) -> Vec<(Vec<u8>, UsageCounters)> {
+async fn read_usage_stats(ctx: &DriverContext) -> Vec<(Vec<u8>, UsageCounters)> {
     let Event::Storage(StorageEvent::IterResult { values, .. }) = ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
@@ -306,15 +290,12 @@ async fn read_all_usage_stats(ctx: &DriverContext) -> Vec<(Vec<u8>, UsageCounter
         .collect()
 }
 
-/// Effective, reader-visible counters: the summed global total across all 64
-/// shards, plus every non-zero per-group counter. This is the semantically
-/// meaningful projection both `LoadUsageCountersOperation` and the realm summary
-/// read; per-shard placement of `stored_*` differs between the incremental write
-/// paths (group shard) and a rebuild (shard 0), but the summed total is identical.
+/// Effective, reader-visible counters: the summed global total across all 64 shards, plus every
+/// non-zero per-group counter.
 async fn effective_usage(ctx: &DriverContext) -> (UsageCounters, BTreeMap<Vec<u8>, UsageCounters>) {
     let mut global = UsageCounters::default();
     let mut groups = BTreeMap::new();
-    for (key, counters) in read_all_usage_stats(ctx).await {
+    for (key, counters) in read_usage_stats(ctx).await {
         if key.starts_with(b"global/") {
             global.add(&counters).unwrap();
         } else if key.starts_with(b"group/") && counters != UsageCounters::default() {
@@ -325,7 +306,7 @@ async fn effective_usage(ctx: &DriverContext) -> (UsageCounters, BTreeMap<Vec<u8
 }
 
 async fn read_group(ctx: &DriverContext, group_id: Ulid) -> UsageCounters {
-    for (key, counters) in read_all_usage_stats(ctx).await {
+    for (key, counters) in read_usage_stats(ctx).await {
         if key == usage_group_key(group_id) {
             return counters;
         }
@@ -334,10 +315,9 @@ async fn read_group(ctx: &DriverContext, group_id: Ulid) -> UsageCounters {
 }
 
 async fn read_global(ctx: &DriverContext) -> UsageCounters {
-    let shard_keys: std::collections::HashSet<Vec<u8>> =
-        usage_global_shard_keys().into_iter().collect();
+    let shard_keys: std::collections::HashSet<Vec<u8>> = global_shard_keys().into_iter().collect();
     let mut global = UsageCounters::default();
-    for (key, counters) in read_all_usage_stats(ctx).await {
+    for (key, counters) in read_usage_stats(ctx).await {
         if shard_keys.contains(&key) {
             global.add(&counters).unwrap();
         }
@@ -350,11 +330,7 @@ async fn read_global(ctx: &DriverContext) -> UsageCounters {
 /// incremental bookkeeping produced.
 async fn assert_matches_rebuild(ctx: &DriverContext) {
     let before = effective_usage(ctx).await;
-    drive(RebuildUsageStatsOperation::new(), ctx)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    drive(RebuildStatsOperation::new(), ctx).await.unwrap();
     let after = effective_usage(ctx).await;
     assert_eq!(
         before, after,
@@ -363,7 +339,7 @@ async fn assert_matches_rebuild(ctx: &DriverContext) {
 }
 
 #[tokio::test]
-async fn create_and_delete_bucket_delta() {
+async fn bucket_delta_updates() {
     let h = setup().await;
     let group_id = Ulid::generate();
 
@@ -375,8 +351,6 @@ async fn create_and_delete_bucket_delta() {
     // delete_bucket refuses non-empty buckets, so only empty deletion is drivable.
     drive(DeleteBucketOperation::new("counted".to_string()), &h.driver)
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
     assert_eq!(read_global(&h.driver).await.buckets, 0);
     assert_eq!(read_group(&h.driver, group_id).await.buckets, 0);
@@ -384,7 +358,7 @@ async fn create_and_delete_bucket_delta() {
 }
 
 #[tokio::test]
-async fn simple_put_object_delta() {
+async fn put_delta_updates() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
@@ -411,7 +385,7 @@ async fn simple_put_object_delta() {
 }
 
 #[tokio::test]
-async fn overwrite_put_accumulates_logical_bytes_per_version() {
+async fn overwrite_accumulates_bytes() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
@@ -421,9 +395,7 @@ async fn overwrite_put_accumulates_logical_bytes_per_version() {
     put_object(&h, "bucket", "same.txt", group_id, first).await;
     put_object(&h, "bucket", "same.txt", group_id, second).await;
 
-    // Overwrite semantics are accumulate-per-version, not replace: the object
-    // count stays at 1 (the head moves), but every materialized version's bytes
-    // keep counting logically and each distinct blob is stored.
+    // Overwrite semantics are accumulate-per-version, not replace.
     let global = read_global(&h.driver).await;
     assert_eq!(global.objects, 1);
     assert_eq!(global.stored_blobs, 2);
@@ -438,7 +410,7 @@ async fn overwrite_put_accumulates_logical_bytes_per_version() {
 }
 
 #[tokio::test]
-async fn overwrite_put_same_content_double_counts_logical_bytes() {
+async fn duplicate_content_counts() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
@@ -459,7 +431,7 @@ async fn overwrite_put_same_content_double_counts_logical_bytes() {
 }
 
 #[tokio::test]
-async fn delete_marker_drops_object_but_keeps_logical_bytes() {
+async fn marker_keeps_bytes() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
@@ -467,9 +439,7 @@ async fn delete_marker_drops_object_but_keeps_logical_bytes() {
     let data = b"payload";
     put_object(&h, "bucket", "obj.txt", group_id, data).await;
 
-    // A versioned delete (version_id: None) writes a delete marker over the live
-    // head: the object stops being live but its materialized version and stored
-    // blob remain, so only the object count drops.
+    // A versioned delete (version_id: None) writes a delete marker over the live head.
     let result = delete_object(&h, "bucket", "obj.txt", group_id, None).await;
     assert!(result.delete_marker);
 
@@ -487,7 +457,7 @@ async fn delete_marker_drops_object_but_keeps_logical_bytes() {
 }
 
 #[tokio::test]
-async fn put_over_delete_marker_revives_object() {
+async fn put_revives_object() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
@@ -514,7 +484,7 @@ async fn put_over_delete_marker_revives_object() {
 }
 
 #[tokio::test]
-async fn permanent_delete_of_live_version_frees_logical_bytes() {
+async fn delete_frees_bytes() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
@@ -522,9 +492,8 @@ async fn permanent_delete_of_live_version_frees_logical_bytes() {
     let data = b"payload";
     let put = put_object(&h, "bucket", "obj.txt", group_id, data).await;
 
-    // A permanent delete by version id removes the only (live) version: the
-    // object and its logical bytes are freed. The content-addressed blob is left
-    // in place, so stored_* are unchanged and the rebuild still counts them.
+    // A permanent delete by version id removes the only (live) version: the object and its
+    // logical bytes are freed.
     delete_object(&h, "bucket", "obj.txt", group_id, Some(put.version_id)).await;
 
     let global = read_global(&h.driver).await;
@@ -541,7 +510,7 @@ async fn permanent_delete_of_live_version_frees_logical_bytes() {
 }
 
 #[tokio::test]
-async fn multipart_staging_counts_nothing_until_completion() {
+async fn staging_counts_nothing() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
@@ -552,9 +521,7 @@ async fn multipart_staging_counts_nothing_until_completion() {
     upload_part(&h, "bucket", "big.bin", upload_id, 1, &part1).await;
     upload_part(&h, "bucket", "big.bin", upload_id, 2, part2).await;
 
-    // Staged parts live outside the content-addressed blob keyspace: an initiated
-    // but never-completed upload contributes nothing to the counters, and the
-    // rebuild (which scans only completed blobs) agrees.
+    // Staged parts live outside the content-addressed blob keyspace.
     let staged = read_global(&h.driver).await;
     assert_eq!(staged.objects, 0);
     assert_eq!(staged.stored_blobs, 0);
@@ -590,7 +557,7 @@ async fn multipart_staging_counts_nothing_until_completion() {
 }
 
 #[tokio::test]
-async fn aborted_multipart_upload_leaves_counters_untouched() {
+async fn abort_preserves_counters() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
@@ -599,7 +566,7 @@ async fn aborted_multipart_upload_leaves_counters_untouched() {
     upload_part(&h, "bucket", "abort.bin", upload_id, 1, b"discard me").await;
 
     drive(
-        AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
+        AbortUploadOperation::new(AbortUploadInput {
             bucket: "bucket".to_string(),
             key: "abort.bin".to_string(),
             upload_id,
@@ -608,8 +575,6 @@ async fn aborted_multipart_upload_leaves_counters_untouched() {
         &h.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     // Abort touches no counters; only the bucket remains accounted for.
@@ -623,11 +588,7 @@ async fn aborted_multipart_upload_leaves_counters_untouched() {
     assert_matches_rebuild(&h.driver).await;
 }
 
-// ---------------------------------------------------------------------------
-// Quota gate (finding 3): hard rejection when a positive logical_bytes delta
-// would push a group's realm-wide logical_bytes above the resolved ceiling.
-// ---------------------------------------------------------------------------
-
+// Positive logical byte deltas cannot exceed the resolved group quota.
 #[allow(clippy::result_large_err)]
 async fn try_put_object(
     h: &Harness,
@@ -660,11 +621,6 @@ async fn try_put_object(
         &h.driver,
     )
     .await
-    .map(|result| {
-        result
-            .expect("put object output")
-            .expect("put object inner")
-    })
 }
 
 fn remote_node(seed: u8) -> NodeId {
@@ -673,12 +629,7 @@ fn remote_node(seed: u8) -> NodeId {
 
 /// Injects a remote node's per-group snapshot so the gate reads a realm-wide
 /// total larger than the live local counters.
-async fn inject_remote_group_snapshot(
-    h: &Harness,
-    group_id: Ulid,
-    node_id: NodeId,
-    logical_bytes: u64,
-) {
+async fn inject_group_snapshot(h: &Harness, group_id: Ulid, node_id: NodeId, logical_bytes: u64) {
     let snapshot = NodeUsageSnapshot {
         node_id,
         counters: UsageCounters {
@@ -691,7 +642,7 @@ async fn inject_remote_group_snapshot(
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
             key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
-            key: node_usage_group_key(group_id, node_id).into(),
+            key: usage_snapshot_key(group_id, node_id).into(),
             value: snapshot.to_bytes().unwrap().into(),
             txn_id: None,
         })
@@ -703,7 +654,7 @@ async fn inject_remote_group_snapshot(
 }
 
 #[tokio::test]
-async fn put_object_gate_allows_under_and_at_ceiling_rejects_over() {
+async fn quota_enforces_ceiling() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
@@ -737,7 +688,7 @@ async fn put_object_gate_allows_under_and_at_ceiling_rejects_over() {
 }
 
 #[tokio::test]
-async fn put_object_gate_unlimited_when_ceiling_is_none() {
+async fn unlimited_skips_quota() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
@@ -750,7 +701,7 @@ async fn put_object_gate_unlimited_when_ceiling_is_none() {
 }
 
 #[tokio::test]
-async fn put_object_gate_honors_grace_headroom() {
+async fn quota_allows_headroom() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
@@ -780,7 +731,7 @@ async fn put_object_gate_honors_grace_headroom() {
 }
 
 #[tokio::test]
-async fn put_object_gate_group_override_takes_precedence_over_default() {
+async fn group_override_wins() {
     let h = setup().await;
     let overridden = Ulid::generate();
     let plain = Ulid::generate();
@@ -832,14 +783,14 @@ async fn put_object_gate_group_override_takes_precedence_over_default() {
 }
 
 #[tokio::test]
-async fn put_object_gate_counts_remote_node_snapshots() {
+async fn quota_counts_remote() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
     let ceiling = Some(100);
 
     // A remote node already reports 80 logical bytes for this group.
-    inject_remote_group_snapshot(&h, group_id, remote_node(9), 80).await;
+    inject_group_snapshot(&h, group_id, remote_node(9), 80).await;
 
     // 0 (local) + 80 (remote) + 20 == 100 ceiling: still allowed.
     try_put_object(&h, "bucket", "ok.bin", group_id, &[1u8; 20], ceiling)
@@ -861,7 +812,7 @@ async fn put_object_gate_counts_remote_node_snapshots() {
 }
 
 #[tokio::test]
-async fn delete_object_is_never_gated_by_quota() {
+async fn delete_bypasses_quota() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
@@ -885,11 +836,11 @@ async fn try_complete_multipart(
     group_id: Ulid,
     data: &[u8],
     quota_ceiling: Option<u64>,
-) -> Result<CompleteMultipartUploadResult, CompleteMultipartUploadError> {
+) -> Result<CompleteUploadResult, CompleteUploadError> {
     let upload_id = create_upload(h, bucket, key, group_id).await;
     let part = upload_part(h, bucket, key, upload_id, 1, data).await;
     drive(
-        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+        CompleteUploadOperation::new(CompleteUploadInput {
             bucket: bucket.to_string(),
             key: key.to_string(),
             upload_id,
@@ -912,11 +863,10 @@ async fn try_complete_multipart(
         &h.driver,
     )
     .await
-    .map(|result| result.expect("complete output").expect("complete inner"))
 }
 
 #[tokio::test]
-async fn multipart_completion_is_gated_like_put() {
+async fn multipart_obeys_quota() {
     let h = setup().await;
     let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
@@ -934,7 +884,7 @@ async fn multipart_completion_is_gated_like_put() {
         .expect_err("multipart over ceiling is rejected");
     assert!(matches!(
         error,
-        CompleteMultipartUploadError::QuotaExceeded {
+        CompleteUploadError::QuotaExceeded {
             limit: 30,
             usage: 35
         }
@@ -951,7 +901,7 @@ async fn copy_object(
     source_key: &str,
     dest_key: &str,
     group_id: Ulid,
-) -> CopyObjectResultData {
+) -> CopyResultData {
     aruna_operations::s3::copy_object::copy_object(
         &h.driver,
         CopyObjectInput {
@@ -1106,7 +1056,7 @@ async fn mint_books_bytes() {
     .unwrap();
 
     let outcome = drive(
-        MintPolicySuccessorOperation::new(SuccessorPlan {
+        MintSuccessorOperation::new(SuccessorPlan {
             context: HeadAliasContext::new(h.realm_id, group_id, h.node_id, "bucket", "ruled.txt"),
             mutation_id: Ulid::generate(),
             expected_head: head,

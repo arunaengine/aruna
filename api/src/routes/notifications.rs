@@ -1,31 +1,29 @@
-use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission_with, require_unrestricted_realm_auth,
-};
+use crate::auth::{ValidatedBearer, ensure_permission_with, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::jobs::{decode_cursor, encode_cursor};
+use crate::routes::execution::jobs::{decode_cursor, encode_cursor};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::metrics::WatchAuthorizationMetricReason;
+use aruna_core::metrics::WatchMetricReason;
 use aruna_core::structs::{
     AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NotificationClass, NotificationKind,
     NotificationRecord, Permission, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
-    WatchSubscription, data_watch_resource_path, parse_data_watch_resource_path,
+    WatchSubscription, parse_watch_path, watch_resource_path,
 };
-use aruna_operations::dashboard::subscribe_dashboard_changes;
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::node::dashboard::subscribe_dashboard_changes;
+use aruna_operations::notifications::dispatch;
 use aruna_operations::notifications::dispatch::{
-    InboxWakeReceiver, NotificationDispatchError, WatchDispatchError, create_watch_for_user,
-    delete_watch_for_user, list_notifications_for_user, list_watches_for_user, mark_read_for_user,
-    record_watch_creation_denial_metric, resolve_inbox_holder_for_user, subscribe_inbox_wakes,
-    unread_count_for_user,
+    InboxWakeReceiver, NotificationDispatchError, WatchDispatchError, create_for_user,
+    delete_for_user, list_for_user, mark_for_user, resolve_user_holder, subscribe_inbox_wakes,
+    unread_for_user,
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
 use aruna_operations::notifications::watch::authorization::{
     WatchAuthorization, evaluate_watch_creation, watch_permission_path,
 };
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -56,18 +54,16 @@ const NOTIFICATION_STREAM_COALESCE: Duration = Duration::from_millis(200);
 const NOTIFICATION_STREAM_REMOTE_POLL: Duration = Duration::from_secs(5);
 /// State snapshot and keep-alive cadence so proxies do not cut an idle stream.
 const NOTIFICATION_STREAM_KEEP_ALIVE: Duration = Duration::from_secs(20);
-/// Coarse holder re-resolve cadence on the local wake arm. If the inbox holder
-/// re-ranks to another node mid-stream, deliveries land there with no local wake,
-/// so after this much wake silence the arm re-resolves the holder and degrades to
-/// the remote poll when it has moved off this node.
+/// Re-resolve cadence for detecting an inbox holder that moved without a local wake.
+/// The local arm switches to remote polling after a move.
 const NOTIFICATION_STREAM_LOCAL_RECHECK: Duration = Duration::from_secs(60);
 
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "system/notifications", description = "User notification inbox")),
     components(schemas(
-        NotificationStreamStateResponse,
-        UnreadCountApiResponse
+        NotificationStreamResponse,
+        UnreadCountResponse
     ))
 )]
 pub struct NotificationsApiDoc;
@@ -134,20 +130,23 @@ pub struct NotificationListResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct UnreadCountApiResponse {
+#[schema(as = UnreadCountApiResponse)]
+pub struct UnreadCountResponse {
     pub count: u32,
     pub capped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct NotificationStreamStateResponse {
+#[schema(as = NotificationStreamStateResponse)]
+pub struct NotificationStreamResponse {
     pub epoch: String,
     pub revision: u64,
-    pub unread: UnreadCountApiResponse,
+    pub unread: UnreadCountResponse,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MarkReadApiRequest {
+#[schema(as = MarkReadApiRequest)]
+pub struct MarkReadRequest {
     #[serde(default)]
     pub ids: Vec<String>,
     #[serde(default)]
@@ -155,7 +154,8 @@ pub struct MarkReadApiRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MarkReadApiResponse {
+#[schema(as = MarkReadApiResponse)]
+pub struct MarkReadResponse {
     pub marked: u32,
 }
 
@@ -195,7 +195,7 @@ fn map_dispatch_error(error: NotificationDispatchError, operation: &str) -> Serv
     }
 }
 
-fn map_watch_dispatch_error(error: WatchDispatchError, operation: &str) -> ServerError {
+fn map_watch_error(error: WatchDispatchError, operation: &str) -> ServerError {
     match error {
         WatchDispatchError::Unavailable => ServerError::ServiceUnavailable,
         WatchDispatchError::CapExceeded => {
@@ -233,8 +233,8 @@ fn watch_authorized(subscription: &WatchSubscription) -> bool {
     !subscription.path_prefix.is_empty()
 }
 
-fn record_watch_creation_denial(state: &ServerState, reason: WatchAuthorizationMetricReason) {
-    record_watch_creation_denial_metric(state.get_ctx().as_ref(), reason);
+fn record_watch_denial(state: &ServerState, reason: WatchMetricReason) {
+    dispatch::record_watch_denial(state.get_ctx().as_ref(), reason);
     warn!(
         parent: None,
         reason = reason.as_str(),
@@ -380,7 +380,7 @@ async fn authorize_watch(
     let Some(permission_path) =
         watch_permission_path(state.get_realm_id(), path_prefix, event_mask)
     else {
-        record_watch_creation_denial(state, WatchAuthorizationMetricReason::InvalidResource);
+        record_watch_denial(state, WatchMetricReason::InvalidResource);
         return Err(ServerError::BadRequest);
     };
     if let Err(error) = ensure_permission_with(
@@ -388,17 +388,17 @@ async fn authorize_watch(
         auth,
         permission_path,
         Permission::READ,
-        aruna_operations::request_policy::PolicyRequestExtras::operation(
+        aruna_operations::auth::request_policy::PolicyRequestExtras::operation(
             "notifications.create_watch",
         ),
     )
     .await
     {
-        record_watch_creation_denial(
+        record_watch_denial(
             state,
             match error {
-                ServerError::Forbidden => WatchAuthorizationMetricReason::PermissionDenied,
-                _ => WatchAuthorizationMetricReason::AuthorizationUnavailable,
+                ServerError::Forbidden => WatchMetricReason::PermissionDenied,
+                _ => WatchMetricReason::AuthorizationUnavailable,
             },
         );
         return Err(error);
@@ -414,21 +414,15 @@ async fn authorize_watch(
     {
         Ok(WatchAuthorization::Authorized) => Ok(()),
         Ok(WatchAuthorization::Denied(reason)) => {
-            record_watch_creation_denial(state, reason.metric_reason());
+            record_watch_denial(state, reason.metric_reason());
             Err(ServerError::Forbidden)
         }
         Ok(WatchAuthorization::Unavailable(_)) => {
-            record_watch_creation_denial(
-                state,
-                WatchAuthorizationMetricReason::AuthorizationUnavailable,
-            );
+            record_watch_denial(state, WatchMetricReason::AuthorizationUnavailable);
             Err(ServerError::Forbidden)
         }
         Err(error) => {
-            record_watch_creation_denial(
-                state,
-                WatchAuthorizationMetricReason::AuthorizationUnavailable,
-            );
+            record_watch_denial(state, WatchMetricReason::AuthorizationUnavailable);
             Err(ServerError::InternalError(error))
         }
     }
@@ -442,34 +436,26 @@ async fn canonicalize_watch_path(
     if event_mask.bits() != WatchEventMask::DATA_UPLOADED {
         return Ok(path_prefix);
     }
-    let Some((node_id, bucket, key_prefix)) =
-        parse_data_watch_resource_path(&path_prefix).map(|resource| {
-            (
-                resource.node_id,
-                resource.bucket.to_string(),
-                resource.key_prefix.to_string(),
-            )
-        })
-    else {
+    let Some((node_id, bucket, key_prefix)) = parse_watch_path(&path_prefix).map(|resource| {
+        (
+            resource.node_id,
+            resource.bucket.to_string(),
+            resource.key_prefix.to_string(),
+        )
+    }) else {
         return Ok(path_prefix);
     };
     if node_id != state.get_node_id() {
         return Ok(path_prefix);
     }
-    match drive(
-        GetBucketInfoOperation::new(bucket.clone()),
-        &state.get_ctx(),
-    )
-    .await
-    .and_then(|output| output.transpose())
-    {
-        Ok(Some(info)) => Ok(data_watch_resource_path(
+    match drive(GetBucketOperation::new(bucket.clone()), &state.get_ctx()).await {
+        Ok(info) => Ok(watch_resource_path(
             info.group_id,
             node_id,
             &bucket,
             &key_prefix,
         )),
-        Ok(None) | Err(GetBucketInfoError::NotFound) => Ok(path_prefix),
+        Err(GetBucketError::NotFound) => Ok(path_prefix),
         Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
 }
@@ -548,14 +534,14 @@ pub async fn list_notifications(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(query): Query<ListNotificationsQuery>,
 ) -> ServerResult<(StatusCode, Json<NotificationListResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let cursor = decode_cursor(query.cursor.as_deref())?;
     let limit = query
         .limit
         .unwrap_or(DEFAULT_LIST_LIMIT)
         .min(LIST_NOTIFICATIONS_MAX_LIMIT);
 
-    let (records, next_cursor) = list_notifications_for_user(
+    let (records, next_cursor) = list_for_user(
         &state.get_ctx(),
         state.get_node_id(),
         auth.user_id,
@@ -596,7 +582,7 @@ path-restricted token is refused.
         (
             status = 200,
             description = "Unread badge value for the caller",
-            body = UnreadCountApiResponse,
+            body = UnreadCountResponse,
             example = json!({
                 "count": 7,
                 "capped": false
@@ -612,18 +598,14 @@ path-restricted token is refused.
 pub async fn unread_count(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-) -> ServerResult<(StatusCode, Json<UnreadCountApiResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+) -> ServerResult<(StatusCode, Json<UnreadCountResponse>)> {
+    let auth = require_unrestricted_auth(&state, auth)?;
 
-    let (count, capped) =
-        unread_count_for_user(&state.get_ctx(), state.get_node_id(), auth.user_id)
-            .await
-            .map_err(|error| map_dispatch_error(error, "unread"))?;
+    let (count, capped) = unread_for_user(&state.get_ctx(), state.get_node_id(), auth.user_id)
+        .await
+        .map_err(|error| map_dispatch_error(error, "unread"))?;
 
-    Ok((
-        StatusCode::OK,
-        Json(UnreadCountApiResponse { count, capped }),
-    ))
+    Ok((StatusCode::OK, Json(UnreadCountResponse { count, capped })))
 }
 
 /// Transport for the live unread-count stream. The local arm reacts to the
@@ -665,16 +647,14 @@ fn drain_pending_wakes(rx: &mut InboxWakeReceiver) {
     while rx.try_recv().is_ok() {}
 }
 
-async fn next_local_stream_step(
+async fn next_local_step(
     rx: &mut InboxWakeReceiver,
     recipient: UserId,
     recheck_deadline: Instant,
 ) -> StreamStep {
     use tokio::sync::broadcast::error::RecvError;
 
-    // An already-elapsed sleep_until is not guaranteed ready on its first poll, so
-    // a continuously ready wake bus could starve the overdue recheck indefinitely.
-    // Resolve it deterministically before the select.
+    // Check elapsed deadlines before select so a ready wake bus cannot starve rechecks.
     if Instant::now() >= recheck_deadline {
         return StreamStep::Recheck;
     }
@@ -699,7 +679,7 @@ async fn next_local_stream_step(
 }
 
 async fn fetch_unread_count(state: &UnreadStreamState) -> Option<(u64, bool)> {
-    unread_count_for_user(state.context.as_ref(), state.local_node_id, state.recipient)
+    unread_for_user(state.context.as_ref(), state.local_node_id, state.recipient)
         .await
         .ok()
         .map(|(count, capped)| (count as u64, capped))
@@ -757,7 +737,7 @@ fn unread_count_stream(
                 step = async {
                     match &mut state.mode {
                         UnreadStreamMode::Local(rx) => {
-                            next_local_stream_step(rx, recipient, recheck_deadline).await
+                            next_local_step(rx, recipient, recheck_deadline).await
                         }
                         UnreadStreamMode::Remote => {
                             tokio::time::sleep(remote_poll).await;
@@ -772,15 +752,12 @@ fn unread_count_stream(
                 StreamStep::Wait => continue,
                 StreamStep::Emit | StreamStep::EmitOnChange | StreamStep::Recheck => {
                     if matches!(step, StreamStep::Recheck) {
-                        // Wake silence for a full recheck period: the inbox holder
-                        // may have re-ranked to another node where deliveries land
-                        // with no local wake. Re-resolve and degrade to the remote
-                        // poll if it moved off this node; a resolution failure is a
-                        // transient skip. Then refetch as a missed-wake backstop.
+                        // Re-resolve after wake silence, switching to remote polling if needed.
+                        // Resolution failure skips this cycle; refetch covers a missed wake.
                         state.next_holder_recheck = Instant::now() + state.local_recheck;
                         let resolved = state
                             .shutdown
-                            .run_until_cancelled(resolve_inbox_holder_for_user(
+                            .run_until_cancelled(resolve_user_holder(
                                 state.context.as_ref(),
                                 state.recipient,
                             ))
@@ -818,18 +795,18 @@ struct NotificationStateStream<S> {
     epoch: String,
     revisions: watch::Receiver<u64>,
     cadence: tokio::time::Interval,
-    current_unread: Option<UnreadCountApiResponse>,
+    current_unread: Option<UnreadCountResponse>,
     last_revision: Option<u64>,
     unread_open: bool,
     revisions_open: bool,
 }
 
 impl<S> NotificationStateStream<S> {
-    fn state(&mut self) -> Option<NotificationStreamStateResponse> {
+    fn state(&mut self) -> Option<NotificationStreamResponse> {
         let unread = self.current_unread.clone()?;
         let revision = *self.revisions.borrow_and_update();
         self.last_revision = Some(revision);
-        Some(NotificationStreamStateResponse {
+        Some(NotificationStreamResponse {
             epoch: self.epoch.clone(),
             revision,
             unread,
@@ -848,7 +825,7 @@ fn notification_state_stream<S>(
     epoch: String,
     revisions: watch::Receiver<u64>,
     cadence: Duration,
-) -> impl Stream<Item = NotificationStreamStateResponse> + Send
+) -> impl Stream<Item = NotificationStreamResponse> + Send
 where
     S: Stream<Item = (u64, bool)> + Send,
 {
@@ -868,7 +845,7 @@ where
         loop {
             if state.current_unread.is_none() {
                 let (count, capped) = state.unread.next().await?;
-                state.current_unread = Some(UnreadCountApiResponse {
+                state.current_unread = Some(UnreadCountResponse {
                     count: count as u32,
                     capped,
                 });
@@ -890,10 +867,8 @@ where
 
             match step {
                 NotificationStateStep::Unread(Some((count, capped))) => {
-                    // Every source emission is a wake or a real change; unchanged
-                    // poll ticks were already dropped upstream, so a repeated
-                    // aggregate still forwards a frame for clients to refetch.
-                    state.current_unread = Some(UnreadCountApiResponse {
+                    // Sources emit only wakes or changes, so repeated totals still trigger refetch.
+                    state.current_unread = Some(UnreadCountResponse {
                         count: count as u32,
                         capped,
                     });
@@ -920,7 +895,7 @@ where
     })
 }
 
-fn state_event(state: NotificationStreamStateResponse) -> Event {
+fn state_event(state: NotificationStreamResponse) -> Event {
     let data = serde_json::to_string(&state).unwrap_or_else(|_| {
         format!(
             "{{\"epoch\":\"{}\",\"revision\":{},\"unread\":{{\"count\":{},\"capped\":{}}}}}",
@@ -961,7 +936,7 @@ path-restricted token is refused.
   state, and any state missed while disconnected is recovered by refetching the inbox, never
   replayed on the stream."#,
     responses(
-        (status = 200, description = "Server-sent state stream, media type `text/event-stream`; it ends on client disconnect or node shutdown", body = NotificationStreamStateResponse, content_type = "text/event-stream"),
+        (status = 200, description = "Server-sent state stream, media type `text/event-stream`; it ends on client disconnect or node shutdown", body = NotificationStreamResponse, content_type = "text/event-stream"),
         (status = 401, description = "Missing, malformed or expired bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 503, description = "No inbox holder is available, this node has no realm network handle, or the dashboard change feed is not running; the caller may retry", body = ErrorResponse)
@@ -972,14 +947,14 @@ pub async fn stream_notifications(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<Sse<impl Stream<Item = Result<Event, Infallible>> + Send>> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let context = state.get_ctx();
     let local_node_id = state.get_node_id();
     let recipient = auth.user_id;
     let (dashboard_epoch, dashboard_revisions) =
         subscribe_dashboard_changes(context.as_ref()).ok_or(ServerError::ServiceUnavailable)?;
 
-    let holder = resolve_inbox_holder_for_user(context.as_ref(), recipient)
+    let holder = resolve_user_holder(context.as_ref(), recipient)
         .await
         .map_err(|error| map_dispatch_error(error, "stream"))?;
     // Subscribe on both arms: the remote arm needs the net handle to poll the
@@ -1033,7 +1008,7 @@ path-restricted token is refused.
 **Limits**
 - At most 512 ids, and duplicates are collapsed."#,
     request_body(
-        content = MarkReadApiRequest,
+        content = MarkReadRequest,
         description = "Notifications to mark read, by id, by age, or both; at most 512 ids, duplicates are collapsed",
         example = json!({
             "ids": ["01JABCDEF0123456789ABCDEFG"],
@@ -1044,7 +1019,7 @@ path-restricted token is refused.
         (
             status = 200,
             description = "Number of notifications flipped from unread to read by this call",
-            body = MarkReadApiResponse,
+            body = MarkReadResponse,
             example = json!({
                 "marked": 3
             })
@@ -1060,9 +1035,9 @@ path-restricted token is refused.
 pub async fn mark_read(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Json(request): Json<MarkReadApiRequest>,
-) -> ServerResult<(StatusCode, Json<MarkReadApiResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    Json(request): Json<MarkReadRequest>,
+) -> ServerResult<(StatusCode, Json<MarkReadResponse>)> {
+    let auth = require_unrestricted_auth(&state, auth)?;
     if request.ids.len() > MARK_READ_MAX_IDS {
         return Err(ServerError::BadRequest);
     }
@@ -1072,7 +1047,7 @@ pub async fn mark_read(
         .map(|id| Ulid::from_str(id).map_err(|_| ServerError::BadRequest))
         .collect::<ServerResult<Vec<Ulid>>>()?;
 
-    let marked = mark_read_for_user(
+    let marked = mark_for_user(
         &state.get_ctx(),
         state.get_node_id(),
         auth.user_id,
@@ -1082,7 +1057,7 @@ pub async fn mark_read(
     .await
     .map_err(|error| map_dispatch_error(error, "mark_read"))?;
 
-    Ok((StatusCode::OK, Json(MarkReadApiResponse { marked })))
+    Ok((StatusCode::OK, Json(MarkReadResponse { marked })))
 }
 
 #[utoipa::path(
@@ -1141,11 +1116,11 @@ pub async fn list_watches(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<WatchListResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
 
-    let subscriptions = list_watches_for_user(&state.get_ctx(), state.get_node_id(), auth.user_id)
+    let subscriptions = dispatch::list_watches(&state.get_ctx(), state.get_node_id(), auth.user_id)
         .await
-        .map_err(|error| map_watch_dispatch_error(error, "list_watches"))?;
+        .map_err(|error| map_watch_error(error, "list_watches"))?;
 
     let watches = subscriptions.iter().map(watch_response).collect();
     Ok((StatusCode::OK, Json(WatchListResponse { watches })))
@@ -1213,22 +1188,22 @@ permission path, evaluated against the caller's current grants at creation time.
 pub async fn create_watch(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(_bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(_bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateWatchRequest>,
 ) -> ServerResult<(StatusCode, Json<WatchResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     if request.path_prefix.is_empty()
         || request.path_prefix.starts_with('/')
         || request.path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN
         || request.events.is_empty()
     {
-        record_watch_creation_denial(&state, WatchAuthorizationMetricReason::InvalidResource);
+        record_watch_denial(&state, WatchMetricReason::InvalidResource);
         return Err(ServerError::BadRequest);
     }
     let mut event_mask = WatchEventMask::empty();
     for name in &request.events {
         let Some(kind) = WatchEventKind::from_name(name) else {
-            record_watch_creation_denial(&state, WatchAuthorizationMetricReason::InvalidResource);
+            record_watch_denial(&state, WatchMetricReason::InvalidResource);
             return Err(ServerError::BadRequest);
         };
         event_mask.insert(kind);
@@ -1240,7 +1215,7 @@ pub async fn create_watch(
         ..Default::default()
     };
 
-    let subscription = create_watch_for_user(
+    let subscription = create_for_user(
         &state.get_ctx(),
         state.get_node_id(),
         auth.user_id,
@@ -1251,9 +1226,9 @@ pub async fn create_watch(
     .await
     .map_err(|error| {
         if let WatchDispatchError::Unauthorized(reason) = &error {
-            record_watch_creation_denial(&state, *reason);
+            record_watch_denial(&state, *reason);
         }
-        map_watch_dispatch_error(error, "create_watch")
+        map_watch_error(error, "create_watch")
     })?;
 
     Ok((StatusCode::CREATED, Json(watch_response(&subscription))))
@@ -1292,1444 +1267,21 @@ pub async fn delete_watch(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let watch_id = Ulid::from_str(&id).map_err(|_| ServerError::BadRequest)?;
 
-    delete_watch_for_user(
+    delete_for_user(
         &state.get_ctx(),
         state.get_node_id(),
         auth.user_id,
         watch_id,
     )
     .await
-    .map_err(|error| map_watch_dispatch_error(error, "delete_watch"))?;
+    .map_err(|error| map_watch_error(error, "delete_watch"))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use aruna_core::NodeId;
-    use aruna_core::UserId;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
-    use aruna_core::metrics::NodeMetrics;
-    use aruna_core::structs::{
-        Actor, BucketInfo, GroupAuthorizationDocument, NodeCapabilities, PathRestriction,
-        Permission, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
-        WatchEvent, WatchEventDetail, data_watch_resource_path,
-    };
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::driver::DriverContext;
-    use aruna_operations::notifications::inbox::upsert_inbox_records;
-    use aruna_operations::notifications::routing::route_watch_event;
-    use aruna_operations::notifications::watch::subscriptions::list_watch_subscriptions;
-    use aruna_storage::storage::FjallStorage;
-    use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use byteview::ByteView;
-    use std::time::SystemTime;
-    use tempfile::TempDir;
-    use tokio::time::timeout;
-
-    fn node(seed: u8) -> NodeId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-        iroh::SecretKey::from_bytes(&bytes).public()
-    }
-
-    fn realm_id(seed: u8) -> RealmId {
-        RealmId::from_bytes(
-            *ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
-                .verifying_key()
-                .as_bytes(),
-        )
-    }
-
-    async fn build_state(realm_id: RealmId, node_id: NodeId) -> (TempDir, Arc<ServerState>) {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        let ctx = Arc::new(DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
-        let state = ServerState::new(
-            ctx,
-            realm_id,
-            node_id,
-            NodeCapabilities::user_node(realm_id).expect("capabilities"),
-            false,
-            None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
-        )
-        .await;
-        (dir, Arc::new(state))
-    }
-
-    async fn build_state_with_net(
-        realm_id: RealmId,
-        secret: [u8; 32],
-    ) -> (TempDir, Arc<ServerState>, NetHandle) {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        let net = NetHandle::new(
-            NetConfig {
-                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
-                secret_key: Some(iroh::SecretKey::from_bytes(&secret)),
-                realm_id,
-                discovery_method: DiscoveryMethod::None,
-                relay_method: RelayMethod::None,
-                ..NetConfig::default()
-            },
-            storage.clone(),
-        )
-        .await
-        .expect("net handle");
-        let node_id = net.node_id();
-        let ctx = Arc::new(DriverContext {
-            storage_handle: storage,
-            net_handle: Some(net.clone()),
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        });
-        let state = ServerState::new(
-            ctx,
-            realm_id,
-            node_id,
-            NodeCapabilities::user_node(realm_id).expect("capabilities"),
-            false,
-            None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
-        )
-        .await;
-        (dir, Arc::new(state), net)
-    }
-
-    async fn install_local_holder_config(state: &ServerState, realm_id: RealmId, holder: NodeId) {
-        install_holder_policies(state, realm_id, holder, Vec::new()).await;
-    }
-
-    async fn install_holder_policies(
-        state: &ServerState,
-        realm_id: RealmId,
-        holder: NodeId,
-        policies: Vec<aruna_core::request_policy::RequestPolicy>,
-    ) {
-        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-        config.seed_default_placement();
-        config.ensure_node(holder, RealmNodeKind::Server);
-        config.seed_job_control(holder, 0);
-        config.request_policies = policies;
-        let actor = Actor {
-            node_id: holder,
-            user_id: UserId::nil(realm_id),
-            realm_id,
-        };
-        let bytes = config.to_bytes(&actor).expect("config serializes");
-        match state
-            .get_ctx()
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: ByteView::from(realm_id.as_bytes().to_vec()),
-                value: ByteView::from(bytes),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected realm config write event: {other:?}"),
-        }
-    }
-
-    async fn write_fixture(state: &ServerState, key_space: &str, key: ByteView, value: ByteView) {
-        match state
-            .get_ctx()
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key,
-                value,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected fixture write event: {other:?}"),
-        }
-    }
-
-    async fn install_group_authorization(
-        state: &ServerState,
-        realm_id: RealmId,
-        group_id: Ulid,
-        owner: UserId,
-        readers: &[UserId],
-    ) {
-        let actor = Actor {
-            node_id: state.get_node_id(),
-            user_id: owner,
-            realm_id,
-        };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-        let mut group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
-        let viewer = group_auth
-            .roles
-            .values_mut()
-            .find(|role| role.name == "viewer")
-            .expect("default viewer role");
-        viewer.assigned_users.extend(readers.iter().copied());
-
-        write_fixture(
-            state,
-            AUTH_KEYSPACE,
-            ByteView::from(realm_id.as_bytes().to_vec()),
-            ByteView::from(realm_auth.to_bytes(&actor).expect("realm auth serializes")),
-        )
-        .await;
-        write_fixture(
-            state,
-            AUTH_KEYSPACE,
-            ByteView::from(group_id.to_bytes().to_vec()),
-            ByteView::from(group_auth.to_bytes(&actor).expect("group auth serializes")),
-        )
-        .await;
-        // Policy loading resolves the group record before group policies apply.
-        let group = aruna_core::structs::Group {
-            display_name: "watch-group".to_string(),
-            group_id,
-            realm_id,
-            roles: group_auth.roles.keys().copied().collect(),
-            owner,
-        };
-        write_fixture(
-            state,
-            aruna_core::keyspaces::GROUP_KEYSPACE,
-            ByteView::from(group_id.to_bytes().to_vec()),
-            ByteView::from(group.to_bytes(&actor).expect("group serializes")),
-        )
-        .await;
-    }
-
-    async fn install_bucket(state: &ServerState, bucket: &str, group_id: Ulid, created_by: UserId) {
-        let info = BucketInfo {
-            group_id,
-            created_at: SystemTime::now(),
-            created_by,
-            cors_configuration: None,
-            storage_routing: Vec::new(),
-            placement_policies: Vec::new(),
-            placement_policy_generation: 0,
-        };
-        write_fixture(
-            state,
-            S3_BUCKET_KEYSPACE,
-            ByteView::from(bucket.as_bytes().to_vec()),
-            ByteView::from(info.to_bytes().expect("bucket serializes")),
-        )
-        .await;
-    }
-
-    fn direct_record(recipient: UserId, seed: u8) -> NotificationRecord {
-        NotificationRecord::new(
-            recipient,
-            NotificationClass::Direct,
-            NotificationKind::AddedToGroup {
-                group_id: Ulid::from_bytes([seed; 16]),
-                actor_user_id: UserId::new(Ulid::from_bytes([200u8; 16]), recipient.realm_id),
-            },
-            1_700_000_000_000 + seed as u64,
-        )
-    }
-
-    fn auth_for(user_id: UserId, realm_id: RealmId) -> AuthContext {
-        AuthContext {
-            user_id,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        }
-    }
-
-    fn bearer() -> Extension<Option<ValidatedArunaBearerTokenCarrier>> {
-        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-            "notification-watch-test-token",
-        )))
-    }
-
-    #[tokio::test]
-    async fn list_requires_auth() {
-        let realm_id = realm_id(1);
-        let (_dir, state) = build_state(realm_id, node(1)).await;
-        let error = list_notifications(
-            State(state),
-            Extension(None),
-            Query(ListNotificationsQuery::default()),
-        )
-        .await
-        .expect_err("missing auth must be rejected");
-        assert!(matches!(error, ServerError::Unauthorized));
-    }
-
-    #[tokio::test]
-    async fn path_restricted_token_rejected() {
-        let realm_id = realm_id(5);
-        let (_dir, state) = build_state(realm_id, node(5)).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-        let mut auth = auth_for(user_id, realm_id);
-        auth.path_restrictions = Some(vec![PathRestriction {
-            pattern: "/bucket/**".to_string(),
-            permission: Permission::READ,
-        }]);
-
-        let list_err = list_notifications(
-            State(state.clone()),
-            Extension(Some(auth.clone())),
-            Query(ListNotificationsQuery::default()),
-        )
-        .await
-        .expect_err("delegated token must be rejected");
-        assert!(matches!(list_err, ServerError::Forbidden));
-
-        let unread_err = unread_count(State(state.clone()), Extension(Some(auth.clone())))
-            .await
-            .expect_err("delegated token must be rejected");
-        assert!(matches!(unread_err, ServerError::Forbidden));
-
-        let mark_err = mark_read(
-            State(state),
-            Extension(Some(auth)),
-            Json(MarkReadApiRequest {
-                ids: Vec::new(),
-                up_to_ms: None,
-            }),
-        )
-        .await
-        .expect_err("delegated token must be rejected");
-        assert!(matches!(mark_err, ServerError::Forbidden));
-    }
-
-    #[test]
-    fn cursor_decoding_rejects_garbage() {
-        assert!(matches!(
-            decode_cursor(Some("not base64 !!")),
-            Err(ServerError::BadRequest)
-        ));
-        let short = URL_SAFE_NO_PAD.encode([0u8; 23]);
-        assert!(matches!(
-            decode_cursor(Some(&short)),
-            Err(ServerError::BadRequest)
-        ));
-        assert_eq!(decode_cursor(None).unwrap(), None);
-
-        let raw = vec![7u8; 24];
-        let encoded = encode_cursor(Some(raw.clone()));
-        assert_eq!(decode_cursor(encoded.as_deref()).unwrap(), Some(raw));
-    }
-
-    #[test]
-    fn mark_read_request_defaults_missing_ids() {
-        let request: MarkReadApiRequest =
-            serde_json::from_str(r#"{"up_to_ms":123}"#).expect("request deserializes");
-
-        assert!(request.ids.is_empty());
-        assert_eq!(request.up_to_ms, Some(123));
-    }
-
-    #[tokio::test]
-    async fn mark_read_rejects_bad_ids() {
-        let realm_id = realm_id(2);
-        let (_dir, state) = build_state(realm_id, node(2)).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-        let error = mark_read(
-            State(state),
-            Extension(Some(auth_for(user_id, realm_id))),
-            Json(MarkReadApiRequest {
-                ids: vec!["not-a-ulid".to_string()],
-                up_to_ms: None,
-            }),
-        )
-        .await
-        .expect_err("bad id must be rejected");
-        assert!(matches!(error, ServerError::BadRequest));
-    }
-
-    #[tokio::test]
-    async fn mark_read_rejects_too_many_ids() {
-        let realm_id = realm_id(6);
-        let (_dir, state) = build_state(realm_id, node(6)).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-        let error = mark_read(
-            State(state),
-            Extension(Some(auth_for(user_id, realm_id))),
-            Json(MarkReadApiRequest {
-                ids: (0..=MARK_READ_MAX_IDS)
-                    .map(|_| Ulid::generate().to_string())
-                    .collect(),
-                up_to_ms: None,
-            }),
-        )
-        .await
-        .expect_err("too many ids must be rejected");
-        assert!(matches!(error, ServerError::BadRequest));
-    }
-
-    #[tokio::test]
-    async fn local_path_serves_without_net() {
-        let realm_id = realm_id(3);
-        let holder = node(3);
-        let (_dir, state) = build_state(realm_id, holder).await;
-        install_local_holder_config(&state, realm_id, holder).await;
-
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-        let records = vec![
-            direct_record(user_id, 1),
-            direct_record(user_id, 2),
-            direct_record(user_id, 3),
-        ];
-        upsert_inbox_records(&state.get_ctx().storage_handle, &records)
-            .await
-            .expect("seed inbox");
-
-        let (_, listed) = list_notifications(
-            State(state.clone()),
-            Extension(Some(auth_for(user_id, realm_id))),
-            Query(ListNotificationsQuery::default()),
-        )
-        .await
-        .expect("list succeeds");
-        assert_eq!(listed.notifications.len(), 3);
-        assert_eq!(listed.notifications[0].created_at_ms, 1_700_000_000_000 + 3);
-        assert!(listed.notifications.iter().all(|n| !n.read));
-
-        let (_, unread) = unread_count(
-            State(state.clone()),
-            Extension(Some(auth_for(user_id, realm_id))),
-        )
-        .await
-        .expect("unread succeeds");
-        assert_eq!(unread.count, 3);
-        assert!(!unread.capped);
-
-        let ids = listed
-            .notifications
-            .iter()
-            .map(|n| n.id.clone())
-            .collect::<Vec<_>>();
-        let (_, marked) = mark_read(
-            State(state.clone()),
-            Extension(Some(auth_for(user_id, realm_id))),
-            Json(MarkReadApiRequest {
-                ids,
-                up_to_ms: None,
-            }),
-        )
-        .await
-        .expect("mark read succeeds");
-        assert_eq!(marked.marked, 3);
-
-        let (_, unread_after) =
-            unread_count(State(state), Extension(Some(auth_for(user_id, realm_id))))
-                .await
-                .expect("unread after succeeds");
-        assert_eq!(unread_after.count, 0);
-    }
-
-    #[tokio::test]
-    async fn stream_local_arm_emits_initial_and_on_wake() {
-        let realm_id = realm_id(11);
-        let (_dir, state, net) = build_state_with_net(realm_id, [11u8; 32]).await;
-        install_local_holder_config(&state, realm_id, state.get_node_id()).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-
-        let mut events = Box::pin(unread_count_stream(
-            state.get_ctx(),
-            state.get_node_id(),
-            user_id,
-            UnreadStreamMode::Local(net.subscribe_notification_wakes()),
-            CancellationToken::new(),
-            Duration::from_secs(5),
-            // Long recheck so this test exercises only the wake path.
-            Duration::from_secs(60),
-        ));
-
-        let (initial, initial_capped) = timeout(Duration::from_secs(2), events.next())
-            .await
-            .expect("initial event arrives")
-            .expect("stream open");
-        assert_eq!(initial, 0);
-        assert!(!initial_capped);
-
-        upsert_inbox_records(
-            &state.get_ctx().storage_handle,
-            &[direct_record(user_id, 1)],
-        )
-        .await
-        .expect("seed inbox");
-        net.notify_inbox_activity(user_id);
-
-        let (after_wake, after_wake_capped) = timeout(Duration::from_secs(2), events.next())
-            .await
-            .expect("wake event arrives")
-            .expect("stream open");
-        assert_eq!(after_wake, 1);
-        assert!(!after_wake_capped);
-    }
-
-    #[tokio::test]
-    async fn state_stream_initial() {
-        let (_changes, revisions) = watch::channel(3);
-        let unread = stream::iter([(4, false)]).chain(stream::pending());
-        let mut states = Box::pin(notification_state_stream(
-            unread,
-            "test-epoch".to_string(),
-            revisions,
-            Duration::from_secs(20),
-        ));
-
-        assert_eq!(
-            states.next().await,
-            Some(NotificationStreamStateResponse {
-                epoch: "test-epoch".to_string(),
-                revision: 3,
-                unread: UnreadCountApiResponse {
-                    count: 4,
-                    capped: false,
-                },
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn state_stream_updates() {
-        let (changes, revisions) = watch::channel(3);
-        let unread = stream::iter([(4, false), (5, true)]).chain(stream::pending());
-        let mut states = Box::pin(notification_state_stream(
-            unread,
-            "test-epoch".to_string(),
-            revisions,
-            Duration::from_secs(20),
-        ));
-
-        assert_eq!(states.next().await.expect("initial state").revision, 3);
-        assert_eq!(
-            states.next().await.expect("unread state").unread,
-            UnreadCountApiResponse {
-                count: 5,
-                capped: true,
-            }
-        );
-        changes.send_replace(4);
-        assert_eq!(states.next().await.expect("dashboard state").revision, 4);
-    }
-
-    #[tokio::test]
-    async fn state_stream_closes() {
-        let (_changes, revisions) = watch::channel(3);
-        let unread = stream::iter([(4, false)]);
-        let mut states = Box::pin(notification_state_stream(
-            unread,
-            "test-epoch".to_string(),
-            revisions,
-            Duration::from_secs(20),
-        ));
-
-        assert!(states.next().await.is_some());
-        assert_eq!(states.next().await, None);
-    }
-
-    #[tokio::test]
-    async fn wake_emits_unchanged() {
-        // A wake repeats the aggregate at the unread cap; the frame must still fire.
-        let (_changes, revisions) = watch::channel(3);
-        let unread = stream::iter([(100, true), (100, true)]).chain(stream::pending());
-        let mut states = Box::pin(notification_state_stream(
-            unread,
-            "test-epoch".to_string(),
-            revisions,
-            Duration::from_secs(20),
-        ));
-
-        let capped = UnreadCountApiResponse {
-            count: 100,
-            capped: true,
-        };
-        assert_eq!(states.next().await.expect("initial state").unread, capped);
-        assert_eq!(states.next().await.expect("wake state").unread, capped);
-    }
-
-    #[tokio::test]
-    async fn state_stream_periodic() {
-        tokio::time::pause();
-        let (_changes, revisions) = watch::channel(3);
-        let unread = stream::iter([(4, false)]).chain(stream::pending());
-        let mut states = Box::pin(notification_state_stream(
-            unread,
-            "test-epoch".to_string(),
-            revisions,
-            Duration::from_secs(20),
-        ));
-        let initial = states.next().await.expect("initial state");
-
-        tokio::time::advance(Duration::from_secs(20)).await;
-
-        assert_eq!(states.next().await, Some(initial));
-    }
-
-    #[tokio::test]
-    async fn state_event_shape() {
-        use axum::response::IntoResponse;
-
-        let event = state_event(NotificationStreamStateResponse {
-            epoch: "test-epoch".to_string(),
-            revision: 3,
-            unread: UnreadCountApiResponse {
-                count: 4,
-                capped: false,
-            },
-        });
-        let response = Sse::new(stream::iter([Ok::<_, Infallible>(event)])).into_response();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("SSE body");
-
-        assert_eq!(
-            body.as_ref(),
-            b"event: state\ndata: {\"epoch\":\"test-epoch\",\"revision\":3,\"unread\":{\"count\":4,\"capped\":false}}\n\n"
-        );
-    }
-
-    // The recheck tick is the missed-wake backstop: with no wake fired, the local
-    // arm still periodically re-resolves the holder and refetches, emitting when the
-    // count changed. Driving a live holder re-rank (degrade to the remote arm) in a
-    // single in-process node is impractical (that path needs a real second node
-    // holding the inbox), so it is covered by the multi-node and remote-arm tests;
-    // here we lock in the same-node backstop refetch.
-    #[tokio::test]
-    async fn stream_local_arm_recheck_refetches_on_change_without_wake() {
-        let realm_id = realm_id(12);
-        let (_dir, state, net) = build_state_with_net(realm_id, [12u8; 32]).await;
-        install_local_holder_config(&state, realm_id, state.get_node_id()).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-
-        let mut events = Box::pin(unread_count_stream(
-            state.get_ctx(),
-            state.get_node_id(),
-            user_id,
-            UnreadStreamMode::Local(net.subscribe_notification_wakes()),
-            CancellationToken::new(),
-            Duration::from_secs(60),
-            // Short recheck so the backstop refetch fires promptly.
-            Duration::from_millis(150),
-        ));
-
-        let (initial, _) = timeout(Duration::from_secs(2), events.next())
-            .await
-            .expect("initial event arrives")
-            .expect("stream open");
-        assert_eq!(initial, 0);
-
-        // Seed a record but deliberately fire no wake: only the recheck backstop
-        // can surface it.
-        upsert_inbox_records(
-            &state.get_ctx().storage_handle,
-            &[direct_record(user_id, 1)],
-        )
-        .await
-        .expect("seed inbox");
-
-        let (after_recheck, _) = timeout(Duration::from_secs(2), events.next())
-            .await
-            .expect("recheck backstop emits without a wake")
-            .expect("stream open");
-        assert_eq!(after_recheck, 1);
-    }
-
-    #[tokio::test]
-    async fn expired_local_recheck_wins_over_unrelated_wake() {
-        let realm_id = realm_id(15);
-        let recipient = UserId::new(Ulid::generate(), realm_id);
-        let unrelated = UserId::new(Ulid::generate(), realm_id);
-        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
-        tx.send(unrelated).expect("receiver is open");
-
-        let step = next_local_stream_step(
-            &mut rx,
-            recipient,
-            Instant::now() - Duration::from_millis(1),
-        )
-        .await;
-
-        assert_eq!(step, StreamStep::Recheck);
-    }
-
-    // The remote arm polls the holder and emits only on change: the initial poll
-    // reports the current count, a later poll reports it again once it moved.
-    #[tokio::test]
-    async fn stream_remote_arm_emits_initial_and_on_change() {
-        let realm_id = realm_id(13);
-        let (_dir, state, _net) = build_state_with_net(realm_id, [13u8; 32]).await;
-        install_local_holder_config(&state, realm_id, state.get_node_id()).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-
-        let mut events = Box::pin(unread_count_stream(
-            state.get_ctx(),
-            state.get_node_id(),
-            user_id,
-            UnreadStreamMode::Remote,
-            CancellationToken::new(),
-            Duration::from_millis(100),
-            Duration::from_secs(60),
-        ));
-
-        let (initial, _) = timeout(Duration::from_secs(2), events.next())
-            .await
-            .expect("initial event arrives")
-            .expect("stream open");
-        assert_eq!(initial, 0);
-
-        upsert_inbox_records(
-            &state.get_ctx().storage_handle,
-            &[direct_record(user_id, 1)],
-        )
-        .await
-        .expect("seed inbox");
-
-        let (changed, _) = timeout(Duration::from_secs(2), events.next())
-            .await
-            .expect("poll emits once the count changed")
-            .expect("stream open");
-        assert_eq!(changed, 1);
-    }
-
-    // The stream must end promptly once node shutdown begins: an open SSE
-    // response otherwise pins the ingress drain until the client disconnects.
-    #[tokio::test]
-    async fn shutdown_ends_stream() {
-        let realm_id = realm_id(16);
-        let (_dir, state, net) = build_state_with_net(realm_id, [16u8; 32]).await;
-        install_local_holder_config(&state, realm_id, state.get_node_id()).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-        let shutdown = CancellationToken::new();
-
-        let mut events = Box::pin(unread_count_stream(
-            state.get_ctx(),
-            state.get_node_id(),
-            user_id,
-            UnreadStreamMode::Local(net.subscribe_notification_wakes()),
-            shutdown.clone(),
-            // Both waits are far longer than the test: only the token can end it.
-            Duration::from_secs(60),
-            Duration::from_secs(60),
-        ));
-
-        let (initial, _) = timeout(Duration::from_secs(2), events.next())
-            .await
-            .expect("initial event arrives")
-            .expect("stream open");
-        assert_eq!(initial, 0);
-
-        shutdown.cancel();
-
-        let ended = timeout(Duration::from_secs(2), events.next())
-            .await
-            .expect("stream reacts to shutdown promptly");
-        assert!(ended.is_none(), "stream must end, got {ended:?}");
-    }
-
-    // A poll that cannot reach the holder is skipped silently: the stream neither
-    // emits nor ends, it just keeps polling.
-    #[tokio::test]
-    async fn stream_remote_arm_skips_silently_on_poll_failure() {
-        let realm_id = realm_id(14);
-        let (_dir, state, _net) = build_state_with_net(realm_id, [14u8; 32]).await;
-        // The holder is a node that is in no mesh, so every remote poll fails.
-        install_local_holder_config(&state, realm_id, node(200)).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-
-        let mut events = Box::pin(unread_count_stream(
-            state.get_ctx(),
-            state.get_node_id(),
-            user_id,
-            UnreadStreamMode::Remote,
-            CancellationToken::new(),
-            Duration::from_millis(100),
-            Duration::from_secs(60),
-        ));
-
-        // Nothing is ever emitted and the stream stays open (times out) rather than
-        // ending on the unreachable-holder errors.
-        let outcome = timeout(Duration::from_millis(800), events.next()).await;
-        assert!(
-            outcome.is_err(),
-            "a failing poll must be skipped silently, not emitted or ended: {outcome:?}"
-        );
-    }
-
-    #[test]
-    fn notification_response_maps_deep_link_ids() {
-        let realm_id = RealmId::from_bytes([4u8; 32]);
-        let recipient = UserId::new(Ulid::generate(), realm_id);
-        let group_id = Ulid::generate();
-        let actor = UserId::new(Ulid::generate(), realm_id);
-        let member = UserId::new(Ulid::generate(), realm_id);
-        let onboarded_node = node(9);
-
-        let request_id = Ulid::generate();
-        let joined = notification_response(&NotificationRecord::new(
-            recipient,
-            NotificationClass::Direct,
-            NotificationKind::GroupJoinRequested {
-                group_id,
-                request_id,
-                actor_user_id: actor,
-            },
-            1,
-        ));
-        assert_eq!(joined.kind, "group_join_requested");
-        assert_eq!(joined.category, "group.membership");
-        assert_eq!(joined.request_id, Some(request_id.to_string()));
-        assert_eq!(joined.group_id, Some(group_id.to_string()));
-        assert_eq!(joined.actor_user_id, Some(actor.to_string()));
-        let added = notification_response(&NotificationRecord::new(
-            recipient,
-            NotificationClass::Direct,
-            NotificationKind::AddedToGroup {
-                group_id,
-                actor_user_id: actor,
-            },
-            1,
-        ));
-        assert_eq!(added.group_id, Some(group_id.to_string()));
-        assert_eq!(added.actor_user_id, Some(actor.to_string()));
-        assert_eq!(added.member_user_id, None);
-
-        let removed = notification_response(&NotificationRecord::new(
-            recipient,
-            NotificationClass::Direct,
-            NotificationKind::RemovedFromGroup {
-                group_id,
-                actor_user_id: actor,
-            },
-            1,
-        ));
-        assert_eq!(removed.group_id, Some(group_id.to_string()));
-        assert_eq!(removed.actor_user_id, Some(actor.to_string()));
-
-        let member_added = notification_response(&NotificationRecord::new(
-            recipient,
-            NotificationClass::Direct,
-            NotificationKind::GroupMemberAdded {
-                group_id,
-                member_user_id: member,
-                actor_user_id: actor,
-            },
-            1,
-        ));
-        assert_eq!(member_added.group_id, Some(group_id.to_string()));
-        assert_eq!(member_added.member_user_id, Some(member.to_string()));
-        assert_eq!(member_added.actor_user_id, Some(actor.to_string()));
-
-        let onboarded = notification_response(&NotificationRecord::new(
-            recipient,
-            NotificationClass::Direct,
-            NotificationKind::NodeOnboarded {
-                realm_id,
-                node_id: onboarded_node,
-            },
-            1,
-        ));
-        assert_eq!(onboarded.realm_id, Some(realm_id.to_string()));
-        assert_eq!(onboarded.node_id, Some(onboarded_node.to_string()));
-        assert_eq!(onboarded.group_id, None);
-
-        let document_id = Ulid::generate();
-        let metadata_created = notification_response(&NotificationRecord::new(
-            recipient,
-            NotificationClass::Transient,
-            NotificationKind::MetadataCreated {
-                path: format!("meta/{group_id}/datasets/project/run-42"),
-                group_id,
-                document_id,
-                actor_user_id: actor,
-            },
-            1,
-        ));
-        assert_eq!(metadata_created.kind, "metadata_created");
-        assert_eq!(metadata_created.category, "resource.watch");
-        assert_eq!(
-            metadata_created.path,
-            Some(format!("meta/{group_id}/datasets/project/run-42"))
-        );
-        assert_eq!(metadata_created.group_id, Some(group_id.to_string()));
-        assert_eq!(metadata_created.document_id, Some(document_id.to_string()));
-        assert_eq!(metadata_created.actor_user_id, Some(actor.to_string()));
-
-        let data_uploaded = notification_response(&NotificationRecord::new(
-            recipient,
-            NotificationClass::Transient,
-            NotificationKind::DataUploaded {
-                path: data_watch_resource_path(group_id, onboarded_node, "bucket", "object"),
-                group_id,
-                node_id: onboarded_node,
-                bucket: "bucket".to_string(),
-                key: "object".to_string(),
-                size_bytes: 4096,
-                actor_user_id: actor,
-            },
-            1,
-        ));
-        assert_eq!(data_uploaded.kind, "data_uploaded");
-        assert_eq!(data_uploaded.category, "resource.watch");
-        assert_eq!(
-            data_uploaded.path,
-            Some(data_watch_resource_path(
-                group_id,
-                onboarded_node,
-                "bucket",
-                "object"
-            ))
-        );
-        assert_eq!(data_uploaded.group_id, Some(group_id.to_string()));
-        assert_eq!(data_uploaded.node_id, Some(onboarded_node.to_string()));
-        assert_eq!(data_uploaded.bucket, Some("bucket".to_string()));
-        assert_eq!(data_uploaded.key, Some("object".to_string()));
-        assert_eq!(data_uploaded.size_bytes, Some(4096));
-        assert_eq!(data_uploaded.actor_user_id, Some(actor.to_string()));
-    }
-
-    #[tokio::test]
-    async fn watch_local_path_crud() {
-        let realm_id = realm_id(6);
-        let holder = node(6);
-        let (_dir, state) = build_state(realm_id, holder).await;
-        install_local_holder_config(&state, realm_id, holder).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-        let group_id = Ulid::generate();
-        install_group_authorization(&state, realm_id, group_id, user_id, &[]).await;
-        let path_prefix = data_watch_resource_path(group_id, node(60), "bucket", "prefix");
-
-        let (status, created) = create_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(user_id, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: path_prefix.clone(),
-                events: vec!["data_uploaded".to_string()],
-            }),
-        )
-        .await
-        .expect("create succeeds");
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created.path_prefix, path_prefix);
-        assert_eq!(created.events, vec!["data_uploaded"]);
-
-        let (_, listed) = list_watches(
-            State(state.clone()),
-            Extension(Some(auth_for(user_id, realm_id))),
-        )
-        .await
-        .expect("list succeeds");
-        assert_eq!(listed.watches.len(), 1);
-        assert_eq!(listed.watches[0].id, created.id);
-
-        let status = delete_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(user_id, realm_id))),
-            Path(created.id.clone()),
-        )
-        .await
-        .expect("delete succeeds");
-        assert_eq!(status, StatusCode::NO_CONTENT);
-
-        let (_, empty) = list_watches(State(state), Extension(Some(auth_for(user_id, realm_id))))
-            .await
-            .expect("list after delete succeeds");
-        assert!(empty.watches.is_empty());
-    }
-
-    #[tokio::test]
-    async fn lists_unauthorized_watch() {
-        // Losing READ stops delivery; the row stays listed so its owner can see
-        // and delete it, with its details withheld.
-        let realm_id = realm_id(31);
-        let holder = node(31);
-        let (_dir, state) = build_state(realm_id, holder).await;
-        install_local_holder_config(&state, realm_id, holder).await;
-        let owner = UserId::new(Ulid::generate(), realm_id);
-        let reader = UserId::new(Ulid::generate(), realm_id);
-        let group_id = Ulid::generate();
-        install_group_authorization(&state, realm_id, group_id, owner, &[reader]).await;
-
-        let (status, created) = create_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(reader, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: format!("meta/{group_id}/"),
-                events: vec!["metadata_created".to_string()],
-            }),
-        )
-        .await
-        .expect("group wide watch is accepted");
-        assert_eq!(status, StatusCode::CREATED);
-        assert!(created.authorized);
-
-        let (_, listed) = list_watches(
-            State(state.clone()),
-            Extension(Some(auth_for(reader, realm_id))),
-        )
-        .await
-        .expect("list succeeds");
-        assert_eq!(listed.watches.len(), 1);
-        assert!(listed.watches[0].authorized);
-
-        install_group_authorization(&state, realm_id, group_id, owner, &[]).await;
-
-        let (_, listed) = list_watches(
-            State(state.clone()),
-            Extension(Some(auth_for(reader, realm_id))),
-        )
-        .await
-        .expect("list after revocation succeeds");
-        assert_eq!(listed.watches.len(), 1);
-        assert_eq!(listed.watches[0].id, created.id);
-        assert!(!listed.watches[0].authorized);
-        assert!(listed.watches[0].path_prefix.is_empty());
-    }
-
-    #[tokio::test]
-    async fn policy_denies_watches() {
-        // The realm request policies must reach watch creation, which only
-        // ordinary RBAC used to gate.
-        let realm_id = realm_id(21);
-        let holder = node(21);
-        let (_dir, state) = build_state(realm_id, holder).await;
-        install_local_holder_config(&state, realm_id, holder).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-        let group_id = Ulid::generate();
-        install_group_authorization(&state, realm_id, group_id, user_id, &[]).await;
-        let path_prefix = data_watch_resource_path(group_id, node(60), "bucket", "prefix");
-        let request = || CreateWatchRequest {
-            path_prefix: path_prefix.clone(),
-            events: vec!["data_uploaded".to_string()],
-        };
-
-        let (status, _) = create_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(user_id, realm_id))),
-            bearer(),
-            Json(request()),
-        )
-        .await
-        .expect("a group reader may create a watch");
-        assert_eq!(status, StatusCode::CREATED);
-
-        install_holder_policies(
-            &state,
-            realm_id,
-            holder,
-            vec![aruna_core::request_policy::RequestPolicy {
-                policy_id: Ulid::generate(),
-                name: "deny-watches".to_string(),
-                kind: aruna_core::request_policy::PolicyKind::Deny,
-                when: None,
-                expression: "operation == 'notifications.create_watch'".to_string(),
-                enabled: true,
-            }],
-        )
-        .await;
-
-        let denied = create_watch(
-            State(state),
-            Extension(Some(auth_for(user_id, realm_id))),
-            bearer(),
-            Json(request()),
-        )
-        .await
-        .expect_err("the realm policy must deny watch creation");
-        assert!(matches!(denied, ServerError::Forbidden));
-    }
-
-    #[tokio::test]
-    async fn create_watch_requires_metadata_group_read_permission() {
-        let realm_id = realm_id(15);
-        let (_dir, state, net) = build_state_with_net(realm_id, [15u8; 32]).await;
-        let holder = net.node_id();
-        let metrics = NodeMetrics::new();
-        net.notification_watch_metrics().register(&metrics).await;
-        install_local_holder_config(&state, realm_id, holder).await;
-        let authorized = UserId::new(Ulid::generate(), realm_id);
-        let unauthorized = UserId::new(Ulid::generate(), realm_id);
-        let group_id = Ulid::generate();
-        install_group_authorization(&state, realm_id, group_id, authorized, &[]).await;
-        let path_prefix = format!("meta/{group_id}/datasets/proteomics");
-
-        let error = create_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(unauthorized, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: path_prefix.clone(),
-                events: vec!["metadata_created".to_string()],
-            }),
-        )
-        .await
-        .expect_err("user without metadata READ must be rejected");
-        assert!(matches!(error, ServerError::Forbidden));
-        assert!(metrics.render().await.contains(
-            "aruna_notification_watch_creation_denials_total{reason=\"permission_denied\"} 1"
-        ));
-
-        let (status, created) = create_watch(
-            State(state),
-            Extension(Some(auth_for(authorized, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: path_prefix.clone(),
-                events: vec!["metadata_created".to_string()],
-            }),
-        )
-        .await
-        .expect("metadata reader may create a watch");
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created.path_prefix, path_prefix);
-    }
-
-    #[tokio::test]
-    async fn create_watch_uses_canonical_remote_node_bucket_permission() {
-        let realm_id = realm_id(16);
-        let holder = node(16);
-        let (_dir, state) = build_state(realm_id, holder).await;
-        install_local_holder_config(&state, realm_id, holder).await;
-        let authorized = UserId::new(Ulid::generate(), realm_id);
-        let unauthorized = UserId::new(Ulid::generate(), realm_id);
-        let bucket_group_id = Ulid::generate();
-        install_group_authorization(&state, realm_id, bucket_group_id, authorized, &[]).await;
-        let remote_bucket_node = node(99);
-        let path_prefix =
-            data_watch_resource_path(bucket_group_id, remote_bucket_node, "reports", "quarterly");
-
-        let error = create_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(unauthorized, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: path_prefix.clone(),
-                events: vec!["data_uploaded".to_string()],
-            }),
-        )
-        .await
-        .expect_err("user without bucket READ must be rejected");
-        assert!(matches!(error, ServerError::Forbidden));
-
-        let (status, created) = create_watch(
-            State(state),
-            Extension(Some(auth_for(authorized, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: path_prefix.clone(),
-                events: vec!["data_uploaded".to_string()],
-            }),
-        )
-        .await
-        .expect("bucket reader may create a watch");
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created.path_prefix, path_prefix);
-    }
-
-    #[tokio::test]
-    async fn cross_group_watch() {
-        let realm_id = realm_id(17);
-        let holder = node(17);
-        let (_dir, state) = build_state(realm_id, holder).await;
-        install_local_holder_config(&state, realm_id, holder).await;
-        let watcher = UserId::new(Ulid::generate(), realm_id);
-        let uploader = UserId::new(Ulid::generate(), realm_id);
-        let credential_group = Ulid::generate();
-        let bucket_group = Ulid::generate();
-        let bucket_node = holder;
-        install_group_authorization(&state, realm_id, bucket_group, watcher, &[uploader]).await;
-        install_bucket(&state, "reports", bucket_group, watcher).await;
-
-        let (_, created) = create_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(watcher, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: data_watch_resource_path(
-                    credential_group,
-                    bucket_node,
-                    "reports",
-                    "quarterly/",
-                ),
-                events: vec!["data_uploaded".to_string()],
-            }),
-        )
-        .await
-        .expect("bucket reader may register through a foreign credential group");
-
-        let canonical =
-            data_watch_resource_path(bucket_group, bucket_node, "reports", "quarterly/");
-        assert_eq!(created.path_prefix, canonical);
-        let subscriptions = list_watch_subscriptions(&state.get_ctx().storage_handle, watcher)
-            .await
-            .expect("watch lists");
-        let event_path =
-            data_watch_resource_path(bucket_group, bucket_node, "reports", "quarterly/result.csv");
-        let event = WatchEvent {
-            event_id: Ulid::generate(),
-            realm_id,
-            kind: WatchEventKind::DataUploaded,
-            path: event_path,
-            actor: uploader,
-            occurred_at_ms: created.created_at_ms + 1,
-            detail: WatchEventDetail::DataUploaded {
-                group_id: bucket_group,
-                node_id: bucket_node,
-                bucket: "reports".to_string(),
-                key: "quarterly/result.csv".to_string(),
-                size_bytes: 1,
-            },
-        };
-        assert_eq!(route_watch_event(&event, &subscriptions).len(), 1);
-    }
-
-    // A group that does not exist and a group the caller may not read answer
-    // identically, so creating a watch is never an existence oracle.
-    #[tokio::test]
-    async fn missing_group_forbidden() {
-        let realm_id = realm_id(18);
-        let holder = node(18);
-        let (_dir, state) = build_state(realm_id, holder).await;
-        install_local_holder_config(&state, realm_id, holder).await;
-        let caller = UserId::new(Ulid::generate(), realm_id);
-        let existing_group = Ulid::generate();
-        install_group_authorization(
-            &state,
-            realm_id,
-            existing_group,
-            UserId::new(Ulid::generate(), realm_id),
-            &[],
-        )
-        .await;
-
-        let missing = create_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(caller, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: format!("meta/{}/datasets", Ulid::generate()),
-                events: vec!["metadata_created".to_string()],
-            }),
-        )
-        .await
-        .expect_err("a watch on a group that does not exist must be refused");
-        assert!(matches!(missing, ServerError::Forbidden));
-
-        let unreadable = create_watch(
-            State(state),
-            Extension(Some(auth_for(caller, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: format!("meta/{existing_group}/datasets"),
-                events: vec!["metadata_created".to_string()],
-            }),
-        )
-        .await
-        .expect_err("a watch on an existing unreadable group must be refused");
-        assert!(matches!(unreadable, ServerError::Forbidden));
-    }
-
-    #[tokio::test]
-    async fn create_watch_rejects_mixed_event_namespaces() {
-        let realm_id = realm_id(17);
-        let holder = node(17);
-        let (_dir, state) = build_state(realm_id, holder).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-        let metadata_group_id = Ulid::generate();
-        let path_prefix = format!("meta/{metadata_group_id}/datasets/shared");
-        let events = vec!["metadata_created".to_string(), "data_uploaded".to_string()];
-
-        let error = create_watch(
-            State(state),
-            Extension(Some(auth_for(user_id, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix,
-                events,
-            }),
-        )
-        .await
-        .expect_err("one prefix cannot represent both canonical namespaces");
-        assert!(matches!(error, ServerError::BadRequest));
-    }
-
-    #[tokio::test]
-    async fn create_watch_validates_input() {
-        let realm_id = realm_id(7);
-        let (_dir, state) = build_state(realm_id, node(7)).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-
-        let empty_prefix = create_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(user_id, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: String::new(),
-                events: vec!["metadata_created".to_string()],
-            }),
-        )
-        .await
-        .expect_err("empty prefix must be rejected");
-        assert!(matches!(empty_prefix, ServerError::BadRequest));
-
-        let leading_slash = create_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(user_id, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: "/bucket".to_string(),
-                events: vec!["metadata_created".to_string()],
-            }),
-        )
-        .await
-        .expect_err("leading-slash prefix must be rejected");
-        assert!(matches!(leading_slash, ServerError::BadRequest));
-
-        let empty_events = create_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(user_id, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: "bucket".to_string(),
-                events: Vec::new(),
-            }),
-        )
-        .await
-        .expect_err("empty events must be rejected");
-        assert!(matches!(empty_events, ServerError::BadRequest));
-
-        let unknown_event = create_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(user_id, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: "bucket".to_string(),
-                events: vec!["not_an_event".to_string()],
-            }),
-        )
-        .await
-        .expect_err("unknown event must be rejected");
-        assert!(matches!(unknown_event, ServerError::BadRequest));
-
-        let unscoped_data = create_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(user_id, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: "reports".to_string(),
-                events: vec!["data_uploaded".to_string()],
-            }),
-        )
-        .await
-        .expect_err("a prefix without a bucket boundary is ambiguous");
-        assert!(matches!(unscoped_data, ServerError::BadRequest));
-
-        let group_id = Ulid::generate();
-        let unscoped_metadata = create_watch(
-            State(state.clone()),
-            Extension(Some(auth_for(user_id, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: format!("meta/{group_id}"),
-                events: vec!["metadata_created".to_string()],
-            }),
-        )
-        .await
-        .expect_err("a metadata prefix without the group boundary is ambiguous");
-        assert!(matches!(unscoped_metadata, ServerError::BadRequest));
-
-        let noncanonical_metadata = create_watch(
-            State(state),
-            Extension(Some(auth_for(user_id, realm_id))),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: format!("meta/{group_id}/datasets/proteomics/"),
-                events: vec!["metadata_created".to_string()],
-            }),
-        )
-        .await
-        .expect_err("metadata prefixes must use normalized document paths");
-        assert!(matches!(noncanonical_metadata, ServerError::BadRequest));
-    }
-
-    #[tokio::test]
-    async fn delete_watch_rejects_bad_id() {
-        let realm_id = realm_id(8);
-        let (_dir, state) = build_state(realm_id, node(8)).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-        let error = delete_watch(
-            State(state),
-            Extension(Some(auth_for(user_id, realm_id))),
-            Path("not-a-ulid".to_string()),
-        )
-        .await
-        .expect_err("bad id must be rejected");
-        assert!(matches!(error, ServerError::BadRequest));
-    }
-
-    #[tokio::test]
-    async fn rejects_restricted_watch() {
-        let realm_id = realm_id(9);
-        let holder = node(9);
-        let (_dir, state) = build_state(realm_id, holder).await;
-        install_local_holder_config(&state, realm_id, holder).await;
-        let user_id = UserId::new(Ulid::generate(), realm_id);
-        let group_id = Ulid::generate();
-        install_group_authorization(&state, realm_id, group_id, user_id, &[]).await;
-        let mut auth = auth_for(user_id, realm_id);
-        auth.path_restrictions = Some(vec![PathRestriction {
-            pattern: format!("/{realm_id}/g/{group_id}/data/{holder}/bucket/allowed/**"),
-            permission: Permission::READ,
-        }]);
-
-        let list_err = list_watches(State(state.clone()), Extension(Some(auth.clone())))
-            .await
-            .expect_err("delegated token must be rejected");
-        assert!(matches!(list_err, ServerError::Forbidden));
-
-        let create_err = create_watch(
-            State(state.clone()),
-            Extension(Some(auth.clone())),
-            bearer(),
-            Json(CreateWatchRequest {
-                path_prefix: data_watch_resource_path(group_id, holder, "bucket", "allowed/"),
-                events: vec!["data_uploaded".to_string()],
-            }),
-        )
-        .await
-        .expect_err("delegated token must be rejected");
-        assert!(matches!(create_err, ServerError::Forbidden));
-
-        let delete_err = delete_watch(
-            State(state),
-            Extension(Some(auth)),
-            Path(Ulid::generate().to_string()),
-        )
-        .await
-        .expect_err("delegated token must be rejected");
-        assert!(matches!(delete_err, ServerError::Forbidden));
-    }
-}
+#[path = "notifications_tests.rs"]
+mod tests;

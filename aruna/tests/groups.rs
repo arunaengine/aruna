@@ -3,12 +3,12 @@
 mod shared;
 
 use aruna_api::routes::groups::{
-    AddGroupMemberRequest, CreateGroupRoleRequest, GroupInfoResponse, GroupMembersResponse,
+    AddMemberRequest, CreateRoleRequest, GroupInfoResponse, GroupMembersResponse,
     GroupRolesResponse, RoleResponse,
 };
 use aruna_core::UserId;
 use reqwest::StatusCode;
-use shared::{TestResult, create_bearer_token, create_group_via_http, spawn_seed_node};
+use shared::{TestResult, create_bearer_token, create_group_http, spawn_seed_node};
 use std::collections::HashMap;
 use ulid::Ulid;
 
@@ -30,7 +30,7 @@ fn role_by_name<'a>(roles: &'a [RoleResponse], name: &str) -> &'a RoleResponse {
 }
 
 #[tokio::test]
-async fn membership_lifecycle_with_invite_and_leave() -> TestResult<()> {
+async fn membership_invite_leave() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
@@ -39,7 +39,7 @@ async fn membership_lifecycle_with_invite_and_leave() -> TestResult<()> {
         seed.capabilities.clone(),
     )
     .await?;
-    let group = create_group_via_http(&seed.base_url, &admin_token, "membership-flow").await?;
+    let group = create_group_http(&seed.base_url, &admin_token, "membership-flow").await?;
 
     let everyone = UserId::nil(seed.realm_id);
     let response = reqwest::Client::new()
@@ -48,7 +48,7 @@ async fn membership_lifecycle_with_invite_and_leave() -> TestResult<()> {
             seed.base_url, group.group_id
         ))
         .bearer_auth(&admin_token)
-        .json(&AddGroupMemberRequest {
+        .json(&AddMemberRequest {
             user_id: everyone.to_string(),
             role_ids: None,
         })
@@ -76,7 +76,7 @@ async fn membership_lifecycle_with_invite_and_leave() -> TestResult<()> {
             seed.base_url, group.group_id
         ))
         .bearer_auth(&admin_token)
-        .json(&AddGroupMemberRequest {
+        .json(&AddMemberRequest {
             user_id: member_id.to_string(),
             role_ids: None,
         })
@@ -131,7 +131,7 @@ async fn membership_lifecycle_with_invite_and_leave() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResult<()> {
+async fn roles_reject_foreign() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
@@ -140,7 +140,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
         seed.capabilities.clone(),
     )
     .await?;
-    let group = create_group_via_http(&seed.base_url, &admin_token, "role-flow").await?;
+    let group = create_group_http(&seed.base_url, &admin_token, "role-flow").await?;
     let group_id = &group.group_id;
     let realm_id = seed.realm_id;
 
@@ -151,7 +151,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
             seed.base_url
         ))
         .bearer_auth(&admin_token)
-        .json(&CreateGroupRoleRequest {
+        .json(&CreateRoleRequest {
             name: "escalation".to_string(),
             permissions: HashMap::from([(format!("/{realm_id}/admin/**"), "write".to_string())]),
             assigned_users: Vec::new(),
@@ -168,7 +168,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
                 seed.base_url
             ))
             .bearer_auth(&admin_token)
-            .json(&CreateGroupRoleRequest {
+            .json(&CreateRoleRequest {
                 name: format!("public-{permission}"),
                 permissions: HashMap::from([(
                     format!("/{realm_id}/g/{group_id}/data/**"),
@@ -188,7 +188,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
             seed.base_url
         ))
         .bearer_auth(&admin_token)
-        .json(&CreateGroupRoleRequest {
+        .json(&CreateRoleRequest {
             name: "nil-assigned-user".to_string(),
             permissions: HashMap::from([(
                 format!("/{realm_id}/g/{group_id}/data/**"),
@@ -208,7 +208,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
             seed.base_url
         ))
         .bearer_auth(&admin_token)
-        .json(&CreateGroupRoleRequest {
+        .json(&CreateRoleRequest {
             name: "data-reader".to_string(),
             permissions: HashMap::from([(
                 format!("/{realm_id}/g/{group_id}/data/**"),
@@ -250,7 +250,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
 }
 
 #[tokio::test]
-async fn open_group_endpoints_hide_member_lists_from_non_members() -> TestResult<()> {
+async fn open_hides_members() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
@@ -259,7 +259,7 @@ async fn open_group_endpoints_hide_member_lists_from_non_members() -> TestResult
         seed.capabilities.clone(),
     )
     .await?;
-    let group = create_group_via_http(&seed.base_url, &admin_token, "privacy-flow").await?;
+    let group = create_group_http(&seed.base_url, &admin_token, "privacy-flow").await?;
 
     let outsider_token = create_bearer_token(
         seed.context.as_ref(),

@@ -1,6 +1,7 @@
 use crate::NodeId;
+#[cfg(test)]
 use crate::admin_documents::AdminDocumentTarget;
-use crate::document::{DocumentSyncEvent, DocumentSyncTarget};
+use crate::document::{DocumentEvent, DocumentTarget};
 use crate::errors::ConversionError;
 use crate::keyspaces::{SYNC_QUARANTINE_KEYSPACE, SYNC_QUARANTINE_USAGE_KEYSPACE};
 use crate::types::{Key, KeySpace, Value};
@@ -18,7 +19,7 @@ pub const SYNC_QUARANTINE_USAGE_KEY: &[u8] = b"usage";
 pub const SYNC_QUARANTINE_MAX_RECORDS: u64 = 4_096;
 pub const SYNC_QUARANTINE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Which `DocumentSyncEvent` variant the retained envelope carries, so listings
+/// Which `DocumentEvent` variant the retained envelope carries, so listings
 /// can group by family without decoding `event_bytes`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SyncQuarantineFamily {
@@ -37,10 +38,9 @@ impl SyncQuarantineFamily {
     }
 }
 
-/// Immutable transport identity of a rejected operation: the topic it arrived
-/// on, the signed publisher actor, and that actor's sequence. No payload field
-/// takes part, so two publishers reusing one `event_id` keep distinct rows and
-/// a redelivery replaces exactly its own row.
+/// Immutable transport identity of a rejected operation: the topic it arrived on, the signed publisher
+/// actor, and that actor's sequence. No payload field takes part, so two publishers reusing one
+/// `event_id` keep distinct rows and a redelivery replaces exactly its own row.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SyncQuarantineIdentity {
     pub topic: TopicId,
@@ -63,17 +63,17 @@ impl SyncQuarantineIdentity {
 }
 
 /// What the rejected operation carried. A payload that cannot be decoded into a
-/// `DocumentSyncEvent` at all is retained raw, so a poison op is still evidence
+/// `DocumentEvent` at all is retained raw, so a poison op is still evidence
 /// instead of an error that replays forever.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SyncQuarantineEvidence {
     Event {
         event_id: Ulid,
         family: SyncQuarantineFamily,
-        target: DocumentSyncTarget,
+        target: DocumentTarget,
         /// `Upsert`/`Delete` carry their actor in the revision, `AdminOperation` its origin.
         origin_node_id: NodeId,
-        /// The postcard-encoded complete `DocumentSyncEvent`.
+        /// The postcard-encoded complete `DocumentEvent`.
         bytes: Vec<u8>,
     },
     Raw {
@@ -83,7 +83,7 @@ pub enum SyncQuarantineEvidence {
 }
 
 impl SyncQuarantineEvidence {
-    pub fn from_event(event: &DocumentSyncEvent) -> Self {
+    pub fn from_event(event: &DocumentEvent) -> Self {
         Self::Event {
             event_id: event.event_id(),
             family: event_family(event),
@@ -104,10 +104,9 @@ impl SyncQuarantineEvidence {
     }
 }
 
-/// A replicated sync event that failed permanent validation, retained for
-/// inspection instead of being silently dropped (#338). Evidence is committed in
-/// the same transaction as the cursor that advances past it, so a topic never
-/// moves ahead of an unpersisted rejection.
+/// A replicated sync event that failed permanent validation, retained for inspection instead of being
+/// silently dropped (#338). Evidence is committed in the same transaction as the cursor that advances
+/// past it, so a topic never moves ahead of an unpersisted rejection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncQuarantineRecord {
     pub identity: SyncQuarantineIdentity,
@@ -143,7 +142,7 @@ impl SyncQuarantineRecord {
     }
 
     /// `None` for raw evidence, which by definition has no decodable event.
-    pub fn decoded_event(&self) -> Option<DocumentSyncEvent> {
+    pub fn decoded_event(&self) -> Option<DocumentEvent> {
         match &self.evidence {
             SyncQuarantineEvidence::Event { bytes, .. } => postcard::from_bytes(bytes).ok(),
             SyncQuarantineEvidence::Raw { .. } => None,
@@ -164,7 +163,7 @@ impl SyncQuarantineRecord {
         }
     }
 
-    pub fn target(&self) -> Option<&DocumentSyncTarget> {
+    pub fn target(&self) -> Option<&DocumentTarget> {
         match &self.evidence {
             SyncQuarantineEvidence::Event { target, .. } => Some(target),
             SyncQuarantineEvidence::Raw { .. } => None,
@@ -194,37 +193,20 @@ pub fn sync_quarantine_key(identity: &SyncQuarantineIdentity) -> Vec<u8> {
     key
 }
 
-fn event_family(event: &DocumentSyncEvent) -> SyncQuarantineFamily {
+fn event_family(event: &DocumentEvent) -> SyncQuarantineFamily {
     match event {
-        DocumentSyncEvent::Upsert { .. } => SyncQuarantineFamily::Upsert,
-        DocumentSyncEvent::Delete { .. } => SyncQuarantineFamily::Delete,
-        DocumentSyncEvent::AdminOperation { .. } => SyncQuarantineFamily::AdminOperation,
+        DocumentEvent::Upsert { .. } => SyncQuarantineFamily::Upsert,
+        DocumentEvent::Delete { .. } => SyncQuarantineFamily::Delete,
+        DocumentEvent::AdminOperation { .. } => SyncQuarantineFamily::AdminOperation,
     }
 }
 
-fn event_origin(event: &DocumentSyncEvent) -> NodeId {
+fn event_origin(event: &DocumentEvent) -> NodeId {
     match event {
-        DocumentSyncEvent::Upsert { change, .. } | DocumentSyncEvent::Delete { change, .. } => {
+        DocumentEvent::Upsert { change, .. } | DocumentEvent::Delete { change, .. } => {
             change.current.actor
         }
-        DocumentSyncEvent::AdminOperation { event, .. } => event.origin_node_id,
-    }
-}
-
-/// The document-sync target an admin operation rides under, mirroring the arms
-/// of the admin apply dispatch.
-pub fn admin_sync_target(target: &AdminDocumentTarget) -> DocumentSyncTarget {
-    match target {
-        AdminDocumentTarget::Group { group_id } => DocumentSyncTarget::GroupAuthorization {
-            group_id: *group_id,
-        },
-        AdminDocumentTarget::Realm { realm_id } => DocumentSyncTarget::RealmAuthorization {
-            realm_id: *realm_id,
-        },
-        AdminDocumentTarget::RealmConfig { realm_id } => DocumentSyncTarget::RealmConfig {
-            realm_id: *realm_id,
-        },
-        AdminDocumentTarget::User { user_id } => DocumentSyncTarget::User { user_id: *user_id },
+        DocumentEvent::AdminOperation { event, .. } => event.origin_node_id,
     }
 }
 
@@ -379,17 +361,17 @@ pub fn quarantine_row_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UserId;
     use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation};
-    use crate::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision};
+    use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
     use crate::structs::{Actor, PlacementRef, RealmId};
-    use crate::types::UserId;
 
     fn node() -> NodeId {
         NodeId::from_bytes(&[1u8; 32]).unwrap()
     }
 
-    fn change(kind: DocumentSyncChangeKind) -> DocumentSyncChange {
-        DocumentSyncChange {
+    fn change(kind: DocumentChangeKind) -> DocumentChange {
+        DocumentChange {
             base: None,
             current: DocumentSyncRevision {
                 generation: 3,
@@ -421,24 +403,24 @@ mod tests {
         }
     }
 
-    fn families() -> Vec<DocumentSyncEvent> {
+    fn families() -> Vec<DocumentEvent> {
         let realm_id = RealmId([9; 32]);
         vec![
-            DocumentSyncEvent::Upsert {
+            DocumentEvent::Upsert {
                 event_id: Ulid::from_bytes([4; 16]),
-                target: DocumentSyncTarget::RealmConfig { realm_id },
+                target: DocumentTarget::RealmConfig { realm_id },
                 bytes: vec![1, 2, 3],
-                change: change(DocumentSyncChangeKind::Upsert),
+                change: change(DocumentChangeKind::Upsert),
             },
-            DocumentSyncEvent::Delete {
+            DocumentEvent::Delete {
                 event_id: Ulid::from_bytes([4; 16]),
-                target: DocumentSyncTarget::User {
+                target: DocumentTarget::User {
                     user_id: UserId::local(Ulid::from_bytes([7; 16]), realm_id),
                 },
-                change: change(DocumentSyncChangeKind::Delete),
+                change: change(DocumentChangeKind::Delete),
             },
-            DocumentSyncEvent::AdminOperation {
-                target: DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentEvent::AdminOperation {
+                target: DocumentTarget::RealmConfig { realm_id },
                 origin_signature: iroh::Signature::from_bytes(&[0; 64]),
                 event: Box::new(admin_event()),
                 placement: PlacementRef::NIL,

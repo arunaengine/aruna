@@ -1,20 +1,6 @@
-//! The decentralized submission-to-completion lifecycle.
-//!
-//! Every round here is local authority over replicated immutable records: no
-//! leader, no quorum, no global scheduler. A submission is admitted by one
-//! family holder, planned independently by every witness, accepted by the
-//! target that signs its own receipt, and reduced by whoever is asked.
-//!
-//! * [`ingress`] normalizes and authorizes a request, derives its identity, and
-//!   either admits it here or forwards it one hop to an observed holder.
-//! * [`admit`] commits the claim and the immutable spec in one transaction.
-//! * [`outbox`] replicates locally published records to the other holders.
-//! * [`witness`] ranks holders, stores budgets, plans, and offers launches.
-//! * [`target`] reserves exact local capacity and signs the receipt.
-//! * [`stage`] moves the stored input versions to the target.
-//! * [`updates`] publishes the monotonic execution chain and its outputs.
-//! * [`cancel`] publishes the append-only cancellation intent.
-//! * [`routing`] answers external reads from the family projection.
+//! The decentralized submission-to-completion lifecycle: no leader, no quorum,
+//! no global scheduler. A submission is admitted by one family holder, planned
+//! by every witness, receipted by its target, and reduced by whoever is asked.
 
 use std::time::Duration;
 

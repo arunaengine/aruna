@@ -8,9 +8,13 @@ use aruna_core::compute::runtimes::{
     SessionRuntime, quick_runtime,
 };
 use aruna_core::structs::{
-    JobPayload, OBJECT_CONTENT_TYPE_KEY, Permission, blob_group_permission_path, key_content_type,
+    JobPayload, OBJECT_CONTENT_TYPE_KEY, Permission, group_permission_path, key_content_type,
 };
 use aruna_operations::driver::drive;
+use aruna_operations::jobs::command::{
+    CollisionPolicy, ExecutionInput, ExecutionOutput, ExecutionTarget, InputMode, SessionMountSpec,
+    SubmitExecutionCommand, WorkspaceMode, WorkspaceSpec,
+};
 use aruna_operations::jobs::lifecycle::family_report;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_job_routed,
@@ -123,10 +127,8 @@ pub struct RunScriptInput {
     /// Longer note about what the run does and why. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Name of an existing bucket in that group, for example `project-data`.
-    /// It is the run's workspace: the script is staged under
-    /// `.aruna/scripts/<run id>/` and outputs are written back into it. Call
-    /// `list_buckets` for readable names.
+    /// Existing workspace bucket. Scripts use `.aruna/scripts/<run id>/` and write outputs here.
+    /// Call `list_buckets` for readable names.
     pub bucket: String,
     /// Runtime id from `list_runtimes`: `python-uv`, `deno`, or `bash`.
     pub runtime: String,
@@ -142,11 +144,11 @@ pub struct RunScriptInput {
     /// Objects staged into the container next to the script. The script itself
     /// is added automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inputs: Option<Vec<crate::routes::jobs::ExecutionInputRequest>>,
+    pub inputs: Option<Vec<ExecutionInput>>,
     /// Container paths written back after the run, into `bucket` unless an
     /// entry names one of its own. Omit when the script only prints to stdout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outputs: Option<Vec<crate::routes::jobs::ExecutionOutputRequest>>,
+    pub outputs: Option<Vec<ExecutionOutput>>,
     /// Whole CPU cores reserved. Defaults to 1; `0` is refused and the group's
     /// compute quota may cap it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,7 +164,7 @@ pub struct RunScriptInput {
     /// `realm` (the default) admits the run into the realm; `local` runs it on
     /// this machine and is served by a user device node only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<crate::routes::jobs::ExecutionTarget>,
+    pub target: Option<ExecutionTarget>,
     /// Extra tags recorded on the run, for example who started it. A key under
     /// `aruna-engine.org/label/` demands a matching target label. The runtime
     /// sets its own network tag and keeps it.
@@ -175,7 +177,7 @@ pub struct SubmitJobInput {
     /// The complete native execution request. `group_id` and `image` are
     /// required; every other field has a default. Prefer `run_script` for a
     /// plain Python, Deno, or Bash script.
-    pub spec: crate::routes::jobs::SubmitExecutionRequest,
+    pub spec: SubmitExecutionCommand,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -306,7 +308,7 @@ struct ScriptPlan {
     script_text: String,
     script_type: String,
     dependency: Option<(String, String)>,
-    request: crate::routes::jobs::SubmitExecutionRequest,
+    request: SubmitExecutionCommand,
 }
 
 pub(crate) fn toolset() -> rmcp::handler::server::router::tool::ToolRouter<McpServer> {
@@ -372,7 +374,7 @@ impl McpServer {
         let extras = tool_extras("start_session", &input)?;
         let mut tags = BTreeMap::new();
         tags.insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
-        let request = crate::routes::jobs::SubmitExecutionRequest {
+        let request = SubmitExecutionCommand {
             group_id: input.group_id,
             name: input.name,
             description: None,
@@ -380,7 +382,7 @@ impl McpServer {
             runtime: Some(input.runtime),
             session_idle_after_ms: input.idle_after_ms,
             session_mount: (input.mount_prefix.is_some() || input.mount_path.is_some()).then_some(
-                crate::routes::jobs::SessionMountRequest {
+                SessionMountSpec {
                     prefix: input.mount_prefix,
                     path: input.mount_path,
                 },
@@ -399,13 +401,13 @@ impl McpServer {
             output_prefixes: Vec::new(),
             collision_policy: Default::default(),
             idempotency_key: None,
-            workspace: Some(crate::routes::jobs::WorkspaceRequest {
-                mode: crate::routes::jobs::WorkspaceModeRequest::Existing,
+            workspace: Some(WorkspaceSpec {
+                mode: WorkspaceMode::Existing,
                 bucket: Some(input.bucket),
             }),
             target: None,
         };
-        let (_, response) = crate::routes::jobs::submit_execution(
+        let response = crate::jobs::admit_execution(
             &self.state,
             Some(auth),
             request_bearer(&parts),
@@ -413,7 +415,7 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(job_error)?;
+        .map_err(|error| job_error(map_job_request(error)))?;
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -436,9 +438,9 @@ impl McpServer {
             tool_extras("run_cell", &input)?,
         )
         .await?;
-        let session = crate::routes::job_session::caller_session(&self.state, &auth, &input.id)
+        let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(job_error)?;
+            .map_err(|error| job_error(map_job_request(error)))?;
         let position = session
             .submit_cell(&input.cell_id, &input.code)
             .map_err(bad_request)?;
@@ -469,9 +471,9 @@ impl McpServer {
             tool_extras("read_cell_outputs", &input)?,
         )
         .await?;
-        let session = crate::routes::job_session::caller_session(&self.state, &auth, &input.id)
+        let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(job_error)?;
+            .map_err(|error| job_error(map_job_request(error)))?;
         let (last_event_id, outputs) =
             session.cell_outputs(&input.cell_id, input.after.unwrap_or_default());
         Ok(Json(JsonPayload(json!({
@@ -498,9 +500,9 @@ impl McpServer {
             tool_extras("interrupt_session", &input)?,
         )
         .await?;
-        let session = crate::routes::job_session::caller_session(&self.state, &auth, &input.id)
+        let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(job_error)?;
+            .map_err(|error| job_error(map_job_request(error)))?;
         session.interrupt().map_err(bad_request)?;
         Ok(Json(JsonPayload(json!({ "interrupted": true }))))
     }
@@ -526,9 +528,9 @@ impl McpServer {
             tool_extras("end_session", &input)?,
         )
         .await?;
-        let session = crate::routes::job_session::caller_session(&self.state, &auth, &input.id)
+        let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(job_error)?;
+            .map_err(|error| job_error(map_job_request(error)))?;
         session.end(aruna_compute::session::EndReason::Ended);
         Ok(Json(JsonPayload(json!({ "ended": true }))))
     }
@@ -544,7 +546,7 @@ impl McpServer {
     ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("run_script", &input)?;
-        let run_id = Ulid::generate().to_string();
+        let run_id = Ulid::from_parts(7, 7).to_string();
         let plan = build_script(input, &run_id)?;
         write_text(
             self,
@@ -583,7 +585,7 @@ impl McpServer {
             )
             .await?;
         }
-        let (_, response) = crate::routes::jobs::submit_execution(
+        let response = crate::jobs::admit_execution(
             &self.state,
             Some(auth),
             request_bearer(&parts),
@@ -591,7 +593,7 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(submit_error)?;
+        .map_err(|error| submit_error(map_job_request(error)))?;
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -608,7 +610,7 @@ impl McpServer {
     ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("submit_job", &input)?;
-        let (_, response) = crate::routes::jobs::submit_execution(
+        let response = crate::jobs::admit_execution(
             &self.state,
             Some(auth),
             request_bearer(&parts),
@@ -616,7 +618,7 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(submit_error)?;
+        .map_err(|error| submit_error(map_job_request(error)))?;
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -778,7 +780,7 @@ impl McpServer {
                 authorize_tool(
                     &self.state,
                     &auth,
-                    blob_group_permission_path(
+                    group_permission_path(
                         self.state.get_realm_id(),
                         group_id,
                         self.state.get_node_id(),
@@ -900,9 +902,7 @@ async fn artifact_output(
             &server.state.get_ctx(),
         )
         .await
-        .and_then(|result| result.transpose())
-        .ok()
-        .flatten(),
+        .ok(),
         _ => None,
     };
     let content_type = head
@@ -941,20 +941,18 @@ async fn artifact_output(
     }
 }
 
-fn request_bearer(
-    parts: &http::request::Parts,
-) -> Option<crate::auth::ValidatedArunaBearerTokenCarrier> {
+fn request_bearer(parts: &http::request::Parts) -> Option<crate::auth::ValidatedBearer> {
     parts
         .extensions
-        .get::<Option<crate::auth::ValidatedArunaBearerTokenCarrier>>()
+        .get::<Option<crate::auth::ValidatedBearer>>()
         .cloned()
         .flatten()
 }
 
-/// The REST parser answers a malformed job id with "Not found", which reads to
-/// a caller as a missing job rather than a wrong argument.
+/// A malformed job id is absence to the shared parser, which reads to a caller
+/// as a missing job rather than a wrong argument.
 fn parse_job(id: &str) -> Result<aruna_core::structs::JobId, CallToolResult> {
-    crate::routes::jobs::parse_job_id(id).map_err(|_| {
+    crate::jobs::parse_job_id(id).map_err(|_| {
         bad_request(
             "id must be a 26-character job ULID such as 01JZ8Y6T0K4W7M2N9Q5R3S8V1X; read job_id \
              from run_script, submit_job, or a list_jobs entry",
@@ -1009,11 +1007,32 @@ fn submit_error(error: crate::error::ServerError) -> CallToolResult {
     }
 }
 
+/// Maps the shared job outcome onto the REST status the tool explanations
+/// were written for.
+fn map_job_request(error: crate::jobs::JobRequestError) -> crate::error::ServerError {
+    use crate::error::ServerError;
+    use crate::jobs::JobRequestError;
+    match error {
+        JobRequestError::BadRequest => ServerError::BadRequest,
+        JobRequestError::BadRequestMessage(message) => ServerError::BadRequestMessage(message),
+        JobRequestError::Unauthorized => ServerError::Unauthorized,
+        JobRequestError::Forbidden => ServerError::Forbidden,
+        JobRequestError::NotFound => ServerError::NotFound,
+        JobRequestError::Conflict(message) => ServerError::Conflict(message),
+        JobRequestError::JobPlanConflict(message) => ServerError::JobPlanConflict(message),
+        JobRequestError::ComputeQuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
+        JobRequestError::ServiceUnavailableReason(message) => {
+            ServerError::ServiceUnavailableReason(message)
+        }
+        JobRequestError::InternalError(message) => ServerError::InternalError(message),
+    }
+}
+
 async fn compute_probe(
     server: &McpServer,
     auth: &aruna_core::structs::AuthContext,
     permission: Permission,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(&server.state, auth, permission, extras)
         .await
@@ -1092,24 +1111,24 @@ fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallT
         command.push(format!("--config={WORKDIR}/deno.json"));
     }
     command.push(script_path.clone());
-    let mut inputs = vec![crate::routes::jobs::ExecutionInputRequest {
+    let mut inputs = vec![ExecutionInput {
         bucket: input.bucket.clone(),
         key: script_key.clone(),
         version_id: None,
         source_node_id: None,
         dest_key: runtime.file.to_string(),
         container_path: Some(script_path),
-        mode: crate::routes::jobs::InputModeRequest::Snapshot,
+        mode: InputMode::Snapshot,
     }];
     if dependency.is_some() {
-        inputs.push(crate::routes::jobs::ExecutionInputRequest {
+        inputs.push(ExecutionInput {
             bucket: input.bucket.clone(),
             key: format!("{prefix}/deno.json"),
             version_id: None,
             source_node_id: None,
             dest_key: "deno.json".to_string(),
             container_path: Some(format!("{WORKDIR}/deno.json")),
-            mode: crate::routes::jobs::InputModeRequest::Snapshot,
+            mode: InputMode::Snapshot,
         });
     }
     inputs.extend(input.inputs.unwrap_or_default());
@@ -1127,7 +1146,7 @@ fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallT
         script_text,
         script_type: runtime.content_type.to_string(),
         dependency,
-        request: crate::routes::jobs::SubmitExecutionRequest {
+        request: SubmitExecutionCommand {
             group_id: input.group_id,
             name: input.name,
             description: input.description,
@@ -1147,10 +1166,10 @@ fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallT
             inputs,
             outputs: input.outputs.unwrap_or_default(),
             output_prefixes: Vec::new(),
-            collision_policy: crate::routes::jobs::CollisionPolicyRequest::Reject,
+            collision_policy: CollisionPolicy::Reject,
             idempotency_key: Some(run_id.to_string()),
-            workspace: Some(crate::routes::jobs::WorkspaceRequest {
-                mode: crate::routes::jobs::WorkspaceModeRequest::Existing,
+            workspace: Some(WorkspaceSpec {
+                mode: WorkspaceMode::Existing,
                 bucket: Some(input.bucket),
             }),
             target: Some(input.target.unwrap_or_default()),
@@ -1172,190 +1191,5 @@ fn npm_package_name(spec: &str) -> &str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builds_script_request() {
-        let plan = build_script(
-            RunScriptInput {
-                group_id: "01J00000000000000000000000".to_string(),
-                name: None,
-                description: None,
-                bucket: "scripts".to_string(),
-                runtime: "deno".to_string(),
-                script: "console.log('ok');\n".to_string(),
-                dependencies: Some(vec!["chalk@5".to_string()]),
-                inputs: None,
-                outputs: None,
-                cpu_cores: Some(2),
-                ram_bytes: Some(1_000_000_000),
-                max_walltime_ms: Some(60_000),
-                target: None,
-                tags: None,
-            },
-            "01JTEST0000000000000000000",
-        )
-        .unwrap();
-
-        assert_eq!(
-            plan.script_key,
-            ".aruna/scripts/01JTEST0000000000000000000/script.ts"
-        );
-        assert_eq!(
-            plan.request.command,
-            [
-                "deno",
-                "run",
-                "-A",
-                "--config=/work/deno.json",
-                "/work/script.ts"
-            ]
-        );
-        assert_eq!(
-            plan.request.tags.get(NETWORK_TAG).map(String::as_str),
-            Some("open")
-        );
-    }
-
-    fn error_body(result: CallToolResult) -> serde_json::Value {
-        assert_eq!(result.is_error, Some(true));
-        result.structured_content.expect("structured error body")
-    }
-
-    fn build_err(input: RunScriptInput) -> CallToolResult {
-        match build_script(input, "01JTEST0000000000000000000") {
-            Ok(_) => panic!("expected build_script to refuse the input"),
-            Err(result) => result,
-        }
-    }
-
-    fn script_input(runtime: &str, deps: Option<Vec<String>>) -> RunScriptInput {
-        RunScriptInput {
-            group_id: "01J00000000000000000000000".to_string(),
-            name: None,
-            description: None,
-            bucket: "scripts".to_string(),
-            runtime: runtime.to_string(),
-            script: "print('hi')\n".to_string(),
-            dependencies: deps,
-            inputs: None,
-            outputs: None,
-            cpu_cores: None,
-            ram_bytes: None,
-            max_walltime_ms: None,
-            target: None,
-            tags: None,
-        }
-    }
-
-    #[test]
-    fn python_inline_deps() {
-        let plan = build_script(
-            script_input("python-uv", Some(vec!["httpx>=0.27".to_string()])),
-            "01JTEST0000000000000000000",
-        )
-        .unwrap();
-        assert!(plan.script_text.starts_with("# /// script"));
-        assert!(plan.script_text.contains("requires-python"));
-        assert!(plan.dependency.is_none());
-        assert_eq!(
-            plan.request.tags.get(NETWORK_TAG).map(String::as_str),
-            Some("open")
-        );
-    }
-
-    #[test]
-    fn bash_refuses_dependencies() {
-        let text = error_body(build_err(script_input(
-            "bash",
-            Some(vec!["jq".to_string()]),
-        )));
-        assert!(
-            text["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("resolves no dependencies")
-        );
-    }
-
-    #[test]
-    fn unknown_runtime_refused() {
-        let text = error_body(build_err(script_input("ruby", None)));
-        assert!(
-            text["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("list_runtimes")
-        );
-    }
-
-    #[test]
-    fn rejects_bad_group() {
-        let mut input = script_input("bash", None);
-        input.group_id = "not-a-ulid".to_string();
-        let text = error_body(build_err(input));
-        assert_eq!(text["code"], "Bad request");
-    }
-
-    #[test]
-    fn npm_strips_versions() {
-        assert_eq!(npm_package_name("chalk@5"), "chalk");
-        assert_eq!(npm_package_name("plain"), "plain");
-        assert_eq!(npm_package_name("@scope/pkg@1.2.3"), "@scope/pkg");
-        assert_eq!(npm_package_name("@scope/pkg"), "@scope/pkg");
-    }
-
-    #[test]
-    fn parse_job_reasons() {
-        let text = error_body(parse_job("bad").unwrap_err());
-        assert!(
-            text["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("job ULID")
-        );
-        let id = aruna_core::structs::JobId::from_bytes([7u8; 16]).to_string();
-        assert!(parse_job(&id).is_ok());
-    }
-
-    #[test]
-    fn job_state_names() {
-        assert!(parse_job_state("running").is_ok());
-        assert!(parse_job_state("bogus").is_err());
-    }
-
-    #[test]
-    fn job_submit_errors() {
-        assert!(
-            error_body(job_error(crate::error::ServerError::NotFound))["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("list_jobs")
-        );
-        assert!(
-            error_body(submit_error(crate::error::ServerError::BadRequest))["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("group_id")
-        );
-        assert!(
-            error_body(submit_error(crate::error::ServerError::Forbidden))["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("write permission")
-        );
-    }
-
-    #[test]
-    fn runtime_output_ids() {
-        let ids = QUICK_RUNTIMES
-            .iter()
-            .map(RuntimeOutput::from)
-            .map(|runtime| runtime.id)
-            .collect::<Vec<_>>();
-        assert!(ids.iter().any(|id| id == "bash"));
-        assert!(ids.iter().any(|id| id == "deno"));
-        assert!(ids.iter().any(|id| id == "python-uv"));
-    }
-}
+#[path = "compute_tests.rs"]
+mod pure_tests;

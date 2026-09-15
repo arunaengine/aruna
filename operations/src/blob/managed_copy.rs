@@ -5,12 +5,13 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
 use aruna_core::structs::{
     BackendLocation, CopyOrigin, ManagedCopyKey, ManagedCopyRecord, ManagedCopyState,
     NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementPolicyError, PlacementPolicyRef, VersionKey,
 };
-use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -367,20 +368,20 @@ impl ManagedCopyRemoval {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         CopyRequest, ManagedCopyError, ManagedCopyPage, ManagedCopyRemoval, check_serveable,
         register_effect, scan_effect, split_serve_reads, transition_effect, validate_registration,
     };
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
     use aruna_core::structs::CopyOrigin;
     use aruna_core::structs::{
         BackendLocation, BackendRef, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
         ManagedCopyState, NodeSubjectRecord, PlacementPolicyRef, PlacementSubject, VersionKey,
     };
-    use aruna_core::types::NodeId;
     use std::collections::HashMap;
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
@@ -607,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_node_serves_nothing() {
+    fn rejects_blocked_serving() {
         // A rejoin blocks every governed serve until the inventory is revalidated,
         // even for rows that still read as registered.
         let registered = record(ManagedCopyState::Registered);
@@ -819,8 +820,10 @@ mod driver_tests {
         PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
     };
     use aruna_blob::blob::BlobHandler;
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE,
     };
@@ -831,7 +834,7 @@ mod driver_tests {
         ManagedCopyRecord, ManagedCopyState, NODE_SUBJECT_KEY, NodeSubjectRecord,
         PlacementPolicyRef, PlacementSubject, RealmId, RoutingSnapshot, VersionKey,
     };
-    use aruna_core::types::{GroupId, NodeId, UserId};
+    use aruna_core::types::GroupId;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use std::collections::{HashMap, VecDeque};
@@ -1031,8 +1034,6 @@ mod driver_tests {
         )
         .await
         .expect("put drives")
-        .expect("put succeeds")
-        .expect("put returns a result")
         .version_id
     }
 
@@ -1210,9 +1211,7 @@ mod driver_tests {
                 &context,
             )
             .await
-            .expect("put drives")
-            .expect("put succeeds")
-            .expect("put returns a result");
+            .expect("put drives");
         }
 
         assert_eq!(count_copies(&context, version_id).await, 1);
@@ -1271,9 +1270,7 @@ mod driver_tests {
             &context,
         )
         .await
-        .expect("delete drives")
-        .expect("delete succeeds")
-        .expect("delete returns a result");
+        .expect("delete drives");
 
         assert!(read_version(&context, version_id).await.is_none());
         assert_eq!(count_copies(&context, version_id).await, 0);

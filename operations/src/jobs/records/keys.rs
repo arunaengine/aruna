@@ -104,7 +104,7 @@ pub fn cursor_key(cursor: &FetchCursor) -> Result<JobRecordKey, JobRecordError> 
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use ulid::Ulid;
 

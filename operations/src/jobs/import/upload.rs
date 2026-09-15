@@ -1,3 +1,4 @@
+use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -8,7 +9,7 @@ use aruna_core::structs::{
     HiddenBlobKey, JobId, RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Effects, TxnId, UserId};
+use aruna_core::types::{Effects, TxnId};
 use aruna_storage::StorageHandle;
 use bytes::Bytes;
 use byteview::ByteView;
@@ -19,9 +20,10 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::jobs::JOB_MUTATE_MAX_ATTEMPTS;
+use crate::jobs::store::{CommitStep, commit_write};
 
 #[derive(Debug, PartialEq)]
-pub struct CreateRoCrateUploadConfig {
+pub struct CreateRoCrateConfig {
     pub upload_id: Ulid,
     pub owner: UserId,
     pub media_type: RoCrateMediaType,
@@ -32,7 +34,7 @@ pub struct CreateRoCrateUploadConfig {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum CreateRoCrateUploadError {
+pub enum CreateRoCrateError {
     #[error(transparent)]
     Blob(#[from] BlobError),
     #[error(transparent)]
@@ -65,7 +67,7 @@ enum CreateUploadState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct CreateRoCrateUploadOperation {
+pub struct CreateRoCrateOperation {
     upload_id: Ulid,
     owner: UserId,
     media_type: RoCrateMediaType,
@@ -75,14 +77,14 @@ pub struct CreateRoCrateUploadOperation {
     blob: Option<BackendStream<Result<Bytes, StreamError>>>,
     record: Option<RoCrateUploadRecord>,
     hidden_key: Option<HiddenBlobKey>,
-    pending_error: Option<CreateRoCrateUploadError>,
+    pending_error: Option<CreateRoCrateError>,
     cleanup_attempts: u8,
-    output: Option<Result<RoCrateUploadRecord, CreateRoCrateUploadError>>,
+    output: Option<Result<RoCrateUploadRecord, CreateRoCrateError>>,
     state: CreateUploadState,
 }
 
-impl CreateRoCrateUploadOperation {
-    pub fn new(config: CreateRoCrateUploadConfig) -> Self {
+impl CreateRoCrateOperation {
+    pub fn new(config: CreateRoCrateConfig) -> Self {
         Self {
             upload_id: config.upload_id,
             owner: config.owner,
@@ -100,7 +102,7 @@ impl CreateRoCrateUploadOperation {
         }
     }
 
-    fn fail(&mut self, error: CreateRoCrateUploadError) -> Effects {
+    fn fail(&mut self, error: CreateRoCrateError) -> Effects {
         self.output = Some(Err(error));
         self.state = CreateUploadState::Error;
         smallvec![]
@@ -153,7 +155,7 @@ impl CreateRoCrateUploadOperation {
         })]
     }
 
-    fn queue_cleanup(&mut self, error: CreateRoCrateUploadError) -> Effects {
+    fn queue_cleanup(&mut self, error: CreateRoCrateError) -> Effects {
         self.pending_error = Some(error);
         self.cleanup_attempts = 0;
         let effects = self.cleanup_obligation_effect();
@@ -164,7 +166,7 @@ impl CreateRoCrateUploadOperation {
         effects
     }
 
-    fn fail_with_cleanup(&mut self, error: CreateRoCrateUploadError) -> Effects {
+    fn fail_with_cleanup(&mut self, error: CreateRoCrateError) -> Effects {
         let (state, effects) = if self.record.is_some() {
             (CreateUploadState::CleanupRecord, self.record_effect())
         } else {
@@ -180,7 +182,7 @@ impl CreateRoCrateUploadOperation {
     }
 
     fn unexpected_event(&mut self, expected: &'static str, event: Event) -> Effects {
-        let error = CreateRoCrateUploadError::UnexpectedEvent {
+        let error = CreateRoCrateError::UnexpectedEvent {
             state: self.state_name(),
             expected,
             got: format!("{event:?}"),
@@ -232,9 +234,8 @@ impl CreateRoCrateUploadOperation {
                     Ok(value) => ByteView::from(value),
                     Err(error) => {
                         self.hidden_key = Some(hidden_key);
-                        return self.fail_with_cleanup(CreateRoCrateUploadError::Invalid(
-                            error.to_string(),
-                        ));
+                        return self
+                            .fail_with_cleanup(CreateRoCrateError::Invalid(error.to_string()));
                     }
                 };
                 self.hidden_key = Some(hidden_key);
@@ -258,7 +259,7 @@ impl CreateRoCrateUploadOperation {
         match event {
             Event::Storage(StorageEvent::WriteResult { .. }) => {
                 let Some(record) = self.record.take() else {
-                    return self.fail_with_cleanup(CreateRoCrateUploadError::NotFinished);
+                    return self.fail_with_cleanup(CreateRoCrateError::NotFinished);
                 };
                 self.hidden_key = None;
                 self.output = Some(Ok(record));
@@ -349,18 +350,18 @@ impl CreateRoCrateUploadOperation {
         let error = self
             .pending_error
             .take()
-            .unwrap_or(CreateRoCrateUploadError::Aborted);
+            .unwrap_or(CreateRoCrateError::Aborted);
         self.fail(error)
     }
 }
 
-impl Operation for CreateRoCrateUploadOperation {
+impl Operation for CreateRoCrateOperation {
     type Output = RoCrateUploadRecord;
-    type Error = CreateRoCrateUploadError;
+    type Error = CreateRoCrateError;
 
     fn start(&mut self) -> Effects {
         let Some(blob) = self.blob.take() else {
-            return self.fail(CreateRoCrateUploadError::NotFinished);
+            return self.fail(CreateRoCrateError::NotFinished);
         };
         self.state = CreateUploadState::Spool;
         smallvec![Effect::Blob(BlobEffect::SpoolHidden {
@@ -395,7 +396,7 @@ impl Operation for CreateRoCrateUploadOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(CreateRoCrateUploadError::NotFinished)?
+        self.output.ok_or(CreateRoCrateError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -418,9 +419,9 @@ impl Operation for CreateRoCrateUploadOperation {
             return smallvec![];
         }
         if self.hidden_key.is_some() {
-            self.fail_with_cleanup(CreateRoCrateUploadError::Aborted)
+            self.fail_with_cleanup(CreateRoCrateError::Aborted)
         } else {
-            self.fail(CreateRoCrateUploadError::Aborted)
+            self.fail(CreateRoCrateError::Aborted)
         }
     }
 }
@@ -510,15 +511,17 @@ pub async fn claim_rocrate_upload(
                 return Err(error);
             }
         };
-        match commit_txn(storage, txn_id).await {
-            CommitResult::Committed => return Ok(record),
-            CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
-            CommitResult::Conflict => {
-                return Err(UploadClaimError::Storage(
-                    "upload claim exhausted conflict retries".to_string(),
-                ));
-            }
-            CommitResult::Failed(error) => return Err(UploadClaimError::Storage(error)),
+        match commit_write(
+            storage,
+            txn_id,
+            attempt,
+            "upload claim exhausted conflict retries",
+        )
+        .await
+        .map_err(|error| UploadClaimError::Storage(error.to_string()))?
+        {
+            CommitStep::Committed => return Ok(record),
+            CommitStep::Retry => continue,
         }
     }
     Err(UploadClaimError::Storage(
@@ -626,26 +629,6 @@ async fn start_txn(storage: &StorageHandle) -> Result<TxnId, String> {
     }
 }
 
-enum CommitResult {
-    Committed,
-    Conflict,
-    Failed(String),
-}
-
-async fn commit_txn(storage: &StorageHandle, txn_id: TxnId) -> CommitResult {
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => CommitResult::Committed,
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }) => CommitResult::Conflict,
-        Event::Storage(StorageEvent::Error { error }) => CommitResult::Failed(error.to_string()),
-        other => CommitResult::Failed(format!("unexpected upload commit event: {other:?}")),
-    }
-}
-
 async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
     let _ = storage
         .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
@@ -665,13 +648,13 @@ mod tests {
     use std::time::SystemTime;
     use tempfile::tempdir;
 
-    fn upload_operation() -> (CreateRoCrateUploadOperation, BackendLocation) {
+    fn upload_operation() -> (CreateRoCrateOperation, BackendLocation) {
         upload_operation_with(None)
     }
 
     fn upload_operation_with(
         deadline: Option<Instant>,
-    ) -> (CreateRoCrateUploadOperation, BackendLocation) {
+    ) -> (CreateRoCrateOperation, BackendLocation) {
         let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
         let upload_id = Ulid::from_bytes([2u8; 16]);
         let location = BackendLocation {
@@ -690,7 +673,7 @@ mod tests {
             blob_size: 7,
             hashes: HashMap::new(),
         };
-        let operation = CreateRoCrateUploadOperation::new(CreateRoCrateUploadConfig {
+        let operation = CreateRoCrateOperation::new(CreateRoCrateConfig {
             upload_id,
             owner,
             media_type: RoCrateMediaType::Zip,
@@ -789,7 +772,7 @@ mod tests {
         );
         assert_eq!(
             operation.finalize(),
-            Err(CreateRoCrateUploadError::Storage(StorageError::WriteError(
+            Err(CreateRoCrateError::Storage(StorageError::WriteError(
                 "boom".to_string()
             )))
         );
@@ -862,7 +845,7 @@ mod tests {
         );
         assert_eq!(
             operation.finalize(),
-            Err(CreateRoCrateUploadError::Storage(StorageError::WriteError(
+            Err(CreateRoCrateError::Storage(StorageError::WriteError(
                 "boom".to_string()
             )))
         );
@@ -870,7 +853,7 @@ mod tests {
 
     /// Drives a failed record write through record deletion so the operation
     /// waits in `CleanupBlob` with the spooled blob still owned.
-    fn cleanup_operation() -> (CreateRoCrateUploadOperation, BackendLocation) {
+    fn cleanup_operation() -> (CreateRoCrateOperation, BackendLocation) {
         let (mut operation, location) = upload_operation();
         operation.start();
         operation.step(Event::Blob(BlobEvent::HiddenSpooled {
@@ -977,7 +960,7 @@ mod tests {
         assert!(operation.is_complete());
         assert_eq!(
             operation.finalize(),
-            Err(CreateRoCrateUploadError::Blob(BlobError::ChannelClosed))
+            Err(CreateRoCrateError::Blob(BlobError::ChannelClosed))
         );
     }
 

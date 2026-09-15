@@ -2,12 +2,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
-use aruna_core::metadata::MetadataAuthToken;
+use aruna_core::metadata::AuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{AuthContext, JobFamilyId, JobId, JobPayload, RealmId};
-use aruna_core::types::UserId;
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -27,7 +27,7 @@ use super::service::{
 };
 use super::staging::read_staging_checkpoint;
 use crate::driver::DriverContext;
-use crate::metadata::MetadataWritePeerError;
+use crate::metadata::WritePeerError;
 
 pub(crate) use aruna_core::jobs::{
     JobRequest, JobResponse, JobStatusView, WireArtifact, WireRange,
@@ -207,10 +207,10 @@ async fn prepare_response(
         .await
     {
         Ok(auth) => auth,
-        Err(MetadataWritePeerError::Unauthorized) => {
+        Err(WritePeerError::Unauthorized) => {
             return PreparedResponse::new(JobResponse::Unauthorized);
         }
-        Err(MetadataWritePeerError::Unavailable(error)) => {
+        Err(WritePeerError::Unavailable(error)) => {
             return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
         }
     };
@@ -305,12 +305,9 @@ async fn prepare_record(
     })
 }
 
-/// Owner-directed requests are answered only by the derived owner, the sole
-/// absence authority: a non-owner or unresolved owner answers `Unavailable`,
-/// and only a provably invalid id is `NotFound`.
 /// Who may answer for a job here: its immutable owner, or any node that knows
-/// the request family the alias belongs to. An external job has no single
-/// owner, so a family holder or its executor answers for it.
+/// the request family the alias belongs to. Only the derived owner is absence
+/// authority: others answer `Unavailable`, and an invalid id is `NotFound`.
 async fn owner_gate(
     context: &DriverContext,
     job_id: JobId,
@@ -444,7 +441,7 @@ async fn prepare_cancel(
     context: &DriverContext,
     runtime: &Arc<JobsRuntime>,
     auth: &AuthContext,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
     job_id: JobId,
 ) -> PreparedResponse {
     let requested_family = match crate::jobs::lifecycle::routing::family_of_alias(context, job_id)
@@ -457,9 +454,8 @@ async fn prepare_cancel(
         Ok(holds) => holds,
         Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
     };
-    // A cancel that already reached this node is never forwarded again: two
-    // divergent holder views would bounce it between the same two nodes. A
-    // non-holder answers for its own executions only.
+    // A cancel that already reached this node is never forwarded again: divergent
+    // holder views would bounce it. A non-holder answers only for its executions.
     if !holds {
         let reservations =
             match crate::jobs::lifecycle::reservation::held_reservations(context).await {
@@ -676,7 +672,7 @@ async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, Str
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::structs::{JobProgress, JobState, WorkspaceMode};
     use ulid::Ulid;

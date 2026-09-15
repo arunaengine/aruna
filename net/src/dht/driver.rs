@@ -33,11 +33,12 @@ use super::constants::{
 use super::kbucket::K;
 use super::protocol::{
     CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtInput, DhtIo, DhtIoError, DhtIoRequest, DhtOutput,
-    DhtOutputValue, InboundId, OpId, RpcPhase, StorageStage,
+    DhtOutputValue, InboundId, OpId, RpcPhase, StorageStage, dht_input_kind, dht_io_kind,
+    io_inbound_id, io_op_id,
 };
 use super::rpc::{
-    DhtRequest, DhtResponse, ErrorCode, decode_request_with_trace_context, decode_response,
-    encode_request_with_trace_context, encode_response, request_kind, response_kind,
+    DhtRequest, DhtResponse, ErrorCode, decode_response, decode_traced_request, encode_response,
+    encode_traced_request, request_kind, response_kind,
 };
 use super::state::DhtStateMachine;
 use super::storage::now_unix_secs;
@@ -48,8 +49,8 @@ use super::storage::{
 };
 use crate::connection_pool::{ConnectionPool, PoolConnectError};
 use crate::telemetry::{
-    current_trace_context, duration_ms, extract_trace_context, record_duration_ms,
-    warn_if_slow_iroh_phase, warn_if_slow_iroh_request,
+    current_trace_context, duration_ms, extract_trace_context, record_duration_ms, warn_iroh_phase,
+    warn_iroh_request,
 };
 
 pub type CallerOutcome = std::result::Result<DhtOutputValue, DhtIoError>;
@@ -444,9 +445,8 @@ impl DhtDriver {
                         self.clock_diverged = true;
                     }
                     if let DriverEvent::Command(cmd) = event {
-                        // A mutation must not be stamped under an unstable clock; fail
-                        // the command loudly, but keep the driver alive so it recovers
-                        // once the clock re-anchors on a later sample.
+                        // A mutation must not be stamped under an unstable clock;
+                        // fail loudly but keep the driver alive to recover.
                         reject_driver_cmd(cmd, clock_error(error));
                         continue;
                     }
@@ -509,7 +509,7 @@ impl DhtDriver {
         skip(self),
         fields(op_id, input = dht_input_kind(&input))
     )]
-    fn process_input_for_op(&mut self, op_id: OpId, input: DhtInput) {
+    fn process_op_input(&mut self, op_id: OpId, input: DhtInput) {
         if let Some(span) = self.op_spans.get(&op_id).cloned() {
             let _guard = span.enter();
             self.process_input(input);
@@ -522,9 +522,9 @@ impl DhtDriver {
         name = "dht.driver.process_input_for_io",
         level = "debug",
         skip(self, io),
-        fields(io = dht_io_kind(&io), op_id = ?dht_io_op_id(&io), inbound_id = ?dht_io_inbound_id(&io))
+        fields(io = dht_io_kind(&io), op_id = ?io_op_id(&io), inbound_id = ?io_inbound_id(&io))
     )]
-    fn process_input_for_io(&mut self, io: DhtIo) {
+    fn process_io_input(&mut self, io: DhtIo) {
         if let Some(span) = self.span_for_io(&io) {
             let _guard = span.enter();
             self.process_input(DhtInput::Io(io));
@@ -566,7 +566,7 @@ impl DhtDriver {
                     let _ = span.set_parent(extract_trace_context(trace_context));
                 }
                 self.op_spans.insert(op_id, span);
-                self.process_input_for_op(
+                self.process_op_input(
                     op_id,
                     DhtInput::Cmd(DhtCmd::Put {
                         op_id,
@@ -603,7 +603,7 @@ impl DhtDriver {
                 self.op_spans.insert(op_id, span);
                 self.deadlines
                     .insert(op_id, TokioInstant::now() + options.deadline);
-                self.process_input_for_op(
+                self.process_op_input(
                     op_id,
                     DhtInput::Cmd(DhtCmd::Get {
                         op_id,
@@ -633,7 +633,7 @@ impl DhtDriver {
                     let _ = span.set_parent(extract_trace_context(trace_context));
                 }
                 self.op_spans.insert(op_id, span);
-                self.process_input_for_op(
+                self.process_op_input(
                     op_id,
                     DhtInput::Cmd(DhtCmd::Bootstrap {
                         op_id,
@@ -659,7 +659,7 @@ impl DhtDriver {
                     let _ = span.set_parent(extract_trace_context(trace_context));
                 }
                 self.op_spans.insert(op_id, span);
-                self.process_input_for_op(op_id, DhtInput::Cmd(DhtCmd::RoutingTableSize { op_id }));
+                self.process_op_input(op_id, DhtInput::Cmd(DhtCmd::RoutingTableSize { op_id }));
             }
             DriverCmd::AddPeer { node_id } => {
                 self.process_input(DhtInput::Cmd(DhtCmd::AddPeer { node_id }));
@@ -688,7 +688,7 @@ impl DhtDriver {
     fn handle_effect(&mut self, effect: DhtEffect) {
         match effect {
             DhtEffect::IoRequest(request) => {
-                let span = self.span_for_io_request(&request);
+                let span = self.span_for_request(&request);
                 if let Some(span) = span {
                     let _guard = span.enter();
                     self.dispatch_io_request(*request);
@@ -823,7 +823,7 @@ impl DhtDriver {
         }
     }
 
-    fn span_for_io_request(&mut self, request: &DhtIoRequest) -> Option<Span> {
+    fn span_for_request(&mut self, request: &DhtIoRequest) -> Option<Span> {
         match request {
             DhtIoRequest::RpcRequest { op_id, .. }
             | DhtIoRequest::StorageRead { op_id, .. }
@@ -876,7 +876,7 @@ impl DhtDriver {
         let io_tx = self.io_tx.clone();
         tokio::spawn(async move {
             let started = Instant::now();
-            match tokio::time::timeout(RPC_TIMEOUT, read_request_from_stream(&mut recv)).await {
+            match tokio::time::timeout(RPC_TIMEOUT, read_stream_request(&mut recv)).await {
                 Ok(Ok((trace_context, request))) => {
                     let _ = io_tx
                         .send(DhtIo::InboundRequest {
@@ -925,7 +925,7 @@ impl DhtDriver {
         name = "dht.driver.worker_io",
         level = "debug",
         skip(self, io),
-        fields(io = dht_io_kind(&io), op_id = ?dht_io_op_id(&io), inbound_id = ?dht_io_inbound_id(&io))
+        fields(io = dht_io_kind(&io), op_id = ?io_op_id(&io), inbound_id = ?io_inbound_id(&io))
     )]
     fn handle_worker_io(&mut self, io: DhtIo) {
         if let DhtIo::InboundRequest {
@@ -954,7 +954,7 @@ impl DhtDriver {
                     "Received inbound DHT RPC"
                 );
             }
-            self.process_input_for_io(DhtIo::InboundRequest {
+            self.process_io_input(DhtIo::InboundRequest {
                 inbound_id,
                 peer,
                 request,
@@ -972,7 +972,7 @@ impl DhtDriver {
             let span = self.inbound_spans.get(&inbound_id).cloned();
             let future = async move {
                 if let Some(mut send) = maybe_send
-                    && let Err(error) = write_response_to_stream(
+                    && let Err(error) = write_stream_response(
                         &mut send,
                         &DhtResponse::Error {
                             code: ErrorCode::InvalidRequest,
@@ -1000,19 +1000,19 @@ impl DhtDriver {
 
         if let DhtIo::InboundDropped { inbound_id } = io {
             self.inbound_contexts.remove(&inbound_id);
-            self.process_input_for_io(DhtIo::InboundDropped { inbound_id });
+            self.process_io_input(DhtIo::InboundDropped { inbound_id });
             self.inbound_spans.remove(&inbound_id);
             return;
         }
 
-        self.process_input_for_io(io);
+        self.process_io_input(io);
     }
 
     #[tracing::instrument(
         name = "dht.driver.io_request",
         level = "debug",
         skip(self, request),
-        fields(request = dht_io_request_kind(&request), op_id = ?dht_io_request_op_id(&request), inbound_id = ?dht_io_request_inbound_id(&request))
+        fields(request = io_request_kind(&request), op_id = ?request_op_id(&request), inbound_id = ?request_inbound_id(&request))
     )]
     fn dispatch_io_request(&mut self, request: DhtIoRequest) {
         match request {
@@ -1185,7 +1185,7 @@ impl DhtDriver {
         tokio::spawn(
             async move {
                 if let Some(mut send) = maybe_send
-                    && let Err(error) = write_response_to_stream(&mut send, &response).await
+                    && let Err(error) = write_stream_response(&mut send, &response).await
                 {
                     warn!(
                         inbound_id,
@@ -1207,7 +1207,7 @@ impl DhtDriver {
     )]
     fn dispatch_drop_inbound(&mut self, inbound_id: InboundId) {
         self.inbound_contexts.remove(&inbound_id);
-        self.process_input_for_io(DhtIo::InboundDropped { inbound_id });
+        self.process_io_input(DhtIo::InboundDropped { inbound_id });
         self.inbound_spans.remove(&inbound_id);
     }
 
@@ -1237,7 +1237,7 @@ impl DhtDriver {
 
                 match run_storage_io(
                     stage,
-                    send_storage_effect_with_timeout(&storage, effect, op_id, stage, "read"),
+                    send_storage_effect(&storage, effect, op_id, stage, "read"),
                 )
                 .await
                 {
@@ -1324,7 +1324,7 @@ impl DhtDriver {
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => DhtIoError::QueueFull,
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => DhtIoError::Shutdown,
         };
-        self.process_input_for_io(DhtIo::StorageError {
+        self.process_io_input(DhtIo::StorageError {
             op_id,
             stage,
             error,
@@ -1615,15 +1615,7 @@ async fn reserve_revision_txn(
         key: ByteView::from(DHT_REVISION_KEY),
         txn_id: Some(txn_id),
     });
-    let current = match send_storage_effect_with_timeout(
-        storage,
-        read,
-        op_id,
-        stage,
-        "revision_read",
-    )
-    .await
-    {
+    let current = match send_storage_effect(storage, read, op_id, stage, "revision_read").await {
         Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => match decode_counter(value) {
             Ok(current) => current,
             Err(error) => {
@@ -1746,21 +1738,19 @@ async fn iter_deadlines(
             limit,
             txn_id,
         });
-        let values =
-            match send_storage_effect_with_timeout(storage, effect, op_id, stage, "deadline_iter")
-                .await
-            {
-                Ok(Event::Storage(StorageEvent::IterResult { values, .. })) => values,
-                Ok(Event::Storage(StorageEvent::Error { error })) => {
-                    return Err(storage_transaction_error(error));
-                }
-                Ok(other) => {
-                    return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
-                        "unexpected deadline iteration event: {other:?}"
-                    ))));
-                }
-                Err(error) => return Err(TransactionFailure::Failed(error)),
-            };
+        let values = match send_storage_effect(storage, effect, op_id, stage, "deadline_iter").await
+        {
+            Ok(Event::Storage(StorageEvent::IterResult { values, .. })) => values,
+            Ok(Event::Storage(StorageEvent::Error { error })) => {
+                return Err(storage_transaction_error(error));
+            }
+            Ok(other) => {
+                return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+                    "unexpected deadline iteration event: {other:?}"
+                ))));
+            }
+            Err(error) => return Err(TransactionFailure::Failed(error)),
+        };
         let mut entries = Vec::with_capacity(values.len());
         let mut invalid = Vec::new();
         for (key, _) in values {
@@ -1783,9 +1773,7 @@ async fn iter_deadlines(
             deletes: invalid,
             txn_id,
         });
-        match send_storage_effect_with_timeout(storage, effect, op_id, stage, "deadline_repair")
-            .await
-        {
+        match send_storage_effect(storage, effect, op_id, stage, "deadline_repair").await {
             Ok(Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {}
             Ok(Event::Storage(StorageEvent::Error { error })) => {
                 return Err(storage_transaction_error(error));
@@ -1854,21 +1842,19 @@ async fn find_reclaimable(
                 key: ByteView::from(entry.key.as_bytes().as_slice()),
                 txn_id: Some(txn_id),
             });
-            let value =
-                match send_storage_effect_with_timeout(storage, read, op_id, stage, "reclaim_read")
-                    .await
-                {
-                    Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => value,
-                    Ok(Event::Storage(StorageEvent::Error { error })) => {
-                        return Err(storage_transaction_error(error));
-                    }
-                    Ok(other) => {
-                        return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
-                            "unexpected reclaim read event: {other:?}"
-                        ))));
-                    }
-                    Err(error) => return Err(TransactionFailure::Failed(error)),
-                };
+            let value = match send_storage_effect(storage, read, op_id, stage, "reclaim_read").await
+            {
+                Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => value,
+                Ok(Event::Storage(StorageEvent::Error { error })) => {
+                    return Err(storage_transaction_error(error));
+                }
+                Ok(other) => {
+                    return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+                        "unexpected reclaim read event: {other:?}"
+                    ))));
+                }
+                Err(error) => return Err(TransactionFailure::Failed(error)),
+            };
             let Some(value) = value else {
                 delete_deadline(storage, op_id, stage, txn_id, index, entry).await?;
                 continue;
@@ -1972,7 +1958,7 @@ async fn run_storage_txn(
         key: ByteView::from(key.as_bytes().as_slice()),
         txn_id: Some(txn_id),
     });
-    let value = match send_storage_effect_with_timeout(storage, read, op_id, stage, "read").await {
+    let value = match send_storage_effect(storage, read, op_id, stage, "read").await {
         Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => value,
         Ok(Event::Storage(StorageEvent::Error { error })) => {
             abort_storage_txn(storage, op_id, stage, owner).await;
@@ -2193,7 +2179,7 @@ async fn apply_batch_delete(
         deletes,
         txn_id: Some(txn_id),
     });
-    match send_storage_effect_with_timeout(storage, effect, op_id, stage, "index_delete").await {
+    match send_storage_effect(storage, effect, op_id, stage, "index_delete").await {
         Ok(Event::Storage(StorageEvent::BatchDeleteResult { .. })) => Ok(()),
         Ok(Event::Storage(StorageEvent::Error { error })) => Err(storage_transaction_error(error)),
         Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
@@ -2217,7 +2203,7 @@ async fn apply_batch_write(
         writes,
         txn_id: Some(txn_id),
     });
-    match send_storage_effect_with_timeout(storage, effect, op_id, stage, "index_write").await {
+    match send_storage_effect(storage, effect, op_id, stage, "index_write").await {
         Ok(Event::Storage(StorageEvent::BatchWriteResult { .. })) => Ok(()),
         Ok(Event::Storage(StorageEvent::Error { error })) => Err(storage_transaction_error(error)),
         Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
@@ -2268,7 +2254,7 @@ async fn read_key_count(
         key: ByteView::from(DHT_KEY_COUNT_KEY),
         txn_id: Some(txn_id),
     });
-    match send_storage_effect_with_timeout(storage, read, op_id, stage, "count_read").await {
+    match send_storage_effect(storage, read, op_id, stage, "count_read").await {
         Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => decode_counter(value),
         Ok(Event::Storage(StorageEvent::Error { error })) => Err(storage_transaction_error(error)),
         Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
@@ -2325,7 +2311,7 @@ async fn write_counter(
         value: ByteView::from(value.to_le_bytes().as_slice()),
         txn_id: Some(txn_id),
     });
-    match send_storage_effect_with_timeout(storage, write, op_id, stage, operation).await {
+    match send_storage_effect(storage, write, op_id, stage, operation).await {
         Ok(Event::Storage(StorageEvent::WriteResult { .. })) => Ok(()),
         Ok(Event::Storage(StorageEvent::Error { error })) => Err(storage_transaction_error(error)),
         Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
@@ -2347,7 +2333,7 @@ async fn commit_storage_txn(
         )));
     };
     let commit = Effect::Storage(StorageEffect::CommitTransaction { txn_id });
-    match send_storage_effect_with_timeout(storage, commit, op_id, stage, "commit").await {
+    match send_storage_effect(storage, commit, op_id, stage, "commit").await {
         Ok(Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed }))
             if committed == txn_id =>
         {
@@ -2400,7 +2386,7 @@ async fn abort_storage_txn(
         return;
     };
     let abort = Effect::Storage(StorageEffect::AbortTransaction { txn_id });
-    match send_storage_effect_with_timeout(storage, abort, op_id, stage, "abort").await {
+    match send_storage_effect(storage, abort, op_id, stage, "abort").await {
         Ok(Event::Storage(StorageEvent::TransactionAborted { txn_id: aborted }))
             if aborted == txn_id =>
         {
@@ -2421,7 +2407,7 @@ fn storage_transaction_error(error: StorageError) -> TransactionFailure {
     }
 }
 
-async fn send_storage_effect_with_timeout(
+async fn send_storage_effect(
     storage: &StorageHandle,
     effect: Effect,
     op_id: OpId,
@@ -2477,29 +2463,9 @@ fn output_op_id(output: &DhtOutput) -> OpId {
     }
 }
 
-fn dht_input_kind(input: &DhtInput) -> &'static str {
-    match input {
-        DhtInput::Cmd(cmd) => dht_cmd_kind(cmd),
-        DhtInput::Io(io) => dht_io_kind(io),
-        DhtInput::Clock { .. } => "clock",
-        DhtInput::Tick { .. } => "tick",
-    }
-}
-
-fn dht_cmd_kind(cmd: &DhtCmd) -> &'static str {
-    match cmd {
-        DhtCmd::Put { .. } => "put",
-        DhtCmd::Get { .. } => "get",
-        DhtCmd::Cancel { .. } => "cancel",
-        DhtCmd::Bootstrap { .. } => "bootstrap",
-        DhtCmd::RoutingTableSize { .. } => "routing_table_size",
-        DhtCmd::AddPeer { .. } => "add_peer",
-    }
-}
-
 fn dht_effect_kind(effect: &DhtEffect) -> &'static str {
     match effect {
-        DhtEffect::IoRequest(request) => dht_io_request_kind(request),
+        DhtEffect::IoRequest(request) => io_request_kind(request),
         DhtEffect::Output(output) => dht_output_kind(output),
     }
 }
@@ -2511,55 +2477,7 @@ fn dht_output_kind(output: &DhtOutput) -> &'static str {
     }
 }
 
-fn dht_io_kind(io: &DhtIo) -> &'static str {
-    match io {
-        DhtIo::RpcResponse { .. } => "rpc_response",
-        DhtIo::RpcError { .. } => "rpc_error",
-        DhtIo::InboundRequest { .. } => "inbound_request",
-        DhtIo::InboundReadError { .. } => "inbound_read_error",
-        DhtIo::InboundDropped { .. } => "inbound_dropped",
-        DhtIo::StorageReadResult { .. } => "storage_read_result",
-        DhtIo::StorageRevisionResult { .. } => "storage_revision_result",
-        DhtIo::StorageWriteResult { .. } => "storage_write_result",
-        DhtIo::StorageIterResult { .. } => "storage_iter_result",
-        DhtIo::StorageError { .. } => "storage_error",
-        DhtIo::PeerSeen { .. } => "peer_seen",
-    }
-}
-
-fn dht_io_op_id(io: &DhtIo) -> Option<OpId> {
-    match io {
-        DhtIo::RpcResponse { op_id, .. }
-        | DhtIo::RpcError { op_id, .. }
-        | DhtIo::StorageReadResult { op_id, .. }
-        | DhtIo::StorageRevisionResult { op_id, .. }
-        | DhtIo::StorageWriteResult { op_id, .. }
-        | DhtIo::StorageIterResult { op_id, .. }
-        | DhtIo::StorageError { op_id, .. } => Some(*op_id),
-        DhtIo::InboundRequest { .. }
-        | DhtIo::InboundReadError { .. }
-        | DhtIo::InboundDropped { .. }
-        | DhtIo::PeerSeen { .. } => None,
-    }
-}
-
-fn dht_io_inbound_id(io: &DhtIo) -> Option<InboundId> {
-    match io {
-        DhtIo::InboundRequest { inbound_id, .. }
-        | DhtIo::InboundReadError { inbound_id, .. }
-        | DhtIo::InboundDropped { inbound_id } => Some(*inbound_id),
-        DhtIo::RpcResponse { .. }
-        | DhtIo::RpcError { .. }
-        | DhtIo::StorageReadResult { .. }
-        | DhtIo::StorageRevisionResult { .. }
-        | DhtIo::StorageWriteResult { .. }
-        | DhtIo::StorageIterResult { .. }
-        | DhtIo::StorageError { .. }
-        | DhtIo::PeerSeen { .. } => None,
-    }
-}
-
-fn dht_io_request_kind(request: &DhtIoRequest) -> &'static str {
+fn io_request_kind(request: &DhtIoRequest) -> &'static str {
     match request {
         DhtIoRequest::RpcRequest { .. } => "rpc_request",
         DhtIoRequest::RpcResponse { .. } => "rpc_response",
@@ -2572,7 +2490,7 @@ fn dht_io_request_kind(request: &DhtIoRequest) -> &'static str {
     }
 }
 
-fn dht_io_request_op_id(request: &DhtIoRequest) -> Option<OpId> {
+fn request_op_id(request: &DhtIoRequest) -> Option<OpId> {
     match request {
         DhtIoRequest::RpcRequest { op_id, .. }
         | DhtIoRequest::StorageRead { op_id, .. }
@@ -2584,7 +2502,7 @@ fn dht_io_request_op_id(request: &DhtIoRequest) -> Option<OpId> {
     }
 }
 
-fn dht_io_request_inbound_id(request: &DhtIoRequest) -> Option<InboundId> {
+fn request_inbound_id(request: &DhtIoRequest) -> Option<InboundId> {
     match request {
         DhtIoRequest::RpcResponse { inbound_id, .. } | DhtIoRequest::DropInbound { inbound_id } => {
             Some(*inbound_id)
@@ -2631,7 +2549,7 @@ fn encode_request_frame(
     request: &DhtRequest,
     trace_context: Option<DistributedTraceContext>,
 ) -> Result<Vec<u8>, DhtIoError> {
-    let bytes = encode_request_with_trace_context(request, trace_context)?;
+    let bytes = encode_traced_request(request, trace_context)?;
     if bytes.len() > MAX_MESSAGE_SIZE {
         return Err(DhtIoError::invalid_request("request too large"));
     }
@@ -2662,7 +2580,7 @@ async fn rpc_request(
         Ok(conn) => {
             let elapsed = connect_started.elapsed();
             record_duration_ms(&span, "iroh.connect_ms", elapsed);
-            warn_if_slow_iroh_phase("dht.rpc", "connect", elapsed);
+            warn_iroh_phase("dht.rpc", "connect", elapsed);
             trace!(
                 event = "dht.rpc.iroh_phase",
                 op_id,
@@ -2697,7 +2615,7 @@ async fn rpc_request(
         Ok(Ok(streams)) => {
             let elapsed = open_started.elapsed();
             record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
-            warn_if_slow_iroh_phase("dht.rpc", "open_bi", elapsed);
+            warn_iroh_phase("dht.rpc", "open_bi", elapsed);
             trace!(
                 event = "dht.rpc.iroh_phase",
                 op_id,
@@ -2786,7 +2704,7 @@ async fn rpc_request(
     }
     let elapsed = write_started.elapsed();
     record_duration_ms(&span, "iroh.write_request_ms", elapsed);
-    warn_if_slow_iroh_phase("dht.rpc", "write_request", elapsed);
+    warn_iroh_phase("dht.rpc", "write_request", elapsed);
     trace!(
         event = "dht.rpc.iroh_phase",
         op_id,
@@ -2804,7 +2722,7 @@ async fn rpc_request(
         Ok(Ok(_)) => {
             let elapsed = wait_response_started.elapsed();
             record_duration_ms(&span, "iroh.wait_response_header_ms", elapsed);
-            warn_if_slow_iroh_phase("dht.rpc", "wait_response_header", elapsed);
+            warn_iroh_phase("dht.rpc", "wait_response_header", elapsed);
             trace!(
                 event = "dht.rpc.iroh_phase",
                 op_id,
@@ -2848,7 +2766,7 @@ async fn rpc_request(
         Ok(Ok(_)) => {
             let elapsed = read_body_started.elapsed();
             record_duration_ms(&span, "iroh.read_response_body_ms", elapsed);
-            warn_if_slow_iroh_phase("dht.rpc", "read_response_body", elapsed);
+            warn_iroh_phase("dht.rpc", "read_response_body", elapsed);
             trace!(
                 event = "dht.rpc.iroh_phase",
                 op_id,
@@ -2883,7 +2801,7 @@ async fn rpc_request(
 
     let total_elapsed = total_started.elapsed();
     record_duration_ms(&span, "iroh.total_ms", total_elapsed);
-    warn_if_slow_iroh_request("dht.rpc", total_elapsed);
+    warn_iroh_request("dht.rpc", total_elapsed);
     trace!(
         event = "dht.rpc.iroh_completed",
         op_id,
@@ -2928,7 +2846,7 @@ fn record_selected_path(span: &Span, conn: &Connection) {
     span.record("iroh.rtt_ms", duration_ms(path.rtt()));
 }
 
-async fn read_request_from_stream(
+async fn read_stream_request(
     recv: &mut RecvStream,
 ) -> Result<(Option<DistributedTraceContext>, DhtRequest), DhtIoError> {
     let mut len_buf = [0u8; 4];
@@ -2954,10 +2872,10 @@ async fn read_request_from_stream(
         Err(err) => return Err(DhtIoError::network(err)),
     }
 
-    Ok(decode_request_with_trace_context(&req_bytes)?)
+    Ok(decode_traced_request(&req_bytes)?)
 }
 
-async fn write_response_to_stream(
+async fn write_stream_response(
     send: &mut SendStream,
     response: &DhtResponse,
 ) -> Result<(), DhtIoError> {
@@ -3009,15 +2927,10 @@ async fn write_response_to_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::make_node;
     use aruna_core::structs::RealmId;
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};
-
-    fn make_node(seed: u8) -> NodeId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-        iroh::SecretKey::from_bytes(&bytes).public()
-    }
 
     fn make_entry(seed: u8, key: DhtKeyId, expires_at: u64) -> StoredEntry {
         make_entry_rev(seed, key, expires_at, 1)

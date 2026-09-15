@@ -7,23 +7,13 @@ use std::sync::Arc;
 use utoipa::openapi::{Components, OpenApi};
 use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 
+pub mod access;
 pub mod assistant;
 pub mod audit;
-pub mod blobs;
-pub mod bucket_usage;
-pub mod compute;
-pub mod connectors;
-pub mod credentials;
 pub mod device;
-pub mod device_compute;
 pub mod drs;
-pub mod group_backends;
-pub mod group_join;
-pub mod groups;
+pub mod execution;
 pub mod info;
-pub mod job_audit;
-pub mod job_session;
-pub mod jobs;
 pub mod management_relay;
 pub mod metadata;
 pub mod notifications;
@@ -34,15 +24,18 @@ pub mod placement;
 pub mod policies;
 pub mod rocrate_import;
 pub mod search;
-pub mod sessions;
 pub mod staging;
-pub mod storage_deletion;
-pub mod storage_routing;
+pub mod storage;
 pub mod sync;
 pub mod sync_quarantine;
-pub mod tes;
-pub mod tokens;
-pub mod users;
+
+// Temporary aliases for the pre-family module paths; the access, execution
+// and storage families own these modules now. Remove once consumers migrate.
+pub use access::{credentials, group_join, groups, sessions, tokens, users};
+pub use execution::{compute, device_compute, job_audit, job_session, jobs, tes};
+pub use storage::{
+    blobs, bucket_usage, connectors, group_backends, storage_deletion, storage_routing,
+};
 
 /// The single REST source: every route is registered from a `#[utoipa::path]`
 /// handler, so the runtime router and the generated document cannot diverge.
@@ -52,25 +45,25 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(assistant::router())
         .merge(info::router())
         .merge(onboarding::router())
-        .merge(blobs::router())
-        .merge(bucket_usage::router())
+        .merge(storage::blobs::router())
+        .merge(storage::bucket_usage::router())
         .merge(drs::router())
         .merge(staging::router())
-        .merge(storage_deletion::router())
-        .merge(group_backends::router())
-        .merge(storage_routing::router())
+        .merge(storage::storage_deletion::router())
+        .merge(storage::group_backends::router())
+        .merge(storage::storage_routing::router())
         .merge(sync::router())
         .merge(sync_quarantine::router())
-        .merge(compute::router())
-        .merge(connectors::router())
-        .merge(credentials::router())
+        .merge(execution::compute::router())
+        .merge(storage::connectors::router())
+        .merge(access::credentials::router())
         .merge(device::router())
-        .merge(device_compute::router())
-        .merge(groups::router())
-        .merge(group_join::router())
-        .merge(job_session::router())
-        .merge(jobs::router())
-        .merge(job_audit::router())
+        .merge(execution::device_compute::router())
+        .merge(access::groups::router())
+        .merge(access::group_join::router())
+        .merge(execution::job_session::router())
+        .merge(execution::jobs::router())
+        .merge(execution::job_audit::router())
         .merge(metadata::router())
         .merge(oai::router())
         .merge(pid::router())
@@ -79,10 +72,10 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(notifications::router())
         .merge(policies::router())
         .merge(search::router())
-        .merge(sessions::router())
-        .merge(tes::router())
-        .merge(tokens::router())
-        .merge(users::router())
+        .merge(access::sessions::router())
+        .merge(execution::tes::router())
+        .merge(access::tokens::router())
+        .merge(access::users::router())
 }
 
 pub fn rest_router(state: Arc<ServerState>) -> Router {
@@ -134,7 +127,8 @@ fn routes_at(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+
     use super::rest_openapi;
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -451,6 +445,47 @@ mod tests {
         }
     }
 
+    /// Child modules declared behind `#[cfg(test)] mod name;`: their file is
+    /// test code, so the raw-route scan must not read assembly out of them.
+    /// Hoisted suites name their file beside the owner with `#[path = "..."]`.
+    fn test_modules(file: &Path, source: &str) -> Vec<PathBuf> {
+        let lines = source.lines().collect::<Vec<_>>();
+        let mut modules = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim() != "#[cfg(test)]" {
+                continue;
+            }
+            let (declaration, hoisted) = match lines.get(index + 1) {
+                Some(line) if line.starts_with("#[path = ") => (
+                    lines
+                        .get(index + 2)
+                        .and_then(|line| line.strip_prefix("mod ")),
+                    line.strip_prefix("#[path = \"")
+                        .and_then(|path| path.strip_suffix("\"]")),
+                ),
+                Some(line) => (line.strip_prefix("mod "), None),
+                None => (None, None),
+            };
+            let Some(name) = declaration.and_then(|declaration| declaration.strip_suffix(';'))
+            else {
+                continue;
+            };
+            if let Some(hoisted) = hoisted {
+                let owner_dir = file.parent().unwrap_or_else(|| Path::new(""));
+                modules.push(owner_dir.join(hoisted));
+                continue;
+            }
+            let directory = file.with_extension("");
+            let candidate = directory.join(format!("{name}.rs"));
+            modules.push(if candidate.exists() {
+                candidate
+            } else {
+                directory.join(name).join("mod.rs")
+            });
+        }
+        modules
+    }
+
     fn raw_gaps(file: &Path, source: &str) -> Vec<&'static str> {
         let source = source.split("#[cfg(test)]").next().unwrap_or_default();
         [".route(", ".route_service(", ".nest(", ".nest_service("]
@@ -508,8 +543,23 @@ mod tests {
         source_files(&source_root.join("src/routes"), &mut files);
         files.push(source_root.join("src/server.rs"));
         assert!(files.len() > 1, "route modules must be discoverable");
-        for file in files {
-            let source = std::fs::read_to_string(&file).expect("readable route module");
+        let sources = files
+            .iter()
+            .map(|file| {
+                (
+                    file.clone(),
+                    std::fs::read_to_string(file).expect("readable route module"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let test_files = sources
+            .iter()
+            .flat_map(|(file, source)| test_modules(file, source))
+            .collect::<BTreeSet<_>>();
+        for (file, source) in sources {
+            if test_files.contains(&file) {
+                continue;
+            }
             if let Some(form) = raw_gaps(&file, &source).first() {
                 panic!(
                     "{} registers {form} outside routes!; use routes! or routes_at",

@@ -1,0 +1,1179 @@
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::Arc;
+
+use crate::auth::{parse_group_id, require_realm_auth};
+use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::server_state::ServerState;
+use aruna_core::errors::SourceResolutionError;
+use aruna_core::structs::{
+    AuthContext, Permission, ResolvedSourceAccess, SourceConnector, SourceConnectorKind,
+    SourceEntryKind,
+};
+use aruna_operations::connectors::create_connector::{
+    SourceConnectorError, SourceConnectorInput, SourceConnectorOperation,
+};
+use aruna_operations::connectors::delete_connector::{
+    DeleteSourceError, DeleteSourceInput, DeleteSourceOperation,
+};
+use aruna_operations::connectors::get_connector::{
+    GetSourceError, GetSourceInput, GetSourceOperation,
+};
+use aruna_operations::connectors::list_connectors::{
+    ListSourceError, ListSourceInput, ListSourceOperation,
+};
+use aruna_operations::connectors::replace_connector::{
+    ReplaceSourceError, ReplaceSourceInput, ReplaceSourceOperation,
+};
+use aruna_operations::connectors::resolver::{resolve_inline_access, validate_source_path};
+use aruna_operations::connectors::secret_config::{HasConfigError, HasConfigOperation};
+use aruna_operations::connectors::validation::validate_connector_input;
+use aruna_operations::connectors::{ResolveConnectorInput, ResolveConnectorOperation};
+use aruna_operations::driver::drive;
+use aruna_operations::staging::check_source::CheckSourceOperation;
+use aruna_operations::staging::list_source::{
+    ListStagingError, ListStagingInput, ListStagingOperation,
+};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::{Extension, Json};
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant, UNIX_EPOCH};
+use tokio::time::timeout;
+use ulid::Ulid;
+use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+
+const CONNECTOR_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_ENTRY_LIMIT: usize = 200;
+const MAX_ENTRY_LIMIT: usize = 1000;
+
+#[derive(OpenApi)]
+#[openapi(
+    tags((name = "data/connectors", description = "External source connector registration"))
+)]
+pub struct ConnectorsApiDoc;
+
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(ConnectorsApiDoc::openapi())
+        .routes(routes!(check_source_connector))
+        .routes(routes!(create_source_connector, list_source_connectors))
+        .routes(routes!(
+            get_source_connector,
+            replace_source_connector,
+            delete_source_connector
+        ))
+        .routes(routes!(check_stored_connector))
+        .routes(routes!(list_connector_entries))
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = ApiSourceConnectorKind)]
+pub enum ApiConnectorKind {
+    Http,
+    S3,
+    Webdav,
+    /// Rejected on registration and refused at use; readable on stored records only.
+    Ftp,
+    /// Rejected on registration and refused at use; readable on stored records only.
+    ArunaNative,
+    /// A directory offered by a device, registered there and never here;
+    /// readable on stored records only.
+    LocalDirectory,
+}
+
+impl From<ApiConnectorKind> for SourceConnectorKind {
+    fn from(value: ApiConnectorKind) -> Self {
+        match value {
+            ApiConnectorKind::Http => SourceConnectorKind::Http,
+            ApiConnectorKind::S3 => SourceConnectorKind::S3,
+            ApiConnectorKind::Webdav => SourceConnectorKind::Webdav,
+            ApiConnectorKind::Ftp => SourceConnectorKind::Ftp,
+            ApiConnectorKind::ArunaNative => SourceConnectorKind::ArunaNative,
+            ApiConnectorKind::LocalDirectory => SourceConnectorKind::LocalDirectory,
+        }
+    }
+}
+
+impl From<SourceConnectorKind> for ApiConnectorKind {
+    fn from(value: SourceConnectorKind) -> Self {
+        match value {
+            SourceConnectorKind::Http => ApiConnectorKind::Http,
+            SourceConnectorKind::S3 => ApiConnectorKind::S3,
+            SourceConnectorKind::Webdav => ApiConnectorKind::Webdav,
+            SourceConnectorKind::Ftp => ApiConnectorKind::Ftp,
+            SourceConnectorKind::ArunaNative => ApiConnectorKind::ArunaNative,
+            SourceConnectorKind::LocalDirectory => ApiConnectorKind::LocalDirectory,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = CreateSourceConnectorRequest)]
+pub struct CreateConnectorRequest {
+    pub name: String,
+    pub kind: ApiConnectorKind,
+    pub public_config: HashMap<String, String>,
+    #[serde(default)]
+    pub secret_config: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = ReplaceSourceConnectorRequest)]
+pub struct ReplaceConnectorRequest {
+    pub name: String,
+    pub kind: ApiConnectorKind,
+    pub public_config: HashMap<String, String>,
+    #[serde(default)]
+    pub secret_config: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SourceConnectorRequest {
+    pub name: String,
+    pub kind: ApiConnectorKind,
+    pub public_config: HashMap<String, String>,
+    #[serde(default)]
+    pub secret_config: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ConnectorCheckSuccess {
+    pub ok: bool,
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ConnectorCheckFailure {
+    pub ok: bool,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ConnectorCheckResponse {
+    Success(ConnectorCheckSuccess),
+    Failure(ConnectorCheckFailure),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectorEntriesQuery {
+    #[serde(default)]
+    pub path: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectorEntryKind {
+    File,
+    Dir,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ConnectorEntryResponse {
+    pub name: String,
+    pub path: String,
+    pub kind: ConnectorEntryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ConnectorEntriesResponse {
+    pub entries: Vec<ConnectorEntryResponse>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SourceConnectorResponse {
+    pub connector_id: String,
+    pub group_id: String,
+    pub name: String,
+    pub kind: ApiConnectorKind,
+    pub public_config: HashMap<String, String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub created_by: String,
+    pub has_secret_config: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[schema(as = ListSourceConnectorsResponse)]
+pub struct ListSourceResponse {
+    pub connectors: Vec<SourceConnectorResponse>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/groups/{group_id}/connectors",
+    tag = "data/connectors",
+    summary = "Register a source connector for a group",
+    description = r#"Registers an external source connector for a group and stores its credentials write-only.
+
+**Authentication**: realm bearer token with WRITE on the group's data path.
+
+**Behavior**
+- `secret_config` is write-only: no endpoint returns it, and a reader only learns from
+  `has_secret_config` whether any credentials are stored.
+- Nothing is contacted here, so a registration proves neither that the credentials work nor that the
+  endpoint is reachable; an endpoint the egress guard blocks is only refused at use.
+- The record is written on the node that serves the request and is not replicated to the realm's
+  other nodes.
+
+**Limits** (the accepted keys depend on `kind`)
+- `http` and `webdav` require the public key `endpoint` and also accept `root`, with `username`,
+  `password` or `token` as secrets.
+- `s3` requires `bucket` and `endpoint`, also accepts `region`, `root` and `skip_signature`, and
+  requires the secrets `access_key_id` and `secret_access_key` unless `skip_signature` is `true`,
+  which in turn forbids any secret.
+- `ftp` and `aruna_native` are refused outright.
+- An unknown or empty config key, an endpoint the HTTP client would parse differently than it is
+  written, and a bucket containing a path or authority separator are refused as well."#,
+    params(("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID")),
+    request_body(
+        content = CreateConnectorRequest,
+        description = "Connector definition; `secret_config` may be omitted for a source that needs no credentials",
+        example = json!({
+            "name": "reference-data",
+            "kind": "s3",
+            "public_config": {
+                "bucket": "reference-data",
+                "endpoint": "https://s3.example.test",
+                "region": "eu-central-1"
+            },
+            "secret_config": {
+                "access_key_id": "EXAMPLE-KEY-ID-PLACEHOLDER",
+                "secret_access_key": "EXAMPLE-SECRET-PLACEHOLDER"
+            }
+        })
+    ),
+    responses(
+        (
+            status = 201,
+            description = "Connector registered; the stored credentials are never echoed back",
+            body = SourceConnectorResponse,
+            example = json!({
+                "connector_id": "01JCNCTR0123456789ABCDEFGH",
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "name": "reference-data",
+                "kind": "s3",
+                "public_config": {
+                    "bucket": "reference-data",
+                    "endpoint": "https://s3.example.test",
+                    "region": "eu-central-1"
+                },
+                "created_at": "2026-04-09T14:23:11.123456789+00:00",
+                "updated_at": "2026-04-09T14:23:11.123456789+00:00",
+                "created_by": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                "has_secret_config": true
+            })
+        ),
+        (
+            status = 400,
+            description = "The group id is not a ULID, or the name, kind or configuration failed validation; the body names no reason",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_source_connector(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+    Json(request): Json<CreateConnectorRequest>,
+) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
+
+    let result = drive(
+        SourceConnectorOperation::new(SourceConnectorInput {
+            group_id,
+            created_by: auth.user_id,
+            name: request.name,
+            kind: request.kind.into(),
+            public_config: request.public_config,
+            secret_config: request.secret_config,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(map_connector_response(
+            result.connector,
+            result.has_secret_config,
+        )),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/groups/{group_id}/connectors",
+    tag = "data/connectors",
+    summary = "List a group's source connectors",
+    description = r#"Returns every source connector the group has registered on this node.
+
+**Authentication**: realm bearer token with READ on the group's data path.
+
+**Behavior**
+- Connectors are ordered by connector id and therefore by registration time, and are returned in one
+  response: there is no paging, no cursor and no limit.
+- Credentials are never included; `has_secret_config` only states whether any are stored.
+- This is the node's own view, so a connector registered against another node of the realm is not
+  listed here."#,
+    params(("group_id" = String, Path, description = "Group whose connectors are listed, as a 26-character ULID")),
+    responses(
+        (
+            status = 200,
+            description = "Every connector the group has registered on this node, credentials excluded",
+            body = ListSourceResponse,
+            example = json!({
+                "connectors": [
+                    {
+                        "connector_id": "01JCNCTR0123456789ABCDEFGH",
+                        "group_id": "01JABCDEF0123456789ABCDEFG",
+                        "name": "reference-data",
+                        "kind": "s3",
+                        "public_config": {
+                            "bucket": "reference-data",
+                            "endpoint": "https://s3.example.test"
+                        },
+                        "created_at": "2026-04-09T14:23:11.123456789+00:00",
+                        "updated_at": "2026-04-09T14:23:11.123456789+00:00",
+                        "created_by": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                        "has_secret_config": true
+                    }
+                ]
+            })
+        ),
+        (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_source_connectors(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+) -> ServerResult<(StatusCode, Json<ListSourceResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
+
+    let result = drive(
+        ListSourceOperation::new(ListSourceInput { group_id }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_connector_list)?;
+
+    let mut connectors = Vec::with_capacity(result.connectors.len());
+    for connector in result.connectors {
+        let has_secret_config =
+            connector_has_secret(state.as_ref(), connector.connector_id).await?;
+        connectors.push(map_connector_response(connector, has_secret_config));
+    }
+
+    Ok((StatusCode::OK, Json(ListSourceResponse { connectors })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/groups/{group_id}/connectors/{connector_id}",
+    tag = "data/connectors",
+    summary = "Read one source connector",
+    description = r#"Returns one stored connector with its name, kind and public configuration.
+
+**Authentication**: realm bearer token with READ on the group's data path.
+
+**Behavior**
+- The connector is looked up under the group in the path, so a connector id belonging to a different
+  group reads as not found rather than as forbidden.
+- Credentials are never returned; `has_secret_config` is all a reader learns about them.
+- Reads this node's own records, so a connector registered against another node of the realm is not
+  found here."#,
+    params(
+        ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
+        ("connector_id" = String, Path, description = "Connector to read, as a 26-character ULID")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The stored connector, credentials excluded",
+            body = SourceConnectorResponse,
+            example = json!({
+                "connector_id": "01JCNCTR0123456789ABCDEFGH",
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "name": "reference-data",
+                "kind": "s3",
+                "public_config": {
+                    "bucket": "reference-data",
+                    "endpoint": "https://s3.example.test",
+                    "region": "eu-central-1"
+                },
+                "created_at": "2026-04-09T14:23:11.123456789+00:00",
+                "updated_at": "2026-04-09T14:25:02.987654321+00:00",
+                "created_by": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                "has_secret_config": true
+            })
+        ),
+        (
+            status = 400,
+            description = "The group id or the connector id is not a ULID",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
+            body = ErrorResponse
+        ),
+        (
+            status = 404,
+            description = "No connector with that id is registered for this group on this node",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_source_connector(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, connector_id)): Path<(String, String)>,
+) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    let connector_id = parse_connector_id(&connector_id)?;
+    ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
+
+    let result = drive(
+        GetSourceOperation::new(GetSourceInput {
+            group_id,
+            connector_id,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_get_error)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(map_connector_response(
+            result.connector,
+            result.has_secret_config,
+        )),
+    ))
+}
+
+#[utoipa::path(
+    put,
+    path = "/data/groups/{group_id}/connectors/{connector_id}",
+    tag = "data/connectors",
+    summary = "Replace a source connector's settings and credentials",
+    description = r#"Replaces a stored connector's name, kind, public configuration and credentials in full.
+
+**Authentication**: realm bearer token with WRITE on the group's data path.
+
+**Behavior**
+- This is a full replacement, not a patch: credentials that are not sent again are deleted, so after
+  a request without `secret_config` the connector has none and `has_secret_config` reads false.
+- The connector id, the owning group, the creation time and the creator are preserved and the update
+  time is refreshed.
+- Changing the credentials is refused while a stored object version still references them, so a
+  reference always resolves with the credentials it was created against; the name and the public
+  configuration may still change.
+- Nothing is contacted, so a successful replace does not prove that the new credentials work.
+
+**Limits**
+- The same validation rules as registration apply."#,
+    params(
+        ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
+        ("connector_id" = String, Path, description = "Connector to replace, as a 26-character ULID")
+    ),
+    request_body(
+        content = ReplaceConnectorRequest,
+        description = "The complete new connector definition; an omitted or empty `secret_config` clears the stored credentials",
+        example = json!({
+            "name": "reference-data",
+            "kind": "s3",
+            "public_config": {
+                "bucket": "reference-data-v2",
+                "endpoint": "https://s3.example.test",
+                "region": "eu-central-1"
+            },
+            "secret_config": {
+                "access_key_id": "EXAMPLE-KEY-ID-PLACEHOLDER",
+                "secret_access_key": "EXAMPLE-ROTATED-SECRET-PLACEHOLDER"
+            }
+        })
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The connector as stored after the replacement, credentials excluded",
+            body = SourceConnectorResponse,
+            example = json!({
+                "connector_id": "01JCNCTR0123456789ABCDEFGH",
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "name": "reference-data",
+                "kind": "s3",
+                "public_config": {
+                    "bucket": "reference-data-v2",
+                    "endpoint": "https://s3.example.test",
+                    "region": "eu-central-1"
+                },
+                "created_at": "2026-04-09T14:23:11.123456789+00:00",
+                "updated_at": "2026-04-10T09:02:44.500000000+00:00",
+                "created_by": "01JHKMNPQR0123456789ABCDEF@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                "has_secret_config": true
+            })
+        ),
+        (
+            status = 400,
+            description = "An id is not a ULID, or the new name, kind or configuration failed validation; the body names no reason",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
+            body = ErrorResponse
+        ),
+        (
+            status = 404,
+            description = "No connector with that id is registered for this group on this node",
+            body = ErrorResponse
+        ),
+        (
+            status = 409,
+            description = "The credentials are still referenced by a stored object version, and stay so until those versions are gone",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn replace_source_connector(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, connector_id)): Path<(String, String)>,
+    Json(request): Json<ReplaceConnectorRequest>,
+) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    let connector_id = parse_connector_id(&connector_id)?;
+    ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
+
+    let result = drive(
+        ReplaceSourceOperation::new(ReplaceSourceInput {
+            group_id,
+            connector_id,
+            name: request.name,
+            kind: request.kind.into(),
+            public_config: request.public_config,
+            secret_config: request.secret_config,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_replace_error)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(map_connector_response(
+            result.connector,
+            result.has_secret_config,
+        )),
+    ))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/data/groups/{group_id}/connectors/{connector_id}",
+    tag = "data/connectors",
+    summary = "Delete a source connector",
+    description = r#"Removes a source connector record and its stored credentials together.
+
+**Authentication**: realm bearer token with WRITE on the group's data path.
+
+**Behavior**
+- After a 204 nothing on this node can resolve the connector any more, and a staged reference that
+  would have used it fails from then on.
+- Repeating the call is a 404, not a silent success, so the delete is not idempotent.
+- The deletion is refused while a stored object version still references the connector's
+  credentials, so a referenced connector must be detached before it can be removed."#,
+    params(
+        ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
+        ("connector_id" = String, Path, description = "Connector to delete, as a 26-character ULID")
+    ),
+    responses(
+        (
+            status = 204,
+            description = "Connector and credentials deleted; the response has no body"
+        ),
+        (
+            status = 400,
+            description = "The group id or the connector id is not a ULID",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
+            body = ErrorResponse
+        ),
+        (
+            status = 404,
+            description = "No connector with that id is registered for this group on this node",
+            body = ErrorResponse
+        ),
+        (
+            status = 409,
+            description = "The credentials are still referenced by a stored object version, and stay so until those versions are gone",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_source_connector(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, connector_id)): Path<(String, String)>,
+) -> ServerResult<StatusCode> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    let connector_id = parse_connector_id(&connector_id)?;
+    ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
+
+    drive(
+        DeleteSourceOperation::new(DeleteSourceInput {
+            group_id,
+            connector_id,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_delete_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/groups/{group_id}/connectors/check",
+    tag = "data/connectors",
+    summary = "Test connector settings without registering them",
+    description = r#"Probes a candidate connector definition and reports whether the source answered.
+
+**Authentication**: realm bearer token with WRITE on the group's data path, as for registration,
+because the body carries credentials the node then opens a connection with.
+
+**Behavior**
+- The body is validated with exactly the registration rules, so a malformed body is rejected before
+  anything is contacted.
+- The probe outcome is reported inside a 200 response: `{"ok": true, "latency_ms": ...}` when the
+  source answered, `{"ok": false, "error": ...}` when it did not. A failed check is never an HTTP
+  error status.
+- An `http` source counts as reachable as soon as the endpoint answers, including with a 404 for the
+  probe path.
+- Nothing is stored: the credentials in the body serve this request only.
+
+**Errors**: a failure `error` comes from a fixed set.
+- `connector configuration is invalid`: the settings cannot be turned into a client.
+- `connector is unreachable`: the endpoint refused or denied, or the egress guard blocked its
+  address; worth retrying only if the remote is expected to recover.
+- `connector check is unavailable`: this node cannot run source checks at the moment; retry as is.
+- `connector check timed out`: the check exceeded its five-second budget."#,
+    params(("group_id" = String, Path, description = "Group whose data permission gates the check, as a 26-character ULID")),
+    request_body(
+        content = SourceConnectorRequest,
+        description = "A candidate connector definition in the shape registration takes; the credentials are never stored",
+        example = json!({
+            "name": "reference-data",
+            "kind": "s3",
+            "public_config": {
+                "bucket": "reference-data",
+                "endpoint": "https://s3.example.test"
+            },
+            "secret_config": {
+                "access_key_id": "EXAMPLE-KEY-ID-PLACEHOLDER",
+                "secret_access_key": "EXAMPLE-SECRET-PLACEHOLDER"
+            }
+        })
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The probe ran; `ok` says whether the source answered",
+            body = ConnectorCheckResponse,
+            examples(
+                ("Reachable" = (
+                    summary = "The source answered within the budget",
+                    value = json!({
+                        "ok": true,
+                        "latency_ms": 87
+                    })
+                )),
+                ("Unreachable" = (
+                    summary = "The endpoint did not answer or was blocked",
+                    value = json!({
+                        "ok": false,
+                        "error": "connector is unreachable"
+                    })
+                ))
+            )
+        ),
+        (
+            status = 400,
+            description = "The group id is not a ULID, or the candidate configuration failed validation; the message names the offending field",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn check_source_connector(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+    Json(request): Json<SourceConnectorRequest>,
+) -> ServerResult<Json<ConnectorCheckResponse>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
+
+    let kind: SourceConnectorKind = request.kind.into();
+    validate_connector_input(
+        &request.name,
+        kind,
+        &request.public_config,
+        &request.secret_config,
+    )
+    .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+
+    let access = resolve_inline_access(kind, &request.public_config, request.secret_config)
+        .map_err(map_resolution_error)?;
+    Ok(Json(run_connector_check(&state, access).await))
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/groups/{group_id}/connectors/{connector_id}/check",
+    tag = "data/connectors",
+    summary = "Test a registered connector's stored settings",
+    description = r#"Probes a registered connector with its stored credentials and reports the outcome.
+
+**Authentication**: realm bearer token with READ on the group's data path. READ is enough here,
+unlike the check that takes settings in the body, because the caller supplies no credentials.
+
+**Behavior**
+- The node probes the source root with the stored credentials, which tells the caller whether they
+  still work without exposing them.
+- The outcome is reported inside a 200 response exactly as for the inline check, with the same fixed
+  reason texts and the same five-second budget.
+- A stored `ftp` connector resolves but always reports `connector kind is not supported`.
+- Nothing is written and the record is left untouched whatever the outcome.
+
+**Errors**: `connector check is unavailable` and `connector check timed out` are retryable, while
+`connector configuration is invalid` and `connector kind is not supported` mean the stored record
+must be replaced."#,
+    params(
+        ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
+        ("connector_id" = String, Path, description = "Connector to probe, as a 26-character ULID")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The probe ran with the stored credentials; `ok` says whether the source answered",
+            body = ConnectorCheckResponse,
+            examples(
+                ("Reachable" = (
+                    summary = "The stored credentials still open the source",
+                    value = json!({
+                        "ok": true,
+                        "latency_ms": 142
+                    })
+                )),
+                ("Unavailable" = (
+                    summary = "This node cannot run source checks at the moment",
+                    value = json!({
+                        "ok": false,
+                        "error": "connector check is unavailable"
+                    })
+                ))
+            )
+        ),
+        (
+            status = 400,
+            description = "An id is not a ULID, or the stored record names a kind that cannot be probed at all",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
+            body = ErrorResponse
+        ),
+        (
+            status = 404,
+            description = "No connector with that id is registered for this group on this node",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn check_stored_connector(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, connector_id)): Path<(String, String)>,
+) -> ServerResult<Json<ConnectorCheckResponse>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    let connector_id = parse_connector_id(&connector_id)?;
+    ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
+
+    let resolved = drive(
+        ResolveConnectorOperation::new(ResolveConnectorInput {
+            group_id,
+            connector_id,
+            source_path: String::new(),
+            allow_root: true,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_resolution_error)?;
+
+    Ok(Json(run_connector_check(&state, resolved.access).await))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/groups/{group_id}/connectors/{connector_id}/entries",
+    tag = "data/connectors",
+    summary = "Browse the entries under a connector path",
+    description = r#"Lists one level below a path at the connector's source, using its stored credentials.
+
+**Authentication**: realm bearer token with READ on the group's data path.
+
+**Behavior**
+- The listing never descends: a directory is returned as an entry of kind `dir` and is browsed with
+  a follow-up request.
+- `size` and `modified_ms` are omitted for entries whose source reports neither, and `modified_ms`
+  is milliseconds since the Unix epoch.
+- A source that simply holds nothing below the path answers 200 with an empty list, while a source
+  reporting the path itself as gone is a 404.
+- An `http` connector has no listing protocol, so its entries are parsed out of the server's HTML
+  directory index and a server that serves none fails with 502.
+
+**Limits**
+- There is no cursor: `truncated` only says the source held more entries than the limit allowed, and
+  the only way to see more is a larger `limit`, up to the cap, or a narrower `path`."#,
+    params(
+        ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
+        ("connector_id" = String, Path, description = "Connector to browse, as a 26-character ULID"),
+        (
+            "path" = Option<String>,
+            Query,
+            description = "Directory to list, relative to the connector root and without a leading slash; absolute paths and `.` or `..` components are rejected, and an empty or absent value lists the root"
+        ),
+        (
+            "limit" = Option<usize>,
+            Query,
+            description = "Maximum number of entries to return; defaults to 200, must be greater than zero and is capped at 1000"
+        )
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The entries directly below the requested path",
+            body = ConnectorEntriesResponse,
+            example = json!({
+                "entries": [
+                    {
+                        "name": "run-1",
+                        "path": "datasets/run-1/",
+                        "kind": "dir"
+                    },
+                    {
+                        "name": "manifest.tsv",
+                        "path": "datasets/manifest.tsv",
+                        "kind": "file",
+                        "size": 20480,
+                        "modified_ms": 1775744591123_i64
+                    }
+                ],
+                "truncated": false
+            })
+        ),
+        (
+            status = 400,
+            description = "An id is not a ULID, the path escapes the connector root, or the limit is zero",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
+            body = ErrorResponse
+        ),
+        (
+            status = 404,
+            description = "No connector with that id on this node, or the source reported the path as gone",
+            body = ErrorResponse
+        ),
+        (
+            status = 502,
+            description = "The source refused the listing, the egress guard blocked its address, or no directory index could be parsed; the message repeats the source's reason and covers a configuration that can never work as well as a transient failure",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_connector_entries(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, connector_id)): Path<(String, String)>,
+    Query(query): Query<ConnectorEntriesQuery>,
+) -> ServerResult<Json<ConnectorEntriesResponse>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    let connector_id = parse_connector_id(&connector_id)?;
+    ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
+    let source_path = normalize_browse_path(&query.path)?;
+    let limit = query.limit.unwrap_or(DEFAULT_ENTRY_LIMIT);
+    if limit == 0 {
+        return Err(ServerError::BadRequestReason(
+            "limit must be greater than zero".to_string(),
+        ));
+    }
+
+    let result = drive(
+        ListStagingOperation::new(ListStagingInput {
+            group_id,
+            connector_id,
+            source_path,
+            offset: 0,
+            limit: limit.min(MAX_ENTRY_LIMIT),
+            recursive: false,
+            files_only: false,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_list_error)?;
+
+    Ok(Json(ConnectorEntriesResponse {
+        entries: result
+            .entries
+            .into_iter()
+            .map(|entry| ConnectorEntryResponse {
+                name: entry.name,
+                path: entry.path,
+                kind: match entry.kind {
+                    SourceEntryKind::File => ConnectorEntryKind::File,
+                    SourceEntryKind::Directory => ConnectorEntryKind::Dir,
+                },
+                size: entry.size,
+                modified_ms: entry.modified.and_then(|modified| {
+                    modified
+                        .duration_since(UNIX_EPOCH)
+                        .ok()
+                        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                }),
+            })
+            .collect(),
+        truncated: result.truncated,
+    }))
+}
+
+async fn run_connector_check(
+    state: &ServerState,
+    access: ResolvedSourceAccess,
+) -> ConnectorCheckResponse {
+    let started = Instant::now();
+    match timeout(
+        CONNECTOR_CHECK_TIMEOUT,
+        drive(CheckSourceOperation::new(access), &state.get_ctx()),
+    )
+    .await
+    {
+        Ok(Ok(())) => ConnectorCheckResponse::Success(ConnectorCheckSuccess {
+            ok: true,
+            latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        }),
+        Ok(Err(error)) => ConnectorCheckResponse::Failure(ConnectorCheckFailure {
+            ok: false,
+            error: check_error_message(&error),
+        }),
+        Err(_) => ConnectorCheckResponse::Failure(ConnectorCheckFailure {
+            ok: false,
+            error: "connector check timed out".to_string(),
+        }),
+    }
+}
+
+fn check_error_message(
+    error: &aruna_operations::staging::check_source::CheckSourceError,
+) -> String {
+    use aruna_core::errors::StagingSourceError;
+    use aruna_operations::staging::check_source::CheckSourceError;
+
+    match error {
+        CheckSourceError::Staging(StagingSourceError::OperatorCreationFailed(_)) => {
+            "connector configuration is invalid".to_string()
+        }
+        CheckSourceError::Staging(StagingSourceError::UnsupportedKind(_)) => {
+            "connector kind is not supported".to_string()
+        }
+        CheckSourceError::Staging(StagingSourceError::HandleMissing)
+        | CheckSourceError::Staging(StagingSourceError::ChannelClosed) => {
+            "connector check is unavailable".to_string()
+        }
+        _ => "connector is unreachable".to_string(),
+    }
+}
+
+fn normalize_browse_path(path: &str) -> ServerResult<String> {
+    if path.trim().is_empty() {
+        return Ok(String::new());
+    }
+    validate_source_path(path, false).map_err(map_resolution_error)?;
+    Ok(format!("{}/", path.trim().trim_end_matches('/')))
+}
+
+fn parse_connector_id(connector_id: &str) -> ServerResult<Ulid> {
+    Ulid::from_str(connector_id).map_err(|_| ServerError::BadRequest)
+}
+
+pub(crate) async fn ensure_data_permission(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: Ulid,
+    required_permission: Permission,
+) -> ServerResult<()> {
+    crate::auth::ensure_permission(
+        state,
+        auth,
+        format!("/{}/g/{group_id}/data/**", state.get_realm_id()),
+        required_permission,
+    )
+    .await
+}
+
+async fn connector_has_secret(state: &ServerState, connector_id: Ulid) -> ServerResult<bool> {
+    drive(HasConfigOperation::new(connector_id), &state.get_ctx())
+        .await
+        .map_err(map_secret_error)
+}
+
+fn map_secret_error(error: HasConfigError) -> ServerError {
+    ServerError::InternalError(error.to_string())
+}
+
+fn map_connector_response(
+    connector: SourceConnector,
+    has_secret_config: bool,
+) -> SourceConnectorResponse {
+    SourceConnectorResponse {
+        connector_id: connector.connector_id.to_string(),
+        group_id: connector.group_id.to_string(),
+        name: connector.name,
+        kind: connector.kind.into(),
+        public_config: connector.public_config,
+        created_at: format_system_time(connector.created_at),
+        updated_at: format_system_time(connector.updated_at),
+        created_by: connector.created_by.to_string(),
+        has_secret_config,
+    }
+}
+
+fn format_system_time(value: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(value).to_rfc3339()
+}
+
+fn map_create_error(error: SourceConnectorError) -> ServerError {
+    match error {
+        SourceConnectorError::ValidationError(_) => ServerError::BadRequest,
+        _ => ServerError::InternalError(error.to_string()),
+    }
+}
+
+fn map_connector_list(error: ListSourceError) -> ServerError {
+    ServerError::InternalError(error.to_string())
+}
+
+fn map_get_error(
+    error: aruna_operations::connectors::get_connector::GetSourceError,
+) -> ServerError {
+    match error {
+        GetSourceError::NotFound => ServerError::NotFound,
+        GetSourceError::StorageError(_)
+        | GetSourceError::ConversionError(_)
+        | GetSourceError::GetSourceConnectorFailed => ServerError::InternalError(error.to_string()),
+    }
+}
+
+fn map_replace_error(error: ReplaceSourceError) -> ServerError {
+    match error {
+        ReplaceSourceError::ValidationError(_) => ServerError::BadRequest,
+        ReplaceSourceError::NotFound => ServerError::NotFound,
+        ReplaceSourceError::ReferencedByObjectVersion => ServerError::Conflict(error.to_string()),
+        _ => ServerError::InternalError(error.to_string()),
+    }
+}
+
+fn map_delete_error(error: DeleteSourceError) -> ServerError {
+    match error {
+        DeleteSourceError::NotFound => ServerError::NotFound,
+        DeleteSourceError::ReferencedByObjectVersion => ServerError::Conflict(error.to_string()),
+        _ => ServerError::InternalError(error.to_string()),
+    }
+}
+
+fn map_resolution_error(error: SourceResolutionError) -> ServerError {
+    match error {
+        SourceResolutionError::NotFound => ServerError::NotFound,
+        SourceResolutionError::InvalidSourcePath
+        | SourceResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
+        _ => ServerError::InternalError(error.to_string()),
+    }
+}
+
+fn map_list_error(error: ListStagingError) -> ServerError {
+    match error {
+        ListStagingError::Resolve(error) => map_resolution_error(error),
+        ListStagingError::Staging(aruna_core::errors::StagingSourceError::NotFound) => {
+            ServerError::NotFound
+        }
+        ListStagingError::Staging(error) => ServerError::BadGatewayReason(error.to_string()),
+        _ => ServerError::InternalError(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+#[path = "connectors_tests.rs"]
+mod tests;

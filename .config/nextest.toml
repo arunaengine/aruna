@@ -8,6 +8,19 @@ fail-fast = true
 # 300s and terminated only after three periods (15 minutes) without finishing.
 slow-timeout = { period = "300s", terminate-after = 3 }
 
+# The audited no-I/O selection: operations and decisions that run as plain
+# synchronous tests. `pure_tests` mark fixed-input reducers and decisions,
+# `state_machine_tests` mark full start/step/finalize traces,
+# `decision_tests` mark the second pure group beside a module's main one, and
+# `reducer::tests` is the core admin-document reducer family. The ten-second
+# timeout is a hang detector, not a budget.
+[profile.fast]
+default-filter = 'test(::state_machine_tests::) | test(::pure_tests::) | test(::decision_tests::) | test(reducer::tests::)'
+test-threads = "num-cpus"
+retries = 0
+fail-fast = false
+slow-timeout = { period = "10s", terminate-after = 2 }
+
 # CI keeps the pass lines out of the log but still surfaces slow tests, and
 # runs every test so one failure does not hide the others.
 [profile.ci]

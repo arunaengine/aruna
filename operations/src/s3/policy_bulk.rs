@@ -1,18 +1,13 @@
-//! Bounded bulk application of a bucket default to current heads.
-//!
-//! A run captures one `(bucket identity, generation, target refs)` target in its
-//! own transaction. Each object is minted through the same per-version
-//! sub-operation the single-object mutation uses, which re-reads the captured
-//! default, the head and the intent inside its commit boundary. The application
-//! is additive: it unions the captured refs with the head re-read inside the mint
-//! transaction, so applying a default never removes an object's constraints.
+//! Bounded bulk application of a bucket default to current heads. Each run
+//! captures one target per transaction and mints via the single-object
+//! sub-operation, which re-reads default/head/intent and unions, never removes.
 
-use crate::blob::blob_keyspace_helper::HeadAliasContext;
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement_policy::foreign_owner;
-use crate::placement_policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::blob::records::HeadAliasContext;
+use crate::placement::policy::foreign_owner;
+use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 use crate::s3::policy_successor::{
-    CapturedDefault, MintPolicySuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
+    CapturedDefault, MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -22,8 +17,8 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     AuthContext, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
     POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, Permission, PlacementPolicyRef,
-    PlacementSubject, PolicyBlockedReason, PolicyBulkIntent, PolicyBulkIntentKey, PolicyBulkRun,
-    PolicyBulkStatus, PolicyIntentOutcome, PolicyRefMode, PolicyResolution, VersionKey,
+    PlacementSubject, PolicyBlockedReason, PolicyBulkRun, PolicyIntent, PolicyIntentKey,
+    PolicyIntentOutcome, PolicyRefMode, PolicyResolution, PolicyStatus, VersionKey,
     group_admin_path, policy_admin_path,
 };
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -60,7 +55,7 @@ pub struct BlockedGap {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BulkReport {
     pub operation_id: Ulid,
-    pub status: PolicyBulkStatus,
+    pub status: PolicyStatus,
     pub generation: u64,
     pub target_refs: Vec<PlacementPolicyRef>,
     pub observed: usize,
@@ -149,7 +144,7 @@ struct Candidate {
     /// Refs the observed head already carries; the union mint needs them
     /// resolved before it can decide.
     refs: Vec<PlacementPolicyRef>,
-    intent: Option<PolicyBulkIntent>,
+    intent: Option<PolicyIntent>,
 }
 
 /// Runs one bounded pass over this responder's own heads. Nothing here claims
@@ -166,11 +161,11 @@ pub struct PolicyBulkOperation {
     resolved: BTreeMap<Ulid, PolicyResolution>,
     candidates: Vec<Candidate>,
     index: usize,
-    mint: Option<MintPolicySuccessorOperation>,
+    mint: Option<MintSuccessorOperation>,
     /// Outcome of a mint that is still cleaning up.
     settled: Option<Result<SuccessorOutcome, SuccessorError>>,
     /// The status the closing transaction writes once the pass has finished.
-    pending_status: Option<PolicyBulkStatus>,
+    pending_status: Option<PolicyStatus>,
     report: BulkReport,
     output: Option<Result<BulkReport, BulkError>>,
 }
@@ -179,7 +174,7 @@ impl PolicyBulkOperation {
     pub fn new(config: BulkConfig) -> Self {
         let report = BulkReport {
             operation_id: config.operation_id,
-            status: PolicyBulkStatus::Active,
+            status: PolicyStatus::Active,
             generation: 0,
             target_refs: Vec::new(),
             observed: 0,
@@ -314,7 +309,7 @@ impl PolicyBulkOperation {
                 bucket_identity: bucket.identity(),
                 generation: bucket.placement_policy_generation,
                 target_refs: bucket.placement_policies.clone(),
-                status: PolicyBulkStatus::Active,
+                status: PolicyStatus::Active,
             };
             return self.write_run(run);
         };
@@ -328,10 +323,10 @@ impl PolicyBulkOperation {
             || run.target_refs != bucket.placement_policies
         {
             let mut superseded = run;
-            superseded.status = PolicyBulkStatus::Superseded;
+            superseded.status = PolicyStatus::Superseded;
             return self.write_run(superseded);
         }
-        if run.status != PolicyBulkStatus::Active {
+        if run.status != PolicyStatus::Active {
             self.run = Some(run);
             return self.stop();
         }
@@ -366,7 +361,7 @@ impl PolicyBulkOperation {
         let stopped = self
             .run
             .as_ref()
-            .is_none_or(|run| run.status != PolicyBulkStatus::Active);
+            .is_none_or(|run| run.status != PolicyStatus::Active);
         if stopped {
             return self.finish();
         }
@@ -552,7 +547,7 @@ impl PolicyBulkOperation {
     fn read_intents(&mut self) -> Effects {
         let mut reads = Vec::with_capacity(self.candidates.len());
         for candidate in &self.candidates {
-            let key = PolicyBulkIntentKey::new(self.config.operation_id, candidate.key.clone());
+            let key = PolicyIntentKey::new(self.config.operation_id, candidate.key.clone());
             let encoded = match key.to_bytes() {
                 Ok(encoded) => encoded,
                 Err(error) => return self.fail(error.into()),
@@ -579,7 +574,7 @@ impl PolicyBulkOperation {
         let mut pending = Vec::with_capacity(candidates.len());
         for (mut candidate, (_, value)) in candidates.into_iter().zip(values) {
             let stored = match value
-                .map(|value| PolicyBulkIntent::from_bytes(value.as_ref()))
+                .map(|value| PolicyIntent::from_bytes(value.as_ref()))
                 .transpose()
             {
                 Ok(stored) => stored,
@@ -595,7 +590,7 @@ impl PolicyBulkOperation {
                     if stale.is_some() {
                         self.report.replanned += 1;
                     }
-                    PolicyBulkIntent {
+                    PolicyIntent {
                         operation_id: self.config.operation_id,
                         key: candidate.key.clone(),
                         observed_head: candidate.pointer.clone(),
@@ -629,9 +624,7 @@ impl PolicyBulkOperation {
                 self.config.bucket.clone(),
                 candidate.key.clone(),
             ),
-            // The preassigned successor is also the mutation identity, so a
-            // retried pass replays onto the same version instead of minting
-            // another.
+            // The successor id is the stable mutation identity across retries.
             mutation_id: intent.successor_version_id,
             expected_head: intent.observed_head.clone(),
             bucket_identity: run.bucket_identity,
@@ -648,7 +641,7 @@ impl PolicyBulkOperation {
             }),
             intent: Some(intent),
         };
-        let mut mint = MintPolicySuccessorOperation::new(plan);
+        let mut mint = MintSuccessorOperation::new(plan);
         let effects = mint.start();
         self.mint = Some(mint);
         self.state = BulkState::Mint;
@@ -671,14 +664,12 @@ impl PolicyBulkOperation {
             // The default moved on: the run stops instead of committing an old
             // target against a new default.
             Err(SuccessorError::DefaultChanged { .. }) => {
-                return self.close_run(PolicyBulkStatus::Superseded);
+                return self.close_run(PolicyStatus::Superseded);
             }
             // This node is mid-transition, so every evaluation this pass made is
             // stale. The run stays active and a later pass resumes it.
             Err(SuccessorError::SubjectDrift) => return self.finish(),
-            // A head that moved, an id another mutation took, an intent a
-            // concurrent pass owns, and a lost commit race are all replanned by
-            // the next pass.
+            // Concurrent head, id, intent and commit races are replanned next pass.
             Err(
                 SuccessorError::HeadConflict { .. }
                 | SuccessorError::VersionCollision(_)
@@ -708,12 +699,12 @@ impl PolicyBulkOperation {
         if !converged {
             return self.finish();
         }
-        self.close_run(PolicyBulkStatus::Completed)
+        self.close_run(PolicyStatus::Completed)
     }
 
     /// Status transitions are compare-and-set: only an active run moves on, so
     /// a replayed or concurrent pass cannot revive or downgrade a finished one.
-    fn close_run(&mut self, status: PolicyBulkStatus) -> Effects {
+    fn close_run(&mut self, status: PolicyStatus) -> Effects {
         self.pending_status = Some(status);
         self.state = BulkState::StartStatus;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -749,7 +740,7 @@ impl PolicyBulkOperation {
         let (Some(mut run), Some(status)) = (stored, self.pending_status) else {
             return self.stop();
         };
-        if run.status != PolicyBulkStatus::Active {
+        if run.status != PolicyStatus::Active {
             self.run = Some(run);
             return self.stop();
         }
@@ -970,18 +961,18 @@ impl Operation for PolicyBulkOperation {
 #[cfg(test)]
 mod tests {
     use super::{BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, PolicyBulkOperation};
-    use crate::claim_initial_realm_admin::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    };
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive, gate_context};
-    use crate::placement_policy::cache::cache_key;
-    use crate::placement_policy::fixtures::{seed_gate, subject};
-    use crate::s3::bucket_placement::{PutBucketPlacementInput, PutBucketPlacementOperation};
-    use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use crate::placement::policy::cache::cache_key;
+    use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use crate::s3::bucket::placement::{PutPlacementInput, PutPlacementOperation};
+    use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use crate::tests::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
         PLACEMENT_POLICY_CACHE_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -992,10 +983,10 @@ mod tests {
         Actor, AuthContext, Backend, BackendConfig, BackendRef, BlobHeadKey, BlobVersion,
         BucketInfo, CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord,
         POLICY_BULK_INTENT_KEYSPACE, PlacementPolicy, PlacementPolicyRef, PlacementSelector,
-        PolicyBlockedReason, PolicyBulkIntent, PolicyBulkIntentKey, PolicyBulkStatus,
-        PolicyIntentOutcome, RealmId, RoutingSnapshot, VerifiedPolicy, VersionKey,
+        PolicyBlockedReason, PolicyIntent, PolicyIntentKey, PolicyIntentOutcome, PolicyStatus,
+        RealmId, RoutingSnapshot, VerifiedPolicy, VersionKey,
     };
-    use aruna_core::types::{GroupId, Key, NodeId, UserId, Value};
+    use aruna_core::types::{GroupId, Key, Value};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -1087,7 +1078,7 @@ mod tests {
         .await
         .expect("realm is created");
         drive(
-            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput { actor }),
+            ClaimInitialOperation::new(ClaimInitialInput { actor }),
             &context,
         )
         .await
@@ -1153,8 +1144,6 @@ mod tests {
         drive(operation, context)
             .await
             .expect("put drives")
-            .expect("put succeeds")
-            .expect("put returns a result")
             .version_id
     }
 
@@ -1194,7 +1183,7 @@ mod tests {
         refs: Vec<PlacementPolicyRef>,
     ) {
         drive(
-            PutBucketPlacementOperation::new(PutBucketPlacementInput {
+            PutPlacementOperation::new(PutPlacementInput {
                 bucket: BUCKET.to_string(),
                 group_id: fixture.group_id,
                 policies: refs,
@@ -1350,12 +1339,12 @@ mod tests {
         context: &DriverContext,
         operation_id: Ulid,
         key: &str,
-    ) -> Option<PolicyBulkIntent> {
+    ) -> Option<PolicyIntent> {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: POLICY_BULK_INTENT_KEYSPACE.to_string(),
-                key: PolicyBulkIntentKey::new(operation_id, key)
+                key: PolicyIntentKey::new(operation_id, key)
                     .to_bytes()
                     .expect("key encodes")
                     .into(),
@@ -1365,7 +1354,7 @@ mod tests {
         else {
             panic!("unexpected storage read result");
         };
-        value.map(|value| PolicyBulkIntent::from_bytes(value.as_ref()).expect("intent decodes"))
+        value.map(|value| PolicyIntent::from_bytes(value.as_ref()).expect("intent decodes"))
     }
 
     fn bulk_config(group_id: GroupId) -> BulkConfig {
@@ -1462,7 +1451,7 @@ mod tests {
         assert!(read_copy(&context, OBJECT, head.version_id).await.is_some());
         assert!(matches!(
             read_intent(&context, operation_id, OBJECT).await,
-            Some(PolicyBulkIntent {
+            Some(PolicyIntent {
                 outcome: PolicyIntentOutcome::Completed { .. },
                 ..
             })
@@ -1477,7 +1466,7 @@ mod tests {
         .expect("second pass runs");
         assert_eq!(second.minted, 0);
         assert_eq!(second.covered, 1);
-        assert_eq!(second.status, PolicyBulkStatus::Completed);
+        assert_eq!(second.status, PolicyStatus::Completed);
     }
 
     #[tokio::test]
@@ -1540,10 +1529,10 @@ mod tests {
             Some(PolicyBlockedReason::PolicyUnresolved)
         );
         assert_eq!(read_head(&context, OBJECT).await.version_id, predecessor);
-        assert_eq!(report.status, PolicyBulkStatus::Active);
+        assert_eq!(report.status, PolicyStatus::Active);
         assert!(matches!(
             read_intent(&context, operation_id, OBJECT).await,
-            Some(PolicyBulkIntent {
+            Some(PolicyIntent {
                 outcome: PolicyIntentOutcome::Blocked(PolicyBlockedReason::PolicyUnresolved),
                 ..
             })
@@ -1600,7 +1589,7 @@ mod tests {
         assert_eq!(count_versions(&context, OBJECT).await, 2);
     }
 
-    async fn write_intent(context: &DriverContext, intent: &PolicyBulkIntent) {
+    async fn write_intent(context: &DriverContext, intent: &PolicyIntent) {
         let _ = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -1646,7 +1635,7 @@ mod tests {
         let taken = Ulid::generate();
         write_intent(
             &context,
-            &PolicyBulkIntent {
+            &PolicyIntent {
                 operation_id,
                 key: "a.txt".to_string(),
                 observed_head: read_head(&context, "a.txt").await,
@@ -1701,7 +1690,7 @@ mod tests {
         .await
         .expect("second pass runs");
 
-        assert_eq!(report.status, PolicyBulkStatus::Superseded);
+        assert_eq!(report.status, PolicyStatus::Superseded);
         assert_eq!(report.observed, 0);
     }
 
@@ -1822,7 +1811,7 @@ mod tests {
         assert_eq!(report.covered, 1);
         assert_eq!(report.minted, 0);
         assert_eq!(read_head(&context, OBJECT).await.version_id, version_id);
-        assert_eq!(report.status, PolicyBulkStatus::Completed);
+        assert_eq!(report.status, PolicyStatus::Completed);
     }
 
     #[test]

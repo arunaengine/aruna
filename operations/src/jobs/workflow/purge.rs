@@ -4,28 +4,24 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::BLOB_DELETE_AUDIT_KEYSPACE;
 use aruna_core::structs::{
-    BlobDeleteAuditKind, BlobDeleteAuditRecord, BlobPurgeScopeKind, JobError, JobProgress,
-    JobResultPayload, MultipartUpload, Permission, StoragePurgeCheckpoint, StoragePurgeResult,
-    StoragePurgeScope, StoragePurgeSpec, blob_object_permission_path, delete_audit_key,
+    BlobAuditKind, BlobAuditRecord, BlobPurgeKind, JobError, JobProgress, JobResultPayload,
+    MultipartUpload, Permission, StoragePurgeCheckpoint, StoragePurgeResult, StoragePurgeScope,
+    StoragePurgeSpec, delete_audit_key, object_permission_path,
 };
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{flush_progress, put_purge_checkpoint, read_purge_checkpoint};
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::drive;
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::s3::abort_multipart_upload::{
-    AbortMultipartUploadError, AbortMultipartUploadInput, AbortMultipartUploadOperation,
-};
+use crate::s3::abort_upload::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::delete_bucket::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::delete_object::DeleteObjectError;
-use crate::s3::delete_objects::{DeleteObjectsEntry, DeleteObjectsInput, delete_objects};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::s3::list_multipart_uploads::{ListMultipartUploadsInput, ListMultipartUploadsOperation};
-use crate::s3::list_object_versions::{
-    ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
-};
+use crate::s3::delete_objects::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use crate::s3::list_uploads::{ListUploadsInput, ListUploadsOperation};
+use crate::s3::list_versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
 use crate::s3::purge_fence::{PurgeFenceError, acquire_purge_fence};
 
 const PURGE_BATCH_SIZE: usize = 1_000;
@@ -62,17 +58,16 @@ async fn run_fenced_purge(
 ) -> Result<StoragePurgeResult, PurgeRunError> {
     check_stop(ctx)?;
     let bucket_exists = match drive(
-        GetBucketInfoOperation::new(spec.scope.bucket().to_string()),
+        GetBucketOperation::new(spec.scope.bucket().to_string()),
         &ctx.driver,
     )
     .await
-    .and_then(|result| result.transpose())
     {
-        Ok(Some(info)) if info.group_id == spec.group_id => true,
-        Ok(Some(_)) => {
+        Ok(info) if info.group_id == spec.group_id => true,
+        Ok(_) => {
             return Err(JobError::permanent("purge bucket is outside the authorized group").into());
         }
-        Ok(None) | Err(GetBucketInfoError::NotFound) => false,
+        Err(GetBucketError::NotFound) => false,
         Err(error) => {
             return Err(JobError::retryable(format!("purge bucket read failed: {error}")).into());
         }
@@ -137,14 +132,8 @@ async fn run_fenced_purge(
                 &ctx.driver,
             )
             .await
-            .and_then(|result| result.transpose())
             {
-                Ok(Some(())) | Err(DeleteBucketError::NotFound) => {}
-                Ok(None) => {
-                    return Err(
-                        JobError::retryable("purge bucket delete returned no result").into(),
-                    );
-                }
+                Ok(()) | Err(DeleteBucketError::NotFound) => {}
                 Err(error) => {
                     return Err(JobError::retryable(format!(
                         "purge bucket delete failed: {error}"
@@ -176,18 +165,18 @@ async fn run_fenced_purge(
     })
 }
 
-fn purge_audit_record(spec: &StoragePurgeSpec, occurred_at_ms: u64) -> BlobDeleteAuditRecord {
+fn purge_audit_record(spec: &StoragePurgeSpec, occurred_at_ms: u64) -> BlobAuditRecord {
     let (scope, key) = match &spec.scope {
-        StoragePurgeScope::File { key, .. } => (BlobPurgeScopeKind::File, key.clone()),
-        StoragePurgeScope::Prefix { prefix, .. } => (BlobPurgeScopeKind::Prefix, prefix.clone()),
-        StoragePurgeScope::Bucket { .. } => (BlobPurgeScopeKind::Bucket, String::new()),
+        StoragePurgeScope::File { key, .. } => (BlobPurgeKind::File, key.clone()),
+        StoragePurgeScope::Prefix { prefix, .. } => (BlobPurgeKind::Prefix, prefix.clone()),
+        StoragePurgeScope::Bucket { .. } => (BlobPurgeKind::Bucket, String::new()),
     };
-    BlobDeleteAuditRecord {
+    BlobAuditRecord {
         realm_id: spec.auth_context.realm_id,
         group_id: spec.group_id,
         node_id: spec.node_id,
         user_id: spec.auth_context.user_id,
-        kind: BlobDeleteAuditKind::Purge(scope),
+        kind: BlobAuditKind::Purge(scope),
         bucket: spec.scope.bucket().to_string(),
         key,
         version_id: None,
@@ -234,7 +223,7 @@ async fn abort_uploads(
             check_stop(ctx)?;
             authorize_object(ctx, spec, &upload.key).await?;
             match drive(
-                AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
+                AbortUploadOperation::new(AbortUploadInput {
                     bucket: upload.bucket,
                     key: upload.key,
                     upload_id: upload.upload_id,
@@ -244,13 +233,9 @@ async fn abort_uploads(
                 &ctx.driver,
             )
             .await
-            .and_then(|result| result.transpose())
             {
-                Ok(Some(())) | Err(AbortMultipartUploadError::NoSuchUpload) => removed += 1,
-                Ok(None) => {
-                    return Err(JobError::retryable("multipart abort returned no result").into());
-                }
-                Err(AbortMultipartUploadError::UploadNotOpen) => {
+                Ok(()) | Err(AbortUploadError::NoSuchUpload) => removed += 1,
+                Err(AbortUploadError::UploadNotOpen) => {
                     return Err(JobError::retryable(
                         "matching multipart upload changed state during purge",
                     )
@@ -283,12 +268,12 @@ async fn delete_versions(
             .items
             .into_iter()
             .map(|item| match item {
-                ListObjectVersionsItem::Version {
+                ListVersionsItem::Version {
                     key, version_id, ..
                 }
-                | ListObjectVersionsItem::DeleteMarker {
+                | ListVersionsItem::DeleteMarker {
                     key, version_id, ..
-                } => DeleteObjectsEntry {
+                } => BulkDeleteEntry {
                     key,
                     version_id: Some(version_id),
                 },
@@ -304,7 +289,7 @@ async fn delete_versions(
         let batch_len = entries.len() as u64;
         let outcomes = delete_objects(
             &ctx.driver,
-            DeleteObjectsInput {
+            BulkDeleteInput {
                 bucket: spec.scope.bucket().to_string(),
                 entries,
                 group_id: spec.group_id,
@@ -336,7 +321,7 @@ async fn authorize_object(
     spec: &StoragePurgeSpec,
     key: &str,
 ) -> Result<(), PurgeRunError> {
-    let path = blob_object_permission_path(
+    let path = object_permission_path(
         spec.auth_context.realm_id,
         spec.group_id,
         spec.node_id,
@@ -382,12 +367,9 @@ async fn final_relist(ctx: &JobContext, scope: &StoragePurgeScope) -> Result<(),
 }
 
 async fn prove_bucket_absent(ctx: &JobContext, bucket: &str) -> Result<(), PurgeRunError> {
-    match drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver)
-        .await
-        .and_then(|result| result.transpose())
-    {
-        Ok(None) | Err(GetBucketInfoError::NotFound) => Ok(()),
-        Ok(Some(_)) => Err(JobError::retryable("bucket still exists after purge").into()),
+    match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
+        Err(GetBucketError::NotFound) => Ok(()),
+        Ok(_) => Err(JobError::retryable("bucket still exists after purge").into()),
         Err(error) => {
             Err(JobError::retryable(format!("bucket emptiness proof failed: {error}")).into())
         }
@@ -423,14 +405,8 @@ async fn count_multipart(
     let mut total = 0u64;
     loop {
         check_stop(ctx)?;
-        let page = list_multipart_page_with_cursor(
-            ctx,
-            scope,
-            PURGE_BATCH_SIZE,
-            key_marker,
-            upload_marker,
-        )
-        .await?;
+        let page =
+            list_multipart_cursor(ctx, scope, PURGE_BATCH_SIZE, key_marker, upload_marker).await?;
         total = total.saturating_add(page.uploads.len() as u64);
         if !page.is_truncated {
             return Ok(total);
@@ -446,7 +422,7 @@ async fn count_multipart(
 }
 
 struct VersionPage {
-    items: Vec<ListObjectVersionsItem>,
+    items: Vec<ListVersionsItem>,
     is_truncated: bool,
     next_key_marker: Option<String>,
     next_version_id_marker: Option<ulid::Ulid>,
@@ -460,7 +436,7 @@ async fn list_version_page(
     version_id_marker: Option<ulid::Ulid>,
 ) -> Result<VersionPage, PurgeRunError> {
     let result = drive(
-        ListObjectVersionsOperation::new(ListObjectVersionsInput {
+        ListVersionsOperation::new(ListVersionsInput {
             bucket: scope.bucket().to_string(),
             prefix: scope.list_prefix().map(str::to_string),
             delimiter: None,
@@ -471,9 +447,7 @@ async fn list_version_page(
         &ctx.driver,
     )
     .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| JobError::retryable(format!("purge version list failed: {error}")))?
-    .ok_or_else(|| JobError::retryable("purge version list returned no result"))?;
+    .map_err(|error| JobError::retryable(format!("purge version list failed: {error}")))?;
 
     let mut items = result.items;
     let mut is_truncated = result.is_truncated;
@@ -481,8 +455,8 @@ async fn list_version_page(
     let mut next_version_id_marker = result.next_version_id_marker;
     if let StoragePurgeScope::File { key, .. } = scope {
         items.retain(|item| match item {
-            ListObjectVersionsItem::Version { key: item, .. }
-            | ListObjectVersionsItem::DeleteMarker { key: item, .. } => item == key,
+            ListVersionsItem::Version { key: item, .. }
+            | ListVersionsItem::DeleteMarker { key: item, .. } => item.as_str() == key.as_str(),
         });
         if next_key_marker.as_deref() != Some(key.as_str()) {
             is_truncated = false;
@@ -503,11 +477,9 @@ async fn list_multipart_page(
     scope: &StoragePurgeScope,
     limit: usize,
 ) -> Result<Vec<MultipartUpload>, PurgeRunError> {
-    Ok(
-        list_multipart_page_with_cursor(ctx, scope, limit, None, None)
-            .await?
-            .uploads,
-    )
+    Ok(list_multipart_cursor(ctx, scope, limit, None, None)
+        .await?
+        .uploads)
 }
 
 struct MultipartPage {
@@ -517,7 +489,7 @@ struct MultipartPage {
     next_upload_id_marker: Option<ulid::Ulid>,
 }
 
-async fn list_multipart_page_with_cursor(
+async fn list_multipart_cursor(
     ctx: &JobContext,
     scope: &StoragePurgeScope,
     limit: usize,
@@ -525,7 +497,7 @@ async fn list_multipart_page_with_cursor(
     upload_id_marker: Option<ulid::Ulid>,
 ) -> Result<MultipartPage, PurgeRunError> {
     let result = drive(
-        ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
+        ListUploadsOperation::new(ListUploadsInput {
             bucket: scope.bucket().to_string(),
             prefix: scope.list_prefix().map(str::to_string),
             delimiter: None,
@@ -538,9 +510,7 @@ async fn list_multipart_page_with_cursor(
         &ctx.driver,
     )
     .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| JobError::retryable(format!("purge multipart list failed: {error}")))?
-    .ok_or_else(|| JobError::retryable("purge multipart list returned no result"))?;
+    .map_err(|error| JobError::retryable(format!("purge multipart list failed: {error}")))?;
 
     let mut uploads = result.uploads;
     let mut is_truncated = result.is_truncated;
@@ -618,13 +588,13 @@ fn fence_error(error: PurgeFenceError) -> JobError {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::purge_audit_record;
+    use aruna_core::UserId;
     use aruna_core::structs::RealmId;
     use aruna_core::structs::{
-        AuthContext, BlobDeleteAuditKind, BlobPurgeScopeKind, StoragePurgeScope, StoragePurgeSpec,
+        AuthContext, BlobAuditKind, BlobPurgeKind, StoragePurgeScope, StoragePurgeSpec,
     };
-    use aruna_core::types::UserId;
     use ulid::Ulid;
 
     fn spec(scope: StoragePurgeScope) -> StoragePurgeSpec {
@@ -651,10 +621,7 @@ mod tests {
             }),
             7,
         );
-        assert_eq!(
-            file.kind,
-            BlobDeleteAuditKind::Purge(BlobPurgeScopeKind::File)
-        );
+        assert_eq!(file.kind, BlobAuditKind::Purge(BlobPurgeKind::File));
         assert_eq!(file.bucket, "bucket");
         assert_eq!(file.key, "reports/a.csv");
         assert_eq!(file.version_id, None);
@@ -667,10 +634,7 @@ mod tests {
             }),
             8,
         );
-        assert_eq!(
-            prefix.kind,
-            BlobDeleteAuditKind::Purge(BlobPurgeScopeKind::Prefix)
-        );
+        assert_eq!(prefix.kind, BlobAuditKind::Purge(BlobPurgeKind::Prefix));
         assert_eq!(prefix.key, "reports/");
 
         let bucket = purge_audit_record(
@@ -679,10 +643,7 @@ mod tests {
             }),
             9,
         );
-        assert_eq!(
-            bucket.kind,
-            BlobDeleteAuditKind::Purge(BlobPurgeScopeKind::Bucket)
-        );
+        assert_eq!(bucket.kind, BlobAuditKind::Purge(BlobPurgeKind::Bucket));
         assert!(bucket.key.is_empty());
     }
 }

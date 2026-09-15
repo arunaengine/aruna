@@ -1,28 +1,20 @@
-//! Ingress of one external submission.
-//!
-//! The node that takes the request normalizes it, authorizes it, derives its
-//! replicated identity and family placement, and then either commits it here
-//! because its own unconflicted view selects it as a holder, or forwards the
-//! complete request one hop to a holder it observes. A non-holder never accepts
-//! a job it could not deliver: it writes nothing and returns an availability
-//! error instead.
-//!
-//! A user device is never an authority: it resolves nothing node-local and
-//! always forwards, and the admitting holder pins the outputs to itself and
-//! resolves the inputs the device only referenced.
+//! Ingress of one external submission: the receiver commits it if its unconflicted
+//! view selects it as holder, else forwards it one hop; a non-holder writes
+//! nothing. A device always forwards; the admitting holder pins outputs.
 
+use aruna_core::UserId;
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::errors::StorageError;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{
     AuthContext, CapturedInput, ExecutionSpec, JobAdmissionRecord, JobFamilyId, JobFamilyRecord,
     JobId, JobRecordEnvelope, JobRecordKind, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
     OutputDestination, Permission, RealmConfigDocument, SubmissionClaim, SubmissionId,
-    WorkspaceMode, blob_group_permission_path,
+    WorkspaceMode, group_permission_path,
 };
-use aruna_core::types::{NodeId, UserId};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -36,7 +28,10 @@ use super::ids::{
 };
 use super::witness::arm_family;
 use super::{LifecycleError, ids};
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
+use crate::forward::authorize::{is_sync_eligible, peer_acts_for};
 use crate::jobs::records::keys::{family_prefix, kind_prefix};
 use crate::jobs::records::rows::ProjectionCache;
 use crate::jobs::records::verify::FamilyView;
@@ -44,12 +39,9 @@ use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperatio
 use crate::jobs::service::{mint_local_job, validate_execution};
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::api::load_realm_config;
-use crate::metadata::forward::{is_sync_eligible, peer_acts_for};
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::{MetadataAuthToken, MetadataWritePeerError};
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::PolicyRequestExtras;
-use crate::s3::get_bucket_info::GetBucketInfoOperation;
+use crate::metadata::{AuthToken, WritePeerError};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
@@ -107,7 +99,7 @@ pub async fn submit_external_job(
     workspace_mode: WorkspaceMode,
     workspace_bucket: Option<String>,
     retention_ms: u64,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<AcceptedSubmission, SubmitJobError> {
     validate_execution(&mut spec, workspace_mode, workspace_bucket.as_deref())?;
     store_workspace(&mut spec, workspace_mode, workspace_bucket.clone())
@@ -171,20 +163,19 @@ fn pin_outputs(spec: &mut ExecutionSpec, node_id: NodeId) {
 }
 
 /// A device forwards without resolving anything: it holds none of the objects it
-/// names, so only the reference shape is its to check and the holder resolves
-/// the rest. Holders follow the submission id alone, so the device selects the
-/// same holder set as the node that recomputes the digest after normalizing.
+/// names, so only the reference shape is checked and the holder resolves the
+/// rest; holder selection follows the submission id alone.
 async fn forward_device(
     context: &DriverContext,
     request: SubmissionRequest,
     config: &RealmConfigDocument,
     local: NodeId,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<AcceptedSubmission, SubmitJobError> {
     reference_shape(&request.spec)?;
     // A device may not assert an auth context for the realm, so the caller's own
     // bearer token is the only credential a holder accepts from it.
-    if !matches!(auth_token, Some(MetadataAuthToken::Bearer(_))) {
+    if !matches!(auth_token, Some(AuthToken::Bearer(_))) {
         return Err(SubmitJobError::AuthorityDenied);
     }
     let identity = request.identity().map_err(SubmitJobError::Conversion)?;
@@ -268,11 +259,6 @@ async fn resolve_inputs(
                 SubmitJobError::InvalidWorkspace(format!("{reference}: input object not found"))
             }
             other => SubmitJobError::PlacementUnavailable(format!("{reference}: {other}")),
-        })?
-        .transpose()
-        .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?
-        .ok_or_else(|| {
-            SubmitJobError::InvalidWorkspace(format!("{reference}: input object not found"))
         })?;
         let version = head
             .resolved_version_id
@@ -336,16 +322,27 @@ async fn resolve_inputs(
     }
     let mut output_policies = Vec::new();
     for bucket in buckets {
-        let info = drive(GetBucketInfoOperation::new(bucket.clone()), context)
-            .await
-            .map_err(|error| {
-                SubmitJobError::PlacementUnavailable(format!("s3://{bucket}: {error}"))
-            })?
-            .transpose()
-            .map_err(|error| SubmitJobError::InvalidWorkspace(format!("s3://{bucket}: {error}")))?
-            .ok_or_else(|| {
-                SubmitJobError::InvalidWorkspace(format!("s3://{bucket}: output bucket not found"))
-            })?;
+        let info = match drive(GetBucketOperation::new(bucket.clone()), context).await {
+            Ok(info) => info,
+            Err(GetBucketError::NotFound) => {
+                return Err(SubmitJobError::InvalidWorkspace(format!(
+                    "s3://{bucket}: output bucket not found"
+                )));
+            }
+            Err(
+                error @ (GetBucketError::ConversionError(_)
+                | GetBucketError::InvalidStateEvent { .. }),
+            ) => {
+                return Err(SubmitJobError::InvalidWorkspace(format!(
+                    "s3://{bucket}: {error}"
+                )));
+            }
+            Err(error) => {
+                return Err(SubmitJobError::PlacementUnavailable(format!(
+                    "s3://{bucket}: {error}"
+                )));
+            }
+        };
         if info.group_id != spec.group_id {
             return Err(SubmitJobError::InvalidWorkspace(format!(
                 "s3://{bucket}: output bucket is outside the execution group"
@@ -384,9 +381,8 @@ fn family_view(
 }
 
 /// Mints the alias, signs the immutable spec and its claim, and commits them.
-/// The alias it answers with is the canonical one at this accept: a fresh
-/// admission holds the only claim, and a replay settles on the claim the family
-/// already reduces as canonical.
+/// The answered alias is canonical at this accept: a fresh admission holds the
+/// only claim, and a replay settles on the already-reduced claim.
 async fn admit_here(
     context: &DriverContext,
     request: &SubmissionRequest,
@@ -478,9 +474,8 @@ async fn admit_here(
 }
 
 /// The state this holder currently reduces for `family`. The cached projection
-/// answers when it is current; otherwise the family is reduced once from its own
-/// records. A family this node cannot fully reduce, including one too large to
-/// project at once, is reported as indeterminate rather than as queued work.
+/// answers when current; otherwise the family is reduced once from its records.
+/// A family this node cannot fully reduce is reported as indeterminate.
 async fn observed_state(context: &DriverContext, family: JobFamilyId) -> LogicalJobState {
     let cached = match cached_projection(context, &family).await {
         Ok(cached) => cached,
@@ -540,9 +535,8 @@ async fn cached_projection(
 const ADMISSION_ATTEMPTS: usize = 3;
 
 /// Decides the standing quota and commits the admission. A replay is settled
-/// from records this node already holds, so it never reads the quota view, and
-/// a transaction a concurrent submission of the same group won is retried
-/// instead of surfacing as an availability failure.
+/// from already-held records and never reads the quota view; a lost transaction
+/// against a concurrent submission of the same group is retried.
 async fn admit_with_quota(
     context: &DriverContext,
     config: &RealmConfigDocument,
@@ -645,7 +639,7 @@ async fn forward_once(
     identity: &RequestIdentity,
     view: &FamilyView,
     local: NodeId,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<AcceptedSubmission, SubmitJobError> {
     let (Some(metadata), Some(auth_token)) = (context.metadata_handle.as_ref(), auth_token) else {
         return Err(SubmitJobError::PlacementUnavailable(
@@ -709,7 +703,7 @@ async fn forward_once(
 pub async fn serve_submission(
     context: &Arc<DriverContext>,
     peer: NodeId,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
     submission_id: SubmissionId,
     request: SubmissionRequest,
 ) -> MetadataTransportMessage {
@@ -720,7 +714,7 @@ pub async fn serve_submission(
 async fn admit_forwarded(
     context: &Arc<DriverContext>,
     peer: NodeId,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
     submission_id: SubmissionId,
     mut request: SubmissionRequest,
 ) -> Result<SubmissionAck, SubmissionRefusal> {
@@ -731,8 +725,8 @@ async fn admit_forwarded(
         .authorize_write_peer(peer, Some(auth_token))
         .await
         .map_err(|error| match error {
-            MetadataWritePeerError::Unauthorized => SubmissionRefusal::Unauthorized,
-            MetadataWritePeerError::Unavailable(_) => SubmissionRefusal::Unavailable,
+            WritePeerError::Unauthorized => SubmissionRefusal::Unauthorized,
+            WritePeerError::Unavailable(_) => SubmissionRefusal::Unavailable,
         })?;
     // The forwarded request keeps its own submitter: a relay may not re-attribute
     // a plan to another caller, and the identity is recomputed from that caller.
@@ -850,7 +844,7 @@ async fn authorize_group(
         context,
         auth.realm_id,
         auth,
-        &blob_group_permission_path(auth.realm_id, request.spec.group_id, local),
+        &group_permission_path(auth.realm_id, request.spec.group_id, local),
         &Permission::WRITE,
         PolicyRequestExtras::rest(),
     )
@@ -869,7 +863,7 @@ mod tests {
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
-    use crate::jobs::records::tests::fixture::{node, payload};
+    use crate::tests::records::{node, payload};
 
     fn family(seed: u8) -> JobFamilyId {
         JobFamilyId {

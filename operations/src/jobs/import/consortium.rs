@@ -16,19 +16,19 @@ use super::archive::{
     signature_entry,
 };
 use super::rewrite::validate_document;
-use crate::staging::test_utils::setup_driver_context;
+use crate::tests::staging::setup_driver_context;
 
 const ELABFTW: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/fixtures/eln/elabftw.eln"
+    "/tests/fixtures/elabftw.eln"
 ));
 const PASTA: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/fixtures/eln/pasta.eln"
+    "/tests/fixtures/pasta.eln"
 ));
 const KADI4MAT: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/fixtures/eln/kadi4mat.eln"
+    "/tests/fixtures/kadi4mat.eln"
 ));
 
 struct FixtureData {

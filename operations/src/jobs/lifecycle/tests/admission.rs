@@ -20,10 +20,10 @@ use crate::jobs::lifecycle::admit::{
 use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, store_workspace};
 use crate::jobs::lifecycle::routing::{family_of_alias, family_status};
 use crate::jobs::lifecycle::{LifecycleError, submit_external_job};
-use crate::jobs::records::tests::fixture::{Family, REALM, context, node, payload, secret, user};
 use crate::jobs::store::iter_prefix_page;
 use crate::jobs::submit::SubmitJobError;
-use crate::metadata::MetadataAuthToken;
+use crate::metadata::AuthToken;
+use crate::tests::records::{Family, REALM, context, node, payload, secret, user};
 
 fn frame(record: JobFamilyRecord, family: &Family) -> JobRecordFrame {
     JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded record")
@@ -245,7 +245,7 @@ async fn answers_by_alias() {
     assert_eq!(status.job.job_id, family.job_id);
 
     let stranger = AuthContext {
-        user_id: aruna_core::types::UserId::new(Ulid::from_bytes([12u8; 16]), REALM),
+        user_id: aruna_core::UserId::new(Ulid::from_bytes([12u8; 16]), REALM),
         realm_id: REALM,
         path_restrictions: None,
         session: None,
@@ -354,9 +354,8 @@ fn absent_input() -> InputSelection {
 
 #[tokio::test]
 async fn device_skips_materialization() {
-    // A device references its inputs instead of resolving them: an object absent
-    // here still reaches forwarding, and nothing is admitted locally. The same
-    // request on a realm node is refused because that node must hold the input.
+    // A device references inputs instead of resolving them: an absent object still
+    // reaches forwarding. A realm node refuses because it must hold the input.
     let mut spec = payload();
     spec.inputs.push(absent_input());
 
@@ -369,7 +368,7 @@ async fn device_skips_materialization() {
         WorkspaceMode::None,
         None,
         60_000,
-        Some(MetadataAuthToken::bearer("token").expect("bearer fits")),
+        Some(AuthToken::bearer("token").expect("bearer fits")),
     )
     .await
     .expect_err("a device admits nothing locally");
@@ -396,14 +395,13 @@ async fn device_skips_materialization() {
         WorkspaceMode::None,
         None,
         60_000,
-        Some(MetadataAuthToken::bearer("token").expect("bearer fits")),
+        Some(AuthToken::bearer("token").expect("bearer fits")),
     )
     .await
     .expect_err("the input is not materialized here");
 
-    // The realm node resolves the input against its own objects, so it stops at
-    // the absent one instead of reaching forwarding. A definitive miss is the
-    // submitter's error, not a retryable placement failure.
+    // The realm node resolves against its own objects and stops at the absent one;
+    // a definitive miss is the submitter's error, not a retryable placement one.
     let SubmitJobError::InvalidWorkspace(reason) = refused else {
         panic!("a realm node must refuse an input it does not hold");
     };

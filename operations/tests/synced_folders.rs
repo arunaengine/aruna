@@ -28,7 +28,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
-use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
+use aruna_operations::s3::get_bucket::GetBucketOperation;
 use aruna_operations::s3::get_object::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::staging::offered_directory::{OfferDirectoryInput, offer_directory};
@@ -46,10 +46,6 @@ fn body(bytes: &'static [u8]) -> BackendStream<Result<bytes::Bytes, StreamError>
 }
 
 /// Waits until the realm has pulled every queued upload.
-///
-/// The drain is a timer task the reconciliation arms, so it runs concurrently
-/// with an explicit pass and may hold the row this one wanted. Publishing is
-/// therefore complete when the outbox is empty, never after one call.
 async fn await_uploads(realm: &Topology) -> TestResult<()> {
     let device = realm.user_node();
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
@@ -82,8 +78,7 @@ async fn create_bucket(
         ),
         context,
     )
-    .await?
-    .ok_or("bucket creation did not finish")??;
+    .await?;
     Ok(())
 }
 
@@ -121,8 +116,7 @@ async fn put_object(
         }),
         context,
     )
-    .await?
-    .ok_or("the put did not finish")??;
+    .await?;
     Ok(result.version_id)
 }
 
@@ -149,8 +143,7 @@ async fn read_object(
         }),
         context,
     )
-    .await?
-    .ok_or("the get did not finish")??;
+    .await?;
     let mut bytes = Vec::new();
     let mut blob = result.blob.0;
     while let Some(chunk) = blob.next().await {
@@ -182,8 +175,7 @@ async fn delete_object(
         }),
         context,
     )
-    .await?
-    .ok_or("the delete did not finish")??;
+    .await?;
     Ok(())
 }
 
@@ -314,11 +306,10 @@ async fn creates_remote_bucket() -> TestResult<()> {
     )
     .await?;
     let bucket = drive(
-        GetBucketInfoOperation::new(REMOTE_BUCKET.to_string()),
+        GetBucketOperation::new(REMOTE_BUCKET.to_string()),
         &server.context,
     )
-    .await?
-    .ok_or("bucket lookup did not finish")??;
+    .await?;
     assert_eq!(bucket.group_id, group_id);
 
     let plan = reconcile_folder(&device.context, &folder).await?;
@@ -530,8 +521,7 @@ async fn recovers_missing_bucket() -> TestResult<()> {
         DeleteBucketOperation::new(REMOTE_BUCKET.to_string()),
         &server.context,
     )
-    .await?
-    .ok_or("bucket deletion did not finish")??;
+    .await?;
     let error = reconcile_folder(&device.context, &folder)
         .await
         .expect_err("the missing bucket is reported");

@@ -191,13 +191,13 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
     match effect {
         NetEffect::Dht(dht_effect) => handle_dht_effect(ctx, dht_effect).await,
         NetEffect::DocumentSync(document_sync_effect) => match document_sync_effect {
-            aruna_core::DocumentSyncEffect::PublishDocuments { documents, peers } => {
+            aruna_core::DocumentEffect::PublishDocuments { documents, peers } => {
                 NetEvent::DocumentSync(document_sync.publish_documents(documents, peers).await)
             }
-            aruna_core::DocumentSyncEffect::SyncDocument { topic, peers } => {
+            aruna_core::DocumentEffect::SyncDocument { topic, peers } => {
                 NetEvent::DocumentSync(document_sync.sync_document_event(topic, peers).await)
             }
-            aruna_core::DocumentSyncEffect::SyncDocuments { topics, peers } => {
+            aruna_core::DocumentEffect::SyncDocuments { topics, peers } => {
                 NetEvent::DocumentSync(document_sync.sync_documents_event(topics, peers).await)
             }
         },
@@ -515,10 +515,10 @@ fn stream_effect_kind(effect: &StreamEffect) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::make_repeated_node;
     use aruna_core::audit::MAX_AUDIT_PEERS;
     use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect};
     use aruna_core::events::{DhtEvent, NetEvent};
-    use aruna_core::id::NodeId;
     use aruna_core::keys::realm_presence_key;
     use aruna_storage::FjallStorage;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -644,13 +644,9 @@ mod tests {
         context.tasks.wait().await;
     }
 
-    fn make_node(seed: u8) -> NodeId {
-        iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
     fn make_entry(seed: u8, realm_id: RealmId) -> DhtEntry {
         DhtEntry {
-            node_id: make_node(seed),
+            node_id: make_repeated_node(seed),
             realm_id,
             value: Vec::new(),
             expires_at: 0,
@@ -717,7 +713,7 @@ mod tests {
 
         assert!(matches!(
             cache.serve(realm_id, Instant::now()),
-            PresenceServe::Fresh(values) if values[0].node_id == make_node(6)
+            PresenceServe::Fresh(values) if values[0].node_id == make_repeated_node(6)
         ));
     }
 
@@ -769,7 +765,7 @@ mod tests {
 
         assert!(matches!(
             cache.serve(realm_id, Instant::now()),
-            PresenceServe::Stale { refresh: true, values, .. } if values[0].node_id == make_node(7)
+            PresenceServe::Stale { refresh: true, values, .. } if values[0].node_id == make_repeated_node(7)
         ));
     }
 
@@ -842,7 +838,7 @@ mod tests {
 
         assert!(matches!(
             served,
-            PresenceServe::Fresh(values) if values[0].node_id == make_node(14)
+            PresenceServe::Fresh(values) if values[0].node_id == make_repeated_node(14)
         ));
         assert!(cache.refreshing.lock().is_empty());
     }
@@ -1070,7 +1066,7 @@ mod tests {
                 stale: true,
                 values,
                 ..
-            }) if values[0].node_id == make_node(19)
+            }) if values[0].node_id == make_repeated_node(19)
         ));
 
         context.shutdown.cancel();
@@ -1168,7 +1164,7 @@ mod tests {
         // A fallback batch has no completed node, so an oversized list must
         // report the bounded prefix as missing instead of an empty page.
         let nodes = (1u8..=u8::try_from(MAX_AUDIT_PEERS + 1).unwrap())
-            .map(make_node)
+            .map(make_repeated_node)
             .collect();
         let batch = audit_fallback(nodes, usize::MAX);
 
@@ -1180,8 +1176,8 @@ mod tests {
 
     #[test]
     fn keeps_unique() {
-        let first = make_node(1);
-        let second = make_node(2);
+        let first = make_repeated_node(1);
+        let second = make_repeated_node(2);
         let batch = audit_fallback(vec![second, first, first], usize::MAX);
 
         let mut expected = vec![first, second];
