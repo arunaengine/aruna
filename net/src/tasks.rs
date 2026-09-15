@@ -1,10 +1,6 @@
 //! Background task ownership and the loops the network starts at construction.
-//!
-//! `BackgroundTasks` is the single owner of every spawned loop. The
-//! constructor starts services first and tasks last, so nothing fallible runs
-//! after the first spawn; a failure before that point has only the endpoint and
-//! DHT driver to release, which the constructor handles explicitly. Shutdown
-//! drains inbound handlers first and then joins through this owner.
+//! `BackgroundTasks` owns every spawned loop; the constructor starts services
+//! first and tasks last, so no fallible step runs after the first spawn.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -80,16 +76,9 @@ impl EffectExecutor for NetEffectContext {
     }
 }
 
-/// Serializes accepted net effects onto the effect executor. Each accepted
-/// effect runs in its own tracked task, so the effect completion boundary is
-/// the tracker plus the dispatcher, not the dispatcher alone. A tracker close
-/// only lets `wait` finish; it does not reject later insertions, so callers
-/// must join the dispatcher before treating the tracker as the final boundary.
-///
-/// On cancellation the receiver is closed and every effect already buffered in
-/// the channel is still spawned under the tracker before the dispatcher exits:
-/// work accepted into the channel is settled by completion, not dropped with
-/// the receiver, and later submissions fail closed.
+/// Serializes accepted net effects onto the executor. Cancellation still spawns
+/// buffered effects under the tracker (accepted work settles by completion, not
+/// drops), so callers join the dispatcher before trusting the tracker's wait.
 pub(crate) fn spawn_effect_dispatch<E: EffectExecutor>(
     mut effect_rx: mpsc::Receiver<EffectHandle>,
     executor: Arc<E>,
@@ -101,8 +90,10 @@ pub(crate) fn spawn_effect_dispatch<E: EffectExecutor>(
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => {
+                    // `recv` yields `None` only once send capacity reserved
+                    // before `close` settles, so it waits out held permits.
                     effect_rx.close();
-                    while let Ok((effect, response_tx, span)) = effect_rx.try_recv() {
+                    while let Some((effect, response_tx, span)) = effect_rx.recv().await {
                         let executor = executor.clone();
                         effect_tasks.spawn(async move {
                             let event = executor.execute(effect).await;
@@ -353,6 +344,84 @@ mod tests {
         effect_tasks.close();
         effect_tasks.wait().await;
         assert_eq!(completed.load(Ordering::SeqCst), 2);
+    }
+
+    // Capacity reserved before cancellation is accepted work: the dispatcher
+    // must not finish while a held permit can still publish, even past a budget.
+    #[tokio::test(start_paused = true)]
+    async fn held_reservation_settles() {
+        let (executor, mut started, release, completed) = controlled_executor();
+        let effect_tasks = TaskTracker::new();
+        let (effect_tx, effect_rx) = mpsc::channel::<EffectHandle>(2);
+        let permit = effect_tx
+            .reserve()
+            .await
+            .expect("capacity is reserved before cancellation");
+        let shutdown = CancellationToken::new();
+        let dispatcher =
+            spawn_effect_dispatch(effect_rx, executor, effect_tasks.clone(), shutdown.clone());
+
+        shutdown.cancel();
+        // The queue is empty, so only the held permit keeps the dispatcher open.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(
+            !dispatcher.is_finished(),
+            "a held reservation must keep the dispatcher from completing"
+        );
+
+        let (response_tx, response_rx) = oneshot::channel();
+        permit.send((presence_effect_for(0x65), response_tx, Span::current()));
+        dispatcher
+            .await
+            .expect("the dispatcher joins once the reservation settles");
+
+        assert_eq!(
+            effect_tasks.len(),
+            1,
+            "the reserved effect must be spawned before the dispatcher exits"
+        );
+        started.recv().await.expect("the reserved effect started");
+        release.add_permits(1);
+        effect_tasks.close();
+        effect_tasks.wait().await;
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert!(
+            response_rx.await.is_ok(),
+            "the reserved effect must deliver its response"
+        );
+    }
+
+    // Releasing the reservation without sending settles the boundary too: the
+    // dispatcher completes with no accepted work behind it.
+    #[tokio::test(start_paused = true)]
+    async fn released_reservation_settles() {
+        let (executor, _started, _release, completed) = controlled_executor();
+        let effect_tasks = TaskTracker::new();
+        let (effect_tx, effect_rx) = mpsc::channel::<EffectHandle>(1);
+        let permit = effect_tx
+            .reserve()
+            .await
+            .expect("capacity is reserved before cancellation");
+        let shutdown = CancellationToken::new();
+        let dispatcher =
+            spawn_effect_dispatch(effect_rx, executor, effect_tasks.clone(), shutdown.clone());
+
+        shutdown.cancel();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(
+            !dispatcher.is_finished(),
+            "a held reservation must keep the dispatcher from completing"
+        );
+
+        drop(permit);
+        dispatcher
+            .await
+            .expect("the dispatcher joins once the reservation drops");
+
+        assert_eq!(effect_tasks.len(), 0, "no effect was accepted");
+        effect_tasks.close();
+        effect_tasks.wait().await;
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
     }
 
     // After the dispatcher stops, the effect channel is closed: a later send is
