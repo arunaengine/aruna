@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use ::irokle::{Event as _, Storage as _};
 use aruna_core::document::{DocumentEvent, DocumentReconcileResult, DocumentTarget};
 use aruna_core::effects::StorageEffect;
-use aruna_core::keyspaces::{
-    APPLIED_OPS_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE,
-};
+use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE};
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::storage_entries::{
     create_acceptance_entry, create_acceptance_key, create_projection_entries,
@@ -21,9 +19,8 @@ use crate::document_sync::storage::{
     replace_batch_in, start_storage_transaction, transaction_read,
 };
 use crate::document_sync::{
-    FRAME_LEN_LIMIT, DeferredRegistrationOutcome, DocumentSyncDependency,
-    DocumentSyncService, MetadataPlacementFence, MetadataPlacementOutcome, PendingCreateApply,
-    SyncRejection,
+    DeferredRegistrationOutcome, DocumentSyncDependency, DocumentSyncService, FRAME_LEN_LIMIT,
+    MetadataPlacementFence, MetadataPlacementOutcome, PendingCreateApply, SyncRejection,
 };
 use crate::error::{NetError, Result};
 
@@ -111,27 +108,15 @@ impl DocumentSyncService {
                 deferred_rejections.append(&mut outcome.rejections);
                 deferred_cursor_writes.push((
                     topic_id,
-                    (
-                        APPLIED_OPS_KEYSPACE.to_string(),
-                        cursor_key,
-                        value,
-                    ),
+                    (APPLIED_OPS_KEYSPACE.to_string(), cursor_key, value),
                 ));
             } else if outcome.rejections.is_empty() {
-                self.storage_write(
-                    APPLIED_OPS_KEYSPACE.to_string(),
-                    cursor_key,
-                    value,
-                )
-                .await?;
+                self.storage_write(APPLIED_OPS_KEYSPACE.to_string(), cursor_key, value)
+                    .await?;
             } else if !self
                 .commit_cursor_evidence(
                     &outcome.rejections,
-                    (
-                        APPLIED_OPS_KEYSPACE.to_string(),
-                        cursor_key,
-                        value,
-                    ),
+                    (APPLIED_OPS_KEYSPACE.to_string(), cursor_key, value),
                 )
                 .await?
             {
@@ -192,10 +177,7 @@ impl DocumentSyncService {
         topic_ids: impl IntoIterator<Item = ::irokle::TopicId>,
     ) -> Result<ReconcileWork> {
         let deferred_topics: BTreeMap<DocumentSyncDependency, BTreeSet<::irokle::TopicId>> = self
-            .storage_read(
-                APPLIED_OPS_KEYSPACE.to_string(),
-                deferred_topics_key(),
-            )
+            .storage_read(APPLIED_OPS_KEYSPACE.to_string(), deferred_topics_key())
             .await?
             .map(|bytes| postcard::from_bytes(&bytes))
             .transpose()
@@ -252,11 +234,8 @@ impl DocumentSyncService {
             self.node.storage(),
             topic_id,
             genesis,
-            self.storage_read(
-                APPLIED_OPS_KEYSPACE.to_string(),
-                cursor_key.clone(),
-            )
-            .await?,
+            self.storage_read(APPLIED_OPS_KEYSPACE.to_string(), cursor_key.clone())
+                .await?,
         )?;
         let batch = self.document_event_batch(topic_id, &cursor, FRAME_LEN_LIMIT)?;
         if batch.cursor == cursor {

@@ -278,10 +278,7 @@ async fn lost_eviction_replays() {
         topic_id,
         genesis(loser_node),
         loser
-            .storage_read(
-                APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-            )
+            .storage_read(APPLIED_OPS_KEYSPACE.to_string(), topic_cursor_key(topic_id))
             .await
             .expect("cursor read"),
     )
@@ -309,10 +306,7 @@ async fn lost_eviction_replays() {
     let winning_genesis = genesis(loser_node);
     assert!(
         loser
-            .storage_read(
-                APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-            )
+            .storage_read(APPLIED_OPS_KEYSPACE.to_string(), topic_cursor_key(topic_id),)
             .await
             .expect("cursor read")
             .is_some(),
@@ -325,10 +319,7 @@ async fn lost_eviction_replays() {
         .expect("the winning chain reconciles");
     let stored: AppliedCursor = postcard::from_bytes(
         &loser
-            .storage_read(
-                APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-            )
+            .storage_read(APPLIED_OPS_KEYSPACE.to_string(), topic_cursor_key(topic_id))
             .await
             .expect("cursor read")
             .expect("reconcile rewrites the cursor"),

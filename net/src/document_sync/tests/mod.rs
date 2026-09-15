@@ -7,11 +7,10 @@ use aruna_core::alpn::Alpn;
 use aruna_core::auth::{MAX_TOKEN_LIFETIME, REVOCATION_GRACE_SECS};
 use aruna_core::document::{DocumentChangeKind, DocumentSyncRevision};
 use aruna_core::keyspaces::{
-    DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE,
-    CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE,
-    EVENT_LOG_KEYSPACE, PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
-    METADATA_INDEX_KEYSPACE, USER_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE,
-    SUBJECT_INDEX_KEYSPACE,
+    AUTH_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE,
+    DOCUMENT_STATE_KEYSPACE, EVENT_LOG_KEYSPACE, GROUP_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
+    METADATA_INDEX_KEYSPACE, PRUNE_JOB_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE,
+    USER_KEYSPACE,
 };
 use aruna_core::metadata::MetadataEventPayload;
 use aruna_core::reducer::CONFIG_STRATEGY_PATH;
@@ -19,19 +18,19 @@ use aruna_core::storage_entries::{
     create_acceptance_key, event_log_key, metadata_document_key, metadata_registry_key,
     reducer_conflict_key, reducer_state_key, subject_index_key, subject_index_value,
 };
+use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::auth::{Actor, Permission, Role};
-use aruna_core::structs::placement::placement_record::{
-    BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HandleRange,
-    METADATA_HANDLE, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef,
-    PlacementStrategy, StrategyBinding, band_start,
-};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     GroupQuotaOverride, MetadataReplicationConfig, QuotaConfig, RealmAuthorizationDocument,
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, StaticRealmEndpoint,
     UserCapOverride,
 };
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::placement::placement_record::{
+    BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HandleRange,
+    METADATA_HANDLE, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef,
+    PlacementStrategy, StrategyBinding, band_start,
+};
 use aruna_core::structs::{QUARANTINE_MAX_RECORDS, SyncQuarantineFamily, SyncQuarantineRecord};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::{MetaResourceId, StructuredId, UserId};
@@ -267,10 +266,7 @@ async fn eviction_preserves_event() {
     // tie-break just replaced.
     assert!(
         loser
-            .storage_read(
-                APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-            )
+            .storage_read(APPLIED_OPS_KEYSPACE.to_string(), topic_cursor_key(topic_id),)
             .await
             .expect("cursor read")
             .is_some(),
@@ -287,10 +283,7 @@ async fn eviction_preserves_event() {
     // surviving cursor would skip its first ops forever.
     assert!(
         loser
-            .storage_read(
-                APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(topic_id),
-            )
+            .storage_read(APPLIED_OPS_KEYSPACE.to_string(), topic_cursor_key(topic_id),)
             .await
             .expect("cursor read")
             .is_none(),
@@ -497,13 +490,9 @@ async fn deferred_admin_retries() {
     assert!(!deferred_cursor.dominates(&auth_clock));
     let deferred_topics: BTreeMap<DocumentSyncDependency, BTreeSet<::irokle::TopicId>> =
         postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                APPLIED_OPS_KEYSPACE,
-                deferred_topics_key(),
-            )
-            .await
-            .expect("deferred topic registry is persisted"),
+            &read_storage_value(&storage, APPLIED_OPS_KEYSPACE, deferred_topics_key())
+                .await
+                .expect("deferred topic registry is persisted"),
         )
         .expect("deferred topic registry decodes");
     assert_eq!(

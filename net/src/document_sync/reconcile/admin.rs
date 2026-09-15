@@ -199,10 +199,7 @@ pub(in crate::document_sync) async fn apply_user_operation(
                     subject_index_value(canonical_user_id),
                 ));
             } else {
-                attempt_deletes.push((
-                    SUBJECT_CLAIMS_KEYSPACE.to_string(),
-                    subject_key.clone(),
-                ));
+                attempt_deletes.push((SUBJECT_CLAIMS_KEYSPACE.to_string(), subject_key.clone()));
                 attempt_deletes.push((SUBJECT_INDEX_KEYSPACE.to_string(), subject_key));
             }
         }
@@ -806,9 +803,7 @@ pub(in crate::document_sync) fn materialize_group_authorization(
 
     let (role_id, user_id) = match &event.op {
         AdminDocumentOperation::GroupAssignmentAdded { role_id, user_id }
-        | AdminDocumentOperation::GroupAssignmentRemoved { role_id, user_id } => {
-            (role_id, user_id)
-        }
+        | AdminDocumentOperation::GroupAssignmentRemoved { role_id, user_id } => (role_id, user_id),
         _ => return,
     };
     let path = group_user_path(role_id, user_id);
@@ -882,9 +877,7 @@ pub(in crate::document_sync) fn materialize_realm_authorization(
 
     let (role_id, user_id) = match &event.op {
         AdminDocumentOperation::RealmAssignmentAdded { role_id, user_id }
-        | AdminDocumentOperation::RealmAssignmentRemoved { role_id, user_id } => {
-            (role_id, user_id)
-        }
+        | AdminDocumentOperation::RealmAssignmentRemoved { role_id, user_id } => (role_id, user_id),
         _ => return,
     };
     let path = realm_user_path(role_id, user_id);
@@ -1107,10 +1100,7 @@ async fn apply_realm_config(
     }
     validate_config_actor(realm_id, &event)?;
 
-    let is_revocation = matches!(
-        &event.op,
-        AdminDocumentOperation::ConfigTokenRevoked { .. }
-    );
+    let is_revocation = matches!(&event.op, AdminDocumentOperation::ConfigTokenRevoked { .. });
 
     for _ in 0..APPLY_CONFLICT_ATTEMPTS {
         tokio::task::yield_now().await;

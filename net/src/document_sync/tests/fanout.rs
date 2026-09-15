@@ -84,10 +84,7 @@ fn fanout_cursor_restart() {
             .open()
             .expect("fanout cursor database");
         let cursors = db
-            .keyspace(
-                SYNC_FANOUT_KEYSPACE,
-                fjall::KeyspaceCreateOptions::default,
-            )
+            .keyspace(SYNC_FANOUT_KEYSPACE, fjall::KeyspaceCreateOptions::default)
             .expect("fanout cursor keyspace");
         assert_eq!(
             current_cursor(&cursors, topic_id, test_genesis(1)).expect("first cursor"),
@@ -102,10 +99,7 @@ fn fanout_cursor_restart() {
         .open()
         .expect("reopen fanout cursor database");
     let cursors = db
-        .keyspace(
-            SYNC_FANOUT_KEYSPACE,
-            fjall::KeyspaceCreateOptions::default,
-        )
+        .keyspace(SYNC_FANOUT_KEYSPACE, fjall::KeyspaceCreateOptions::default)
         .expect("reopen fanout cursor keyspace");
     assert_eq!(
         current_cursor(&cursors, topic_id, test_genesis(1)).expect("restarted cursor"),
@@ -138,10 +132,7 @@ fn fanout_cursor_clear() {
             .open()
             .expect("fanout cursor clear database");
         let cursors = db
-            .keyspace(
-                SYNC_FANOUT_KEYSPACE,
-                fjall::KeyspaceCreateOptions::default,
-            )
+            .keyspace(SYNC_FANOUT_KEYSPACE, fjall::KeyspaceCreateOptions::default)
             .expect("fanout cursor clear keyspace");
         advance_cursor(&cursors, topic_id, test_genesis(3), 0).expect("create fanout cursor");
         assert!(
@@ -158,10 +149,7 @@ fn fanout_cursor_clear() {
         .open()
         .expect("reopen fanout cursor clear database");
     let cursors = db
-        .keyspace(
-            SYNC_FANOUT_KEYSPACE,
-            fjall::KeyspaceCreateOptions::default,
-        )
+        .keyspace(SYNC_FANOUT_KEYSPACE, fjall::KeyspaceCreateOptions::default)
         .expect("reopen fanout cursor clear keyspace");
     assert!(
         !cursors

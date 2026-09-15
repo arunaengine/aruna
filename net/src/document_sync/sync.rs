@@ -270,12 +270,7 @@ impl DocumentSyncService {
             move |peer| {
                 let net = net.clone();
                 async move {
-                    match timeout(
-                        PEER_SYNC_TIMEOUT,
-                        net.sync_peer_now(peer, topic_id),
-                    )
-                    .await
-                    {
+                    match timeout(PEER_SYNC_TIMEOUT, net.sync_peer_now(peer, topic_id)).await {
                         Ok(Ok(())) => Ok(()),
                         Ok(Err(error)) => Err(NetError::Bootstrap(error.to_string())),
                         Err(_) => Err(NetError::Timeout(PEER_SYNC_TIMEOUT)),
@@ -455,13 +450,10 @@ impl DocumentSyncService {
         let r2_process = r2_process_started.elapsed();
         let fu_io_started = Instant::now();
         if !followup.is_empty() {
-            let responses = timeout(
-                PEER_SYNC_TIMEOUT,
-                self.net.sync_with(peer_addr, &followup),
-            )
-            .await
-            .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
-            .map_err(NetError::from)?;
+            let responses = timeout(PEER_SYNC_TIMEOUT, self.net.sync_with(peer_addr, &followup))
+                .await
+                .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
+                .map_err(NetError::from)?;
             for response in responses {
                 match response {
                     SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {}
@@ -700,13 +692,10 @@ impl DocumentSyncService {
             self.net.schedule_topic_recheck(topic_id)?;
         }
         if followup.len() > 1 {
-            let responses = timeout(
-                PEER_SYNC_TIMEOUT,
-                self.net.sync_with(peer_addr, &followup),
-            )
-            .await
-            .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
-            .map_err(NetError::from)?;
+            let responses = timeout(PEER_SYNC_TIMEOUT, self.net.sync_with(peer_addr, &followup))
+                .await
+                .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
+                .map_err(NetError::from)?;
             for response in responses {
                 match response {
                     SyncMessage::Summary(summary) if summary.topic_id == topic_id => {}

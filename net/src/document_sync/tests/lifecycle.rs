@@ -537,13 +537,9 @@ async fn capacity_retains_cursors() {
         .expect("metadata reconciliation remains retryable at capacity");
     let deferred_topics: BTreeMap<DocumentSyncDependency, BTreeSet<::irokle::TopicId>> =
         postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                APPLIED_OPS_KEYSPACE,
-                deferred_topics_key(),
-            )
-            .await
-            .expect("deferred topic registry remains stored"),
+            &read_storage_value(&storage, APPLIED_OPS_KEYSPACE, deferred_topics_key())
+                .await
+                .expect("deferred topic registry remains stored"),
         )
         .expect("deferred topic registry decodes");
     assert_eq!(
@@ -769,13 +765,9 @@ async fn metadata_placement_defers() {
     assert!(!deferred_cursor.dominates(&metadata_clock));
     let deferred_topics: BTreeMap<DocumentSyncDependency, BTreeSet<::irokle::TopicId>> =
         postcard::from_bytes(
-            &read_storage_value(
-                &storage,
-                APPLIED_OPS_KEYSPACE,
-                deferred_topics_key(),
-            )
-            .await
-            .expect("deferred topic registry is persisted"),
+            &read_storage_value(&storage, APPLIED_OPS_KEYSPACE, deferred_topics_key())
+                .await
+                .expect("deferred topic registry is persisted"),
         )
         .expect("deferred topic registry decodes");
     assert_eq!(

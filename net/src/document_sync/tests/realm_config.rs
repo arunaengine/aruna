@@ -344,11 +344,7 @@ fn conflict_clears_default() {
             .unwrap();
     }
 
-    assert!(
-        state
-            .conflicts
-            .contains_key(CONFIG_STRATEGY_PATH)
-    );
+    assert!(state.conflicts.contains_key(CONFIG_STRATEGY_PATH));
     assert_eq!(state.materialized_default_strategy(), None);
 
     let index = state.revocation_index(now);
@@ -776,10 +772,7 @@ async fn accepts_onboarded_origin() {
         1,
         AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: aruna_core::auth::bearer_token_hash("long-token"),
-            expires_at: unix_timestamp_secs()
-                + MAX_TOKEN_LIFETIME
-                + REVOCATION_GRACE_SECS
-                + 1,
+            expires_at: unix_timestamp_secs() + MAX_TOKEN_LIFETIME + REVOCATION_GRACE_SECS + 1,
             token_owner: attacker.user_id,
         },
     );

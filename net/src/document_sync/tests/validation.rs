@@ -90,10 +90,7 @@ fn watch_interest_validation() {
         }),
     );
     assert!(validate_watch_interest(&target, &too_many.to_bytes().unwrap()).is_err());
-    assert!(
-        validate_watch_interest(&target, &vec![0; INTEREST_BYTES_CAP + 1],)
-            .is_err()
-    );
+    assert!(validate_watch_interest(&target, &vec![0; INTEREST_BYTES_CAP + 1],).is_err());
 
     // A digest whose embedded node id is a different node is rejected.
     let misattributed = WatchInterestDigest::from_subscriptions(

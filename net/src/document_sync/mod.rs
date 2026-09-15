@@ -31,22 +31,20 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
-    DOCUMENT_STATE_KEYSPACE, APPLIED_OPS_KEYSPACE,
-    SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, OWNER_INDEX_KEYSPACE,
-    CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
-    GRAPH_LIFECYCLE_KEYSPACE, WATCH_INTEREST_KEYSPACE,
-    ID_MAPPING_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
-    QUARANTINE_USAGE_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE,
+    APPLIED_OPS_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
+    DOCUMENT_STATE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, GROUP_KEYSPACE, ID_MAPPING_KEYSPACE,
+    OWNER_INDEX_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
+    SYNC_REVISION_KEYSPACE, WATCH_INTEREST_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, GraphPruneRecord, MetadataDeleteRecord, MetadataEventRecord,
     MetadataLifecycleRecord,
 };
 use aruna_core::reducer::{
-    AdminApplyStatus, AdminDocumentState, DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
-    REALM_ID_PATH, REVOCATIONS_PER_ORIGIN, CONFIG_COMPUTE_PATH,
-    CONFIG_DESCRIPTION_PATH, CONFIG_DISCOVERY_PATH,
-    METADATA_REPLICATION_PATH, CONFIG_POLICIES_PATH, CONFIG_QUOTA_PATH,
+    AdminApplyStatus, AdminDocumentState, CONFIG_COMPUTE_PATH, CONFIG_DESCRIPTION_PATH,
+    CONFIG_DISCOVERY_PATH, CONFIG_POLICIES_PATH, CONFIG_QUOTA_PATH, DISPLAY_NAME_PATH,
+    GROUP_OWNER_PATH, METADATA_REPLICATION_PATH, REALM_ID_PATH, REVOCATIONS_PER_ORIGIN,
     RevocationIndex, USER_NAME_PATH, config_node_path, decode_reducer_state, group_role_path,
     group_user_path, overlay_placement, parse_config_node, parse_config_oidc,
     parse_group_assignment, parse_group_role, parse_realm_assignment, realm_role_path,
@@ -60,18 +58,26 @@ use aruna_core::storage_entries::{
     stale_conflict_deletes, subject_index_key, subject_index_value, sync_revision_entry,
     sync_revision_key,
 };
+use aruna_core::structs::execution::notification_watch::{
+    INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP, MAX_PREFIX_LEN, WatchEventMask, WatchInterestDigest,
+    WatchSubscription, interest_dirty_key, interest_node_id, interest_realm_id,
+};
+use aruna_core::structs::identity::auth::Role;
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument, owner_group_key};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+};
+use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::binding_directory::BindingError;
 use aruna_core::structs::placement::placement_record::{
     DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, PlacementRef, PlacementScope,
     PoolAdmission, admit_band_pool, coordinator_spans,
 };
-use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument, owner_group_key};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::execution::notification_watch::{
-    INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP,
-    MAX_PREFIX_LEN, WatchEventMask, WatchInterestDigest, WatchSubscription,
-    interest_dirty_key, interest_node_id, interest_realm_id,
+use aruna_core::structs::placement::policy_document::{
+    PlacementPolicyDocument, placement_policy_change, placement_policy_target,
+    verify_policy_authority,
 };
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::{NodeInfoDocument, reserved_label};
 use aruna_core::structs::storage::usage::{NodeUsageSnapshot, usage_node_id};
 use aruna_core::structs::{
@@ -80,15 +86,6 @@ use aruna_core::structs::{
     SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries,
     persistent_id_change, persistent_id_key, persistent_id_target, quarantine_usage_entry,
 };
-use aruna_core::structs::placement::policy_document::{
-    PlacementPolicyDocument, placement_policy_change, placement_policy_target,
-    verify_policy_authority,
-};
-use aruna_core::structs::identity::realm::{
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
-};
-use aruna_core::structs::identity::auth::Role;
-use aruna_core::structs::identity::user::User;
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::types::{GroupId, RoleId, TxnId, Value};
@@ -287,9 +284,7 @@ impl InboundSyncBudget {
     fn acquire(self: &Arc<Self>, peer: PeerId) -> Option<InboundSyncPermit> {
         let mut state = self.state.lock();
         let held = state.per_peer.get(&peer).copied().unwrap_or(0);
-        if state.global >= INBOUND_GLOBAL_STREAMS
-            || held >= INBOUND_PEER_STREAMS
-        {
+        if state.global >= INBOUND_GLOBAL_STREAMS || held >= INBOUND_PEER_STREAMS {
             return None;
         }
         state.global += 1;
@@ -467,10 +462,7 @@ impl DocumentSyncService {
             .open()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let fanout_cursors = db
-            .keyspace(
-                SYNC_FANOUT_KEYSPACE,
-                fjall::KeyspaceCreateOptions::default,
-            )
+            .keyspace(SYNC_FANOUT_KEYSPACE, fjall::KeyspaceCreateOptions::default)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let node = ::irokle::Irokle::builder()
             .with_iroh_secret_key(endpoint.secret_key())
@@ -595,8 +587,7 @@ fn select_sync_peers(
     let start = if candidate_count == 0 {
         0
     } else {
-        ((round as u128 * OUTBOUND_PEER_LIMIT as u128) % candidate_count as u128)
-            as usize
+        ((round as u128 * OUTBOUND_PEER_LIMIT as u128) % candidate_count as u128) as usize
     };
     let peers = (0..selected)
         .map(|offset| ranked[(start + offset) % candidate_count].0)

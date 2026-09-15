@@ -432,13 +432,9 @@ async fn assignment_conflict_materializes() {
     .expect("conflicting remove applies");
 
     assert!(
-        read_storage_value(
-            &storage,
-            DOCUMENT_CONFLICT_KEYSPACE,
-            conflict_key.clone(),
-        )
-        .await
-        .is_some()
+        read_storage_value(&storage, DOCUMENT_CONFLICT_KEYSPACE, conflict_key.clone(),)
+            .await
+            .is_some()
     );
     assert!(
         !read_group_auth(&storage, group_id).await.roles[&role_id]

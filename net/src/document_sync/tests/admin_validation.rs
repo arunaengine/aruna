@@ -7,7 +7,8 @@ fn outsider_reports_rejected() {
     let realm_id = RealmId::from_bytes([61u8; 32]);
     let strategy_id = Ulid::from_parts(1_700, 1);
     let transition_id = Ulid::from_parts(1_701, 1);
-    let mut config = aruna_core::structs::identity::realm::RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    let mut config =
+        aruna_core::structs::identity::realm::RealmConfigDocument::new(realm_id, Vec::new(), 3);
     for (seed, kind) in [
         (1u8, RealmNodeKind::Server),
         (2, RealmNodeKind::Server),
@@ -21,24 +22,26 @@ fn outsider_reports_rejected() {
     ] {
         config.ensure_node(node(seed), kind);
     }
-    config
-        .placement_transitions
-        .push(aruna_core::structs::placement::placement_transition::PlacementTransition::new(
+    config.placement_transitions.push(
+        aruna_core::structs::placement::placement_transition::PlacementTransition::new(
             aruna_core::structs::placement::placement_transition::TransitionPlan {
                 transition_id,
                 strategy_id,
-                buckets: vec![aruna_core::structs::placement::placement_transition::BucketPlan {
-                    bucket: 0,
-                    old_holders: vec![node(1)],
-                    target_holders: vec![node(2)],
-                    predecessor_epoch: 1,
-                }],
+                buckets: vec![
+                    aruna_core::structs::placement::placement_transition::BucketPlan {
+                        bucket: 0,
+                        old_holders: vec![node(1)],
+                        target_holders: vec![node(2)],
+                        predecessor_epoch: 1,
+                    },
+                ],
                 target_map_epoch: 2,
                 limits: Default::default(),
                 created_by: node(1),
                 created_at_ms: 1,
             },
-        ));
+        ),
+    );
     let barrier = |seed: u8| {
         let actor = test_actor(seed, UserId::nil(realm_id), realm_id);
         test_admin_event(
@@ -130,7 +133,8 @@ fn removal_needs_management() {
     // Eviction is an ordinary realm-config admin event, so admission keeps
     // it to Management origins whoever relayed it.
     let realm_id = RealmId::from_bytes([62u8; 32]);
-    let mut config = aruna_core::structs::identity::realm::RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    let mut config =
+        aruna_core::structs::identity::realm::RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.ensure_node(node(1), RealmNodeKind::Management);
     config.ensure_node(node(2), RealmNodeKind::Server);
     let device = node(3);

@@ -3,14 +3,12 @@ use super::*;
 #[path = "tests_document_sync.rs"]
 pub(crate) mod document_sync_support;
 
-use crate::discovery::{
-    DHT_MAX_SKEW, select_signed_endpoint, validate_endpoint_announcement,
-};
+use crate::discovery::{DHT_MAX_SKEW, select_signed_endpoint, validate_endpoint_announcement};
 use crate::eviction::flush_evicted_documents;
 use crate::test_support::make_secret;
 use aruna_core::events::DhtEntry;
-use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus};
 use aruna_core::structs::identity::realm::{RealmEndpointAnnouncement, endpoint_signing_bytes};
+use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
 use std::sync::Arc;
@@ -753,8 +751,14 @@ async fn config_replaces_peers() -> Result<()> {
         handle.node_id(),
         aruna_core::structs::identity::realm::RealmNodeKind::Management,
     );
-    document.ensure_node(peer_b, aruna_core::structs::identity::realm::RealmNodeKind::Server);
-    document.ensure_node(peer_a, aruna_core::structs::identity::realm::RealmNodeKind::Server);
+    document.ensure_node(
+        peer_b,
+        aruna_core::structs::identity::realm::RealmNodeKind::Server,
+    );
+    document.ensure_node(
+        peer_a,
+        aruna_core::structs::identity::realm::RealmNodeKind::Server,
+    );
     // A User-kind node must never enter the sync fan-out set.
     let user_node = make_secret(13).public();
     document.ensure_node(
@@ -781,15 +785,15 @@ async fn config_replaces_peers() -> Result<()> {
     );
 
     let mut replacement = RealmConfigDocument::default_for_realm(*handle.realm_id(), Vec::new());
-    replacement.ensure_node(peer_b, aruna_core::structs::identity::realm::RealmNodeKind::Server);
+    replacement.ensure_node(
+        peer_b,
+        aruna_core::structs::identity::realm::RealmNodeKind::Server,
+    );
 
     let peers = handle.refresh_document_peers(&replacement).await?;
     assert_eq!(peers, vec![peer_b]);
     assert_eq!(handle.realm_peers().await, vec![peer_b]);
-    assert_eq!(
-        *handle.inner.signed_authorized_nodes.read(),
-        vec![peer_b]
-    );
+    assert_eq!(*handle.inner.signed_authorized_nodes.read(), vec![peer_b]);
 
     handle.shutdown().await;
     Ok(())

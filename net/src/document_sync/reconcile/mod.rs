@@ -458,9 +458,7 @@ pub(in crate::document_sync) fn satisfied_dependencies(
     match target {
         DocumentTarget::RealmConfig { realm_id } => {
             dependencies.push(DocumentSyncDependency::RealmConfig(*realm_id));
-            if let AdminDocumentOperation::PlacementStrategyUpserted { strategy } =
-                &event.op
-            {
+            if let AdminDocumentOperation::PlacementStrategyUpserted { strategy } = &event.op {
                 dependencies.push(DocumentSyncDependency::PlacementStrategy {
                     realm_id: *realm_id,
                     strategy_id: strategy.strategy_id,
@@ -519,9 +517,7 @@ pub(in crate::document_sync) fn register_deferred_topic(
         .get(&dependency)
         .map(BTreeSet::len)
         .unwrap_or_default();
-    if total_topics >= MAX_DEFERRED_TOPICS
-        || dependency_topics >= TOPICS_PER_DEPENDENCY
-    {
+    if total_topics >= MAX_DEFERRED_TOPICS || dependency_topics >= TOPICS_PER_DEPENDENCY {
         return DeferredRegistrationOutcome::CapacityExceeded;
     }
     deferred_topics

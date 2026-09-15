@@ -490,10 +490,7 @@ async fn replay_backlog() {
         "genesis consumes one bounded replay slot"
     );
     let actor = ::irokle::actor_id_for(topic_id, service.node().peer_id());
-    assert_eq!(
-        first.cursor.get(&actor),
-        REPLAY_BATCH_LIMIT as u64
-    );
+    assert_eq!(first.cursor.get(&actor), REPLAY_BATCH_LIMIT as u64);
     let topic_clock = service
         .node()
         .storage()

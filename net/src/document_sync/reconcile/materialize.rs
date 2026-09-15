@@ -63,9 +63,7 @@ pub(in crate::document_sync) fn overlay_group_state(
     group: &mut Group,
     reducer_state: &AdminDocumentState,
 ) {
-    if !reducer_state
-        .conflicts
-        .contains_key(DISPLAY_NAME_PATH)
+    if !reducer_state.conflicts.contains_key(DISPLAY_NAME_PATH)
         && let Some(display_name) = reducer_state.materialized_group_name()
     {
         group.display_name = display_name;
@@ -105,9 +103,7 @@ fn overlay_group_roles(group: &mut Group, reducer_state: &AdminDocumentState) {
 }
 
 fn group_metadata_conflicted(reducer_state: &AdminDocumentState) -> bool {
-    reducer_state
-        .conflicts
-        .contains_key(DISPLAY_NAME_PATH)
+    reducer_state.conflicts.contains_key(DISPLAY_NAME_PATH)
         || reducer_state.conflicts.contains_key(REALM_ID_PATH)
         || reducer_state.conflicts.contains_key(GROUP_OWNER_PATH)
 }
@@ -241,9 +237,7 @@ pub(in crate::document_sync) fn overlay_realm_config(
         config.metadata_replication = metadata_replication;
     }
 
-    if !reducer_state
-        .conflicts
-        .contains_key(CONFIG_DISCOVERY_PATH)
+    if !reducer_state.conflicts.contains_key(CONFIG_DISCOVERY_PATH)
         && let Some(discovery) = reducer_state.materialized_realm_discovery()
     {
         config.discovery = discovery;
@@ -257,25 +251,19 @@ pub(in crate::document_sync) fn overlay_realm_config(
         config.description = description;
     }
 
-    if !reducer_state
-        .conflicts
-        .contains_key(CONFIG_QUOTA_PATH)
+    if !reducer_state.conflicts.contains_key(CONFIG_QUOTA_PATH)
         && let Some(quota) = reducer_state.materialized_realm_quota()
     {
         config.quota = quota;
     }
 
-    if !reducer_state
-        .conflicts
-        .contains_key(CONFIG_POLICIES_PATH)
+    if !reducer_state.conflicts.contains_key(CONFIG_POLICIES_PATH)
         && let Some(request_policies) = reducer_state.materialized_realm_policies()
     {
         config.request_policies = request_policies;
     }
 
-    if !reducer_state
-        .conflicts
-        .contains_key(CONFIG_COMPUTE_PATH)
+    if !reducer_state.conflicts.contains_key(CONFIG_COMPUTE_PATH)
         && let Some(compute) = reducer_state.materialized_realm_compute()
     {
         config.compute = compute;

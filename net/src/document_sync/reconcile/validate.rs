@@ -274,10 +274,7 @@ pub(in crate::document_sync) fn validate_config_authority(
             ));
         }
     }
-    if matches!(
-        &event.op,
-        AdminDocumentOperation::ConfigTokenRevoked { .. }
-    ) {
+    if matches!(&event.op, AdminDocumentOperation::ConfigTokenRevoked { .. }) {
         if !revocation_origin_known(current_config, previous_state, event, realm_id) {
             return Ok(AdminEventValidation::Deferred {
                 dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
@@ -327,10 +324,8 @@ pub(in crate::document_sync) fn validate_config_authority(
             PoolAdmission::Accept => {}
         }
     }
-    if let (
-        AdminDocumentOperation::HandleRangeGranted { range },
-        Some(placement_config),
-    ) = (&event.op, placement_config.as_ref())
+    if let (AdminDocumentOperation::HandleRangeGranted { range }, Some(placement_config)) =
+        (&event.op, placement_config.as_ref())
     {
         let canonical = range.len() == HANDLE_RANGE_SIZE
             && range
@@ -804,7 +799,12 @@ pub(in crate::document_sync) fn has_write_permission<'a>(
     path: &str,
     roles: impl IntoIterator<Item = &'a Role>,
 ) -> bool {
-    !user_id.is_nil() && aruna_core::structs::placement::policy_document::holds_admin_write(user_id, path, roles.into_iter())
+    !user_id.is_nil()
+        && aruna_core::structs::placement::policy_document::holds_admin_write(
+            user_id,
+            path,
+            roles.into_iter(),
+        )
 }
 
 /// Validates a replicated node-usage snapshot against its target: the payload
@@ -1347,7 +1347,9 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
             if *reported_by != event.origin_node_id {
                 return Err("transition report does not come from the node it names".to_string());
             }
-            if frontier.len() > aruna_core::structs::placement::placement_transition::MAX_FRONTIER_BYTES {
+            if frontier.len()
+                > aruna_core::structs::placement::placement_transition::MAX_FRONTIER_BYTES
+            {
                 return Err("transition barrier frontier exceeds its size bound".to_string());
             }
         }
@@ -1359,7 +1361,8 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
             if *reported_by != event.origin_node_id {
                 return Err("transition report does not come from the node it names".to_string());
             }
-            if reason.len() > aruna_core::structs::placement::placement_transition::MAX_STALL_BYTES {
+            if reason.len() > aruna_core::structs::placement::placement_transition::MAX_STALL_BYTES
+            {
                 return Err("transition stall reason exceeds its size bound".to_string());
             }
         }
@@ -1522,9 +1525,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::TransitionStallReported { .. }
         | AdminDocumentOperation::TransitionDrainReported { .. }
         | AdminDocumentOperation::ConfigComputeSet { .. }
-        | AdminDocumentOperation::ConfigTokenRevoked { .. } => {
-            AdminOperationFamily::RealmConfig
-        }
+        | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
     };
 
     if !family_matches_targets(family, target, &event.target) {
