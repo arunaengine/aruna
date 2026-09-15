@@ -3,11 +3,11 @@ use super::query::*;
 use super::references::*;
 use super::rocrate::*;
 use super::validation::*;
-use crate::auth::ValidatedArunaBearerTokenCarrier;
+use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
 use crate::metadata::*;
 use crate::server_state::ServerState;
-use crate::tests::fixtures::routes::{
+use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, test_context, test_state, test_storage,
 };
 use aruna_core::keys::generate_signing_key;
@@ -16,8 +16,8 @@ use aruna_core::structs::{Actor, AuthContext, Permission};
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{
-    MetadataApiError, MetadataApiQueryMode, MetadataQueryRequest, MetadataSearchRequest,
-    load_realm_nodes, query_metadata as run_query_metadata, search_metadata as run_search_metadata,
+    ApiQueryMode, MetadataApiError, MetadataQueryRequest, MetadataSearchRequest, load_realm_nodes,
+    query_metadata as run_query_metadata, search_metadata as run_search_metadata,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -35,13 +35,13 @@ use aruna_core::keyspaces::{
     HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, TASK_TIMER_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
-    MetadataMaterializationState, MetadataMaterializationStatusRecord,
+    GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord, MetadataDeleteRecord,
+    MetadataLifecycleRecord,
 };
 use aruna_core::storage_entries::{materialization_status_entry, registry_delete_entries};
 use aruna_core::structs::{
     BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, Group,
-    GroupAuthorizationDocument, HashPathIndexKey, METADATA_HANDLE, NodeCapabilities,
+    GroupAuthorizationDocument, HashIndex, METADATA_HANDLE, NodeCapabilities,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
     VersionKey,
 };
@@ -57,9 +57,9 @@ use aruna_operations::metadata::projector::{
 use aruna_operations::metadata::prune_queue::{process_graph_tombstones, prune_jobs_exist};
 use aruna_operations::metadata::repository::{write_document_lifecycle, write_graph_lifecycle};
 use aruna_operations::realm::announce_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
@@ -91,7 +91,7 @@ fn projected(response: MetadataRoCrateResponse) -> ProjectedRoCrateResponse {
     }
 }
 
-async fn write_status(state: &ServerState, status: &MetadataMaterializationStatusRecord) {
+async fn write_status(state: &ServerState, status: &MaterializationStatusRecord) {
     let (key_space, key, value) = materialization_status_entry(status).unwrap();
     match state
         .get_ctx()
@@ -124,17 +124,15 @@ async fn public_routes_work() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/public-dataset".to_string(),
-                name: "Public Dataset".to_string(),
-                description: "Visible metadata".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: None,
-                public: true,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/public-dataset".to_string(),
+            name: "Public Dataset".to_string(),
+            description: "Visible metadata".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: None,
+            public: true,
+        })),
     )
     .await
     .unwrap();
@@ -177,7 +175,7 @@ async fn public_routes_work() {
         Extension(None),
         Extension(None),
         Path(document_id.clone()),
-        Query(MetadataRoCrateExportParams {
+        Query(RoCrateExportParams {
             view: Some(MetadataRoCrateView::Raw),
             limit: None,
             offset: None,
@@ -234,7 +232,7 @@ async fn public_routes_work() {
         Extension(Some(test.auth.clone())),
         Extension(None),
         Path(document_id.clone()),
-        Json(ReplaceMetadataRoCrateRequest {
+        Json(ReplaceRoCrateRequest {
             rocrate: serde_json::from_str(&paged_jsonld).unwrap(),
             public: Some(true),
         }),
@@ -247,7 +245,7 @@ async fn public_routes_work() {
         Extension(None),
         Extension(None),
         Path(document_id.clone()),
-        Query(MetadataRoCrateExportParams {
+        Query(RoCrateExportParams {
             view: Some(MetadataRoCrateView::Raw),
             limit: None,
             offset: None,
@@ -270,7 +268,7 @@ async fn public_routes_work() {
         .unwrap();
     assert!(!projected_jsonld.contains("file-2.txt"));
     let failed_event_id = Ulid::from_string(&raw.winning_event_id).unwrap();
-    let mut failed_status = MetadataMaterializationStatusRecord {
+    let mut failed_status = MaterializationStatusRecord {
         document_id: Ulid::from_string(&document_id).unwrap(),
         event_id: failed_event_id,
         graph_iri: created.summary.graph_iri.clone(),
@@ -287,7 +285,7 @@ async fn public_routes_work() {
             .transpose()
             .unwrap()
             .map(|digest| digest.try_into().unwrap()),
-        state: MetadataMaterializationState::Failed,
+        state: MaterializationState::Failed,
         attempts: 1,
         failures: 0,
         last_error: Some("projection failed".to_string()),
@@ -299,7 +297,7 @@ async fn public_routes_work() {
         Extension(None),
         Extension(None),
         Path(document_id.clone()),
-        Query(MetadataRoCrateExportParams {
+        Query(RoCrateExportParams {
             view: Some(MetadataRoCrateView::Raw),
             limit: None,
             offset: None,
@@ -313,7 +311,7 @@ async fn public_routes_work() {
     };
     assert_eq!(failed.projection_state, "failed");
     assert!(failed.projected_event_id.is_none());
-    failed_status.state = MetadataMaterializationState::Pending;
+    failed_status.state = MaterializationState::Pending;
     failed_status.attempts = 0;
     failed_status.last_error = None;
     write_status(test.state.as_ref(), &failed_status).await;
@@ -325,7 +323,7 @@ async fn public_routes_work() {
         Extension(None),
         Extension(None),
         Path(document_id.clone()),
-        Query(MetadataRoCrateExportParams {
+        Query(RoCrateExportParams {
             view: Some(MetadataRoCrateView::Raw),
             limit: None,
             offset: None,
@@ -344,7 +342,7 @@ async fn public_routes_work() {
         Extension(None),
         Extension(None),
         Path(document_id.clone()),
-        Query(MetadataRoCrateExportParams::default()),
+        Query(RoCrateExportParams::default()),
     )
     .await
     .unwrap();
@@ -361,7 +359,7 @@ async fn public_routes_work() {
         Extension(None),
         Extension(None),
         Path(document_id.clone()),
-        Query(MetadataRoCrateExportParams {
+        Query(RoCrateExportParams {
             view: Some(MetadataRoCrateView::Summary),
             limit: None,
             offset: None,
@@ -381,7 +379,7 @@ async fn public_routes_work() {
         Extension(None),
         Extension(None),
         Path(document_id.clone()),
-        Query(MetadataRoCrateExportParams {
+        Query(RoCrateExportParams {
             view: Some(MetadataRoCrateView::Page),
             limit: Some(2),
             offset: Some(0),
@@ -533,38 +531,36 @@ async fn portal_searches_description() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::RoCrate(
-            CreateMetadataRoCrateRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/portal-array-context".to_string(),
-                public: true,
-                rocrate: json!({
-                    "@context": [
-                        "https://w3id.org/ro/crate/1.2/context",
-                        {
-                            "portalTerm": "https://example.org/portalTerm"
-                        }
-                    ],
-                    "@graph": [
-                        {
-                            "@id": "ro-crate-metadata.json",
-                            "@type": "CreativeWork",
-                            "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
-                            "about": { "@id": "urn:dataset:portal-search" }
-                        },
-                        {
-                            "@id": "urn:dataset:portal-search",
-                            "@type": "Dataset",
-                            "name": "Portal Search Dataset",
-                            "description": "A plain multi word constellation dataset description",
-                            "datePublished": "2026-07-18",
-                            "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" },
-                            "portalTerm": "portal-shape"
-                        }
-                    ]
-                }),
-            },
-        )),
+        Json(CreateMetadataRequest::RoCrate(CreateRoCrateRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/portal-array-context".to_string(),
+            public: true,
+            rocrate: json!({
+                "@context": [
+                    "https://w3id.org/ro/crate/1.2/context",
+                    {
+                        "portalTerm": "https://example.org/portalTerm"
+                    }
+                ],
+                "@graph": [
+                    {
+                        "@id": "ro-crate-metadata.json",
+                        "@type": "CreativeWork",
+                        "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                        "about": { "@id": "urn:dataset:portal-search" }
+                    },
+                    {
+                        "@id": "urn:dataset:portal-search",
+                        "@type": "Dataset",
+                        "name": "Portal Search Dataset",
+                        "description": "A plain multi word constellation dataset description",
+                        "datePublished": "2026-07-18",
+                        "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" },
+                        "portalTerm": "portal-shape"
+                    }
+                ]
+            }),
+        })),
     )
     .await
     .unwrap();
@@ -609,32 +605,30 @@ async fn rocrate_routes_work() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::RoCrate(
-            CreateMetadataRoCrateRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/rocrate-dataset".to_string(),
-                public: true,
-                rocrate: json!({
-                    "@context": "https://w3id.org/ro/crate/1.2/context",
-                    "@graph": [
-                        {
-                            "@id": "ro-crate-metadata.json",
-                            "@type": "CreativeWork",
-                            "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
-                            "about": { "@id": "urn:dataset:rocrate-create" }
-                        },
-                        {
-                            "@id": "urn:dataset:rocrate-create",
-                            "@type": "Dataset",
-                            "name": "Created From RO-Crate",
-                            "description": "Created from inline JSON-LD",
-                            "datePublished": "2026-01-01",
-                            "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" }
-                        }
-                    ]
-                }),
-            },
-        )),
+        Json(CreateMetadataRequest::RoCrate(CreateRoCrateRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/rocrate-dataset".to_string(),
+            public: true,
+            rocrate: json!({
+                "@context": "https://w3id.org/ro/crate/1.2/context",
+                "@graph": [
+                    {
+                        "@id": "ro-crate-metadata.json",
+                        "@type": "CreativeWork",
+                        "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                        "about": { "@id": "urn:dataset:rocrate-create" }
+                    },
+                    {
+                        "@id": "urn:dataset:rocrate-create",
+                        "@type": "Dataset",
+                        "name": "Created From RO-Crate",
+                        "description": "Created from inline JSON-LD",
+                        "datePublished": "2026-01-01",
+                        "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" }
+                    }
+                ]
+            }),
+        })),
     )
     .await
     .unwrap();
@@ -680,7 +674,7 @@ async fn rocrate_routes_work() {
         Extension(None),
         Extension(None),
         Path(document_id.clone()),
-        Query(MetadataRoCrateExportParams::default()),
+        Query(RoCrateExportParams::default()),
     )
     .await
     .unwrap();
@@ -703,17 +697,15 @@ async fn list_uses_registry() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/cache-served".to_string(),
-                name: "Cache Served Dataset".to_string(),
-                description: "Served from the handle registry cache".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: true,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/cache-served".to_string(),
+            name: "Cache Served Dataset".to_string(),
+            description: "Served from the handle registry cache".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: true,
+        })),
     )
     .await
     .unwrap();
@@ -763,17 +755,15 @@ async fn tombstone_hides_listing() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/inbound-tombstone".to_string(),
-                name: "Inbound Tombstone Dataset".to_string(),
-                description: "Deleted by document lifecycle only".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: true,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/inbound-tombstone".to_string(),
+            name: "Inbound Tombstone Dataset".to_string(),
+            description: "Deleted by document lifecycle only".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: true,
+        })),
     )
     .await
     .unwrap();
@@ -793,15 +783,15 @@ async fn tombstone_hides_listing() {
     .unwrap();
     assert_eq!(listed.documents.len(), 1);
 
-    let tombstone = MetadataGraphLifecycleRecord::deleted(
+    let tombstone = GraphLifecycleRecord::deleted(
         record.graph_iri.clone(),
         record.realm_id,
         record.group_id,
         record.document_id,
         2,
     );
-    let lifecycle = MetadataDocumentLifecycleRecord::Delete {
-        event: MetadataDocumentDeleteRecord {
+    let lifecycle = MetadataLifecycleRecord::Delete {
+        event: MetadataDeleteRecord {
             event_id: Ulid::generate(),
             tombstone: tombstone.clone(),
             deleted_after_event_id: record.last_event_id,
@@ -874,17 +864,15 @@ async fn private_metadata_hidden() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/private-dataset".to_string(),
-                name: "Private Dataset".to_string(),
-                description: "Private metadata".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: false,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/private-dataset".to_string(),
+            name: "Private Dataset".to_string(),
+            description: "Private metadata".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: false,
+        })),
     )
     .await
     .unwrap();
@@ -905,7 +893,7 @@ async fn private_metadata_hidden() {
         Extension(None),
         Extension(None),
         Path(created.summary.document_id),
-        Query(MetadataRoCrateExportParams::default()),
+        Query(RoCrateExportParams::default()),
     )
     .await;
     assert!(matches!(result, Err(ServerError::NotFound)));
@@ -922,17 +910,15 @@ async fn hides_document_existence() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/secret".to_string(),
-                name: "Secret".to_string(),
-                description: "Secret metadata".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: false,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/secret".to_string(),
+            name: "Secret".to_string(),
+            description: "Secret metadata".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: false,
+        })),
     )
     .await
     .unwrap();
@@ -1032,7 +1018,7 @@ async fn presence_tracks_config() {
 
     let remote_ctx = remote.state.get_ctx();
     drive(
-        AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+        AnnouncePresenceOperation::new(AnnouncePresenceConfig {
             realm_id,
             node_id: remote.net.node_id(),
             schedule_refresh: false,
@@ -1088,7 +1074,7 @@ async fn preview_refuses_stranger() {
     let result = preview_profile_validation(
         State(test.state.clone()),
         Extension(Some(stranger)),
-        Json(ProfileValidationPreviewRequest {
+        Json(ProfilePreviewRequest {
             rocrate: draft_crate(),
             group_id: Some(test.group_id.to_string()),
             public: false,
@@ -1106,7 +1092,7 @@ async fn preview_admits_member() {
     let (status, Json(preview)) = preview_profile_validation(
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
-        Json(ProfileValidationPreviewRequest {
+        Json(ProfilePreviewRequest {
             rocrate: draft_crate(),
             group_id: Some(test.group_id.to_string()),
             public: false,
@@ -1148,7 +1134,7 @@ async fn seed_preview_object(test: &TestState) -> Value {
     write_doc(
         &ctx,
         HASH_PATHS_INDEX_KEYSPACE,
-        HashPathIndexKey::new(
+        HashIndex::new(
             hash,
             version_id,
             test.state.get_realm_id(),
@@ -1215,7 +1201,7 @@ async fn preview_lists_restricted() {
     let (_, Json(preview)) = preview_profile_validation(
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
-        Json(ProfileValidationPreviewRequest {
+        Json(ProfilePreviewRequest {
             rocrate,
             group_id: Some(test.group_id.to_string()),
             public: true,
@@ -1254,7 +1240,7 @@ async fn preview_skips_readable() {
     let (_, Json(preview)) = preview_profile_validation(
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
-        Json(ProfileValidationPreviewRequest {
+        Json(ProfilePreviewRequest {
             rocrate,
             group_id: Some(test.group_id.to_string()),
             public: true,
@@ -1275,7 +1261,7 @@ async fn preview_skips_private() {
     let (_, Json(preview)) = preview_profile_validation(
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
-        Json(ProfileValidationPreviewRequest {
+        Json(ProfilePreviewRequest {
             rocrate,
             group_id: Some(test.group_id.to_string()),
             public: false,
@@ -1297,17 +1283,15 @@ async fn pending_export_unavailable() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/pending-dataset".to_string(),
-                name: "Pending Dataset".to_string(),
-                description: "Not yet materialized".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: true,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/pending-dataset".to_string(),
+            name: "Pending Dataset".to_string(),
+            description: "Not yet materialized".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: true,
+        })),
     )
     .await
     .unwrap();
@@ -1317,7 +1301,7 @@ async fn pending_export_unavailable() {
         Extension(None),
         Extension(None),
         Path(created.summary.document_id.clone()),
-        Query(MetadataRoCrateExportParams::default()),
+        Query(RoCrateExportParams::default()),
     )
     .await;
     assert!(matches!(result, Err(ServerError::NotFound)));
@@ -1330,7 +1314,7 @@ async fn pending_export_unavailable() {
         Extension(None),
         Extension(None),
         Path(created.summary.document_id.clone()),
-        Query(MetadataRoCrateExportParams::default()),
+        Query(RoCrateExportParams::default()),
     )
     .await;
     assert!(matches!(result, Err(ServerError::ServiceUnavailable)));
@@ -1342,7 +1326,7 @@ async fn pending_export_unavailable() {
         Extension(None),
         Extension(None),
         Path(created.summary.document_id),
-        Query(MetadataRoCrateExportParams::default()),
+        Query(RoCrateExportParams::default()),
     )
     .await;
     assert!(result.is_ok());
@@ -1356,17 +1340,15 @@ async fn pending_summary_tolerated() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/pending-summary".to_string(),
-                name: "Pending Summary".to_string(),
-                description: "Summary projection in flight".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: true,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/pending-summary".to_string(),
+            name: "Pending Summary".to_string(),
+            description: "Summary projection in flight".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: true,
+        })),
     )
     .await
     .unwrap();
@@ -1410,17 +1392,15 @@ async fn replacement_summary_withheld() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/replaced-summary".to_string(),
-                name: "Original Dataset".to_string(),
-                description: "before the replace".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: true,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/replaced-summary".to_string(),
+            name: "Original Dataset".to_string(),
+            description: "before the replace".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: true,
+        })),
     )
     .await
     .unwrap();
@@ -1451,7 +1431,7 @@ async fn replacement_summary_withheld() {
         Extension(Some(test.auth.clone())),
         Extension(None),
         Path(document_id),
-        Json(ReplaceMetadataRoCrateRequest {
+        Json(ReplaceRoCrateRequest {
             rocrate: serde_json::from_str(&rocrate).unwrap(),
             public: Some(true),
         }),
@@ -1619,17 +1599,15 @@ async fn local_partition_executes() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/local-partition".to_string(),
-                name: "Local Partition Dataset".to_string(),
-                description: "Coordinator partition".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: true,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/local-partition".to_string(),
+            name: "Local Partition Dataset".to_string(),
+            description: "Coordinator partition".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: true,
+        })),
     )
     .await
     .unwrap();
@@ -1673,17 +1651,15 @@ async fn query_applies_visibility() {
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
             Extension(None),
-            Json(CreateMetadataRequest::Scaffold(
-                CreateMetadataScaffoldRequest {
-                    group_id: test.group_id.to_string(),
-                    path: path.to_string(),
-                    name: name.to_string(),
-                    description: "Lazy visibility".to_string(),
-                    date_published: "2026-01-01".to_string(),
-                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                    public,
-                },
-            )),
+            Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+                group_id: test.group_id.to_string(),
+                path: path.to_string(),
+                name: name.to_string(),
+                description: "Lazy visibility".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+                public,
+            })),
         )
         .await
         .unwrap();
@@ -1734,7 +1710,7 @@ async fn query_forwards_token() {
     let authorized = query_remote_names(
         &test,
         Some(token_auth.clone()),
-        Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+        Some(ValidatedBearer::new_for_test(
             test.valid_bearer_token.clone(),
         )),
     )
@@ -1764,9 +1740,7 @@ async fn query_forwards_token() {
     let oversized_non_forwardable_token = query_remote_names(
         &test,
         Some(token_auth.clone()),
-        Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-            "x".repeat(4097),
-        )),
+        Some(ValidatedBearer::new_for_test("x".repeat(4097))),
     )
     .await;
     assert_eq!(oversized_non_forwardable_token.nodes_failed, 0);
@@ -1787,7 +1761,7 @@ async fn query_forwards_token() {
     let invalid_forwarded_token = query_remote_names(
         &test,
         Some(token_auth),
-        Some(ValidatedArunaBearerTokenCarrier::new_for_test("not-a-jwt")),
+        Some(ValidatedBearer::new_for_test("not-a-jwt")),
     )
     .await;
     assert_eq!(invalid_forwarded_token.nodes_queried, 1);
@@ -1809,7 +1783,7 @@ async fn query_forwards_token() {
             bearer_token: Some("not-a-jwt".to_string()),
             graph_iris: None,
             query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
-            mode: Some(MetadataApiQueryMode::Distributed),
+            mode: Some(ApiQueryMode::Distributed),
             target_nodes: Some(vec![test.remote.net.node_id()]),
             allow_partial: false,
         },
@@ -1839,7 +1813,7 @@ async fn private_get_forwards() {
     let (_, Json(path)) = get_metadata_path(
         State(test.coordinator.state.clone()),
         Extension(Some(test.auth.clone())),
-        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+        Extension(Some(ValidatedBearer::new_for_test(
             test.valid_bearer_token.clone(),
         ))),
         Path(test.group_id.to_string()),
@@ -1855,7 +1829,7 @@ async fn private_get_forwards() {
     let (_, Json(fetched)) = get_metadata_document(
         State(test.coordinator.state.clone()),
         Extension(Some(test.auth.clone())),
-        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+        Extension(Some(ValidatedBearer::new_for_test(
             test.valid_bearer_token.clone(),
         ))),
         Path(private.document_id),
@@ -1873,20 +1847,18 @@ async fn user_writes_forward() {
     let denied = create_metadata_document(
         State(test.coordinator.state.clone()),
         Extension(Some(test.denied_auth.clone())),
-        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+        Extension(Some(ValidatedBearer::new_for_test(
             test.denied_bearer_token.clone(),
         ))),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/user-denied".to_string(),
-                name: "User Denied".to_string(),
-                description: "Forwarded write without group permission".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: None,
-                public: false,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/user-denied".to_string(),
+            name: "User Denied".to_string(),
+            description: "Forwarded write without group permission".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: None,
+            public: false,
+        })),
     )
     .await;
     // A device forwards only for the owner its realm config names, so
@@ -1894,7 +1866,7 @@ async fn user_writes_forward() {
     assert!(matches!(denied, Err(ServerError::Forbidden)));
 
     let bearer = || {
-        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+        Extension(Some(ValidatedBearer::new_for_test(
             test.valid_bearer_token.clone(),
         )))
     };
@@ -1913,17 +1885,15 @@ async fn user_writes_forward() {
         State(test.coordinator.state.clone()),
         Extension(Some(test.auth.clone())),
         bearer(),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: foreign_group.to_string(),
-                path: "datasets/user-unpermitted".to_string(),
-                name: "User Unpermitted".to_string(),
-                description: "Forwarded write into a foreign group".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: None,
-                public: false,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: foreign_group.to_string(),
+            path: "datasets/user-unpermitted".to_string(),
+            name: "User Unpermitted".to_string(),
+            description: "Forwarded write into a foreign group".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: None,
+            public: false,
+        })),
     )
     .await;
     assert!(matches!(unpermitted, Err(ServerError::Forbidden)));
@@ -1947,17 +1917,15 @@ async fn user_writes_forward() {
         State(test.coordinator.state.clone()),
         Extension(Some(test.auth.clone())),
         bearer(),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/user-forward".to_string(),
-                name: "User Forward".to_string(),
-                description: "Forwarded from a User node".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: None,
-                public: false,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/user-forward".to_string(),
+            name: "User Forward".to_string(),
+            description: "Forwarded from a User node".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: None,
+            public: false,
+        })),
     )
     .await
     .unwrap();
@@ -2012,20 +1980,18 @@ async fn missing_config_fails() {
     let result = create_metadata_document(
         State(test.coordinator.state.clone()),
         Extension(Some(test.auth.clone())),
-        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+        Extension(Some(ValidatedBearer::new_for_test(
             test.valid_bearer_token.clone(),
         ))),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/missing-config".to_string(),
-                name: "Missing Config".to_string(),
-                description: "Origin must fail closed".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: None,
-                public: false,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/missing-config".to_string(),
+            name: "Missing Config".to_string(),
+            description: "Origin must fail closed".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: None,
+            public: false,
+        })),
     )
     .await;
     assert!(matches!(result, Err(ServerError::ServiceUnavailable)));
@@ -2058,7 +2024,7 @@ async fn run_search_route(
     limit: usize,
     cursor: Option<String>,
     mode: Option<MetadataQueryMode>,
-) -> ServerResult<MetadataSearchResponse> {
+) -> ServerResult<SearchResultsResponse> {
     search_metadata(
         State(state.clone()),
         Extension(Some(auth.clone())),
@@ -2179,7 +2145,7 @@ async fn search_cluster_page(
             group_id: None,
             limit: Some(limit),
             cursor,
-            mode: Some(MetadataApiQueryMode::Distributed),
+            mode: Some(ApiQueryMode::Distributed),
             target_nodes: Some(target_nodes),
         },
     )
@@ -2300,7 +2266,7 @@ async fn search_cluster_group(
             group_id,
             limit: Some(50),
             cursor: None,
-            mode: Some(MetadataApiQueryMode::Distributed),
+            mode: Some(ApiQueryMode::Distributed),
             target_nodes: Some(target_nodes),
         },
     )
@@ -2368,17 +2334,15 @@ async fn discovery_failure_partial() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/discovery-partial".to_string(),
-                name: "Discovery Partial Dataset".to_string(),
-                description: "discovery failure fixture".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: true,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/discovery-partial".to_string(),
+            name: "Discovery Partial Dataset".to_string(),
+            description: "discovery failure fixture".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: true,
+        })),
     )
     .await
     .unwrap();
@@ -2407,7 +2371,7 @@ async fn discovery_failure_partial() {
             group_id: None,
             limit: Some(10),
             cursor: None,
-            mode: Some(MetadataApiQueryMode::Distributed),
+            mode: Some(ApiQueryMode::Distributed),
             target_nodes: None,
         },
     )
@@ -2426,17 +2390,15 @@ async fn invalid_cursor_rejected() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/alpha".to_string(),
-                name: "Alpha Widget".to_string(),
-                description: "cursor fixture".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: true,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/alpha".to_string(),
+            name: "Alpha Widget".to_string(),
+            description: "cursor fixture".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: true,
+        })),
     )
     .await
     .unwrap();
@@ -2519,17 +2481,15 @@ async fn cursor_suppresses_churn() {
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
             Extension(None),
-            Json(CreateMetadataRequest::Scaffold(
-                CreateMetadataScaffoldRequest {
-                    group_id: test.group_id.to_string(),
-                    path: format!("datasets/widget-{index}"),
-                    name: format!("Widget {index}"),
-                    description: "churn fixture".to_string(),
-                    date_published: "2026-01-01".to_string(),
-                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                    public: true,
-                },
-            )),
+            Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+                group_id: test.group_id.to_string(),
+                path: format!("datasets/widget-{index}"),
+                name: format!("Widget {index}"),
+                description: "churn fixture".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+                public: true,
+            })),
         )
         .await
         .unwrap();
@@ -2563,17 +2523,15 @@ async fn cursor_suppresses_churn() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/widget-extra".to_string(),
-                name: "Widget Extra".to_string(),
-                description: "churn fixture".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: true,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/widget-extra".to_string(),
+            name: "Widget Extra".to_string(),
+            description: "churn fixture".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: true,
+        })),
     )
     .await
     .unwrap();
@@ -2627,17 +2585,15 @@ async fn page_size_clamped() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/capacity".to_string(),
-                name: "Placeholder Dataset".to_string(),
-                description: "placeholder".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: true,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/capacity".to_string(),
+            name: "Placeholder Dataset".to_string(),
+            description: "placeholder".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: true,
+        })),
     )
     .await
     .unwrap();
@@ -2664,7 +2620,7 @@ async fn page_size_clamped() {
         Extension(Some(test.auth.clone())),
         Extension(None),
         Path(document_id.clone()),
-        Json(ReplaceMetadataRoCrateRequest {
+        Json(ReplaceRoCrateRequest {
             rocrate: serde_json::from_str(&rocrate).unwrap(),
             public: Some(true),
         }),
@@ -2752,7 +2708,7 @@ async fn search_group_scoped(
     group_id: Option<Ulid>,
     limit: usize,
     cursor: Option<String>,
-) -> ServerResult<MetadataSearchResponse> {
+) -> ServerResult<SearchResultsResponse> {
     search_metadata(
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
@@ -2872,17 +2828,15 @@ async fn search_tolerates_pending() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/pending".to_string(),
-                name: "Pending Dataset".to_string(),
-                description: "pending fixture".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public: true,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/pending".to_string(),
+            name: "Pending Dataset".to_string(),
+            description: "pending fixture".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public: true,
+        })),
     )
     .await
     .unwrap();
@@ -2904,7 +2858,7 @@ async fn search_tolerates_pending() {
     }
 }
 
-struct DistributedMetadataAccessState {
+struct DistributedAccessState {
     auth: AuthContext,
     denied_auth: AuthContext,
     group_id: Ulid,
@@ -2914,7 +2868,7 @@ struct DistributedMetadataAccessState {
     remote: DistributedMetadataNode,
 }
 
-impl DistributedMetadataAccessState {
+impl DistributedAccessState {
     async fn shutdown(self) {
         self.coordinator.net.shutdown().await;
         self.remote.net.shutdown().await;
@@ -2940,7 +2894,7 @@ struct SearchPathsResult {
     nodes_failed: usize,
 }
 
-async fn setup_access_state() -> DistributedMetadataAccessState {
+async fn setup_access_state() -> DistributedAccessState {
     let realm_signing_key = test_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
     let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
@@ -3002,7 +2956,7 @@ async fn setup_access_state() -> DistributedMetadataAccessState {
         &test_token_claims(realm_id, denied_user_id),
     );
 
-    DistributedMetadataAccessState {
+    DistributedAccessState {
         auth,
         denied_auth,
         group_id,
@@ -3045,7 +2999,7 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });
-    initialize_net_incoming_for_tests(context.clone());
+    initialize_incoming_fixture(context.clone());
     let state = Arc::new(
         ServerState::new(
             context,
@@ -3187,17 +3141,17 @@ async fn references_route(
 async fn preflight_route(
     test: &TestState,
     auth: Option<AuthContext>,
-    target: MetadataReferencePreflightTargetBody,
+    target: PreflightTargetBody,
     mode: MetadataQueryMode,
     allow_partial: bool,
     limit: Option<usize>,
     cursor: Option<String>,
-) -> ServerResult<MetadataReferencePreflightResponse> {
+) -> ServerResult<PreflightResponse> {
     metadata_reference_preflight(
         State(test.state.clone()),
         Extension(auth),
         Extension(None),
-        Json(MetadataReferencePreflightBody {
+        Json(PreflightBody {
             target,
             mode: Some(mode),
             allow_partial,
@@ -3251,14 +3205,12 @@ async fn create_linking_doc(
         State(test.state.clone()),
         Extension(Some(auth)),
         Extension(None),
-        Json(CreateMetadataRequest::RoCrate(
-            CreateMetadataRoCrateRequest {
-                group_id: group_id.to_string(),
-                path: path.to_string(),
-                public,
-                rocrate,
-            },
-        )),
+        Json(CreateMetadataRequest::RoCrate(CreateRoCrateRequest {
+            group_id: group_id.to_string(),
+            path: path.to_string(),
+            public,
+            rocrate,
+        })),
     )
     .await
     .unwrap();
@@ -3587,7 +3539,7 @@ async fn references_clamps_limit() {
 async fn preflight_distinguishes_states() {
     let test = setup_state().await;
     let w3id = preflight_w3id([31u8; 32]);
-    let target = || MetadataReferencePreflightTargetBody::ContentW3ids {
+    let target = || PreflightTargetBody::ContentW3ids {
         content_w3ids: vec![w3id.clone()],
         remove_all_resolvable_locations: false,
     };
@@ -3715,7 +3667,7 @@ async fn hidden_references_concealed() {
     let response = preflight_route(
         &test,
         Some(test.auth.clone()),
-        MetadataReferencePreflightTargetBody::ContentW3ids {
+        PreflightTargetBody::ContentW3ids {
             content_w3ids: vec![w3id],
             remove_all_resolvable_locations: false,
         },
@@ -3795,7 +3747,7 @@ async fn preflight_finds_ids() {
     write_doc(
         &ctx,
         HASH_PATHS_INDEX_KEYSPACE,
-        HashPathIndexKey::new(
+        HashIndex::new(
             hash,
             version_id,
             test.state.get_realm_id(),
@@ -3825,10 +3777,10 @@ async fn preflight_finds_ids() {
     let response = preflight_route(
         &test,
         Some(test.auth.clone()),
-        MetadataReferencePreflightTargetBody::BucketPrefix {
+        PreflightTargetBody::BucketPrefix {
             bucket: bucket.to_string(),
             prefix: Some("folder/".to_string()),
-            operation: MetadataPreflightStorageOperationBody::AllVersionsPurge,
+            operation: PreflightStorageBody::AllVersionsPurge,
         },
         MetadataQueryMode::Local,
         true,
@@ -3858,26 +3810,24 @@ async fn create_test_document(
         State(state),
         Extension(Some(auth)),
         Extension(None),
-        Json(CreateMetadataRequest::Scaffold(
-            CreateMetadataScaffoldRequest {
-                group_id: group_id.to_string(),
-                path: path.to_string(),
-                name: name.to_string(),
-                description: "Remote metadata access fixture".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                public,
-            },
-        )),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: group_id.to_string(),
+            path: path.to_string(),
+            name: name.to_string(),
+            description: "Remote metadata access fixture".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            public,
+        })),
     )
     .await
     .unwrap();
 }
 
 async fn query_remote_names(
-    test: &DistributedMetadataAccessState,
+    test: &DistributedAccessState,
     auth: Option<AuthContext>,
-    bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
+    bearer_token: Option<ValidatedBearer>,
 ) -> QueryNamesResult {
     let ctx = test.coordinator.state.get_ctx();
     let result = run_query_metadata(
@@ -3889,7 +3839,7 @@ async fn query_remote_names(
             bearer_token: bearer_token_string(bearer_token),
             graph_iris: None,
             query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
-            mode: Some(MetadataApiQueryMode::Distributed),
+            mode: Some(ApiQueryMode::Distributed),
             target_nodes: Some(vec![test.remote.net.node_id()]),
             allow_partial: true,
         },
@@ -3908,9 +3858,9 @@ async fn query_remote_names(
 }
 
 async fn search_remote_paths(
-    test: &DistributedMetadataAccessState,
+    test: &DistributedAccessState,
     auth: Option<AuthContext>,
-    bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
+    bearer_token: Option<ValidatedBearer>,
 ) -> SearchPathsResult {
     let ctx = test.coordinator.state.get_ctx();
     let result = run_search_metadata(
@@ -3926,7 +3876,7 @@ async fn search_remote_paths(
             group_id: None,
             limit: Some(10),
             cursor: None,
-            mode: Some(MetadataApiQueryMode::Distributed),
+            mode: Some(ApiQueryMode::Distributed),
             target_nodes: Some(vec![test.remote.net.node_id()]),
         },
     )
@@ -4142,7 +4092,7 @@ async fn setup_network_state() -> TestState {
     )
     .await;
     drive(
-        AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+        AnnouncePresenceOperation::new(AnnouncePresenceConfig {
             realm_id,
             node_id,
             schedule_refresh: false,
@@ -4261,10 +4211,9 @@ async fn read_task_timer(ctx: &DriverContext, key: &TaskKey) -> Option<Persisted
     }
 }
 
-/// Route-family contract tests for the D016/D017 replacement: every
-/// protected metadata route is executed in-process for the unauthenticated,
-/// foreign-realm, stranger, allowed, and intentionally public cases, and a
-/// refusal is followed by evidence that no privileged write happened.
+/// Route-family contract tests for D016/D017: every protected metadata route
+/// runs in-process for the unauthenticated, foreign-realm, stranger, allowed,
+/// and public cases, and a refusal leaves evidence that no write happened.
 mod authorization {
     use super::*;
 
@@ -4293,7 +4242,7 @@ mod authorization {
     }
 
     fn scaffold(group_id: Ulid, path: &str, public: bool) -> CreateMetadataRequest {
-        CreateMetadataRequest::Scaffold(CreateMetadataScaffoldRequest {
+        CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: group_id.to_string(),
             path: path.to_string(),
             name: "Authorization fixture".to_string(),
@@ -4334,7 +4283,7 @@ mod authorization {
     }
 
     #[tokio::test]
-    async fn create_requires_auth_and_writes_nothing() {
+    async fn unauthorized_create_denied() {
         let test = setup_network_state().await;
         let denied = create(&test, None, "datasets/anonymous", false).await;
         assert!(matches!(denied, Err(ServerError::Unauthorized)));
@@ -4342,7 +4291,7 @@ mod authorization {
     }
 
     #[tokio::test]
-    async fn create_rejects_foreign_realm_and_writes_nothing() {
+    async fn foreign_create_denied() {
         let test = setup_network_state().await;
         let denied = create(&test, Some(foreign_auth()), "datasets/foreign", false).await;
         assert!(matches!(denied, Err(ServerError::Forbidden)));
@@ -4350,7 +4299,7 @@ mod authorization {
     }
 
     #[tokio::test]
-    async fn create_rejects_stranger_and_writes_nothing() {
+    async fn stranger_create_denied() {
         let test = setup_network_state().await;
         let denied = create(
             &test,
@@ -4364,7 +4313,7 @@ mod authorization {
     }
 
     #[tokio::test]
-    async fn create_allows_the_group_member() {
+    async fn member_create_allowed() {
         let test = setup_network_state().await;
         let (status, Json(created)) =
             create(&test, Some(test.auth.clone()), "datasets/allowed", false)
@@ -4376,7 +4325,7 @@ mod authorization {
     }
 
     #[tokio::test]
-    async fn delete_rejects_stranger_and_keeps_the_document() {
+    async fn stranger_delete_denied() {
         let test = setup_network_state().await;
         let (_, Json(created)) = create(&test, Some(test.auth.clone()), "datasets/guarded", false)
             .await
@@ -4405,7 +4354,7 @@ mod authorization {
     }
 
     #[tokio::test]
-    async fn private_read_is_hidden_while_public_read_is_anonymous() {
+    async fn read_visibility() {
         let test = setup_network_state().await;
         let (_, Json(public)) = create(&test, Some(test.auth.clone()), "datasets/public", true)
             .await
@@ -4434,6 +4383,9 @@ mod authorization {
             Path(private.summary.document_id),
         )
         .await;
-        assert!(matches!(anonymous_private, Err(ServerError::NotFound)));
+        assert!(
+            matches!(anonymous_private, Err(ServerError::NotFound)),
+            "a private document stays hidden from anonymous readers"
+        );
     }
 }
