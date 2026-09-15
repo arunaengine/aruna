@@ -1,7 +1,7 @@
 //! Creation of an immutable placement-policy document on one of its holders.
 
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicySignEvent, StorageEvent, SubOperationEvent};
@@ -126,14 +126,14 @@ impl CreatePolicyOperation {
         self.config.policy.policy_id
     }
 
-    fn target(&self) -> DocumentSyncTarget {
+    fn target(&self) -> DocumentTarget {
         placement_policy_target(self.policy_id())
     }
 
     fn emit_read_config(&mut self, txn_id: TxnId) -> Effects {
         self.txn_id = Some(txn_id);
         self.state = CreatePolicyState::ReadConfig;
-        let config_target = DocumentSyncTarget::RealmConfig {
+        let config_target = DocumentTarget::RealmConfig {
             realm_id: self.config.actor.realm_id,
         };
         let target = self.target();
@@ -265,7 +265,7 @@ impl CreatePolicyOperation {
             self.config.actor.node_id,
             target,
             holders,
-            DocumentSyncOutboxEvent::Upsert { bytes, change },
+            DocumentOutboxEvent::Upsert { bytes, change },
             placement,
             // Shard topics are join-only: the bucket's rank-0 holder mints the
             // genesis, so no publisher of a policy document claims it.
@@ -467,7 +467,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::placement::policy::read::{PolicySource, ReadPolicyConfig, ReadPolicyOperation};
-    use crate::realm::claim_admin::{ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation};
+    use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
     use aruna_core::handle::Handle;
@@ -557,7 +557,7 @@ mod tests {
         .await
         .expect("realm is created");
         drive(
-            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+            ClaimInitialOperation::new(ClaimInitialInput {
                 actor: actor.clone(),
             }),
             &context,
@@ -610,14 +610,14 @@ mod tests {
         assert_eq!(document.publication.created_by, actor.user_id);
         let realm_config = read_document(
             &context,
-            DocumentSyncTarget::RealmConfig {
+            DocumentTarget::RealmConfig {
                 realm_id: actor.realm_id,
             },
         )
         .await;
         let realm_auth = read_document(
             &context,
-            DocumentSyncTarget::RealmAuthorization {
+            DocumentTarget::RealmAuthorization {
                 realm_id: actor.realm_id,
             },
         )
@@ -634,7 +634,7 @@ mod tests {
         );
     }
 
-    async fn read_document(context: &DriverContext, target: DocumentSyncTarget) -> Value {
+    async fn read_document(context: &DriverContext, target: DocumentTarget) -> Value {
         let event = context
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::Read {
@@ -709,7 +709,7 @@ mod tests {
     /// A realm role granting the admin user write on one group's admin path,
     /// so a group-owned publication has an authority to check against.
     async fn seed_group_admin(context: &DriverContext, actor: &Actor, group_id: Ulid) {
-        let target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let target = DocumentTarget::GroupAuthorization { group_id };
         let document = aruna_core::structs::GroupAuthorizationDocument {
             group_id,
             roles: std::collections::HashMap::from([(
@@ -755,23 +755,20 @@ mod tests {
         assert_eq!(document.policy.owner_group_id, Some(group_id));
         let realm_config = read_document(
             &context,
-            DocumentSyncTarget::RealmConfig {
+            DocumentTarget::RealmConfig {
                 realm_id: actor.realm_id,
             },
         )
         .await;
         let realm_auth = read_document(
             &context,
-            DocumentSyncTarget::RealmAuthorization {
+            DocumentTarget::RealmAuthorization {
                 realm_id: actor.realm_id,
             },
         )
         .await;
-        let group_auth = read_document(
-            &context,
-            DocumentSyncTarget::GroupAuthorization { group_id },
-        )
-        .await;
+        let group_auth =
+            read_document(&context, DocumentTarget::GroupAuthorization { group_id }).await;
         let group_auth = aruna_core::structs::GroupAuthorizationDocument::from_bytes(&group_auth)
             .expect("group authorization decodes");
         assert_eq!(

@@ -314,7 +314,7 @@ mod pure_tests {
     use ulid::Ulid;
 
     use crate::placement::policy::cache::PolicyCacheEntry;
-    use crate::tests::fixtures::policy::{signed_document, subject};
+    use crate::tests::policy::{signed_document, subject};
 
     fn realm_id() -> RealmId {
         RealmId::from_bytes([1u8; 32])

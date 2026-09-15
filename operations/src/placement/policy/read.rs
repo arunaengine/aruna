@@ -2,7 +2,7 @@
 //! bounded fetch from the holders its id resolves to. No catalog is consulted;
 //! a document failing the hash or realm-admin authority is refused, not returned.
 
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{
     Effect, HolderList, MAX_POLICY_FETCH_HOLDERS, NetEffect, PolicyFetchEffect, StorageEffect,
 };
@@ -145,7 +145,7 @@ impl ReadPolicyOperation {
         }
     }
 
-    fn target(&self) -> DocumentSyncTarget {
+    fn target(&self) -> DocumentTarget {
         placement_policy_target(self.config.policy_ref.policy_id)
     }
 
@@ -208,7 +208,7 @@ impl ReadPolicyOperation {
                 Err(error) => self.refuse(error, remaining),
             };
         };
-        let target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let target = DocumentTarget::GroupAuthorization { group_id };
         self.state = ReadPolicyState::ReadGroupAuth {
             pending: Box::new(PendingAuthority {
                 document,
@@ -365,10 +365,10 @@ impl Operation for ReadPolicyOperation {
     fn start(&mut self) -> Effects {
         self.state = ReadPolicyState::ReadLocal;
         let target = self.target();
-        let config = DocumentSyncTarget::RealmConfig {
+        let config = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
-        let auth = DocumentSyncTarget::RealmAuthorization {
+        let auth = DocumentTarget::RealmAuthorization {
             realm_id: self.config.realm_id,
         };
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -461,7 +461,7 @@ impl Operation for ReadPolicyOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::tests::fixtures::policy::{admin_user, realm_view, signed_document};
+    use crate::tests::policy::{admin_user, realm_view, signed_document};
     use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::effects::NetEffect;

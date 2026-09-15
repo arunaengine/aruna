@@ -213,7 +213,7 @@ mod pure_tests {
     use aruna_core::types::Key;
     use ulid::Ulid;
 
-    use crate::tests::fixtures::policy::signed_document;
+    use crate::tests::policy::signed_document;
 
     fn realm_id() -> RealmId {
         RealmId::from_bytes([1u8; 32])
