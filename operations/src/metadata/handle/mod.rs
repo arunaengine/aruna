@@ -40,7 +40,7 @@ use super::profile_shacl::{
 use super::query_cache::MetadataQueryCache;
 use super::summary_cache::summary_cache;
 use crate::auth::bearer_token::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache, realm_token_revoked,
+    ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_token_revoked,
 };
 use crate::driver::{DriverContext, drive};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
@@ -155,7 +155,7 @@ pub(crate) enum MetadataRequestDelivery {
 }
 
 #[derive(Debug)]
-pub(crate) enum MetadataWritePeerError {
+pub(crate) enum WritePeerError {
     Unauthorized,
     Unavailable(MetadataError),
 }
@@ -250,7 +250,7 @@ impl From<MetadataSearchStorage> for SearchStorage {
 struct MetadataInner {
     node: Arc<CraqleNode>,
     storage_handle: StorageHandle,
-    auth_validation: MetadataAuthValidationState,
+    auth_validation: AuthValidationState,
     net_handle: Option<NetHandle>,
     document_sync_db: Option<fjall::OptimisticTxDatabase>,
     document_sync_persist_policy: FjallPersistPolicy,
@@ -268,7 +268,7 @@ struct MetadataInner {
 }
 
 #[derive(Clone)]
-struct MetadataAuthValidationState {
+struct AuthValidationState {
     storage_handle: StorageHandle,
     /// Realm this node serves; without one there is no replicated revocation
     /// set to consult, and this node serves no remote metadata peers either.
@@ -276,7 +276,7 @@ struct MetadataAuthValidationState {
     issuer_keys: Arc<IssuerKeyCache>,
 }
 
-impl MetadataAuthValidationState {
+impl AuthValidationState {
     fn new(storage_handle: StorageHandle, realm_id: Option<RealmId>) -> Self {
         Self {
             storage_handle,
@@ -287,12 +287,12 @@ impl MetadataAuthValidationState {
 }
 
 #[async_trait]
-impl ArunaBearerTokenValidationState for MetadataAuthValidationState {
+impl ArunaValidationState for AuthValidationState {
     async fn is_token_revoked(
         &self,
         realm_id: &RealmId,
         token_hash: &str,
-    ) -> Result<bool, ArunaBearerTokenError> {
+    ) -> Result<bool, ArunaBearerError> {
         // Without realm state this node holds no revocation authority at all;
         // once it has any, the token's own issuing realm answers.
         match self.realm_id {
@@ -316,20 +316,20 @@ impl ArunaBearerTokenValidationState for MetadataAuthValidationState {
     async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+    ) -> Result<DecodingKey, ArunaBearerError> {
         self.issuer_keys.get_or_insert(issuer_pubkey).await
     }
 }
 
-struct RevocationBlindValidation<'a>(&'a MetadataAuthValidationState);
+struct RevocationBlindValidation<'a>(&'a AuthValidationState);
 
 #[async_trait]
-impl ArunaBearerTokenValidationState for RevocationBlindValidation<'_> {
+impl ArunaValidationState for RevocationBlindValidation<'_> {
     async fn is_token_revoked(
         &self,
         _realm_id: &RealmId,
         _token_hash: &str,
-    ) -> Result<bool, ArunaBearerTokenError> {
+    ) -> Result<bool, ArunaBearerError> {
         Ok(false)
     }
 
@@ -340,7 +340,7 @@ impl ArunaBearerTokenValidationState for RevocationBlindValidation<'_> {
     async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+    ) -> Result<DecodingKey, ArunaBearerError> {
         self.0.issuer_decoding_key(issuer_pubkey).await
     }
 }
@@ -348,7 +348,7 @@ impl ArunaBearerTokenValidationState for RevocationBlindValidation<'_> {
 struct MetadataVisibilityCache {
     registry: Mutex<Option<RegistryCacheEntry>>,
     registry_fill: Arc<tokio::sync::Mutex<()>>,
-    lifecycle_deleted: Mutex<HashMap<String, LifecycleDeletedCacheEntry>>,
+    lifecycle_deleted: Mutex<HashMap<String, LifecycleDeletedEntry>>,
     generation: AtomicU64,
 }
 
@@ -392,7 +392,7 @@ impl RegistryCacheEntry {
     }
 }
 
-struct LifecycleDeletedCacheEntry {
+struct LifecycleDeletedEntry {
     deleted: bool,
     expires_at: Instant,
 }
@@ -475,7 +475,7 @@ impl MetadataHandle {
         Ok(Self {
             inner: Arc::new(MetadataInner {
                 node: Arc::new(node),
-                auth_validation: MetadataAuthValidationState::new(
+                auth_validation: AuthValidationState::new(
                     storage_handle.clone(),
                     net_handle.as_ref().map(|net| *net.realm_id()),
                 ),

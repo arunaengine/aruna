@@ -1,4 +1,6 @@
+#[path = "forward_read.rs"]
 mod read;
+#[path = "forward_write.rs"]
 mod write;
 
 pub(crate) use self::read::{
@@ -11,9 +13,10 @@ pub use self::read::{
 };
 pub(crate) use self::write::apply_forwarded_write;
 pub use self::write::{
-    CreateMetadataAuthorizedError, apply_batch_routed, create_metadata_authorized,
-    route_metadata_create, route_metadata_delete, route_metadata_update,
+    CreateAuthorizedError, apply_batch_routed, create_metadata_authorized, route_metadata_create,
+    route_metadata_delete, route_metadata_update,
 };
 
 #[cfg(test)]
+#[path = "forward_tests.rs"]
 mod tests;

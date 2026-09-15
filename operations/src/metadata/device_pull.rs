@@ -23,16 +23,14 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::{DriverContext, drive, routing_snapshot};
 use crate::forward::authorize::peer_acts_for;
-use crate::metadata::handle::MetadataWritePeerError;
+use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
-use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::s3::list_versions::{
-    ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
-};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use crate::s3::list_versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 
 /// Versions one idempotency scan reads at a time.
@@ -78,7 +76,7 @@ pub async fn serve_sync_pull(
 }
 
 struct PullRequest {
-    auth_token: aruna_core::metadata::MetadataAuthToken,
+    auth_token: aruna_core::metadata::AuthToken,
     source: VersionedObjectArn,
     blake3: Option<[u8; 32]>,
     size: u64,
@@ -123,7 +121,7 @@ async fn apply_pull(
 pub(crate) async fn authorize_peer(
     context: &Arc<DriverContext>,
     peer: NodeId,
-    auth_token: aruna_core::metadata::MetadataAuthToken,
+    auth_token: aruna_core::metadata::AuthToken,
 ) -> Result<AuthContext, SyncRefusal> {
     let metadata = context
         .metadata_handle
@@ -133,8 +131,8 @@ pub(crate) async fn authorize_peer(
         .authorize_write_peer(peer, Some(auth_token))
         .await
         .map_err(|error| match error {
-            MetadataWritePeerError::Unauthorized => SyncRefusal::Unauthorized,
-            MetadataWritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
+            WritePeerError::Unauthorized => SyncRefusal::Unauthorized,
+            WritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
         })?;
     let config = load_realm_config(context, auth.realm_id)
         .await
@@ -152,7 +150,7 @@ async fn read_bucket(
     context: &Arc<DriverContext>,
     bucket: &str,
 ) -> Result<BucketInfo, SyncRefusal> {
-    match drive(GetBucketInfoOperation::new(bucket.to_string()), context).await {
+    match drive(GetBucketOperation::new(bucket.to_string()), context).await {
         Ok(info) => Ok(info),
         Err(error) => {
             debug!(error = %error, bucket = %bucket, "A sync pull could not read its target bucket");
@@ -163,9 +161,9 @@ async fn read_bucket(
 
 /// A bucket that is not there is permanent; everything else is this node's
 /// problem and must not park the device's upload.
-fn bucket_refusal(error: GetBucketInfoError) -> SyncRefusal {
+fn bucket_refusal(error: GetBucketError) -> SyncRefusal {
     match error {
-        GetBucketInfoError::NotFound => SyncRefusal::NotFound,
+        GetBucketError::NotFound => SyncRefusal::NotFound,
         _ => SyncRefusal::Unavailable,
     }
 }
@@ -448,7 +446,7 @@ pub(crate) fn refusal_kind(refusal: &SyncRefusal) -> &'static str {
 async fn list_heads(
     context: &Arc<DriverContext>,
     peer: NodeId,
-    auth_token: aruna_core::metadata::MetadataAuthToken,
+    auth_token: aruna_core::metadata::AuthToken,
     bucket: String,
     prefix: String,
     cursor: Option<SyncListCursor>,
@@ -463,7 +461,7 @@ async fn list_heads(
         None => (None, None),
     };
     let result = drive(
-        ListObjectVersionsOperation::new(ListObjectVersionsInput {
+        ListVersionsOperation::new(ListVersionsInput {
             bucket,
             prefix: (!prefix.is_empty()).then(|| listing_prefix(&prefix)),
             delimiter: None,
@@ -495,9 +493,9 @@ fn listing_prefix(prefix: &str) -> String {
 
 /// One current head, named relative to the requested prefix. Only the latest
 /// version of a key is a head; older versions are not the folder's state.
-fn head_of(item: &ListObjectVersionsItem, prefix: &str) -> Option<RemoteHead> {
+fn head_of(item: &ListVersionsItem, prefix: &str) -> Option<RemoteHead> {
     let (key, version_id, deleted, location, metadata, created_at) = match item {
-        ListObjectVersionsItem::Version {
+        ListVersionsItem::Version {
             key,
             version_id,
             is_latest: true,
@@ -512,7 +510,7 @@ fn head_of(item: &ListObjectVersionsItem, prefix: &str) -> Option<RemoteHead> {
             source_metadata,
             created_at,
         ),
-        ListObjectVersionsItem::DeleteMarker {
+        ListVersionsItem::DeleteMarker {
             key,
             version_id,
             is_latest: true,
@@ -688,7 +686,7 @@ mod tests {
 
     fn pull_request(deleted: bool) -> PullRequest {
         PullRequest {
-            auth_token: aruna_core::metadata::MetadataAuthToken::internal(AuthContext {
+            auth_token: aruna_core::metadata::AuthToken::internal(AuthContext {
                 user_id: UserId::local(Ulid::from_bytes([5; 16]), RealmId::from_bytes([4u8; 32])),
                 realm_id: RealmId::from_bytes([4u8; 32]),
                 path_restrictions: None,
@@ -871,8 +869,8 @@ mod tests {
         );
     }
 
-    fn version(key: &str, latest: bool) -> ListObjectVersionsItem {
-        ListObjectVersionsItem::Version {
+    fn version(key: &str, latest: bool) -> ListVersionsItem {
+        ListVersionsItem::Version {
             key: key.to_string(),
             version_id: Ulid::from_bytes([1u8; 16]),
             is_latest: latest,
@@ -923,23 +921,23 @@ mod tests {
         // The drain parks a NotFound for good, so only a bucket that is really
         // absent may answer it; a storage fault must stay retryable.
         assert_eq!(
-            bucket_refusal(GetBucketInfoError::NotFound),
+            bucket_refusal(GetBucketError::NotFound),
             SyncRefusal::NotFound
         );
         assert_eq!(
-            bucket_refusal(GetBucketInfoError::StorageError(
-                StorageError::KeyspaceError("unavailable".to_string())
-            )),
+            bucket_refusal(GetBucketError::StorageError(StorageError::KeyspaceError(
+                "unavailable".to_string()
+            ))),
             SyncRefusal::Unavailable
         );
         assert_eq!(
-            bucket_refusal(GetBucketInfoError::ConversionError(
+            bucket_refusal(GetBucketError::ConversionError(
                 ConversionError::FromStrError("broken".to_string())
             )),
             SyncRefusal::Unavailable
         );
         assert_eq!(
-            bucket_refusal(GetBucketInfoError::Incomplete),
+            bucket_refusal(GetBucketError::Incomplete),
             SyncRefusal::Unavailable
         );
     }

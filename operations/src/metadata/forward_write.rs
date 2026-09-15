@@ -4,31 +4,31 @@ use crate::device::edit::DeviceEditError;
 use crate::device::edit::accepts_edits;
 use crate::device::edit::apply_local_edit;
 use crate::driver::DriverContext;
-use crate::metadata::api::GetVisibleMetadataDocumentRequest;
+use crate::metadata::api::GetVisibleRequest;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::ensure_record_readable;
 use crate::metadata::api::get_visible_document;
 use crate::metadata::api::load_live_record;
-use crate::metadata::create_document::CreateMetadataDocumentConfig;
-use crate::metadata::create_document::CreateMetadataDocumentError;
-use crate::metadata::create_document::CreateMetadataDocumentOperation;
-use crate::metadata::create_document::CreateMetadataDocumentPayload;
-use crate::metadata::create_document::CreateMetadataDocumentResult;
+use crate::metadata::create_document::CreateDocumentConfig;
+use crate::metadata::create_document::CreateDocumentError;
+use crate::metadata::create_document::CreateDocumentOperation;
+use crate::metadata::create_document::CreateDocumentPayload;
+use crate::metadata::create_document::CreateDocumentResult;
 use crate::metadata::create_document::create_metadata_document;
 use crate::metadata::create_document::mint_forward_document;
 use crate::metadata::create_document::mint_local_document;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::delete_document::DeleteMetadataDocumentOperation;
+use crate::metadata::delete_document::DeleteDocumentOperation;
 use crate::metadata::delete_document::delete_metadata_document;
 use crate::metadata::profile_validation::current_validation_status;
 use crate::metadata::profile_validation::revalidate_current;
-use crate::metadata::protocol::MetadataAuthToken;
+use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::update_document::UpdateMetadataDocumentConfig;
-use crate::metadata::update_document::UpdateMetadataDocumentError;
-use crate::metadata::update_document::UpdateMetadataDocumentMutation;
-use crate::metadata::update_document::UpdateMetadataDocumentOperation;
+use crate::metadata::update_document::UpdateDocumentConfig;
+use crate::metadata::update_document::UpdateDocumentError;
+use crate::metadata::update_document::UpdateDocumentMutation;
+use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_document::update_metadata_document;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::placement::process_placements::load_realm_config;
@@ -80,13 +80,13 @@ use aruna_core::StructuredId;
 /// Definitely unsent requests may try another holder; ambiguous delivery is
 /// terminal so the create is not replayed.
 pub async fn route_metadata_create(
-    operation: CreateMetadataDocumentOperation,
+    operation: CreateDocumentOperation,
     context: Arc<DriverContext>,
-    auth_token: Option<MetadataAuthToken>,
-) -> Result<CreateMetadataDocumentResult, MetadataWriteError> {
+    auth_token: Option<AuthToken>,
+) -> Result<CreateDocumentResult, MetadataWriteError> {
     let config = operation.config().clone();
     match create_metadata_document(operation, context.clone()).await {
-        Err(CreateMetadataDocumentError::OriginHoldsNoBucket) => {}
+        Err(CreateDocumentError::OriginHoldsNoBucket) => {}
         Ok(created) => return Ok(created),
         Err(error) => return Err(error.into()),
     }
@@ -107,7 +107,7 @@ pub async fn route_metadata_create(
         )?
     } else {
         MetaResourceId::from_bytes(config.document_id.to_bytes()).map_err(|error| {
-            CreateMetadataDocumentError::PlacementBindingUnavailable(format!(
+            CreateDocumentError::PlacementBindingUnavailable(format!(
                 "forwarded document id is not a structured id: {error}"
             ))
         })?
@@ -141,7 +141,7 @@ pub async fn route_metadata_create(
         MetadataTransportMessage::ForwardedRecord { record }
             if create_record_matches(&config, document_id.as_ulid(), &placement, &record) =>
         {
-            Ok(CreateMetadataDocumentResult {
+            Ok(CreateDocumentResult {
                 event_id: record.last_event_id,
                 record: *record,
             })
@@ -150,8 +150,7 @@ pub async fn route_metadata_create(
             "holder returned a metadata create record for another document".to_string(),
         )),
         MetadataTransportMessage::ForwardedProfileValidation { findings } => Err(
-            CreateMetadataDocumentError::MetadataError(MetadataError::ProfileValidation(findings))
-                .into(),
+            CreateDocumentError::MetadataError(MetadataError::ProfileValidation(findings)).into(),
         ),
         other => Err(unexpected_response(other)),
     }
@@ -160,7 +159,7 @@ pub async fn route_metadata_create(
 /// Errors of the shared authorized create flow. Every variant maps onto the
 /// same transport status the former REST-local sequence produced.
 #[derive(Debug, Error)]
-pub enum CreateMetadataAuthorizedError {
+pub enum CreateAuthorizedError {
     #[error("metadata document path must not be empty")]
     EmptyPath,
     #[error("metadata create is forbidden")]
@@ -168,7 +167,7 @@ pub enum CreateMetadataAuthorizedError {
     #[error(transparent)]
     Api(#[from] MetadataApiError),
     #[error(transparent)]
-    Create(#[from] CreateMetadataDocumentError),
+    Create(#[from] CreateDocumentError),
     #[error(transparent)]
     Authorize(#[from] AuthorizeError),
     #[error(transparent)]
@@ -185,15 +184,15 @@ pub async fn create_metadata_authorized(
     local_node_id: NodeId,
     auth: &AuthContext,
     extras: PolicyRequestExtras,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
     group_id: GroupId,
     path: String,
     public: bool,
-    payload: CreateMetadataDocumentPayload,
-) -> Result<MetadataRegistryRecord, CreateMetadataAuthorizedError> {
+    payload: CreateDocumentPayload,
+) -> Result<MetadataRegistryRecord, CreateAuthorizedError> {
     let path = MetadataRegistryRecord::normalize_document_path(&path);
     if path.is_empty() {
-        return Err(CreateMetadataAuthorizedError::EmptyPath);
+        return Err(CreateAuthorizedError::EmptyPath);
     }
     let user_origin = is_user_origin(context, realm_id, local_node_id).await?;
     let realm_config = load_realm_config(context, realm_id)
@@ -209,7 +208,7 @@ pub async fn create_metadata_authorized(
     } else {
         match mint_local_document(&realm_config, &actor, group_id, &path) {
             Ok(document_id) => document_id.as_ulid(),
-            Err(CreateMetadataDocumentError::OriginHoldsNoBucket) => {
+            Err(CreateDocumentError::OriginHoldsNoBucket) => {
                 mint_forward_document(&realm_config, &actor, group_id, &path)?.as_ulid()
             }
             Err(error) => return Err(error.into()),
@@ -217,7 +216,7 @@ pub async fn create_metadata_authorized(
     };
     if !user_origin {
         if auth.realm_id != realm_id {
-            return Err(CreateMetadataAuthorizedError::Forbidden);
+            return Err(CreateAuthorizedError::Forbidden);
         }
         authorize_create(
             context,
@@ -231,7 +230,7 @@ pub async fn create_metadata_authorized(
         .await?;
     }
     let created = route_metadata_create(
-        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
             actor,
             group_id,
             document_id,
@@ -268,8 +267,8 @@ pub async fn route_metadata_update(
     record: Option<&MetadataRegistryRecord>,
     document_id: Ulid,
     public: Option<bool>,
-    mutation: UpdateMetadataDocumentMutation,
-    auth_token: Option<MetadataAuthToken>,
+    mutation: UpdateDocumentMutation,
+    auth_token: Option<AuthToken>,
 ) -> Result<MetadataRegistryRecord, MetadataWriteError> {
     let config = load_realm_config(context, actor.realm_id)
         .await
@@ -317,7 +316,7 @@ pub async fn route_metadata_update(
     let mut local_capacity = false;
     if local_holds && let Some(record) = record {
         match update_metadata_document(
-            UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+            UpdateDocumentOperation::new(UpdateDocumentConfig {
                 actor: actor.clone(),
                 group_id: record.group_id,
                 document_id,
@@ -329,7 +328,7 @@ pub async fn route_metadata_update(
         .await
         {
             Ok(record) => return Ok(record),
-            Err(UpdateMetadataDocumentError::RawLimit) => local_capacity = true,
+            Err(UpdateDocumentError::RawLimit) => local_capacity = true,
             Err(error) => return Err(error.into()),
         }
     }
@@ -364,12 +363,11 @@ pub async fn route_metadata_update(
         MetadataTransportMessage::ForwardedRecord { .. } => Err(MetadataWriteError::Undeliverable(
             "holder returned a metadata update record for another document".to_string(),
         )),
-        MetadataTransportMessage::ForwardedUpdateInvalidInput { message } => Err(
-            UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)).into(),
-        ),
+        MetadataTransportMessage::ForwardedUpdateInvalidInput { message } => {
+            Err(UpdateDocumentError::MetadataError(MetadataError::InvalidInput(message)).into())
+        }
         MetadataTransportMessage::ForwardedProfileValidation { findings } => Err(
-            UpdateMetadataDocumentError::MetadataError(MetadataError::ProfileValidation(findings))
-                .into(),
+            UpdateDocumentError::MetadataError(MetadataError::ProfileValidation(findings)).into(),
         ),
         other => Err(unexpected_response(other)),
     }
@@ -384,7 +382,7 @@ pub async fn apply_batch_routed(
     document_id: Ulid,
     batch: Box<MetadataBatch>,
     authored: MetadataBatchSource,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
 ) -> Result<MetadataRegistryRecord, MetadataWriteError> {
     let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
         MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
@@ -438,7 +436,7 @@ pub async fn apply_batch_routed(
 pub(super) fn device_edit_error(error: DeviceEditError) -> MetadataWriteError {
     match error {
         DeviceEditError::Invalid(message) => {
-            UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)).into()
+            UpdateDocumentError::MetadataError(MetadataError::InvalidInput(message)).into()
         }
         DeviceEditError::NoReplica => MetadataWriteError::NotFound,
         other => MetadataWriteError::Undeliverable(other.to_string()),
@@ -452,7 +450,7 @@ pub(super) fn batch_refusal(refusal: SyncRefusal) -> MetadataWriteError {
         SyncRefusal::Forbidden => MetadataWriteError::Forbidden,
         SyncRefusal::NotFound => MetadataWriteError::NotFound,
         SyncRefusal::Invalid(message) => {
-            UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)).into()
+            UpdateDocumentError::MetadataError(MetadataError::InvalidInput(message)).into()
         }
         SyncRefusal::Unavailable => {
             MetadataWriteError::Undeliverable("no holder could apply the device edit".to_string())
@@ -465,7 +463,7 @@ pub async fn route_metadata_delete(
     actor: Actor,
     record: Option<&MetadataRegistryRecord>,
     document_id: Ulid,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<(), MetadataWriteError> {
     let config = load_realm_config(context, actor.realm_id)
         .await
@@ -509,7 +507,7 @@ pub async fn route_metadata_delete(
         && let Some(record) = record
     {
         delete_metadata_document(
-            DeleteMetadataDocumentOperation::new(actor, record.group_id, document_id),
+            DeleteDocumentOperation::new(actor, record.group_id, document_id),
             context.as_ref(),
             document_id,
         )
@@ -586,7 +584,7 @@ pub(crate) async fn apply_forwarded_write(
                     get_visible_document(
                         context.as_ref(),
                         realm_id,
-                        GetVisibleMetadataDocumentRequest {
+                        GetVisibleRequest {
                             document_id: *document_id,
                             auth,
                         },
@@ -689,7 +687,7 @@ pub(crate) async fn apply_forwarded_write(
                 if let Err(error) = authorize_write(context, auth.clone(), path).await {
                     return forward_auth_error(error);
                 }
-                let create_config = CreateMetadataDocumentConfig {
+                let create_config = CreateDocumentConfig {
                     actor: Actor {
                         node_id: net_handle.node_id(),
                         user_id: auth.user_id,
@@ -706,15 +704,14 @@ pub(crate) async fn apply_forwarded_write(
                     Ok(None) => {}
                     Err(error) => return reject(error),
                 }
-                let operation =
-                    CreateMetadataDocumentOperation::new_forwarded(create_config.clone());
+                let operation = CreateDocumentOperation::new_forwarded(create_config.clone());
                 match create_metadata_document(operation, context.clone()).await {
                     Ok(created) => MetadataTransportMessage::ForwardedRecord {
                         record: Box::new(created.record),
                     },
                     // Lost the race against a concurrent delivery of the same
                     // forward: the winner's record is the answer, not an error.
-                    Err(CreateMetadataDocumentError::DocumentAlreadyExists) => {
+                    Err(CreateDocumentError::DocumentAlreadyExists) => {
                         match forwarded_create_replay(context, &create_config).await {
                             Ok(Some(response)) => response,
                             Ok(None) => reject(format!(
@@ -723,9 +720,9 @@ pub(crate) async fn apply_forwarded_write(
                             Err(error) => reject(error),
                         }
                     }
-                    Err(CreateMetadataDocumentError::MetadataError(
-                        MetadataError::ProfileValidation(findings),
-                    )) => MetadataTransportMessage::ForwardedProfileValidation { findings },
+                    Err(CreateDocumentError::MetadataError(MetadataError::ProfileValidation(
+                        findings,
+                    ))) => MetadataTransportMessage::ForwardedProfileValidation { findings },
                     Err(error) => reject(format!("forwarded metadata create failed: {error}")),
                 }
             })
@@ -754,31 +751,30 @@ pub(crate) async fn apply_forwarded_write(
                 {
                     return forward_auth_error(error);
                 }
-                let operation =
-                    UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-                        actor: Actor {
-                            node_id: net_handle.node_id(),
-                            user_id: auth.user_id,
-                            realm_id,
-                        },
-                        group_id: record.group_id,
-                        document_id,
-                        public: public.unwrap_or(record.public),
-                        mutation,
-                    });
+                let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
+                    actor: Actor {
+                        node_id: net_handle.node_id(),
+                        user_id: auth.user_id,
+                        realm_id,
+                    },
+                    group_id: record.group_id,
+                    document_id,
+                    public: public.unwrap_or(record.public),
+                    mutation,
+                });
                 match update_metadata_document(operation, context.as_ref()).await {
                     Ok(record) => MetadataTransportMessage::ForwardedRecord {
                         record: Box::new(record),
                     },
-                    Err(UpdateMetadataDocumentError::RawLimit) => {
+                    Err(UpdateDocumentError::RawLimit) => {
                         MetadataTransportMessage::ForwardedMetadataHistoryCapacity
                     }
-                    Err(UpdateMetadataDocumentError::MetadataError(
-                        MetadataError::InvalidInput(message),
-                    )) => MetadataTransportMessage::ForwardedUpdateInvalidInput { message },
-                    Err(UpdateMetadataDocumentError::MetadataError(
-                        MetadataError::ProfileValidation(findings),
-                    )) => MetadataTransportMessage::ForwardedProfileValidation { findings },
+                    Err(UpdateDocumentError::MetadataError(MetadataError::InvalidInput(
+                        message,
+                    ))) => MetadataTransportMessage::ForwardedUpdateInvalidInput { message },
+                    Err(UpdateDocumentError::MetadataError(MetadataError::ProfileValidation(
+                        findings,
+                    ))) => MetadataTransportMessage::ForwardedProfileValidation { findings },
                     Err(error) => reject(format!("forwarded metadata update failed: {error}")),
                 }
             })
@@ -806,7 +802,7 @@ pub(crate) async fn apply_forwarded_write(
                 {
                     return forward_auth_error(error);
                 }
-                let operation = DeleteMetadataDocumentOperation::new(
+                let operation = DeleteDocumentOperation::new(
                     Actor {
                         node_id: net_handle.node_id(),
                         user_id: auth.user_id,

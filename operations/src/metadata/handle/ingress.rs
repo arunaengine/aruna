@@ -24,12 +24,12 @@ use super::{MetadataHandle, create_sync_bucket, sync_identity_matches, valid_syn
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::metadata::protocol::{MetadataAuthToken, MetadataReadError, MetadataTransportMessage};
-use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::metadata::protocol::{AuthToken, MetadataReadError, MetadataTransportMessage};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use crate::s3::search_buckets::{SearchBucketsInput, search_local_buckets};
 use crate::s3::search_objects::{SearchObjectsInput, search_local_objects};
 use crate::sync::sync_relationship::{
-    DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
+    DeleteRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
 };
 
@@ -39,7 +39,7 @@ impl MetadataHandle {
         &self,
         context: &Arc<DriverContext>,
         peer: NodeId,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         relationship: SyncRelationship,
         source_group_id: Option<GroupId>,
         delete: bool,
@@ -109,13 +109,13 @@ impl MetadataHandle {
         }
 
         let (group_id, create_bucket) = match drive(
-            GetBucketInfoOperation::new(local_bucket.to_string()),
+            GetBucketOperation::new(local_bucket.to_string()),
             context.as_ref(),
         )
         .await
         {
             Ok(bucket_info) => (bucket_info.group_id, false),
-            Err(GetBucketInfoError::NotFound) => {
+            Err(GetBucketError::NotFound) => {
                 let Some(source_group_id) = source_group_id else {
                     return MetadataTransportMessage::Reject("invalid_relationship".to_string());
                 };
@@ -154,7 +154,7 @@ impl MetadataHandle {
         }
 
         match drive(
-            StoreSyncRelationshipOperation::new(relationship, direction),
+            StoreRelationshipOperation::new(relationship, direction),
             context.as_ref(),
         )
         .await
@@ -175,7 +175,7 @@ async fn delete_mirror(
     extras: PolicyRequestExtras,
 ) -> MetadataTransportMessage {
     let stored = match drive(
-        GetSyncRelationshipOperation::new(relationship.id, direction),
+        GetRelationshipOperation::new(relationship.id, direction),
         context.as_ref(),
     )
     .await
@@ -191,7 +191,7 @@ async fn delete_mirror(
     }
     // A present bucket must pass the origin's authorization boundary.
     match drive(
-        GetBucketInfoOperation::new(local_bucket.to_string()),
+        GetBucketOperation::new(local_bucket.to_string()),
         context.as_ref(),
     )
     .await
@@ -220,7 +220,7 @@ async fn delete_mirror(
                 Err(_) => return MetadataTransportMessage::Reject("access_denied".to_string()),
             }
         }
-        Err(GetBucketInfoError::NotFound) => {}
+        Err(GetBucketError::NotFound) => {}
         Err(_) => {
             return MetadataTransportMessage::Reject("mirror_internal".to_string());
         }
@@ -232,7 +232,7 @@ async fn delete_mirror(
         }
         SyncRelationshipDirection::Incoming => {
             drive(
-                DeleteSyncRelationshipOperation::new(stored, direction),
+                DeleteRelationshipOperation::new(stored, direction),
                 context.as_ref(),
             )
             .await
@@ -651,7 +651,7 @@ impl MetadataHandle {
                                     let result = super::super::api::resolve_local_path(
                                         context.as_ref(),
                                         realm_id,
-                                        super::super::api::MetadataPathLookupRequest {
+                                        super::super::api::MetadataLookupRequest {
                                             group_id,
                                             document_path,
                                             auth,
