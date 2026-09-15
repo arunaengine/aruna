@@ -27,7 +27,9 @@ use super::logs::BoundedTail;
 use super::staging::{StageLayout, StagePlan};
 use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, now_ms};
 
+#[path = "apptainer_runtime.rs"]
 mod runtime;
+#[path = "apptainer_state.rs"]
 mod state;
 
 use state::{

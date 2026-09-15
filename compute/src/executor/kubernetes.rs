@@ -40,8 +40,11 @@ use super::logs::BoundedTail;
 use super::staging::{StageLayout, StagePlan};
 use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned};
 
+#[path = "kubernetes_manifest.rs"]
 mod manifest;
+#[path = "kubernetes_session.rs"]
 mod session;
+#[path = "kubernetes_status.rs"]
 mod status;
 
 use manifest::{
