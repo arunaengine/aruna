@@ -313,8 +313,8 @@ impl DocumentSyncService {
         }
         let mut usage = match transaction_read(
             &self.storage,
-            SYNC_QUARANTINE_USAGE_KEYSPACE.to_string(),
-            ByteView::from(SYNC_QUARANTINE_USAGE_KEY),
+            QUARANTINE_USAGE_KEYSPACE.to_string(),
+            ByteView::from(QUARANTINE_USAGE_KEY),
             Some(txn_id),
         )
         .await?
@@ -437,7 +437,7 @@ pub(in crate::document_sync) async fn store_watch_change(
 
         let current = match storage
             .send_storage_effect(StorageEffect::Read {
-                key_space: DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+                key_space: SYNC_REVISION_KEYSPACE.to_string(),
                 key: sync_revision_key(&target),
                 txn_id: Some(txn_id),
             })
@@ -502,7 +502,7 @@ pub(in crate::document_sync) async fn store_watch_change(
         let mut writes = vec![
             revision_entry,
             (
-                NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                WATCH_INTEREST_KEYSPACE.to_string(),
                 ByteView::from(interest_dirty_key(realm_id)),
                 ByteView::from(Ulid::generate().to_bytes().to_vec()),
             ),

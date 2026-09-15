@@ -227,11 +227,11 @@ impl DocumentSyncService {
             ::irokle::ActorId,
             BTreeMap<u64, BTreeSet<::irokle::ActorId>>,
         > = BTreeMap::new();
-        let mut events = Vec::with_capacity(DOCUMENT_SYNC_REPLAY_BATCH_LIMIT);
+        let mut events = Vec::with_capacity(REPLAY_BATCH_LIMIT);
         let mut rejections = Vec::new();
         let mut processed = 0usize;
         let mut batch_bytes = 0usize;
-        while processed < DOCUMENT_SYNC_REPLAY_BATCH_LIMIT {
+        while processed < REPLAY_BATCH_LIMIT {
             let Some(actor_id) = queued.pop_first() else {
                 break;
             };
@@ -307,7 +307,7 @@ impl DocumentSyncService {
                 .ok_or_else(|| NetError::Bootstrap(format!("missing document sync op {op_id}")))?;
             let op_bytes = postcard::experimental::serialized_size(&op)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            if op_bytes > DOCUMENT_SYNC_FRAME_LEN_LIMIT {
+            if op_bytes > FRAME_LEN_LIMIT {
                 return Err(NetError::Bootstrap(
                     "document sync operation exceeds replay frame limit".into(),
                 ));
@@ -394,7 +394,7 @@ impl DocumentSyncService {
         cursor: &::irokle::ActorClock,
     ) -> Result<Vec<(DocumentEvent, ::irokle::ActorId, u64)>> {
         Ok(self
-            .document_event_batch(topic_id, cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)?
+            .document_event_batch(topic_id, cursor, FRAME_LEN_LIMIT)?
             .events)
     }
 
@@ -458,7 +458,7 @@ pub(in crate::document_sync) fn satisfied_dependencies(
     match target {
         DocumentTarget::RealmConfig { realm_id } => {
             dependencies.push(DocumentSyncDependency::RealmConfig(*realm_id));
-            if let AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy } =
+            if let AdminDocumentOperation::PlacementStrategyUpserted { strategy } =
                 &event.op
             {
                 dependencies.push(DocumentSyncDependency::PlacementStrategy {
@@ -520,7 +520,7 @@ pub(in crate::document_sync) fn register_deferred_topic(
         .map(BTreeSet::len)
         .unwrap_or_default();
     if total_topics >= MAX_DEFERRED_TOPICS
-        || dependency_topics >= MAX_DEFERRED_TOPICS_PER_DEPENDENCY
+        || dependency_topics >= TOPICS_PER_DEPENDENCY
     {
         return DeferredRegistrationOutcome::CapacityExceeded;
     }

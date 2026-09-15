@@ -400,7 +400,7 @@ pub(in crate::document_sync) async fn store_pid_mapping(
         let target = persistent_id_target(merged.target);
         let change = persistent_id_change(&merged, placement);
         let mut writes = vec![(
-            PERSISTENT_ID_MAPPING_KEYSPACE.to_string(),
+            ID_MAPPING_KEYSPACE.to_string(),
             ByteView::from(persistent_id_key(merged.target)),
             Value::from(
                 merged
@@ -607,7 +607,7 @@ pub(in crate::document_sync) async fn pid_merge_txn(
 ) -> Result<Option<PersistentIdMapping>> {
     let local = transaction_read(
         storage,
-        PERSISTENT_ID_MAPPING_KEYSPACE.to_string(),
+        ID_MAPPING_KEYSPACE.to_string(),
         ByteView::from(persistent_id_key(incoming.target)),
         Some(txn_id),
     )
@@ -721,7 +721,7 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
 
         let accepted = transaction_read(
             storage,
-            METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+            CREATE_ACCEPTANCE_KEYSPACE.to_string(),
             create_acceptance_key(event.record.document_id),
             Some(txn_id),
         )
@@ -783,7 +783,7 @@ pub(in crate::document_sync) async fn lifecycle_stale_txn(
 ) -> Result<bool> {
     let value = transaction_read(
         storage,
-        DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+        SYNC_REVISION_KEYSPACE.to_string(),
         sync_revision_key(target),
         Some(txn_id),
     )
@@ -898,7 +898,7 @@ pub(in crate::document_sync) async fn graph_record_txn(
 ) -> Result<Option<GraphLifecycleRecord>> {
     let value = transaction_read(
         storage,
-        METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+        GRAPH_LIFECYCLE_KEYSPACE.to_string(),
         graph_lifecycle_key(graph_iri),
         Some(txn_id),
     )
@@ -918,7 +918,7 @@ pub(in crate::document_sync) async fn delete_record_txn(
 ) -> Result<Option<MetadataDeleteRecord>> {
     let value = transaction_read(
         storage,
-        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+        DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
         document_lifecycle_key(document_id),
         Some(txn_id),
     )
@@ -940,7 +940,7 @@ pub(in crate::document_sync) async fn create_fence_txn(
     txn_id: TxnId,
 ) -> Result<bool> {
     if let Some(delete) = delete_record_txn(storage, event.record.document_id, txn_id).await? {
-        return Ok(event.event_id <= delete.deleted_after_event_id);
+        return Ok(event.event_id <= delete.deleted_after_id);
     }
     Ok(graph_record_txn(storage, &event.record.graph_iri, txn_id)
         .await?
@@ -997,7 +997,7 @@ pub(in crate::document_sync) async fn registry_cleanup_txn(
     let record: MetadataRegistryRecord =
         postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
     if record.updated_at_ms > delete.tombstone.updated_at_ms
-        || record.last_event_id > delete.deleted_after_event_id
+        || record.last_event_id > delete.deleted_after_id
     {
         return Ok(Vec::new());
     }
@@ -1085,7 +1085,7 @@ pub(in crate::document_sync) async fn derive_placement_txn(
                 DocumentSyncDependency::RealmConfig(realm_id),
             ));
         }
-        Err(BindingError::Conflicted(_) | BindingError::BucketOutOfRange(_)) => {
+        Err(BindingError::Conflicted(_) | BindingError::OutOfRange(_)) => {
             return Ok(MetadataPlacementOutcome::Rejected);
         }
     };
@@ -1149,6 +1149,6 @@ pub(in crate::document_sync) async fn registry_live_txn(
     let record: MetadataRegistryRecord =
         postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
     let live = record.updated_at_ms > delete.tombstone.updated_at_ms
-        || record.last_event_id > delete.deleted_after_event_id;
+        || record.last_event_id > delete.deleted_after_id;
     Ok((live, Some(record)))
 }

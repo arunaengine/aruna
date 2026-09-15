@@ -46,7 +46,7 @@ fn outsider_reports_rejected() {
             AdminDocumentTarget::RealmConfig { realm_id },
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            AdminDocumentOperation::TransitionBarrierReported {
                 transition_id,
                 bucket: 0,
                 reported_by: node(seed),
@@ -90,7 +90,7 @@ fn outsider_reports_rejected() {
             AdminDocumentTarget::RealmConfig { realm_id },
             &actor,
             2,
-            AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            AdminDocumentOperation::TransitionProofSubmitted {
                 transition_id,
                 strategy_id,
                 proof: claim.sign(&iroh::SecretKey::from_bytes(&[4; 32])),
@@ -108,7 +108,7 @@ fn outsider_reports_rejected() {
             AdminDocumentTarget::RealmConfig { realm_id },
             &actor,
             3,
-            AdminDocumentOperation::RealmConfigTransitionStallReported {
+            AdminDocumentOperation::TransitionStallReported {
                 transition_id: Ulid::from_parts(1_705, 1),
                 bucket: 0,
                 reported_by: node(1),
@@ -148,7 +148,7 @@ fn removal_needs_management() {
             AdminDocumentTarget::RealmConfig { realm_id },
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigNodeRemoved { node_id: device },
+            AdminDocumentOperation::ConfigNodeRemoved { node_id: device },
         )
     };
 

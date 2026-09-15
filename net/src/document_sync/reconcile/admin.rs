@@ -72,8 +72,8 @@ pub(in crate::document_sync) async fn apply_user_operation(
     if !matches!(
         &event.op,
         AdminDocumentOperation::UserNameSet { .. }
-            | AdminDocumentOperation::UserSubjectIdAdded { .. }
-            | AdminDocumentOperation::UserSubjectIdRemoved { .. }
+            | AdminDocumentOperation::SubjectIdAdded { .. }
+            | AdminDocumentOperation::SubjectIdRemoved { .. }
             | AdminDocumentOperation::UserAttributeSet { .. }
             | AdminDocumentOperation::UserAttributeRemoved { .. }
     ) {
@@ -83,14 +83,14 @@ pub(in crate::document_sync) async fn apply_user_operation(
         ));
     }
     let changed_subject_id = match &event.op {
-        AdminDocumentOperation::UserSubjectIdAdded { subject_id }
-        | AdminDocumentOperation::UserSubjectIdRemoved { subject_id } => Some(subject_id.clone()),
+        AdminDocumentOperation::SubjectIdAdded { subject_id }
+        | AdminDocumentOperation::SubjectIdRemoved { subject_id } => Some(subject_id.clone()),
         _ => None,
     };
 
     let previous_state = storage_read_from(
         storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        DOCUMENT_STATE_KEYSPACE.to_string(),
         reducer_state_key(&event.target),
     )
     .await?
@@ -153,7 +153,7 @@ pub(in crate::document_sync) async fn apply_user_operation(
             let subject_key = subject_index_key(subject_id);
             let mut claims = match transaction_read(
                 storage,
-                USER_SUBJECT_CLAIMS_KEYSPACE.to_string(),
+                SUBJECT_CLAIMS_KEYSPACE.to_string(),
                 subject_key.clone(),
                 Some(txn_id),
             )
@@ -165,7 +165,7 @@ pub(in crate::document_sync) async fn apply_user_operation(
                     let mut claims = BTreeSet::new();
                     if let Some(bytes) = transaction_read(
                         storage,
-                        USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+                        SUBJECT_INDEX_KEYSPACE.to_string(),
                         subject_key.clone(),
                         Some(txn_id),
                     )
@@ -187,23 +187,23 @@ pub(in crate::document_sync) async fn apply_user_operation(
 
             if let Some(canonical_user_id) = claims.first().copied() {
                 attempt_writes.push((
-                    USER_SUBJECT_CLAIMS_KEYSPACE.to_string(),
+                    SUBJECT_CLAIMS_KEYSPACE.to_string(),
                     subject_key.clone(),
                     postcard::to_allocvec(&claims)
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?
                         .into(),
                 ));
                 attempt_writes.push((
-                    USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+                    SUBJECT_INDEX_KEYSPACE.to_string(),
                     subject_key,
                     subject_index_value(canonical_user_id),
                 ));
             } else {
                 attempt_deletes.push((
-                    USER_SUBJECT_CLAIMS_KEYSPACE.to_string(),
+                    SUBJECT_CLAIMS_KEYSPACE.to_string(),
                     subject_key.clone(),
                 ));
-                attempt_deletes.push((USER_SUBJECT_INDEX_KEYSPACE.to_string(), subject_key));
+                attempt_deletes.push((SUBJECT_INDEX_KEYSPACE.to_string(), subject_key));
             }
         }
         match replace_batch_in(storage, txn_id, attempt_deletes, attempt_writes).await {
@@ -262,7 +262,7 @@ pub(in crate::document_sync) async fn group_reducer_entries(
                 .into(),
         ),
         (
-            GROUP_OWNER_INDEX_KEYSPACE.to_string(),
+            OWNER_INDEX_KEYSPACE.to_string(),
             owner_group_key(group.owner, group.group_id).into(),
             ByteView::from(Vec::new()),
         ),
@@ -298,12 +298,12 @@ pub(in crate::document_sync) async fn apply_group_authorization(
             | AdminDocumentOperation::GroupRoleAdded { .. }
             | AdminDocumentOperation::GroupRoleCreated { .. }
             | AdminDocumentOperation::GroupRoleRemoved { .. }
-            | AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
-            | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
+            | AdminDocumentOperation::GroupAssignmentAdded { .. }
+            | AdminDocumentOperation::GroupAssignmentRemoved { .. }
             | AdminDocumentOperation::GroupPoliciesSet { .. }
             | AdminDocumentOperation::GroupJoinRequested { .. }
             | AdminDocumentOperation::GroupJoinDecided { .. }
-            | AdminDocumentOperation::GroupDisplayNameSet { .. }
+            | AdminDocumentOperation::DisplayNameSet { .. }
     ) {
         return Err(NetError::Bootstrap(
             "group admin operation sync only supports group creation, renames, role seeds, role creation/removal, role user assignment updates, and policy updates"
@@ -313,7 +313,7 @@ pub(in crate::document_sync) async fn apply_group_authorization(
 
     let previous_state = storage_read_from(
         storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        DOCUMENT_STATE_KEYSPACE.to_string(),
         reducer_state_key(&event.target),
     )
     .await?
@@ -397,8 +397,8 @@ pub(in crate::document_sync) async fn apply_realm_authorization(
         &event.op,
         AdminDocumentOperation::RealmRoleAdded { .. }
             | AdminDocumentOperation::RealmRoleCreated { .. }
-            | AdminDocumentOperation::RealmRoleUserAssignmentAdded { .. }
-            | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { .. }
+            | AdminDocumentOperation::RealmAssignmentAdded { .. }
+            | AdminDocumentOperation::RealmAssignmentRemoved { .. }
     ) {
         return Err(NetError::Bootstrap(
             "realm admin operation sync only supports role seeds, role creation, and role user assignment updates"
@@ -408,7 +408,7 @@ pub(in crate::document_sync) async fn apply_realm_authorization(
 
     let previous_state = storage_read_from(
         storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        DOCUMENT_STATE_KEYSPACE.to_string(),
         reducer_state_key(&event.target),
     )
     .await?
@@ -469,15 +469,15 @@ pub(in crate::document_sync) async fn apply_realm_authorization(
 pub(in crate::document_sync) fn coalescible_config_op(op: &AdminDocumentOperation) -> bool {
     matches!(
         op,
-        AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
-            | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
-            | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
-            | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
-            | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
-            | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
-            | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
-            | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
-            | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
+        AdminDocumentOperation::CandidateMapPublished { .. }
+            | AdminDocumentOperation::ConfigActivationsInitialized { .. }
+            | AdminDocumentOperation::ConfigTransitionStarted { .. }
+            | AdminDocumentOperation::TransitionBarrierReported { .. }
+            | AdminDocumentOperation::TransitionProofSubmitted { .. }
+            | AdminDocumentOperation::ConfigTransitionAborted { .. }
+            | AdminDocumentOperation::TransitionBucketForced { .. }
+            | AdminDocumentOperation::TransitionStallReported { .. }
+            | AdminDocumentOperation::TransitionDrainReported { .. }
     )
 }
 
@@ -486,38 +486,38 @@ pub(in crate::document_sync) fn coalescible_config_op(op: &AdminDocumentOperatio
 fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
     matches!(
         op,
-        AdminDocumentOperation::RealmConfigNodeEnsured { .. }
-            | AdminDocumentOperation::RealmConfigNodeRemoved { .. }
-            | AdminDocumentOperation::RealmConfigOidcProviderUpserted { .. }
-            | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
-            | AdminDocumentOperation::RealmConfigSettingsSet { .. }
-            | AdminDocumentOperation::RealmConfigDescriptionSet { .. }
-            | AdminDocumentOperation::RealmConfigQuotaSet { .. }
-            | AdminDocumentOperation::RealmConfigNodePlacementSet { .. }
-            | AdminDocumentOperation::RealmConfigNodePlacementRemoved { .. }
-            | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. }
-            | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
-            | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
-            | AdminDocumentOperation::RealmConfigJobFamilySet { .. }
-            | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
-            | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
-            | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
-            | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
-            | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
-            | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
-            | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
-            | AdminDocumentOperation::RealmConfigPoliciesSet { .. }
-            | AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
-            | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
-            | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
-            | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
-            | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
-            | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
-            | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
-            | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
-            | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
-            | AdminDocumentOperation::RealmConfigComputeSet { .. }
-            | AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+        AdminDocumentOperation::ConfigNodeEnsured { .. }
+            | AdminDocumentOperation::ConfigNodeRemoved { .. }
+            | AdminDocumentOperation::OidcProviderUpserted { .. }
+            | AdminDocumentOperation::OidcProviderRemoved { .. }
+            | AdminDocumentOperation::ConfigSettingsSet { .. }
+            | AdminDocumentOperation::ConfigDescriptionSet { .. }
+            | AdminDocumentOperation::ConfigQuotaSet { .. }
+            | AdminDocumentOperation::NodePlacementSet { .. }
+            | AdminDocumentOperation::NodePlacementRemoved { .. }
+            | AdminDocumentOperation::PlacementStrategyUpserted { .. }
+            | AdminDocumentOperation::PlacementStrategyRemoved { .. }
+            | AdminDocumentOperation::ConfigStrategySet { .. }
+            | AdminDocumentOperation::JobFamilySet { .. }
+            | AdminDocumentOperation::StrategyBindingSet { .. }
+            | AdminDocumentOperation::StrategyBindingRemoved { .. }
+            | AdminDocumentOperation::PlacementOverrideSet { .. }
+            | AdminDocumentOperation::PlacementOverrideRemoved { .. }
+            | AdminDocumentOperation::PlacementBindingAppended { .. }
+            | AdminDocumentOperation::HandleRangeGranted { .. }
+            | AdminDocumentOperation::BandPoolAssigned { .. }
+            | AdminDocumentOperation::ConfigPoliciesSet { .. }
+            | AdminDocumentOperation::CandidateMapPublished { .. }
+            | AdminDocumentOperation::ConfigActivationsInitialized { .. }
+            | AdminDocumentOperation::ConfigTransitionStarted { .. }
+            | AdminDocumentOperation::TransitionBarrierReported { .. }
+            | AdminDocumentOperation::TransitionProofSubmitted { .. }
+            | AdminDocumentOperation::ConfigTransitionAborted { .. }
+            | AdminDocumentOperation::TransitionBucketForced { .. }
+            | AdminDocumentOperation::TransitionStallReported { .. }
+            | AdminDocumentOperation::TransitionDrainReported { .. }
+            | AdminDocumentOperation::ConfigComputeSet { .. }
+            | AdminDocumentOperation::ConfigTokenRevoked { .. }
     )
 }
 
@@ -630,7 +630,7 @@ pub(in crate::document_sync) async fn apply_config_events(
         let txn_id = start_storage_transaction(storage).await?;
         let previous_state = match transaction_read(
             storage,
-            ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            DOCUMENT_STATE_KEYSPACE.to_string(),
             reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id }),
             Some(txn_id),
         )
@@ -805,8 +805,8 @@ pub(in crate::document_sync) fn materialize_group_authorization(
     }
 
     let (role_id, user_id) = match &event.op {
-        AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id }
-        | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id } => {
+        AdminDocumentOperation::GroupAssignmentAdded { role_id, user_id }
+        | AdminDocumentOperation::GroupAssignmentRemoved { role_id, user_id } => {
             (role_id, user_id)
         }
         _ => return,
@@ -881,8 +881,8 @@ pub(in crate::document_sync) fn materialize_realm_authorization(
     }
 
     let (role_id, user_id) = match &event.op {
-        AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id }
-        | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id } => {
+        AdminDocumentOperation::RealmAssignmentAdded { role_id, user_id }
+        | AdminDocumentOperation::RealmAssignmentRemoved { role_id, user_id } => {
             (role_id, user_id)
         }
         _ => return,
@@ -968,8 +968,8 @@ pub(in crate::document_sync) fn materialize_user_operation(
                 user.name = name;
             }
         }
-        AdminDocumentOperation::UserSubjectIdAdded { subject_id }
-        | AdminDocumentOperation::UserSubjectIdRemoved { subject_id } => {
+        AdminDocumentOperation::SubjectIdAdded { subject_id }
+        | AdminDocumentOperation::SubjectIdRemoved { subject_id } => {
             let path = user_subject_path(subject_id);
             let materialized_subject_id = if reducer_state.conflicts.contains_key(&path) {
                 None
@@ -1076,7 +1076,7 @@ fn validate_revocation_snapshot(
                 .to_string(),
         ));
     }
-    if let AdminDocumentOperation::RealmConfigTokenRevoked {
+    if let AdminDocumentOperation::ConfigTokenRevoked {
         token_hash,
         expires_at,
         token_owner,
@@ -1109,7 +1109,7 @@ async fn apply_realm_config(
 
     let is_revocation = matches!(
         &event.op,
-        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+        AdminDocumentOperation::ConfigTokenRevoked { .. }
     );
 
     for _ in 0..APPLY_CONFLICT_ATTEMPTS {
@@ -1118,7 +1118,7 @@ async fn apply_realm_config(
         let txn_id = start_storage_transaction(storage).await?;
         let previous_state = match transaction_read(
             storage,
-            ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            DOCUMENT_STATE_KEYSPACE.to_string(),
             reducer_state_key(&event.target),
             Some(txn_id),
         )

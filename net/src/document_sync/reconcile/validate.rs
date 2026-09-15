@@ -33,7 +33,7 @@ pub(in crate::document_sync) async fn read_reducer_state(
 ) -> Result<Option<AdminDocumentState>> {
     storage_read_from(
         storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        DOCUMENT_STATE_KEYSPACE.to_string(),
         reducer_state_key(target),
     )
     .await?
@@ -89,7 +89,7 @@ pub(in crate::document_sync) fn revocation_origin_full(
     };
     let index = state.revocation_index(state.revocation_floor.max(unix_timestamp_secs()));
     index.origin(token_hash) != Some(event.origin_node_id)
-        && index.count(&event.origin_node_id) >= MAX_LIVE_REVOCATIONS_PER_ORIGIN
+        && index.count(&event.origin_node_id) >= REVOCATIONS_PER_ORIGIN
 }
 
 pub(in crate::document_sync) fn revocation_origin_known(
@@ -175,24 +175,24 @@ fn report_participation(
         Departing,
     }
     let (transition_id, bucket, reporter, role) = match op {
-        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+        AdminDocumentOperation::TransitionBarrierReported {
             transition_id,
             bucket,
             reported_by,
             ..
         } => (*transition_id, *bucket, *reported_by, Role::Old),
-        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+        AdminDocumentOperation::TransitionProofSubmitted {
             transition_id,
             proof,
             ..
         } => (*transition_id, proof.bucket, proof.holder, Role::Target),
-        AdminDocumentOperation::RealmConfigTransitionStallReported {
+        AdminDocumentOperation::TransitionStallReported {
             transition_id,
             bucket,
             reported_by,
             ..
         } => (*transition_id, *bucket, *reported_by, Role::Union),
-        AdminDocumentOperation::RealmConfigTransitionDrainReported {
+        AdminDocumentOperation::TransitionDrainReported {
             transition_id,
             bucket,
             reported_by,
@@ -276,7 +276,7 @@ pub(in crate::document_sync) fn validate_config_authority(
     }
     if matches!(
         &event.op,
-        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+        AdminDocumentOperation::ConfigTokenRevoked { .. }
     ) {
         if !revocation_origin_known(current_config, previous_state, event, realm_id) {
             return Ok(AdminEventValidation::Deferred {
@@ -295,8 +295,8 @@ pub(in crate::document_sync) fn validate_config_authority(
     // handle checks consult it, so the overlay is not paid for every op.
     let placement_config = matches!(
         &event.op,
-        AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
-            | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
+        AdminDocumentOperation::BandPoolAssigned { .. }
+            | AdminDocumentOperation::HandleRangeGranted { .. }
     )
     .then(|| {
         let mut placement_config = current_config
@@ -309,7 +309,7 @@ pub(in crate::document_sync) fn validate_config_authority(
     });
     // Band pools form a causal delegation tree; reject a forged or
     // non-owning issuer, and defer a child until its parent replicates.
-    if let (AdminDocumentOperation::RealmConfigBandPoolAssigned { pool }, Some(placement_config)) =
+    if let (AdminDocumentOperation::BandPoolAssigned { pool }, Some(placement_config)) =
         (&event.op, placement_config.as_ref())
     {
         match admit_band_pool(&placement_config.band_pools, pool, &event.origin_node_id) {
@@ -328,7 +328,7 @@ pub(in crate::document_sync) fn validate_config_authority(
         }
     }
     if let (
-        AdminDocumentOperation::RealmConfigHandleRangeGranted { range },
+        AdminDocumentOperation::HandleRangeGranted { range },
         Some(placement_config),
     ) = (&event.op, placement_config.as_ref())
     {
@@ -366,7 +366,7 @@ pub(in crate::document_sync) fn validate_config_authority(
         ) {
             (
                 Some(RealmNodeKind::Server),
-                AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding },
+                AdminDocumentOperation::PlacementBindingAppended { binding },
             ) => {
                 binding.allocated_by == Some(event.origin_node_id)
                     && binding.has_valid_provenance(&config.handle_range_directory())
@@ -377,13 +377,13 @@ pub(in crate::document_sync) fn validate_config_authority(
         // and moves no authority on its own, so a holder may emit it.
         let self_report = matches!(
             &event.op,
-            AdminDocumentOperation::RealmConfigTransitionBarrierReported { reported_by, .. }
-            | AdminDocumentOperation::RealmConfigTransitionStallReported { reported_by, .. }
-            | AdminDocumentOperation::RealmConfigTransitionDrainReported { reported_by, .. }
+            AdminDocumentOperation::TransitionBarrierReported { reported_by, .. }
+            | AdminDocumentOperation::TransitionStallReported { reported_by, .. }
+            | AdminDocumentOperation::TransitionDrainReported { reported_by, .. }
                 if *reported_by == event.origin_node_id
         ) || matches!(
             &event.op,
-            AdminDocumentOperation::RealmConfigTransitionProofSubmitted { proof, .. }
+            AdminDocumentOperation::TransitionProofSubmitted { proof, .. }
                 if proof.holder == event.origin_node_id
         );
         if matches!(
@@ -391,7 +391,7 @@ pub(in crate::document_sync) fn validate_config_authority(
             Some(RealmNodeKind::Management)
         ) && matches!(
             &event.op,
-            AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding }
+            AdminDocumentOperation::PlacementBindingAppended { binding }
                 if !binding.has_valid_provenance(&config.handle_range_directory())
         ) {
             // The granting range event may still be in flight in the same batch
@@ -420,7 +420,7 @@ pub(in crate::document_sync) fn validate_config_authority(
     let bootstrap = previous_state.is_none()
         && matches!(
             &event.op,
-            AdminDocumentOperation::RealmConfigNodeEnsured {
+            AdminDocumentOperation::ConfigNodeEnsured {
                 node_id,
                 kind: RealmNodeKind::Management,
             } if *node_id == event.origin_node_id
@@ -726,7 +726,7 @@ pub(in crate::document_sync) async fn validate_group_authority(
     }
     if matches!(
         &event.op,
-        AdminDocumentOperation::GroupRoleUserAssignmentRemoved { user_id, .. }
+        AdminDocumentOperation::GroupAssignmentRemoved { user_id, .. }
             if *user_id == event.actor.user_id
     ) {
         return Ok(AdminEventValidation::Accepted);
@@ -766,8 +766,8 @@ pub(in crate::document_sync) async fn validate_group_authority(
         AdminDocumentOperation::GroupJoinDecided { .. } => {
             vec![format!("/{realm_id}/g/{group_id}/admin/users/**")]
         }
-        AdminDocumentOperation::GroupRoleUserAssignmentAdded { user_id, .. }
-        | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { user_id, .. } => {
+        AdminDocumentOperation::GroupAssignmentAdded { user_id, .. }
+        | AdminDocumentOperation::GroupAssignmentRemoved { user_id, .. } => {
             vec![format!("/{realm_id}/g/{group_id}/admin/users/{user_id}")]
         }
         AdminDocumentOperation::GroupRoleAdded { .. }
@@ -778,7 +778,7 @@ pub(in crate::document_sync) async fn validate_group_authority(
         AdminDocumentOperation::GroupPoliciesSet { .. } => {
             vec![format!("/{realm_id}/g/{group_id}/admin/config")]
         }
-        AdminDocumentOperation::GroupDisplayNameSet { .. } => vec![
+        AdminDocumentOperation::DisplayNameSet { .. } => vec![
             format!("/{realm_id}/g/{group_id}/admin"),
             format!("/{realm_id}/admin/groups"),
         ],
@@ -841,10 +841,10 @@ pub(in crate::document_sync) fn validate_watch_interest(
     target: &DocumentTarget,
     bytes: &[u8],
 ) -> std::result::Result<(), String> {
-    if bytes.len() > NOTIFICATION_WATCH_INTEREST_BYTES_CAP {
+    if bytes.len() > INTEREST_BYTES_CAP {
         return Err(format!(
             "watch interest digest exceeds serialized byte cap {}",
-            NOTIFICATION_WATCH_INTEREST_BYTES_CAP
+            INTEREST_BYTES_CAP
         ));
     }
     let DocumentTarget::WatchInterest { realm_id, node_id } = target else {
@@ -852,10 +852,10 @@ pub(in crate::document_sync) fn validate_watch_interest(
     };
     let digest = WatchInterestDigest::from_bytes(bytes)
         .map_err(|error| format!("undecodable watch interest digest: {error}"))?;
-    if digest.entries.len() > NOTIFICATION_WATCH_INTEREST_ENTRY_CAP {
+    if digest.entries.len() > INTEREST_ENTRY_CAP {
         return Err(format!(
             "watch interest digest exceeds entry cap {}",
-            NOTIFICATION_WATCH_INTEREST_ENTRY_CAP
+            INTEREST_ENTRY_CAP
         ));
     }
     if digest.node_id != *node_id {
@@ -899,7 +899,7 @@ pub(in crate::document_sync) fn validate_watch_upsert(
     }
     if subscription.path_prefix.is_empty()
         || subscription.path_prefix.starts_with('/')
-        || subscription.path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN
+        || subscription.path_prefix.len() > MAX_PREFIX_LEN
     {
         return Err("watch subscription path prefix is invalid".to_string());
     }
@@ -1234,7 +1234,7 @@ fn validate_event_scope(event: &AdminDocumentEvent) -> std::result::Result<(), S
     }
     if matches!(
         &event.op,
-        AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding }
+        AdminDocumentOperation::PlacementBindingAppended { binding }
             if matches!(
                 binding.scope,
                 aruna_core::structs::placement::placement_record::PlacementScope::Realm(binding_realm_id)
@@ -1249,10 +1249,10 @@ fn validate_event_scope(event: &AdminDocumentEvent) -> std::result::Result<(), S
 /// Whether a role assignment names a user in the event actor's realm.
 fn validate_role_assignment(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
     match &event.op {
-        AdminDocumentOperation::GroupRoleUserAssignmentAdded { user_id, .. }
-        | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { user_id, .. }
-        | AdminDocumentOperation::RealmRoleUserAssignmentAdded { user_id, .. }
-        | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { user_id, .. }
+        AdminDocumentOperation::GroupAssignmentAdded { user_id, .. }
+        | AdminDocumentOperation::GroupAssignmentRemoved { user_id, .. }
+        | AdminDocumentOperation::RealmAssignmentAdded { user_id, .. }
+        | AdminDocumentOperation::RealmAssignmentRemoved { user_id, .. }
             if user_id.realm_id != event.actor.realm_id =>
         {
             Err("role assignment user belongs to a different realm".to_string())
@@ -1305,20 +1305,20 @@ fn validate_group_shape(event: &AdminDocumentEvent) -> std::result::Result<(), S
 /// transitions, grants, labels, strategies, policies, and revocations.
 fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
     match &event.op {
-        AdminDocumentOperation::RealmConfigComputeSet { compute } => {
+        AdminDocumentOperation::ConfigComputeSet { compute } => {
             // A malformed link or quota set would make every planner estimate
             // meaningless, so it is refused before it reaches storage.
             if compute.validate().is_err() {
                 return Err("realm compute configuration is malformed".to_string());
             }
         }
-        AdminDocumentOperation::RealmConfigCandidateMapPublished { map } => {
+        AdminDocumentOperation::CandidateMapPublished { map } => {
             let mut seen = std::collections::BTreeSet::new();
             if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
                 return Err("candidate placement map is malformed".to_string());
             }
         }
-        AdminDocumentOperation::RealmConfigActivationsInitialized {
+        AdminDocumentOperation::ConfigActivationsInitialized {
             candidate_map_epoch,
             ..
         } => {
@@ -1326,7 +1326,7 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err("activation names no candidate map epoch".to_string());
             }
         }
-        AdminDocumentOperation::RealmConfigTransitionStarted { plan } => {
+        AdminDocumentOperation::ConfigTransitionStarted { plan } => {
             let mut seen = std::collections::BTreeSet::new();
             let well_formed = plan.limits.max_incomplete_buckets >= 1
                 && plan.target_map_epoch > 0
@@ -1339,7 +1339,7 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err("placement transition plan is malformed".to_string());
             }
         }
-        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+        AdminDocumentOperation::TransitionBarrierReported {
             reported_by,
             frontier,
             ..
@@ -1347,11 +1347,11 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
             if *reported_by != event.origin_node_id {
                 return Err("transition report does not come from the node it names".to_string());
             }
-            if frontier.len() > aruna_core::structs::placement::placement_transition::MAX_BARRIER_FRONTIER_BYTES {
+            if frontier.len() > aruna_core::structs::placement::placement_transition::MAX_FRONTIER_BYTES {
                 return Err("transition barrier frontier exceeds its size bound".to_string());
             }
         }
-        AdminDocumentOperation::RealmConfigTransitionStallReported {
+        AdminDocumentOperation::TransitionStallReported {
             reported_by,
             reason,
             ..
@@ -1359,16 +1359,16 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
             if *reported_by != event.origin_node_id {
                 return Err("transition report does not come from the node it names".to_string());
             }
-            if reason.len() > aruna_core::structs::placement::placement_transition::MAX_STALL_REASON_BYTES {
+            if reason.len() > aruna_core::structs::placement::placement_transition::MAX_STALL_BYTES {
                 return Err("transition stall reason exceeds its size bound".to_string());
             }
         }
-        AdminDocumentOperation::RealmConfigTransitionDrainReported { reported_by, .. } => {
+        AdminDocumentOperation::TransitionDrainReported { reported_by, .. } => {
             if *reported_by != event.origin_node_id {
                 return Err("transition report does not come from the node it names".to_string());
             }
         }
-        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+        AdminDocumentOperation::TransitionProofSubmitted {
             transition_id,
             strategy_id,
             proof,
@@ -1381,24 +1381,24 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err("transition completion proof does not verify".to_string());
             }
         }
-        AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
+        AdminDocumentOperation::NodePlacementSet { entry } => {
             if let Some(label) = reserved_label(&entry.labels) {
                 return Err(format!(
                     "placement entry must not set derived label {label}"
                 ));
             }
         }
-        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy }
+        AdminDocumentOperation::PlacementStrategyUpserted { strategy }
             if strategy.replica_count == Some(0) =>
         {
             return Err("placement strategy replica count must be greater than zero".to_string());
         }
-        AdminDocumentOperation::RealmConfigPoliciesSet { policies } => {
+        AdminDocumentOperation::ConfigPoliciesSet { policies } => {
             if let Err(error) = aruna_core::request_policy::validate_policy_set(policies) {
                 return Err(format!("invalid policy set: {error}"));
             }
         }
-        AdminDocumentOperation::RealmConfigTokenRevoked {
+        AdminDocumentOperation::ConfigTokenRevoked {
             token_hash,
             expires_at,
             token_owner,
@@ -1471,58 +1471,58 @@ pub(in crate::document_sync) async fn validate_admin_event(
     // explicit inbound authorization decision here before it can reach storage.
     let family = match &event.op {
         AdminDocumentOperation::GroupRoleAdded { .. }
-        | AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
-        | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
+        | AdminDocumentOperation::GroupAssignmentAdded { .. }
+        | AdminDocumentOperation::GroupAssignmentRemoved { .. }
         | AdminDocumentOperation::GroupRoleCreated { .. }
         | AdminDocumentOperation::GroupRoleRemoved { .. }
         | AdminDocumentOperation::GroupCreated { .. }
-        | AdminDocumentOperation::GroupDisplayNameSet { .. }
+        | AdminDocumentOperation::DisplayNameSet { .. }
         | AdminDocumentOperation::GroupPoliciesSet { .. }
         | AdminDocumentOperation::GroupJoinRequested { .. }
         | AdminDocumentOperation::GroupJoinDecided { .. } => AdminOperationFamily::Group,
         AdminDocumentOperation::RealmRoleAdded { .. }
-        | AdminDocumentOperation::RealmRoleUserAssignmentAdded { .. }
-        | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { .. }
+        | AdminDocumentOperation::RealmAssignmentAdded { .. }
+        | AdminDocumentOperation::RealmAssignmentRemoved { .. }
         | AdminDocumentOperation::RealmRoleCreated { .. } => {
             AdminOperationFamily::RealmAuthorization
         }
         AdminDocumentOperation::UserAttributeSet { .. }
         | AdminDocumentOperation::UserAttributeRemoved { .. }
         | AdminDocumentOperation::UserNameSet { .. }
-        | AdminDocumentOperation::UserSubjectIdAdded { .. }
-        | AdminDocumentOperation::UserSubjectIdRemoved { .. } => AdminOperationFamily::User,
-        AdminDocumentOperation::RealmConfigNodeEnsured { .. }
-        | AdminDocumentOperation::RealmConfigNodeRemoved { .. }
-        | AdminDocumentOperation::RealmConfigOidcProviderUpserted { .. }
-        | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
-        | AdminDocumentOperation::RealmConfigSettingsSet { .. }
-        | AdminDocumentOperation::RealmConfigDescriptionSet { .. }
-        | AdminDocumentOperation::RealmConfigQuotaSet { .. }
-        | AdminDocumentOperation::RealmConfigNodePlacementSet { .. }
-        | AdminDocumentOperation::RealmConfigNodePlacementRemoved { .. }
-        | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. }
-        | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
-        | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
-        | AdminDocumentOperation::RealmConfigJobFamilySet { .. }
-        | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
-        | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
-        | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
-        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
-        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
-        | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
-        | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
-        | AdminDocumentOperation::RealmConfigPoliciesSet { .. }
-        | AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
-        | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
-        | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
-        | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
-        | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
-        | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
-        | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
-        | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
-        | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
-        | AdminDocumentOperation::RealmConfigComputeSet { .. }
-        | AdminDocumentOperation::RealmConfigTokenRevoked { .. } => {
+        | AdminDocumentOperation::SubjectIdAdded { .. }
+        | AdminDocumentOperation::SubjectIdRemoved { .. } => AdminOperationFamily::User,
+        AdminDocumentOperation::ConfigNodeEnsured { .. }
+        | AdminDocumentOperation::ConfigNodeRemoved { .. }
+        | AdminDocumentOperation::OidcProviderUpserted { .. }
+        | AdminDocumentOperation::OidcProviderRemoved { .. }
+        | AdminDocumentOperation::ConfigSettingsSet { .. }
+        | AdminDocumentOperation::ConfigDescriptionSet { .. }
+        | AdminDocumentOperation::ConfigQuotaSet { .. }
+        | AdminDocumentOperation::NodePlacementSet { .. }
+        | AdminDocumentOperation::NodePlacementRemoved { .. }
+        | AdminDocumentOperation::PlacementStrategyUpserted { .. }
+        | AdminDocumentOperation::PlacementStrategyRemoved { .. }
+        | AdminDocumentOperation::ConfigStrategySet { .. }
+        | AdminDocumentOperation::JobFamilySet { .. }
+        | AdminDocumentOperation::StrategyBindingSet { .. }
+        | AdminDocumentOperation::StrategyBindingRemoved { .. }
+        | AdminDocumentOperation::PlacementOverrideSet { .. }
+        | AdminDocumentOperation::PlacementOverrideRemoved { .. }
+        | AdminDocumentOperation::PlacementBindingAppended { .. }
+        | AdminDocumentOperation::HandleRangeGranted { .. }
+        | AdminDocumentOperation::BandPoolAssigned { .. }
+        | AdminDocumentOperation::ConfigPoliciesSet { .. }
+        | AdminDocumentOperation::CandidateMapPublished { .. }
+        | AdminDocumentOperation::ConfigActivationsInitialized { .. }
+        | AdminDocumentOperation::ConfigTransitionStarted { .. }
+        | AdminDocumentOperation::TransitionBarrierReported { .. }
+        | AdminDocumentOperation::TransitionProofSubmitted { .. }
+        | AdminDocumentOperation::ConfigTransitionAborted { .. }
+        | AdminDocumentOperation::TransitionBucketForced { .. }
+        | AdminDocumentOperation::TransitionStallReported { .. }
+        | AdminDocumentOperation::TransitionDrainReported { .. }
+        | AdminDocumentOperation::ConfigComputeSet { .. }
+        | AdminDocumentOperation::ConfigTokenRevoked { .. } => {
             AdminOperationFamily::RealmConfig
         }
     };
@@ -1583,7 +1583,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
     {
         return reject("stored admin reducer state has the wrong target");
     }
-    if let AdminDocumentOperation::RealmConfigTokenRevoked { token_hash, .. } = &event.op {
+    if let AdminDocumentOperation::ConfigTokenRevoked { token_hash, .. } = &event.op {
         if revocation_origin_full(previous_state.as_ref(), event, token_hash) {
             return reject("revocation origin reached its live revocation cap");
         }

@@ -65,13 +65,13 @@ pub(in crate::document_sync) fn overlay_group_state(
 ) {
     if !reducer_state
         .conflicts
-        .contains_key(GROUP_DISPLAY_NAME_PATH)
+        .contains_key(DISPLAY_NAME_PATH)
         && let Some(display_name) = reducer_state.materialized_group_name()
     {
         group.display_name = display_name;
     }
 
-    if !reducer_state.conflicts.contains_key(GROUP_REALM_ID_PATH)
+    if !reducer_state.conflicts.contains_key(REALM_ID_PATH)
         && let Some(realm_id) = reducer_state.materialized_group_realm()
     {
         group.realm_id = realm_id;
@@ -107,8 +107,8 @@ fn overlay_group_roles(group: &mut Group, reducer_state: &AdminDocumentState) {
 fn group_metadata_conflicted(reducer_state: &AdminDocumentState) -> bool {
     reducer_state
         .conflicts
-        .contains_key(GROUP_DISPLAY_NAME_PATH)
-        || reducer_state.conflicts.contains_key(GROUP_REALM_ID_PATH)
+        .contains_key(DISPLAY_NAME_PATH)
+        || reducer_state.conflicts.contains_key(REALM_ID_PATH)
         || reducer_state.conflicts.contains_key(GROUP_OWNER_PATH)
 }
 
@@ -235,7 +235,7 @@ pub(in crate::document_sync) fn overlay_realm_config(
 ) {
     if !reducer_state
         .conflicts
-        .contains_key(REALM_CONFIG_METADATA_REPLICATION_PATH)
+        .contains_key(METADATA_REPLICATION_PATH)
         && let Some(metadata_replication) = reducer_state.materialized_metadata_replication()
     {
         config.metadata_replication = metadata_replication;
@@ -243,7 +243,7 @@ pub(in crate::document_sync) fn overlay_realm_config(
 
     if !reducer_state
         .conflicts
-        .contains_key(REALM_CONFIG_DISCOVERY_PATH)
+        .contains_key(CONFIG_DISCOVERY_PATH)
         && let Some(discovery) = reducer_state.materialized_realm_discovery()
     {
         config.discovery = discovery;
@@ -251,7 +251,7 @@ pub(in crate::document_sync) fn overlay_realm_config(
 
     if !reducer_state
         .conflicts
-        .contains_key(REALM_CONFIG_DESCRIPTION_PATH)
+        .contains_key(CONFIG_DESCRIPTION_PATH)
         && let Some(description) = reducer_state.materialized_realm_description()
     {
         config.description = description;
@@ -259,7 +259,7 @@ pub(in crate::document_sync) fn overlay_realm_config(
 
     if !reducer_state
         .conflicts
-        .contains_key(REALM_CONFIG_QUOTA_PATH)
+        .contains_key(CONFIG_QUOTA_PATH)
         && let Some(quota) = reducer_state.materialized_realm_quota()
     {
         config.quota = quota;
@@ -267,7 +267,7 @@ pub(in crate::document_sync) fn overlay_realm_config(
 
     if !reducer_state
         .conflicts
-        .contains_key(REALM_CONFIG_POLICIES_PATH)
+        .contains_key(CONFIG_POLICIES_PATH)
         && let Some(request_policies) = reducer_state.materialized_realm_policies()
     {
         config.request_policies = request_policies;
@@ -275,7 +275,7 @@ pub(in crate::document_sync) fn overlay_realm_config(
 
     if !reducer_state
         .conflicts
-        .contains_key(REALM_CONFIG_COMPUTE_PATH)
+        .contains_key(CONFIG_COMPUTE_PATH)
         && let Some(compute) = reducer_state.materialized_realm_compute()
     {
         config.compute = compute;
@@ -359,7 +359,7 @@ pub(in crate::document_sync) fn materialized_realm_config(
         default_strategy_id: None,
         // Rebuilt from the reducer, never reset: the overlay below would restore
         // it anyway, and a hardcoded nil here would defeat family routing.
-        job_family_strategy_id: reducer_state
+        family_strategy_id: reducer_state
             .materialized_family_strategy()
             .unwrap_or_else(Ulid::nil),
         strategy_bindings: Vec::new(),

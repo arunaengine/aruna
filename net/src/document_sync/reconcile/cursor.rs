@@ -145,16 +145,16 @@ pub(in crate::document_sync) async fn read_sync_messages(
     let mut bytes_read = 0usize;
     let mut frame_index = 0usize;
     while let Some(frame) = timeout(
-        DOCUMENT_SYNC_INBOUND_FRAME_TIMEOUT,
+        INBOUND_FRAME_TIMEOUT,
         read_sync_frame(recv, &mut bytes_read, reservation),
     )
     .await
-    .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_INBOUND_FRAME_TIMEOUT))??
+    .map_err(|_| NetError::Timeout(INBOUND_FRAME_TIMEOUT))??
     {
         frame_index = frame_index.saturating_add(1);
-        if messages.len() >= DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT {
+        if messages.len() >= SYNC_MESSAGE_LIMIT {
             return Err(NetError::Stream(format!(
-                "document sync stream exceeded {DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT} messages"
+                "document sync stream exceeded {SYNC_MESSAGE_LIMIT} messages"
             )));
         }
         let message = decode_sync_message(&frame).map_err(|error| {
@@ -198,15 +198,15 @@ pub(in crate::document_sync) async fn read_sync_frame(
     }
 
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > DOCUMENT_SYNC_FRAME_LEN_LIMIT {
+    if len > FRAME_LEN_LIMIT {
         return Err(NetError::Stream(
             "document sync frame exceeds maximum length".to_string(),
         ));
     }
     *bytes_read = bytes_read.saturating_add(4).saturating_add(len);
-    if *bytes_read > DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES {
+    if *bytes_read > SYNC_STREAM_BYTES {
         return Err(NetError::Stream(format!(
-            "document sync stream exceeded {DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES} bytes"
+            "document sync stream exceeded {SYNC_STREAM_BYTES} bytes"
         )));
     }
     reservation.reserve(len)?;
@@ -233,9 +233,9 @@ pub(in crate::document_sync) async fn read_sync_chunk(
     recv: &mut RecvStream,
     buf: &mut [u8],
 ) -> Result<Option<usize>> {
-    let read = timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT, recv.read(buf))
+    let read = timeout(PEER_SYNC_TIMEOUT, recv.read(buf))
         .await
-        .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
+        .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
         .map_err(|error| NetError::Stream(error.to_string()))?;
     Ok((read > 0).then_some(read))
 }
@@ -248,9 +248,9 @@ pub(in crate::document_sync) async fn write_sync_messages(
         let payload =
             encode_sync_message(message).map_err(|error| NetError::Stream(error.to_string()))?;
         let frame = encode_frame(&payload).map_err(|error| NetError::Stream(error.to_string()))?;
-        timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT, send.write_all(&frame))
+        timeout(PEER_SYNC_TIMEOUT, send.write_all(&frame))
             .await
-            .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
+            .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
             .map_err(|error| NetError::Stream(error.to_string()))?;
     }
     send.finish()

@@ -4,7 +4,7 @@ use ::irokle::{Event as _, Storage as _};
 use aruna_core::document::{DocumentEvent, DocumentReconcileResult, DocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{
-    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+    APPLIED_OPS_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE,
 };
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::storage_entries::{
@@ -21,7 +21,7 @@ use crate::document_sync::storage::{
     replace_batch_in, start_storage_transaction, transaction_read,
 };
 use crate::document_sync::{
-    DOCUMENT_SYNC_FRAME_LEN_LIMIT, DeferredRegistrationOutcome, DocumentSyncDependency,
+    FRAME_LEN_LIMIT, DeferredRegistrationOutcome, DocumentSyncDependency,
     DocumentSyncService, MetadataPlacementFence, MetadataPlacementOutcome, PendingCreateApply,
     SyncRejection,
 };
@@ -112,14 +112,14 @@ impl DocumentSyncService {
                 deferred_cursor_writes.push((
                     topic_id,
                     (
-                        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                        APPLIED_OPS_KEYSPACE.to_string(),
                         cursor_key,
                         value,
                     ),
                 ));
             } else if outcome.rejections.is_empty() {
                 self.storage_write(
-                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    APPLIED_OPS_KEYSPACE.to_string(),
                     cursor_key,
                     value,
                 )
@@ -128,7 +128,7 @@ impl DocumentSyncService {
                 .commit_cursor_evidence(
                     &outcome.rejections,
                     (
-                        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                        APPLIED_OPS_KEYSPACE.to_string(),
                         cursor_key,
                         value,
                     ),
@@ -156,7 +156,7 @@ impl DocumentSyncService {
         let persisted_deferred_topics = postcard::to_allocvec(&work.deferred_topics)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         self.storage_write(
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+            APPLIED_OPS_KEYSPACE.to_string(),
             deferred_topics_key(),
             persisted_deferred_topics.clone().into(),
         )
@@ -174,7 +174,7 @@ impl DocumentSyncService {
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         if updated_deferred_topics != persisted_deferred_topics {
             self.storage_write(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                APPLIED_OPS_KEYSPACE.to_string(),
                 deferred_topics_key(),
                 updated_deferred_topics.into(),
             )
@@ -193,7 +193,7 @@ impl DocumentSyncService {
     ) -> Result<ReconcileWork> {
         let deferred_topics: BTreeMap<DocumentSyncDependency, BTreeSet<::irokle::TopicId>> = self
             .storage_read(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                APPLIED_OPS_KEYSPACE.to_string(),
                 deferred_topics_key(),
             )
             .await?
@@ -253,12 +253,12 @@ impl DocumentSyncService {
             topic_id,
             genesis,
             self.storage_read(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                APPLIED_OPS_KEYSPACE.to_string(),
                 cursor_key.clone(),
             )
             .await?,
         )?;
-        let batch = self.document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)?;
+        let batch = self.document_event_batch(topic_id, &cursor, FRAME_LEN_LIMIT)?;
         if batch.cursor == cursor {
             return Ok(None);
         }
@@ -473,7 +473,7 @@ impl DocumentSyncService {
             } else {
                 let value = match transaction_read(
                     &self.storage,
-                    METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+                    CREATE_ACCEPTANCE_KEYSPACE.to_string(),
                     create_acceptance_key(document_id),
                     Some(txn_id),
                 )

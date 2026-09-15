@@ -271,14 +271,14 @@ impl DocumentSyncService {
                 let net = net.clone();
                 async move {
                     match timeout(
-                        DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
+                        PEER_SYNC_TIMEOUT,
                         net.sync_peer_now(peer, topic_id),
                     )
                     .await
                     {
                         Ok(Ok(())) => Ok(()),
                         Ok(Err(error)) => Err(NetError::Bootstrap(error.to_string())),
-                        Err(_) => Err(NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT)),
+                        Err(_) => Err(NetError::Timeout(PEER_SYNC_TIMEOUT)),
                     }
                 }
             },
@@ -296,7 +296,7 @@ impl DocumentSyncService {
         }
         type SyncGroups =
             BTreeMap<BTreeSet<PeerId>, (PeerSelection, Vec<(::irokle::TopicId, u64)>)>;
-        for chunk in topic_ids.chunks(DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT) {
+        for chunk in topic_ids.chunks(BATCH_TOPIC_LIMIT) {
             let mut groups: SyncGroups = BTreeMap::new();
             for topic_id in chunk.iter().copied() {
                 let selection = self.sync_peer_selection(peers, &topic_id)?;
@@ -373,11 +373,11 @@ impl DocumentSyncService {
 
         let r1_io_started = Instant::now();
         let responses = timeout(
-            DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
+            PEER_SYNC_TIMEOUT,
             self.net.sync_with(peer_addr.clone(), &initial_messages),
         )
         .await
-        .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
+        .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
         .map_err(NetError::from)?;
         let r1_io = r1_io_started.elapsed();
         let r1_process_started = Instant::now();
@@ -427,11 +427,11 @@ impl DocumentSyncService {
         let r2_message_count = sync_messages.len();
         let r2_io_started = Instant::now();
         let responses = timeout(
-            DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
+            PEER_SYNC_TIMEOUT,
             self.net.sync_with(peer_addr.clone(), &sync_messages),
         )
         .await
-        .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
+        .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
         .map_err(NetError::from)?;
         let r2_io = r2_io_started.elapsed();
         let r2_process_started = Instant::now();
@@ -456,11 +456,11 @@ impl DocumentSyncService {
         let fu_io_started = Instant::now();
         if !followup.is_empty() {
             let responses = timeout(
-                DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
+                PEER_SYNC_TIMEOUT,
                 self.net.sync_with(peer_addr, &followup),
             )
             .await
-            .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
+            .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
             .map_err(NetError::from)?;
             for response in responses {
                 match response {
@@ -565,7 +565,7 @@ impl DocumentSyncService {
             let peer = node_to_peer(&node_id);
             (node_id, self.probe_peer_topics(topic_ids, peer).await)
         }))
-        .buffer_unordered(SHARD_GENESIS_PROBE_CONCURRENCY);
+        .buffer_unordered(SHARD_PROBE_CONCURRENCY);
         // Poll a bounded number of peer probes together; aggregation is order
         // independent (set unions plus an unreachable list).
         let probe_results: Vec<_> = probes.collect().await;
@@ -573,7 +573,7 @@ impl DocumentSyncService {
             match result {
                 Ok(peer_probe) => {
                     probe
-                        .known_by_co_holder
+                        .known_co_holder
                         .extend(peer_probe.known.iter().copied());
                     // A reached co-holder that neither advertised nor confirmed
                     // unknown refused it; withhold, never fork with a fresh genesis.
@@ -602,17 +602,17 @@ impl DocumentSyncService {
         let peer_addr = peer_endpoint_addr(peer)?;
         let wanted: BTreeSet<::irokle::TopicId> = topics.iter().copied().collect();
         let mut probe = PeerTopicProbe::default();
-        for chunk in topics.chunks(DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT) {
+        for chunk in topics.chunks(BATCH_TOPIC_LIMIT) {
             let opens: Vec<SyncMessage> = chunk
                 .iter()
                 .map(|topic| SyncMessage::Open(self.node.sync_open(*topic)))
                 .collect();
             let responses = timeout(
-                DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
+                PEER_SYNC_TIMEOUT,
                 self.net.sync_with(peer_addr.clone(), &opens),
             )
             .await
-            .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
+            .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
             .map_err(NetError::from)?;
             probe.merge(classify_probe_responses(&wanted, responses));
         }
@@ -622,14 +622,14 @@ impl DocumentSyncService {
     async fn bootstrap_from_peer(&self, topic_id: ::irokle::TopicId, peer: PeerId) -> Result<()> {
         let peer_addr = peer_endpoint_addr(peer)?;
         let responses = timeout(
-            DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
+            PEER_SYNC_TIMEOUT,
             self.net.sync_with(
                 peer_addr.clone(),
                 &[SyncMessage::Open(self.node.sync_open(topic_id))],
             ),
         )
         .await
-        .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
+        .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
         .map_err(NetError::from)?;
         let summary = responses
             .into_iter()
@@ -659,7 +659,7 @@ impl DocumentSyncService {
             actor_range_hints: Vec::new(),
         };
         let responses = timeout(
-            DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
+            PEER_SYNC_TIMEOUT,
             self.net.sync_with(
                 peer_addr.clone(),
                 &[
@@ -669,7 +669,7 @@ impl DocumentSyncService {
             ),
         )
         .await
-        .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
+        .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
         .map_err(NetError::from)?;
 
         let mut followup = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
@@ -701,11 +701,11 @@ impl DocumentSyncService {
         }
         if followup.len() > 1 {
             let responses = timeout(
-                DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
+                PEER_SYNC_TIMEOUT,
                 self.net.sync_with(peer_addr, &followup),
             )
             .await
-            .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
+            .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
             .map_err(NetError::from)?;
             for response in responses {
                 match response {
