@@ -1,7 +1,7 @@
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_blob::blob::BlobHandler;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey,
+    Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashIndex,
     PortableSourceDescriptor, RealmId, RoutingSnapshot, SourceConnectorKind, SourceMetadata,
     StagingStrategy, VersionKey, VersionSourceBinding,
 };
@@ -56,9 +56,8 @@ fn obligation_keeps_restrictions() {
     let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
         panic!("expected one obligation write, got {effects:?}")
     };
-    let record =
-        crate::replication::queue::LiveReplicationObligationRecord::from_bytes(value.as_ref())
-            .expect("obligation decodes");
+    let record = crate::replication::queue::LiveObligationRecord::from_bytes(value.as_ref())
+        .expect("obligation decodes");
     assert_eq!(record.auth_context.path_restrictions, Some(restrictions));
 }
 
@@ -76,7 +75,7 @@ fn audit_op(version_id: Option<Ulid>) -> DeleteObjectOperation {
     operation
 }
 
-fn audit_record(effects: &[Effect]) -> aruna_core::structs::BlobDeleteAuditRecord {
+fn audit_record(effects: &[Effect]) -> aruna_core::structs::BlobAuditRecord {
     let [
         Effect::Storage(StorageEffect::Write {
             key_space, value, ..
@@ -86,8 +85,7 @@ fn audit_record(effects: &[Effect]) -> aruna_core::structs::BlobDeleteAuditRecor
         panic!("expected one audit write, got {effects:?}")
     };
     assert_eq!(key_space, BLOB_DELETE_AUDIT_KEYSPACE);
-    aruna_core::structs::BlobDeleteAuditRecord::from_bytes(value.as_ref())
-        .expect("audit record decodes")
+    aruna_core::structs::BlobAuditRecord::from_bytes(value.as_ref()).expect("audit record decodes")
 }
 
 #[test]
@@ -99,7 +97,7 @@ fn audits_delete_marker() {
     let record = audit_record(&operation.write_delete_audit());
     assert_eq!(
         record.kind,
-        aruna_core::structs::BlobDeleteAuditKind::DeleteMarker
+        aruna_core::structs::BlobAuditKind::DeleteMarker
     );
     assert_eq!(record.version_id, Some(marker));
     assert_eq!(record.bucket, "bucket");
@@ -114,7 +112,7 @@ fn audits_version_delete() {
     let record = audit_record(&operation.write_delete_audit());
     assert_eq!(
         record.kind,
-        aruna_core::structs::BlobDeleteAuditKind::DeleteVersion
+        aruna_core::structs::BlobAuditKind::DeleteVersion
     );
     assert_eq!(record.version_id, Some(version_id));
 }
@@ -677,7 +675,7 @@ async fn creates_tombstone() {
     let historical_hash_path = read_value(
         &context,
         HASH_PATHS_INDEX_KEYSPACE,
-        HashPathIndexKey::new(
+        HashIndex::new(
             put_result
                 .location
                 .get_blake3()
@@ -830,7 +828,7 @@ async fn deletes_version() {
     let restored_hash_path = read_value(
         &context,
         HASH_PATHS_INDEX_KEYSPACE,
-        HashPathIndexKey::new(
+        HashIndex::new(
             put_result
                 .location
                 .get_blake3()
@@ -940,7 +938,7 @@ async fn deletes_version() {
         read_value(
             &context,
             HASH_PATHS_INDEX_KEYSPACE,
-            HashPathIndexKey::new(
+            HashIndex::new(
                 put_result
                     .location
                     .get_blake3()
@@ -965,7 +963,7 @@ async fn deletes_version() {
         read_value(
             &context,
             HASH_PATHS_INDEX_KEYSPACE,
-            HashPathIndexKey::new(
+            HashIndex::new(
                 put_result
                     .location
                     .get_blake3()

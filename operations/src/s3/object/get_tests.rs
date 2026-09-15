@@ -2,8 +2,8 @@ use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::UsageCounterUpdate;
 use crate::replication::bao_read::BaoReadError;
 use crate::replication::protocol::{BaoReadRefusal, ReferenceAdvance};
-use crate::replication::queue::LiveReplicationObligationRecord;
-use crate::s3::get_object::{
+use crate::replication::queue::LiveObligationRecord;
+use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, HolderFailures,
     MAX_AUTO_ADVANCES, MAX_DRIFT_ADVANCE_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest,
     RoutedRead, get_object_routed, routed_info,
@@ -1247,7 +1247,7 @@ async fn drift_creates_successor() {
     };
     let obligations: Vec<_> = values
         .iter()
-        .map(|(_, value)| LiveReplicationObligationRecord::from_bytes(value.as_ref()).unwrap())
+        .map(|(_, value)| LiveObligationRecord::from_bytes(value.as_ref()).unwrap())
         .collect();
     assert_eq!(obligations.len(), 1);
     assert_eq!(obligations[0].version_id, successor_id);
@@ -1427,7 +1427,7 @@ fn advance_writes_obligation() {
     assert_eq!(successor.metadata, operation.metadata);
     let next_pointer = CurrentVersionPointer::from_bytes(head_value.as_ref()).unwrap();
     assert_eq!(key_space, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE);
-    let record = LiveReplicationObligationRecord::from_bytes(obligation_value.as_ref()).unwrap();
+    let record = LiveObligationRecord::from_bytes(obligation_value.as_ref()).unwrap();
     assert_eq!(Some(record.version_id), operation.resolved_version_id);
     assert_ne!(record.version_id, headed);
     assert_eq!(next_pointer.version_id, record.version_id);
