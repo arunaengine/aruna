@@ -16,13 +16,13 @@ enum GetSessionState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct GetS3SessionOperation {
+pub struct GetS3Operation {
     access_key: String,
     state: GetSessionState,
     output: Result<Option<S3Session>, S3SessionError>,
 }
 
-impl GetS3SessionOperation {
+impl GetS3Operation {
     pub fn new(access_key: String) -> Self {
         Self {
             access_key,
@@ -77,7 +77,7 @@ impl GetS3SessionOperation {
     }
 }
 
-impl Operation for GetS3SessionOperation {
+impl Operation for GetS3Operation {
     type Output = Option<S3Session>;
     type Error = S3SessionError;
 

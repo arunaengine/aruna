@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
-pub struct RefreshS3SessionConfig {
+pub struct RefreshS3Config {
     pub access_key: String,
     pub user_identity: UserId,
     pub group_id: GroupId,
@@ -39,8 +39,8 @@ enum RefreshSessionState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct RefreshS3SessionOperation {
-    config: RefreshS3SessionConfig,
+pub struct RefreshS3Operation {
+    config: RefreshS3Config,
     encryption_key: CredentialEncryptionKey,
     pending: Option<S3SessionCredentials>,
     txn_id: Option<Ulid>,
@@ -48,8 +48,8 @@ pub struct RefreshS3SessionOperation {
     output: Result<S3SessionCredentials, S3SessionError>,
 }
 
-impl RefreshS3SessionOperation {
-    pub fn new(config: RefreshS3SessionConfig, encryption_key: CredentialEncryptionKey) -> Self {
+impl RefreshS3Operation {
+    pub fn new(config: RefreshS3Config, encryption_key: CredentialEncryptionKey) -> Self {
         Self {
             config,
             encryption_key,
@@ -247,7 +247,7 @@ impl RefreshS3SessionOperation {
     }
 }
 
-impl Operation for RefreshS3SessionOperation {
+impl Operation for RefreshS3Operation {
     type Output = S3SessionCredentials;
     type Error = S3SessionError;
 

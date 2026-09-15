@@ -9,9 +9,9 @@ use crate::blob::managed_copy::{
 use crate::blob::records::HeadAliasContext;
 use crate::node::usage_stats::{QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError};
 use crate::placement::policy::{PolicyGateError, drift_reads, split_drift_reads};
-use crate::replication::queue::{LiveReplicationObligationRecord, live_obligation_entry};
+use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -23,9 +23,9 @@ use aruna_core::structs::{
     AuthContext, BackendLocation, BlobVersion, BlobVersionState, BucketIdentity,
     CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, POLICY_BULK_INTENT_KEYSPACE,
     POLICY_MUTATION_KEYSPACE, PlacementDecision, PlacementPolicyError, PlacementPolicyRef,
-    PlacementSubject, PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome,
-    PolicyMutationParams, PolicyMutationRecord, PolicyRefMode, PolicyResolution,
-    RealmConfigDocument, UsageDelta, VersionKey, evaluate_placement,
+    PlacementSubject, PolicyBlockedReason, PolicyIntent, PolicyIntentOutcome, PolicyMutationParams,
+    PolicyMutationRecord, PolicyRefMode, PolicyResolution, RealmConfigDocument, UsageDelta,
+    VersionKey, evaluate_placement,
 };
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -61,7 +61,7 @@ pub struct SuccessorPlan {
     pub resolved: BTreeMap<Ulid, PolicyResolution>,
     /// A bulk run's receipt for this object, committed in the same batch as the
     /// successor or the blocked reason it records.
-    pub intent: Option<PolicyBulkIntent>,
+    pub intent: Option<PolicyIntent>,
     /// Set by a bulk run, so the pass cannot commit against a default that
     /// moved on between the run's capture and this transaction.
     pub captured_default: Option<CapturedDefault>,
@@ -311,7 +311,7 @@ impl SuccessorMint {
         let Some(value) = read_value(event)? else {
             return Ok(Some(self.read_head(txn_id)?));
         };
-        let stored = PolicyBulkIntent::from_bytes(value.as_ref())?;
+        let stored = PolicyIntent::from_bytes(value.as_ref())?;
         // A stale intent from an older head is replanned by this pass; only
         // completed evidence and a concurrent pass on the same head stop it.
         let same_head = stored.observed_head == self.plan.expected_head;
@@ -616,16 +616,14 @@ impl SuccessorMint {
         }
         // The successor replicates like any other write, so peers converge on
         // the governed version instead of only this node holding it.
-        writes.push(live_obligation_entry(
-            &LiveReplicationObligationRecord::new(
-                self.plan.subject.node_id,
-                self.plan.auth_context.clone(),
-                self.plan.context.bucket.clone(),
-                self.plan.context.key.clone(),
-                version_id,
-                false,
-            ),
-        )?);
+        writes.push(live_obligation_entry(&LiveObligationRecord::new(
+            self.plan.subject.node_id,
+            self.plan.auth_context.clone(),
+            self.plan.context.bucket.clone(),
+            self.plan.context.key.clone(),
+            version_id,
+            false,
+        ))?);
         if let Some(intent) = self.plan.intent.as_ref() {
             let mut receipt = intent.clone();
             receipt.outcome = PolicyIntentOutcome::Completed {
@@ -668,7 +666,7 @@ impl SuccessorMint {
         self.state = MintState::ReadQuota;
         Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
             key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: DocumentSyncTarget::RealmConfig {
+            key: DocumentTarget::RealmConfig {
                 realm_id: self.plan.auth_context.realm_id,
             }
             .storage_key(),
@@ -842,14 +840,14 @@ enum OperationState {
 
 /// The realm-admin mutation: one transaction, one durably assigned successor.
 #[derive(Debug, PartialEq)]
-pub struct MintPolicySuccessorOperation {
+pub struct MintSuccessorOperation {
     mint: SuccessorMint,
     state: OperationState,
     txn_id: Option<TxnId>,
     output: Option<Result<SuccessorOutcome, SuccessorError>>,
 }
 
-impl MintPolicySuccessorOperation {
+impl MintSuccessorOperation {
     pub fn new(plan: SuccessorPlan) -> Self {
         Self {
             mint: SuccessorMint::new(plan),
@@ -883,7 +881,7 @@ impl MintPolicySuccessorOperation {
     }
 }
 
-impl Operation for MintPolicySuccessorOperation {
+impl Operation for MintSuccessorOperation {
     type Output = SuccessorOutcome;
     type Error = SuccessorError;
 
@@ -987,7 +985,7 @@ impl Operation for MintPolicySuccessorOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::{
-        CapturedDefault, MintPolicySuccessorOperation, MintState, SuccessorError, SuccessorMint,
+        CapturedDefault, MintState, MintSuccessorOperation, SuccessorError, SuccessorMint,
         SuccessorOutcome, SuccessorPlan, successor_version,
     };
     use crate::blob::records::HeadAliasContext;
@@ -1004,7 +1002,7 @@ mod pure_tests {
         Actor, AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo,
         CurrentVersionPointer, JobId, ManagedCopyRecord, ManagedCopyState, NodeSubjectRecord,
         POLICY_BULK_INTENT_KEYSPACE, PlacementPolicy, PlacementPolicyRef, PlacementSelector,
-        PlacementSubject, PolicyBlockedReason, PolicyBulkIntent, PolicyIntentOutcome,
+        PlacementSubject, PolicyBlockedReason, PolicyIntent, PolicyIntentOutcome,
         PolicyMutationRecord, PolicyRefMode, PolicyResolution, RealmConfigDocument, RealmId,
         StoragePurgeFence, StoragePurgeScope, UsageCounters, VerifiedPolicy, VersionKey,
         checksum::HASH_BLAKE3, usage_group_key,
@@ -1112,8 +1110,8 @@ mod pure_tests {
         }
     }
 
-    fn intent() -> PolicyBulkIntent {
-        PolicyBulkIntent {
+    fn intent() -> PolicyIntent {
+        PolicyIntent {
             operation_id: Ulid::from_bytes([3u8; 16]),
             key: OBJECT.to_string(),
             observed_head: head(),
@@ -1124,8 +1122,7 @@ mod pure_tests {
 
     #[test]
     fn successor_obeys_fence() {
-        let mut operation =
-            MintPolicySuccessorOperation::new(plan(Vec::new(), PolicyRefMode::Replace));
+        let mut operation = MintSuccessorOperation::new(plan(Vec::new(), PolicyRefMode::Replace));
         let transaction = Ulid::from_bytes([11; 16]);
         operation.start();
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
@@ -1714,7 +1711,7 @@ mod pure_tests {
 
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, POLICY_BULK_INTENT_KEYSPACE);
-        let stored = PolicyBulkIntent::from_bytes(&writes[0].2).expect("intent decodes");
+        let stored = PolicyIntent::from_bytes(&writes[0].2).expect("intent decodes");
         assert_eq!(
             stored.outcome,
             PolicyIntentOutcome::Blocked(PolicyBlockedReason::SourceUnavailable)

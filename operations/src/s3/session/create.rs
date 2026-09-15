@@ -18,7 +18,7 @@ use std::time::SystemTime;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
-pub struct CreateS3SessionConfig {
+pub struct CreateS3Config {
     pub user_identity: UserId,
     pub group_id: GroupId,
     pub now: SystemTime,
@@ -41,8 +41,8 @@ enum CreateSessionState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct CreateS3SessionOperation {
-    config: CreateS3SessionConfig,
+pub struct CreateS3Operation {
+    config: CreateS3Config,
     key_id: String,
     encryption_key: CredentialEncryptionKey,
     pending: Option<S3SessionCredentials>,
@@ -51,13 +51,13 @@ pub struct CreateS3SessionOperation {
     output: Result<S3SessionCredentials, S3SessionError>,
 }
 
-impl CreateS3SessionOperation {
-    pub fn new(config: CreateS3SessionConfig, encryption_key: CredentialEncryptionKey) -> Self {
+impl CreateS3Operation {
+    pub fn new(config: CreateS3Config, encryption_key: CredentialEncryptionKey) -> Self {
         Self::with_key(config, Ulid::generate().to_string(), encryption_key)
     }
 
     pub fn with_key(
-        config: CreateS3SessionConfig,
+        config: CreateS3Config,
         key_id: String,
         encryption_key: CredentialEncryptionKey,
     ) -> Self {
@@ -324,7 +324,7 @@ impl CreateS3SessionOperation {
     }
 }
 
-impl Operation for CreateS3SessionOperation {
+impl Operation for CreateS3Operation {
     type Output = S3SessionCredentials;
     type Error = S3SessionError;
 
