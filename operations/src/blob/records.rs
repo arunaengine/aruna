@@ -5,8 +5,8 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
 };
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
-    HashPathIndexKey, RealmId, VersionKey,
+    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer, HashIndex,
+    RealmId, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
@@ -43,8 +43,8 @@ impl HeadAliasContext {
         BlobHeadKey::new(self.bucket.clone(), self.key.clone())
     }
 
-    pub fn path_index_key(&self, blake3_hash: [u8; 32], version_id: Ulid) -> HashPathIndexKey {
-        HashPathIndexKey::new(
+    pub fn path_index_key(&self, blake3_hash: [u8; 32], version_id: Ulid) -> HashIndex {
+        HashIndex::new(
             blake3_hash,
             version_id,
             self.realm_id,
@@ -199,7 +199,7 @@ pub fn iter_hash_page(
 ) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Iter {
         key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
-        prefix: Some(HashPathIndexKey::hash_prefix(blake3_hash)?.into()),
+        prefix: Some(HashIndex::hash_prefix(blake3_hash)?.into()),
         start: start_after.map(IterStart::After),
         limit,
         txn_id,
@@ -240,7 +240,7 @@ mod pure_tests {
         iter_index_effect,
     };
     use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::structs::{CurrentVersionPointer, HashPathIndexKey, RealmId};
+    use aruna_core::structs::{CurrentVersionPointer, HashIndex, RealmId};
     use ulid::Ulid;
 
     fn alias_context() -> HeadAliasContext {
@@ -263,7 +263,7 @@ mod pure_tests {
             panic!("expected storage write effect");
         };
 
-        let decoded_key = HashPathIndexKey::from_bytes(key.as_ref()).unwrap();
+        let decoded_key = HashIndex::from_bytes(key.as_ref()).unwrap();
         assert_eq!(decoded_key.blake3_hash, [9u8; 32]);
         assert_eq!(decoded_key.version_id, version_id);
         assert!(value.is_empty());
@@ -278,7 +278,7 @@ mod pure_tests {
         };
 
         let prefix = prefix.expect("expected prefix");
-        let expected = aruna_core::structs::HashPathIndexKey::hash_prefix(&[7u8; 32]).unwrap();
+        let expected = aruna_core::structs::HashIndex::hash_prefix(&[7u8; 32]).unwrap();
         assert_eq!(prefix.as_ref(), expected.as_slice());
     }
 

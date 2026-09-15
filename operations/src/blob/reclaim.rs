@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, CleanupStrategy,
-    GroupStorageBackend, HashPathIndexKey, ReclaimCandidate, ReclaimCandidateKey, VersionKey,
+    GroupStorage, HashIndex, ReclaimCandidate, ReclaimCandidateKey, VersionKey,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, Key, TxnId};
@@ -98,7 +98,7 @@ async fn sweep_at(
     mut start_after: Option<Key>,
 ) -> Result<ReclaimOutcome, String> {
     let catalog = node_routing(context).catalog;
-    let mut records: HashMap<Ulid, Option<GroupStorageBackend>> = HashMap::new();
+    let mut records: HashMap<Ulid, Option<GroupStorage>> = HashMap::new();
     let mut outcome = ReclaimOutcome::default();
     let mut driven = 0usize;
 
@@ -202,7 +202,7 @@ fn decode_candidate(key: &Key, value: &[u8]) -> Option<(ReclaimCandidateKey, Rec
 /// the bytes with.
 async fn group_strategy(
     context: &DriverContext,
-    records: &mut HashMap<Ulid, Option<GroupStorageBackend>>,
+    records: &mut HashMap<Ulid, Option<GroupStorage>>,
     backend_id: Ulid,
 ) -> Result<Option<CleanupStrategy>, String> {
     if let std::collections::hash_map::Entry::Vacant(slot) = records.entry(backend_id) {
@@ -215,8 +215,7 @@ async fn group_strategy(
             })
             .await;
         slot.insert(
-            parse_read(event, GroupStorageBackend::from_bytes)
-                .map_err(|error| error.to_string())?,
+            parse_read(event, GroupStorage::from_bytes).map_err(|error| error.to_string())?,
         );
     }
     Ok(records
@@ -467,7 +466,7 @@ impl ReclaimBlobOperation {
     /// retain conflicts with this sweep instead of racing it. A grace the tenant
     /// lengthened since the sweep read it makes the candidate not due again.
     fn handle_fence(&mut self, event: Event) -> Effects {
-        let record = match parse_read(event, GroupStorageBackend::from_bytes) {
+        let record = match parse_read(event, GroupStorage::from_bytes) {
             Ok(Some(record)) => record,
             Ok(None) => return self.drop_candidate(ReclaimVerdict::Dropped),
             Err(error) => return self.fail(error.into()),
@@ -540,7 +539,7 @@ impl ReclaimBlobOperation {
         let reads = match values
             .iter()
             .map(|(key, _)| {
-                let alias = HashPathIndexKey::from_bytes(key.as_ref())?;
+                let alias = HashIndex::from_bytes(key.as_ref())?;
                 let version = VersionKey::new(&alias.bucket, &alias.key, alias.version_id);
                 Ok((
                     BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -921,7 +920,7 @@ mod tests {
     }
 
     async fn add_alias(context: &DriverContext, version_id: Ulid, pins: bool) {
-        let alias = HashPathIndexKey::new(
+        let alias = HashIndex::new(
             HASH,
             version_id,
             RealmId::from_bytes([1u8; 32]),
@@ -1097,7 +1096,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn long_operation_candidate_keeps_enqueue_grace() {
+    async fn reclaim_uses_enqueue() {
         // A candidate written after a long apply carries its enqueue time, so a
         // sweep past the operation-start grace but not the enqueue grace must
         // defer it rather than free the bytes early.
@@ -1256,7 +1255,7 @@ mod tests {
     }
 
     fn group_record(backend_id: Ulid, cleanup: CleanupStrategy) -> Vec<u8> {
-        GroupStorageBackend {
+        GroupStorage {
             backend_id,
             group_id: Ulid::from_bytes([2u8; 16]),
             name: "tenant".to_string(),

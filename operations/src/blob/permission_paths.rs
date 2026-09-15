@@ -3,7 +3,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::HashPathIndexKey;
+use aruna_core::structs::HashIndex;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -12,7 +12,7 @@ use ulid::Ulid;
 pub const MAX_HASH_ALIASES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ResolveBlobPermissionPathsState {
+pub enum ResolvePathsState {
     Init,
     StartTransaction,
     ReadHashAliases,
@@ -22,7 +22,7 @@ pub enum ResolveBlobPermissionPathsState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ResolveBlobPermissionPathsError {
+pub enum ResolvePathsError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -35,31 +35,31 @@ pub enum ResolveBlobPermissionPathsError {
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: ResolveBlobPermissionPathsState,
+        state: ResolvePathsState,
         expected: &'static str,
         got: String,
     },
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ResolveBlobPermissionPathsOperation {
+pub struct ResolvePathsOperation {
     blake3_hash: [u8; 32],
     txn_id: Option<Ulid>,
-    output: Option<Result<Vec<HashPathIndexKey>, ResolveBlobPermissionPathsError>>,
-    state: ResolveBlobPermissionPathsState,
+    output: Option<Result<Vec<HashIndex>, ResolvePathsError>>,
+    state: ResolvePathsState,
 }
 
-impl ResolveBlobPermissionPathsOperation {
+impl ResolvePathsOperation {
     pub fn new(blake3_hash: [u8; 32]) -> Self {
         Self {
             blake3_hash,
             txn_id: None,
             output: None,
-            state: ResolveBlobPermissionPathsState::Init,
+            state: ResolvePathsState::Init,
         }
     }
 
-    fn emit_read_aliases(&mut self) -> Result<Effects, ResolveBlobPermissionPathsError> {
+    fn emit_read_aliases(&mut self) -> Result<Effects, ResolvePathsError> {
         Ok(smallvec![iter_hash_page(
             &self.blake3_hash,
             None,
@@ -72,13 +72,13 @@ impl ResolveBlobPermissionPathsOperation {
         &mut self,
         values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>,
         next_start_after: Option<Key>,
-    ) -> Result<Effects, ResolveBlobPermissionPathsError> {
+    ) -> Result<Effects, ResolvePathsError> {
         if next_start_after.is_some() || values.len() > MAX_HASH_ALIASES {
-            return Err(ResolveBlobPermissionPathsError::TooManyAliases);
+            return Err(ResolvePathsError::TooManyAliases);
         }
         let mut candidates = values
             .into_iter()
-            .map(|(key, _)| HashPathIndexKey::from_bytes(key.as_ref()))
+            .map(|(key, _)| HashIndex::from_bytes(key.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
 
         candidates
@@ -86,39 +86,33 @@ impl ResolveBlobPermissionPathsOperation {
 
         self.output = Some(Ok(candidates));
 
-        let txn_id = self
-            .txn_id
-            .ok_or(ResolveBlobPermissionPathsError::NoTransactionFound)?;
+        let txn_id = self.txn_id.ok_or(ResolvePathsError::NoTransactionFound)?;
         Ok(smallvec![Effect::Storage(
             StorageEffect::CommitTransaction { txn_id }
         )])
     }
 
-    fn fail(&mut self, err: ResolveBlobPermissionPathsError) -> Effects {
-        self.state = ResolveBlobPermissionPathsState::Error;
+    fn fail(&mut self, err: ResolvePathsError) -> Effects {
+        self.state = ResolvePathsState::Error;
         self.output = Some(Err(err));
         smallvec![]
     }
 
-    fn fail_with_cleanup(
-        &mut self,
-        err: ResolveBlobPermissionPathsError,
-        cleanup_effects: Effects,
-    ) -> Effects {
-        self.state = ResolveBlobPermissionPathsState::Error;
+    fn fail_with_cleanup(&mut self, err: ResolvePathsError, cleanup_effects: Effects) -> Effects {
+        self.state = ResolvePathsState::Error;
         self.output = Some(Err(err));
         cleanup_effects
     }
 
     fn unexpected_event(
         &mut self,
-        state: ResolveBlobPermissionPathsState,
+        state: ResolvePathsState,
         expected: &'static str,
         got: String,
     ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
-            ResolveBlobPermissionPathsError::UnexpectedEvent {
+            ResolvePathsError::UnexpectedEvent {
                 state,
                 expected,
                 got,
@@ -139,13 +133,13 @@ impl ResolveBlobPermissionPathsOperation {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
-                ResolveBlobPermissionPathsState::StartTransaction,
+                ResolvePathsState::StartTransaction,
                 "Event::Storage(StorageEvent::TransactionStarted)",
                 got,
             );
         };
 
-        self.state = ResolveBlobPermissionPathsState::ReadHashAliases;
+        self.state = ResolvePathsState::ReadHashAliases;
         self.txn_id = Some(txn_id);
         match self.emit_read_aliases() {
             Ok(effects) => effects,
@@ -161,7 +155,7 @@ impl ResolveBlobPermissionPathsOperation {
         }) = event
         else {
             return self.unexpected_event(
-                ResolveBlobPermissionPathsState::ReadHashAliases,
+                ResolvePathsState::ReadHashAliases,
                 "Event::Storage(StorageEvent::IterResult)",
                 got,
             );
@@ -169,7 +163,7 @@ impl ResolveBlobPermissionPathsOperation {
 
         match self.parse_hash_aliases(values, next_start_after) {
             Ok(effects) => {
-                self.state = ResolveBlobPermissionPathsState::CommitTransaction;
+                self.state = ResolvePathsState::CommitTransaction;
                 effects
             }
             Err(err) => {
@@ -183,23 +177,23 @@ impl ResolveBlobPermissionPathsOperation {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
-                ResolveBlobPermissionPathsState::CommitTransaction,
+                ResolvePathsState::CommitTransaction,
                 "Event::Storage(StorageEvent::TransactionCommitted)",
                 got,
             );
         };
 
-        self.state = ResolveBlobPermissionPathsState::Finish;
+        self.state = ResolvePathsState::Finish;
         smallvec![]
     }
 }
 
-impl Operation for ResolveBlobPermissionPathsOperation {
-    type Output = Vec<HashPathIndexKey>;
-    type Error = ResolveBlobPermissionPathsError;
+impl Operation for ResolvePathsOperation {
+    type Output = Vec<HashIndex>;
+    type Error = ResolvePathsError;
 
     fn start(&mut self) -> Effects {
-        self.state = ResolveBlobPermissionPathsState::StartTransaction;
+        self.state = ResolvePathsState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: true,
         })]
@@ -212,29 +206,24 @@ impl Operation for ResolveBlobPermissionPathsOperation {
         };
 
         match self.state {
-            ResolveBlobPermissionPathsState::StartTransaction => {
-                self.handle_start_transaction(event)
+            ResolvePathsState::StartTransaction => self.handle_start_transaction(event),
+            ResolvePathsState::ReadHashAliases => self.handle_read_aliases(event),
+            ResolvePathsState::CommitTransaction => self.handle_commit_transaction(event),
+            ResolvePathsState::Init | ResolvePathsState::Finish | ResolvePathsState::Error => {
+                smallvec![]
             }
-            ResolveBlobPermissionPathsState::ReadHashAliases => self.handle_read_aliases(event),
-            ResolveBlobPermissionPathsState::CommitTransaction => {
-                self.handle_commit_transaction(event)
-            }
-            ResolveBlobPermissionPathsState::Init
-            | ResolveBlobPermissionPathsState::Finish
-            | ResolveBlobPermissionPathsState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            ResolveBlobPermissionPathsState::Finish | ResolveBlobPermissionPathsState::Error
+            ResolvePathsState::Finish | ResolvePathsState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .ok_or(ResolveBlobPermissionPathsError::NotFinished)?
+        self.output.ok_or(ResolvePathsError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -247,10 +236,7 @@ impl Operation for ResolveBlobPermissionPathsOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_HASH_ALIASES, ResolveBlobPermissionPathsError, ResolveBlobPermissionPathsOperation,
-        ResolveBlobPermissionPathsState,
-    };
+    use super::{MAX_HASH_ALIASES, ResolvePathsError, ResolvePathsOperation, ResolvePathsState};
     use crate::blob::records::add_index_effect;
     use crate::driver::{DriverContext, drive};
     use aruna_core::effects::{Effect, StorageEffect};
@@ -258,7 +244,7 @@ mod tests {
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::HASH_PATHS_INDEX_KEYSPACE;
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{HashPathIndexKey, RealmId};
+    use aruna_core::structs::{HashIndex, RealmId};
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -271,16 +257,16 @@ mod tests {
         node_id: aruna_core::NodeId,
         bucket: &str,
         key: &str,
-    ) -> HashPathIndexKey {
-        HashPathIndexKey::new(hash, version_id, realm_id, group_id, node_id, bucket, key)
+    ) -> HashIndex {
+        HashIndex::new(hash, version_id, realm_id, group_id, node_id, bucket, key)
     }
 
     #[test]
     fn starts_alias_reads() {
-        let mut op = ResolveBlobPermissionPathsOperation::new([7u8; 32]);
+        let mut op = ResolvePathsOperation::new([7u8; 32]);
 
         let effects = op.start();
-        assert_eq!(op.state, ResolveBlobPermissionPathsState::StartTransaction);
+        assert_eq!(op.state, ResolvePathsState::StartTransaction);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::StartTransaction {
@@ -290,7 +276,7 @@ mod tests {
 
         let txn_id = Ulid::generate();
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        assert_eq!(op.state, ResolveBlobPermissionPathsState::ReadHashAliases);
+        assert_eq!(op.state, ResolvePathsState::ReadHashAliases);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Iter {
@@ -312,13 +298,13 @@ mod tests {
         let group_b = Ulid::from_bytes([3u8; 16]);
         let node_a = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
         let node_b = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
-        let mut op = ResolveBlobPermissionPathsOperation::new(hash);
+        let mut op = ResolvePathsOperation::new(hash);
 
         op.start();
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::generate(),
         }));
-        assert_eq!(op.state, ResolveBlobPermissionPathsState::ReadHashAliases);
+        assert_eq!(op.state, ResolvePathsState::ReadHashAliases);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Iter { .. })]
@@ -364,7 +350,7 @@ mod tests {
             next_start_after: None,
         }));
 
-        assert_eq!(op.state, ResolveBlobPermissionPathsState::CommitTransaction);
+        assert_eq!(op.state, ResolvePathsState::CommitTransaction);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { .. })]
@@ -374,13 +360,13 @@ mod tests {
             txn_id: Ulid::generate(),
         }));
         assert!(effects.is_empty());
-        assert_eq!(op.state, ResolveBlobPermissionPathsState::Finish);
+        assert_eq!(op.state, ResolvePathsState::Finish);
         assert_eq!(op.finalize().unwrap(), vec![alias_b, alias_b_dupe, alias_a]);
     }
 
     #[test]
     fn rejects_unexpected_event() {
-        let mut op = ResolveBlobPermissionPathsOperation::new([7u8; 32]);
+        let mut op = ResolvePathsOperation::new([7u8; 32]);
         op.start();
         let txn_id = Ulid::generate();
         op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
@@ -394,13 +380,13 @@ mod tests {
         assert!(op.is_complete());
         assert!(matches!(
             op.finalize(),
-            Err(ResolveBlobPermissionPathsError::UnexpectedEvent { .. })
+            Err(ResolvePathsError::UnexpectedEvent { .. })
         ));
     }
 
     #[test]
     fn rejects_alias_overflow() {
-        let mut op = ResolveBlobPermissionPathsOperation::new([10u8; 32]);
+        let mut op = ResolvePathsOperation::new([10u8; 32]);
         op.start();
         op.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::generate(),
@@ -420,7 +406,7 @@ mod tests {
         ));
         assert!(matches!(
             op.finalize(),
-            Err(ResolveBlobPermissionPathsError::TooManyAliases)
+            Err(ResolvePathsError::TooManyAliases)
         ));
     }
 
@@ -438,12 +424,9 @@ mod tests {
             compute_handle: None,
         };
 
-        let result = drive(
-            ResolveBlobPermissionPathsOperation::new([1u8; 32]),
-            &context,
-        )
-        .await
-        .unwrap();
+        let result = drive(ResolvePathsOperation::new([1u8; 32]), &context)
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -462,7 +445,7 @@ mod tests {
         };
 
         let hash = [8u8; 32];
-        let alias = HashPathIndexKey::new(
+        let alias = HashIndex::new(
             hash,
             Ulid::from_bytes([4u8; 16]),
             RealmId::from_bytes([1u8; 32]),
@@ -490,7 +473,7 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
 
-        let result = drive(ResolveBlobPermissionPathsOperation::new(hash), &context)
+        let result = drive(ResolvePathsOperation::new(hash), &context)
             .await
             .unwrap();
         assert_eq!(result, vec![alias]);
