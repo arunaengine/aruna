@@ -13,10 +13,10 @@ use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
 use crate::types::{GroupId, Key};
 
-pub const NOTIFICATION_WATCH_PER_USER_CAP: usize = 50;
-pub const NOTIFICATION_WATCH_MAX_PREFIX_LEN: usize = 1024;
-pub const NOTIFICATION_WATCH_INTEREST_ENTRY_CAP: usize = 1024;
-pub const NOTIFICATION_WATCH_INTEREST_BYTES_CAP: usize = 2 * 1024 * 1024;
+pub const WATCH_USER_CAP: usize = 50;
+pub const MAX_PREFIX_LEN: usize = 1024;
+pub const INTEREST_ENTRY_CAP: usize = 1024;
+pub const INTEREST_BYTES_CAP: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataResourcePath<'a> {
@@ -298,14 +298,14 @@ impl WatchEvent {
 }
 
 /// Domain separator for the deterministic per-subscription notification id.
-pub const WATCH_NOTIFICATION_ID_DOMAIN: &[u8] = b"aruna-watch-notification-v1\0";
+pub const WATCH_ID_DOMAIN: &[u8] = b"aruna-watch-notification-v1\0";
 
 /// Deterministic notification-record id for the `(event, subscription)` pair. Because it is a pure
 /// function of the origin-minted `event_id` and the `watch_id`, re-expanding a redelivered event mints
 /// the same id, so the holder-side idempotent upsert collapses duplicate deliveries.
 pub fn watch_notification_id(event_id: Ulid, watch_id: Ulid) -> Ulid {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(WATCH_NOTIFICATION_ID_DOMAIN);
+    hasher.update(WATCH_ID_DOMAIN);
     hasher.update(&event_id.to_bytes());
     hasher.update(&watch_id.to_bytes());
     let hash = hasher.finalize();
@@ -427,10 +427,10 @@ pub fn parse_watch_key(key: &[u8]) -> Result<(UserId, Ulid), ConversionError> {
 
 /// Watch-interest keys use fixed binary prefixes for per-realm node scans.
 /// Local text-prefixed markers cannot collide with the binary digest prefix.
-pub const WATCH_INTEREST_NODE_PREFIX: &[u8] = b"n/";
-pub const WATCH_INTEREST_DIRTY_PREFIX: &[u8] = b"dirty/";
-const WATCH_INTEREST_PENDING_PREFIX: &[u8] = b"pending/";
-const WATCH_INTEREST_RETRY_PREFIX: &[u8] = b"retry/";
+pub const WATCH_NODE_PREFIX: &[u8] = b"n/";
+pub const WATCH_DIRTY_PREFIX: &[u8] = b"dirty/";
+const WATCH_PENDING_PREFIX: &[u8] = b"pending/";
+const WATCH_RETRY_PREFIX: &[u8] = b"retry/";
 
 /// One coalesced interest entry: the union of every subscription a node holds
 /// for a realm that shares this path prefix.
@@ -484,8 +484,8 @@ impl WatchInterestDigest {
 }
 
 pub fn interest_node_key(realm_id: RealmId, node_id: NodeId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(WATCH_INTEREST_NODE_PREFIX.len() + 64);
-    key.extend_from_slice(WATCH_INTEREST_NODE_PREFIX);
+    let mut key = Vec::with_capacity(WATCH_NODE_PREFIX.len() + 64);
+    key.extend_from_slice(WATCH_NODE_PREFIX);
     key.extend_from_slice(realm_id.as_bytes());
     key.extend_from_slice(node_id.as_bytes());
     key
@@ -493,48 +493,48 @@ pub fn interest_node_key(realm_id: RealmId, node_id: NodeId) -> Vec<u8> {
 
 /// Scan prefix over every node's digest, ordered by realm.
 pub fn interest_node_prefix() -> Vec<u8> {
-    WATCH_INTEREST_NODE_PREFIX.to_vec()
+    WATCH_NODE_PREFIX.to_vec()
 }
 
 /// Scan prefix over one realm's digests (all nodes, contiguous range).
 pub fn interest_realm_prefix(realm_id: RealmId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(WATCH_INTEREST_NODE_PREFIX.len() + 32);
-    key.extend_from_slice(WATCH_INTEREST_NODE_PREFIX);
+    let mut key = Vec::with_capacity(WATCH_NODE_PREFIX.len() + 32);
+    key.extend_from_slice(WATCH_NODE_PREFIX);
     key.extend_from_slice(realm_id.as_bytes());
     key
 }
 
 /// Recovers the realm id from a `n/<realm><node>` digest key.
 pub fn interest_realm_id(key: &[u8]) -> Option<RealmId> {
-    let tail = key.strip_prefix(WATCH_INTEREST_NODE_PREFIX)?;
+    let tail = key.strip_prefix(WATCH_NODE_PREFIX)?;
     let bytes: [u8; 32] = tail.get(..32)?.try_into().ok()?;
     Some(RealmId::from_bytes(bytes))
 }
 
 /// Recovers the node id from a `n/<realm><node>` digest key.
 pub fn interest_node_id(key: &[u8]) -> Option<NodeId> {
-    let tail = key.strip_prefix(WATCH_INTEREST_NODE_PREFIX)?;
+    let tail = key.strip_prefix(WATCH_NODE_PREFIX)?;
     let bytes: [u8; 32] = tail.get(32..64)?.try_into().ok()?;
     NodeId::from_bytes(&bytes).ok()
 }
 
 pub fn interest_dirty_key(realm_id: RealmId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(WATCH_INTEREST_DIRTY_PREFIX.len() + 32);
-    key.extend_from_slice(WATCH_INTEREST_DIRTY_PREFIX);
+    let mut key = Vec::with_capacity(WATCH_DIRTY_PREFIX.len() + 32);
+    key.extend_from_slice(WATCH_DIRTY_PREFIX);
     key.extend_from_slice(realm_id.as_bytes());
     key
 }
 
 pub fn interest_pending_key(realm_id: RealmId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(WATCH_INTEREST_PENDING_PREFIX.len() + 32);
-    key.extend_from_slice(WATCH_INTEREST_PENDING_PREFIX);
+    let mut key = Vec::with_capacity(WATCH_PENDING_PREFIX.len() + 32);
+    key.extend_from_slice(WATCH_PENDING_PREFIX);
     key.extend_from_slice(realm_id.as_bytes());
     key
 }
 
 pub fn watch_retry_prefix(realm_id: RealmId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(WATCH_INTEREST_RETRY_PREFIX.len() + 32);
-    key.extend_from_slice(WATCH_INTEREST_RETRY_PREFIX);
+    let mut key = Vec::with_capacity(WATCH_RETRY_PREFIX.len() + 32);
+    key.extend_from_slice(WATCH_RETRY_PREFIX);
     key.extend_from_slice(realm_id.as_bytes());
     key
 }
@@ -547,7 +547,7 @@ pub fn watch_retry_key(realm_id: RealmId, event_id: Ulid) -> Vec<u8> {
 
 /// Recovers the realm id from a `dirty/<realm>` marker key.
 pub fn dirty_interest_realm(key: &[u8]) -> Option<RealmId> {
-    let tail = key.strip_prefix(WATCH_INTEREST_DIRTY_PREFIX)?;
+    let tail = key.strip_prefix(WATCH_DIRTY_PREFIX)?;
     let bytes: [u8; 32] = tail.try_into().ok()?;
     Some(RealmId::from_bytes(bytes))
 }
@@ -675,7 +675,7 @@ impl WatchInterestTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keyspaces::NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE;
+    use crate::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
     use crate::storage_entries::{watch_delete_entry, watch_write_entry};
     use crate::structs::identity::realm::RealmId;
 
@@ -1054,12 +1054,12 @@ mod tests {
         let record = subscription(owner);
 
         let write = watch_write_entry(&record).unwrap();
-        assert_eq!(write.0, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE);
+        assert_eq!(write.0, WATCH_SUBSCRIPTIONS_KEYSPACE);
         assert_eq!(write.1, watch_subscription_key(owner, record.watch_id));
         assert_eq!(WatchSubscription::from_bytes(&write.2).unwrap(), record);
 
         let delete = watch_delete_entry(owner, record.watch_id);
-        assert_eq!(delete.0, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE);
+        assert_eq!(delete.0, WATCH_SUBSCRIPTIONS_KEYSPACE);
         assert_eq!(delete.1, watch_subscription_key(owner, record.watch_id));
     }
 
@@ -1136,7 +1136,7 @@ mod tests {
         let node_id = node(9);
 
         let key = interest_node_key(realm_id, node_id);
-        assert!(key.starts_with(WATCH_INTEREST_NODE_PREFIX));
+        assert!(key.starts_with(WATCH_NODE_PREFIX));
         assert!(key.starts_with(&interest_realm_prefix(realm_id)));
         assert!(key.starts_with(&interest_node_prefix()));
         assert_eq!(interest_realm_id(&key), Some(realm_id));

@@ -171,14 +171,14 @@ fn observed_group_assignment() {
         assignment_origin,
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id },
+        AdminDocumentOperation::GroupAssignmentAdded { role_id, user_id },
     );
     let removal = group_event(
         3,
         node(3),
         1,
         AdminDocumentClock::default().with_observed(assignment_origin, 1),
-        AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id },
+        AdminDocumentOperation::GroupAssignmentRemoved { role_id, user_id },
     );
 
     state.apply(&add_group_role(1, 1, role_id)).unwrap();

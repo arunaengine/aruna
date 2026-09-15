@@ -10,20 +10,20 @@ use crate::document::{
 };
 use crate::errors::ConversionError;
 use crate::keyspaces::{
-    ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
-    DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
-    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
-    METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
-    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_IRI_REFERENCE_INDEX_KEYSPACE,
-    METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE, METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
-    METADATA_MATERIALIZATION_JOB_KEYSPACE, METADATA_MATERIALIZATION_PRUNE_KEYSPACE,
-    METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
-    METADATA_PROFILE_VALIDATION_STATUS_KEYSPACE, METADATA_RAW_BUDGET_KEYSPACE,
-    METADATA_UPDATED_INDEX_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
-    NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE,
-    NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
-    USER_SUBJECT_INDEX_KEYSPACE,
+    DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
+    SYNC_CONFLICT_KEYSPACE, SYNC_REVISION_KEYSPACE,
+    CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE,
+    DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE,
+    GRAPH_LIFECYCLE_KEYSPACE, PRUNE_JOB_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, IRI_INDEX_KEYSPACE,
+    DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE,
+    MATERIALIZATION_JOB_KEYSPACE, MATERIALIZATION_PRUNE_KEYSPACE,
+    MATERIALIZATION_STATUS_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
+    VALIDATION_STATUS_KEYSPACE, RAW_BUDGET_KEYSPACE,
+    UPDATED_INDEX_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
+    PRUNE_INDEX_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE,
+    WATCH_SUBSCRIPTIONS_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
+    SUBJECT_INDEX_KEYSPACE,
 };
 use crate::metadata::{
     DeadLetterRecord, GraphLifecycleRecord, GraphPruneRecord, IriIndexRecord,
@@ -55,7 +55,7 @@ pub fn subject_index_writes(user: &User) -> Vec<(KeySpace, Key, Value)> {
         .iter()
         .map(|subject_id| {
             (
-                USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+                SUBJECT_INDEX_KEYSPACE.to_string(),
                 subject_index_key(subject_id),
                 subject_index_value(user.user_id),
             )
@@ -80,7 +80,7 @@ pub fn stale_subject_deletes(
         })
         .map(|subject_id| {
             (
-                USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+                SUBJECT_INDEX_KEYSPACE.to_string(),
                 subject_index_key(subject_id),
             )
         })
@@ -120,7 +120,7 @@ pub fn parse_updated_key(key: &[u8]) -> Result<(u64, Ulid), ConversionError> {
 /// left for lazy cleanup, which only ever over-lists and never under-lists.
 pub fn updated_index_entry(record: &MetadataRegistryRecord) -> (KeySpace, Key, Value) {
     (
-        METADATA_UPDATED_INDEX_KEYSPACE.to_string(),
+        UPDATED_INDEX_KEYSPACE.to_string(),
         updated_index_key(record.updated_at_ms, record.document_id),
         ByteView::from(Vec::new()),
     )
@@ -327,7 +327,7 @@ pub fn create_event_entry(
     event: &MetadataEventRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        METADATA_EVENT_LOG_KEYSPACE.to_string(),
+        EVENT_LOG_KEYSPACE.to_string(),
         event_log_key(event.record.document_id, event.event_id),
         postcard::to_allocvec(event)?.into(),
     ))
@@ -337,7 +337,7 @@ pub fn raw_budget_entry(
     budget: &RawOriginBudget,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        METADATA_RAW_BUDGET_KEYSPACE.to_string(),
+        RAW_BUDGET_KEYSPACE.to_string(),
         raw_budget_key(budget.document_id, budget.node_id),
         postcard::to_allocvec(budget)?.into(),
     ))
@@ -347,7 +347,7 @@ pub fn profile_validation_entry(
     status: &ProfileValidationStatus,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        METADATA_PROFILE_VALIDATION_STATUS_KEYSPACE.to_string(),
+        VALIDATION_STATUS_KEYSPACE.to_string(),
         profile_validation_key(status.document_id),
         postcard::to_allocvec(status)?.into(),
     ))
@@ -357,7 +357,7 @@ pub fn create_acceptance_entry(
     event: &MetadataEventRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+        CREATE_ACCEPTANCE_KEYSPACE.to_string(),
         create_acceptance_key(event.record.document_id),
         postcard::to_allocvec(event)?.into(),
     ))
@@ -365,7 +365,7 @@ pub fn create_acceptance_entry(
 
 pub fn pending_projection_entry(event: &MetadataEventRecord) -> (KeySpace, Key, Value) {
     (
-        METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+        PENDING_PROJECTION_KEYSPACE.to_string(),
         pending_projection_key(event.record.document_id, event.event_id),
         ByteView::from(Vec::new()),
     )
@@ -373,7 +373,7 @@ pub fn pending_projection_entry(event: &MetadataEventRecord) -> (KeySpace, Key, 
 
 pub fn delete_projection_entry(document_id: Ulid, event_id: Ulid) -> (KeySpace, Key) {
     (
-        METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+        PENDING_PROJECTION_KEYSPACE.to_string(),
         pending_projection_key(document_id, event_id),
     )
 }
@@ -391,7 +391,7 @@ pub fn graph_lifecycle_entry(
     record: &GraphLifecycleRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+        GRAPH_LIFECYCLE_KEYSPACE.to_string(),
         graph_lifecycle_key(&record.graph_iri),
         postcard::to_allocvec(record)?.into(),
     ))
@@ -401,7 +401,7 @@ pub fn document_lifecycle_entry(
     record: &MetadataLifecycleRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+        DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
         document_lifecycle_key(record.document_id()),
         postcard::to_allocvec(record)?.into(),
     ))
@@ -412,7 +412,7 @@ pub fn sync_revision_entry(
     change: &DocumentChange,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+        SYNC_REVISION_KEYSPACE.to_string(),
         sync_revision_key(target),
         postcard::to_allocvec(change)?.into(),
     ))
@@ -490,7 +490,7 @@ pub fn sync_conflict_entry(
     conflict: &DocumentSyncConflict,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        DOCUMENT_SYNC_CONFLICT_KEYSPACE.to_string(),
+        SYNC_CONFLICT_KEYSPACE.to_string(),
         sync_conflict_key(target),
         postcard::to_allocvec(conflict)?.into(),
     ))
@@ -565,7 +565,7 @@ pub fn materialization_status_entry(
     record: &MaterializationStatusRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
+        MATERIALIZATION_STATUS_KEYSPACE.to_string(),
         materialization_status_key(record.document_id),
         postcard::to_allocvec(record)?.into(),
     ))
@@ -575,7 +575,7 @@ pub fn iri_reference_entry(
     record: &IriIndexRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+        IRI_INDEX_KEYSPACE.to_string(),
         iri_reference_key(
             &record.predicate_iri,
             &record.object_iri,
@@ -593,7 +593,7 @@ pub fn materialization_job_entry(
     record: &MetadataMaterializationRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+        MATERIALIZATION_JOB_KEYSPACE.to_string(),
         materialization_job_key(record),
         ByteView::from(Vec::new()),
     ))
@@ -605,7 +605,7 @@ pub fn document_job_entry(
     record: &MetadataMaterializationRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+        DOCUMENT_JOB_KEYSPACE.to_string(),
         document_job_key(record.document_id, record.event_id),
         postcard::to_allocvec(record)?.into(),
     ))
@@ -617,7 +617,7 @@ pub fn dead_letter_entry(
     record: &DeadLetterRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE.to_string(),
+        DEAD_LETTER_KEYSPACE.to_string(),
         dead_letter_key(record.job.document_id, record.job.event_id),
         postcard::to_allocvec(record)?.into(),
     ))
@@ -630,7 +630,7 @@ pub fn materialization_prune_entry(
     cursor: Ulid,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        METADATA_MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
+        MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
         materialization_prune_key(document_id),
         postcard::to_allocvec(&cursor)?.into(),
     ))
@@ -644,7 +644,7 @@ pub fn graph_prune_entry(
     record: &GraphPruneRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+        PRUNE_JOB_KEYSPACE.to_string(),
         graph_prune_key(record),
         postcard::to_allocvec(record)?.into(),
     ))
@@ -664,7 +664,7 @@ pub fn inbox_write_entries(
             record.to_bytes()?.into(),
         ),
         (
-            NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(),
+            PRUNE_INDEX_KEYSPACE.to_string(),
             notification_prune_key(record),
             ByteView::from(Vec::new()),
         ),
@@ -682,7 +682,7 @@ pub fn inbox_delete_entries(record: &NotificationRecord) -> Vec<(KeySpace, Key)>
             ),
         ),
         (
-            NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(),
+            PRUNE_INDEX_KEYSPACE.to_string(),
             notification_prune_key(record),
         ),
     ]
@@ -716,7 +716,7 @@ pub fn watch_write_entry(
     subscription: &WatchSubscription,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+        WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
         watch_subscription_key(subscription.owner, subscription.watch_id),
         subscription.to_bytes()?.into(),
     ))
@@ -724,7 +724,7 @@ pub fn watch_write_entry(
 
 pub fn watch_delete_entry(owner: UserId, watch_id: Ulid) -> (KeySpace, Key) {
     (
-        NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+        WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
         watch_subscription_key(owner, watch_id),
     )
 }
@@ -733,7 +733,7 @@ pub fn reducer_state_entry(
     state: &AdminDocumentState,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        DOCUMENT_STATE_KEYSPACE.to_string(),
         reducer_state_key(&state.target),
         postcard::to_allocvec(state)?.into(),
     ))
@@ -744,7 +744,7 @@ pub fn conflict_write_entry(
     conflict: &AdminConflict,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+        DOCUMENT_CONFLICT_KEYSPACE.to_string(),
         reducer_conflict_key(target, &conflict.path),
         postcard::to_allocvec(conflict)?.into(),
     ))
@@ -762,7 +762,7 @@ pub fn conflict_write_entries(
 
 pub fn conflict_delete_entry(target: &AdminDocumentTarget, path: &str) -> (KeySpace, Key) {
     (
-        ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+        DOCUMENT_CONFLICT_KEYSPACE.to_string(),
         reducer_conflict_key(target, path),
     )
 }
@@ -801,7 +801,7 @@ pub fn registry_write_entries(
             record_bytes.clone(),
         ),
         (
-            METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
+            DOCUMENT_INDEX_KEYSPACE.to_string(),
             metadata_document_key(record.document_id),
             record_bytes,
         ),
@@ -819,7 +819,7 @@ pub fn registry_write_entries(
 /// the delete batch is built or the key leaks with no later write to supersede it.
 pub fn updated_index_delete(record: &MetadataRegistryRecord) -> (KeySpace, Key) {
     (
-        METADATA_UPDATED_INDEX_KEYSPACE.to_string(),
+        UPDATED_INDEX_KEYSPACE.to_string(),
         updated_index_key(record.updated_at_ms, record.document_id),
     )
 }
@@ -833,7 +833,7 @@ pub fn registry_delete_entries(record: &MetadataRegistryRecord) -> Vec<(KeySpace
             metadata_registry_key(group_id, document_id),
         ),
         (
-            METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
+            DOCUMENT_INDEX_KEYSPACE.to_string(),
             metadata_document_key(document_id),
         ),
         (
@@ -865,10 +865,10 @@ mod tests {
         DocumentTarget,
     };
     use crate::keyspaces::{
-        ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
-        DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
-        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
-        METADATA_IRI_REFERENCE_INDEX_KEYSPACE, METADATA_UPDATED_INDEX_KEYSPACE,
+        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
+        SYNC_CONFLICT_KEYSPACE, SYNC_REVISION_KEYSPACE,
+        DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        IRI_INDEX_KEYSPACE, UPDATED_INDEX_KEYSPACE,
         SHARD_MANIFEST_KEYSPACE,
     };
     use crate::metadata::{GraphLifecycleRecord, IriIndexRecord};
@@ -913,7 +913,7 @@ mod tests {
         let prefix = iri_reference_prefix(&record.predicate_iri, &record.object_iri);
         let decoded: IriIndexRecord = postcard::from_bytes(value.as_ref()).unwrap();
 
-        assert_eq!(keyspace, METADATA_IRI_REFERENCE_INDEX_KEYSPACE);
+        assert_eq!(keyspace, IRI_INDEX_KEYSPACE);
         assert_eq!(prefix.as_ref().len(), 64);
         assert_eq!(key.as_ref().len(), 96);
         assert!(key.as_ref().starts_with(prefix.as_ref()));
@@ -1012,7 +1012,7 @@ mod tests {
         let (keyspace, key, value) = reducer_state_entry(&state).unwrap();
         let decoded: AdminDocumentState = postcard::from_bytes(value.as_ref()).unwrap();
 
-        assert_eq!(keyspace, ADMIN_DOCUMENT_STATE_KEYSPACE);
+        assert_eq!(keyspace, DOCUMENT_STATE_KEYSPACE);
         assert_eq!(key, reducer_state_key(&target));
         assert_eq!(decoded, state);
     }
@@ -1044,7 +1044,7 @@ mod tests {
         let (keyspace, key, value) = reducer_state_entry(&state).unwrap();
         let decoded: AdminDocumentState = postcard::from_bytes(value.as_ref()).unwrap();
 
-        assert_eq!(keyspace, ADMIN_DOCUMENT_STATE_KEYSPACE);
+        assert_eq!(keyspace, DOCUMENT_STATE_KEYSPACE);
         assert_eq!(key, reducer_state_key(&target));
         assert_eq!(decoded, state);
     }
@@ -1065,7 +1065,7 @@ mod tests {
         let (keyspace, key, value) = sync_revision_entry(&target, &change).unwrap();
         let decoded: DocumentChange = postcard::from_bytes(value.as_ref()).unwrap();
 
-        assert_eq!(keyspace, DOCUMENT_SYNC_REVISION_KEYSPACE);
+        assert_eq!(keyspace, SYNC_REVISION_KEYSPACE);
         assert_eq!(key, sync_revision_key(&target));
         assert_eq!(decoded, change);
     }
@@ -1090,7 +1090,7 @@ mod tests {
         assert!(older.current < newer.current);
         let (keyspace, key, value) = sync_revision_entry(&target, &newer).unwrap();
         let decoded: DocumentChange = postcard::from_bytes(value.as_ref()).unwrap();
-        assert_eq!(keyspace, DOCUMENT_SYNC_REVISION_KEYSPACE);
+        assert_eq!(keyspace, SYNC_REVISION_KEYSPACE);
         assert_eq!(key, sync_revision_key(&target));
         assert_eq!(decoded, newer);
 
@@ -1252,7 +1252,7 @@ mod tests {
         let (keyspace, key, value) = sync_conflict_entry(&target, &conflict).unwrap();
         let decoded: DocumentSyncConflict = postcard::from_bytes(value.as_ref()).unwrap();
 
-        assert_eq!(keyspace, DOCUMENT_SYNC_CONFLICT_KEYSPACE);
+        assert_eq!(keyspace, SYNC_CONFLICT_KEYSPACE);
         assert_eq!(key, sync_conflict_key(&target));
         assert_eq!(decoded, conflict);
     }
@@ -1300,7 +1300,7 @@ mod tests {
         for (keyspace, key, value) in entries {
             let decoded: AdminConflict = postcard::from_bytes(value.as_ref()).unwrap();
 
-            assert_eq!(keyspace, ADMIN_DOCUMENT_CONFLICT_KEYSPACE);
+            assert_eq!(keyspace, DOCUMENT_CONFLICT_KEYSPACE);
             assert!(key.as_ref().starts_with(prefix.as_ref()));
             assert!(!key.as_ref().starts_with(other_prefix.as_ref()));
             assert_eq!(
@@ -1366,7 +1366,7 @@ mod tests {
         assert_eq!(
             deletes,
             vec![(
-                ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+                DOCUMENT_CONFLICT_KEYSPACE.to_string(),
                 reducer_conflict_key(&target, "user.attributes.department"),
             )]
         );
@@ -1413,9 +1413,9 @@ mod tests {
             keyspaces,
             vec![
                 METADATA_INDEX_KEYSPACE,
-                METADATA_DOCUMENT_INDEX_KEYSPACE,
+                DOCUMENT_INDEX_KEYSPACE,
                 METADATA_HOLDERS_KEYSPACE,
-                METADATA_UPDATED_INDEX_KEYSPACE,
+                UPDATED_INDEX_KEYSPACE,
             ]
         );
         let registry_key = metadata_registry_key(record.group_id, record.document_id);

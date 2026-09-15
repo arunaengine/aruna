@@ -502,7 +502,8 @@ impl JobProgress {
 pub struct JobClaim {
     pub holder_node_id: NodeId,
     pub claim_token: Ulid,
-    pub lease_expires_at_ms: u64,
+    #[serde(rename = "lease_expires_at_ms")]
+    pub lease_expires_ms: u64,
 }
 
 /// Which bucket a run writes into: none of its own, or one the caller owns.
@@ -601,7 +602,7 @@ impl JobRecord {
             workspace_mode: WorkspaceMode::default(),
             captured_inputs: Vec::new(),
             report_digest: None,
-            retention_ms: DEFAULT_JOB_RETENTION_MS,
+            retention_ms: RETENTION_MS,
             locally_exhausted: false,
         }
     }
@@ -711,8 +712,8 @@ fn external_attempt_transition(from: JobState, to: JobState) -> bool {
 }
 
 pub fn job_record_key(job_id: JobId) -> Key {
-    let mut bytes = Vec::with_capacity(JOB_RECORD_KEY_PREFIX.len() + 16);
-    bytes.extend_from_slice(JOB_RECORD_KEY_PREFIX);
+    let mut bytes = Vec::with_capacity(RECORD_KEY_PREFIX.len() + 16);
+    bytes.extend_from_slice(RECORD_KEY_PREFIX);
     bytes.extend_from_slice(&job_id.to_bytes());
     ByteView::from(bytes)
 }
@@ -811,24 +812,24 @@ fn schedule_index_key(prefix: &[u8], timestamp_ms: u64, job_id: JobId) -> Key {
 }
 
 pub fn due_index_key(due_at_ms: u64, job_id: JobId) -> Key {
-    schedule_index_key(JOB_DUE_INDEX_PREFIX, due_at_ms, job_id)
+    schedule_index_key(DUE_INDEX_PREFIX, due_at_ms, job_id)
 }
 
-pub fn lease_index_key(lease_expires_at_ms: u64, job_id: JobId) -> Key {
-    schedule_index_key(JOB_LEASE_INDEX_PREFIX, lease_expires_at_ms, job_id)
+pub fn lease_index_key(lease_expires_ms: u64, job_id: JobId) -> Key {
+    schedule_index_key(LEASE_INDEX_PREFIX, lease_expires_ms, job_id)
 }
 
 pub fn job_prune_key(retention_expiry_ms: u64, job_id: JobId) -> Key {
-    schedule_index_key(JOB_PRUNE_INDEX_PREFIX, retention_expiry_ms, job_id)
+    schedule_index_key(PRUNE_INDEX_PREFIX, retention_expiry_ms, job_id)
 }
 
 /// Extract `(timestamp_ms, job_id)` from a `due/`, `lease/`, or `prune/` schedule
 /// index key.
 pub fn parse_schedule_key(key: &[u8]) -> Result<(u64, JobId), ConversionError> {
     for prefix in [
-        JOB_DUE_INDEX_PREFIX,
-        JOB_LEASE_INDEX_PREFIX,
-        JOB_PRUNE_INDEX_PREFIX,
+        DUE_INDEX_PREFIX,
+        LEASE_INDEX_PREFIX,
+        PRUNE_INDEX_PREFIX,
     ] {
         if let Some(rest) = key.strip_prefix(prefix) {
             if rest.len() != 24 {

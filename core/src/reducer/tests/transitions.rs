@@ -95,7 +95,7 @@ fn transition_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
             node(1),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            AdminDocumentOperation::PlacementStrategyUpserted {
                 strategy: transition_strategy(),
             },
         ),
@@ -104,7 +104,7 @@ fn transition_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
             node(1),
             2,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigCandidateMapPublished {
+            AdminDocumentOperation::CandidateMapPublished {
                 map: map_with(1, &[1, 2]),
             },
         ),
@@ -113,7 +113,7 @@ fn transition_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
             node(1),
             3,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigCandidateMapPublished {
+            AdminDocumentOperation::CandidateMapPublished {
                 map: map_with(2, &[3, 4]),
             },
         ),
@@ -122,7 +122,7 @@ fn transition_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
             node(1),
             4,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigActivationsInitialized {
+            AdminDocumentOperation::ConfigActivationsInitialized {
                 strategy_id: plan.strategy_id,
                 candidate_map_epoch: 1,
             },
@@ -132,7 +132,7 @@ fn transition_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
             node(1),
             5,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigTransitionStarted { plan: plan.clone() },
+            AdminDocumentOperation::ConfigTransitionStarted { plan: plan.clone() },
         ),
     ]
 }
@@ -145,7 +145,7 @@ fn completion_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
             node(seed),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            AdminDocumentOperation::TransitionBarrierReported {
                 transition_id: plan.transition_id,
                 bucket: 0,
                 reported_by: node(seed),
@@ -159,7 +159,7 @@ fn completion_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
             node(seed),
             2,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            AdminDocumentOperation::TransitionProofSubmitted {
                 transition_id: plan.transition_id,
                 strategy_id: plan.strategy_id,
                 proof: proof_for(plan, 0, seed),
@@ -190,7 +190,7 @@ fn foreign_reports_dropped() {
             node(3),
             5,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            AdminDocumentOperation::TransitionBarrierReported {
                 transition_id: plan.transition_id,
                 bucket: 0,
                 reported_by: node(3),
@@ -204,7 +204,7 @@ fn foreign_reports_dropped() {
             node(5),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigTransitionStallReported {
+            AdminDocumentOperation::TransitionStallReported {
                 transition_id: plan.transition_id,
                 bucket: 0,
                 reported_by: node(5),
@@ -231,11 +231,11 @@ fn foreign_reports_dropped() {
         node(1),
         9,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+        AdminDocumentOperation::TransitionBarrierReported {
             transition_id: plan.transition_id,
             bucket: 0,
             reported_by: node(1),
-            frontier: vec![0; crate::structs::placement::placement_transition::MAX_BARRIER_FRONTIER_BYTES + 1],
+            frontier: vec![0; crate::structs::placement::placement_transition::MAX_FRONTIER_BYTES + 1],
         },
     );
     assert!(matches!(
@@ -258,7 +258,7 @@ fn concurrent_plans_gated() {
         node(1),
         6,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigTransitionStarted {
+        AdminDocumentOperation::ConfigTransitionStarted {
             plan: plan_b.clone(),
         },
     );
@@ -271,7 +271,7 @@ fn concurrent_plans_gated() {
                     node(seed),
                     3,
                     AdminDocumentClock::default(),
-                    AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                    AdminDocumentOperation::TransitionBarrierReported {
                         transition_id: plan_b.transition_id,
                         bucket: 0,
                         reported_by: node(seed),
@@ -284,7 +284,7 @@ fn concurrent_plans_gated() {
                     node(seed),
                     4,
                     AdminDocumentClock::default(),
-                    AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                    AdminDocumentOperation::TransitionProofSubmitted {
                         transition_id: plan_b.transition_id,
                         strategy_id: plan_b.strategy_id,
                         proof: proof_for(&plan_b, 0, seed),
@@ -329,7 +329,7 @@ fn map_conflict_closed() {
                 origin,
                 1,
                 AdminDocumentClock::default(),
-                AdminDocumentOperation::RealmConfigCandidateMapPublished {
+                AdminDocumentOperation::CandidateMapPublished {
                     map: map_with(1, seeds),
                 },
             ))
@@ -375,7 +375,7 @@ fn proof_admission_forgery() {
             origin,
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            AdminDocumentOperation::TransitionProofSubmitted {
                 transition_id: plan.transition_id,
                 strategy_id: plan.strategy_id,
                 proof,
@@ -419,7 +419,7 @@ fn duplicate_proof_idempotent() {
         node(3),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+        AdminDocumentOperation::TransitionProofSubmitted {
             transition_id: plan.transition_id,
             strategy_id: plan.strategy_id,
             proof: proof_for(&plan, 0, 3),
@@ -512,7 +512,7 @@ fn abort_keeps_buckets() {
             node(1),
             6,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigTransitionAborted {
+            AdminDocumentOperation::ConfigTransitionAborted {
                 transition_id: plan.transition_id,
             },
         ))
@@ -556,7 +556,7 @@ fn late_proof_completes() {
         node(1),
         6,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigTransitionAborted {
+        AdminDocumentOperation::ConfigTransitionAborted {
             transition_id: plan.transition_id,
         },
     );
@@ -621,7 +621,7 @@ fn prune_keeps_advances() {
         (
             60u8,
             1u8,
-            AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            AdminDocumentOperation::TransitionBarrierReported {
                 transition_id: plan.transition_id,
                 bucket: 1,
                 reported_by: node(1),
@@ -631,7 +631,7 @@ fn prune_keeps_advances() {
         (
             61,
             2,
-            AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            AdminDocumentOperation::TransitionBarrierReported {
                 transition_id: plan.transition_id,
                 bucket: 1,
                 reported_by: node(2),
@@ -641,7 +641,7 @@ fn prune_keeps_advances() {
         (
             62,
             3,
-            AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            AdminDocumentOperation::TransitionProofSubmitted {
                 transition_id: plan.transition_id,
                 strategy_id: plan.strategy_id,
                 proof: proof_for(&plan, 1, 3),
@@ -650,7 +650,7 @@ fn prune_keeps_advances() {
         (
             63,
             4,
-            AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            AdminDocumentOperation::TransitionProofSubmitted {
                 transition_id: plan.transition_id,
                 strategy_id: plan.strategy_id,
                 proof: proof_for(&plan, 1, 4),
@@ -675,7 +675,7 @@ fn prune_keeps_advances() {
                 node(seed),
                 4 + u64::from(bucket),
                 AdminDocumentClock::default(),
-                AdminDocumentOperation::RealmConfigTransitionDrainReported {
+                AdminDocumentOperation::TransitionDrainReported {
                     transition_id: plan.transition_id,
                     bucket,
                     reported_by: node(seed),
@@ -724,7 +724,7 @@ fn drops_unreferenced_maps() {
             node(1),
             6,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigCandidateMapPublished {
+            AdminDocumentOperation::CandidateMapPublished {
                 map: map_with(3, &[1, 4]),
             },
         ))
@@ -742,7 +742,7 @@ fn drops_unreferenced_maps() {
             node(1),
             7,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigTransitionAborted {
+            AdminDocumentOperation::ConfigTransitionAborted {
                 transition_id: plan.transition_id,
             },
         ))

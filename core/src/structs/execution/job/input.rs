@@ -335,7 +335,7 @@ impl Default for RoCrateLimits {
             metadata_bytes: 16 * 1024 * 1024,
             key_bytes: 1024,
             upload_retention_ms: DAY_MS,
-            artifact_retention_ms: DEFAULT_JOB_RETENTION_MS,
+            artifact_retention_ms: RETENTION_MS,
             max_active_jobs: 4,
             holder_ttl_ms: DAY_MS,
             holder_refresh_ms: 8 * 60 * 60 * 1000,

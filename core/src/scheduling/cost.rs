@@ -52,12 +52,12 @@ impl<'a> LinkIndex<'a> {
                 .map(|link| {
                     (
                         (link.from.trim(), link.to.trim()),
-                        link.bandwidth_bytes_per_sec,
+                        link.bandwidth_per_sec,
                     )
                 })
                 .collect(),
-            pessimistic: config.pessimistic_bandwidth_bytes_per_sec.max(1),
-            stale_after_ms: config.availability_stale_after_ms,
+            pessimistic: config.pessimistic_per_sec.max(1),
+            stale_after_ms: config.availability_stale_ms,
         }
     }
 

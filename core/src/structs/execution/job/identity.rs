@@ -1,14 +1,14 @@
 use super::*;
 
 /// Version prefix keeping the record wrappable in a version envelope later (#286).
-pub const JOB_RECORD_KEY_PREFIX: &[u8] = b"jobs-v1/";
+pub const RECORD_KEY_PREFIX: &[u8] = b"jobs-v1/";
 
-pub const JOB_DUE_INDEX_PREFIX: &[u8] = b"due/";
-pub const JOB_LEASE_INDEX_PREFIX: &[u8] = b"lease/";
-pub const JOB_PRUNE_INDEX_PREFIX: &[u8] = b"prune/";
+pub const DUE_INDEX_PREFIX: &[u8] = b"due/";
+pub const LEASE_INDEX_PREFIX: &[u8] = b"lease/";
+pub const PRUNE_INDEX_PREFIX: &[u8] = b"prune/";
 /// Invalid UTF-8 byte separating generated report rows from user paths.
-pub const JOB_SYSTEM_ENTRY_PREFIX: u8 = u8::MAX;
-pub const DEFAULT_JOB_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+pub const SYSTEM_ENTRY_PREFIX: u8 = u8::MAX;
+pub const RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Creation-ordered job identifier stored at API and persistence boundaries.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]

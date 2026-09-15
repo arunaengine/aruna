@@ -552,7 +552,7 @@ fn sample_spec() -> LogicalJobSpec {
         group_id: Ulid::from_bytes([7u8; 16]),
         created_by: user(8, 2),
         created_at_ms: 1_700_000_000_000,
-        retention_ms: DEFAULT_JOB_RETENTION_MS,
+        retention_ms: RETENTION_MS,
         payload: ExecutionSpec {
             group_id: Ulid::from_bytes([7u8; 16]),
             name: None,
@@ -575,7 +575,7 @@ fn sample_spec() -> LogicalJobSpec {
         spec_digest: [0u8; 32],
         resources: sample_resources(),
         retry: JobRetryPolicy {
-            max_launches_per_witness: 3,
+            launches_per_witness: 3,
         },
         admission: sample_admission(),
         captured_inputs: Vec::new(),
@@ -829,14 +829,14 @@ fn derives_submission_id() {
 fn rejects_empty_retry() {
     assert_eq!(
         JobRetryPolicy {
-            max_launches_per_witness: 0
+            launches_per_witness: 0
         }
         .validate(),
         Err(JobContractError::EmptyRetry)
     );
     assert!(
         JobRetryPolicy {
-            max_launches_per_witness: 1
+            launches_per_witness: 1
         }
         .validate()
         .is_ok()
@@ -1807,32 +1807,32 @@ fn key_bytes_ordered() {
         JobFamilyRecord::Receipt(Box::new(sample_receipt())).key(),
     ];
     keys.sort();
-    let mut encoded: Vec<[u8; JOB_RECORD_KEY_BYTES]> =
+    let mut encoded: Vec<[u8; RECORD_KEY_BYTES]> =
         keys.iter().map(JobRecordKey::to_bytes).collect();
     encoded.sort();
     assert_eq!(
         encoded,
         keys.iter()
             .map(JobRecordKey::to_bytes)
-            .collect::<Vec<[u8; JOB_RECORD_KEY_BYTES]>>()
+            .collect::<Vec<[u8; RECORD_KEY_BYTES]>>()
     );
     for key in keys {
         assert_eq!(JobRecordKey::from_bytes(&key.to_bytes()), Ok(key));
     }
     assert_eq!(
-        JobRecordKey::from_bytes(&[0u8; JOB_RECORD_KEY_BYTES - 1]),
+        JobRecordKey::from_bytes(&[0u8; RECORD_KEY_BYTES - 1]),
         Err(JobRecordError::MalformedKey)
     );
 }
 
 #[test]
 fn bounds_result_message() {
-    assert!(ResultMessage::new("m".repeat(MAX_RESULT_MESSAGE_BYTES)).is_ok());
+    assert!(ResultMessage::new("m".repeat(MAX_MESSAGE_BYTES)).is_ok());
     assert_eq!(
-        ResultMessage::new("m".repeat(MAX_RESULT_MESSAGE_BYTES + 1)),
+        ResultMessage::new("m".repeat(MAX_MESSAGE_BYTES + 1)),
         Err(JobRecordError::MessageBytes)
     );
-    let over = postcard::to_allocvec(&"m".repeat(MAX_RESULT_MESSAGE_BYTES + 1)).unwrap();
+    let over = postcard::to_allocvec(&"m".repeat(MAX_MESSAGE_BYTES + 1)).unwrap();
     assert!(postcard::from_bytes::<ResultMessage>(&over).is_err());
 }
 
@@ -1845,14 +1845,14 @@ fn keeps_message_tail() {
         ResultMessage::tail("short").map(|tail| tail.as_str().to_string()),
         Some("short".to_string())
     );
-    let text = format!("{}end", "m".repeat(MAX_RESULT_MESSAGE_BYTES));
+    let text = format!("{}end", "m".repeat(MAX_MESSAGE_BYTES));
     let tail = ResultMessage::tail(&text).expect("non-empty tail");
-    assert_eq!(tail.as_str().len(), MAX_RESULT_MESSAGE_BYTES);
+    assert_eq!(tail.as_str().len(), MAX_MESSAGE_BYTES);
     assert!(tail.as_str().ends_with("end"));
     // 6000 bytes of three-byte characters: the cut at 1904 is inside one.
     let wide = "€".repeat(2000);
     let tail = ResultMessage::tail(&wide).expect("non-empty tail");
-    assert_eq!(tail.as_str().len(), MAX_RESULT_MESSAGE_BYTES - 1);
+    assert_eq!(tail.as_str().len(), MAX_MESSAGE_BYTES - 1);
     assert!(wide.ends_with(tail.as_str()));
 }
 
@@ -1871,8 +1871,8 @@ fn digest_tracks_projection() {
 #[test]
 fn record_key_versioned() {
     let key = job_record_key(JobId::from_bytes([9u8; 16]));
-    assert!(key.starts_with(JOB_RECORD_KEY_PREFIX));
-    assert_eq!(key.len(), JOB_RECORD_KEY_PREFIX.len() + 16);
+    assert!(key.starts_with(RECORD_KEY_PREFIX));
+    assert_eq!(key.len(), RECORD_KEY_PREFIX.len() + 16);
 }
 
 #[test]
@@ -1892,8 +1892,8 @@ fn prefixes_disjoint() {
     let prune = job_prune_key(5, id);
     assert!(due < lease);
     assert!(lease < prune);
-    assert!(!due.starts_with(JOB_LEASE_INDEX_PREFIX));
-    assert!(!lease.starts_with(JOB_PRUNE_INDEX_PREFIX));
+    assert!(!due.starts_with(LEASE_INDEX_PREFIX));
+    assert!(!lease.starts_with(PRUNE_INDEX_PREFIX));
 }
 
 #[test]

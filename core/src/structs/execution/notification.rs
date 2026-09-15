@@ -10,9 +10,9 @@ use crate::structs::identity::realm::RealmId;
 use crate::structs::execution::notification_watch::WatchAuthorizationBinding;
 use crate::types::{GroupId, Key};
 
-pub const NOTIFICATION_DIRECT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
-pub const NOTIFICATION_TRANSIENT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
-pub const NOTIFICATION_TRANSIENT_PER_USER_CAP: usize = 500;
+pub const DIRECT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+pub const TRANSIENT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+pub const TRANSIENT_USER_CAP: usize = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotificationClass {
@@ -23,8 +23,8 @@ pub enum NotificationClass {
 impl NotificationClass {
     pub fn ttl_ms(&self) -> u64 {
         match self {
-            NotificationClass::Direct => NOTIFICATION_DIRECT_TTL_MS,
-            NotificationClass::Transient => NOTIFICATION_TRANSIENT_TTL_MS,
+            NotificationClass::Direct => DIRECT_TTL_MS,
+            NotificationClass::Transient => TRANSIENT_TTL_MS,
         }
     }
 }
@@ -303,7 +303,7 @@ pub fn notification_outbox_key(outbox_id: Ulid) -> Key {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE};
+    use crate::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
     use crate::storage_entries::{inbox_delete_entries, inbox_update_entry, inbox_write_entries};
 
     fn make_node_id(seed: u8) -> NodeId {
@@ -529,7 +529,7 @@ mod tests {
             writes[0].1,
             notification_inbox_key(r, record.created_at_ms, record.notification_id)
         );
-        assert_eq!(writes[1].0, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE);
+        assert_eq!(writes[1].0, PRUNE_INDEX_KEYSPACE);
         assert_eq!(writes[1].1, notification_prune_key(&record));
         assert!(writes[1].2.is_empty());
 
@@ -540,7 +540,7 @@ mod tests {
             deletes[0].1,
             notification_inbox_key(r, record.created_at_ms, record.notification_id)
         );
-        assert_eq!(deletes[1].0, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE);
+        assert_eq!(deletes[1].0, PRUNE_INDEX_KEYSPACE);
         assert_eq!(deletes[1].1, notification_prune_key(&record));
 
         let update = inbox_update_entry(&record).unwrap();

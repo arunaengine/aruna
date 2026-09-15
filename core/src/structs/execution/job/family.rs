@@ -47,10 +47,10 @@ pub const JOB_ENVELOPE_DOMAIN: &[u8] = b"aruna-job-envelope-v1";
 pub const MAX_EXECUTION_OUTPUTS: usize = 1024;
 
 /// Bytes of the free-text diagnostic on a terminal execution update.
-pub const MAX_RESULT_MESSAGE_BYTES: usize = 4096;
+pub const MAX_MESSAGE_BYTES: usize = 4096;
 
 /// Encoded width of a [`JobRecordKey`]: family, kind, subject, sequence.
-pub const JOB_RECORD_KEY_BYTES: usize = 105;
+pub const RECORD_KEY_BYTES: usize = 105;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum JobContractError {
@@ -96,13 +96,13 @@ pub enum JobRecordError {
     Inconsistent,
     #[error("caller is not authorized against the stored job spec")]
     Unauthorized,
-    #[error("job record key must be {JOB_RECORD_KEY_BYTES} bytes naming a known kind")]
+    #[error("job record key must be {RECORD_KEY_BYTES} bytes naming a known kind")]
     MalformedKey,
     #[error("outputs must be at most {MAX_EXECUTION_OUTPUTS} canonically ordered exact objects")]
     OutputOrder,
     #[error("every output must name its exact version and its producing execution once")]
     OutputIdentity,
-    #[error("result message must be at most {MAX_RESULT_MESSAGE_BYTES} bytes")]
+    #[error("result message must be at most {MAX_MESSAGE_BYTES} bytes")]
     MessageBytes,
     #[error("two different updates claim sequence {sequence}")]
     ChainConflict { sequence: u64 },
@@ -112,12 +112,13 @@ pub enum JobRecordError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRetryPolicy {
     /// Includes the initial launch and is at least one.
-    pub max_launches_per_witness: u32,
+    #[serde(rename = "max_launches_per_witness")]
+    pub launches_per_witness: u32,
 }
 
 impl JobRetryPolicy {
     pub fn validate(&self) -> Result<(), JobContractError> {
-        match self.max_launches_per_witness {
+        match self.launches_per_witness {
             0 => Err(JobContractError::EmptyRetry),
             _ => Ok(()),
         }
@@ -367,7 +368,7 @@ pub struct ResultMessage(String);
 
 impl ResultMessage {
     pub fn new(message: String) -> Result<Self, JobRecordError> {
-        match message.len() <= MAX_RESULT_MESSAGE_BYTES {
+        match message.len() <= MAX_MESSAGE_BYTES {
             true => Ok(Self(message)),
             false => Err(JobRecordError::MessageBytes),
         }
@@ -379,7 +380,7 @@ impl ResultMessage {
         if text.is_empty() {
             return None;
         }
-        Some(Self(tail_str(text, MAX_RESULT_MESSAGE_BYTES).to_string()))
+        Some(Self(tail_str(text, MAX_MESSAGE_BYTES).to_string()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -613,8 +614,8 @@ pub struct JobRecordKey {
 }
 
 impl JobRecordKey {
-    pub fn to_bytes(&self) -> [u8; JOB_RECORD_KEY_BYTES] {
-        let mut bytes = [0u8; JOB_RECORD_KEY_BYTES];
+    pub fn to_bytes(&self) -> [u8; RECORD_KEY_BYTES] {
+        let mut bytes = [0u8; RECORD_KEY_BYTES];
         bytes[..64].copy_from_slice(&self.family.to_bytes());
         bytes[64] = self.kind.as_byte();
         bytes[65..97].copy_from_slice(&self.subject);
@@ -623,7 +624,7 @@ impl JobRecordKey {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, JobRecordError> {
-        if bytes.len() != JOB_RECORD_KEY_BYTES {
+        if bytes.len() != RECORD_KEY_BYTES {
             return Err(JobRecordError::MalformedKey);
         }
         let read = |range: std::ops::Range<usize>| -> Result<[u8; 32], JobRecordError> {
@@ -1165,7 +1166,7 @@ impl JobRecordEnvelope {
             return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Spec));
         };
         match budget.source_spec_digest == spec.spec_digest
-            && budget.max_launches <= spec.retry.max_launches_per_witness
+            && budget.max_launches <= spec.retry.launches_per_witness
         {
             true => Ok(RecordVerdict::Authentic),
             false => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Spec)),

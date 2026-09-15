@@ -43,17 +43,17 @@ fn admin_document_trip() {
     let node_id = node(6);
 
     assert_eq!(USER_NAME_PATH, "user.name");
-    assert_eq!(GROUP_DISPLAY_NAME_PATH, "group.display_name");
-    assert_eq!(GROUP_REALM_ID_PATH, "group.realm_id");
+    assert_eq!(DISPLAY_NAME_PATH, "group.display_name");
+    assert_eq!(REALM_ID_PATH, "group.realm_id");
     assert_eq!(
-        REALM_CONFIG_METADATA_REPLICATION_PATH,
+        METADATA_REPLICATION_PATH,
         "realm_config.settings.metadata_replication"
     );
     assert_eq!(
-        REALM_CONFIG_DISCOVERY_PATH,
+        CONFIG_DISCOVERY_PATH,
         "realm_config.settings.discovery"
     );
-    assert_eq!(REALM_CONFIG_DESCRIPTION_PATH, "realm_config.description");
+    assert_eq!(CONFIG_DESCRIPTION_PATH, "realm_config.description");
     assert_eq!(
         user_attribute_path("department"),
         "user.attributes.department"
@@ -398,7 +398,7 @@ fn same_origin_stale() {
         origin,
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigSettingsSet {
+        AdminDocumentOperation::ConfigSettingsSet {
             metadata_replication: MetadataReplicationConfig::new(3),
             discovery: RealmDiscoveryConfig::Static {
                 endpoints: Vec::new(),
@@ -414,7 +414,7 @@ fn same_origin_stale() {
         origin,
         2,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigSettingsSet {
+        AdminDocumentOperation::ConfigSettingsSet {
             metadata_replication: newer_metadata.clone(),
             discovery: newer_discovery.clone(),
         },

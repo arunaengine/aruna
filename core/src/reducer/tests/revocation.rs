@@ -6,7 +6,7 @@ fn revoke_token(event_seed: u8, origin_seed: u8, token: &str) -> AdminDocumentEv
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigTokenRevoked {
+        AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: crate::auth::bearer_token_hash(token),
             expires_at: 2_000,
             token_owner: user_id(),
@@ -25,7 +25,7 @@ fn revoke_token_at(
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigTokenRevoked {
+        AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: crate::auth::bearer_token_hash(token),
             expires_at,
             token_owner: user_id(),
@@ -45,7 +45,7 @@ fn revoke_token_owned(
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigTokenRevoked {
+        AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: crate::auth::bearer_token_hash(token),
             expires_at,
             token_owner,
@@ -185,7 +185,7 @@ fn compaction_canonicalizes() {
     assert!(
         state
             .conflicts
-            .contains_key(super::REALM_CONFIG_DESCRIPTION_PATH)
+            .contains_key(super::CONFIG_DESCRIPTION_PATH)
     );
     assert!(
         state
@@ -406,7 +406,7 @@ fn divergent_expiry_keeps() {
     let mut state = realm_config_state();
     state.apply(&revoke_token(1, 1, "token")).unwrap();
     let mut longer = revoke_token(2, 2, "token");
-    longer.op = AdminDocumentOperation::RealmConfigTokenRevoked {
+    longer.op = AdminDocumentOperation::ConfigTokenRevoked {
         token_hash: crate::auth::bearer_token_hash("token"),
         expires_at: 5_000,
         token_owner: user_id(),
@@ -449,7 +449,7 @@ fn compaction_drops_expired() {
         node(1),
         2,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigTokenRevoked {
+        AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: crate::auth::bearer_token_hash("live"),
             expires_at: 9_000,
             token_owner: user_id(),
@@ -509,7 +509,7 @@ fn rejects_malformed_hash() {
         node(1),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigTokenRevoked {
+        AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: "not-a-hash".to_string(),
             expires_at: 2_000,
             token_owner: user_id(),

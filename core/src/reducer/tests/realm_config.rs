@@ -82,7 +82,7 @@ fn removes_config_node() {
         origin,
         2,
         AdminDocumentClock::default().with_observed(origin, 1),
-        AdminDocumentOperation::RealmConfigNodeRemoved {
+        AdminDocumentOperation::ConfigNodeRemoved {
             node_id: config_node,
         },
     );
@@ -106,7 +106,7 @@ fn observed_realm_conflict() {
         first_origin,
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigNodeEnsured {
+        AdminDocumentOperation::ConfigNodeEnsured {
             node_id: config_node,
             kind: RealmNodeKind::Management,
         },
@@ -116,7 +116,7 @@ fn observed_realm_conflict() {
         second_origin,
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigNodeEnsured {
+        AdminDocumentOperation::ConfigNodeEnsured {
             node_id: config_node,
             kind: RealmNodeKind::Server,
         },
@@ -128,7 +128,7 @@ fn observed_realm_conflict() {
         AdminDocumentClock::default()
             .with_observed(first_origin, 1)
             .with_observed(second_origin, 1),
-        AdminDocumentOperation::RealmConfigNodeEnsured {
+        AdminDocumentOperation::ConfigNodeEnsured {
             node_id: config_node,
             kind: RealmNodeKind::User {
                 owner: UserId::nil(realm_id()),
@@ -300,14 +300,14 @@ fn observed_realm_provider() {
         upsert_origin,
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider },
+        AdminDocumentOperation::OidcProviderUpserted { provider },
     );
     let removal = realm_config_event(
         2,
         node(2),
         1,
         AdminDocumentClock::default().with_observed(upsert_origin, 1),
-        AdminDocumentOperation::RealmConfigOidcProviderRemoved {
+        AdminDocumentOperation::OidcProviderRemoved {
             provider_id: "default".to_string(),
         },
     );
@@ -365,9 +365,9 @@ fn keeps_device_cap() {
     // quota field.
     let mut state = realm_config_state();
     let quota = QuotaConfig {
-        default_group_quota_bytes: Some(1_000),
-        max_devices_per_user: Some(6),
-        device_requests_per_minute: Some(120),
+        default_quota_bytes: Some(1_000),
+        devices_per_user: Some(6),
+        device_request_rate: Some(120),
         device_concurrent_pulls: Some(4),
         ..QuotaConfig::default()
     };
@@ -379,7 +379,7 @@ fn keeps_device_cap() {
             node(1),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigQuotaSet {
+            AdminDocumentOperation::ConfigQuotaSet {
                 quota: quota.clone(),
             },
         ))
@@ -389,7 +389,7 @@ fn keeps_device_cap() {
 
     let stored_value = state
         .user_subject_ids
-        .get(REALM_CONFIG_QUOTA_PATH)
+        .get(CONFIG_QUOTA_PATH)
         .and_then(|version| version.value.as_deref())
         .expect("quota reducer value exists")
         .to_string();
@@ -398,7 +398,7 @@ fn keeps_device_cap() {
 
     state
         .user_subject_ids
-        .get_mut(REALM_CONFIG_QUOTA_PATH)
+        .get_mut(CONFIG_QUOTA_PATH)
         .expect("quota reducer value exists")
         .value = Some(serde_json::to_string(&quota).unwrap());
     assert_eq!(state.materialized_realm_quota(), Some(expected));
@@ -411,7 +411,7 @@ fn realm_config_detection() {
     let user_a = user_id_seed(3);
     let user_b = user_id_seed(4);
     let expected = QuotaConfig {
-        default_group_quota_bytes: Some(1_000),
+        default_quota_bytes: Some(1_000),
         grace_factor_percent: 125,
         warn_threshold_percent: 80,
         group_overrides: vec![
@@ -426,8 +426,8 @@ fn realm_config_detection() {
                 grace_factor_percent: Some(150),
             },
         ],
-        max_groups_per_user: Some(4),
-        user_group_cap_overrides: vec![
+        groups_per_user: Some(4),
+        group_cap_overrides: vec![
             UserCapOverride {
                 user_id: user_a,
                 max_groups: Some(2),
@@ -437,18 +437,18 @@ fn realm_config_detection() {
                 max_groups: Some(3),
             },
         ],
-        max_devices_per_user: Some(6),
+        devices_per_user: Some(6),
         ..QuotaConfig::default()
     };
     let reordered = QuotaConfig {
         group_overrides: expected.group_overrides.iter().cloned().rev().collect(),
-        user_group_cap_overrides: expected
-            .user_group_cap_overrides
+        group_cap_overrides: expected
+            .group_cap_overrides
             .iter()
             .cloned()
             .rev()
             .collect(),
-        max_devices_per_user: Some(6),
+        devices_per_user: Some(6),
         ..expected.clone()
     };
 
@@ -457,7 +457,7 @@ fn realm_config_detection() {
         node(1),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigQuotaSet {
+        AdminDocumentOperation::ConfigQuotaSet {
             quota: expected.clone(),
         },
     );
@@ -466,7 +466,7 @@ fn realm_config_detection() {
         node(2),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigQuotaSet { quota: reordered },
+        AdminDocumentOperation::ConfigQuotaSet { quota: reordered },
     );
 
     let mut state = realm_config_state();
@@ -478,7 +478,7 @@ fn realm_config_detection() {
 
     let stored_value = state
         .user_subject_ids
-        .get(REALM_CONFIG_QUOTA_PATH)
+        .get(CONFIG_QUOTA_PATH)
         .and_then(|version| version.value.as_deref())
         .expect("quota reducer value exists");
     let stored_quota: QuotaConfig = serde_json::from_str(stored_value).unwrap();
@@ -510,10 +510,10 @@ fn realm_config_replication() {
 
     assert_eq!(state.materialized_metadata_replication(), None);
     assert_eq!(state.materialized_realm_discovery(), Some(discovery));
-    assert!(!state.conflicts.contains_key(REALM_CONFIG_DISCOVERY_PATH));
+    assert!(!state.conflicts.contains_key(CONFIG_DISCOVERY_PATH));
     let conflict = state
         .conflicts
-        .get(REALM_CONFIG_METADATA_REPLICATION_PATH)
+        .get(METADATA_REPLICATION_PATH)
         .expect("conflict is recorded");
     assert_eq!(conflict.values.len(), 2);
     assert!(
@@ -568,11 +568,11 @@ fn realm_settings_discovery() {
     assert!(
         !state
             .conflicts
-            .contains_key(REALM_CONFIG_METADATA_REPLICATION_PATH)
+            .contains_key(METADATA_REPLICATION_PATH)
     );
     let conflict = state
         .conflicts
-        .get(REALM_CONFIG_DISCOVERY_PATH)
+        .get(CONFIG_DISCOVERY_PATH)
         .expect("conflict is recorded");
     assert_eq!(conflict.values.len(), 2);
     assert!(
@@ -619,7 +619,7 @@ fn oidc_provider_change() {
         node(1),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+        AdminDocumentOperation::OidcProviderUpserted {
             provider: oidc_provider("default", "one"),
         },
     );
@@ -640,7 +640,7 @@ fn realm_config_target() {
         node(1),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigSettingsSet {
+        AdminDocumentOperation::ConfigSettingsSet {
             metadata_replication: MetadataReplicationConfig::new(3),
             discovery: RealmDiscoveryConfig::Static {
                 endpoints: Vec::new(),
