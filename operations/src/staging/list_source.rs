@@ -4,7 +4,7 @@ use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::SourceEntry;
+use aruna_core::structs::execution::source_access::SourceEntry;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -160,9 +160,10 @@ impl Operation for ListStagingOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::{
-        ResolvedSourceAccess, ResolvedSourceConnector, SourceConnector, SourceConnectorKind,
+    use aruna_core::structs::execution::source_access::{
+        ResolvedSourceAccess, ResolvedSourceConnector,
     };
+    use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
     use std::collections::HashMap;
     use std::time::SystemTime;
 

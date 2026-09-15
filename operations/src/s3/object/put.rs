@@ -30,12 +30,17 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
-use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CopyOrigin, CurrentVersionPointer, ManagedCopyKey, PathRestriction,
-    PlacementPolicyError, PlacementPolicyRef, RealmId, RoCrateLimits, RoutingError,
-    RoutingSnapshot, UsageDelta, VersionKey, VersionSourceBinding, WriteOwner, resolve_backend,
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
+    CopyOrigin, CurrentVersionPointer, ManagedCopyKey, VersionKey, WriteOwner,
 };
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
+use aruna_core::structs::storage::usage::UsageDelta;
+use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::types::{Effects, GroupId};
 use bytes::Bytes;
 use smallvec::smallvec;
@@ -1561,12 +1566,14 @@ mod pure_tests {
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::RealmId;
-    use aruna_core::structs::{
-        BackendCatalog, BackendLocation, BackendRef, GroupBackendKind, GroupRoutingInputs,
-        GroupStorage, PathRestriction, RoutingError, RoutingSnapshot, RoutingTarget,
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::routing::{
+        BackendCatalog, GroupRoutingInputs, RoutingError, RoutingSnapshot, RoutingTarget,
         StorageRoutingRule,
     };
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
+    use aruna_core::structs::identity::auth::PathRestriction;
     use aruna_core::types::TxnId;
     use std::collections::{BTreeSet, HashMap};
     use ulid::Ulid;
@@ -1646,7 +1653,7 @@ mod pure_tests {
         // credential must stay scoped on it.
         let restrictions = vec![PathRestriction {
             pattern: "/realm/g/group/data/node/bucket/scoped/**".to_string(),
-            permission: aruna_core::structs::Permission::WRITE,
+            permission: aruna_core::structs::identity::auth::Permission::WRITE,
         }];
         let mut operation = PutObjectOperation::new(config(snapshot()))
             .with_restrictions(Some(restrictions.clone()));
@@ -1844,7 +1851,7 @@ mod pure_tests {
             updated_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
             disabled: true,
-            cleanup: aruna_core::structs::CleanupStrategy::Retain,
+            cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         }
     }
 }
@@ -1865,10 +1872,12 @@ mod decision_tests {
     use aruna_core::id::NodeId;
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{
-        BucketInfo, PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject,
-        RealmId, RoutingSnapshot, VerifiedPolicy,
+    use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::placement::placement_policy::{
+        PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::types::{Effects, Value};
     use byteview::ByteView;
     use std::collections::{BTreeMap, HashMap};
@@ -2110,7 +2119,7 @@ mod decision_tests {
     }
 
     fn subject_row(generation: u64, blocked: bool) -> Value {
-        let mut record = aruna_core::structs::NodeSubjectRecord::seed(
+        let mut record = aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(
             crate::tests::policy::subject(node(9), "eu-west"),
         )
         .expect("subject is valid");
@@ -2160,10 +2169,10 @@ mod decision_tests {
 
     /// The realm view and the policy row a cache miss reads next.
     fn opened(policy_row: Option<Value>) -> Event {
-        let mut config = aruna_core::structs::RealmConfigDocument::new(realm(), Vec::new(), 2);
+        let mut config = aruna_core::structs::identity::realm::RealmConfigDocument::new(realm(), Vec::new(), 2);
         config.seed_default_placement();
         for seed in 1..=4u8 {
-            config.ensure_node(node(seed), aruna_core::structs::RealmNodeKind::Server);
+            config.ensure_node(node(seed), aruna_core::structs::identity::realm::RealmNodeKind::Server);
         }
         let (config_value, auth_value) =
             crate::tests::policy::realm_view(&config, crate::tests::policy::admin_user(realm()));
@@ -2252,9 +2261,9 @@ mod decision_tests {
         ));
     }
 
-    fn location() -> aruna_core::structs::BackendLocation {
-        aruna_core::structs::BackendLocation {
-            backend: aruna_core::structs::BackendRef::node_default(),
+    fn location() -> aruna_core::structs::storage::blob::BackendLocation {
+        aruna_core::structs::storage::blob::BackendLocation {
+            backend: aruna_core::structs::storage::blob::BackendRef::node_default(),
             storage_class: None,
             root: "/data".to_string(),
             storage_bucket: "aruna".to_string(),

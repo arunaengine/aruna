@@ -4,7 +4,8 @@ use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{SourceConnector, SourceMetadata};
+use aruna_core::structs::execution::source_connector::SourceConnector;
+use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -185,7 +186,10 @@ mod tests {
     use super::*;
     use crate::driver::drive;
     use crate::tests::staging::{create_http_connector, setup_driver_context};
-    use aruna_core::structs::{ResolvedSourceAccess, ResolvedSourceConnector, SourceConnectorKind};
+    use aruna_core::structs::execution::source_access::{
+        ResolvedSourceAccess, ResolvedSourceConnector,
+    };
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use std::collections::HashMap;
     use std::time::SystemTime;
 

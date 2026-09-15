@@ -7,10 +7,11 @@ use aruna_core::effects::StagingSourceEffect;
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{Event, StagingSourceEvent};
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::{
-    AuthContext, Permission, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
-    SyncRelationship, SyncState, object_permission_path,
-};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::{SyncRelationship, SyncState};
+use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_net::NetHandle;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
 use futures_util::StreamExt;
@@ -26,11 +27,11 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::connectors::resolver::{ARUNA_NATIVE_ORIGIN_NODE_ID, ARUNA_NATIVE_RELATIONSHIP_ID};
 use crate::driver::{DriverContext, drive};
-use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use crate::s3::get_object::{
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
 };
-use crate::s3::head_object::{
+use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
@@ -593,7 +594,8 @@ fn close_stream(stream: &mut BiStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{ArunaArn, ReferenceHandling, SyncMode, SyncStatusSnapshot};
+    use aruna_core::structs::storage::replication::ArunaArn;
+    use aruna_core::structs::{ReferenceHandling, SyncMode, SyncStatusSnapshot};
     use aruna_net::NetConfig;
     use aruna_storage::storage::FjallStorage;
 

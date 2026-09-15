@@ -22,13 +22,19 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{HASH_MD5, HASH_SHA256};
-use aruna_core::structs::{
+use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BlobVersionState, CurrentVersionPointer, MultipartChecksumType, MultipartObjectSummary,
-    PathRestriction, Permission, PortableSourceDescriptor, RealmId, ResolvedSourceAccess,
-    SourceConnectorKind, SourceMetadata, StagingStrategy, UsageDelta, VersionKey,
-    VersionSourceBinding, usage_group_key,
+    BlobVersionState, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartObjectSummary};
+use aruna_core::structs::identity::auth::{PathRestriction, Permission};
+use aruna_core::structs::execution::staging::{
+    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::storage::usage::{UsageDelta, usage_group_key};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
 use axum::{Router, routing::get};
@@ -1227,7 +1233,7 @@ async fn drift_creates_successor() {
     else {
         panic!("missing usage counters");
     };
-    let counters = aruna_core::structs::UsageCounters::from_bytes(value.unwrap().as_ref()).unwrap();
+    let counters = aruna_core::structs::storage::usage::UsageCounters::from_bytes(value.unwrap().as_ref()).unwrap();
     assert_eq!(counters.referenced_bytes, 15);
 
     // The successor's obligation is committed with it, so replication and

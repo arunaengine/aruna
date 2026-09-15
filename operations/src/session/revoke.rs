@@ -4,7 +4,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::USER_SESSION_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{Actor, UserSession};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::user_session::UserSession;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -281,7 +282,8 @@ impl Operation for RevokeSessionOperation {
 mod pure_tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::structs::{RealmId, SessionKind};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::identity::auth::SessionKind;
 
     #[test]
     fn revoke_is_idempotent() {

@@ -5,7 +5,8 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE};
-use aruna_core::structs::{BlobCleanupWork, MultipartPart, MultipartPartKey};
+use aruna_core::structs::storage::blob::BlobCleanupWork;
+use aruna_core::structs::storage::multipart::{MultipartPart, MultipartPartKey};
 use aruna_core::types::TxnId;
 use ulid::Ulid;
 

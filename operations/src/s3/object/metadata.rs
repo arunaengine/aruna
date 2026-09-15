@@ -7,7 +7,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, REFERENCE_METADATA_REFRESH_JOB_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BlobVersion, BlobVersionState, SourceMetadata, VersionKey};
+use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
+use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::unix_timestamp_millis;
@@ -793,10 +794,11 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
-    use aruna_core::structs::{
-        PortableSourceDescriptor, RealmId, SourceConnectorKind, StagingStrategy,
-        VersionSourceBinding,
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 

@@ -10,11 +10,14 @@ use aruna_core::keyspaces::{
     NODE_SUBJECT_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, ManagedCopyKey, NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementPolicyRef,
-    SourceConnectorKind, SourceMetadata, VersionKey,
+    CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;

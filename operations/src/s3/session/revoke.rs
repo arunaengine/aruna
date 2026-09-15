@@ -6,7 +6,7 @@ use aruna_core::keyspaces::{
     S3_SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, S3_SESSION_OWNER_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::S3Session;
+use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use ulid::Ulid;

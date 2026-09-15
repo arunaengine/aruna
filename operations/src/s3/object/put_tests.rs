@@ -17,11 +17,15 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::{
+use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CurrentVersionPointer, HashIndex, RealmId, UsageDelta, VersionKey,
+    BucketInfo, CurrentVersionPointer, HashIndex, VersionKey,
 };
-use aruna_core::structs::{BackendCatalog, NodeRoutingRule, RoutingSnapshot, RoutingTarget};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::usage::UsageDelta;
+use aruna_core::structs::storage::routing::{
+    BackendCatalog, NodeRoutingRule, RoutingSnapshot, RoutingTarget,
+};
 use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
@@ -125,7 +129,7 @@ fn guard_allows_edit() {
         placement_policy_generation: 0,
     };
     let edited = BucketInfo {
-        cors_configuration: Some(aruna_core::structs::BucketCorsConfiguration {
+        cors_configuration: Some(aruna_core::structs::storage::blob::BucketCorsConfiguration {
             rules: Vec::new(),
         }),
         ..expected.clone()

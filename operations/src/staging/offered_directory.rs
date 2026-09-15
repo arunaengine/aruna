@@ -5,19 +5,28 @@
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
-use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
+use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StagingSourceError, StorageError};
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::structs::{
-    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
-    OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory, PortableSourceDescriptor,
-    RealmId, ResolvedSourceAccess, SourceConnectorKind, SourceEntry, SourceMetadata,
-    StagingStrategy, UsageDelta, VersionKey, VersionSourceBinding,
+use aruna_core::structs::storage::blob::{
+    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::execution::offered_directory::{
+    OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,
+};
+use aruna_core::structs::execution::staging::{
+    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::source_access::{
+    ResolvedSourceAccess, SourceEntry, SourceMetadata,
+};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, TxnId};
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
@@ -65,7 +74,7 @@ pub struct ObservedFile {
     pub version_id: Ulid,
     /// The stat the listing read, for the decisions that need more than the
     /// fingerprint it was folded into.
-    pub stat: Option<aruna_core::structs::FileStat>,
+    pub stat: Option<aruna_core::structs::execution::offered_directory::FileStat>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -296,9 +305,9 @@ fn millis_since_epoch(time: SystemTime) -> Option<u64> {
 /// an incomplete fingerprint, which never stands in for reading the bytes.
 fn entry_fingerprint(entry: &SourceEntry) -> String {
     let stat = entry.stat.unwrap_or_else(|| {
-        aruna_core::structs::FileStat::partial(entry.size.unwrap_or_default(), entry.modified)
+        aruna_core::structs::execution::offered_directory::FileStat::partial(entry.size.unwrap_or_default(), entry.modified)
     });
-    aruna_core::structs::weak_fingerprint(&stat)
+    aruna_core::structs::execution::offered_directory::weak_fingerprint(&stat)
 }
 
 fn entry_metadata(entry: &SourceEntry) -> SourceMetadata {
@@ -823,9 +832,9 @@ async fn commit(context: &DriverContext, txn_id: TxnId) -> Result<(), OfferedDir
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
+    use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
     use crate::tests::staging::setup_driver_context;
-    use aruna_core::structs::{UsageCounters, usage_group_key};
+    use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
     use futures_util::StreamExt;
 
     fn input(bucket: &str, root: &str) -> OfferDirectoryInput {

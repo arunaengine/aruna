@@ -9,10 +9,11 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::S3_MULTIPART_OBJECT_METADATA_KEYSPACE;
-use aruna_core::structs::{
-    BackendLocation, BackendRef, BlobLocationKey, ManagedCopyKey, MultipartObjectKey,
-    MultipartObjectSummary, PlacementPolicyRef, VersionKey,
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobLocationKey, ManagedCopyKey, VersionKey,
 };
+use aruna_core::structs::storage::multipart::{MultipartObjectKey, MultipartObjectSummary};
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
@@ -126,7 +127,7 @@ pub(crate) fn summary_from_read(
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::MultipartChecksumType;
+    use aruna_core::structs::storage::multipart::MultipartChecksumType;
 
     #[test]
     fn summary_decode_fails() {

@@ -6,10 +6,13 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
-    CurrentVersionPointer, Permission, RealmId, VersionKey, W3idIdentifier, object_permission_path,
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
+    VersionKey, object_permission_path,
 };
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_core::types::{GroupId, Key, TxnId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -486,10 +489,10 @@ mod tests {
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::structs::checksum::HASH_BLAKE3;
-    use aruna_core::structs::{
-        Actor, BackendRef, BlobLocationKey, Group, GroupAuthorizationDocument, PathRestriction,
-        RealmAuthorizationDocument, RealmConfigDocument, Role,
-    };
+    use aruna_core::structs::identity::auth::{Actor, PathRestriction, Role};
+    use aruna_core::structs::storage::blob::{BackendRef, BlobLocationKey};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
     use aruna_storage::storage;
     use byteview::ByteView;
     use tempfile::TempDir;

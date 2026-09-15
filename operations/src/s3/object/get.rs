@@ -26,13 +26,18 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{
-    AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BlobVersionState, CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType,
-    MultipartObjectKey, MultipartObjectSummary, PathRestriction, PlacementPolicyError,
-    PlacementPolicyRef, ResolvedSourceAccess, SourceMetadata, UsageDelta, VersionKey,
-    VersionSourceBinding,
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
+use aruna_core::structs::storage::multipart::{
+    MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary,
+};
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
+use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
+use aruna_core::structs::storage::usage::UsageDelta;
+use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::types::Effects;
 use aruna_core::{NodeId, UserId};
 use bytes::Bytes;

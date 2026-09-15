@@ -3,7 +3,7 @@ use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{Event, StagingSourceEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::ResolvedSourceAccess;
+use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -104,7 +104,7 @@ impl Operation for CheckSourceOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::SourceConnectorKind;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use std::collections::HashMap;
 
     fn sample_access() -> ResolvedSourceAccess {

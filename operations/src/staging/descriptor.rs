@@ -1,8 +1,9 @@
 use aruna_core::NodeId;
-use aruna_core::structs::{
-    PortableSourceDescriptor, SourceConnector, SourceMetadata, StagingStrategy,
-    VersionSourceBinding,
+use aruna_core::structs::execution::staging::{
+    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
 };
+use aruna_core::structs::execution::source_connector::SourceConnector;
+use aruna_core::structs::execution::source_access::SourceMetadata;
 use ulid::Ulid;
 
 pub fn build_source_descriptor(
@@ -87,7 +88,7 @@ mod pure_tests {
         )
     }
 
-    use aruna_core::structs::SourceConnectorKind;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 
     fn sample_metadata() -> SourceMetadata {
         SourceMetadata {

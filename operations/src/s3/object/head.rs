@@ -12,11 +12,15 @@ use aruna_core::errors::{
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType, PlacementPolicyRef,
-    SourceConnectorKind, SourceMetadata, VersionKey, VersionSourceBinding,
+    CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
+use aruna_core::structs::storage::multipart::MultipartChecksumType;
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -598,14 +602,17 @@ mod tests {
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     };
-    use aruna_core::structs::BackendConfig;
-    use aruna_core::structs::BackendLocation;
+    use aruna_core::structs::storage::blob::BackendConfig;
+    use aruna_core::structs::storage::blob::BackendLocation;
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
-    use aruna_core::structs::{
-        Backend, BackendRef, BlobHeadKey, BlobVersion, CurrentVersionPointer,
-        PortableSourceDescriptor, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
-        StagingStrategy, VersionKey, VersionSourceBinding,
+    use aruna_core::structs::storage::blob::{
+        Backend, BackendRef, BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_net::{NetConfig, NetHandle};
     use std::collections::HashMap;
     use std::time::SystemTime;

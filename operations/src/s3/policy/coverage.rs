@@ -9,11 +9,13 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{
-    AuthContext, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
-    ManagedCopyKey, ManagedCopyRecord, Permission, PlacementPolicyRef, VersionKey,
-    policy_admin_path,
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{
+    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, ManagedCopyKey,
+    ManagedCopyRecord, VersionKey,
 };
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::placement::policy_document::policy_admin_path;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -631,11 +633,13 @@ mod pure_tests {
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::id::NodeId;
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{
-        AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
-        CurrentVersionPointer, ManagedCopyRecord, ManagedCopyState, PlacementPolicyRef, RealmId,
-        VersionKey,
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::storage::blob::{
+        BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
+        ManagedCopyRecord, ManagedCopyState, VersionKey,
     };
+    use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::Key;
     use std::collections::HashMap;
     use std::time::UNIX_EPOCH;
@@ -820,7 +824,7 @@ mod pure_tests {
             vec![policy_ref(1)],
             version(vec![policy_ref(1)]),
             Some(copy_record(
-                ManagedCopyState::Quarantined(aruna_core::structs::ManagedCopyQuarantine::Rejoin),
+                ManagedCopyState::Quarantined(aruna_core::structs::storage::blob::ManagedCopyQuarantine::Rejoin),
                 Ulid::from_bytes([9u8; 16]),
             )),
         );

@@ -19,14 +19,21 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobVersion, BlobVersionState, BucketIdentity,
-    CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, POLICY_BULK_INTENT_KEYSPACE,
-    POLICY_MUTATION_KEYSPACE, PlacementDecision, PlacementPolicyError, PlacementPolicyRef,
-    PlacementSubject, PolicyBlockedReason, PolicyIntent, PolicyIntentOutcome, PolicyMutationParams,
-    PolicyMutationRecord, PolicyRefMode, PolicyResolution, RealmConfigDocument, UsageDelta,
-    VersionKey, evaluate_placement,
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BlobVersion, BlobVersionState, BucketIdentity, CurrentVersionPointer,
+    ManagedCopyKey, ManagedCopyRecord, VersionKey,
 };
+use aruna_core::structs::placement::policy_attachment::{
+    POLICY_BULK_INTENT_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyBlockedReason, PolicyIntent,
+    PolicyIntentOutcome, PolicyMutationParams, PolicyMutationRecord, PolicyRefMode,
+};
+use aruna_core::structs::placement::placement_policy::{
+    PlacementDecision, PlacementPolicyError, PlacementPolicyRef, PlacementSubject,
+    PolicyResolution, evaluate_placement,
+};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
@@ -998,15 +1005,25 @@ mod pure_tests {
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, USAGE_STATS_KEYSPACE,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{
-        Actor, AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo,
-        CurrentVersionPointer, JobId, ManagedCopyRecord, ManagedCopyState, NodeSubjectRecord,
-        POLICY_BULK_INTENT_KEYSPACE, PlacementPolicy, PlacementPolicyRef, PlacementSelector,
-        PlacementSubject, PolicyBlockedReason, PolicyIntent, PolicyIntentOutcome,
-        PolicyMutationRecord, PolicyRefMode, PolicyResolution, RealmConfigDocument, RealmId,
-        StoragePurgeFence, StoragePurgeScope, UsageCounters, VerifiedPolicy, VersionKey,
-        checksum::HASH_BLAKE3, usage_group_key,
+    use aruna_core::structs::identity::auth::{Actor, AuthContext};
+    use aruna_core::structs::storage::blob::{
+        BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
+        ManagedCopyRecord, ManagedCopyState, VersionKey,
     };
+    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
+    use aruna_core::structs::placement::policy_attachment::{
+        POLICY_BULK_INTENT_KEYSPACE, PolicyBlockedReason, PolicyIntent, PolicyIntentOutcome,
+        PolicyMutationRecord, PolicyRefMode,
+    };
+    use aruna_core::structs::placement::placement_policy::{
+        PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, PolicyResolution,
+        VerifiedPolicy,
+    };
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+    use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
+    use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
+    use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::types::{Key, TxnId, Value};
     use std::collections::{BTreeMap, HashMap};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1848,10 +1865,10 @@ mod pure_tests {
 
     fn reference() -> BlobVersion {
         BlobVersion::reference(
-            aruna_core::structs::VersionSourceBinding {
-                strategy: aruna_core::structs::StagingStrategy::Reference,
-                descriptor: aruna_core::structs::PortableSourceDescriptor {
-                    kind: aruna_core::structs::SourceConnectorKind::Http,
+            aruna_core::structs::execution::staging::VersionSourceBinding {
+                strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
+                descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
+                    kind: aruna_core::structs::execution::source_connector::SourceConnectorKind::Http,
                     public_config: HashMap::new(),
                     source_path: "source".to_string(),
                     version_selector: None,
@@ -1860,7 +1877,7 @@ mod pure_tests {
                 },
                 connector_id: None,
             },
-            aruna_core::structs::SourceMetadata {
+            aruna_core::structs::execution::source_access::SourceMetadata {
                 content_length: REFERENCE_BYTES,
                 content_type: None,
                 etag: None,
