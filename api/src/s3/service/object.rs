@@ -3,7 +3,7 @@
 
 use aruna_core::permission_path::permission_pattern_matches;
 use aruna_core::structs::{PathRestriction, Permission};
-use aruna_operations::s3::get_object::ObjectRangeRequest;
+use aruna_operations::s3::object::get::ObjectRangeRequest;
 
 pub(super) fn object_range_request(range: s3s::dto::Range) -> ObjectRangeRequest {
     match range {

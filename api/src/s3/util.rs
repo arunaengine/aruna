@@ -1,12 +1,10 @@
 use crate::s3::auth::Action;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::{
-    MultipartChecksumType, MultipartUploadChecksumHint, ensure_confined_path,
-};
-use aruna_operations::s3::complete_upload::CompleteMultipartPart;
-use aruna_operations::s3::get_object::ObjectRangeRequest;
-use aruna_operations::s3::put_object::PutObjectInput as BlobPutObjectInput;
+use aruna_core::structs::{MultipartChecksumHint, MultipartChecksumType, ensure_confined_path};
+use aruna_operations::s3::multipart::complete::CompleteMultipartPart;
+use aruna_operations::s3::object::get::ObjectRangeRequest;
+use aruna_operations::s3::object::put::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;
 use http::HeaderMap;
 use s3s::dto::ChecksumAlgorithm as S3ChecksumAlgorithm;
@@ -172,7 +170,7 @@ pub(crate) fn reject_sse(requested: bool) -> S3Result<()> {
 
 pub(crate) fn parse_checksum_hint(
     input: &CreateMultipartUploadInput,
-) -> S3Result<Option<MultipartUploadChecksumHint>> {
+) -> S3Result<Option<MultipartChecksumHint>> {
     let algorithm = input
         .checksum_algorithm
         .as_ref()
@@ -185,12 +183,10 @@ pub(crate) fn parse_checksum_hint(
         .unwrap_or(MultipartChecksumType::FullObject);
 
     Ok(
-        (algorithm.is_some() || input.checksum_type.is_some()).then_some(
-            MultipartUploadChecksumHint {
-                algorithm,
-                checksum_type,
-            },
-        ),
+        (algorithm.is_some() || input.checksum_type.is_some()).then_some(MultipartChecksumHint {
+            algorithm,
+            checksum_type,
+        }),
     )
 }
 
@@ -416,7 +412,7 @@ mod tests {
     use crate::s3::checksum::parse_upload_checksum;
     use aruna_core::structs::MultipartChecksumType;
     use aruna_core::structs::checksum::ChecksumAlgorithm;
-    use aruna_operations::s3::get_object::ObjectRangeRequest;
+    use aruna_operations::s3::object::get::ObjectRangeRequest;
     use http::HeaderMap;
     use s3s::S3ErrorCode;
     use s3s::dto::CopySource;

@@ -15,19 +15,17 @@ use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::MetadataAuthToken;
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
-use aruna_operations::replication::queue::{
-    QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
-};
-use aruna_operations::s3::get_bucket::GetBucketInfoOperation;
+use aruna_operations::metadata::AuthToken;
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
+use aruna_operations::s3::bucket::get::GetBucketOperation;
 use aruna_operations::sync::mirror_repair::{
-    SyncMirrorRepairIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
+    SyncMirrorIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
     request_mirror_create,
 };
 use aruna_operations::sync::sync_relationship::{
-    DeleteSyncRelationshipOperation, ListSyncRelationshipsOperation,
-    StoreSyncRelationshipOperation, SyncRelationshipDirection,
+    DeleteRelationshipOperation, ListRelationshipsOperation, StoreRelationshipOperation,
+    SyncRelationshipDirection,
 };
 use s3s::dto::{
     DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
@@ -107,7 +105,7 @@ impl ArunaS3Service {
         &self,
         group_id: aruna_core::types::GroupId,
     ) -> S3Result<Option<u64>> {
-        let realm_config = drive(GetRealmConfigOperation::new(self.realm_id), &self.state)
+        let realm_config = drive(GetConfigOperation::new(self.realm_id), &self.state)
             .await
             .map_err(|err| {
                 error!(error = %err, "Failed to load realm config for quota enforcement");
@@ -258,7 +256,7 @@ impl ArunaS3Service {
         bucket: &str,
     ) -> S3Result<Vec<SyncRelationship>> {
         let relationships = drive(
-            ListSyncRelationshipsOperation::new(
+            ListRelationshipsOperation::new(
                 SyncRelationshipDirection::Outgoing,
                 Some(bucket.to_string()),
             ),
@@ -287,7 +285,7 @@ impl ArunaS3Service {
         direction: SyncRelationshipDirection,
     ) -> S3Result<()> {
         drive(
-            StoreSyncRelationshipOperation::new(relationship, direction),
+            StoreRelationshipOperation::new(relationship, direction),
             &self.state,
         )
         .await
@@ -301,7 +299,7 @@ impl ArunaS3Service {
         direction: SyncRelationshipDirection,
     ) -> S3Result<()> {
         drive(
-            DeleteSyncRelationshipOperation::new(relationship, direction),
+            DeleteRelationshipOperation::new(relationship, direction),
             &self.state,
         )
         .await
@@ -320,7 +318,7 @@ impl ArunaS3Service {
                 .bucket()
                 .ok_or_else(|| s3_error!(InvalidArgument, "Invalid replication target ARN"))?;
             let bucket_info = drive(
-                GetBucketInfoOperation::new(target_bucket.to_string()),
+                GetBucketOperation::new(target_bucket.to_string()),
                 &self.state,
             )
             .await
@@ -350,7 +348,7 @@ impl ArunaS3Service {
                 .await;
         }
 
-        let auth_token = MetadataAuthToken::internal(AuthContext {
+        let auth_token = AuthToken::internal(AuthContext {
             user_id: user_access.user_identity,
             realm_id: self.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
@@ -390,7 +388,7 @@ impl ArunaS3Service {
     pub(super) async fn clear_mirror_repair(
         &self,
         relationship: &SyncRelationship,
-        expected: SyncMirrorRepairIntent,
+        expected: SyncMirrorIntent,
     ) {
         if let Err(error) = clear_mirror_repair(&self.state, relationship, expected).await {
             warn!(%error, relationship_id = %relationship.id, "Failed to clear sync mirror repair");
@@ -407,7 +405,7 @@ impl ArunaS3Service {
         delete_marker: bool,
     ) {
         let result = match drive(
-            QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+            LiveVersionOperation::new(LiveVersionInput {
                 local_node_id: self.node_id,
                 auth_context,
                 bucket: bucket.clone(),

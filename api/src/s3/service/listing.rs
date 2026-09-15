@@ -9,13 +9,13 @@ use crate::s3::util::{map_checksum_algorithm, map_checksum_type};
 use aruna_core::structs::BlobHeadKey;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_operations::driver::drive;
-use aruna_operations::s3::list_objects::{
-    ListObjectsV2ContinuationToken, ListObjectsV2Input as LOV2I, ListObjectsV2Operation,
-};
-use aruna_operations::s3::list_parts::ListPartsResult;
-use aruna_operations::s3::list_uploads::ListMultipartUploadsResult;
-use aruna_operations::s3::list_versions::{ListObjectVersionsItem, ListObjectVersionsResult};
 use aruna_operations::s3::listing::common_prefix_of;
+use aruna_operations::s3::multipart::parts::ListPartsResult;
+use aruna_operations::s3::multipart::uploads::ListUploadsResult;
+use aruna_operations::s3::object::list::{
+    ListBucketInput as LOV2I, ListBucketOperation, ListContinuationToken,
+};
+use aruna_operations::s3::object::versions::{ListVersionsItem, ListVersionsResult};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use percent_encoding::utf8_percent_encode;
@@ -33,7 +33,7 @@ use ulid::Ulid;
 pub(super) struct ObjectListingPage {
     pub(super) contents: Vec<Object>,
     pub(super) common_prefixes: Vec<CommonPrefix>,
-    pub(super) continuation_token: Option<ListObjectsV2ContinuationToken>,
+    pub(super) continuation_token: Option<ListContinuationToken>,
 }
 
 /// Resumes a delimited ListObjects page past the group the marker collapses
@@ -43,7 +43,7 @@ pub(super) fn marker_continuation_token(
     marker: Option<&str>,
     prefix: Option<&str>,
     delimiter: Option<&str>,
-) -> S3Result<Option<ListObjectsV2ContinuationToken>> {
+) -> S3Result<Option<ListContinuationToken>> {
     let Some(marker) = marker.filter(|marker| !marker.is_empty()) else {
         return Ok(None);
     };
@@ -52,7 +52,7 @@ pub(super) fn marker_continuation_token(
     };
     let last_key = BlobHeadKey::object_prefix(bucket, marker)
         .map_err(|_| s3_error!(InvalidArgument, "Invalid marker"))?;
-    Ok(Some(ListObjectsV2ContinuationToken {
+    Ok(Some(ListContinuationToken {
         last_key,
         last_common_prefix: Some(group),
     }))
@@ -63,7 +63,7 @@ pub(super) fn marker_continuation_token(
 /// one. An undelimited page with contents needs none: the client resumes from its last key.
 pub(super) fn next_marker_for(
     delimiter: Option<&str>,
-    token: Option<&ListObjectsV2ContinuationToken>,
+    token: Option<&ListContinuationToken>,
     contents_empty: bool,
 ) -> Option<String> {
     let token = token?;
@@ -76,7 +76,7 @@ pub(super) fn next_marker_for(
 
 /// Names the last entry of a truncated page, preferring the common prefix the
 /// page stopped inside.
-pub(super) fn next_marker_of(token: &ListObjectsV2ContinuationToken) -> Option<String> {
+pub(super) fn next_marker_of(token: &ListContinuationToken) -> Option<String> {
     if let Some(group) = token.last_common_prefix.clone() {
         return Some(group);
     }
@@ -88,20 +88,20 @@ pub(super) fn next_marker_of(token: &ListObjectsV2ContinuationToken) -> Option<S
 impl ArunaS3Service {
     pub(super) fn decode_list_token(
         token: Option<&str>,
-    ) -> S3Result<Option<ListObjectsV2ContinuationToken>> {
+    ) -> S3Result<Option<ListContinuationToken>> {
         token
             .map(|token| {
                 let decoded = STANDARD
                     .decode(token)
                     .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))?;
-                ListObjectsV2ContinuationToken::from_bytes(&decoded)
+                ListContinuationToken::from_bytes(&decoded)
                     .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
             })
             .transpose()
     }
 
     pub(super) fn encode_list_token(
-        token: Option<&ListObjectsV2ContinuationToken>,
+        token: Option<&ListContinuationToken>,
     ) -> S3Result<Option<String>> {
         token
             .map(|token| {
@@ -130,7 +130,7 @@ impl ArunaS3Service {
         };
         loop {
             consume_scope_page(remaining_pages)?;
-            let result = drive(ListObjectsV2Operation::new(input.clone()), &self.state)
+            let result = drive(ListBucketOperation::new(input.clone()), &self.state)
                 .await
                 .map_err(IntoS3Error::into_s3_error)?;
             if result
@@ -160,13 +160,13 @@ impl ArunaS3Service {
             input.max_keys = Some(
                 input
                     .max_keys
-                    .unwrap_or(ListObjectsV2Operation::DEFAULT_MAX_KEYS)
+                    .unwrap_or(ListBucketOperation::DEFAULT_MAX_KEYS)
                     .min(remaining_pages - 1),
             );
         }
         let result = loop {
             consume_scope_page(&mut remaining_pages)?;
-            let mut result = drive(ListObjectsV2Operation::new(input.clone()), &self.state)
+            let mut result = drive(ListBucketOperation::new(input.clone()), &self.state)
                 .await
                 .map_err(IntoS3Error::into_s3_error)?;
 
@@ -268,14 +268,14 @@ pub(super) fn scoped_marker(
     bucket: &str,
     last_key: Option<&str>,
     last_prefix: Option<&str>,
-) -> S3Result<Option<ListObjectsV2ContinuationToken>> {
+) -> S3Result<Option<ListContinuationToken>> {
     let group = last_prefix.filter(|prefix| last_key.is_none_or(|key| *prefix > key));
     let Some(entry) = group.or(last_key) else {
         return Ok(None);
     };
     let last_key = BlobHeadKey::object_prefix(bucket, entry)
         .map_err(|_| s3_error!(InternalError, "Invalid listing marker"))?;
-    Ok(Some(ListObjectsV2ContinuationToken {
+    Ok(Some(ListContinuationToken {
         last_key,
         last_common_prefix: group.map(str::to_string),
     }))
@@ -360,7 +360,7 @@ pub(super) fn list_parts_output(
 pub(super) fn list_uploads_output(
     input: ListMultipartUploadsInput,
     max_uploads: usize,
-    result: ListMultipartUploadsResult,
+    result: ListUploadsResult,
 ) -> S3Response<ListMultipartUploadsOutput> {
     let url_encoded = input
         .encoding_type
@@ -434,7 +434,7 @@ impl ArunaS3Service {
         input: ListObjectVersionsInput,
         group_id: Ulid,
         max_keys: usize,
-        result: ListObjectVersionsResult,
+        result: ListVersionsResult,
     ) -> S3Response<ListObjectVersionsOutput> {
         let owner = Some(Owner {
             display_name: None,
@@ -456,7 +456,7 @@ impl ArunaS3Service {
         let mut delete_markers = Vec::new();
         for item in result.items {
             match item {
-                ListObjectVersionsItem::Version {
+                ListVersionsItem::Version {
                     key,
                     version_id,
                     is_latest,
@@ -486,7 +486,7 @@ impl ArunaS3Service {
                         ..Default::default()
                     });
                 }
-                ListObjectVersionsItem::DeleteMarker {
+                ListVersionsItem::DeleteMarker {
                     key,
                     version_id,
                     is_latest,
