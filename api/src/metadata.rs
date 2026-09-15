@@ -2,11 +2,12 @@
 //! request DTOs in `model`, operation error mapping, the local-write lookup,
 //! and response assembly. Neither transport reaches into the other's handlers.
 
+#[path = "metadata_model.rs"]
 mod model;
 
 pub use model::*;
 
-use crate::auth::ValidatedArunaBearerTokenCarrier;
+use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
@@ -19,19 +20,15 @@ use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::forward::routing::origin_holds_document as run_origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::api::{
-    ExportMetadataRoCrateResult, ListVisibleMetadataDocumentsRequest, MetadataApiError,
-    MetadataApiQueryMode, MetadataFanoutStats, MetadataListOrder, MetadataReferenceEntry,
-    MetadataReferencesExecution, MetadataRoCrateExportView as OperationMetadataRoCrateExportView,
-    forwarded_bearer, list_visible_documents as run_list_visible_metadata_documents,
+    ApiQueryMode, ExportMetadataResult, ListVisibleRequest, MetadataApiError, MetadataFanoutStats,
+    MetadataListOrder, MetadataReferenceEntry, MetadataReferencesExecution,
+    RoCrateExportView as OperationMetadataRoCrateExportView, forwarded_bearer,
+    list_visible_documents as run_list_visible_metadata_documents,
 };
-use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentError, CreateMetadataDocumentPayload,
-};
-use aruna_operations::metadata::forward::{
-    CreateMetadataAuthorizedError, create_metadata_authorized,
-};
+use aruna_operations::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
+use aruna_operations::metadata::forward::{CreateAuthorizedError, create_metadata_authorized};
 use aruna_operations::metadata::get_document::load_document_record as load_metadata_record_by_document_from_operations;
-use aruna_operations::metadata::update_document::UpdateMetadataDocumentError;
+use aruna_operations::metadata::update_document::UpdateDocumentError;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -43,11 +40,11 @@ pub(crate) async fn run_create_metadata(
     state: &ServerState,
     auth: &AuthContext,
     extras: PolicyRequestExtras,
-    bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
+    bearer_token: Option<ValidatedBearer>,
     group_id: Ulid,
     path: String,
     public: bool,
-    payload: CreateMetadataDocumentPayload,
+    payload: CreateDocumentPayload,
 ) -> ServerResult<MetadataRegistryRecord> {
     let ctx = state.get_ctx();
     create_metadata_authorized(
@@ -64,12 +61,12 @@ pub(crate) async fn run_create_metadata(
     )
     .await
     .map_err(|error| match error {
-        CreateMetadataAuthorizedError::EmptyPath => ServerError::BadRequest,
-        CreateMetadataAuthorizedError::Forbidden => ServerError::Forbidden,
-        CreateMetadataAuthorizedError::Api(error) => map_api_error(error),
-        CreateMetadataAuthorizedError::Create(error) => map_create_error(error),
-        CreateMetadataAuthorizedError::Authorize(error) => crate::auth::map_authorize_error(error),
-        CreateMetadataAuthorizedError::Write(error) => map_write_error(error),
+        CreateAuthorizedError::EmptyPath => ServerError::BadRequest,
+        CreateAuthorizedError::Forbidden => ServerError::Forbidden,
+        CreateAuthorizedError::Api(error) => map_api_error(error),
+        CreateAuthorizedError::Create(error) => map_create_error(error),
+        CreateAuthorizedError::Authorize(error) => crate::auth::map_authorize_error(error),
+        CreateAuthorizedError::Write(error) => map_write_error(error),
     })
 }
 
@@ -115,7 +112,7 @@ pub(crate) async fn run_document_list(
     let result = run_list_visible_metadata_documents(
         ctx.as_ref(),
         state.get_realm_id(),
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             group_id,
             path_prefix: query.path_prefix,
             include_summary: include.summary,
@@ -134,7 +131,7 @@ pub(crate) async fn run_document_list(
             .rocrate_summary_jsonld
             .map(parse_jsonld)
             .transpose()?;
-        documents.push(MetadataDocumentListItem::from_record(
+        documents.push(DocumentListItem::from_record(
             &document.record,
             rocrate_summary,
         ));
@@ -206,44 +203,40 @@ pub(crate) fn map_write_error(error: MetadataWriteError) -> ServerError {
     }
 }
 
-pub(crate) fn map_create_error(error: CreateMetadataDocumentError) -> ServerError {
+pub(crate) fn map_create_error(error: CreateDocumentError) -> ServerError {
     match error {
-        CreateMetadataDocumentError::MetadataError(metadata_error) => {
-            map_metadata_error(metadata_error)
-        }
-        CreateMetadataDocumentError::StorageError(StorageError::TransactionConflict) => {
+        CreateDocumentError::MetadataError(metadata_error) => map_metadata_error(metadata_error),
+        CreateDocumentError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent metadata create conflict; retry".to_string())
         }
-        CreateMetadataDocumentError::PlacementBinding(
-            aruna_core::structs::BindingError::Conflicted(_),
-        ) => ServerError::ServiceUnavailableReason("placement_binding_conflict".to_string()),
-        CreateMetadataDocumentError::PlacementBinding(_)
-        | CreateMetadataDocumentError::PlacementBindingUnavailable(_) => {
+        CreateDocumentError::PlacementBinding(aruna_core::structs::BindingError::Conflicted(_)) => {
+            ServerError::ServiceUnavailableReason("placement_binding_conflict".to_string())
+        }
+        CreateDocumentError::PlacementBinding(_)
+        | CreateDocumentError::PlacementBindingUnavailable(_) => {
             ServerError::ServiceUnavailableReason("placement_binding_unavailable".to_string())
         }
-        CreateMetadataDocumentError::ClockHealth(_) => {
+        CreateDocumentError::ClockHealth(_) => {
             ServerError::ServiceUnavailableReason("structured_id_clock_unhealthy".to_string())
         }
-        CreateMetadataDocumentError::RawLimit => ServerError::ServiceUnavailable,
+        CreateDocumentError::RawLimit => ServerError::ServiceUnavailable,
         other => ServerError::InternalError(other.to_string()),
     }
 }
 
-pub(crate) fn map_update_error(error: UpdateMetadataDocumentError) -> ServerError {
+pub(crate) fn map_update_error(error: UpdateDocumentError) -> ServerError {
     match error {
-        UpdateMetadataDocumentError::DocumentNotFound => ServerError::NotFound,
-        UpdateMetadataDocumentError::RawLimit => ServerError::ServiceUnavailable,
-        UpdateMetadataDocumentError::MetadataError(metadata_error) => {
-            map_metadata_error(metadata_error)
-        }
+        UpdateDocumentError::DocumentNotFound => ServerError::NotFound,
+        UpdateDocumentError::RawLimit => ServerError::ServiceUnavailable,
+        UpdateDocumentError::MetadataError(metadata_error) => map_metadata_error(metadata_error),
         other => ServerError::InternalError(other.to_string()),
     }
 }
 /// The caller's own bearer token, carried to the holder a write is forwarded to
 /// so it re-runs the same permission checks under the same authority.
 pub(crate) fn forwarded_auth_token(
-    bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
-) -> ServerResult<Option<aruna_operations::metadata::MetadataAuthToken>> {
+    bearer_token: Option<ValidatedBearer>,
+) -> ServerResult<Option<aruna_operations::metadata::AuthToken>> {
     forwarded_bearer(bearer_token_string(bearer_token).as_deref()).map_err(map_api_error)
 }
 
@@ -277,16 +270,14 @@ pub(crate) fn map_api_error(error: MetadataApiError) -> ServerError {
     }
 }
 
-pub(crate) fn map_query_mode(mode: Option<MetadataQueryMode>) -> Option<MetadataApiQueryMode> {
+pub(crate) fn map_query_mode(mode: Option<MetadataQueryMode>) -> Option<ApiQueryMode> {
     mode.map(|mode| match mode {
-        MetadataQueryMode::Local => MetadataApiQueryMode::Local,
-        MetadataQueryMode::Distributed => MetadataApiQueryMode::Distributed,
+        MetadataQueryMode::Local => ApiQueryMode::Local,
+        MetadataQueryMode::Distributed => ApiQueryMode::Distributed,
     })
 }
 
-pub(crate) fn bearer_token_string(
-    bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
-) -> Option<String> {
+pub(crate) fn bearer_token_string(bearer_token: Option<ValidatedBearer>) -> Option<String> {
     bearer_token.map(|carrier| carrier.as_str().to_string())
 }
 
@@ -387,12 +378,12 @@ pub(crate) fn map_export_view(view: &MetadataRoCrateView) -> OperationMetadataRo
 }
 
 pub(crate) fn map_export_response(
-    export: ExportMetadataRoCrateResult,
-    params: &MetadataRoCrateExportParams,
+    export: ExportMetadataResult,
+    params: &RoCrateExportParams,
     view: MetadataRoCrateView,
 ) -> ServerResult<MetadataRoCrateResponse> {
     match export {
-        ExportMetadataRoCrateResult::Full { jsonld, .. } => Ok(MetadataRoCrateResponse::Projected(
+        ExportMetadataResult::Full { jsonld, .. } => Ok(MetadataRoCrateResponse::Projected(
             ProjectedRoCrateResponse {
                 rocrate: parse_jsonld(jsonld)?,
                 total_data_entities: None,
@@ -401,8 +392,8 @@ pub(crate) fn map_export_response(
                 next_cursor: None,
             },
         )),
-        ExportMetadataRoCrateResult::Summary { record, jsonld } => Ok(
-            MetadataRoCrateResponse::Projected(ProjectedRoCrateResponse {
+        ExportMetadataResult::Summary { record, jsonld } => Ok(MetadataRoCrateResponse::Projected(
+            ProjectedRoCrateResponse {
                 rocrate: rewrite_view_jsonld(
                     parse_jsonld(jsonld)?,
                     &record.graph_iri,
@@ -412,24 +403,24 @@ pub(crate) fn map_export_response(
                 returned_data_entities: None,
                 next_offset: None,
                 next_cursor: None,
-            }),
-        ),
-        ExportMetadataRoCrateResult::Page { record, page } => map_page_response(
+            },
+        )),
+        ExportMetadataResult::Page { record, page } => map_page_response(
             page,
             &record.graph_iri,
             &build_view_id(&record.graph_iri, params, view),
         ),
-        ExportMetadataRoCrateResult::Raw {
+        ExportMetadataResult::Raw {
             raw,
             dataset_digest,
             ..
-        } => Ok(MetadataRoCrateResponse::Raw(MetadataRawRoCrateResponse {
+        } => Ok(MetadataRoCrateResponse::Raw(RawRoCrateResponse {
             raw: parse_jsonld(raw.revision.jsonld)?,
             winning_event_id: raw.revision.winning_event_id.to_string(),
             projection_state: match raw.projection_state {
-                aruna_core::metadata::MetadataMaterializationState::Pending => "pending",
-                aruna_core::metadata::MetadataMaterializationState::Materialized => "materialized",
-                aruna_core::metadata::MetadataMaterializationState::Failed => "failed",
+                aruna_core::metadata::MaterializationState::Pending => "pending",
+                aruna_core::metadata::MaterializationState::Materialized => "materialized",
+                aruna_core::metadata::MaterializationState::Failed => "failed",
             }
             .to_string(),
             projected_event_id: raw.projected_event_id.map(|event_id| event_id.to_string()),
@@ -439,7 +430,7 @@ pub(crate) fn map_export_response(
                 .revision
                 .merged
                 .map(|merged| {
-                    Ok::<_, ServerError>(MetadataMergedRoCrateResponse {
+                    Ok::<_, ServerError>(MergedRoCrateResponse {
                         rocrate: parse_jsonld(merged.jsonld)?,
                         findings: merged.findings,
                     })
@@ -467,7 +458,7 @@ fn map_page_response(
 
 fn build_view_id(
     graph_iri: &str,
-    params: &MetadataRoCrateExportParams,
+    params: &RoCrateExportParams,
     view: MetadataRoCrateView,
 ) -> String {
     let mut serializer = Serializer::new(String::new());
@@ -567,8 +558,8 @@ pub(crate) fn map_query_results(
     })
 }
 
-pub(crate) fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitResponse {
-    MetadataSearchHitResponse {
+pub(crate) fn map_search_hit(hit: MetadataSearchHit) -> SearchHitResponse {
+    SearchHitResponse {
         document_id: hit.document_id,
         group_id: hit.group_id,
         document_path: hit.document_path,
@@ -582,6 +573,8 @@ pub(crate) fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitRespons
 }
 
 #[cfg(test)]
+#[path = "metadata_pure_tests.rs"]
 mod pure_tests;
 #[cfg(test)]
+#[path = "metadata_tests.rs"]
 mod tests;
