@@ -11,9 +11,9 @@ use crate::groups::create_group::CreateGroupConfig;
 use crate::groups::create_group::CreateGroupError;
 use crate::groups::create_group::CreateGroupOperation;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::protocol::MetadataAuthToken;
+use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::protocol::MetadataWriteAuthError;
+use crate::metadata::protocol::WriteAuthError;
 use crate::placement::process_placements::load_realm_config;
 use crate::placement::selector::select_top_peers;
 use aruna_core::NodeId;
@@ -51,7 +51,7 @@ pub enum ForwardGroupError {
 pub async fn forward_group_create(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
     display_name: String,
 ) -> Result<(Group, GroupAuthorizationDocument), ForwardGroupError> {
     let Some(config) = load_realm_config(context, realm_id).await else {
@@ -98,10 +98,10 @@ pub async fn forward_group_create(
                 return Err(ForwardGroupError::Conflict(reason));
             }
             Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
-                error: MetadataWriteAuthError::Unauthorized,
+                error: WriteAuthError::Unauthorized,
             })) => return Err(MetadataApiError::Unauthorized.into()),
             Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
-                error: MetadataWriteAuthError::Forbidden,
+                error: WriteAuthError::Forbidden,
             })) => return Err(MetadataApiError::Forbidden.into()),
             Ok(Ok(MetadataTransportMessage::Reject(error))) => {
                 warn!(%peer, %error, "Ingress rejected a forwarded group create");
@@ -152,7 +152,7 @@ pub(crate) async fn apply_group_create(
     };
     if auth.path_restrictions.is_some() {
         return MetadataTransportMessage::ForwardedWriteDenied {
-            error: MetadataWriteAuthError::Forbidden,
+            error: WriteAuthError::Forbidden,
         };
     }
     let MetadataTransportMessage::ForwardGroupCreate { display_name, .. } = message else {

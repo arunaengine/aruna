@@ -1,5 +1,5 @@
 use crate::endpoint_screening;
-use aruna_core::structs::{GroupBackendKind, GroupStorageBackend, ensure_confined_path};
+use aruna_core::structs::{GroupBackendKind, GroupStorage, ensure_confined_path};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
@@ -76,7 +76,7 @@ const fn identity_keys(kind: GroupBackendKind) -> &'static [&'static str] {
 /// An update changes credentials and the name only; the store it points at must
 /// stay the one the existing objects were written to.
 pub fn check_identity(
-    existing: &GroupStorageBackend,
+    existing: &GroupStorage,
     kind: GroupBackendKind,
     public: &HashMap<String, String>,
 ) -> Result<(), GroupBackendError> {

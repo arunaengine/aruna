@@ -5,7 +5,7 @@ use crate::sync::document_outbox::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -16,7 +16,7 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentReducerError, decode_reducer_state};
+use aruna_core::reducer::{AdminDocumentError, decode_reducer_state};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -81,7 +81,7 @@ pub enum GroupJoinError {
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error(transparent)]
-    Reducer(#[from] AdminDocumentReducerError),
+    Reducer(#[from] AdminDocumentError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -343,7 +343,7 @@ impl GroupJoinOperation {
         if config.realm_id != group.realm_id {
             return Err(GroupJoinError::Unauthorized);
         }
-        let target = DocumentSyncTarget::GroupAuthorization {
+        let target = DocumentTarget::GroupAuthorization {
             group_id: self.input.group_id,
         };
         let placement = target_placement_ref(&config, &target, Default::default());
@@ -353,7 +353,7 @@ impl GroupJoinOperation {
             self.input.actor.node_id,
             target,
             Vec::new(),
-            DocumentSyncOutboxEvent::admin(event),
+            DocumentOutboxEvent::admin(event),
             placement,
             false,
         )
@@ -546,10 +546,10 @@ impl Operation for GroupJoinOperation {
 mod pure_tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::admin_documents::AdminDocumentRoleDefinition;
-    use aruna_core::document::DocumentSyncOutboxRecord;
+    use aruna_core::admin_documents::AdminRoleDefinition;
+    use aruna_core::document::DocumentOutboxRecord;
     use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
-    use aruna_core::reducer::AdminDocumentReducerState;
+    use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::RealmId;
 
     #[test]
@@ -580,13 +580,13 @@ mod pure_tests {
             owner: actor.user_id,
             roles: auth_doc.roles.keys().copied().collect(),
         };
-        let mut reducer = AdminDocumentReducerState::new(AdminDocumentTarget::Group { group_id });
+        let mut reducer = AdminDocumentState::new(AdminDocumentTarget::Group { group_id });
         for role in auth_doc.roles.values() {
             reducer
                 .apply_operation(
                     &actor,
                     AdminDocumentOperation::GroupRoleCreated {
-                        role: AdminDocumentRoleDefinition::from(role),
+                        role: AdminRoleDefinition::from(role),
                     },
                 )
                 .unwrap();
@@ -753,10 +753,10 @@ mod pure_tests {
             reducer.join_requests()[0].decision.as_ref().unwrap().kind,
             JoinDecisionKind::Approved
         );
-        let outbox: DocumentSyncOutboxRecord =
+        let outbox: DocumentOutboxRecord =
             postcard::from_bytes(value(DOCUMENT_SYNC_OUTBOX_KEYSPACE)).unwrap();
         assert!(
-            matches!(outbox.event, DocumentSyncOutboxEvent::AdminOperation { event, .. }
+            matches!(outbox.event, DocumentOutboxEvent::AdminOperation { event, .. }
         if matches!(event.op, AdminDocumentOperation::GroupJoinDecided { .. }))
         );
         assert!(!operation.is_complete());
