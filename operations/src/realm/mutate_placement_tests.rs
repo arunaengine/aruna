@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use aruna_core::UserId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::events::StorageEvent;
-use aruna_core::metadata::{MetadataCreateEventPayload, MetadataCreateEventRecord};
+use aruna_core::metadata::{MetadataEventPayload, MetadataEventRecord};
 use aruna_core::storage_entries::{create_projection_entries, registry_write_entries};
 use aruna_core::structs::{
     AffinityEffect, AffinityRule, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT, DocumentClass,
@@ -17,7 +17,7 @@ use tempfile::tempdir;
 use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::placement::transition::{TransitionRequest, plan_transition};
-use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetConfigOperation;
 use aruna_core::structs::{PlacementTransition, ProofClaim, TransitionLimits};
 
 fn node(seed: u8) -> aruna_core::NodeId {
@@ -60,7 +60,7 @@ async fn seed_config(context: &DriverContext, actor: &Actor) -> RealmConfigDocum
         start: FIRST_GRANTABLE_HANDLE,
         end: FIRST_GRANTABLE_HANDLE + 1024,
     });
-    let target = DocumentSyncTarget::RealmConfig {
+    let target = DocumentTarget::RealmConfig {
         realm_id: actor.realm_id,
     };
     let event = context
@@ -83,9 +83,9 @@ async fn mutate(
     context: &DriverContext,
     actor: &Actor,
     mutation: RealmPlacementMutation,
-) -> Result<RealmConfigDocument, MutateRealmPlacementError> {
+) -> Result<RealmConfigDocument, MutatePlacementError> {
     drive(
-        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
+        MutatePlacementOperation::new(MutatePlacementConfig {
             actor: actor.clone(),
             mutation,
         }),
@@ -96,11 +96,11 @@ async fn mutate(
 
 #[test]
 fn conflict_is_expected() {
-    assert!(MutateRealmPlacementOperation::expected_error(
-        &MutateRealmPlacementError::StorageError(StorageError::TransactionConflict)
+    assert!(MutatePlacementOperation::expected_error(
+        &MutatePlacementError::StorageError(StorageError::TransactionConflict)
     ));
-    assert!(!MutateRealmPlacementOperation::expected_error(
-        &MutateRealmPlacementError::RealmConfigNotFound
+    assert!(!MutatePlacementOperation::expected_error(
+        &MutatePlacementError::RealmConfigNotFound
     ));
 }
 
@@ -119,7 +119,7 @@ async fn concurrent_mutations_land() {
         let actor = actor.clone();
         tasks.push(tokio::spawn(async move {
             drive_placement_mutation(
-                MutateRealmPlacementConfig {
+                MutatePlacementConfig {
                     actor,
                     mutation: RealmPlacementMutation::UpsertStrategy(strategy(strategy_id)),
                 },
@@ -132,7 +132,7 @@ async fn concurrent_mutations_land() {
     for task in tasks {
         task.await.unwrap().expect("every mutation lands");
     }
-    let config = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+    let config = drive(GetConfigOperation::new(actor.realm_id), &context)
         .await
         .unwrap();
     for strategy_id in ids {
@@ -151,10 +151,10 @@ fn strategy(strategy_id: Ulid) -> PlacementStrategy {
     }
 }
 
-fn create_event(actor: &Actor, strategy_id: Ulid, document_seed: u8) -> MetadataCreateEventRecord {
+fn create_event(actor: &Actor, strategy_id: Ulid, document_seed: u8) -> MetadataEventRecord {
     let document_id = Ulid::from_bytes([document_seed; 16]);
     let event_id = Ulid::from_bytes([document_seed.wrapping_add(1); 16]);
-    MetadataCreateEventRecord {
+    MetadataEventRecord {
         event_id,
         record: MetadataRegistryRecord {
             realm_id: actor.realm_id,
@@ -176,7 +176,7 @@ fn create_event(actor: &Actor, strategy_id: Ulid, document_seed: u8) -> Metadata
         },
         user_id: actor.user_id,
         node_id: actor.node_id,
-        payload: MetadataCreateEventPayload::Scaffold {
+        payload: MetadataEventPayload::Scaffold {
             name: "Referenced".to_string(),
             description: "Strategy reference".to_string(),
             date_published: "2026-01-01".to_string(),
@@ -226,7 +226,7 @@ async fn strategy_binding_lifecycle() {
             RealmPlacementMutation::SetDefaultStrategy(strategy_id),
         )
         .await,
-        Err(MutateRealmPlacementError::InvalidInput(reason))
+        Err(MutatePlacementError::InvalidInput(reason))
             if reason.contains("has no binding")
     ));
     let range_id = initial.placement_handle_ranges[0].range_id;
@@ -318,12 +318,12 @@ async fn strategy_binding_lifecycle() {
         RealmPlacementMutation::RemoveStrategy(strategy_id),
     )
         .await,
-        Err(MutateRealmPlacementError::StrategyReferenced {
+        Err(MutatePlacementError::StrategyReferenced {
             strategy_id: referenced
         }) if referenced == strategy_id
     ));
 
-    let stored = drive(GetRealmConfigOperation::new(realm_id), &context)
+    let stored = drive(GetConfigOperation::new(realm_id), &context)
         .await
         .unwrap();
     assert!(stored.strategy(&strategy_id).is_some());
@@ -398,8 +398,8 @@ async fn rejects_reserved_label() {
 
     assert!(matches!(
         mutate(&context, &actor, RealmPlacementMutation::UpsertNode(entry)).await,
-        Err(MutateRealmPlacementError::AdminDocumentReducerError(
-            AdminDocumentReducerError::ReservedPlacementLabel(_)
+        Err(MutatePlacementError::AdminDocumentError(
+            AdminDocumentError::ReservedPlacementLabel(_)
         ))
     ));
 }
@@ -422,7 +422,7 @@ async fn rejects_dangling_refs() {
             RealmPlacementMutation::UpsertStrategy(zero)
         )
         .await,
-        Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("zero")
+        Err(MutatePlacementError::InvalidInput(reason)) if reason.contains("zero")
     ));
 
     for mutation in [
@@ -440,7 +440,7 @@ async fn rejects_dangling_refs() {
     ] {
         assert!(matches!(
             mutate(&context, &actor, mutation).await,
-            Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("missing strategy")
+            Err(MutatePlacementError::InvalidInput(reason)) if reason.contains("missing strategy")
         ));
     }
 }
@@ -458,7 +458,7 @@ fn shard_count_frozen() {
 
     assert!(matches!(
         RealmPlacementMutation::UpsertStrategy(reshaped).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("shard_count")
+        Err(MutatePlacementError::InvalidInput(reason)) if reason.contains("shard_count")
     ));
 
     // Selector edits without a shard_count change stay allowed.
@@ -483,11 +483,11 @@ fn family_strategy_frozen() {
 
     assert_eq!(
         RealmPlacementMutation::UpsertStrategy(reshaped).validate(&document),
-        Err(MutateRealmPlacementError::JobFamilyImmutable { strategy_id })
+        Err(MutatePlacementError::JobFamilyImmutable { strategy_id })
     );
     assert_eq!(
         RealmPlacementMutation::RemoveStrategy(strategy_id).validate(&document),
-        Err(MutateRealmPlacementError::JobFamilyImmutable { strategy_id })
+        Err(MutatePlacementError::JobFamilyImmutable { strategy_id })
     );
 
     // Holder movement under the same strategy stays allowed.
@@ -529,7 +529,7 @@ async fn referenced_strategy_conflicts() {
             RealmPlacementMutation::RemoveStrategy(strategy_id)
         )
         .await,
-        Err(MutateRealmPlacementError::StrategyReferenced { strategy_id })
+        Err(MutatePlacementError::StrategyReferenced { strategy_id })
     );
 }
 
@@ -558,7 +558,7 @@ async fn materialized_reference_blocks() {
             RealmPlacementMutation::RemoveStrategy(strategy_id)
         )
         .await,
-        Err(MutateRealmPlacementError::StrategyReferenced { strategy_id })
+        Err(MutatePlacementError::StrategyReferenced { strategy_id })
     );
 }
 
@@ -587,7 +587,7 @@ async fn pending_reference_blocks() {
             RealmPlacementMutation::RemoveStrategy(strategy_id)
         )
         .await,
-        Err(MutateRealmPlacementError::StrategyReferenced { strategy_id })
+        Err(MutatePlacementError::StrategyReferenced { strategy_id })
     );
 }
 
@@ -605,7 +605,7 @@ async fn missing_config_absent() {
             RealmPlacementMutation::RemoveOverride(Vec::new())
         )
         .await,
-        Err(MutateRealmPlacementError::RealmConfigNotFound)
+        Err(MutatePlacementError::RealmConfigNotFound)
     );
 }
 
@@ -613,11 +613,11 @@ async fn missing_config_absent() {
 fn mutation_schedules_revalidation() {
     let realm_id = RealmId::from_bytes([6; 32]);
     let actor = actor(realm_id);
-    let mut operation = MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
+    let mut operation = MutatePlacementOperation::new(MutatePlacementConfig {
         actor: actor.clone(),
         mutation: RealmPlacementMutation::RemoveOverride(Vec::new()),
     });
-    operation.state = MutateRealmPlacementState::ScheduleDocumentSyncOutboxDrain;
+    operation.state = MutatePlacementState::ScheduleDocumentSyncOutboxDrain;
 
     let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
         key: TaskKey::DrainDocumentSyncOutbox,
@@ -655,7 +655,7 @@ async fn seed_placement_config(
     }
     // The issuing actor must be Management, or admission rejects it.
     document.ensure_node(actor.node_id, RealmNodeKind::Management);
-    let target = DocumentSyncTarget::RealmConfig {
+    let target = DocumentTarget::RealmConfig {
         realm_id: actor.realm_id,
     };
     let event = context
@@ -699,7 +699,7 @@ fn draining_change_rejected() {
 
         assert!(matches!(
             RealmPlacementMutation::UpsertNode(changed).validate(&document),
-            Err(MutateRealmPlacementError::InvalidInput(reason))
+            Err(MutatePlacementError::InvalidInput(reason))
                 if reason.contains("draining freezes")
         ));
     }
@@ -792,7 +792,7 @@ fn rejects_unknown_node() {
     let document = placed_document(placed_entry(node(1)));
     assert!(matches!(
         set_attributes(node(2), Some("us-east"), None).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(reason))
+        Err(MutatePlacementError::InvalidInput(reason))
             if reason.contains("no placement entry")
     ));
 }
@@ -807,7 +807,7 @@ fn rejects_derived_label() {
     )]);
     assert!(matches!(
         set_attributes(node(1), None, Some(labels)).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(reason))
+        Err(MutatePlacementError::InvalidInput(reason))
             if reason.contains("derived")
     ));
 }
@@ -825,7 +825,7 @@ fn rejects_label_count() {
     let document = placed_document(placed_entry(node(1)));
     assert!(matches!(
         set_attributes(node(1), None, Some(label_map(33))).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(_))
+        Err(MutatePlacementError::InvalidInput(_))
     ));
     assert!(
         set_attributes(node(1), None, Some(label_map(31)))
@@ -840,7 +840,7 @@ fn rejects_blank_label() {
     let labels = BTreeMap::from([("   ".to_string(), "hot".to_string())]);
     assert!(matches!(
         set_attributes(node(1), None, Some(labels)).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(_))
+        Err(MutatePlacementError::InvalidInput(_))
     ));
 }
 
@@ -854,7 +854,7 @@ fn rejects_colliding_labels() {
     ]);
     assert!(matches!(
         set_attributes(node(1), None, Some(labels)).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(_))
+        Err(MutatePlacementError::InvalidInput(_))
     ));
 }
 
@@ -882,7 +882,7 @@ fn upsert_rejects_labels() {
     entry.labels = label_map(33);
     assert!(matches!(
         RealmPlacementMutation::UpsertNode(entry).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(_))
+        Err(MutatePlacementError::InvalidInput(_))
     ));
 }
 
@@ -891,7 +891,7 @@ fn rejects_long_location() {
     let document = placed_document(placed_entry(node(1)));
     assert!(matches!(
         set_attributes(node(1), Some(&"x".repeat(65)), None).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(_))
+        Err(MutatePlacementError::InvalidInput(_))
     ));
 }
 
@@ -902,7 +902,7 @@ fn rejects_draining_edit() {
     let document = placed_document(entry);
     assert!(matches!(
         set_attributes(node(1), Some("us-east"), None).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(reason))
+        Err(MutatePlacementError::InvalidInput(reason))
             if reason.contains("draining freezes")
     ));
 }
@@ -972,7 +972,7 @@ async fn rejects_empty_holders() {
             RealmPlacementMutation::UpsertStrategy(filtered)
         )
         .await,
-        Err(MutateRealmPlacementError::EmptyShardHolders { .. })
+        Err(MutatePlacementError::EmptyShardHolders { .. })
     ));
 }
 
@@ -1043,7 +1043,7 @@ fn binding_blocks_removal() {
 
     assert_eq!(
         RealmPlacementMutation::RemoveStrategy(strategy_id).validate(&document),
-        Err(MutateRealmPlacementError::StrategyReferenced { strategy_id })
+        Err(MutatePlacementError::StrategyReferenced { strategy_id })
     );
 }
 
@@ -1054,7 +1054,7 @@ fn binding_requires_strategy() {
     let binding = placement_binding(realm_id, 5, Ulid::from_bytes([9; 16]));
     assert!(matches!(
         RealmPlacementMutation::AppendPlacementBinding(binding).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("missing strategy")
+        Err(MutatePlacementError::InvalidInput(reason)) if reason.contains("missing strategy")
     ));
 }
 
@@ -1089,7 +1089,7 @@ fn rejects_divergent_rebind() {
     same.allocator_range_id = Some(Ulid::from_bytes([77; 16]));
     assert!(matches!(
         RealmPlacementMutation::AppendPlacementBinding(same).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("provenance")
+        Err(MutatePlacementError::InvalidInput(reason)) if reason.contains("provenance")
     ));
 
     let mut divergent = placement_binding(realm_id, handle, strategy_b);
@@ -1097,13 +1097,13 @@ fn rejects_divergent_rebind() {
     divergent.allocated_at_ms = Some(1);
     assert!(matches!(
         RealmPlacementMutation::AppendPlacementBinding(divergent).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("different tuple")
+        Err(MutatePlacementError::InvalidInput(reason)) if reason.contains("different tuple")
     ));
 
     let foreign = placement_binding(RealmId::from_bytes([33; 32]), 6, strategy_a);
     assert!(matches!(
         RealmPlacementMutation::AppendPlacementBinding(foreign).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("does not match")
+        Err(MutatePlacementError::InvalidInput(reason)) if reason.contains("does not match")
     ));
 }
 
@@ -1159,7 +1159,7 @@ fn rejects_plan_mismatch() {
     forged.buckets[0].target_holders = vec![node(1)];
     assert!(matches!(
         RealmPlacementMutation::StartTransition(forged).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(reason))
+        Err(MutatePlacementError::InvalidInput(reason))
             if reason.contains("does not match the resolved holder sets")
     ));
 
@@ -1172,7 +1172,7 @@ fn rejects_plan_mismatch() {
     successor.transition_id = Ulid::from_bytes([44; 16]);
     assert!(matches!(
         RealmPlacementMutation::StartTransition(successor).validate(&in_flight),
-        Err(MutateRealmPlacementError::TransitionInFlight { transition_id })
+        Err(MutatePlacementError::TransitionInFlight { transition_id })
             if transition_id == plan.transition_id
     ));
 }
@@ -1223,7 +1223,7 @@ fn authority_needs_management() {
             assert!(
                 matches!(
                     mutation.authorize(&document, &issuer(realm_id, rejected)),
-                    Err(MutateRealmPlacementError::Unauthorized { node_id })
+                    Err(MutatePlacementError::Unauthorized { node_id })
                         if node_id == rejected
                 ),
                 "{rejected} must not originate an authority-moving mutation"
@@ -1369,9 +1369,9 @@ async fn unauthorized_writes_nothing() {
 
     assert!(matches!(
         result,
-        Err(MutateRealmPlacementError::Unauthorized { node_id }) if node_id == node(2)
+        Err(MutatePlacementError::Unauthorized { node_id }) if node_id == node(2)
     ));
-    let stored = drive(GetRealmConfigOperation::new(realm_id), &context)
+    let stored = drive(GetConfigOperation::new(realm_id), &context)
         .await
         .expect("the realm config survives a rejected mutation");
     assert!(stored.candidate_maps.is_empty());
@@ -1400,7 +1400,7 @@ fn force_requires_proof() {
 
     assert!(matches!(
         force.validate(&document),
-        Err(MutateRealmPlacementError::ForceWithoutProof { bucket: forced, .. })
+        Err(MutatePlacementError::ForceWithoutProof { bucket: forced, .. })
             if forced == bucket
     ));
 
@@ -1460,14 +1460,14 @@ fn completion_must_verify() {
         .expect("the fixture has more than one node");
     assert!(matches!(
         submit(claim.sign(&node_secret(&other))).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(reason))
+        Err(MutatePlacementError::InvalidInput(reason))
             if reason.contains("does not verify")
     ));
     let mut off_plan = claim;
     off_plan.bucket = 9;
     assert!(matches!(
         submit(off_plan.sign(&node_secret(&holder))).validate(&document),
-        Err(MutateRealmPlacementError::InvalidInput(reason))
+        Err(MutatePlacementError::InvalidInput(reason))
             if reason.contains("does not cover bucket")
     ));
 }
@@ -1481,8 +1481,8 @@ fn auth(actor: &Actor) -> AuthContext {
     }
 }
 
-fn placement_config(actor: &Actor) -> MutateRealmPlacementConfig {
-    MutateRealmPlacementConfig {
+fn placement_config(actor: &Actor) -> MutatePlacementConfig {
+    MutatePlacementConfig {
         actor: actor.clone(),
         mutation: RealmPlacementMutation::SetDefaultStrategy(Ulid::from_bytes([2; 16])),
     }
@@ -1493,7 +1493,7 @@ fn authorized_checks_permission() {
     let realm_id = RealmId::from_bytes([1; 32]);
     let actor = actor(realm_id);
     let mut operation =
-        MutateRealmPlacementOperation::authorized(placement_config(&actor), auth(&actor));
+        MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
     let effects = operation.start();
     assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
     let emitted = format!("{effects:?}");
@@ -1506,7 +1506,7 @@ fn denied_is_terminal() {
     let realm_id = RealmId::from_bytes([1; 32]);
     let actor = actor(realm_id);
     let mut operation =
-        MutateRealmPlacementOperation::authorized(placement_config(&actor), auth(&actor));
+        MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
     operation.start();
     let effects = operation.step(Event::SubOperation(
         SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
@@ -1515,7 +1515,7 @@ fn denied_is_terminal() {
     assert!(operation.is_complete());
     assert_eq!(
         operation.finalize(),
-        Err(MutateRealmPlacementError::Unauthorized {
+        Err(MutatePlacementError::Unauthorized {
             node_id: actor.node_id,
         })
     );
@@ -1527,7 +1527,7 @@ fn capacity_not_denied() {
     let realm_id = RealmId::from_bytes([1; 32]);
     let actor = actor(realm_id);
     let mut operation =
-        MutateRealmPlacementOperation::authorized(placement_config(&actor), auth(&actor));
+        MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
     operation.start();
     operation.step(Event::SubOperation(
         SubOperationEvent::AuthorizationResult {
@@ -1539,7 +1539,7 @@ fn capacity_not_denied() {
     assert!(operation.is_complete());
     assert_eq!(
         operation.finalize(),
-        Err(MutateRealmPlacementError::StorageError(
+        Err(MutatePlacementError::StorageError(
             StorageError::CleanupCapacity
         ))
     );
@@ -1549,7 +1549,7 @@ fn capacity_not_denied() {
 fn internal_skips_authorization() {
     let realm_id = RealmId::from_bytes([1; 32]);
     let actor = actor(realm_id);
-    let mut operation = MutateRealmPlacementOperation::new(placement_config(&actor));
+    let mut operation = MutatePlacementOperation::new(placement_config(&actor));
     assert_eq!(
         operation.start().as_slice(),
         &[Effect::Storage(StorageEffect::StartTransaction {
@@ -1566,7 +1566,7 @@ fn refuses_server_node() {
     let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     document.ensure_node(actor.node_id, RealmNodeKind::Server);
     let mut operation =
-        MutateRealmPlacementOperation::authorized(placement_config(&actor), auth(&actor));
+        MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
     operation.start();
     operation.step(Event::SubOperation(
         SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
@@ -1585,7 +1585,7 @@ fn refuses_server_node() {
     }));
     assert_eq!(
         operation.finalize(),
-        Err(MutateRealmPlacementError::Unauthorized {
+        Err(MutatePlacementError::Unauthorized {
             node_id: actor.node_id,
         })
     );

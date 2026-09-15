@@ -1,6 +1,6 @@
 use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -8,11 +8,9 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
     METADATA_PENDING_PROJECTION_KEYSPACE,
 };
-use aruna_core::metadata::MetadataCreateEventRecord;
+use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState, overlay_placement,
-};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, overlay_placement};
 use aruna_core::storage_entries::{
     conflict_write_entries, pending_projection_target, reducer_state_entry, reducer_state_key,
     stale_conflict_deletes,
@@ -107,7 +105,7 @@ impl RealmPlacementMutation {
     fn admin_operation(
         &self,
         document: &RealmConfigDocument,
-    ) -> Result<AdminDocumentOperation, MutateRealmPlacementError> {
+    ) -> Result<AdminDocumentOperation, MutatePlacementError> {
         Ok(match self {
             Self::UpsertNode(entry) => AdminDocumentOperation::RealmConfigNodePlacementSet {
                 entry: entry.clone(),
@@ -235,9 +233,9 @@ impl RealmPlacementMutation {
         &self,
         document: &RealmConfigDocument,
         actor: &Actor,
-    ) -> Result<(), MutateRealmPlacementError> {
+    ) -> Result<(), MutatePlacementError> {
         let kind = node_kind(document, actor.node_id);
-        let rejected = MutateRealmPlacementError::Unauthorized {
+        let rejected = MutatePlacementError::Unauthorized {
             node_id: actor.node_id,
         };
         if kind.is_none() {
@@ -299,7 +297,7 @@ impl RealmPlacementMutation {
         allowed.then_some(()).ok_or(rejected)
     }
 
-    fn validate(&self, document: &RealmConfigDocument) -> Result<(), MutateRealmPlacementError> {
+    fn validate(&self, document: &RealmConfigDocument) -> Result<(), MutatePlacementError> {
         match self {
             Self::SetNodeAttributes {
                 node_id,
@@ -308,18 +306,17 @@ impl RealmPlacementMutation {
             } => {
                 let current = placement_entry(document, *node_id)?;
                 if current.draining {
-                    return Err(MutateRealmPlacementError::InvalidInput(
+                    return Err(MutatePlacementError::InvalidInput(
                         "draining freezes placement attributes until the node un-drains or is removed"
                             .to_string(),
                     ));
                 }
                 if let Some(location) = location {
-                    normalize_placement_input(Some(location), None).map_err(|error| {
-                        MutateRealmPlacementError::InvalidInput(error.to_string())
-                    })?;
+                    normalize_placement_input(Some(location), None)
+                        .map_err(|error| MutatePlacementError::InvalidInput(error.to_string()))?;
                 }
                 if let Some(label) = labels.as_ref().and_then(reserved_label) {
-                    return Err(MutateRealmPlacementError::InvalidInput(format!(
+                    return Err(MutatePlacementError::InvalidInput(format!(
                         "placement label {label} is derived and cannot be set"
                     )));
                 }
@@ -349,14 +346,14 @@ impl RealmPlacementMutation {
                 if unchanged {
                     Ok(())
                 } else {
-                    Err(MutateRealmPlacementError::InvalidInput(
+                    Err(MutatePlacementError::InvalidInput(
                         "draining freezes placement attributes until the node un-drains or is removed"
                             .to_string(),
                     ))
                 }
             }
             Self::UpsertStrategy(strategy) if strategy.replica_count == Some(0) => {
-                Err(MutateRealmPlacementError::InvalidInput(
+                Err(MutatePlacementError::InvalidInput(
                     "placement strategy replica_count must not be zero".to_string(),
                 ))
             }
@@ -368,7 +365,7 @@ impl RealmPlacementMutation {
                         .strategy(&strategy.strategy_id)
                         .is_some_and(|existing| existing.shard_count != strategy.shard_count) =>
             {
-                Err(MutateRealmPlacementError::JobFamilyImmutable {
+                Err(MutatePlacementError::JobFamilyImmutable {
                     strategy_id: strategy.strategy_id,
                 })
             }
@@ -382,7 +379,7 @@ impl RealmPlacementMutation {
                         .iter()
                         .any(|entry| entry.strategy_id == strategy.strategy_id) =>
             {
-                Err(MutateRealmPlacementError::InvalidInput(
+                Err(MutatePlacementError::InvalidInput(
                     "shard_count cannot change while the strategy has activations".to_string(),
                 ))
             }
@@ -417,25 +414,25 @@ impl RealmPlacementMutation {
                     PlacementScope::Realm(binding_realm_id)
                         if binding_realm_id != document.realm_id
                 ) {
-                    return Err(MutateRealmPlacementError::InvalidInput(
+                    return Err(MutatePlacementError::InvalidInput(
                         "placement binding realm does not match the realm config".to_string(),
                     ));
                 }
                 if !binding.has_valid_provenance(&document.handle_range_directory()) {
-                    return Err(MutateRealmPlacementError::InvalidInput(
+                    return Err(MutatePlacementError::InvalidInput(
                         "placement binding provenance does not match an owned handle range"
                             .to_string(),
                     ));
                 }
                 match document.binding_directory().resolve(binding.handle) {
                     Ok(existing) if existing != binding.tuple() => {
-                        Err(MutateRealmPlacementError::InvalidInput(format!(
+                        Err(MutatePlacementError::InvalidInput(format!(
                             "placement binding handle {} is already bound to a different tuple",
                             binding.handle.get()
                         )))
                     }
                     Err(BindingError::Conflicted(_)) => {
-                        Err(MutateRealmPlacementError::InvalidInput(format!(
+                        Err(MutatePlacementError::InvalidInput(format!(
                             "placement binding handle {} is conflicted",
                             binding.handle.get()
                         )))
@@ -454,7 +451,7 @@ impl RealmPlacementMutation {
                         .iter()
                         .any(|known| known.epoch == map.epoch)
                 {
-                    return Err(MutateRealmPlacementError::InvalidInput(format!(
+                    return Err(MutatePlacementError::InvalidInput(format!(
                         "candidate map epoch {} is already published",
                         map.epoch
                     )));
@@ -467,7 +464,7 @@ impl RealmPlacementMutation {
             } => {
                 require_strategy(document, strategy_id, "activation")?;
                 if document.candidate_map(*candidate_map_epoch).is_none() {
-                    return Err(MutateRealmPlacementError::InvalidInput(format!(
+                    return Err(MutatePlacementError::InvalidInput(format!(
                         "candidate map epoch {candidate_map_epoch} is missing or conflicted"
                     )));
                 }
@@ -476,21 +473,21 @@ impl RealmPlacementMutation {
             Self::StartTransition(plan) => {
                 require_strategy(document, &plan.strategy_id, "transition")?;
                 if plan.limits.max_incomplete_buckets == 0 {
-                    return Err(MutateRealmPlacementError::InvalidInput(
+                    return Err(MutatePlacementError::InvalidInput(
                         "a transition must allow at least one bucket in flight".to_string(),
                     ));
                 }
                 if let Some(existing) = document.placement_transitions.iter().find(|transition| {
                     transition.plan.strategy_id == plan.strategy_id && !transition.is_terminal()
                 }) {
-                    return Err(MutateRealmPlacementError::TransitionInFlight {
+                    return Err(MutatePlacementError::TransitionInFlight {
                         transition_id: existing.plan.transition_id,
                     });
                 }
                 // The plan restates derived holder sets, so admission re-derives
                 // them: a plan naming sets this node disagrees with never enters.
                 if !crate::placement::transition::plan_is_derivable(document, plan) {
-                    return Err(MutateRealmPlacementError::InvalidInput(
+                    return Err(MutatePlacementError::InvalidInput(
                         "transition plan does not match the resolved holder sets".to_string(),
                     ));
                 }
@@ -518,14 +515,14 @@ impl RealmPlacementMutation {
             } => {
                 let transition = require_transition_bucket(document, transition_id, proof.bucket)
                     .and(document.transition(transition_id).ok_or(
-                    MutateRealmPlacementError::UnknownTransition {
+                    MutatePlacementError::UnknownTransition {
                         transition_id: *transition_id,
                     },
                 ))?;
                 if transition.plan.strategy_id != *strategy_id
                     || !proof.verify(document.realm_id, *transition_id, *strategy_id)
                 {
-                    return Err(MutateRealmPlacementError::InvalidInput(
+                    return Err(MutatePlacementError::InvalidInput(
                         "transition completion proof does not verify".to_string(),
                     ));
                 }
@@ -534,7 +531,7 @@ impl RealmPlacementMutation {
             Self::AbortTransition(transition_id) => document
                 .transition(transition_id)
                 .map(|_| ())
-                .ok_or(MutateRealmPlacementError::UnknownTransition {
+                .ok_or(MutatePlacementError::UnknownTransition {
                     transition_id: *transition_id,
                 }),
             Self::ForceFinalizeBucket {
@@ -544,7 +541,7 @@ impl RealmPlacementMutation {
             } => {
                 let transition = require_transition_bucket(document, transition_id, *bucket).and(
                     document.transition(transition_id).ok_or(
-                        MutateRealmPlacementError::UnknownTransition {
+                        MutatePlacementError::UnknownTransition {
                             transition_id: *transition_id,
                         },
                     ),
@@ -552,7 +549,7 @@ impl RealmPlacementMutation {
                 // A forced cut still needs one verified copy on a target holder,
                 // so the last verified copy is never the one cut away.
                 if transition.proofs_for(*bucket).next().is_none() {
-                    return Err(MutateRealmPlacementError::ForceWithoutProof {
+                    return Err(MutatePlacementError::ForceWithoutProof {
                         transition_id: *transition_id,
                         bucket: *bucket,
                     });
@@ -561,7 +558,7 @@ impl RealmPlacementMutation {
             }
             Self::RemoveStrategy(strategy_id) => {
                 if document.job_family_strategy_id == *strategy_id {
-                    return Err(MutateRealmPlacementError::JobFamilyImmutable {
+                    return Err(MutatePlacementError::JobFamilyImmutable {
                         strategy_id: *strategy_id,
                     });
                 }
@@ -579,7 +576,7 @@ impl RealmPlacementMutation {
                         .iter()
                         .any(|record| record.strategy_id == Some(*strategy_id));
                 if referenced {
-                    Err(MutateRealmPlacementError::StrategyReferenced {
+                    Err(MutatePlacementError::StrategyReferenced {
                         strategy_id: *strategy_id,
                     })
                 } else {
@@ -624,9 +621,9 @@ fn bucket_plan<'a>(
 fn placement_entry(
     document: &RealmConfigDocument,
     node_id: NodeId,
-) -> Result<&NodePlacementEntry, MutateRealmPlacementError> {
+) -> Result<&NodePlacementEntry, MutatePlacementError> {
     document.placement_entry(node_id).ok_or_else(|| {
-        MutateRealmPlacementError::InvalidInput(format!("node {node_id} has no placement entry"))
+        MutatePlacementError::InvalidInput(format!("node {node_id} has no placement entry"))
     })
 }
 
@@ -637,7 +634,7 @@ fn attributes_entry(
     node_id: NodeId,
     location: Option<&String>,
     labels: Option<&BTreeMap<String, String>>,
-) -> Result<NodePlacementEntry, MutateRealmPlacementError> {
+) -> Result<NodePlacementEntry, MutatePlacementError> {
     let mut entry = placement_entry(document, node_id)?.clone();
     if let Some(location) = location {
         entry.location = location.trim().to_string();
@@ -650,19 +647,19 @@ fn attributes_entry(
 
 /// Refuses attributes whose derived storage subject the node could never
 /// advance to. The generation is not part of that validation.
-fn ensure_subject(entry: &NodePlacementEntry) -> Result<(), MutateRealmPlacementError> {
+fn ensure_subject(entry: &NodePlacementEntry) -> Result<(), MutatePlacementError> {
     storage_subject(entry, 1)
         .validate()
-        .map_err(|error| MutateRealmPlacementError::InvalidInput(error.to_string()))
+        .map_err(|error| MutatePlacementError::InvalidInput(error.to_string()))
 }
 
 fn require_strategy(
     document: &RealmConfigDocument,
     strategy_id: &Ulid,
     reference: &str,
-) -> Result<(), MutateRealmPlacementError> {
+) -> Result<(), MutatePlacementError> {
     if document.strategy(strategy_id).is_none() {
-        return Err(MutateRealmPlacementError::InvalidInput(format!(
+        return Err(MutatePlacementError::InvalidInput(format!(
             "{reference} references missing strategy {strategy_id}"
         )));
     }
@@ -673,15 +670,15 @@ fn require_transition_bucket(
     document: &RealmConfigDocument,
     transition_id: &Ulid,
     bucket: u32,
-) -> Result<(), MutateRealmPlacementError> {
+) -> Result<(), MutatePlacementError> {
     let transition =
         document
             .transition(transition_id)
-            .ok_or(MutateRealmPlacementError::UnknownTransition {
+            .ok_or(MutatePlacementError::UnknownTransition {
                 transition_id: *transition_id,
             })?;
     if !transition.plan.covers(bucket) {
-        return Err(MutateRealmPlacementError::InvalidInput(format!(
+        return Err(MutatePlacementError::InvalidInput(format!(
             "transition {transition_id} does not cover bucket {bucket}"
         )));
     }
@@ -692,7 +689,7 @@ fn require_metadata_binding(
     document: &RealmConfigDocument,
     scope: PlacementScope,
     strategy_id: Ulid,
-) -> Result<(), MutateRealmPlacementError> {
+) -> Result<(), MutatePlacementError> {
     let directory = document.binding_directory();
     let exact = directory
         .handle_for(scope, DocumentClass::Metadata, strategy_id)
@@ -706,7 +703,7 @@ fn require_metadata_binding(
             )
             .is_some();
     if !exact && !realm_fallback {
-        return Err(MutateRealmPlacementError::InvalidInput(format!(
+        return Err(MutatePlacementError::InvalidInput(format!(
             "metadata policy strategy {strategy_id} has no binding for {scope:?}"
         )));
     }
@@ -714,21 +711,21 @@ fn require_metadata_binding(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MutateRealmPlacementConfig {
+pub struct MutatePlacementConfig {
     pub actor: Actor,
     pub mutation: RealmPlacementMutation,
 }
 
 #[derive(Debug, PartialEq)]
-pub struct MutateRealmPlacementOperation {
+pub struct MutatePlacementOperation {
     actor: Actor,
     /// Set when a caller's token has to be authorized: the node-internal
     /// mutation paths originate their own changes and carry no token.
     auth_context: Option<AuthContext>,
     mutations: Vec<RealmPlacementMutation>,
     txn_id: Option<TxnId>,
-    state: MutateRealmPlacementState,
-    output: Option<Result<RealmConfigDocument, MutateRealmPlacementError>>,
+    state: MutatePlacementState,
+    output: Option<Result<RealmConfigDocument, MutatePlacementError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -739,7 +736,7 @@ struct StrategyRemovalCheck {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum MutateRealmPlacementState {
+enum MutatePlacementState {
     Init,
     Auth,
     StartTransaction,
@@ -771,13 +768,13 @@ enum MutateRealmPlacementState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum MutateRealmPlacementError {
+pub enum MutatePlacementError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
-    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
+    AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
     RealmConfigNotFound,
     #[error("invalid placement mutation: {0}")]
@@ -810,16 +807,16 @@ pub enum MutateRealmPlacementError {
     },
 }
 
-impl MutateRealmPlacementOperation {
+impl MutatePlacementOperation {
     /// Node-internal entry: the node originates the mutation itself, so only the
     /// per-mutation node authorization applies.
-    pub fn new(config: MutateRealmPlacementConfig) -> Self {
+    pub fn new(config: MutatePlacementConfig) -> Self {
         Self::batch(config.actor, vec![config.mutation])
     }
 
     /// Caller-facing entry: the token must hold WRITE on the realm configuration
     /// admin path and only a management node may serve it.
-    pub fn authorized(config: MutateRealmPlacementConfig, auth_context: AuthContext) -> Self {
+    pub fn authorized(config: MutatePlacementConfig, auth_context: AuthContext) -> Self {
         Self {
             auth_context: Some(auth_context),
             ..Self::batch(config.actor, vec![config.mutation])
@@ -835,13 +832,13 @@ impl MutateRealmPlacementOperation {
             auth_context: None,
             mutations,
             txn_id: None,
-            state: MutateRealmPlacementState::Init,
+            state: MutatePlacementState::Init,
             output: None,
         }
     }
 
-    fn document_ref(&self) -> DocumentSyncTarget {
-        DocumentSyncTarget::RealmConfig {
+    fn document_ref(&self) -> DocumentTarget {
+        DocumentTarget::RealmConfig {
             realm_id: self.actor.realm_id,
         }
     }
@@ -854,7 +851,7 @@ impl MutateRealmPlacementOperation {
 
     fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
         self.txn_id = Some(txn_id);
-        self.state = MutateRealmPlacementState::ReadCurrent;
+        self.state = MutatePlacementState::ReadCurrent;
         let document = self.document_ref();
         let target = self.admin_target();
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -876,15 +873,15 @@ impl MutateRealmPlacementOperation {
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, MutateRealmPlacementError> {
+    ) -> Result<Effects, MutatePlacementError> {
         let Some(txn_id) = self.txn_id else {
-            return Err(MutateRealmPlacementError::MissingTransaction);
+            return Err(MutatePlacementError::MissingTransaction);
         };
         let Some(document_value) = document_value else {
-            return Err(MutateRealmPlacementError::RealmConfigNotFound);
+            return Err(MutatePlacementError::RealmConfigNotFound);
         };
         if self.mutations.is_empty() {
-            return Err(MutateRealmPlacementError::InvalidInput(
+            return Err(MutatePlacementError::InvalidInput(
                 "empty placement mutation batch".to_string(),
             ));
         }
@@ -902,12 +899,12 @@ impl MutateRealmPlacementOperation {
             .as_ref()
             .is_some_and(|state| state.target != target)
         {
-            return Err(AdminDocumentReducerError::TargetMismatch.into());
+            return Err(AdminDocumentError::TargetMismatch.into());
         }
 
         let mut reducer_state = previous_reducer_state
             .clone()
-            .unwrap_or_else(|| AdminDocumentReducerState::new(target));
+            .unwrap_or_else(|| AdminDocumentState::new(target));
         let pre_document = document.clone();
         let mut admin_events = Vec::with_capacity(self.mutations.len());
         for mutation in &self.mutations {
@@ -922,13 +919,13 @@ impl MutateRealmPlacementOperation {
         if let Some((node_id, placement)) =
             crate::placement::first_draining_change(&pre_document, &document)
         {
-            return Err(MutateRealmPlacementError::InvalidInput(format!(
+            return Err(MutatePlacementError::InvalidInput(format!(
                 "placement change alters drain-time holder set for node {node_id}, strategy {} shard {}",
                 placement.strategy_id, placement.shard
             )));
         }
         if let Some(placement) = crate::placement::first_empty_shard(&document) {
-            return Err(MutateRealmPlacementError::EmptyShardHolders {
+            return Err(MutatePlacementError::EmptyShardHolders {
                 strategy_id: placement.strategy_id,
                 shard: placement.shard,
             });
@@ -952,7 +949,7 @@ impl MutateRealmPlacementOperation {
                 self.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::admin(admin_event),
+                DocumentOutboxEvent::admin(admin_event),
                 placement,
                 false,
             );
@@ -961,7 +958,7 @@ impl MutateRealmPlacementOperation {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
-        self.state = MutateRealmPlacementState::WriteDocumentAndAdminState {
+        self.state = MutatePlacementState::WriteDocumentAndAdminState {
             document,
             stale_conflict_deletes,
         };
@@ -975,9 +972,9 @@ impl MutateRealmPlacementOperation {
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, MutateRealmPlacementError> {
+    ) -> Result<Effects, MutatePlacementError> {
         let Some(document_value) = document_value else {
-            return Err(MutateRealmPlacementError::RealmConfigNotFound);
+            return Err(MutatePlacementError::RealmConfigNotFound);
         };
         // A caller's request is served by management nodes only; a node's own
         // mutations stay governed by the per-mutation node authorization.
@@ -987,7 +984,7 @@ impl MutateRealmPlacementOperation {
                 self.actor.node_id,
             )
         {
-            return Err(MutateRealmPlacementError::Unauthorized {
+            return Err(MutatePlacementError::Unauthorized {
                 node_id: self.actor.node_id,
             });
         }
@@ -1004,7 +1001,7 @@ impl MutateRealmPlacementOperation {
                     .iter()
                     .any(|mutation| matches!(mutation, RealmPlacementMutation::RemoveStrategy(_)))
                 {
-                    return Err(MutateRealmPlacementError::InvalidInput(
+                    return Err(MutatePlacementError::InvalidInput(
                         "strategy removal cannot be batched".to_string(),
                     ));
                 }
@@ -1025,9 +1022,9 @@ impl MutateRealmPlacementOperation {
         start_after: Option<Key>,
     ) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.fail(MutateRealmPlacementError::MissingTransaction);
+            return self.fail(MutatePlacementError::MissingTransaction);
         };
-        self.state = MutateRealmPlacementState::ReadRegistryReferences { check };
+        self.state = MutatePlacementState::ReadRegistryReferences { check };
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: METADATA_INDEX_KEYSPACE.to_string(),
             prefix: None,
@@ -1043,9 +1040,9 @@ impl MutateRealmPlacementOperation {
         start_after: Option<Key>,
     ) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.fail(MutateRealmPlacementError::MissingTransaction);
+            return self.fail(MutatePlacementError::MissingTransaction);
         };
-        self.state = MutateRealmPlacementState::ReadPendingReferences { check };
+        self.state = MutatePlacementState::ReadPendingReferences { check };
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
             prefix: None,
@@ -1070,22 +1067,22 @@ impl MutateRealmPlacementOperation {
 
     fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.fail(MutateRealmPlacementError::MissingTransaction);
+            return self.fail(MutatePlacementError::MissingTransaction);
         };
-        self.state = MutateRealmPlacementState::CommitTransaction { document };
+        self.state = MutatePlacementState::CommitTransaction { document };
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
-    fn fail(&mut self, error: MutateRealmPlacementError) -> Effects {
+    fn fail(&mut self, error: MutatePlacementError) -> Effects {
         let cleanup = self.abort();
-        self.state = MutateRealmPlacementState::Error;
+        self.state = MutatePlacementState::Error;
         self.output = Some(Err(error));
         cleanup
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
-        self.fail(MutateRealmPlacementError::UnexpectedEvent {
+        self.fail(MutatePlacementError::UnexpectedEvent {
             state,
             expected,
             got,
@@ -1093,32 +1090,32 @@ impl MutateRealmPlacementOperation {
     }
 }
 
-impl Operation for MutateRealmPlacementOperation {
+impl Operation for MutatePlacementOperation {
     type Output = RealmConfigDocument;
-    type Error = MutateRealmPlacementError;
+    type Error = MutatePlacementError;
 
     /// An SSI conflict is ordinary contention that every caller re-drives, so
     /// only an exhausted retry belongs on the error stream.
     fn expected_error(error: &Self::Error) -> bool {
         matches!(
             error,
-            MutateRealmPlacementError::StorageError(StorageError::TransactionConflict)
+            MutatePlacementError::StorageError(StorageError::TransactionConflict)
         )
     }
 
     fn start(&mut self) -> Effects {
         let Some(auth_context) = self.auth_context.clone() else {
-            self.state = MutateRealmPlacementState::StartTransaction;
+            self.state = MutatePlacementState::StartTransaction;
             return smallvec![Effect::Storage(StorageEffect::StartTransaction {
                 read: false,
             })];
         };
         if auth_context.realm_id != self.actor.realm_id {
-            return self.fail(MutateRealmPlacementError::Unauthorized {
+            return self.fail(MutatePlacementError::Unauthorized {
                 node_id: self.actor.node_id,
             });
         }
-        self.state = MutateRealmPlacementState::Auth;
+        self.state = MutatePlacementState::Auth;
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context,
@@ -1131,25 +1128,25 @@ impl Operation for MutateRealmPlacementOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state.clone() {
-            MutateRealmPlacementState::Auth => match event {
+            MutatePlacementState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
                         Ok(true) => {
-                            self.state = MutateRealmPlacementState::StartTransaction;
+                            self.state = MutatePlacementState::StartTransaction;
                             smallvec![Effect::Storage(StorageEffect::StartTransaction {
                                 read: false,
                             })]
                         }
-                        Ok(false) => self.fail(MutateRealmPlacementError::Unauthorized {
+                        Ok(false) => self.fail(MutatePlacementError::Unauthorized {
                             node_id: self.actor.node_id,
                         }),
                         Err(error) => {
                             warn!(error = %error, "Realm placement authorization check failed");
                             match error {
                                 AuthorizationError::StorageError(error) => {
-                                    self.fail(MutateRealmPlacementError::StorageError(error))
+                                    self.fail(MutatePlacementError::StorageError(error))
                                 }
-                                _ => self.fail(MutateRealmPlacementError::Unauthorized {
+                                _ => self.fail(MutatePlacementError::Unauthorized {
                                     node_id: self.actor.node_id,
                                 }),
                             }
@@ -1158,14 +1155,14 @@ impl Operation for MutateRealmPlacementOperation {
                 }
                 other => self.unexpected_event("authorization result", format!("{other:?}")),
             },
-            MutateRealmPlacementState::StartTransaction => match event {
+            MutatePlacementState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("transaction start result", format!("{other:?}")),
             },
-            MutateRealmPlacementState::ReadCurrent => match event {
+            MutatePlacementState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
                         return self.unexpected_event(
@@ -1183,7 +1180,7 @@ impl Operation for MutateRealmPlacementOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            MutateRealmPlacementState::ReadRegistryReferences { check } => match event {
+            MutatePlacementState::ReadRegistryReferences { check } => match event {
                 Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
@@ -1194,7 +1191,7 @@ impl Operation for MutateRealmPlacementOperation {
                             Err(error) => return self.fail(ConversionError::from(error).into()),
                         };
                         if self.reference_matches(&record, check.strategy_id) {
-                            return self.fail(MutateRealmPlacementError::StrategyReferenced {
+                            return self.fail(MutatePlacementError::StrategyReferenced {
                                 strategy_id: check.strategy_id,
                             });
                         }
@@ -1209,7 +1206,7 @@ impl Operation for MutateRealmPlacementOperation {
                     self.unexpected_event("metadata registry scan result", format!("{other:?}"))
                 }
             },
-            MutateRealmPlacementState::ReadPendingReferences { check } => match event {
+            MutatePlacementState::ReadPendingReferences { check } => match event {
                 Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
@@ -1221,9 +1218,9 @@ impl Operation for MutateRealmPlacementOperation {
                         };
                     }
                     let Some(txn_id) = self.txn_id else {
-                        return self.fail(MutateRealmPlacementError::MissingTransaction);
+                        return self.fail(MutatePlacementError::MissingTransaction);
                     };
-                    self.state = MutateRealmPlacementState::ReadPendingEvents {
+                    self.state = MutatePlacementState::ReadPendingEvents {
                         check,
                         next_start_after,
                     };
@@ -1240,21 +1237,21 @@ impl Operation for MutateRealmPlacementOperation {
                     self.unexpected_event("pending projection scan result", format!("{other:?}"))
                 }
             },
-            MutateRealmPlacementState::ReadPendingEvents {
+            MutatePlacementState::ReadPendingEvents {
                 check,
                 next_start_after,
             } => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     for (key, value) in values {
                         let Some(value) = value else {
-                            return self.fail(MutateRealmPlacementError::StrategyReferenced {
+                            return self.fail(MutatePlacementError::StrategyReferenced {
                                 strategy_id: check.strategy_id,
                             });
                         };
-                        let event: MetadataCreateEventRecord = match postcard::from_bytes(&value) {
+                        let event: MetadataEventRecord = match postcard::from_bytes(&value) {
                             Ok(event) => event,
                             Err(_) => {
-                                return self.fail(MutateRealmPlacementError::StrategyReferenced {
+                                return self.fail(MutatePlacementError::StrategyReferenced {
                                     strategy_id: check.strategy_id,
                                 });
                             }
@@ -1267,7 +1264,7 @@ impl Operation for MutateRealmPlacementOperation {
                         );
                         if !valid_target || self.reference_matches(&event.record, check.strategy_id)
                         {
-                            return self.fail(MutateRealmPlacementError::StrategyReferenced {
+                            return self.fail(MutatePlacementError::StrategyReferenced {
                                 strategy_id: check.strategy_id,
                             });
                         }
@@ -1280,17 +1277,16 @@ impl Operation for MutateRealmPlacementOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("pending create event reads", format!("{other:?}")),
             },
-            MutateRealmPlacementState::WriteDocumentAndAdminState {
+            MutatePlacementState::WriteDocumentAndAdminState {
                 document,
                 stale_conflict_deletes,
             } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
-                        return self.fail(MutateRealmPlacementError::MissingTransaction);
+                        return self.fail(MutatePlacementError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state =
-                            MutateRealmPlacementState::DeleteStaleAdminConflicts { document };
+                        self.state = MutatePlacementState::DeleteStaleAdminConflicts { document };
                         return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                             deletes: stale_conflict_deletes,
                             txn_id: Some(txn_id),
@@ -1301,17 +1297,17 @@ impl Operation for MutateRealmPlacementOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             },
-            MutateRealmPlacementState::DeleteStaleAdminConflicts { document } => match event {
+            MutatePlacementState::DeleteStaleAdminConflicts { document } => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
             },
-            MutateRealmPlacementState::CommitTransaction { .. } => match event {
+            MutatePlacementState::CommitTransaction { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state = MutateRealmPlacementState::ScheduleDocumentSyncOutboxDrain;
+                    self.state = MutatePlacementState::ScheduleDocumentSyncOutboxDrain;
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -1320,9 +1316,9 @@ impl Operation for MutateRealmPlacementOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            MutateRealmPlacementState::ScheduleDocumentSyncOutboxDrain => match event {
+            MutatePlacementState::ScheduleDocumentSyncOutboxDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = MutateRealmPlacementState::SchedulePlacementRevalidation;
+                    self.state = MutatePlacementState::SchedulePlacementRevalidation;
                     smallvec![schedule_revalidation(
                         self.actor.realm_id,
                         self.actor.node_id,
@@ -1330,7 +1326,7 @@ impl Operation for MutateRealmPlacementOperation {
                 }
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                    self.state = MutateRealmPlacementState::SchedulePlacementRevalidation;
+                    self.state = MutatePlacementState::SchedulePlacementRevalidation;
                     smallvec![schedule_revalidation(
                         self.actor.realm_id,
                         self.actor.node_id,
@@ -1341,14 +1337,14 @@ impl Operation for MutateRealmPlacementOperation {
                     format!("{other:?}"),
                 ),
             },
-            MutateRealmPlacementState::SchedulePlacementRevalidation => match event {
+            MutatePlacementState::SchedulePlacementRevalidation => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = MutateRealmPlacementState::Finish;
+                    self.state = MutatePlacementState::Finish;
                     smallvec![]
                 }
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     warn!(error = %message, "Failed to schedule placement revalidation after realm placement mutation");
-                    self.state = MutateRealmPlacementState::Finish;
+                    self.state = MutatePlacementState::Finish;
                     smallvec![]
                 }
                 other => self.unexpected_event(
@@ -1356,22 +1352,22 @@ impl Operation for MutateRealmPlacementOperation {
                     format!("{other:?}"),
                 ),
             },
-            MutateRealmPlacementState::Finish
-            | MutateRealmPlacementState::Error
-            | MutateRealmPlacementState::Init => smallvec![],
+            MutatePlacementState::Finish
+            | MutatePlacementState::Error
+            | MutatePlacementState::Init => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            MutateRealmPlacementState::Finish | MutateRealmPlacementState::Error
+            MutatePlacementState::Finish | MutatePlacementState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         self.output
-            .unwrap_or(Err(MutateRealmPlacementError::NotFinished))
+            .unwrap_or(Err(MutatePlacementError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -1386,10 +1382,10 @@ impl Operation for MutateRealmPlacementOperation {
 /// installed outbox drain owner so pre-holdership-loss records retry without a second
 /// drainer or replacing a persisted deadline. `auth_context` is `None` for local origin.
 pub async fn drive_placement_mutation(
-    config: MutateRealmPlacementConfig,
+    config: MutatePlacementConfig,
     auth_context: Option<AuthContext>,
     context: &crate::driver::DriverContext,
-) -> Result<RealmConfigDocument, MutateRealmPlacementError> {
+) -> Result<RealmConfigDocument, MutatePlacementError> {
     let drains_node = matches!(
         &config.mutation,
         RealmPlacementMutation::UpsertNode(entry)
@@ -1400,12 +1396,12 @@ pub async fn drive_placement_mutation(
     let outcome = loop {
         let operation = match auth_context.clone() {
             Some(auth_context) => {
-                MutateRealmPlacementOperation::authorized(config.clone(), auth_context)
+                MutatePlacementOperation::authorized(config.clone(), auth_context)
             }
-            None => MutateRealmPlacementOperation::new(config.clone()),
+            None => MutatePlacementOperation::new(config.clone()),
         };
         match crate::driver::drive(operation, context).await {
-            Err(MutateRealmPlacementError::StorageError(StorageError::TransactionConflict))
+            Err(MutatePlacementError::StorageError(StorageError::TransactionConflict))
                 if attempts < CONFLICT_ATTEMPTS =>
             {
                 // Retrying with no wait spends every attempt in one contention window.
@@ -1416,9 +1412,9 @@ pub async fn drive_placement_mutation(
                 .await;
                 attempts += 1;
             }
-            Err(MutateRealmPlacementError::StorageError(StorageError::TransactionConflict)) => {
+            Err(MutatePlacementError::StorageError(StorageError::TransactionConflict)) => {
                 warn!(attempts, "Realm placement mutation kept conflicting");
-                break Err(MutateRealmPlacementError::StorageError(
+                break Err(MutatePlacementError::StorageError(
                     StorageError::TransactionConflict,
                 ));
             }
@@ -1432,4 +1428,5 @@ pub async fn drive_placement_mutation(
 }
 
 #[cfg(test)]
+#[path = "mutate_placement_tests.rs"]
 mod tests;
