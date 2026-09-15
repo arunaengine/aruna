@@ -2,15 +2,15 @@ use crate::NodeId;
 use crate::compute::{AdvertisementError, ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
 use crate::compute_quota::{ComputeDemandSnapshot, ComputeReservationSnapshot, SnapshotError};
 use crate::errors::ConversionError;
-use crate::structs::placement::placement_policy::{MAX_LABEL_KEY_LEN, MAX_LABEL_VALUE_LEN};
+use crate::structs::placement::placement_policy::{MAX_LABEL_LEN, MAX_VALUE_LEN};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Maximum labels one node advertises. Above the placement-view labels plus a
 /// storage-class label per registered backend.
-pub const MAX_NODE_INFO_LABELS: usize = 64;
+pub const MAX_INFO_LABELS: usize = 64;
 /// Maximum length of an advertised url.
-pub const MAX_NODE_URL_LEN: usize = 512;
+pub const MAX_URL_LEN: usize = 512;
 
 /// Derived read-only label carrying a node's `RealmNode.kind`; writes are rejected.
 pub const KIND_LABEL_KEY: &str = "aruna-engine.org/kind";
@@ -18,7 +18,7 @@ pub const KIND_LABEL_KEY: &str = "aruna-engine.org/kind";
 /// Derived read-only label prefix advertising a storage class this node's
 /// operator registered. Capability only: it reaches `NodeInfo` and never the
 /// realm placement map that placement selection reads.
-pub const STORAGE_CLASS_LABEL_PREFIX: &str = "aruna-engine.org/storage-class/";
+pub const CLASS_LABEL_PREFIX: &str = "aruna-engine.org/storage-class/";
 
 /// Derived read-only label carrying the node's configured placement location,
 /// so an affinity rule or selector can match the location as a label. It is
@@ -38,7 +38,7 @@ pub fn reserved_label(labels: &BTreeMap<String, String>) -> Option<&str> {
             key.as_str() == KIND_LABEL_KEY
                 || key.as_str() == LOCATION_LABEL_KEY
                 || key.as_str() == NODE_LABEL_KEY
-                || key.starts_with(STORAGE_CLASS_LABEL_PREFIX)
+                || key.starts_with(CLASS_LABEL_PREFIX)
         })
         .map(String::as_str)
 }
@@ -152,12 +152,12 @@ impl NodeInfoDocument {
 }
 
 fn validate_labels(labels: &BTreeMap<String, String>) -> Result<(), AdvertisementError> {
-    if labels.len() > MAX_NODE_INFO_LABELS {
+    if labels.len() > MAX_INFO_LABELS {
         return Err(AdvertisementError::LabelCount);
     }
     for (key, value) in labels {
         let key = key.trim();
-        if key.is_empty() || key.len() > MAX_LABEL_KEY_LEN || value.len() > MAX_LABEL_VALUE_LEN {
+        if key.is_empty() || key.len() > MAX_LABEL_LEN || value.len() > MAX_VALUE_LEN {
             return Err(AdvertisementError::InvalidLabel);
         }
     }
@@ -175,7 +175,7 @@ impl NodeUrls {
         match [self.api.as_deref(), self.s3.as_deref()]
             .iter()
             .flatten()
-            .all(|url| !url.is_empty() && url.len() <= MAX_NODE_URL_LEN)
+            .all(|url| !url.is_empty() && url.len() <= MAX_URL_LEN)
         {
             true => Ok(()),
             false => Err(AdvertisementError::InvalidUrl),

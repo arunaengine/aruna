@@ -31,7 +31,7 @@ use std::str::FromStr;
 use thiserror::Error;
 use ulid::Ulid;
 
-pub const REALM_ENDPOINT_ANNOUNCEMENT_DOMAIN: &str = "aruna-realm-endpoint-v1";
+pub const ENDPOINT_ANNOUNCEMENT_DOMAIN: &str = "aruna-realm-endpoint-v1";
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RealmId(pub [u8; 32]);
@@ -157,7 +157,7 @@ impl RealmAuthorizationDocument {
     }
 }
 
-pub const DEFAULT_METADATA_REPLICATION_FACTOR: u32 = 3;
+pub const METADATA_REPLICATION_FACTOR: u32 = 3;
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct RealmConfigDocument {
@@ -173,7 +173,8 @@ pub struct RealmConfigDocument {
     pub default_strategy_id: Option<Ulid>,
     /// Strategy every node derives submission-family placement from. It and its
     /// shard count are immutable while v1 family records are retained.
-    pub job_family_strategy_id: Ulid,
+    #[serde(rename = "job_family_strategy_id")]
+    pub family_strategy_id: Ulid,
     pub strategy_bindings: Vec<StrategyBinding>,
     pub placement_overrides: Vec<PlacementOverride>,
     /// Append-only bindings materialized by the reducer overlay. Divergent
@@ -221,16 +222,21 @@ pub struct TokenRevocation {
 /// own limits.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct QuotaConfig {
-    pub default_group_quota_bytes: Option<u64>,
+    #[serde(rename = "default_group_quota_bytes")]
+    pub default_quota_bytes: Option<u64>,
     pub grace_factor_percent: u32,
     pub warn_threshold_percent: u32,
     pub group_overrides: Vec<GroupQuotaOverride>,
-    pub max_groups_per_user: Option<u32>,
-    pub user_group_cap_overrides: Vec<UserCapOverride>,
-    pub max_devices_per_user: Option<u32>,
+    #[serde(rename = "max_groups_per_user")]
+    pub groups_per_user: Option<u32>,
+    #[serde(rename = "user_group_cap_overrides")]
+    pub group_cap_overrides: Vec<UserCapOverride>,
+    #[serde(rename = "max_devices_per_user")]
+    pub devices_per_user: Option<u32>,
     /// Inbound requests one user device may send a realm node per minute.
     /// `None` leaves devices uncapped.
-    pub device_requests_per_minute: Option<u32>,
+    #[serde(rename = "device_requests_per_minute")]
+    pub device_request_rate: Option<u32>,
     /// Inbound requests one user device may keep in flight at a realm node at
     /// once, which is what bounds long blob pulls. `None` leaves them uncapped.
     pub device_concurrent_pulls: Option<u32>,
@@ -252,14 +258,14 @@ pub struct UserCapOverride {
 impl Default for QuotaConfig {
     fn default() -> Self {
         Self {
-            default_group_quota_bytes: None,
+            default_quota_bytes: None,
             grace_factor_percent: 110,
             warn_threshold_percent: 85,
             group_overrides: Vec::new(),
-            max_groups_per_user: Some(3),
-            user_group_cap_overrides: Vec::new(),
-            max_devices_per_user: None,
-            device_requests_per_minute: None,
+            groups_per_user: Some(3),
+            group_cap_overrides: Vec::new(),
+            devices_per_user: None,
+            device_request_rate: None,
             device_concurrent_pulls: None,
         }
     }
@@ -268,11 +274,11 @@ impl Default for QuotaConfig {
 impl QuotaConfig {
     /// None = unlimited.
     pub fn max_groups_for(&self, user_id: &UserId) -> Option<u32> {
-        self.user_group_cap_overrides
+        self.group_cap_overrides
             .iter()
             .find(|over| over.user_id == *user_id)
             .map(|over| over.max_groups)
-            .unwrap_or(self.max_groups_per_user)
+            .unwrap_or(self.groups_per_user)
     }
 
     /// Resolves the effective pre-grace quota (in bytes) for a group: the group override's `quota_bytes`
@@ -285,7 +291,7 @@ impl QuotaConfig {
             .find(|over| over.group_id == *group_id)
         {
             Some(over) => over.quota_bytes,
-            None => self.default_group_quota_bytes,
+            None => self.default_quota_bytes,
         }
     }
 
@@ -404,7 +410,7 @@ pub fn endpoint_signing_bytes(
     sequence: u64,
 ) -> Result<Vec<u8>, postcard::Error> {
     postcard::to_allocvec(&(
-        REALM_ENDPOINT_ANNOUNCEMENT_DOMAIN,
+        ENDPOINT_ANNOUNCEMENT_DOMAIN,
         realm_id,
         node_id,
         endpoint_addr,
@@ -481,7 +487,7 @@ impl RealmConfigDocument {
             revocation_floor: 0,
             strategies: Vec::new(),
             default_strategy_id: None,
-            job_family_strategy_id: Ulid::nil(),
+            family_strategy_id: Ulid::nil(),
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
@@ -498,7 +504,7 @@ impl RealmConfigDocument {
         Self::new(
             realm_id,
             oidc_providers,
-            DEFAULT_METADATA_REPLICATION_FACTOR,
+            METADATA_REPLICATION_FACTOR,
         )
     }
 
@@ -532,7 +538,7 @@ impl RealmConfigDocument {
             shard_count: DEFAULT_SHARD_COUNT,
         };
         self.default_strategy_id = Some(default_strategy.strategy_id);
-        self.job_family_strategy_id = job_family_strategy.strategy_id;
+        self.family_strategy_id = job_family_strategy.strategy_id;
         self.strategy_bindings = [
             DocumentClass::MetadataRegistry,
             DocumentClass::Admin,
@@ -712,12 +718,12 @@ impl RealmConfigDocument {
         &self,
         submission_id: SubmissionId,
     ) -> Result<PlacementRef, JobFamilyError> {
-        if self.job_family_strategy_id.is_nil() {
+        if self.family_strategy_id.is_nil() {
             return Err(JobFamilyError::Unset);
         }
         let strategy = self
-            .strategy(&self.job_family_strategy_id)
-            .ok_or(JobFamilyError::Dangling(self.job_family_strategy_id))?;
+            .strategy(&self.family_strategy_id)
+            .ok_or(JobFamilyError::Dangling(self.family_strategy_id))?;
         Ok(PlacementRef {
             strategy_id: strategy.strategy_id,
             shard: shard_for_subject(&submission_id.0, strategy.shard_count),
@@ -935,7 +941,7 @@ impl RealmConfigDocument {
             .map_err(|error| match error {
                 // A bucket beyond the strategy's immutable capacity is proof of
                 // an invalid id, not of unsynced state.
-                BindingError::BucketOutOfRange(_) => JobOwnerError::NotJobControl,
+                BindingError::OutOfRange(_) => JobOwnerError::NotJobControl,
                 error => JobOwnerError::Unavailable(error.to_string()),
             })?;
         if resolved.document_class != DocumentClass::JobControl
@@ -1165,7 +1171,7 @@ mod test {
             placement_map: Vec::new(),
             strategies: Vec::new(),
             default_strategy_id: None,
-            job_family_strategy_id: Ulid::from_bytes([3u8; 16]),
+            family_strategy_id: Ulid::from_bytes([3u8; 16]),
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
@@ -1203,14 +1209,14 @@ mod test {
         // occupies a fixed slot that a shorter encoding cannot satisfy.
         const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e5500010300000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000e0a712c0ee6d";
         let mut config = RealmConfigDocument::new(RealmId([1u8; 32]), Vec::new(), 3);
-        config.job_family_strategy_id = Ulid::from_bytes([2u8; 16]);
+        config.family_strategy_id = Ulid::from_bytes([2u8; 16]);
 
         let bytes = postcard::to_allocvec(&config).unwrap();
         assert_eq!(hex::encode(&bytes), ENCODED);
         assert_eq!(RealmConfigDocument::from_bytes(&bytes).unwrap(), config);
 
         // Dropping the field's length-prefixed slot must fail to decode.
-        let text = config.job_family_strategy_id.to_string();
+        let text = config.family_strategy_id.to_string();
         let start = bytes
             .windows(text.len())
             .position(|window| window == text.as_bytes())
@@ -1224,13 +1230,13 @@ mod test {
     fn seeds_family_strategy() {
         // Fresh creation must select a real strategy, not the nil placeholder.
         let mut config = RealmConfigDocument::new(RealmId([9u8; 32]), Vec::new(), 3);
-        assert!(config.job_family_strategy_id.is_nil());
+        assert!(config.family_strategy_id.is_nil());
         config.seed_default_placement();
 
-        assert!(!config.job_family_strategy_id.is_nil());
-        assert!(config.strategy(&config.job_family_strategy_id).is_some());
+        assert!(!config.family_strategy_id.is_nil());
+        assert!(config.strategy(&config.family_strategy_id).is_some());
         assert_ne!(
-            Some(config.job_family_strategy_id),
+            Some(config.family_strategy_id),
             config.default_strategy_id
         );
     }
@@ -1243,11 +1249,11 @@ mod test {
         left.seed_default_placement();
         let mut right = RealmConfigDocument::new(RealmId([11u8; 32]), Vec::new(), 5);
         right.strategies = left.strategies.clone();
-        right.job_family_strategy_id = left.job_family_strategy_id;
+        right.family_strategy_id = left.family_strategy_id;
 
         let submission = SubmissionId([7u8; 32]);
         let placement = left.family_placement(submission).unwrap();
-        assert_eq!(placement.strategy_id, left.job_family_strategy_id);
+        assert_eq!(placement.strategy_id, left.family_strategy_id);
         assert_eq!(Ok(placement), right.family_placement(submission));
         assert_ne!(
             placement.shard,
@@ -1267,7 +1273,7 @@ mod test {
         );
 
         let dangling = Ulid::from_bytes([5u8; 16]);
-        config.job_family_strategy_id = dangling;
+        config.family_strategy_id = dangling;
         assert_eq!(
             config.family_placement(submission),
             Err(JobFamilyError::Dangling(dangling))
@@ -1278,7 +1284,7 @@ mod test {
     fn digest_binds_family() {
         let config = RealmConfigDocument::new(RealmId([12u8; 32]), Vec::new(), 3);
         let mut changed = config.clone();
-        changed.job_family_strategy_id = Ulid::from_bytes([1u8; 16]);
+        changed.family_strategy_id = Ulid::from_bytes([1u8; 16]);
 
         assert_eq!(config.digest().unwrap(), config.clone().digest().unwrap());
         assert_ne!(config.digest().unwrap(), changed.digest().unwrap());
@@ -1360,7 +1366,7 @@ mod test {
         reducer
             .apply_operation(
                 &actor,
-                AdminDocumentOperation::RealmConfigTokenRevoked {
+                AdminDocumentOperation::ConfigTokenRevoked {
                     token_hash: token_hash.clone(),
                     expires_at: 1_000,
                     token_owner: owner,
@@ -1415,7 +1421,7 @@ mod test {
         reducer
             .apply_operation(
                 &actor_a,
-                AdminDocumentOperation::RealmConfigTokenRevoked {
+                AdminDocumentOperation::ConfigTokenRevoked {
                     token_hash: token_hash.clone(),
                     expires_at: 2_000,
                     token_owner: owner_a,
@@ -1425,7 +1431,7 @@ mod test {
         reducer
             .apply_operation(
                 &actor_b,
-                AdminDocumentOperation::RealmConfigTokenRevoked {
+                AdminDocumentOperation::ConfigTokenRevoked {
                     token_hash: token_hash.clone(),
                     expires_at: 2_000,
                     token_owner: owner_b,
@@ -1614,7 +1620,7 @@ mod test {
         let group = Ulid::from_bytes([1u8; 16]);
         let other = Ulid::from_bytes([2u8; 16]);
         let quota = super::QuotaConfig {
-            default_group_quota_bytes: Some(1_000),
+            default_quota_bytes: Some(1_000),
             grace_factor_percent: 110,
             group_overrides: vec![super::GroupQuotaOverride {
                 group_id: group,
@@ -1631,7 +1637,7 @@ mod test {
 
         // No default and no override => unlimited (no gate).
         let unlimited = super::QuotaConfig {
-            default_group_quota_bytes: None,
+            default_quota_bytes: None,
             ..super::QuotaConfig::default()
         };
         assert_eq!(unlimited.effective_group_ceiling(&other), None);
@@ -1639,7 +1645,7 @@ mod test {
         // An existing override with quota_bytes: None is explicitly unlimited even
         // when a finite default exists.
         let unlimited_override = super::QuotaConfig {
-            default_group_quota_bytes: Some(1_000),
+            default_quota_bytes: Some(1_000),
             grace_factor_percent: 110,
             group_overrides: vec![super::GroupQuotaOverride {
                 group_id: group,
@@ -1655,14 +1661,14 @@ mod test {
         );
 
         let huge = super::QuotaConfig {
-            default_group_quota_bytes: Some(u64::MAX),
+            default_quota_bytes: Some(u64::MAX),
             grace_factor_percent: 100,
             ..super::QuotaConfig::default()
         };
         assert_eq!(huge.effective_group_ceiling(&other), Some(u64::MAX));
 
         let over_huge = super::QuotaConfig {
-            default_group_quota_bytes: Some(u64::MAX),
+            default_quota_bytes: Some(u64::MAX),
             grace_factor_percent: 110,
             ..super::QuotaConfig::default()
         };
@@ -1706,7 +1712,7 @@ mod test {
             placement_map: Vec::new(),
             strategies: Vec::new(),
             default_strategy_id: None,
-            job_family_strategy_id: Ulid::nil(),
+            family_strategy_id: Ulid::nil(),
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),

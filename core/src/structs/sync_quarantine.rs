@@ -3,7 +3,7 @@ use crate::NodeId;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{DocumentEvent, DocumentTarget};
 use crate::errors::ConversionError;
-use crate::keyspaces::{SYNC_QUARANTINE_KEYSPACE, SYNC_QUARANTINE_USAGE_KEYSPACE};
+use crate::keyspaces::{SYNC_QUARANTINE_KEYSPACE, QUARANTINE_USAGE_KEYSPACE};
 use crate::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use irokle::{ActorId, TopicId};
@@ -13,11 +13,11 @@ use ulid::Ulid;
 
 /// Single row of the usage keyspace; the quarantine keyspace itself stays a pure
 /// `topic || actor || actor_seq` prefix scan.
-pub const SYNC_QUARANTINE_USAGE_KEY: &[u8] = b"usage";
+pub const QUARANTINE_USAGE_KEY: &[u8] = b"usage";
 
 /// Hard defaults for [`SyncQuarantineCapacity`].
-pub const SYNC_QUARANTINE_MAX_RECORDS: u64 = 4_096;
-pub const SYNC_QUARANTINE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub const QUARANTINE_MAX_RECORDS: u64 = 4_096;
+pub const QUARANTINE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Which `DocumentEvent` variant the retained envelope carries, so listings
 /// can group by family without decoding `event_bytes`.
@@ -244,8 +244,8 @@ pub struct SyncQuarantineCapacity {
 impl Default for SyncQuarantineCapacity {
     fn default() -> Self {
         Self {
-            max_records: SYNC_QUARANTINE_MAX_RECORDS,
-            max_bytes: SYNC_QUARANTINE_MAX_BYTES,
+            max_records: QUARANTINE_MAX_RECORDS,
+            max_bytes: QUARANTINE_MAX_BYTES,
         }
     }
 }
@@ -342,8 +342,8 @@ pub fn quarantine_usage_entry(
     usage: SyncQuarantineUsage,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
-        SYNC_QUARANTINE_USAGE_KEYSPACE.to_string(),
-        ByteView::from(SYNC_QUARANTINE_USAGE_KEY),
+        QUARANTINE_USAGE_KEYSPACE.to_string(),
+        ByteView::from(QUARANTINE_USAGE_KEY),
         ByteView::from(usage.to_bytes()?),
     ))
 }
@@ -399,7 +399,7 @@ mod tests {
                 user_id: UserId::local(Ulid::from_bytes([6; 16]), realm_id),
                 realm_id,
             },
-            op: AdminDocumentOperation::RealmConfigDescriptionSet {
+            op: AdminDocumentOperation::ConfigDescriptionSet {
                 description: "quarantined".to_string(),
             },
         }
@@ -506,7 +506,7 @@ mod tests {
         assert_eq!(write.usage.bytes, write.row.2.len() as u64);
         assert_eq!(
             quarantine_usage_entry(write.usage).unwrap().0,
-            SYNC_QUARANTINE_USAGE_KEYSPACE
+            QUARANTINE_USAGE_KEYSPACE
         );
     }
 
@@ -527,7 +527,7 @@ mod tests {
             usage,
             SyncQuarantineCapacity {
                 max_records: 2,
-                max_bytes: SYNC_QUARANTINE_MAX_BYTES,
+                max_bytes: QUARANTINE_MAX_BYTES,
             },
         )
         .unwrap_err();
@@ -549,7 +549,7 @@ mod tests {
         };
         let capacity = SyncQuarantineCapacity {
             max_records: 1,
-            max_bytes: SYNC_QUARANTINE_MAX_BYTES,
+            max_bytes: QUARANTINE_MAX_BYTES,
         };
         let first = build_quarantine_entries(input(None), SyncQuarantineUsage::default(), capacity)
             .unwrap();

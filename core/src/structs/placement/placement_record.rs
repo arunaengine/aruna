@@ -14,16 +14,16 @@ pub const DEFAULT_NODE_WEIGHT: u32 = 100;
 /// can mask with `shard_count - 1`.
 pub const DEFAULT_SHARD_COUNT: u32 = 64;
 /// Maximum shard fan-out, fixed to the structured-id bucket capacity.
-pub const MAX_PLACEMENT_SHARD_COUNT: u32 = crate::structured_id::MAX_BUCKET_COUNT as u32;
+pub const MAX_SHARD_COUNT: u32 = crate::structured_id::MAX_BUCKET_COUNT as u32;
 /// Upper bound for a configurable node weight; onboarding/config inputs clamp
 /// present values into `1..=MAX_NODE_WEIGHT`.
 pub const MAX_NODE_WEIGHT: u32 = 10_000;
 /// Maximum accepted placement location length (bytes, after trim).
-pub const MAX_NODE_LOCATION_LEN: usize = 64;
+pub const MAX_LOCATION_LEN: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum NodeInputError {
-    #[error("placement location must be at most {MAX_NODE_LOCATION_LEN} characters")]
+    #[error("placement location must be at most {MAX_LOCATION_LEN} characters")]
     LocationTooLong,
 }
 
@@ -37,7 +37,7 @@ pub fn normalize_placement_input(
     let location = match location {
         Some(raw) => {
             let trimmed = raw.trim();
-            if trimmed.len() > MAX_NODE_LOCATION_LEN {
+            if trimmed.len() > MAX_LOCATION_LEN {
                 return Err(NodeInputError::LocationTooLong);
             }
             trimmed.to_string()
@@ -621,12 +621,12 @@ mod tests {
             "eu-west"
         );
         assert_eq!(normalize_placement_input(Some("   "), None).unwrap().0, "");
-        let long = "x".repeat(MAX_NODE_LOCATION_LEN + 1);
+        let long = "x".repeat(MAX_LOCATION_LEN + 1);
         assert_eq!(
             normalize_placement_input(Some(&long), None),
             Err(NodeInputError::LocationTooLong)
         );
-        let at_limit = "y".repeat(MAX_NODE_LOCATION_LEN);
+        let at_limit = "y".repeat(MAX_LOCATION_LEN);
         assert!(normalize_placement_input(Some(&at_limit), None).is_ok());
     }
 
@@ -722,10 +722,10 @@ mod tests {
         // Single source of truth: raising the codec bucket cap raises the placement shard cap in lockstep, so
         // a strategy can never declare more shards than the id's bucket field can encode.
         assert_eq!(
-            MAX_PLACEMENT_SHARD_COUNT,
+            MAX_SHARD_COUNT,
             crate::structured_id::MAX_BUCKET_COUNT as u32
         );
-        assert_eq!(MAX_PLACEMENT_SHARD_COUNT, 4096);
+        assert_eq!(MAX_SHARD_COUNT, 4096);
     }
 
     #[test]

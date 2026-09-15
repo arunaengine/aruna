@@ -3,7 +3,7 @@ use crate::errors::ConversionError;
 use serde::{Deserialize, Serialize};
 
 /// Bytes one vault payload may hold.
-pub const MAX_USER_VAULT_BYTES: usize = 64 * 1024;
+pub const MAX_VAULT_BYTES: usize = 64 * 1024;
 
 /// The passphrase-sealed keys of one user. The payload is the portal's own
 /// ciphertext and stays opaque; the node holds no key that opens it.

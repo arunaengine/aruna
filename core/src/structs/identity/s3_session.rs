@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;
 
-pub const S3_SESSION_MAX_TTL: Duration = Duration::from_secs(60 * 60);
-pub const S3_SESSION_REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
-pub const S3_SESSION_ACCESS_PREFIX: &str = "ASIA";
+pub const SESSION_MAX_TTL: Duration = Duration::from_secs(60 * 60);
+pub const SESSION_REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
+pub const SESSION_ACCESS_PREFIX: &str = "ASIA";
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct S3Session {
@@ -31,18 +31,18 @@ pub struct S3Session {
 impl S3Session {
     pub fn build_access_key(key_id: &str) -> Result<String, ConversionError> {
         let key_id = key_id.parse::<Ulid>()?.to_string();
-        Ok(format!("{S3_SESSION_ACCESS_PREFIX}{key_id}"))
+        Ok(format!("{SESSION_ACCESS_PREFIX}{key_id}"))
     }
 
     pub fn is_session_key(access_key: &str) -> bool {
-        access_key.starts_with(S3_SESSION_ACCESS_PREFIX)
+        access_key.starts_with(SESSION_ACCESS_PREFIX)
     }
 
     pub fn valid_access_key(access_key: &str) -> bool {
         access_key
-            .strip_prefix(S3_SESSION_ACCESS_PREFIX)
+            .strip_prefix(SESSION_ACCESS_PREFIX)
             .and_then(|key_id| key_id.parse::<Ulid>().ok())
-            .is_some_and(|key_id| format!("{S3_SESSION_ACCESS_PREFIX}{key_id}") == access_key)
+            .is_some_and(|key_id| format!("{SESSION_ACCESS_PREFIX}{key_id}") == access_key)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -62,7 +62,7 @@ impl S3Session {
             && self
                 .expiry
                 .duration_since(now)
-                .is_ok_and(|remaining| remaining <= S3_SESSION_REFRESH_WINDOW)
+                .is_ok_and(|remaining| remaining <= SESSION_REFRESH_WINDOW)
     }
 
     pub fn token_matches(&self, token_hash: &str) -> bool {
@@ -143,11 +143,11 @@ mod tests {
     #[test]
     fn refresh_at_boundary() {
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let session = session(start + S3_SESSION_MAX_TTL);
+        let session = session(start + SESSION_MAX_TTL);
 
         assert!(!session.can_refresh(start + Duration::from_secs(54 * 60 + 59)));
         assert!(session.can_refresh(start + Duration::from_secs(55 * 60)));
-        assert!(!session.can_refresh(start + S3_SESSION_MAX_TTL));
+        assert!(!session.can_refresh(start + SESSION_MAX_TTL));
     }
 
     #[test]

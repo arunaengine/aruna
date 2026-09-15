@@ -78,7 +78,7 @@ pub struct PeerConnectionState {
     pub status: PeerConnectionStatus,
     pub active_addresses: Vec<ConnectionAddressState>,
     pub last_error: Option<String>,
-    pub next_retry_in_secs: Option<u64>,
+    pub retry_in_secs: Option<u64>,
 }
 
 pub struct NetState {

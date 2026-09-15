@@ -12,7 +12,7 @@ use ulid::Ulid;
 
 /// Upper bound of a storage class identifier. The same vocabulary names node
 /// backend classes, routing targets and derived node labels.
-pub const STORAGE_CLASS_MAX_LEN: usize = 32;
+pub const CLASS_MAX_LEN: usize = 32;
 
 #[derive(Debug, Clone, Eq, PartialEq, Error)]
 pub enum RoutingError {
@@ -39,7 +39,7 @@ pub enum RoutingError {
 /// A storage class identifier is `[a-z0-9-]` of 1..=32 characters.
 pub fn validate_storage_class(class: &str) -> Result<(), RoutingError> {
     let valid = !class.is_empty()
-        && class.len() <= STORAGE_CLASS_MAX_LEN
+        && class.len() <= CLASS_MAX_LEN
         && class
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');

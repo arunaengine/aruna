@@ -18,8 +18,8 @@ mod sync_relationship;
 mod synced_folder;
 
 pub use assistant_chat::{
-    AssistantChatHead, AssistantChatTurn, MAX_ASSISTANT_CHAT_BYTES, MAX_ASSISTANT_CHAT_TURNS,
-    MAX_ASSISTANT_CHATS, MAX_ASSISTANT_TURN_BYTES,
+    AssistantChatHead, AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_TURNS,
+    MAX_ASSISTANT_CHATS, MAX_TURN_BYTES,
 };
 pub use assistant_provider::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
@@ -37,7 +37,7 @@ pub use persistent_id::{
     persistent_id_key, persistent_id_target,
 };
 pub use sync_quarantine::{
-    SYNC_QUARANTINE_MAX_BYTES, SYNC_QUARANTINE_MAX_RECORDS, SYNC_QUARANTINE_USAGE_KEY,
+    QUARANTINE_MAX_BYTES, QUARANTINE_MAX_RECORDS, QUARANTINE_USAGE_KEY,
     SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence, SyncQuarantineFamily,
     SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineRecord, SyncQuarantineUsage,
     SyncQuarantineWrite, build_quarantine_entries, check_quarantine_capacity, quarantine_row_entry,
@@ -50,7 +50,7 @@ pub use sync_relationship::{
 pub use synced_folder::{
     ActionKind, ActionOutcome, ActionScope, EntrySide, EntryState, FolderMode, FolderState,
     MAX_SYNC_PAGE, Observed, PendingMark, RemoteBinding, RemoteHead, ReplaceReason,
-    SYNC_SOURCE_VERSION_TAG, SYNC_TRASH_DIR, SyncAction, SyncActionRecord, SyncBase,
+    SYNC_VERSION_TAG, SYNC_TRASH_DIR, SyncAction, SyncActionRecord, SyncBase,
     SyncListCursor, SyncPageLimit, SyncPolicy, SyncPullAck, SyncRefusal, SyncVersionPage,
     SyncedBytes, SyncedFolder, WriteGuard, decide,
 };

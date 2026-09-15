@@ -1,6 +1,6 @@
 use crate::NodeId;
 use crate::structs::placement::placement_record::{
-    DEFAULT_LOCATION, LabelMatch, MAX_NODE_LOCATION_LEN,
+    DEFAULT_LOCATION, LabelMatch, MAX_LOCATION_LEN,
 };
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
@@ -13,17 +13,17 @@ pub const POLICY_DIGEST_DOMAIN: &[u8] = b"aruna-placement-policy-v2";
 /// Domain separator for the advertised placement-subject digest.
 pub const SUBJECT_DIGEST_DOMAIN: &[u8] = b"aruna-placement-subject-v1";
 /// Maximum policy name length in bytes, after trimming.
-pub const MAX_POLICY_NAME_LEN: usize = 128;
+pub const MAX_POLICY_LEN: usize = 128;
 /// Maximum OR-arms in one policy; a residency rule needs few alternatives.
 pub const MAX_POLICY_SELECTORS: usize = 32;
 /// Maximum ANDed label matches inside one selector.
 pub const MAX_SELECTOR_LABELS: usize = 16;
 /// Maximum label key length, above any realistic node or worker label key.
-pub const MAX_LABEL_KEY_LEN: usize = 128;
+pub const MAX_LABEL_LEN: usize = 128;
 /// Maximum label value length; an empty value is a valid label.
-pub const MAX_LABEL_VALUE_LEN: usize = 256;
+pub const MAX_VALUE_LEN: usize = 256;
 /// Maximum executor kind length, matching the short wire kinds nodes advertise.
-pub const MAX_EXECUTOR_KIND_LEN: usize = 32;
+pub const MAX_KIND_LEN: usize = 32;
 /// Maximum labels one advertised subject carries, above any realistic node or
 /// worker label set.
 pub const MAX_SUBJECT_LABELS: usize = 32;
@@ -32,7 +32,7 @@ pub const MAX_SUBJECT_LABELS: usize = 32;
 pub const MAX_POLICY_REFS: usize = 8;
 /// Raw refs one canonical set may be built from. A union of two governed sets
 /// stays acceptable, while a larger input is rejected before it is allocated.
-pub const MAX_POLICY_REF_INPUT: usize = 2 * MAX_POLICY_REFS;
+pub const MAX_REF_INPUT: usize = 2 * MAX_POLICY_REFS;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
 pub enum PlacementPolicyError {
@@ -40,7 +40,7 @@ pub enum PlacementPolicyError {
     NilPolicyId,
     #[error("owner group id must not be nil")]
     NilOwnerGroup,
-    #[error("policy name must be 1..={MAX_POLICY_NAME_LEN} bytes")]
+    #[error("policy name must be 1..={MAX_POLICY_LEN} bytes")]
     InvalidName,
     #[error("policy must define 1..={MAX_POLICY_SELECTORS} selectors")]
     SelectorCount,
@@ -48,21 +48,21 @@ pub enum PlacementPolicyError {
     EmptySelector,
     #[error("selector must define at most {MAX_SELECTOR_LABELS} label matches")]
     LabelCount,
-    #[error("label key must be 1..={MAX_LABEL_KEY_LEN} bytes, value at most {MAX_LABEL_VALUE_LEN}")]
+    #[error("label key must be 1..={MAX_LABEL_LEN} bytes, value at most {MAX_VALUE_LEN}")]
     InvalidLabel,
     #[error("subject carries at most {MAX_SUBJECT_LABELS} labels")]
     SubjectLabelCount,
     #[error("label key {key} is present with more than one spelling")]
     AmbiguousLabel { key: String },
-    #[error("selector location must be 1..={MAX_NODE_LOCATION_LEN} bytes")]
+    #[error("selector location must be 1..={MAX_LOCATION_LEN} bytes")]
     InvalidLocation,
-    #[error("selector executor kind must be 1..={MAX_EXECUTOR_KIND_LEN} bytes")]
+    #[error("selector executor kind must be 1..={MAX_KIND_LEN} bytes")]
     InvalidExecutorKind,
     #[error("policy document is not in canonical form")]
     NotCanonical,
     #[error("a governed record carries at most {MAX_POLICY_REFS} policy refs")]
     RefCount,
-    #[error("one evaluation resolves at most {MAX_POLICY_REF_INPUT} policies")]
+    #[error("one evaluation resolves at most {MAX_REF_INPUT} policies")]
     ResolutionCount,
     #[error("policy {policy_id} is referenced with two different digests")]
     ConflictingRefs { policy_id: Ulid },
@@ -215,7 +215,7 @@ impl PlacementPolicy {
             return Err(PlacementPolicyError::NilOwnerGroup);
         }
         let name = self.name.trim();
-        if name.is_empty() || name.len() > MAX_POLICY_NAME_LEN {
+        if name.is_empty() || name.len() > MAX_POLICY_LEN {
             return Err(PlacementPolicyError::InvalidName);
         }
         if self.allowed.is_empty() || self.allowed.len() > MAX_POLICY_SELECTORS {
@@ -333,13 +333,13 @@ impl PlacementSelector {
     pub fn validate(&self) -> Result<(), PlacementPolicyError> {
         if let Some(location) = self.location.as_deref() {
             let location = location.trim();
-            if location.is_empty() || location.len() > MAX_NODE_LOCATION_LEN {
+            if location.is_empty() || location.len() > MAX_LOCATION_LEN {
                 return Err(PlacementPolicyError::InvalidLocation);
             }
         }
         if let Some(kind) = self.executor_kind.as_deref() {
             let kind = kind.trim();
-            if kind.is_empty() || kind.len() > MAX_EXECUTOR_KIND_LEN {
+            if kind.is_empty() || kind.len() > MAX_KIND_LEN {
                 return Err(PlacementPolicyError::InvalidExecutorKind);
             }
         }
@@ -349,8 +349,8 @@ impl PlacementSelector {
         for label in &self.labels {
             let key = label.key.trim();
             if key.is_empty()
-                || key.len() > MAX_LABEL_KEY_LEN
-                || label.value.trim().len() > MAX_LABEL_VALUE_LEN
+                || key.len() > MAX_LABEL_LEN
+                || label.value.trim().len() > MAX_VALUE_LEN
             {
                 return Err(PlacementPolicyError::InvalidLabel);
             }
@@ -425,7 +425,7 @@ impl PlacementPolicyRef {
     /// is bounded before it is copied, and two digests for one policy id
     /// contradict policy immutability and fail closed.
     pub fn canonical_set(refs: &[Self]) -> Result<Vec<Self>, PlacementPolicyError> {
-        if refs.len() > MAX_POLICY_REF_INPUT {
+        if refs.len() > MAX_REF_INPUT {
             return Err(PlacementPolicyError::RefCount);
         }
         let mut canonical = refs.to_vec();
@@ -449,7 +449,7 @@ impl PlacementSubject {
     /// Bounds every advertised attribute before it is evaluated or hashed. Two
     /// label keys that trim to one key are ambiguous rather than merged.
     pub fn validate(&self) -> Result<(), PlacementPolicyError> {
-        if self.location.trim().len() > MAX_NODE_LOCATION_LEN {
+        if self.location.trim().len() > MAX_LOCATION_LEN {
             return Err(PlacementPolicyError::InvalidLocation);
         }
         if self.labels.len() > MAX_SUBJECT_LABELS {
@@ -459,8 +459,8 @@ impl PlacementSubject {
         for (key, value) in &self.labels {
             let key = key.trim();
             if key.is_empty()
-                || key.len() > MAX_LABEL_KEY_LEN
-                || value.trim().len() > MAX_LABEL_VALUE_LEN
+                || key.len() > MAX_LABEL_LEN
+                || value.trim().len() > MAX_VALUE_LEN
             {
                 return Err(PlacementPolicyError::InvalidLabel);
             }
@@ -472,7 +472,7 @@ impl PlacementSubject {
         }
         if let Some(kind) = self.executor_kind.as_deref() {
             let kind = kind.trim();
-            if kind.is_empty() || kind.len() > MAX_EXECUTOR_KIND_LEN {
+            if kind.is_empty() || kind.len() > MAX_KIND_LEN {
                 return Err(PlacementPolicyError::InvalidExecutorKind);
             }
         }
@@ -537,7 +537,7 @@ pub fn evaluate_placement(
     resolved: &BTreeMap<Ulid, PolicyResolution>,
     subject: &PlacementSubject,
 ) -> PlacementDecision {
-    if resolved.len() > MAX_POLICY_REF_INPUT {
+    if resolved.len() > MAX_REF_INPUT {
         return PlacementDecision::InvalidInput {
             reason: PlacementPolicyError::ResolutionCount,
         };

@@ -10,7 +10,7 @@ use crate::{MetaResourceId, StructuredId};
 /// Domain tag separating the path-claim winner digest from every other hash in
 /// the system (a MetaResourceId or event id must never be reusable as a winner
 /// preimage elsewhere).
-const PATH_CLAIM_WINNER_DOMAIN: &[u8] = b"aruna-path-claim-v1";
+const CLAIM_WINNER_DOMAIN: &[u8] = b"aruna-path-claim-v1";
 
 /// One retained claim of a normalized canonical path by a committed Meta
 /// Resource. Identified by its `MetaResourceId` (the `document_id`) plus the
@@ -30,7 +30,7 @@ impl PathClaimRecord {
     /// The domain-separated digest over path, document, and establishing event.
     fn winner_digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(PATH_CLAIM_WINNER_DOMAIN);
+        hasher.update(CLAIM_WINNER_DOMAIN);
         hasher.update(self.requested_path.as_bytes());
         hasher.update(&self.document_id.to_bytes());
         hasher.update(&self.establishing_event_id.to_bytes());

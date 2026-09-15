@@ -25,7 +25,7 @@ pub enum BindingError {
     Conflicted(PlacementHandle),
     /// `bucket >= bucket_count` of the resolved strategy (REQ-META-ID-FORMAT-001).
     #[error(transparent)]
-    BucketOutOfRange(BucketRangeError),
+    OutOfRange(BucketRangeError),
     /// The strategy named by the resolved binding is unknown to the caller.
     #[error("strategy {0} named by the binding is unknown")]
     UnknownStrategy(Ulid),
@@ -181,7 +181,7 @@ impl BindingDirectory {
         let bucket_count = bucket_count_of(tuple.strategy_id)
             .ok_or(BindingError::UnknownStrategy(tuple.strategy_id))?;
         id.validate_bucket(bucket_count)
-            .map_err(BindingError::BucketOutOfRange)?;
+            .map_err(BindingError::OutOfRange)?;
         Ok(ResolvedBinding {
             scope: tuple.scope,
             document_class: tuple.document_class,
@@ -326,7 +326,7 @@ mod tests {
         // bucket == bucket_count is out of range: fail closed.
         assert!(matches!(
             directory.resolve_id(&id_with(10, 64), |_| Some(64)),
-            Err(BindingError::BucketOutOfRange(_))
+            Err(BindingError::OutOfRange(_))
         ));
 
         // A missing strategy is a fail-closed resolution error too.

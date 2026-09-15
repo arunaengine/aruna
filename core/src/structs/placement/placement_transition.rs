@@ -16,15 +16,15 @@ pub const TRANSITION_PROOF_DOMAIN: &[u8] = b"aruna-transition-proof-v1";
 pub const TRANSITION_BARRIER_DOMAIN: &[u8] = b"aruna-transition-barrier-v1";
 /// Default window a cut-over bucket keeps its old holders as members and
 /// retained publishers before they are released.
-pub const DEFAULT_TRANSITION_GRACE_MS: u64 = 3_600_000;
+pub const TRANSITION_GRACE_MS: u64 = 3_600_000;
 /// A transition still incomplete after this long is surfaced to operators. It
 /// is a health signal only: nothing about the record changes.
 pub const TRANSITION_OVERDUE_MS: u64 = 86_400_000;
 /// Upper bound on a reported barrier frontier: a postcard `ActorClock` is tens
 /// of bytes per actor, so this covers realms far beyond current scale.
-pub const MAX_BARRIER_FRONTIER_BYTES: usize = 65_536;
+pub const MAX_FRONTIER_BYTES: usize = 65_536;
 /// Upper bound on a stall or force reason; reasons are diagnostics.
-pub const MAX_STALL_REASON_BYTES: usize = 1_024;
+pub const MAX_STALL_BYTES: usize = 1_024;
 
 /// One eligible node as frozen into a candidate map. Selection input only: the
 /// selector ranks over these fields and never over live config state.
@@ -101,7 +101,7 @@ impl Default for TransitionLimits {
     fn default() -> Self {
         Self {
             max_incomplete_buckets: 1,
-            grace_ms: DEFAULT_TRANSITION_GRACE_MS,
+            grace_ms: TRANSITION_GRACE_MS,
         }
     }
 }

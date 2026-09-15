@@ -13,9 +13,9 @@ use ulid::Ulid;
 /// durably assigned. A replay reads it instead of minting a second version.
 pub const POLICY_MUTATION_KEYSPACE: &str = "policy_mutations";
 /// One row per bulk run, capturing the bucket default every intent applies.
-pub const POLICY_BULK_RUN_KEYSPACE: &str = "policy_bulk_runs";
+pub const BULK_RUN_KEYSPACE: &str = "policy_bulk_runs";
 /// One row per (run, object): observed head, preassigned successor, outcome.
-pub const POLICY_BULK_INTENT_KEYSPACE: &str = "policy_bulk_intents";
+pub const BULK_INTENT_KEYSPACE: &str = "policy_bulk_intents";
 
 /// How target refs combine with the refs already on the re-read head.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -331,7 +331,7 @@ fn validate_bounds_inputs() {
         ..selector()
     };
     let mut named = policy(vec![valid.clone()]);
-    named.name = "n".repeat(MAX_POLICY_NAME_LEN + 1);
+    named.name = "n".repeat(MAX_POLICY_LEN + 1);
     assert_eq!(named.validate(), Err(PlacementPolicyError::InvalidName));
     named.name = "  ".to_string();
     assert_eq!(named.validate(), Err(PlacementPolicyError::InvalidName));
@@ -350,7 +350,7 @@ fn validate_bounds_inputs() {
     );
 
     let long_location = policy(vec![PlacementSelector {
-        location: Some("l".repeat(MAX_NODE_LOCATION_LEN + 1)),
+        location: Some("l".repeat(MAX_LOCATION_LEN + 1)),
         ..selector()
     }]);
     assert_eq!(
@@ -359,7 +359,7 @@ fn validate_bounds_inputs() {
     );
 
     let long_kind = policy(vec![PlacementSelector {
-        executor_kind: Some("k".repeat(MAX_EXECUTOR_KIND_LEN + 1)),
+        executor_kind: Some("k".repeat(MAX_KIND_LEN + 1)),
         ..selector()
     }]);
     assert_eq!(
@@ -377,7 +377,7 @@ fn validate_bounds_inputs() {
     );
 
     let long_key = policy(vec![PlacementSelector {
-        labels: vec![label(&"k".repeat(MAX_LABEL_KEY_LEN + 1), "a")],
+        labels: vec![label(&"k".repeat(MAX_LABEL_LEN + 1), "a")],
         ..selector()
     }]);
     assert_eq!(long_key.validate(), Err(PlacementPolicyError::InvalidLabel));
@@ -514,7 +514,7 @@ fn refs_reject_conflicts() {
     );
     // The raw input is bounded before it is copied and deduplicated.
     assert_eq!(
-        PlacementPolicyRef::canonical_set(&distinct_refs(MAX_POLICY_REF_INPUT + 1)),
+        PlacementPolicyRef::canonical_set(&distinct_refs(MAX_REF_INPUT + 1)),
         Err(PlacementPolicyError::RefCount)
     );
     assert!(PlacementPolicyRef::canonical_set(&distinct_refs(MAX_POLICY_REFS)).is_ok());
@@ -550,7 +550,7 @@ fn invalid_known_blocks() {
             ..base.clone()
         },
         PlacementPolicy {
-            name: "n".repeat(MAX_POLICY_NAME_LEN + 1),
+            name: "n".repeat(MAX_POLICY_LEN + 1),
             ..base.clone()
         },
         PlacementPolicy {
@@ -566,14 +566,14 @@ fn invalid_known_blocks() {
         },
         PlacementPolicy {
             allowed: vec![PlacementSelector {
-                location: Some("l".repeat(MAX_NODE_LOCATION_LEN + 1)),
+                location: Some("l".repeat(MAX_LOCATION_LEN + 1)),
                 ..selector()
             }],
             ..base.clone()
         },
         PlacementPolicy {
             allowed: vec![PlacementSelector {
-                executor_kind: Some("k".repeat(MAX_EXECUTOR_KIND_LEN + 1)),
+                executor_kind: Some("k".repeat(MAX_KIND_LEN + 1)),
                 ..valid
             }],
             ..base.clone()
@@ -638,7 +638,7 @@ fn oversized_refs_rejected() {
         }
     );
     assert_eq!(
-        evaluate_placement(&distinct_refs(MAX_POLICY_REF_INPUT + 1), &store, &subject()),
+        evaluate_placement(&distinct_refs(MAX_REF_INPUT + 1), &store, &subject()),
         PlacementDecision::InvalidInput {
             reason: PlacementPolicyError::RefCount
         }
@@ -663,7 +663,7 @@ fn oversized_refs_rejected() {
 #[test]
 fn oversized_resolution_rejected() {
     // An empty ref set must not shortcut a malformed resolution map.
-    let store = (0..=MAX_POLICY_REF_INPUT)
+    let store = (0..=MAX_REF_INPUT)
         .map(|_| (Ulid::generate(), PolicyResolution::Unresolved))
         .collect();
     assert_eq!(
@@ -679,7 +679,7 @@ fn subject_bounds_rejected() {
     let cases = vec![
         (
             PlacementSubject {
-                location: "l".repeat(MAX_NODE_LOCATION_LEN + 1),
+                location: "l".repeat(MAX_LOCATION_LEN + 1),
                 ..subject()
             },
             PlacementPolicyError::InvalidLocation,
@@ -695,14 +695,14 @@ fn subject_bounds_rejected() {
         ),
         (
             PlacementSubject {
-                labels: BTreeMap::from([("k".repeat(MAX_LABEL_KEY_LEN + 1), "a".to_string())]),
+                labels: BTreeMap::from([("k".repeat(MAX_LABEL_LEN + 1), "a".to_string())]),
                 ..subject()
             },
             PlacementPolicyError::InvalidLabel,
         ),
         (
             PlacementSubject {
-                labels: BTreeMap::from([("zone".to_string(), "v".repeat(MAX_LABEL_VALUE_LEN + 1))]),
+                labels: BTreeMap::from([("zone".to_string(), "v".repeat(MAX_VALUE_LEN + 1))]),
                 ..subject()
             },
             PlacementPolicyError::InvalidLabel,
@@ -716,7 +716,7 @@ fn subject_bounds_rejected() {
         ),
         (
             PlacementSubject {
-                executor_kind: Some("k".repeat(MAX_EXECUTOR_KIND_LEN + 1)),
+                executor_kind: Some("k".repeat(MAX_KIND_LEN + 1)),
                 ..subject()
             },
             PlacementPolicyError::InvalidExecutorKind,

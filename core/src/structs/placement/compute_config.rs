@@ -3,7 +3,7 @@
 //! an unconfigured link, and how long an availability sample stays meaningful.
 
 use crate::compute_quota::ComputeQuota;
-use crate::structs::placement::placement_record::MAX_NODE_LOCATION_LEN;
+use crate::structs::placement::placement_record::MAX_LOCATION_LEN;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -15,24 +15,24 @@ pub const MAX_LOCATION_LINKS: usize = 256;
 /// Bandwidth assumed for an unconfigured directed link: 100 Mbit/s.
 pub const DEFAULT_PESSIMISTIC_BANDWIDTH: u64 = 12_500_000;
 /// Age above which an availability sample only counts as unknown.
-pub const DEFAULT_AVAILABILITY_STALE_MS: u64 = 300_000;
+pub const AVAILABILITY_STALE_MS: u64 = 300_000;
 /// Delay per witness rank. `base * (RF - 1)` bounds leaderless launch failover when higher ranks
 /// are down, making the operator setting the explicit failover control.
-pub const DEFAULT_WITNESS_BASE_DELAY_MS: u64 = 30_000;
+pub const WITNESS_DELAY_MS: u64 = 30_000;
 /// How long a witness waits for a launch to produce a receipt, and how long an
 /// executor node may stay silent, before the round plans again: 5 minutes.
-pub const DEFAULT_CATCH_UP_AFTER_MS: u64 = 300_000;
+pub const CATCH_UP_MS: u64 = 300_000;
 /// How long an interactive session may stay without a cell submit before the
 /// node ends it: 30 minutes.
-pub const DEFAULT_SESSION_IDLE_AFTER_MS: u64 = 1_800_000;
+pub const IDLE_AFTER_MS: u64 = 1_800_000;
 /// Groups one realm gives an explicit compute quota.
-pub const MAX_GROUP_COMPUTE_QUOTAS: usize = 256;
+pub const MAX_COMPUTE_QUOTAS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ComputeConfigError {
     #[error("a realm configures at most {MAX_LOCATION_LINKS} location links")]
     LinkCount,
-    #[error("link endpoints must be 1..={MAX_NODE_LOCATION_LEN} bytes")]
+    #[error("link endpoints must be 1..={MAX_LOCATION_LEN} bytes")]
     InvalidLocation,
     #[error("link bandwidth must be greater than zero")]
     ZeroBandwidth,
@@ -41,10 +41,10 @@ pub enum ComputeConfigError {
     #[error("witness base delay must be greater than zero")]
     ZeroWitnessDelay,
     #[error("catch-up wait must be greater than zero")]
-    ZeroCatchUpWait,
+    ZeroCatchUp,
     #[error("session idle timeout must be greater than zero")]
     ZeroSessionIdle,
-    #[error("a realm configures at most {MAX_GROUP_COMPUTE_QUOTAS} group compute quotas")]
+    #[error("a realm configures at most {MAX_COMPUTE_QUOTAS} group compute quotas")]
     QuotaCount,
     #[error("group {group_id} has two compute quotas")]
     DuplicateQuota { group_id: GroupId },
@@ -56,7 +56,8 @@ pub enum ComputeConfigError {
 pub struct LocationLink {
     pub from: String,
     pub to: String,
-    pub bandwidth_bytes_per_sec: u64,
+    #[serde(rename = "bandwidth_bytes_per_sec")]
+    pub bandwidth_per_sec: u64,
 }
 
 /// One group's standing compute quota. An entry replaces the realm default
@@ -72,32 +73,37 @@ pub struct RealmComputeConfig {
     pub links: Vec<LocationLink>,
     /// Assumed for a link the realm never configured. It keeps an unknown route
     /// expensive and size-sensitive instead of impossible.
-    pub pessimistic_bandwidth_bytes_per_sec: u64,
-    pub availability_stale_after_ms: u64,
+    #[serde(rename = "pessimistic_bandwidth_bytes_per_sec")]
+    pub pessimistic_per_sec: u64,
+    #[serde(rename = "availability_stale_after_ms")]
+    pub availability_stale_ms: u64,
     /// Per-rank fallback delay of the leaderless witness schedule.
-    pub witness_base_delay_ms: u64,
+    #[serde(rename = "witness_base_delay_ms")]
+    pub witness_delay_ms: u64,
     /// Applies to every group without its own entry.
     pub default_group_quota: ComputeQuota,
     pub group_quotas: Vec<GroupComputeQuota>,
     /// Wait window before a round plans again: how long a launch may stay
     /// without a receipt, and how long an executor node may stay silent.
-    pub catch_up_after_ms: u64,
+    #[serde(rename = "catch_up_after_ms")]
+    pub catch_up_ms: u64,
     /// How long an interactive session job may stay without a cell submit
     /// before the executing node ends it. A submit resets the wait.
-    pub session_idle_after_ms: u64,
+    #[serde(rename = "session_idle_after_ms")]
+    pub session_idle_ms: u64,
 }
 
 impl Default for RealmComputeConfig {
     fn default() -> Self {
         Self {
             links: Vec::new(),
-            pessimistic_bandwidth_bytes_per_sec: DEFAULT_PESSIMISTIC_BANDWIDTH,
-            availability_stale_after_ms: DEFAULT_AVAILABILITY_STALE_MS,
-            witness_base_delay_ms: DEFAULT_WITNESS_BASE_DELAY_MS,
+            pessimistic_per_sec: DEFAULT_PESSIMISTIC_BANDWIDTH,
+            availability_stale_ms: AVAILABILITY_STALE_MS,
+            witness_delay_ms: WITNESS_DELAY_MS,
             default_group_quota: ComputeQuota::default(),
             group_quotas: Vec::new(),
-            catch_up_after_ms: DEFAULT_CATCH_UP_AFTER_MS,
-            session_idle_after_ms: DEFAULT_SESSION_IDLE_AFTER_MS,
+            catch_up_ms: CATCH_UP_MS,
+            session_idle_ms: IDLE_AFTER_MS,
         }
     }
 }
@@ -109,20 +115,20 @@ impl RealmComputeConfig {
         if self.links.len() > MAX_LOCATION_LINKS {
             return Err(ComputeConfigError::LinkCount);
         }
-        if self.pessimistic_bandwidth_bytes_per_sec == 0 {
+        if self.pessimistic_per_sec == 0 {
             return Err(ComputeConfigError::ZeroBandwidth);
         }
         // Zero would let every rank plan at once, which is the launch storm the
         // ranked fallback exists to avoid.
-        if self.witness_base_delay_ms == 0 {
+        if self.witness_delay_ms == 0 {
             return Err(ComputeConfigError::ZeroWitnessDelay);
         }
         // Zero would make every launch look overdue at once.
-        if self.catch_up_after_ms == 0 {
-            return Err(ComputeConfigError::ZeroCatchUpWait);
+        if self.catch_up_ms == 0 {
+            return Err(ComputeConfigError::ZeroCatchUp);
         }
         // Zero would end every session before its first cell.
-        if self.session_idle_after_ms == 0 {
+        if self.session_idle_ms == 0 {
             return Err(ComputeConfigError::ZeroSessionIdle);
         }
         let mut seen = BTreeSet::new();
@@ -130,12 +136,12 @@ impl RealmComputeConfig {
             let (from, to) = (link.from.trim(), link.to.trim());
             if from.is_empty()
                 || to.is_empty()
-                || from.len() > MAX_NODE_LOCATION_LEN
-                || to.len() > MAX_NODE_LOCATION_LEN
+                || from.len() > MAX_LOCATION_LEN
+                || to.len() > MAX_LOCATION_LEN
             {
                 return Err(ComputeConfigError::InvalidLocation);
             }
-            if link.bandwidth_bytes_per_sec == 0 {
+            if link.bandwidth_per_sec == 0 {
                 return Err(ComputeConfigError::ZeroBandwidth);
             }
             if !seen.insert((from, to)) {
@@ -161,7 +167,7 @@ impl RealmComputeConfig {
     }
 
     fn validate_quotas(&self) -> Result<(), ComputeConfigError> {
-        if self.group_quotas.len() > MAX_GROUP_COMPUTE_QUOTAS {
+        if self.group_quotas.len() > MAX_COMPUTE_QUOTAS {
             return Err(ComputeConfigError::QuotaCount);
         }
         let mut seen = BTreeSet::new();
@@ -184,7 +190,7 @@ mod tests {
         LocationLink {
             from: from.to_string(),
             to: to.to_string(),
-            bandwidth_bytes_per_sec: bandwidth,
+            bandwidth_per_sec: bandwidth,
         }
     }
 
@@ -203,7 +209,7 @@ mod tests {
         for links in [
             vec![link("eu", "us", 0)],
             vec![link("", "us", 10)],
-            vec![link("eu", &"x".repeat(MAX_NODE_LOCATION_LEN + 1), 10)],
+            vec![link("eu", &"x".repeat(MAX_LOCATION_LEN + 1), 10)],
             vec![link("eu", "us", 10), link(" eu ", "us", 20)],
         ] {
             let config = RealmComputeConfig {
@@ -214,7 +220,7 @@ mod tests {
         }
         assert!(
             RealmComputeConfig {
-                pessimistic_bandwidth_bytes_per_sec: 0,
+                pessimistic_per_sec: 0,
                 ..Default::default()
             }
             .validate()
@@ -222,7 +228,7 @@ mod tests {
         );
         assert_eq!(
             RealmComputeConfig {
-                witness_base_delay_ms: 0,
+                witness_delay_ms: 0,
                 ..Default::default()
             }
             .validate(),
@@ -230,15 +236,15 @@ mod tests {
         );
         assert_eq!(
             RealmComputeConfig {
-                catch_up_after_ms: 0,
+                catch_up_ms: 0,
                 ..Default::default()
             }
             .validate(),
-            Err(ComputeConfigError::ZeroCatchUpWait)
+            Err(ComputeConfigError::ZeroCatchUp)
         );
         assert_eq!(
             RealmComputeConfig {
-                session_idle_after_ms: 0,
+                session_idle_ms: 0,
                 ..Default::default()
             }
             .validate(),

@@ -8,7 +8,7 @@ mod generator;
 mod layout;
 
 pub use generator::{
-    ClockHealthError, DEFAULT_MAX_ID_CLOCK_SKEW_MS, IdEnvironment, StructuredIdGenerator,
+    ClockHealthError, MAX_ID_SKEW, IdEnvironment, StructuredIdGenerator,
     SystemEnvironment,
 };
 
@@ -28,13 +28,13 @@ pub enum FieldError {
     #[error("placement handle 0 is reserved and must not be allocated")]
     ReservedHandle,
     #[error("placement handle {0} exceeds the 20-bit range")]
-    HandleOutOfRange(u32),
+    HandleRangeError(u32),
     #[error("bucket {0} exceeds the 12-bit range")]
-    BucketOutOfRange(u16),
+    OutOfRange(u16),
     #[error("timestamp {0} exceeds the 48-bit range")]
-    TimestampOutOfRange(u64),
+    TimestampRange(u64),
     #[error("nonce {0} exceeds the 48-bit range")]
-    NonceOutOfRange(u64),
+    NonceRange(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -65,7 +65,7 @@ impl PlacementHandle {
         if value == layout::RESERVED_HANDLE {
             Err(FieldError::ReservedHandle)
         } else if value > layout::MAX_HANDLE {
-            Err(FieldError::HandleOutOfRange(value))
+            Err(FieldError::HandleRangeError(value))
         } else {
             Ok(Self(value))
         }
@@ -96,7 +96,7 @@ pub struct BucketId(u16);
 impl BucketId {
     pub const fn new(value: u16) -> Result<Self, FieldError> {
         if value > layout::MAX_BUCKET {
-            Err(FieldError::BucketOutOfRange(value))
+            Err(FieldError::OutOfRange(value))
         } else {
             Ok(Self(value))
         }
@@ -164,10 +164,10 @@ pub trait StructuredId: Sized + Copy + private::Private {
         nonce: u64,
     ) -> Result<Self, FieldError> {
         if timestamp_ms > layout::MAX_TIMESTAMP_MS {
-            return Err(FieldError::TimestampOutOfRange(timestamp_ms));
+            return Err(FieldError::TimestampRange(timestamp_ms));
         }
         if nonce > layout::MAX_NONCE {
-            return Err(FieldError::NonceOutOfRange(nonce));
+            return Err(FieldError::NonceRange(nonce));
         }
         Ok(Self::from_ulid(
             Ulid(layout::pack(
@@ -386,11 +386,11 @@ mod tests {
     fn width_overflow_rejected() {
         assert_eq!(
             PlacementHandle::new(0x100000),
-            Err(FieldError::HandleOutOfRange(0x100000))
+            Err(FieldError::HandleRangeError(0x100000))
         );
         assert_eq!(
             BucketId::new(0x1000),
-            Err(FieldError::BucketOutOfRange(0x1000))
+            Err(FieldError::OutOfRange(0x1000))
         );
     }
 

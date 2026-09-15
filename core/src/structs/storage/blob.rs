@@ -23,12 +23,12 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;
 
-const ACCESS_KEY_MAX_LEN: usize = 128;
+const KEY_MAX_LEN: usize = 128;
 pub const HIDDEN_BLOB_PREFIX: &str = "_jobs";
 /// Reserved container prefix holding in-flight multipart parts, so parts never
 /// share a namespace with tenant-written keys.
 pub const MULTIPART_PART_PREFIX: &str = "_parts";
-pub const OBJECT_CONTENT_TYPE_KEY: &str = "aruna.internal.content-type";
+pub const CONTENT_TYPE_KEY: &str = "aruna.internal.content-type";
 
 /// MIME type implied by a key's extension, for writers that have no declared
 /// type. A captured `chart.png` must serve as an image rather than a download.
@@ -202,16 +202,16 @@ impl ResolvedBackend {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlobTimeoutConfig {
-    pub control_plane_connect_timeout: Duration,
-    pub control_plane_io_timeout: Duration,
+    pub control_connect_timeout: Duration,
+    pub control_io_timeout: Duration,
     pub transfer_idle_timeout: Duration,
 }
 
 impl Default for BlobTimeoutConfig {
     fn default() -> Self {
         Self {
-            control_plane_connect_timeout: Duration::from_secs(30),
-            control_plane_io_timeout: Duration::from_secs(30),
+            control_connect_timeout: Duration::from_secs(30),
+            control_io_timeout: Duration::from_secs(30),
             transfer_idle_timeout: Duration::from_secs(30 * 60),
         }
     }
@@ -932,7 +932,7 @@ pub enum ManagedCopyQuarantine {
 /// oversized or noncanonical set can never be persisted or served.
 pub(crate) fn checked_refs(refs: &[PlacementPolicyRef]) -> Result<(), ConversionError> {
     if PlacementPolicyRef::canonical_set(refs)? != refs {
-        return Err(ConversionError::NonCanonicalPolicyRefs);
+        return Err(ConversionError::NonCanonicalRefs);
     }
     Ok(())
 }
@@ -1210,9 +1210,9 @@ impl UserAccess {
     /// Access keys are the key id itself, kept strictly alphanumeric so every
     /// S3 client and the CSI mount driver accept them verbatim.
     pub fn build_access_key(key_id: &str) -> Result<String, ConversionError> {
-        if key_id.is_empty() || key_id.len() > ACCESS_KEY_MAX_LEN {
+        if key_id.is_empty() || key_id.len() > KEY_MAX_LEN {
             return Err(ConversionError::InvalidLength(format!(
-                "access key must be 1..={ACCESS_KEY_MAX_LEN} characters"
+                "access key must be 1..={KEY_MAX_LEN} characters"
             )));
         }
         if !key_id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {

@@ -14,7 +14,7 @@ pub const MAX_SYNC_PAGE: usize = 256;
 
 /// Version metadata tag naming the device version a realm object was pulled
 /// from. It makes a replayed pull idempotent instead of a second version.
-pub const SYNC_SOURCE_VERSION_TAG: &str = "aruna-sync-source-version";
+pub const SYNC_VERSION_TAG: &str = "aruna-sync-source-version";
 
 /// Directory a folder's move-aside puts files into, relative to the root.
 pub const SYNC_TRASH_DIR: &str = ".aruna/trash";
@@ -90,7 +90,8 @@ pub struct SyncedFolder {
     pub created_at_ms: u64,
     pub last_reconcile_ms: Option<u64>,
     pub last_error: Option<String>,
-    pub last_error_at_ms: Option<u64>,
+    #[serde(rename = "last_error_at_ms")]
+    pub last_error_ms: Option<u64>,
     pub observed_files: u64,
     /// Where the next pass resumes listing the realm heads. A folder larger
     /// than one pass converges over several, and a pass never decides about
@@ -973,7 +974,7 @@ mod tests {
             created_at_ms: 7,
             last_reconcile_ms: None,
             last_error: None,
-            last_error_at_ms: None,
+            last_error_ms: None,
             observed_files: 0,
             list_cursor: None,
         };

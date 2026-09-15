@@ -8,7 +8,7 @@ use ulid::Ulid;
 
 pub const ARUNA_DATA_PREFIX: &str = "https://w3id.org/aruna/data/";
 
-const ARN_KEY_ENCODE_SET: &AsciiSet = &CONTROLS
+const KEY_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'!')
     .add(b'"')
@@ -298,7 +298,7 @@ impl W3idIdentifier {
 }
 
 fn encode_object_key(key: &str) -> String {
-    utf8_percent_encode(key, ARN_KEY_ENCODE_SET).to_string()
+    utf8_percent_encode(key, KEY_ENCODE_SET).to_string()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -342,7 +342,8 @@ pub enum ReplicationItemKind {
 pub enum ReplicationNegotiationResult {
     AlreadyReplicatedVersion,
     NeedVersionOnly,
-    NeedBlobAndVersion,
+    #[serde(rename = "NeedBlobAndVersion")]
+    NeedBlobVersion,
     Rejected(String),
 }
 
