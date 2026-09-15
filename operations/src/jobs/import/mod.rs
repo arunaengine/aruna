@@ -6,9 +6,9 @@ pub(crate) mod rewrite;
 mod upload;
 
 pub use upload::{
-    CreateRoCrateUploadConfig, CreateRoCrateUploadError, CreateRoCrateUploadOperation,
-    UploadClaimError, claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload,
-    read_rocrate_upload, write_rocrate_upload,
+    CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation, UploadClaimError,
+    claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload, read_rocrate_upload,
+    write_rocrate_upload,
 };
 
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use aruna_core::effects::{BlobEffect, StorageEffect};
-use aruna_core::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
+use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE};
 use aruna_core::metadata::MetadataValidationViolation;
@@ -52,24 +52,20 @@ use super::store::{list_job_entries, put_job_entry, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
 use crate::forward::transport::MetadataWriteError;
-use crate::metadata::MetadataAuthToken;
+use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
 use crate::metadata::forward::route_metadata_create;
 use crate::notifications::watch::emit::emit_metadata_created;
-use crate::realm::get_config::GetRealmConfigOperation;
-use crate::replication::queue::{
-    QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
-};
+use crate::realm::get_config::GetConfigOperation;
+use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::delete_object::DeleteObjectError;
-use crate::s3::delete_objects::{DeleteObjectsEntry, DeleteObjectsInput, delete_objects};
-use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::delete_objects::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::staging::read_source::{
-    ReadStagingSourceError, ReadStagingSourceInput, ReadStagingSourceOperation,
-};
+use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 
 const PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -467,7 +463,7 @@ async fn acquire_source(
             )
             .await?;
             let result = drive(
-                ReadStagingSourceOperation::new(ReadStagingSourceInput {
+                ReadSourceOperation::new(ReadSourceInput {
                     group_id: *group_id,
                     connector_id: *connector_id,
                     source_path: path.clone(),
@@ -826,7 +822,7 @@ async fn write_next(
     )
     .await?;
     let quota = drive(
-        GetRealmConfigOperation::new(spec.auth_context.realm_id),
+        GetConfigOperation::new(spec.auth_context.realm_id),
         &ctx.driver,
     )
     .await
@@ -911,7 +907,7 @@ async fn write_next(
     }
     checkpoint.next_entry = checkpoint.next_entry.saturating_add(1);
     let _ = drive(
-        QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+        LiveVersionOperation::new(LiveVersionInput {
             local_node_id: ctx.owner_node_id,
             auth_context: spec.auth_context.clone(),
             bucket: spec.target.bucket.clone(),
@@ -1004,16 +1000,16 @@ async fn create_document(
         realm_id: spec.auth_context.realm_id,
     };
     match route_metadata_create(
-        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
             actor,
             group_id: spec.metadata.group_id,
             document_id: spec.document_id,
             document_path: spec.metadata.path.clone(),
             public: spec.metadata.public,
-            payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
+            payload: CreateDocumentPayload::RoCrate { jsonld },
         }),
         ctx.driver.clone(),
-        Some(MetadataAuthToken::internal(spec.auth_context.clone())),
+        Some(AuthToken::internal(spec.auth_context.clone())),
     )
     .await
     {
@@ -1119,11 +1115,11 @@ async fn rollback_writes(
         })?;
     let outcomes = delete_objects(
         &ctx.driver,
-        DeleteObjectsInput {
+        BulkDeleteInput {
             bucket: spec.target.bucket.clone(),
             entries: plan.entries[..attempted]
                 .iter()
-                .map(|entry| DeleteObjectsEntry {
+                .map(|entry| BulkDeleteEntry {
                     key: entry.target_key.clone(),
                     version_id: Some(entry.version_id),
                 })
@@ -1233,9 +1229,9 @@ async fn ensure_permission(
 }
 
 async fn load_bucket(ctx: &JobContext, bucket: &str) -> Result<BucketInfo, ImportFailure> {
-    match drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver).await {
+    match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
         Ok(info) => Ok(info),
-        Err(GetBucketInfoError::NotFound) => Err(ImportFailure::Permanent(format!(
+        Err(GetBucketError::NotFound) => Err(ImportFailure::Permanent(format!(
             "bucket `{bucket}` does not exist"
         ))),
         Err(error) => Err(ImportFailure::Retryable(error.to_string())),
@@ -1764,10 +1760,10 @@ fn classify_get(error: GetObjectError) -> ImportFailure {
     }
 }
 
-fn classify_read(error: ReadStagingSourceError) -> ImportFailure {
+fn classify_read(error: ReadSourceError) -> ImportFailure {
     let permanent = match &error {
-        ReadStagingSourceError::Resolve(error) => permanent_resolve(error),
-        ReadStagingSourceError::Staging(error) => permanent_staging(error),
+        ReadSourceError::Resolve(error) => permanent_resolve(error),
+        ReadSourceError::Staging(error) => permanent_staging(error),
         _ => false,
     };
     if permanent {
@@ -1789,13 +1785,13 @@ fn classify_blob(error: BlobError) -> ImportFailure {
     }
 }
 
-fn permanent_resolve(error: &SourceConnectorResolutionError) -> bool {
+fn permanent_resolve(error: &SourceResolutionError) -> bool {
     matches!(
         error,
-        SourceConnectorResolutionError::ConversionError(_)
-            | SourceConnectorResolutionError::NotFound
-            | SourceConnectorResolutionError::UnsupportedConnectorKind(_)
-            | SourceConnectorResolutionError::InvalidSourcePath
+        SourceResolutionError::ConversionError(_)
+            | SourceResolutionError::NotFound
+            | SourceResolutionError::UnsupportedConnectorKind(_)
+            | SourceResolutionError::InvalidSourcePath
     )
 }
 
@@ -1903,7 +1899,7 @@ pub(crate) mod tests {
 
     use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::insert_job;
-    use crate::tests::fixtures::staging::setup_driver_context;
+    use crate::tests::staging::setup_driver_context;
 
     #[test]
     fn target_checks_limits() {
@@ -1958,7 +1954,7 @@ pub(crate) mod tests {
     // observation and an exhausted binding never heal by retrying.
     // The typed blob cause decides permanence; local wording never does.
     #[test]
-    fn classifies_blob_write_failures() {
+    fn blob_write_classification() {
         let cases = [
             (
                 BlobError::IntegrityCheckFailed("sha256 mismatch".to_string()),
@@ -2061,9 +2057,7 @@ pub(crate) mod tests {
             ImportFailure::Retryable(_)
         ));
         assert!(matches!(
-            classify_read(ReadStagingSourceError::Resolve(
-                SourceConnectorResolutionError::NotFound
-            )),
+            classify_read(ReadSourceError::Resolve(SourceResolutionError::NotFound)),
             ImportFailure::Permanent(_)
         ));
         assert!(matches!(
@@ -2078,18 +2072,18 @@ pub(crate) mod tests {
 
     #[test]
     fn profile_rejections_permanent() {
-        let finding = aruna_core::metadata::MetadataProfileValidationFinding {
+        let finding = aruna_core::metadata::ProfileValidationFinding {
             code: "unsupported_constraint".to_string(),
-            severity: aruna_core::metadata::MetadataProfileValidationSeverity::Violation,
+            severity: aruna_core::metadata::ProfileValidationSeverity::Violation,
             focus_node: None,
             path: None,
             rule: "http://www.w3.org/ns/shacl#SPARQLConstraintComponent".to_string(),
             message: "unsupported".to_string(),
             profile_revision: None,
-            completeness: aruna_core::metadata::MetadataProfileValidationCompleteness::Incomplete,
+            completeness: aruna_core::metadata::ProfileValidationCompleteness::Incomplete,
         };
         let failure = classify_metadata(MetadataWriteError::Create(
-            crate::metadata::create_document::CreateMetadataDocumentError::MetadataError(
+            crate::metadata::create_document::CreateDocumentError::MetadataError(
                 aruna_core::metadata::MetadataError::ProfileValidation(vec![finding]),
             ),
         ));

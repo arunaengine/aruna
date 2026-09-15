@@ -7,11 +7,11 @@ use aruna_core::structs::{BucketInfo, CopyJobSpec, JobError, JobResultPayload};
 
 use super::executor::{JobContext, JobRunOutcome};
 use crate::driver::drive;
-use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetConfigOperation;
 use crate::s3::copy_object::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_tracked,
 };
-use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use crate::s3::get_object::GetObjectError;
 use crate::s3::head_object::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::put_object::PutObjectError;
@@ -34,7 +34,7 @@ pub async fn run_copy_job(ctx: &JobContext, spec: &CopyJobSpec) -> JobRunOutcome
         return permanent("a bucket changed its group after the copy was queued");
     }
     let quota_ceiling = match drive(
-        GetRealmConfigOperation::new(spec.auth_context.realm_id),
+        GetConfigOperation::new(spec.auth_context.realm_id),
         &ctx.driver,
     )
     .await
@@ -124,11 +124,9 @@ async fn source_length(ctx: &JobContext, spec: &CopyJobSpec) -> Option<u64> {
 }
 
 async fn live_bucket(ctx: &JobContext, bucket: &str) -> Result<BucketInfo, JobRunOutcome> {
-    match drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver).await {
+    match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
         Ok(info) => Ok(info),
-        Err(GetBucketInfoError::NotFound) => {
-            Err(permanent("a bucket of the copy no longer exists"))
-        }
+        Err(GetBucketError::NotFound) => Err(permanent("a bucket of the copy no longer exists")),
         Err(error) => Err(retryable(error.to_string())),
     }
 }
@@ -166,7 +164,7 @@ mod tests {
     };
     use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
     use aruna_core::UserId;
-    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::id::NodeId;
     use aruna_core::structs::{
@@ -197,7 +195,7 @@ mod tests {
         let group_id = Ulid::generate();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
         let user_id = UserId::local(Ulid::generate(), realm_id);
-        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let target = DocumentTarget::RealmConfig { realm_id };
         let actor = Actor {
             node_id,
             user_id: UserId::nil(realm_id),

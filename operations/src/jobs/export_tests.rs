@@ -1,12 +1,12 @@
 use super::*;
 
 use crate::jobs::executor::ProgressReporter;
-use crate::sync::incoming::initialize_net_incoming_for_tests;
-use crate::tests::fixtures::import::{
+use crate::sync::incoming::initialize_incoming_fixture;
+use crate::tests::import::{
     RewriteTarget, file_id_candidates, inspect_archive, open_archive, payload_entries,
     read_metadata, rewrite_document, signature_entry, validate_document,
 };
-use crate::tests::fixtures::staging::setup_driver_context;
+use crate::tests::staging::setup_driver_context;
 use aruna_blob::blob::{BlobHandle, BlobHandler};
 use aruna_core::UserId;
 use aruna_core::keyspaces::{
@@ -32,11 +32,11 @@ use tokio::io::AsyncReadExt;
 const FIXTURE_BYTES: &[u8] = b"duplicate fixture payload";
 const ROCRATE_12: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/data/rocrate/roundtrip-1.2.json"
+    "/tests/fixtures/roundtrip-1.2.json"
 ));
 const ROCRATE_13: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/data/rocrate/roundtrip-1.3.json"
+    "/tests/fixtures/roundtrip-1.3.json"
 ));
 
 struct SparseWriter {
@@ -118,7 +118,7 @@ async fn bao_node(realm_id: RealmId) -> BaoNode {
         task_handle: None,
         compute_handle: None,
     });
-    initialize_net_incoming_for_tests(driver.clone());
+    initialize_incoming_fixture(driver.clone());
     BaoNode {
         _tempdir: tempdir,
         net,
@@ -1018,7 +1018,7 @@ async fn denies_foreign_alias() {
     let realm_id = owner.realm_id;
     let hash = candidate.expected_blake3.unwrap();
     let foreign = Ulid::from_bytes([200; 16]);
-    let alias = HashPathIndexKey::new(
+    let alias = HashIndex::new(
         hash,
         Ulid::from_bytes([201; 16]),
         realm_id,
@@ -1115,7 +1115,7 @@ fn learns_probe_hash() {
 #[test]
 fn deduplicates_aliases() {
     let realm_id = RealmId::from_bytes([11; 32]);
-    let alias = HashPathIndexKey::new(
+    let alias = HashIndex::new(
         [12; 32],
         Ulid::from_bytes([13; 16]),
         realm_id,
@@ -1138,7 +1138,7 @@ fn deduplicates_aliases() {
 #[test]
 fn bounds_alias_cache() {
     let realm_id = RealmId::from_bytes([11; 32]);
-    let alias = HashPathIndexKey::new(
+    let alias = HashIndex::new(
         [12; 32],
         Ulid::from_bytes([13; 16]),
         realm_id,
@@ -1150,7 +1150,7 @@ fn bounds_alias_cache() {
     let mut cache = BTreeMap::new();
     cache_aliases(&mut cache, [16; 32], vec![alias; MAX_HASH_ALIASES]).unwrap();
 
-    let mut cross_realm = HashPathIndexKey::new(
+    let mut cross_realm = HashIndex::new(
         [17; 32],
         Ulid::from_bytes([18; 16]),
         RealmId::from_bytes([19; 32]),
@@ -1227,7 +1227,7 @@ fn caps_repeated_hashes() {
 #[test]
 fn rejects_alias_budget() {
     let realm_id = RealmId::from_bytes([11; 32]);
-    let alias = HashPathIndexKey::new(
+    let alias = HashIndex::new(
         [12; 32],
         Ulid::from_bytes([13; 16]),
         realm_id,

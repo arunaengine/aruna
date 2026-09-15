@@ -1,13 +1,11 @@
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH,
-};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, GROUP_DISPLAY_NAME_PATH};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -104,7 +102,7 @@ pub enum UpdateGroupError {
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
-    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
+    AdminDocumentError(#[from] AdminDocumentError),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -130,8 +128,8 @@ impl UpdateGroupOperation {
         normalize_group_name(&self.config.display_name).ok_or(UpdateGroupError::InvalidDisplayName)
     }
 
-    fn document_ref(&self) -> DocumentSyncTarget {
-        DocumentSyncTarget::GroupAuthorization {
+    fn document_ref(&self) -> DocumentTarget {
+        DocumentTarget::GroupAuthorization {
             group_id: self.config.group_id,
         }
     }
@@ -211,11 +209,11 @@ impl UpdateGroupOperation {
             .as_ref()
             .is_some_and(|state| state.target != target)
         {
-            return Err(AdminDocumentReducerError::TargetMismatch.into());
+            return Err(AdminDocumentError::TargetMismatch.into());
         }
         let mut reducer_state = previous_reducer_state
             .clone()
-            .unwrap_or_else(|| AdminDocumentReducerState::new(target));
+            .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_event = reducer_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::GroupDisplayNameSet {
@@ -253,7 +251,7 @@ impl UpdateGroupOperation {
             self.config.actor.node_id,
             document_target,
             Vec::new(),
-            DocumentSyncOutboxEvent::admin(admin_event),
+            DocumentOutboxEvent::admin(admin_event),
             placement,
             false,
         )
@@ -488,7 +486,7 @@ impl Operation for UpdateGroupOperation {
 
 /// Keeps the stored name when the reducer withheld the field on a conflict, so
 /// a concurrent rename never blanks the group label (decision Q2).
-fn overlay_reducer_name(group: &mut Group, reducer_state: &AdminDocumentReducerState) {
+fn overlay_reducer_name(group: &mut Group, reducer_state: &AdminDocumentState) {
     if !reducer_state
         .conflicts
         .contains_key(GROUP_DISPLAY_NAME_PATH)
@@ -503,9 +501,7 @@ mod pure_tests {
     use super::{UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation};
     use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-    use aruna_core::document::{
-        DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
-    };
+    use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
@@ -513,7 +509,7 @@ mod pure_tests {
         REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::reducer::AdminDocumentReducerState;
+    use aruna_core::reducer::AdminDocumentState;
     use aruna_core::storage_entries::reducer_state_key;
     use aruna_core::structs::{Actor, AuthContext, Group, RealmId};
     use aruna_core::task::{TaskEvent, TaskKey};
@@ -621,7 +617,7 @@ mod pure_tests {
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: read_values(),
         }));
-        let document = DocumentSyncTarget::GroupAuthorization { group_id: group() };
+        let document = DocumentTarget::GroupAuthorization { group_id: group() };
         match effects.first().unwrap() {
             Effect::Storage(StorageEffect::BatchWrite { writes, txn_id: id }) => {
                 assert_eq!(*id, Some(txn_id));
@@ -638,14 +634,14 @@ mod pure_tests {
                     .iter()
                     .find(|(keyspace, _, _)| keyspace == ADMIN_DOCUMENT_STATE_KEYSPACE)
                     .expect("reducer state is written");
-                let reducer_state: AdminDocumentReducerState =
+                let reducer_state: AdminDocumentState =
                     postcard::from_bytes(reducer_write.2.as_ref()).unwrap();
                 assert_eq!(
                     reducer_state.materialized_group_name().as_deref(),
                     Some("Platform")
                 );
 
-                let records: Vec<DocumentSyncOutboxRecord> = writes
+                let records: Vec<DocumentOutboxRecord> = writes
                     .iter()
                     .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
                     .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
@@ -654,7 +650,7 @@ mod pure_tests {
                 assert_eq!(records[0].target, document);
                 assert!(matches!(
                     &records[0].event,
-                    DocumentSyncOutboxEvent::AdminOperation { event, .. }
+                    DocumentOutboxEvent::AdminOperation { event, .. }
                         if matches!(
                             &event.op,
                             AdminDocumentOperation::GroupDisplayNameSet { display_name }

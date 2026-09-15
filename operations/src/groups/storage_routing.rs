@@ -6,7 +6,7 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_ROUTING_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    GroupRoutingInputs, GroupStorageBackend, GroupStorageRouting, RoutingError, RoutingTarget,
+    GroupRoutingInputs, GroupStorage, GroupStorageRouting, RoutingError, RoutingTarget,
     validate_tenant_target,
 };
 use aruna_core::types::{Effects, GroupId, Key};
@@ -32,7 +32,7 @@ enum LoadInputsState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum GroupRoutingInputsError {
+pub enum GroupInputsError {
     #[error(transparent)]
     Read(#[from] RecordReadError),
     #[error("group routing inputs never completed")]
@@ -43,14 +43,14 @@ pub enum GroupRoutingInputsError {
 /// the backends it registered. The scan is prefixed by group, so a write never
 /// pays for another tenant's backends.
 #[derive(Debug, PartialEq)]
-pub struct GroupRoutingInputsOperation {
+pub struct GroupInputsOperation {
     group_id: GroupId,
     state: LoadInputsState,
     inputs: GroupRoutingInputs,
-    output: Option<Result<GroupRoutingInputs, GroupRoutingInputsError>>,
+    output: Option<Result<GroupRoutingInputs, GroupInputsError>>,
 }
 
-impl GroupRoutingInputsOperation {
+impl GroupInputsOperation {
     pub fn new(group_id: GroupId) -> Self {
         Self {
             group_id,
@@ -71,16 +71,16 @@ impl GroupRoutingInputsOperation {
         })]
     }
 
-    fn fail(&mut self, error: GroupRoutingInputsError) -> Effects {
+    fn fail(&mut self, error: GroupInputsError) -> Effects {
         self.state = LoadInputsState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 }
 
-impl Operation for GroupRoutingInputsOperation {
+impl Operation for GroupInputsOperation {
     type Output = GroupRoutingInputs;
-    type Error = GroupRoutingInputsError;
+    type Error = GroupInputsError;
 
     fn start(&mut self) -> Effects {
         self.state = LoadInputsState::ReadDefault;
@@ -103,27 +103,23 @@ impl Operation for GroupRoutingInputsOperation {
                 }
                 self.scan_backends(None)
             }
-            LoadInputsState::ScanBackends => {
-                match parse_iter(event, GroupStorageBackend::from_bytes) {
-                    Ok((records, next_start_after)) => {
-                        self.inputs.backend_ids.extend(
-                            records
-                                .into_iter()
-                                .filter(|record| {
-                                    record.group_id == self.group_id && !record.disabled
-                                })
-                                .map(|record| record.backend_id),
-                        );
-                        if let Some(start_after) = next_start_after {
-                            return self.scan_backends(Some(start_after));
-                        }
-                        self.state = LoadInputsState::Finish;
-                        self.output = Some(Ok(std::mem::take(&mut self.inputs)));
-                        smallvec![]
+            LoadInputsState::ScanBackends => match parse_iter(event, GroupStorage::from_bytes) {
+                Ok((records, next_start_after)) => {
+                    self.inputs.backend_ids.extend(
+                        records
+                            .into_iter()
+                            .filter(|record| record.group_id == self.group_id && !record.disabled)
+                            .map(|record| record.backend_id),
+                    );
+                    if let Some(start_after) = next_start_after {
+                        return self.scan_backends(Some(start_after));
                     }
-                    Err(error) => self.fail(error.into()),
+                    self.state = LoadInputsState::Finish;
+                    self.output = Some(Ok(std::mem::take(&mut self.inputs)));
+                    smallvec![]
                 }
-            }
+                Err(error) => self.fail(error.into()),
+            },
             LoadInputsState::Finish | LoadInputsState::Error => {
                 self.fail(RecordReadError::Unexpected.into())
             }
@@ -135,8 +131,7 @@ impl Operation for GroupRoutingInputsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(GroupRoutingInputsError::Incomplete))
+        self.output.unwrap_or(Err(GroupInputsError::Incomplete))
     }
 
     fn abort(&mut self) -> Effects {
@@ -147,7 +142,7 @@ impl Operation for GroupRoutingInputsOperation {
 /// Emits the sub-operation that loads a group's routing inputs.
 pub fn load_group_inputs(group_id: GroupId) -> Effect {
     Effect::SubOperation(boxed_suboperation(
-        GroupRoutingInputsOperation::new(group_id),
+        GroupInputsOperation::new(group_id),
         |result| {
             Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
                 result: result.map_err(|error| error.to_string()),
@@ -157,7 +152,7 @@ pub fn load_group_inputs(group_id: GroupId) -> Effect {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PutGroupRoutingState {
+enum PutGroupState {
     Init,
     LoadInputs,
     WriteRecord,
@@ -166,7 +161,7 @@ enum PutGroupRoutingState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum PutGroupRoutingError {
+pub enum PutGroupError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -188,13 +183,13 @@ pub enum PutGroupRoutingError {
 /// Writes the group's default write target. Clearing it is a write with
 /// `default_target = None`, so the record always records who decided last.
 #[derive(Debug, PartialEq)]
-pub struct PutGroupRoutingOperation {
+pub struct PutGroupOperation {
     record: GroupStorageRouting,
-    state: PutGroupRoutingState,
-    output: Option<Result<GroupStorageRouting, PutGroupRoutingError>>,
+    state: PutGroupState,
+    output: Option<Result<GroupStorageRouting, PutGroupError>>,
 }
 
-impl PutGroupRoutingOperation {
+impl PutGroupOperation {
     pub fn new(
         group_id: GroupId,
         default_target: Option<RoutingTarget>,
@@ -208,13 +203,13 @@ impl PutGroupRoutingOperation {
                 updated_at,
                 updated_by,
             },
-            state: PutGroupRoutingState::Init,
+            state: PutGroupState::Init,
             output: None,
         }
     }
 
-    fn fail(&mut self, err: PutGroupRoutingError) -> Effects {
-        self.state = PutGroupRoutingState::Error;
+    fn fail(&mut self, err: PutGroupError) -> Effects {
+        self.state = PutGroupState::Error;
         self.output = Some(Err(err));
         smallvec![]
     }
@@ -229,7 +224,7 @@ impl PutGroupRoutingOperation {
             Ok(value) => value,
             Err(err) => return self.fail(err.into()),
         };
-        self.state = PutGroupRoutingState::WriteRecord;
+        self.state = PutGroupState::WriteRecord;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: GROUP_STORAGE_ROUTING_KEYSPACE.to_string(),
             key: routing_key(self.record.group_id),
@@ -239,24 +234,24 @@ impl PutGroupRoutingOperation {
     }
 }
 
-impl Operation for PutGroupRoutingOperation {
+impl Operation for PutGroupOperation {
     type Output = GroupStorageRouting;
-    type Error = PutGroupRoutingError;
+    type Error = PutGroupError;
 
     fn start(&mut self) -> Effects {
         // A `Group` target is checked against the ids this group registered, so
         // the record can never name another tenant's backend.
-        self.state = PutGroupRoutingState::LoadInputs;
+        self.state = PutGroupState::LoadInputs;
         smallvec![load_group_inputs(self.record.group_id)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            PutGroupRoutingState::Init => self.start(),
-            PutGroupRoutingState::LoadInputs => {
+            PutGroupState::Init => self.start(),
+            PutGroupState::LoadInputs => {
                 let Event::SubOperation(SubOperationEvent::GroupRoutingLoaded { result }) = event
                 else {
-                    return self.fail(PutGroupRoutingError::InvalidStateEvent {
+                    return self.fail(PutGroupError::InvalidStateEvent {
                         state: "LoadInputs",
                         expected: "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)",
                         received: event,
@@ -264,23 +259,23 @@ impl Operation for PutGroupRoutingOperation {
                 };
                 match result {
                     Ok(inputs) => self.write_record(&inputs.backend_ids),
-                    Err(error) => self.fail(PutGroupRoutingError::InputsUnavailable(error)),
+                    Err(error) => self.fail(PutGroupError::InputsUnavailable(error)),
                 }
             }
-            PutGroupRoutingState::WriteRecord => {
+            PutGroupState::WriteRecord => {
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-                    return self.fail(PutGroupRoutingError::InvalidStateEvent {
+                    return self.fail(PutGroupError::InvalidStateEvent {
                         state: "WriteRecord",
                         expected: "Event::Storage(StorageEvent::WriteResult)",
                         received: event,
                     });
                 };
-                self.state = PutGroupRoutingState::Finish;
+                self.state = PutGroupState::Finish;
                 self.output = Some(Ok(self.record.clone()));
                 smallvec![]
             }
-            PutGroupRoutingState::Finish | PutGroupRoutingState::Error => {
-                self.fail(PutGroupRoutingError::InvalidStateEvent {
+            PutGroupState::Finish | PutGroupState::Error => {
+                self.fail(PutGroupError::InvalidStateEvent {
                     state: "terminal",
                     expected: "no event",
                     received: event,
@@ -290,17 +285,14 @@ impl Operation for PutGroupRoutingOperation {
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            PutGroupRoutingState::Finish | PutGroupRoutingState::Error
-        )
+        matches!(self.state, PutGroupState::Finish | PutGroupState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         match self.output {
             Some(Ok(record)) => Ok(record),
             Some(Err(error)) => Err(error),
-            None => Err(PutGroupRoutingError::NotFinished),
+            None => Err(PutGroupError::NotFinished),
         }
     }
 
@@ -310,7 +302,7 @@ impl Operation for PutGroupRoutingOperation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum GetGroupRoutingState {
+enum GroupRoutingState {
     Init,
     ReadRecord,
     Finish,
@@ -318,7 +310,7 @@ enum GetGroupRoutingState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum GetGroupRoutingError {
+pub enum GroupRoutingError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -336,34 +328,34 @@ pub enum GetGroupRoutingError {
 /// Reads the group's default write target. An absent record is no default, not
 /// an error: most groups never set one.
 #[derive(Debug, PartialEq)]
-pub struct GetGroupRoutingOperation {
+pub struct GroupRoutingOperation {
     group_id: GroupId,
-    state: GetGroupRoutingState,
-    output: Option<Result<Option<GroupStorageRouting>, GetGroupRoutingError>>,
+    state: GroupRoutingState,
+    output: Option<Result<Option<GroupStorageRouting>, GroupRoutingError>>,
 }
 
-impl GetGroupRoutingOperation {
+impl GroupRoutingOperation {
     pub fn new(group_id: GroupId) -> Self {
         Self {
             group_id,
-            state: GetGroupRoutingState::Init,
+            state: GroupRoutingState::Init,
             output: None,
         }
     }
 
-    fn fail(&mut self, err: GetGroupRoutingError) -> Effects {
-        self.state = GetGroupRoutingState::Error;
+    fn fail(&mut self, err: GroupRoutingError) -> Effects {
+        self.state = GroupRoutingState::Error;
         self.output = Some(Err(err));
         smallvec![]
     }
 }
 
-impl Operation for GetGroupRoutingOperation {
+impl Operation for GroupRoutingOperation {
     type Output = Option<GroupStorageRouting>;
-    type Error = GetGroupRoutingError;
+    type Error = GroupRoutingError;
 
     fn start(&mut self) -> Effects {
-        self.state = GetGroupRoutingState::ReadRecord;
+        self.state = GroupRoutingState::ReadRecord;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: GROUP_STORAGE_ROUTING_KEYSPACE.to_string(),
             key: routing_key(self.group_id),
@@ -373,10 +365,10 @@ impl Operation for GetGroupRoutingOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            GetGroupRoutingState::Init => self.start(),
-            GetGroupRoutingState::ReadRecord => {
+            GroupRoutingState::Init => self.start(),
+            GroupRoutingState::ReadRecord => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(GetGroupRoutingError::InvalidStateEvent {
+                    return self.fail(GroupRoutingError::InvalidStateEvent {
                         state: "ReadRecord",
                         expected: "Event::Storage(StorageEvent::ReadResult)",
                         received: event,
@@ -389,12 +381,12 @@ impl Operation for GetGroupRoutingOperation {
                     Ok(record) => record,
                     Err(err) => return self.fail(err.into()),
                 };
-                self.state = GetGroupRoutingState::Finish;
+                self.state = GroupRoutingState::Finish;
                 self.output = Some(Ok(record));
                 smallvec![]
             }
-            GetGroupRoutingState::Finish | GetGroupRoutingState::Error => {
-                self.fail(GetGroupRoutingError::InvalidStateEvent {
+            GroupRoutingState::Finish | GroupRoutingState::Error => {
+                self.fail(GroupRoutingError::InvalidStateEvent {
                     state: "terminal",
                     expected: "no event",
                     received: event,
@@ -406,13 +398,12 @@ impl Operation for GetGroupRoutingOperation {
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            GetGroupRoutingState::Finish | GetGroupRoutingState::Error
+            GroupRoutingState::Finish | GroupRoutingState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(GetGroupRoutingError::NotFinished))
+        self.output.unwrap_or(Err(GroupRoutingError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -423,9 +414,8 @@ impl Operation for GetGroupRoutingOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::{
-        GetGroupRoutingError, GetGroupRoutingOperation, GroupRoutingInputsError,
-        GroupRoutingInputsOperation, PutGroupRoutingError, PutGroupRoutingOperation,
-        RecordReadError, routing_key,
+        GroupInputsError, GroupInputsOperation, GroupRoutingError, GroupRoutingOperation,
+        PutGroupError, PutGroupOperation, RecordReadError, routing_key,
     };
     use crate::groups::backends::{index_key, index_prefix};
     use aruna_core::effects::{Effect, StorageEffect};
@@ -435,7 +425,7 @@ mod pure_tests {
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        BackendRef, GroupBackendKind, GroupRoutingInputs, GroupStorageBackend, GroupStorageRouting,
+        BackendRef, GroupBackendKind, GroupRoutingInputs, GroupStorage, GroupStorageRouting,
         RoutingError, RoutingTarget,
     };
     use aruna_core::types::Effects;
@@ -448,7 +438,7 @@ mod pure_tests {
     }
 
     /// Replays the loader sub-operation with the ids the group owns.
-    fn loaded(operation: &mut PutGroupRoutingOperation, owned: BTreeSet<Ulid>) -> Effects {
+    fn loaded(operation: &mut PutGroupOperation, owned: BTreeSet<Ulid>) -> Effects {
         operation.start();
         operation.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
             result: Ok(GroupRoutingInputs {
@@ -458,8 +448,8 @@ mod pure_tests {
         }))
     }
 
-    fn backend(backend_id: Ulid, group_id: Ulid) -> GroupStorageBackend {
-        GroupStorageBackend {
+    fn backend(backend_id: Ulid, group_id: Ulid) -> GroupStorage {
+        GroupStorage {
             backend_id,
             group_id,
             name: "tenant".to_string(),
@@ -485,7 +475,7 @@ mod pure_tests {
     #[test]
     fn writes_group_default() {
         let target = RoutingTarget::Class("cold".to_string());
-        let mut operation = PutGroupRoutingOperation::new(
+        let mut operation = PutGroupOperation::new(
             group(),
             Some(target.clone()),
             aruna_core::UserId::default(),
@@ -515,7 +505,7 @@ mod pure_tests {
 
     #[test]
     fn rejects_operator_target() {
-        let mut operation = PutGroupRoutingOperation::new(
+        let mut operation = PutGroupOperation::new(
             group(),
             Some(RoutingTarget::Backend(BackendRef::Node("cold".to_string()))),
             aruna_core::UserId::default(),
@@ -528,7 +518,7 @@ mod pure_tests {
         assert!(operation.is_complete());
         assert!(matches!(
             operation.finalize(),
-            Err(PutGroupRoutingError::InvalidTarget(
+            Err(PutGroupError::InvalidTarget(
                 RoutingError::OperatorBackendTarget
             ))
         ));
@@ -536,7 +526,7 @@ mod pure_tests {
 
     #[test]
     fn rejects_unexpected_event() {
-        let mut operation = PutGroupRoutingOperation::new(
+        let mut operation = PutGroupOperation::new(
             group(),
             None,
             aruna_core::UserId::default(),
@@ -550,7 +540,7 @@ mod pure_tests {
 
         assert!(matches!(
             operation.finalize(),
-            Err(PutGroupRoutingError::InvalidStateEvent { .. })
+            Err(PutGroupError::InvalidStateEvent { .. })
         ));
     }
 
@@ -558,7 +548,7 @@ mod pure_tests {
     fn rejects_foreign_backend() {
         // A default naming a backend this group does not own must not be stored.
         let foreign = Ulid::from_bytes([9u8; 16]);
-        let mut operation = PutGroupRoutingOperation::new(
+        let mut operation = PutGroupOperation::new(
             group(),
             Some(RoutingTarget::Backend(BackendRef::Group(foreign))),
             aruna_core::UserId::default(),
@@ -573,9 +563,9 @@ mod pure_tests {
         assert!(effects.is_empty(), "expected no write, got {effects:?}");
         assert_eq!(
             operation.finalize(),
-            Err(PutGroupRoutingError::InvalidTarget(
-                RoutingError::ForeignBackend(foreign)
-            ))
+            Err(PutGroupError::InvalidTarget(RoutingError::ForeignBackend(
+                foreign
+            )))
         );
     }
 
@@ -584,7 +574,7 @@ mod pure_tests {
         // The scan is prefixed by group, and a disabled backend cannot be routed to.
         let mine = Ulid::from_bytes([4u8; 16]);
         let disabled = Ulid::from_bytes([5u8; 16]);
-        let mut operation = GroupRoutingInputsOperation::new(group());
+        let mut operation = GroupInputsOperation::new(group());
         operation.start();
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -637,7 +627,7 @@ mod pure_tests {
 
     #[test]
     fn reads_absent_record() {
-        let mut operation = GetGroupRoutingOperation::new(group());
+        let mut operation = GroupRoutingOperation::new(group());
         operation.start();
 
         operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -651,7 +641,7 @@ mod pure_tests {
     #[test]
     fn reads_stored_target() {
         let stored = record(Some(RoutingTarget::Class("cold".to_string())));
-        let mut operation = GetGroupRoutingOperation::new(group());
+        let mut operation = GroupRoutingOperation::new(group());
         operation.start();
 
         operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -671,7 +661,7 @@ mod pure_tests {
             })
         };
 
-        let mut inputs = GroupRoutingInputsOperation::new(group());
+        let mut inputs = GroupInputsOperation::new(group());
         inputs.start();
         inputs.step(Event::Storage(StorageEvent::ReadResult {
             key: routing_key(group()),
@@ -684,10 +674,10 @@ mod pure_tests {
         inputs.step(stray());
         assert!(matches!(
             inputs.finalize(),
-            Err(GroupRoutingInputsError::Read(RecordReadError::Unexpected))
+            Err(GroupInputsError::Read(RecordReadError::Unexpected))
         ));
 
-        let mut put = PutGroupRoutingOperation::new(
+        let mut put = PutGroupOperation::new(
             group(),
             None,
             aruna_core::UserId::default(),
@@ -700,10 +690,10 @@ mod pure_tests {
         put.step(stray());
         assert!(matches!(
             put.finalize(),
-            Err(PutGroupRoutingError::InvalidStateEvent { .. })
+            Err(PutGroupError::InvalidStateEvent { .. })
         ));
 
-        let mut get = GetGroupRoutingOperation::new(group());
+        let mut get = GroupRoutingOperation::new(group());
         get.start();
         get.step(Event::Storage(StorageEvent::ReadResult {
             key: routing_key(group()),
@@ -712,7 +702,7 @@ mod pure_tests {
         get.step(stray());
         assert!(matches!(
             get.finalize(),
-            Err(GetGroupRoutingError::InvalidStateEvent { .. })
+            Err(GroupRoutingError::InvalidStateEvent { .. })
         ));
     }
 }

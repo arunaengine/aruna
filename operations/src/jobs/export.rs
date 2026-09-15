@@ -13,9 +13,9 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ArtifactRef, ArunaArn, ArunaArnType, BackendLocation, BlobVersion, BucketInfo,
     ExportOmissionCounts, ExportReportDetail, ExportReportRow, ExportReportSource,
-    ExportRoCrateResult, ExportRoCrateSpec, HashPathIndexKey, JobError, JobId, JobResultPayload,
+    ExportRoCrateResult, ExportRoCrateSpec, HashIndex, JobError, JobId, JobResultPayload,
     ManagedCopyKey, Permission, RealmId, ReasonCode, RoCrateCheckpointRefs, VersionKey,
-    VersionedObjectArn, W3idDataIdentifier, ensure_confined_path, object_permission_path,
+    VersionedObjectArn, W3idIdentifier, ensure_confined_path, object_permission_path,
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
@@ -47,21 +47,21 @@ use crate::auth::request_policy::{
     PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
 };
 use crate::blob::hidden::delete_hidden;
-use crate::blob::holders::GetBlobHoldersOperation;
+use crate::blob::holders::GetHoldersOperation;
 use crate::blob::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
-use crate::blob::permission_paths::{MAX_HASH_ALIASES, ResolveBlobPermissionPathsOperation};
+use crate::blob::permission_paths::{MAX_HASH_ALIASES, ResolvePathsOperation};
 use crate::driver::{DriverContext, drive};
-use crate::metadata::MetadataAuthToken;
+use crate::metadata::AuthToken;
 use crate::metadata::api::{
-    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataApiError,
-    MetadataRoCrateExportView,
+    ExportMetadataRequest, ExportMetadataResult, MetadataApiError, RoCrateExportView,
 };
 use crate::metadata::forward::export_rocrate_routed;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
+#[path = "export_archive.rs"]
 mod archive;
 pub(crate) use archive::*;
 
@@ -271,7 +271,7 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
     let mut permission_rules = BTreeMap::<GroupId, PermissionRules>::new();
     let mut alias_paths = BTreeSet::<(GroupId, String)>::new();
     let mut alias_keys = BTreeSet::<([u8; 32], String, Ulid)>::new();
-    let mut alias_cache = BTreeMap::<[u8; 32], Vec<HashPathIndexKey>>::new();
+    let mut alias_cache = BTreeMap::<[u8; 32], Vec<HashIndex>>::new();
     let mut resolved_aliases = BTreeMap::<[u8; 32], (Vec<ExportCandidate>, bool)>::new();
     let mut authorized_aliases = BTreeMap::<(GroupId, String), bool>::new();
     for entity in &checkpoint.entities {
@@ -435,20 +435,20 @@ async fn snapshot_export(
     let export = export_rocrate_routed(
         &ctx.driver,
         spec.auth_context.realm_id,
-        ExportMetadataRoCrateRequest {
+        ExportMetadataRequest {
             document_id: spec.document_id,
             auth: Some(spec.auth_context.clone()),
-            view: MetadataRoCrateExportView::Raw,
+            view: RoCrateExportView::Raw,
             limit: None,
             offset: None,
             after: None,
         },
-        Some(MetadataAuthToken::internal(spec.auth_context.clone())),
+        Some(AuthToken::internal(spec.auth_context.clone())),
         spec.limits.metadata_bytes,
     )
     .await
     .map_err(snapshot_read_failure)?;
-    let ExportMetadataRoCrateResult::Raw { raw, .. } = export else {
+    let ExportMetadataResult::Raw { raw, .. } = export else {
         return Err(ExportFailure::Permanent(
             "raw export returned an unexpected view".to_string(),
         ));
@@ -490,7 +490,7 @@ async fn resolve_entries(
     permission_rules: &mut BTreeMap<GroupId, PermissionRules>,
     alias_paths: &mut BTreeSet<(GroupId, String)>,
     alias_keys: &mut BTreeSet<([u8; 32], String, Ulid)>,
-    alias_cache: &mut BTreeMap<[u8; 32], Vec<HashPathIndexKey>>,
+    alias_cache: &mut BTreeMap<[u8; 32], Vec<HashIndex>>,
     resolved_aliases: &mut BTreeMap<[u8; 32], (Vec<ExportCandidate>, bool)>,
     authorized_aliases: &mut BTreeMap<(GroupId, String), bool>,
 ) -> Result<(), ExportFailure> {
@@ -629,7 +629,7 @@ async fn extend_hash_candidates(
     permission_rules: &mut BTreeMap<GroupId, PermissionRules>,
     alias_paths: &mut BTreeSet<(GroupId, String)>,
     alias_keys: &mut BTreeSet<([u8; 32], String, Ulid)>,
-    alias_cache: &mut BTreeMap<[u8; 32], Vec<HashPathIndexKey>>,
+    alias_cache: &mut BTreeMap<[u8; 32], Vec<HashIndex>>,
     resolved_aliases: &mut BTreeMap<[u8; 32], (Vec<ExportCandidate>, bool)>,
     authorized_aliases: &mut BTreeMap<(GroupId, String), bool>,
 ) -> Result<bool, ExportFailure> {
@@ -638,7 +638,7 @@ async fn extend_hash_candidates(
         *denied |= *cached_denied;
     } else {
         if !alias_cache.contains_key(&hash) {
-            let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), &ctx.driver)
+            let aliases = drive(ResolvePathsOperation::new(hash), &ctx.driver)
                 .await
                 .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
             cache_aliases(alias_cache, hash, aliases)?;
@@ -695,7 +695,7 @@ async fn extend_hash_candidates(
     }
 
     let holders = match drive(
-        GetBlobHoldersOperation::new(hash, spec.auth_context.realm_id, ctx.owner_node_id),
+        GetHoldersOperation::new(hash, spec.auth_context.realm_id, ctx.owner_node_id),
         &ctx.driver,
     )
     .await
@@ -722,9 +722,9 @@ async fn extend_hash_candidates(
 }
 
 fn cache_aliases(
-    alias_cache: &mut BTreeMap<[u8; 32], Vec<HashPathIndexKey>>,
+    alias_cache: &mut BTreeMap<[u8; 32], Vec<HashIndex>>,
     hash: [u8; 32],
-    aliases: Vec<HashPathIndexKey>,
+    aliases: Vec<HashIndex>,
 ) -> Result<(), ExportFailure> {
     if aliases.len() > MAX_HASH_ALIASES {
         return Err(ExportFailure::Retryable(
@@ -751,11 +751,11 @@ fn cache_aliases(
 }
 
 fn collect_aliases(
-    aliases: &[HashPathIndexKey],
+    aliases: &[HashIndex],
     realm_id: RealmId,
     seen: &mut BTreeSet<(GroupId, String)>,
     alias_keys: &mut BTreeSet<([u8; 32], String, Ulid)>,
-) -> Result<BTreeMap<(GroupId, String), Vec<HashPathIndexKey>>, ExportFailure> {
+) -> Result<BTreeMap<(GroupId, String), Vec<HashIndex>>, ExportFailure> {
     if aliases.len() > MAX_HASH_ALIASES {
         return Err(ExportFailure::Retryable(
             "hash alias limit exceeded".to_string(),
@@ -927,7 +927,7 @@ async fn resolve_exact_txn(
 async fn resolve_alias(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    alias: &HashPathIndexKey,
+    alias: &HashIndex,
     allowed: &BTreeMap<(GroupId, String), bool>,
 ) -> Result<ResolveResult, ExportFailure> {
     let permission_path = alias.permission_path();
@@ -956,7 +956,7 @@ async fn resolve_alias(
 async fn resolve_alias_txn(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    alias: &HashPathIndexKey,
+    alias: &HashIndex,
     txn_id: TxnId,
     permission_path: &str,
 ) -> Result<ResolveResult, ExportFailure> {
@@ -1309,7 +1309,7 @@ async fn probe_sources_checked(
     permission_rules: &mut BTreeMap<GroupId, PermissionRules>,
     alias_paths: &mut BTreeSet<(GroupId, String)>,
     alias_keys: &mut BTreeSet<([u8; 32], String, Ulid)>,
-    alias_cache: &mut BTreeMap<[u8; 32], Vec<HashPathIndexKey>>,
+    alias_cache: &mut BTreeMap<[u8; 32], Vec<HashIndex>>,
     resolved_aliases: &mut BTreeMap<[u8; 32], (Vec<ExportCandidate>, bool)>,
     authorized_aliases: &mut BTreeMap<(GroupId, String), bool>,
 ) -> Result<Vec<ProbedEntry>, ExportFailure> {
@@ -1802,4 +1802,5 @@ async fn write_archive(
 }
 
 #[cfg(test)]
+#[path = "export_tests.rs"]
 mod tests;
