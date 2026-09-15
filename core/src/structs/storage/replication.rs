@@ -261,12 +261,12 @@ impl fmt::Display for VersionedObjectArn {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum W3idDataIdentifier {
+pub enum W3idIdentifier {
     ContentHash([u8; 32]),
     VersionedObject(VersionedObjectArn),
 }
 
-impl W3idDataIdentifier {
+impl W3idIdentifier {
     pub fn parse(input: &str) -> Result<Self, ConversionError> {
         let suffix = input.strip_prefix(ARUNA_DATA_PREFIX).ok_or_else(|| {
             ConversionError::FromStrError("identifier is not an Aruna data W3ID".to_string())
@@ -390,13 +390,9 @@ pub struct ReplicationItemError {
 }
 
 impl ReplicationItemError {
-    /// Classifies a peer rejection reason once, at the wire boundary.
-    ///
-    /// The recognized values are the receiving node's published refusal texts.
-    /// `writer_access_denied` was and stays its own category; every other
-    /// `*access_denied` value took the legacy access-denied path and keeps it.
-    /// Unknown reasons stay `Other`, so a reworded peer message can never
-    /// escalate into a permission failure or a destructive cleanup.
+    /// Classifies a peer rejection reason once, at the wire boundary: known texts
+    /// keep their category (`writer_access_denied` stays its own), and an unknown
+    /// reason stays `Other`, so a reword can never fake a permission outcome.
     pub fn from_peer_reason(reason: &str) -> Self {
         let failure = match reason {
             "writer_access_denied" => ReplicationFailure::WriterDenied,
@@ -417,7 +413,7 @@ mod failure_tests {
     use super::{ReplicationFailure, ReplicationItemError};
 
     #[test]
-    fn peer_reason_classification_is_fixed() {
+    fn peer_reason_classification() {
         let cases = [
             ("writer_access_denied", ReplicationFailure::WriterDenied),
             ("manifest_access_denied", ReplicationFailure::AccessDenied),
@@ -434,7 +430,7 @@ mod failure_tests {
     }
 
     #[test]
-    fn unknown_reasons_stay_retryable() {
+    fn unknown_reasons_retryable() {
         let error = ReplicationItemError::from_peer_reason("writer access denied");
         assert_eq!(error.failure, ReplicationFailure::Other);
         assert!(!error.failure.is_denied());
@@ -443,9 +439,7 @@ mod failure_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ARUNA_DATA_PREFIX, ArunaArn, ArunaArnType, VersionedObjectArn, W3idDataIdentifier,
-    };
+    use super::{ARUNA_DATA_PREFIX, ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier};
     use crate::errors::ConversionError;
     use crate::{NodeId, structs::RealmId};
     use proptest::prelude::*;
@@ -538,8 +532,8 @@ mod tests {
         let hash = [3u8; 32];
         let hash_url = format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash));
         assert_eq!(
-            W3idDataIdentifier::parse(&hash_url).unwrap(),
-            W3idDataIdentifier::ContentHash(hash)
+            W3idIdentifier::parse(&hash_url).unwrap(),
+            W3idIdentifier::ContentHash(hash)
         );
 
         let arn = VersionedObjectArn::new(
@@ -551,17 +545,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            W3idDataIdentifier::parse(&arn.to_w3id()).unwrap(),
-            W3idDataIdentifier::VersionedObject(arn)
+            W3idIdentifier::parse(&arn.to_w3id()).unwrap(),
+            W3idIdentifier::VersionedObject(arn)
         );
     }
 
     #[test]
     fn rejects_pid_suffix() {
-        assert!(W3idDataIdentifier::parse(&format!("{ARUNA_DATA_PREFIX}ABC")).is_err());
-        assert!(
-            W3idDataIdentifier::parse(&format!("{ARUNA_DATA_PREFIX}{}", "A".repeat(64))).is_err()
-        );
+        assert!(W3idIdentifier::parse(&format!("{ARUNA_DATA_PREFIX}ABC")).is_err());
+        assert!(W3idIdentifier::parse(&format!("{ARUNA_DATA_PREFIX}{}", "A".repeat(64))).is_err());
     }
 
     #[test]

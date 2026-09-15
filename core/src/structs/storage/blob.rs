@@ -102,7 +102,7 @@ pub enum Backend {
     S3,
     FileSystem,
     /// A tenant-registered backend. Never nameable in the backends file: it is
-    /// synthesized from a `GroupStorageBackend` record.
+    /// synthesized from a `GroupStorage` record.
     Group(GroupBackendKind),
 }
 
@@ -682,7 +682,7 @@ pub fn object_permission_path(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct HashPathIndexKey {
+pub struct HashIndex {
     pub blake3_hash: [u8; 32],
     pub version_id: Ulid,
     pub realm_id: RealmId,
@@ -693,11 +693,11 @@ pub struct HashPathIndexKey {
 }
 
 #[derive(Serialize)]
-struct HashPathIndexKeyPrefix {
+struct HashIndexPrefix {
     blake3_hash: [u8; 32],
 }
 
-impl HashPathIndexKey {
+impl HashIndex {
     pub fn new(
         blake3_hash: [u8; 32],
         version_id: Ulid,
@@ -719,7 +719,7 @@ impl HashPathIndexKey {
     }
 
     pub fn hash_prefix(hash: &[u8]) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(&HashPathIndexKeyPrefix {
+        Ok(postcard::to_allocvec(&HashIndexPrefix {
             blake3_hash: hash.try_into()?,
         })?)
     }
@@ -757,7 +757,7 @@ struct VersionKeyPrefix<'a> {
 }
 
 #[derive(Serialize)]
-struct BucketVersionKeyPrefix<'a> {
+struct BucketVersionPrefix<'a> {
     bucket: &'a str,
 }
 
@@ -775,7 +775,7 @@ impl VersionKey {
     }
 
     pub fn bucket_prefix(bucket: &str) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(&BucketVersionKeyPrefix { bucket })?)
+        Ok(postcard::to_allocvec(&BucketVersionPrefix { bucket })?)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -1267,10 +1267,10 @@ impl UserAccess {
 mod tests {
     use super::{
         Backend, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-        BucketCorsConfiguration, BucketCorsRule, BucketInfo, CurrentVersionPointer,
-        HashPathIndexKey, HiddenBlobKey, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
-        ManagedCopyState, VersionKey, bucket_permission_path, group_permission_path,
-        key_content_type, object_permission_path,
+        BucketCorsConfiguration, BucketCorsRule, BucketInfo, CurrentVersionPointer, HashIndex,
+        HiddenBlobKey, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
+        VersionKey, bucket_permission_path, group_permission_path, key_content_type,
+        object_permission_path,
     };
     use crate::NodeId;
     use crate::UserId;
@@ -1473,7 +1473,7 @@ mod tests {
         let node_id =
             NodeId::from_str("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6")
                 .unwrap();
-        let key = HashPathIndexKey::new(
+        let key = HashIndex::new(
             [7u8; 32],
             Ulid::from_bytes([8u8; 16]),
             realm_id,
@@ -1483,8 +1483,8 @@ mod tests {
             "nested/path.txt",
         );
 
-        let restored = HashPathIndexKey::from_bytes(&key.to_bytes().unwrap()).unwrap();
-        let prefix = HashPathIndexKey::hash_prefix(&[7u8; 32]).unwrap();
+        let restored = HashIndex::from_bytes(&key.to_bytes().unwrap()).unwrap();
+        let prefix = HashIndex::hash_prefix(&[7u8; 32]).unwrap();
 
         assert_eq!(key, restored);
         assert_eq!(restored.version_id, Ulid::from_bytes([8u8; 16]));

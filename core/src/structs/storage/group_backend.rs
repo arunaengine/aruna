@@ -60,7 +60,7 @@ impl FromStr for GroupBackendKind {
 /// A tenant-registered write backend on the group's own object store. Secrets
 /// live in a separate record and are never part of this one.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GroupStorageBackend {
+pub struct GroupStorage {
     pub backend_id: Ulid,
     pub group_id: GroupId,
     pub name: String,
@@ -78,7 +78,7 @@ pub struct GroupStorageBackend {
     pub cleanup: CleanupStrategy,
 }
 
-impl GroupStorageBackend {
+impl GroupStorage {
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -89,7 +89,7 @@ impl GroupStorageBackend {
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GroupStorageBackendSecret {
+pub struct GroupStorageSecret {
     pub backend_id: Ulid,
     pub secret_config: HashMap<String, String>,
     pub updated_at: SystemTime,
@@ -97,16 +97,16 @@ pub struct GroupStorageBackendSecret {
 
 /// Redacted on purpose: this record reaches effect and error formatting, and
 /// its values are live credentials.
-impl fmt::Debug for GroupStorageBackendSecret {
+impl fmt::Debug for GroupStorageSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GroupStorageBackendSecret")
+        f.debug_struct("GroupStorageSecret")
             .field("backend_id", &self.backend_id)
             .field("keys", &self.secret_config.keys().collect::<Vec<_>>())
             .finish()
     }
 }
 
-impl GroupStorageBackendSecret {
+impl GroupStorageSecret {
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -118,7 +118,7 @@ impl GroupStorageBackendSecret {
 
 #[cfg(test)]
 mod tests {
-    use super::{GroupBackendKind, GroupStorageBackend, GroupStorageBackendSecret};
+    use super::{GroupBackendKind, GroupStorage, GroupStorageSecret};
     use crate::UserId;
     use crate::structs::CleanupStrategy;
     use crate::structs::RealmId;
@@ -131,7 +131,7 @@ mod tests {
     fn secret_stays_separate() {
         // The public record must never carry credential material.
         let backend_id = Ulid::from_bytes([1u8; 16]);
-        let record = GroupStorageBackend {
+        let record = GroupStorage {
             backend_id,
             group_id: Ulid::from_bytes([2u8; 16]),
             name: "tenant-s3".to_string(),
@@ -143,7 +143,7 @@ mod tests {
             disabled: false,
             cleanup: CleanupStrategy::Retain,
         };
-        let secret = GroupStorageBackendSecret {
+        let secret = GroupStorageSecret {
             backend_id,
             secret_config: HashMap::from([(
                 "secret_access_key".to_string(),
@@ -159,19 +159,16 @@ mod tests {
                 .windows("super-secret".len())
                 .any(|window| window == b"super-secret")
         );
+        assert_eq!(GroupStorage::from_bytes(&public_bytes).unwrap(), record);
         assert_eq!(
-            GroupStorageBackend::from_bytes(&public_bytes).unwrap(),
-            record
-        );
-        assert_eq!(
-            GroupStorageBackendSecret::from_bytes(&secret.to_bytes().unwrap()).unwrap(),
+            GroupStorageSecret::from_bytes(&secret.to_bytes().unwrap()).unwrap(),
             secret
         );
     }
 
     #[test]
     fn debug_hides_secrets() {
-        let secret = GroupStorageBackendSecret {
+        let secret = GroupStorageSecret {
             backend_id: Ulid::from_bytes([1u8; 16]),
             secret_config: HashMap::from([("account_key".to_string(), "hunter2".to_string())]),
             updated_at: SystemTime::UNIX_EPOCH,
