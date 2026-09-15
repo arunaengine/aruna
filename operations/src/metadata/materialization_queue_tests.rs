@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::thread;
 use tempfile::tempdir;
 
-use crate::tests::fixtures::metadata::{storage_key_exists, write_entries};
+use crate::tests::metadata::{storage_key_exists, write_entries};
 
 #[tokio::test]
 async fn delete_waits_fence() {
@@ -44,7 +44,7 @@ fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-fn create_event(document_id: Ulid, event_id: Ulid, name: &str) -> MetadataCreateEventRecord {
+fn create_event(document_id: Ulid, event_id: Ulid, name: &str) -> MetadataEventRecord {
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let group_id = Ulid::from_parts(7, 1);
     let document_path = format!("datasets/{name}");
@@ -68,12 +68,12 @@ fn create_event(document_id: Ulid, event_id: Ulid, name: &str) -> MetadataCreate
         establishing_event_id: event_id,
         last_event_id: event_id,
     };
-    MetadataCreateEventRecord {
+    MetadataEventRecord {
         event_id,
         record,
         user_id: aruna_core::UserId::local(Ulid::from_parts(7, 2), realm_id),
         node_id: node(1),
-        payload: MetadataCreateEventPayload::Scaffold {
+        payload: MetadataEventPayload::Scaffold {
             name: name.to_string(),
             description: "Materialization test".to_string(),
             date_published: "2026-01-01".to_string(),
@@ -84,9 +84,9 @@ fn create_event(document_id: Ulid, event_id: Ulid, name: &str) -> MetadataCreate
 }
 
 fn with_payload(
-    mut event: MetadataCreateEventRecord,
-    payload: MetadataCreateEventPayload,
-) -> MetadataCreateEventRecord {
+    mut event: MetadataEventRecord,
+    payload: MetadataEventPayload,
+) -> MetadataEventRecord {
     event.payload = payload;
     event
 }
@@ -98,9 +98,9 @@ async fn older_exists(
     document_id: Ulid,
     event_id: Ulid,
     advanced: &BTreeSet<Ulid>,
-) -> Result<bool, MetadataMaterializationQueueError> {
+) -> Result<bool, MetadataMaterializationError> {
     let group = load_group_jobs(storage, document_id).await?;
-    let job = MetadataMaterializationJobRecord {
+    let job = MetadataMaterializationRecord {
         document_id,
         event_id,
         due_at_ms: 0,
@@ -203,7 +203,7 @@ async fn corrupt_global_job() {
     let document_id = Ulid::from_bytes([14u8; 16]);
     let old_event_id = Ulid::from_parts(14, 1);
     let newer_event_id = Ulid::from_parts(14, 2);
-    let old_job = MetadataMaterializationJobRecord {
+    let old_job = MetadataMaterializationRecord {
         document_id,
         event_id: old_event_id,
         due_at_ms: 1,
@@ -302,7 +302,7 @@ async fn orphan_valid_sidecar() {
     let document_id = Ulid::from_bytes([17u8; 16]);
     let old_event_id = Ulid::from_parts(17, 1);
     let newer_event_id = Ulid::from_parts(17, 2);
-    let old_job = MetadataMaterializationJobRecord {
+    let old_job = MetadataMaterializationRecord {
         document_id,
         event_id: old_event_id,
         due_at_ms: 1,
@@ -334,7 +334,7 @@ async fn orphan_global_job() {
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let document_id = Ulid::from_bytes([22u8; 16]);
     let event_id = Ulid::from_parts(22, 1);
-    let job = MetadataMaterializationJobRecord {
+    let job = MetadataMaterializationRecord {
         document_id,
         event_id,
         due_at_ms: 1,
@@ -427,7 +427,7 @@ async fn scan_stops_early() {
     let document_id = Ulid::from_bytes([40u8; 16]);
     let due_event = Ulid::from_parts(1, 1);
     let event = create_event(document_id, due_event, "due");
-    let due_job = MetadataMaterializationJobRecord {
+    let due_job = MetadataMaterializationRecord {
         document_id,
         event_id: due_event,
         due_at_ms: 1,
@@ -441,7 +441,7 @@ async fn scan_stops_early() {
         document_job_entry(&due_job).unwrap(),
     ];
     for index in 0..600u64 {
-        let future_job = MetadataMaterializationJobRecord {
+        let future_job = MetadataMaterializationRecord {
             document_id: Ulid::from_bytes([41u8; 16]),
             event_id: Ulid::from_parts(2, u128::from(index)),
             due_at_ms: now_ms.saturating_add(60_000).saturating_add(index),
@@ -481,7 +481,7 @@ async fn scan_batches_reads() {
         let document_id = Ulid::from_bytes([index; 16]);
         let event_id = Ulid::from_parts(1, u128::from(index));
         let event = create_event(document_id, event_id, "batched");
-        let job = MetadataMaterializationJobRecord {
+        let job = MetadataMaterializationRecord {
             document_id,
             event_id,
             due_at_ms: 1,
@@ -516,7 +516,7 @@ async fn probe_reads_one() {
         let document_id = Ulid::from_bytes([100 + index; 16]);
         let event_id = Ulid::from_parts(1, u128::from(index));
         let event = create_event(document_id, event_id, "probe");
-        let job = MetadataMaterializationJobRecord {
+        let job = MetadataMaterializationRecord {
             document_id,
             event_id,
             due_at_ms: 1,
@@ -545,7 +545,7 @@ async fn stale_index_pruned() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let now_ms = unix_timestamp_millis();
-    let orphan = MetadataMaterializationJobRecord {
+    let orphan = MetadataMaterializationRecord {
         document_id: Ulid::from_bytes([42u8; 16]),
         event_id: Ulid::from_parts(1, 1),
         due_at_ms: 1,
@@ -553,7 +553,7 @@ async fn stale_index_pruned() {
         failures: 0,
         parks: 0,
     };
-    let mismatched = MetadataMaterializationJobRecord {
+    let mismatched = MetadataMaterializationRecord {
         document_id: Ulid::from_bytes([43u8; 16]),
         event_id: Ulid::from_parts(1, 2),
         due_at_ms: 1,
@@ -561,7 +561,7 @@ async fn stale_index_pruned() {
         failures: 0,
         parks: 0,
     };
-    let mismatched_sidecar = MetadataMaterializationJobRecord {
+    let mismatched_sidecar = MetadataMaterializationRecord {
         due_at_ms: 999,
         ..mismatched.clone()
     };
@@ -612,7 +612,7 @@ async fn older_check_bounded() {
     let middle = Ulid::from_parts(2, 1);
     let last = Ulid::from_parts(3, 1);
     let first_event = create_event(document_id, first, "first");
-    let job_for = |event_id: Ulid| MetadataMaterializationJobRecord {
+    let job_for = |event_id: Ulid| MetadataMaterializationRecord {
         document_id,
         event_id,
         due_at_ms: 1,
@@ -627,7 +627,7 @@ async fn older_check_bounded() {
         document_job_entry(&job_for(last)).unwrap(),
     ];
     for index in 0..500u64 {
-        let other = MetadataMaterializationJobRecord {
+        let other = MetadataMaterializationRecord {
             document_id: Ulid::from_parts(9, u128::from(index)),
             event_id: Ulid::from_parts(9, u128::from(index)),
             due_at_ms: 1,
@@ -649,8 +649,8 @@ async fn older_check_bounded() {
     assert!(delta <= 10, "older check issued {delta} storage requests");
 }
 
-fn application_failure() -> MetadataMaterializationQueueError {
-    MetadataMaterializationQueueError::Metadata(MetadataError::Backend("boom".to_string()))
+fn application_failure() -> MetadataMaterializationError {
+    MetadataMaterializationError::Metadata(MetadataError::Backend("boom".to_string()))
 }
 
 #[tokio::test]
@@ -662,7 +662,7 @@ async fn failure_cap_parks() {
     let document_id = Ulid::from_bytes([45u8; 16]);
     let event_id = Ulid::from_parts(1, 1);
     let event = create_event(document_id, event_id, "capped");
-    let job = MetadataMaterializationJobRecord {
+    let job = MetadataMaterializationRecord {
         document_id,
         event_id,
         due_at_ms: 1,
@@ -707,7 +707,7 @@ async fn failure_cap_parks() {
         .await
         .unwrap()
         .expect("failed status is written");
-    assert_eq!(status.state, MetadataMaterializationState::Failed);
+    assert_eq!(status.state, MaterializationState::Failed);
     assert_eq!(status.failures, MATERIALIZATION_MAX_FAILURES);
     assert!(!materialization_jobs_exist(&storage).await.unwrap());
     let dead_letter = read_dead_letter(&storage, document_id, event_id)
@@ -724,7 +724,7 @@ fn cap_boundary_reschedules() {
     let document_id = Ulid::from_bytes([46u8; 16]);
     let event_id = Ulid::from_parts(2, 1);
     let event = create_event(document_id, event_id, "boundary");
-    let reschedule = MetadataMaterializationJobRecord {
+    let reschedule = MetadataMaterializationRecord {
         document_id,
         event_id,
         due_at_ms: 1,
@@ -739,7 +739,7 @@ fn cap_boundary_reschedules() {
         }
         other => panic!("expected reschedule, got {other:?}"),
     }
-    let park = MetadataMaterializationJobRecord {
+    let park = MetadataMaterializationRecord {
         failures: MATERIALIZATION_MAX_FAILURES - 1,
         parks: 0,
         ..reschedule
@@ -757,7 +757,7 @@ fn transient_skips_cap() {
     let document_id = Ulid::from_bytes([47u8; 16]);
     let event_id = Ulid::from_parts(3, 1);
     let event = create_event(document_id, event_id, "transient");
-    let job = MetadataMaterializationJobRecord {
+    let job = MetadataMaterializationRecord {
         document_id,
         event_id,
         due_at_ms: 1,
@@ -767,11 +767,11 @@ fn transient_skips_cap() {
     };
     let key = materialization_job_key(&job);
     let errors = [
-        MetadataMaterializationQueueError::Storage(StorageError::Timeout),
-        MetadataMaterializationQueueError::Storage(StorageError::TransactionConflict),
+        MetadataMaterializationError::Storage(StorageError::Timeout),
+        MetadataMaterializationError::Storage(StorageError::TransactionConflict),
         // A failed durability flush runs after every apply; charging it would
         // park documents whenever the disk is the bottleneck.
-        MetadataMaterializationQueueError::Metadata(MetadataError::Persist("journal".to_string())),
+        MetadataMaterializationError::Metadata(MetadataError::Persist("journal".to_string())),
     ];
     for error in errors {
         match defer_materialization_job(key.as_ref(), &job, &event, &error) {
@@ -791,7 +791,7 @@ fn iri_failure_transient() {
     let document_id = Ulid::from_bytes([51u8; 16]);
     let event_id = Ulid::from_parts(5, 1);
     let event = create_event(document_id, event_id, "indexed");
-    let job = MetadataMaterializationJobRecord {
+    let job = MetadataMaterializationRecord {
         document_id,
         event_id,
         due_at_ms: 1,
@@ -800,9 +800,8 @@ fn iri_failure_transient() {
         parks: 0,
     };
     let key = materialization_job_key(&job);
-    let error = MetadataMaterializationQueueError::from(MetadataIriIndexError::Storage(
-        StorageError::QueueFull,
-    ));
+    let error =
+        MetadataMaterializationError::from(MetadataIriError::Storage(StorageError::QueueFull));
     match defer_materialization_job(key.as_ref(), &job, &event, &error) {
         FinishedMaterializationJob::Rescheduled { status, .. } => {
             assert_eq!(status.failures, job.failures);
@@ -817,7 +816,7 @@ fn handle_failure_transient() {
     let document_id = Ulid::from_bytes([53u8; 16]);
     let event_id = Ulid::from_parts(7, 1);
     let event = create_event(document_id, event_id, "handle");
-    let job = MetadataMaterializationJobRecord {
+    let job = MetadataMaterializationRecord {
         document_id,
         event_id,
         due_at_ms: 1,
@@ -827,10 +826,8 @@ fn handle_failure_transient() {
     };
     let key = materialization_job_key(&job);
     let errors = [
-        MetadataMaterializationQueueError::Metadata(MetadataError::Storage(
-            StorageError::QueueFull,
-        )),
-        MetadataMaterializationQueueError::Metadata(MetadataError::Storage(StorageError::Timeout)),
+        MetadataMaterializationError::Metadata(MetadataError::Storage(StorageError::QueueFull)),
+        MetadataMaterializationError::Metadata(MetadataError::Storage(StorageError::Timeout)),
     ];
     for error in errors {
         match defer_materialization_job(key.as_ref(), &job, &event, &error) {
@@ -851,7 +848,7 @@ async fn deadletters_requeue_due() {
     let document_id = Ulid::from_bytes([48u8; 16]);
     let event_id = Ulid::from_parts(4, 1);
     let event = create_event(document_id, event_id, "requeue");
-    let job = MetadataMaterializationJobRecord {
+    let job = MetadataMaterializationRecord {
         document_id,
         event_id,
         due_at_ms: 1,
@@ -859,7 +856,7 @@ async fn deadletters_requeue_due() {
         failures: MATERIALIZATION_MAX_FAILURES,
         parks: 0,
     };
-    let pending = MetadataMaterializationDeadLetterRecord {
+    let pending = DeadLetterRecord {
         job: job.clone(),
         last_error: "boom".to_string(),
         parked_at_ms: 1,
@@ -876,7 +873,7 @@ async fn deadletters_requeue_due() {
     .await;
     assert_eq!(requeue_dead_letters(&storage).await.unwrap(), 0);
 
-    let due = MetadataMaterializationDeadLetterRecord {
+    let due = DeadLetterRecord {
         requeue_at_ms: 1,
         ..pending
     };
@@ -899,7 +896,7 @@ async fn deadletters_requeue_due() {
         .await
         .unwrap()
         .expect("status is reset");
-    assert_eq!(status.state, MetadataMaterializationState::Pending);
+    assert_eq!(status.state, MaterializationState::Pending);
     assert!(materialization_jobs_exist(&storage).await.unwrap());
 }
 
@@ -912,7 +909,7 @@ async fn requeued_parks_fast() {
     let document_id = Ulid::from_bytes([53u8; 16]);
     let event_id = Ulid::from_parts(6, 1);
     let event = create_event(document_id, event_id, "poison");
-    let parked = MetadataMaterializationJobRecord {
+    let parked = MetadataMaterializationRecord {
         document_id,
         event_id,
         due_at_ms: 1,
@@ -920,7 +917,7 @@ async fn requeued_parks_fast() {
         failures: MATERIALIZATION_MAX_FAILURES,
         parks: 0,
     };
-    let due = MetadataMaterializationDeadLetterRecord {
+    let due = DeadLetterRecord {
         job: parked,
         last_error: "boom".to_string(),
         parked_at_ms: 1,
@@ -960,9 +957,9 @@ async fn requeued_parks_fast() {
 // A status that already materialized `event_id`, as a newer event would.
 fn materialized_status(
     document_id: Ulid,
-    event: &MetadataCreateEventRecord,
-) -> MetadataMaterializationStatusRecord {
-    let job = MetadataMaterializationJobRecord {
+    event: &MetadataEventRecord,
+) -> MaterializationStatusRecord {
+    let job = MetadataMaterializationRecord {
         document_id,
         event_id: event.event_id,
         due_at_ms: 1,
@@ -985,8 +982,8 @@ async fn deadletter_drops_superseded() {
     let old_event = create_event(document_id, old_event_id, "old");
     let newer_event = create_event(document_id, newer_event_id, "newer");
     let newer_status = materialized_status(document_id, &newer_event);
-    let due = MetadataMaterializationDeadLetterRecord {
-        job: MetadataMaterializationJobRecord {
+    let due = DeadLetterRecord {
+        job: MetadataMaterializationRecord {
             document_id,
             event_id: old_event_id,
             due_at_ms: 1,
@@ -1023,7 +1020,7 @@ async fn deadletter_drops_superseded() {
         .unwrap()
         .expect("status survives");
     assert_eq!(status.event_id, newer_event_id);
-    assert_eq!(status.state, MetadataMaterializationState::Materialized);
+    assert_eq!(status.state, MaterializationState::Materialized);
     assert!(
         read_document_job(&storage, document_id, old_event_id)
             .await
@@ -1042,7 +1039,7 @@ async fn requeue_aborts_raced() {
     let newer_event_id = Ulid::from_parts(2, 1);
     let old_event = create_event(document_id, old_event_id, "old");
     let newer_event = create_event(document_id, newer_event_id, "newer");
-    let job = MetadataMaterializationJobRecord {
+    let job = MetadataMaterializationRecord {
         document_id,
         event_id: old_event_id,
         due_at_ms: 1,
@@ -1050,7 +1047,7 @@ async fn requeue_aborts_raced() {
         failures: MATERIALIZATION_MAX_FAILURES,
         parks: 1,
     };
-    let status = MetadataMaterializationStatusRecord {
+    let status = MaterializationStatusRecord {
         failures: job.failures,
         ..new_pending_status(&old_event, 1)
     };
@@ -1101,7 +1098,7 @@ async fn park_skips_superseded() {
     let old_event = create_event(document_id, old_event_id, "old");
     let newer_event = create_event(document_id, newer_event_id, "newer");
     let newer_status = materialized_status(document_id, &newer_event);
-    let job = MetadataMaterializationJobRecord {
+    let job = MetadataMaterializationRecord {
         document_id,
         event_id: old_event_id,
         due_at_ms: 1,
@@ -1161,7 +1158,7 @@ fn effect_uses_event() {
 
     let rocrate = with_payload(
         event.clone(),
-        MetadataCreateEventPayload::RoCrate {
+        MetadataEventPayload::RoCrate {
             jsonld: "{}".to_string(),
         },
     );
@@ -1178,7 +1175,7 @@ fn effect_uses_event() {
 
     let data = with_payload(
         event.clone(),
-        MetadataCreateEventPayload::UpsertDataEntity {
+        MetadataEventPayload::UpsertDataEntity {
             jsonld: r#"{"@id":"./file.txt","@type":"File","name":"file"}"#.to_string(),
         },
     );
@@ -1195,7 +1192,7 @@ fn effect_uses_event() {
 
     let contextual = with_payload(
         event,
-        MetadataCreateEventPayload::UpsertContextualEntity {
+        MetadataEventPayload::UpsertContextualEntity {
             jsonld: r##"{"@id":"#lab","@type":"Organization","name":"lab"}"##.to_string(),
         },
     );
@@ -1241,7 +1238,7 @@ fn replaying_same_event() {
     let event = create_event(document_id, event_id, "replay");
     let data = with_payload(
         event.clone(),
-        MetadataCreateEventPayload::UpsertDataEntity {
+        MetadataEventPayload::UpsertDataEntity {
             jsonld: r#"{"@id":"./file.txt","@type":"File","name":"file"}"#.to_string(),
         },
     );
@@ -1259,7 +1256,7 @@ fn newer_pending_status() {
     let document_id = Ulid::from_bytes([8u8; 16]);
     let older_event_id = Ulid::from_parts(8, 1);
     let newer_event_id = Ulid::from_parts(8, 2);
-    let older_job = MetadataMaterializationJobRecord {
+    let older_job = MetadataMaterializationRecord {
         document_id,
         event_id: older_event_id,
         due_at_ms: 1,
@@ -1267,20 +1264,20 @@ fn newer_pending_status() {
         failures: 0,
         parks: 0,
     };
-    let newer_pending = MetadataMaterializationStatusRecord {
+    let newer_pending = MaterializationStatusRecord {
         document_id,
         event_id: newer_event_id,
         graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
         context_digest: None,
         dataset_digest: None,
-        state: MetadataMaterializationState::Pending,
+        state: MaterializationState::Pending,
         attempts: 0,
         failures: 0,
         last_error: None,
         updated_at_ms: 1,
     };
-    let newer_final = MetadataMaterializationStatusRecord {
-        state: MetadataMaterializationState::Materialized,
+    let newer_final = MaterializationStatusRecord {
+        state: MaterializationState::Materialized,
         ..newer_pending.clone()
     };
 
@@ -1293,25 +1290,25 @@ fn older_retry_status() {
     let document_id = Ulid::from_bytes([9u8; 16]);
     let older_event_id = Ulid::from_parts(9, 1);
     let newer_event_id = Ulid::from_parts(9, 2);
-    let older_retry = MetadataMaterializationStatusRecord {
+    let older_retry = MaterializationStatusRecord {
         document_id,
         event_id: older_event_id,
         graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
         context_digest: None,
         dataset_digest: None,
-        state: MetadataMaterializationState::Pending,
+        state: MaterializationState::Pending,
         attempts: 1,
         failures: 0,
         last_error: Some("transient".to_string()),
         updated_at_ms: 1,
     };
-    let newer_pending = MetadataMaterializationStatusRecord {
+    let newer_pending = MaterializationStatusRecord {
         document_id,
         event_id: newer_event_id,
         graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
         context_digest: None,
         dataset_digest: None,
-        state: MetadataMaterializationState::Pending,
+        state: MaterializationState::Pending,
         attempts: 0,
         failures: 0,
         last_error: None,
@@ -1326,25 +1323,25 @@ fn older_retry_status() {
 fn stale_final_status() {
     let document_id = Ulid::from_bytes([29u8; 16]);
     let event_id = Ulid::from_parts(29, 1);
-    let retry_status = MetadataMaterializationStatusRecord {
+    let retry_status = MaterializationStatusRecord {
         document_id,
         event_id,
         graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
         context_digest: None,
         dataset_digest: None,
-        state: MetadataMaterializationState::Pending,
+        state: MaterializationState::Pending,
         attempts: 1,
         failures: 0,
         last_error: Some("transient".to_string()),
         updated_at_ms: 1,
     };
-    let stale_final = MetadataMaterializationStatusRecord {
-        state: MetadataMaterializationState::Materialized,
+    let stale_final = MaterializationStatusRecord {
+        state: MaterializationState::Materialized,
         last_error: None,
         updated_at_ms: 2,
         ..retry_status.clone()
     };
-    let fresh_final = MetadataMaterializationStatusRecord {
+    let fresh_final = MaterializationStatusRecord {
         attempts: 2,
         ..stale_final.clone()
     };
@@ -1363,7 +1360,7 @@ async fn reschedule_batch(
         let document_id = Ulid::from_parts(900, seed as u128);
         let event_id = Ulid::from_parts(1, seed as u128);
         let event = create_event(document_id, event_id, "chunk");
-        let job = MetadataMaterializationJobRecord {
+        let job = MetadataMaterializationRecord {
             document_id,
             event_id,
             due_at_ms: 1,
@@ -1420,13 +1417,13 @@ async fn finish_avoids_conflicts() {
     let plan = plan_finish_chunk(&storage, finished).await.unwrap();
 
     let document_id = Ulid::from_bytes([120u8; 16]);
-    let racing = MetadataMaterializationStatusRecord {
+    let racing = MaterializationStatusRecord {
         document_id,
         event_id: Ulid::from_parts(9, 9),
         graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
         context_digest: None,
         dataset_digest: None,
-        state: MetadataMaterializationState::Pending,
+        state: MaterializationState::Pending,
         attempts: 0,
         failures: 0,
         last_error: None,
@@ -1459,7 +1456,7 @@ async fn finish_keeps_newer() {
     let newer_event_id = Ulid::from_parts(2, 1);
     let old_event = create_event(document_id, old_event_id, "old");
     let newer_event = create_event(document_id, newer_event_id, "newer");
-    let old_job = MetadataMaterializationJobRecord {
+    let old_job = MetadataMaterializationRecord {
         document_id,
         event_id: old_event_id,
         due_at_ms: 1,
@@ -1491,7 +1488,7 @@ async fn finish_keeps_newer() {
     let plan = plan_finish_chunk(&storage, finished).await.unwrap();
 
     // The newer event lands after the snapshot was taken.
-    let newer_job = MetadataMaterializationJobRecord {
+    let newer_job = MetadataMaterializationRecord {
         document_id,
         event_id: newer_event_id,
         due_at_ms: 1,
@@ -1541,7 +1538,7 @@ async fn finish_not_regress() {
     let old_event_id = Ulid::from_parts(3, 1);
     let newer_event_id = Ulid::from_parts(4, 1);
     let old_event = create_event(document_id, old_event_id, "old");
-    let old_job = MetadataMaterializationJobRecord {
+    let old_job = MetadataMaterializationRecord {
         document_id,
         event_id: old_event_id,
         due_at_ms: 1,
@@ -1549,13 +1546,13 @@ async fn finish_not_regress() {
         failures: 0,
         parks: 0,
     };
-    let newer_status = MetadataMaterializationStatusRecord {
+    let newer_status = MaterializationStatusRecord {
         document_id,
         event_id: newer_event_id,
         graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
         context_digest: None,
         dataset_digest: None,
-        state: MetadataMaterializationState::Pending,
+        state: MaterializationState::Pending,
         attempts: 7,
         failures: 0,
         last_error: Some("newer pending".to_string()),
@@ -1656,7 +1653,7 @@ async fn supersedes_prior_rows() {
 
     let build = |event_id: Ulid| {
         let event = create_event(document_id, event_id, "rev");
-        let job = MetadataMaterializationJobRecord {
+        let job = MetadataMaterializationRecord {
             document_id,
             event_id,
             due_at_ms: 1,
@@ -1852,7 +1849,7 @@ async fn older_queued_job() {
     let document_id = Ulid::from_bytes([10u8; 16]);
     let older_event_id = Ulid::from_parts(10, 1);
     let newer_event_id = Ulid::from_parts(10, 2);
-    let older_job = MetadataMaterializationJobRecord {
+    let older_job = MetadataMaterializationRecord {
         document_id,
         event_id: older_event_id,
         due_at_ms: 30_000,
@@ -1860,13 +1857,13 @@ async fn older_queued_job() {
         failures: 0,
         parks: 0,
     };
-    let newer_pending = MetadataMaterializationStatusRecord {
+    let newer_pending = MaterializationStatusRecord {
         document_id,
         event_id: newer_event_id,
         graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
         context_digest: None,
         dataset_digest: None,
-        state: MetadataMaterializationState::Pending,
+        state: MaterializationState::Pending,
         attempts: 0,
         failures: 0,
         last_error: None,
@@ -1909,7 +1906,7 @@ async fn reschedules_batched() {
             let document_id = Ulid::from_bytes([70 + seed; 16]);
             let event_id = Ulid::from_parts(1, u128::from(seed));
             let event = create_event(document_id, event_id, "retry");
-            let job = MetadataMaterializationJobRecord {
+            let job = MetadataMaterializationRecord {
                 document_id,
                 event_id,
                 due_at_ms: 1,
@@ -1988,7 +1985,7 @@ async fn failing_apply_reschedules() {
     let document_id = Ulid::from_bytes([90u8; 16]);
     let event_id = Ulid::from_parts(3, 1);
     let event = create_event(document_id, event_id, "reschedule");
-    let job = MetadataMaterializationJobRecord {
+    let job = MetadataMaterializationRecord {
         document_id,
         event_id,
         due_at_ms: 1,

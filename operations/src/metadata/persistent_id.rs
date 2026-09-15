@@ -2,10 +2,11 @@
 //! through `Processing` to `Active`; each step is a compare-and-set txn that
 //! also enqueues its sync publish, so replay cannot mint twice.
 
+#[path = "persistent_id_forward.rs"]
 pub mod forward;
 
 use aruna_core::UserId;
-use aruna_core::document::DocumentSyncOutboxEvent;
+use aruna_core::document::DocumentOutboxEvent;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -454,7 +455,7 @@ pub fn transition_entries(
                 route.actor,
                 target,
                 route.peers.clone(),
-                DocumentSyncOutboxEvent::Upsert {
+                DocumentOutboxEvent::Upsert {
                     bytes: mapping.to_bytes().map_err(PersistentIdError::Conversion)?,
                     change,
                 },
@@ -924,7 +925,7 @@ mod tests {
         config
     }
 
-    fn outbox_row(writes: &[TransitionEntry]) -> aruna_core::document::DocumentSyncOutboxRecord {
+    fn outbox_row(writes: &[TransitionEntry]) -> aruna_core::document::DocumentOutboxRecord {
         let entry = writes
             .iter()
             .find(|(key_space, _, _)| {
