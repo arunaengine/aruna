@@ -7,11 +7,10 @@ use aruna_core::keyspaces::{
     METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_RAW_REVISION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataCreateEventPayload,
-    MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataError,
-    MetadataGraphLifecycleRecord, MetadataMaterializationState, MetadataMergedRevision,
-    MetadataRawRevision, apply_raw_upsert, raw_context_digest, raw_upsert_entity,
-    resolve_raw_revision,
+    GraphLifecycleRecord, METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MaterializationState,
+    MetadataError, MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
+    MetadataMergedRevision, MetadataRawRevision, apply_raw_upsert, raw_context_digest,
+    raw_upsert_entity, resolve_raw_revision,
 };
 use aruna_core::storage_entries::{
     document_lifecycle_key, event_log_key, event_log_prefix, graph_lifecycle_key,
@@ -38,7 +37,7 @@ struct RawLoadBudget {
 }
 
 impl RawLoadBudget {
-    fn inspect(&mut self, encoded_bytes: usize) -> Result<(), MetadataRawReadError> {
+    fn inspect(&mut self, encoded_bytes: usize) -> Result<(), RawReadError> {
         self.encoded_bytes = self
             .encoded_bytes
             .checked_add(encoded_bytes)
@@ -49,7 +48,7 @@ impl RawLoadBudget {
         Ok(())
     }
 
-    fn accept(&mut self) -> Result<(), MetadataRawReadError> {
+    fn accept(&mut self) -> Result<(), RawReadError> {
         self.events = self
             .events
             .checked_add(1)
@@ -61,11 +60,11 @@ impl RawLoadBudget {
     }
 }
 
-fn budget_error(message: &str) -> MetadataRawReadError {
-    MetadataRawReadError::LimitExceeded(message.to_string())
+fn budget_error(message: &str) -> RawReadError {
+    RawReadError::LimitExceeded(message.to_string())
 }
 
-fn event_size(event: &MetadataCreateEventRecord) -> Result<usize, MetadataRawReadError> {
+fn event_size(event: &MetadataEventRecord) -> Result<usize, RawReadError> {
     Ok(postcard::experimental::serialized_size(event).map_err(ConversionError::from)?)
 }
 
@@ -108,12 +107,12 @@ impl RawEventPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataRawView {
     pub revision: MetadataRawRevision,
-    pub projection_state: MetadataMaterializationState,
+    pub projection_state: MaterializationState,
     pub projected_event_id: Option<Ulid>,
 }
 
 #[derive(Debug, Error)]
-pub enum MetadataRawReadError {
+pub enum RawReadError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -134,7 +133,7 @@ pub async fn load_raw_view(
     context: &DriverContext,
     document_id: Ulid,
     txn_id: Option<TxnId>,
-) -> Result<Option<MetadataRawView>, MetadataRawReadError> {
+) -> Result<Option<MetadataRawView>, RawReadError> {
     let status = parse_status_read(
         context
             .storage_handle
@@ -143,10 +142,10 @@ pub async fn load_raw_view(
     )
     .map_err(|error| match error {
         crate::metadata::repository::StorageReadError::Storage(error) => {
-            MetadataRawReadError::Storage(error)
+            RawReadError::Storage(error)
         }
         crate::metadata::repository::StorageReadError::Conversion(error) => {
-            MetadataRawReadError::Conversion(error)
+            RawReadError::Conversion(error)
         }
     })?;
     let revision = load_raw_revision(context, document_id, txn_id).await?;
@@ -156,10 +155,10 @@ pub async fn load_raw_view(
     let projection_state = status
         .as_ref()
         .map(|status| status.state)
-        .unwrap_or(MetadataMaterializationState::Pending);
+        .unwrap_or(MaterializationState::Pending);
     let projected_event_id = status
         .filter(|status| {
-            status.state == MetadataMaterializationState::Materialized
+            status.state == MaterializationState::Materialized
                 && status.event_id == revision.winning_event_id
                 && status.context_digest == Some(revision.context_digest)
                 && status.dataset_digest == revision.dataset_digest
@@ -176,7 +175,7 @@ pub async fn load_raw_revision(
     context: &DriverContext,
     document_id: Ulid,
     txn_id: Option<TxnId>,
-) -> Result<Option<MetadataRawRevision>, MetadataRawReadError> {
+) -> Result<Option<MetadataRawRevision>, RawReadError> {
     if raw_deleted(context, document_id, txn_id).await? {
         return Ok(None);
     }
@@ -203,7 +202,7 @@ pub async fn load_raw_revision(
 pub(crate) async fn load_raw_digest(
     context: &DriverContext,
     document_id: Ulid,
-) -> Result<Option<[u8; 32]>, MetadataRawReadError> {
+) -> Result<Option<[u8; 32]>, RawReadError> {
     Ok(read_raw_state(context, document_id, None)
         .await?
         .and_then(|state| state.revision)
@@ -214,7 +213,7 @@ async fn raw_deleted(
     context: &DriverContext,
     document_id: Ulid,
     txn_id: Option<TxnId>,
-) -> Result<bool, MetadataRawReadError> {
+) -> Result<bool, RawReadError> {
     let document = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -226,14 +225,14 @@ async fn raw_deleted(
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value
             .map(|value| {
-                postcard::from_bytes::<MetadataDocumentLifecycleRecord>(&value)
-                    .map(|record| matches!(record, MetadataDocumentLifecycleRecord::Delete { .. }))
+                postcard::from_bytes::<MetadataLifecycleRecord>(&value)
+                    .map(|record| matches!(record, MetadataLifecycleRecord::Delete { .. }))
                     .map_err(ConversionError::from)
             })
             .transpose()?
             .unwrap_or(false),
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(MetadataRawReadError::UnexpectedEvent(format!("{other:?}"))),
+        other => return Err(RawReadError::UnexpectedEvent(format!("{other:?}"))),
     };
     if document {
         return Ok(true);
@@ -249,23 +248,23 @@ async fn raw_deleted(
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value
             .map(|value| {
-                postcard::from_bytes::<MetadataGraphLifecycleRecord>(&value)
+                postcard::from_bytes::<GraphLifecycleRecord>(&value)
                     .map(|record| record.is_deleted())
                     .map_err(ConversionError::from)
             })
             .transpose()
             .map(|deleted| deleted.unwrap_or(false))
-            .map_err(MetadataRawReadError::from),
+            .map_err(RawReadError::from),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataRawReadError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(RawReadError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 pub(crate) async fn prepare_raw_event(
     context: &DriverContext,
-    event: &MetadataCreateEventRecord,
+    event: &MetadataEventRecord,
     cache: &mut RawStateCache,
-) -> Result<RawEventPlan, MetadataRawReadError> {
+) -> Result<RawEventPlan, RawReadError> {
     if !cache.loaded {
         cache.state = read_raw_state(context, event.record.document_id, None).await?;
         cache.loaded = true;
@@ -288,7 +287,7 @@ pub(crate) async fn prepare_raw_event(
                 .iter()
                 .any(|candidate| candidate.event_id == event.event_id)
             {
-                return Err(MetadataRawReadError::InconsistentLog(format!(
+                return Err(RawReadError::InconsistentLog(format!(
                     "raw event log is missing {}",
                     event.event_id
                 )));
@@ -327,11 +326,11 @@ pub(crate) async fn prepare_raw_event(
 /// this node has merged.
 pub(crate) async fn prepare_merged_event(
     context: &DriverContext,
-    event: &MetadataCreateEventRecord,
+    event: &MetadataEventRecord,
     render: String,
     findings: u32,
     cache: &mut RawStateCache,
-) -> Result<RawEventPlan, MetadataRawReadError> {
+) -> Result<RawEventPlan, RawReadError> {
     if !cache.loaded {
         cache.state = read_raw_state(context, event.record.document_id, None).await?;
         cache.loaded = true;
@@ -360,7 +359,7 @@ pub(crate) async fn prepare_merged_event(
 /// valid revision so the editor can open it and the export stays sound.
 fn merged_raw_state(
     mut state: RawRevisionState,
-    event: &MetadataCreateEventRecord,
+    event: &MetadataEventRecord,
     render: String,
     findings: u32,
 ) -> Result<RawRevisionState, MetadataError> {
@@ -397,11 +396,10 @@ fn rendered_revision(
 
 async fn initial_raw_state(
     context: &DriverContext,
-    event: &MetadataCreateEventRecord,
-) -> Result<(RawRevisionState, bool), MetadataRawReadError> {
+    event: &MetadataEventRecord,
+) -> Result<(RawRevisionState, bool), RawReadError> {
     let events = match &event.payload {
-        MetadataCreateEventPayload::Scaffold { .. }
-        | MetadataCreateEventPayload::RoCrate { .. } => {
+        MetadataEventPayload::Scaffold { .. } | MetadataEventPayload::RoCrate { .. } => {
             let mut budget = RawLoadBudget::default();
             budget.inspect(event_size(event)?)?;
             budget.accept()?;
@@ -420,10 +418,7 @@ async fn initial_raw_state(
         }
     };
     let state = resolve_raw_state(&events)?.ok_or_else(|| {
-        MetadataRawReadError::InconsistentLog(format!(
-            "raw event log is missing {}",
-            event.event_id
-        ))
+        RawReadError::InconsistentLog(format!("raw event log is missing {}", event.event_id))
     })?;
     let rebuild = state.revision.is_some() && !event_matches_state(event, &state);
     Ok((state, rebuild))
@@ -432,8 +427,8 @@ async fn initial_raw_state(
 async fn rebuild_raw_state(
     context: &DriverContext,
     state: &RawRevisionState,
-    event: &MetadataCreateEventRecord,
-) -> Result<RawRevisionState, MetadataRawReadError> {
+    event: &MetadataEventRecord,
+) -> Result<RawRevisionState, RawReadError> {
     let incoming_base = raw_base_identity(event);
     let Some(start_event_id) = state
         .base
@@ -462,7 +457,7 @@ async fn rebuild_raw_state(
         .await?,
     );
     resolve_raw_state(&events)?.ok_or_else(|| {
-        MetadataRawReadError::InconsistentLog(format!(
+        RawReadError::InconsistentLog(format!(
             "raw base event is missing for {}",
             event.record.document_id
         ))
@@ -471,7 +466,7 @@ async fn rebuild_raw_state(
 
 fn advance_raw_state(
     mut state: RawRevisionState,
-    events: &[MetadataCreateEventRecord],
+    events: &[MetadataEventRecord],
 ) -> Result<(RawRevisionState, bool), MetadataError> {
     let next_base = events
         .iter()
@@ -512,7 +507,7 @@ fn advance_raw_state(
 }
 
 fn resolve_raw_state(
-    events: &[MetadataCreateEventRecord],
+    events: &[MetadataEventRecord],
 ) -> Result<Option<RawRevisionState>, MetadataError> {
     let Some(last_event_id) = events.iter().map(|event| event.event_id).max() else {
         return Ok(None);
@@ -527,11 +522,10 @@ fn resolve_raw_state(
     }))
 }
 
-fn raw_base_identity(event: &MetadataCreateEventRecord) -> Option<RawBaseIdentity> {
+fn raw_base_identity(event: &MetadataEventRecord) -> Option<RawBaseIdentity> {
     matches!(
         &event.payload,
-        MetadataCreateEventPayload::RoCrate { .. }
-            | MetadataCreateEventPayload::ReplaceRoCrate { .. }
+        MetadataEventPayload::RoCrate { .. } | MetadataEventPayload::ReplaceRoCrate { .. }
     )
     .then_some(RawBaseIdentity {
         updated_at_ms: event.record.updated_at_ms,
@@ -539,20 +533,19 @@ fn raw_base_identity(event: &MetadataCreateEventRecord) -> Option<RawBaseIdentit
     })
 }
 
-fn event_matches_state(event: &MetadataCreateEventRecord, state: &RawRevisionState) -> bool {
+fn event_matches_state(event: &MetadataEventRecord, state: &RawRevisionState) -> bool {
     match &event.payload {
-        MetadataCreateEventPayload::Scaffold { .. } => state.revision.is_none(),
-        MetadataCreateEventPayload::RoCrate { .. }
-        | MetadataCreateEventPayload::ReplaceRoCrate { .. } => {
+        MetadataEventPayload::Scaffold { .. } => state.revision.is_none(),
+        MetadataEventPayload::RoCrate { .. } | MetadataEventPayload::ReplaceRoCrate { .. } => {
             state.base == raw_base_identity(event)
                 && state
                     .revision
                     .as_ref()
                     .is_some_and(|revision| revision.winning_event_id == event.event_id)
         }
-        MetadataCreateEventPayload::UpsertDataEntity { .. }
-        | MetadataCreateEventPayload::UpsertContextualEntity { .. }
-        | MetadataCreateEventPayload::ApplyBatch { .. } => true,
+        MetadataEventPayload::UpsertDataEntity { .. }
+        | MetadataEventPayload::UpsertContextualEntity { .. }
+        | MetadataEventPayload::ApplyBatch { .. } => true,
     }
 }
 
@@ -560,7 +553,7 @@ async fn read_raw_state(
     context: &DriverContext,
     document_id: Ulid,
     txn_id: Option<TxnId>,
-) -> Result<Option<RawRevisionState>, MetadataRawReadError> {
+) -> Result<Option<RawRevisionState>, RawReadError> {
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -577,7 +570,7 @@ async fn read_raw_state(
         )),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataRawReadError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(RawReadError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
@@ -585,7 +578,7 @@ async fn read_raw_event(
     context: &DriverContext,
     document_id: Ulid,
     event_id: Ulid,
-) -> Result<MetadataCreateEventRecord, MetadataRawReadError> {
+) -> Result<MetadataEventRecord, RawReadError> {
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -601,16 +594,16 @@ async fn read_raw_event(
             if value.len() > RAW_ENCODED_LIMIT {
                 return Err(budget_error("encoded byte limit exceeded"));
             }
-            let event: MetadataCreateEventRecord =
+            let event: MetadataEventRecord =
                 postcard::from_bytes(&value).map_err(ConversionError::from)?;
             validate_raw_entry(document_id, &event_log_key(document_id, event_id), &event)?;
             Ok(event)
         }
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Err(
-            MetadataRawReadError::InconsistentLog(format!("raw event {event_id} is missing")),
+            RawReadError::InconsistentLog(format!("raw event {event_id} is missing")),
         ),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataRawReadError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(RawReadError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
@@ -621,7 +614,7 @@ async fn load_raw_events(
     event_cursor: Option<Ulid>,
     txn_id: Option<TxnId>,
     mut budget: RawLoadBudget,
-) -> Result<Vec<MetadataCreateEventRecord>, MetadataRawReadError> {
+) -> Result<Vec<MetadataEventRecord>, RawReadError> {
     let prefix = event_log_prefix(document_id);
     let mut start: Option<Key> = start_after.map(|event_id| event_log_key(document_id, event_id));
     let mut events = Vec::new();
@@ -648,7 +641,7 @@ async fn load_raw_events(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataRawReadError::UnexpectedEvent(format!("{other:?}")));
+                return Err(RawReadError::UnexpectedEvent(format!("{other:?}")));
             }
         };
         if values.len() > page_limit {
@@ -660,7 +653,7 @@ async fn load_raw_events(
         let mut reached_cursor = false;
         for (key, value) in values {
             budget.inspect(value.len())?;
-            let event: MetadataCreateEventRecord =
+            let event: MetadataEventRecord =
                 postcard::from_bytes(&value).map_err(ConversionError::from)?;
             validate_raw_entry(document_id, &key, &event)?;
             if event_cursor.is_some_and(|cursor| event.event_id > cursor) {
@@ -684,26 +677,26 @@ async fn load_raw_events(
 fn validate_raw_entry(
     document_id: Ulid,
     key: &[u8],
-    event: &MetadataCreateEventRecord,
-) -> Result<(), MetadataRawReadError> {
+    event: &MetadataEventRecord,
+) -> Result<(), RawReadError> {
     let Some((key_document_id, key_event_id)) = pending_projection_target(key) else {
-        return Err(MetadataRawReadError::InconsistentLog(
+        return Err(RawReadError::InconsistentLog(
             "raw event key has invalid identity".to_string(),
         ));
     };
     if key_document_id != document_id {
-        return Err(MetadataRawReadError::InconsistentLog(format!(
+        return Err(RawReadError::InconsistentLog(format!(
             "raw event key belongs to document {key_document_id}"
         )));
     }
     if event.record.document_id != document_id {
-        return Err(MetadataRawReadError::InconsistentLog(format!(
+        return Err(RawReadError::InconsistentLog(format!(
             "raw event belongs to document {}",
             event.record.document_id
         )));
     }
     if event.event_id != key_event_id {
-        return Err(MetadataRawReadError::InconsistentLog(format!(
+        return Err(RawReadError::InconsistentLog(format!(
             "raw event key mismatch for {document_id}/{key_event_id}"
         )));
     }
@@ -718,12 +711,12 @@ mod tests {
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
-    fn test_event(event_id: Ulid, updated_at_ms: u64) -> MetadataCreateEventRecord {
+    fn test_event(event_id: Ulid, updated_at_ms: u64) -> MetadataEventRecord {
         let realm_id = RealmId::from_bytes([1; 32]);
         let group_id = Ulid::from_parts(1, 1);
         let document_id = Ulid::from_parts(1, 2);
         let node_id = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        MetadataCreateEventRecord {
+        MetadataEventRecord {
             event_id,
             record: MetadataRegistryRecord {
                 realm_id,
@@ -747,7 +740,7 @@ mod tests {
             },
             user_id: aruna_core::UserId::local(Ulid::from_parts(1, 3), realm_id),
             node_id,
-            payload: MetadataCreateEventPayload::Scaffold {
+            payload: MetadataEventPayload::Scaffold {
                 name: "raw".to_string(),
                 description: "raw state".to_string(),
                 date_published: "2026-07-24".to_string(),
@@ -757,8 +750,8 @@ mod tests {
         }
     }
 
-    fn crate_payload(name: &str) -> MetadataCreateEventPayload {
-        MetadataCreateEventPayload::RoCrate {
+    fn crate_payload(name: &str) -> MetadataEventPayload {
+        MetadataEventPayload::RoCrate {
             jsonld: serde_json::json!({
                 "@context": "https://w3id.org/ro/crate/1.2/context",
                 "@graph": [{
@@ -777,7 +770,7 @@ mod tests {
         base.payload = crate_payload("base");
         let state = resolve_raw_state(&[base]).unwrap().unwrap();
         let mut update = test_event(Ulid::from_parts(2, 10), 2);
-        update.payload = MetadataCreateEventPayload::UpsertDataEntity {
+        update.payload = MetadataEventPayload::UpsertDataEntity {
             jsonld: serde_json::json!({
                 "@id": "data/file.txt",
                 "@type": "File",
@@ -803,8 +796,8 @@ mod tests {
         let state = resolve_raw_state(&[base]).unwrap().unwrap();
         let mut replacement = test_event(Ulid::from_parts(2, 10), 10);
         replacement.payload = match crate_payload("new") {
-            MetadataCreateEventPayload::RoCrate { jsonld } => {
-                MetadataCreateEventPayload::ReplaceRoCrate { jsonld }
+            MetadataEventPayload::RoCrate { jsonld } => {
+                MetadataEventPayload::ReplaceRoCrate { jsonld }
             }
             _ => unreachable!(),
         };
@@ -825,7 +818,7 @@ mod tests {
         let scaffold = test_event(Ulid::from_parts(1, 10), 1);
         let state = resolve_raw_state(&[scaffold]).unwrap().unwrap();
         let mut update = test_event(Ulid::from_parts(2, 10), 2);
-        update.payload = MetadataCreateEventPayload::UpsertContextualEntity {
+        update.payload = MetadataEventPayload::UpsertContextualEntity {
             jsonld: r##"{"@id":"#person","@type":"Person"}"##.to_string(),
         };
 
@@ -878,7 +871,7 @@ mod tests {
         bytes.inspect(RAW_ENCODED_LIMIT).unwrap();
         assert!(matches!(
             bytes.inspect(1),
-            Err(MetadataRawReadError::LimitExceeded(_))
+            Err(RawReadError::LimitExceeded(_))
         ));
 
         let mut events = RawLoadBudget::default();
@@ -896,7 +889,7 @@ mod tests {
 
         assert!(matches!(
             validate_raw_entry(event.record.document_id, &key, &event),
-            Err(MetadataRawReadError::InconsistentLog(_))
+            Err(RawReadError::InconsistentLog(_))
         ));
     }
 
@@ -905,11 +898,11 @@ mod tests {
         let mut base = test_event(Ulid::from_parts(1, 10), 1);
         base.payload = crate_payload("base");
         let mut late = test_event(Ulid::from_parts(2, 10), 2);
-        late.payload = MetadataCreateEventPayload::UpsertDataEntity {
+        late.payload = MetadataEventPayload::UpsertDataEntity {
             jsonld: r#"{"@id":"data/file.txt","@type":"File","name":"late"}"#.to_string(),
         };
         let mut latest = test_event(Ulid::from_parts(3, 10), 3);
-        latest.payload = MetadataCreateEventPayload::UpsertDataEntity {
+        latest.payload = MetadataEventPayload::UpsertDataEntity {
             jsonld: r#"{"@id":"data/file.txt","@type":"File","name":"latest"}"#.to_string(),
         };
         let cached = resolve_raw_state(&[base.clone(), latest.clone()])
