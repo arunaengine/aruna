@@ -4,7 +4,7 @@ use super::{
 };
 use crate::identity::PersistedNodeIdentity;
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE};
@@ -17,7 +17,7 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::notifications::watch::interest::publish_watch_interest;
 use aruna_operations::sync::document_outbox::read_outbox_records;
-use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::tasks::incoming::OutboxDrainer;
 use aruna_storage::FjallStorage;
 use byteview::ByteView;
@@ -28,10 +28,10 @@ use tempfile::tempdir;
 #[test]
 fn user_topics_deduplicate() {
     let realm_id = RealmId::from_bytes([1u8; 32]);
-    let first = DocumentSyncTarget::User {
+    let first = DocumentTarget::User {
         user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([2u8; 16]), realm_id),
     };
-    let second = DocumentSyncTarget::User {
+    let second = DocumentTarget::User {
         user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([3u8; 16]), realm_id),
     };
     let first_shard = aruna_core::structs::PlacementRef {
@@ -226,7 +226,7 @@ async fn repair_topic(
     context: &Arc<DriverContext>,
     node_id: NodeId,
     realm_id: RealmId,
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
 ) {
     for _ in 0..2 {
         let targets = prepare_core_documents(context, node_id, realm_id, true, false)
@@ -256,7 +256,7 @@ async fn seed_topic(
     node_id: NodeId,
     peer_id: NodeId,
 ) -> ::irokle::TopicId {
-    let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+    let target = DocumentTarget::WatchInterest { realm_id, node_id };
     prepare_core_documents(context, node_id, realm_id, true, false)
         .await
         .unwrap();
@@ -280,7 +280,7 @@ async fn first_boot_watch() {
     let targets = prepare_core_documents(&context, node_id, realm_id, true, false)
         .await
         .unwrap();
-    let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+    let target = DocumentTarget::WatchInterest { realm_id, node_id };
 
     assert!(targets.contains(&target));
     publish_core_documents(&context, node_id, realm_id, true, vec![target.clone()])
@@ -313,7 +313,7 @@ async fn missing_topic_repair() {
         },
     )
     .await;
-    let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+    let target = DocumentTarget::WatchInterest { realm_id, node_id };
     let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
     assert!(!net.sync_topic_exists(topic).unwrap());
 
@@ -340,7 +340,7 @@ async fn restart_stays_quiet() {
     let realm_id = RealmId::from_bytes([9u8; 32]);
     let (_dir, context, net) = net_context(realm_id, 9).await;
     let node_id = net.node_id();
-    let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+    let target = DocumentTarget::WatchInterest { realm_id, node_id };
     write_config(&context, realm_id, node_id).await;
     write_digest(
         &context,
@@ -377,8 +377,8 @@ async fn joiner_announces_watch() {
     let (_joiner_dir, joiner_context, joiner_net) = net_context(realm_id, 11).await;
     let bootstrap_context = Arc::new(bootstrap_context);
     let joiner_context = Arc::new(joiner_context);
-    initialize_net_incoming_for_tests(bootstrap_context.clone());
-    initialize_net_incoming_for_tests(joiner_context.clone());
+    initialize_incoming_fixture(bootstrap_context.clone());
+    initialize_incoming_fixture(joiner_context.clone());
     let bootstrap_id = bootstrap_net.node_id();
     let joiner_id = joiner_net.node_id();
     write_config_nodes(
@@ -404,7 +404,7 @@ async fn joiner_announces_watch() {
         .add_peer_addr(bootstrap_net.endpoint_addr())
         .await;
 
-    let bootstrap_target = DocumentSyncTarget::WatchInterest {
+    let bootstrap_target = DocumentTarget::WatchInterest {
         realm_id,
         node_id: bootstrap_id,
     };
@@ -427,7 +427,7 @@ async fn joiner_announces_watch() {
     .unwrap();
     assert!(joiner_net.sync_topic_exists(topic).unwrap());
 
-    let target = DocumentSyncTarget::WatchInterest {
+    let target = DocumentTarget::WatchInterest {
         realm_id,
         node_id: joiner_id,
     };
@@ -464,8 +464,8 @@ async fn retries_until_seeded() {
     let (_joiner_dir, joiner_context, joiner_net) = net_context(realm_id, 13).await;
     let bootstrap_context = Arc::new(bootstrap_context);
     let joiner_context = Arc::new(joiner_context);
-    initialize_net_incoming_for_tests(bootstrap_context.clone());
-    initialize_net_incoming_for_tests(joiner_context.clone());
+    initialize_incoming_fixture(bootstrap_context.clone());
+    initialize_incoming_fixture(joiner_context.clone());
     let bootstrap_id = bootstrap_net.node_id();
     let joiner_id = joiner_net.node_id();
     write_config_nodes(
@@ -491,7 +491,7 @@ async fn retries_until_seeded() {
         .add_peer_addr(bootstrap_net.endpoint_addr())
         .await;
 
-    let target = DocumentSyncTarget::WatchInterest {
+    let target = DocumentTarget::WatchInterest {
         realm_id,
         node_id: bootstrap_id,
     };
@@ -526,7 +526,7 @@ async fn publication_retries() {
     let context = Arc::new(context);
     let node_id = net.node_id();
     write_config(&context, realm_id, node_id).await;
-    let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+    let target = DocumentTarget::WatchInterest { realm_id, node_id };
     let targets = prepare_core_documents(&context, node_id, realm_id, true, false)
         .await
         .unwrap();
@@ -583,7 +583,7 @@ async fn publication_retries() {
         .unwrap();
     assert_eq!(batch.records.len(), 1);
     assert!(!batch.records[0].1.allow_genesis);
-    let DocumentSyncOutboxEvent::Upsert { bytes, .. } = &batch.records[0].1.event else {
+    let DocumentOutboxEvent::Upsert { bytes, .. } = &batch.records[0].1.event else {
         panic!("watch digest publication must enqueue an upsert")
     };
     assert_eq!(
@@ -678,7 +678,7 @@ async fn initial_watch_digest() {
         .await
         .unwrap();
 
-    assert!(targets.contains(&DocumentSyncTarget::WatchInterest { realm_id, node_id }));
+    assert!(targets.contains(&DocumentTarget::WatchInterest { realm_id, node_id }));
     assert_eq!(
         read_digest(&context, realm_id, node_id).await,
         WatchInterestDigest {
