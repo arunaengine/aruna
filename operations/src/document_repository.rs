@@ -1,4 +1,4 @@
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -6,15 +6,15 @@ use aruna_core::structs::RealmId;
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
 
-pub fn storage_keyspace(document: &DocumentSyncTarget) -> &'static str {
+pub fn storage_keyspace(document: &DocumentTarget) -> &'static str {
     document.storage_keyspace()
 }
 
-pub fn storage_key(document: &DocumentSyncTarget) -> Key {
+pub fn storage_key(document: &DocumentTarget) -> Key {
     document.storage_key()
 }
 
-pub fn read_effect(document: &DocumentSyncTarget, txn_id: Option<TxnId>) -> Effect {
+pub fn read_effect(document: &DocumentTarget, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: storage_keyspace(document).to_string(),
         key: storage_key(document),
@@ -22,11 +22,7 @@ pub fn read_effect(document: &DocumentSyncTarget, txn_id: Option<TxnId>) -> Effe
     })
 }
 
-pub fn write_effect(
-    document: &DocumentSyncTarget,
-    value: Vec<u8>,
-    txn_id: Option<TxnId>,
-) -> Effect {
+pub fn write_effect(document: &DocumentTarget, value: Vec<u8>, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Write {
         key_space: storage_keyspace(document).to_string(),
         key: storage_key(document),
@@ -35,7 +31,7 @@ pub fn write_effect(
     })
 }
 
-pub fn delete_effect(document: &DocumentSyncTarget, txn_id: Option<TxnId>) -> Effect {
+pub fn delete_effect(document: &DocumentTarget, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Delete {
         key_space: storage_keyspace(document).to_string(),
         key: storage_key(document),
@@ -53,19 +49,19 @@ pub fn parse_document_bytes(event: Event) -> Result<Option<Vec<u8>>, StorageErro
     }
 }
 
-pub fn parse_auth_document(key: &[u8]) -> Result<DocumentSyncTarget, ConversionError> {
+pub fn parse_auth_document(key: &[u8]) -> Result<DocumentTarget, ConversionError> {
     match key.len() {
         16 => {
             let mut group_bytes = [0u8; 16];
             group_bytes.copy_from_slice(key);
-            Ok(DocumentSyncTarget::GroupAuthorization {
+            Ok(DocumentTarget::GroupAuthorization {
                 group_id: GroupId::from_bytes(group_bytes),
             })
         }
         32 => {
             let mut realm_bytes = [0u8; 32];
             realm_bytes.copy_from_slice(key);
-            Ok(DocumentSyncTarget::RealmAuthorization {
+            Ok(DocumentTarget::RealmAuthorization {
                 realm_id: RealmId::from_bytes(realm_bytes),
             })
         }
@@ -75,7 +71,7 @@ pub fn parse_auth_document(key: &[u8]) -> Result<DocumentSyncTarget, ConversionE
     }
 }
 
-pub fn parse_group_document(key: &[u8]) -> Result<DocumentSyncTarget, ConversionError> {
+pub fn parse_group_document(key: &[u8]) -> Result<DocumentTarget, ConversionError> {
     if key.len() != 16 {
         return Err(ConversionError::InvalidLength(format!(
             "unexpected group key length {}",
@@ -85,12 +81,12 @@ pub fn parse_group_document(key: &[u8]) -> Result<DocumentSyncTarget, Conversion
 
     let mut group_bytes = [0u8; 16];
     group_bytes.copy_from_slice(key);
-    Ok(DocumentSyncTarget::Group {
+    Ok(DocumentTarget::Group {
         group_id: GroupId::from_bytes(group_bytes),
     })
 }
 
-pub fn parse_realm_config(key: &[u8]) -> Result<DocumentSyncTarget, ConversionError> {
+pub fn parse_realm_config(key: &[u8]) -> Result<DocumentTarget, ConversionError> {
     if key.len() != 32 {
         return Err(ConversionError::InvalidLength(format!(
             "unexpected realm config key length {}",
@@ -100,7 +96,7 @@ pub fn parse_realm_config(key: &[u8]) -> Result<DocumentSyncTarget, ConversionEr
 
     let mut realm_bytes = [0u8; 32];
     realm_bytes.copy_from_slice(key);
-    Ok(DocumentSyncTarget::RealmConfig {
+    Ok(DocumentTarget::RealmConfig {
         realm_id: RealmId::from_bytes(realm_bytes),
     })
 }

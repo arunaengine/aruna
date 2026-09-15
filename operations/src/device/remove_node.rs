@@ -4,13 +4,13 @@
 
 use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -39,7 +39,7 @@ pub enum DeviceEvictionScope {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RemoveDeviceNodeConfig {
+pub struct RemoveNodeConfig {
     /// Acting node and the calling user.
     pub actor: Actor,
     pub node_id: NodeId,
@@ -47,15 +47,15 @@ pub struct RemoveDeviceNodeConfig {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct RemoveDeviceNodeOperation {
-    config: RemoveDeviceNodeConfig,
+pub struct RemoveNodeOperation {
+    config: RemoveNodeConfig,
     txn_id: Option<TxnId>,
-    state: RemoveDeviceNodeState,
-    output: Option<Result<RealmConfigDocument, RemoveDeviceNodeError>>,
+    state: RemoveNodeState,
+    output: Option<Result<RealmConfigDocument, RemoveNodeError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum RemoveDeviceNodeState {
+enum RemoveNodeState {
     Init,
     StartTransaction,
     ReadCurrent,
@@ -77,13 +77,13 @@ enum RemoveDeviceNodeState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum RemoveDeviceNodeError {
+pub enum RemoveNodeError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
-    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
+    AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
     RealmConfigNotFound,
     #[error("no device {node_id} belongs to this caller")]
@@ -102,18 +102,18 @@ pub enum RemoveDeviceNodeError {
     },
 }
 
-impl RemoveDeviceNodeOperation {
-    pub fn new(config: RemoveDeviceNodeConfig) -> Self {
+impl RemoveNodeOperation {
+    pub fn new(config: RemoveNodeConfig) -> Self {
         Self {
             config,
             txn_id: None,
-            state: RemoveDeviceNodeState::Init,
+            state: RemoveNodeState::Init,
             output: None,
         }
     }
 
-    fn document_ref(&self) -> DocumentSyncTarget {
-        DocumentSyncTarget::RealmConfig {
+    fn document_ref(&self) -> DocumentTarget {
+        DocumentTarget::RealmConfig {
             realm_id: self.config.actor.realm_id,
         }
     }
@@ -126,7 +126,7 @@ impl RemoveDeviceNodeOperation {
 
     fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
         self.txn_id = Some(txn_id);
-        self.state = RemoveDeviceNodeState::ReadCurrent;
+        self.state = RemoveNodeState::ReadCurrent;
         let document = self.document_ref();
         let target = self.admin_target();
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -148,18 +148,18 @@ impl RemoveDeviceNodeOperation {
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, RemoveDeviceNodeError> {
+    ) -> Result<Effects, RemoveNodeError> {
         let Some(txn_id) = self.txn_id else {
-            return Err(RemoveDeviceNodeError::MissingTransaction);
+            return Err(RemoveNodeError::MissingTransaction);
         };
         let Some(document_value) = document_value else {
-            return Err(RemoveDeviceNodeError::RealmConfigNotFound);
+            return Err(RemoveNodeError::RealmConfigNotFound);
         };
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
         // Peers admit a realm-config event only from a management origin, so a
         // removal published anywhere else would diverge instead of replicate.
         if !is_management(&document, self.config.actor.node_id) {
-            return Err(RemoveDeviceNodeError::NotManagementNode);
+            return Err(RemoveNodeError::NotManagementNode);
         }
         // Ownership is realm state: an infrastructure node is never a device,
         // and another user's device is not an owner's to evict.
@@ -173,7 +173,7 @@ impl RemoveDeviceNodeOperation {
                     DeviceEvictionScope::RealmAdmin => node.kind.owner().is_some(),
                 }
         }) {
-            return Err(RemoveDeviceNodeError::DeviceNotFound {
+            return Err(RemoveNodeError::DeviceNotFound {
                 node_id: self.config.node_id,
             });
         }
@@ -190,12 +190,12 @@ impl RemoveDeviceNodeOperation {
             .as_ref()
             .is_some_and(|state| state.target != target)
         {
-            return Err(AdminDocumentReducerError::TargetMismatch.into());
+            return Err(AdminDocumentError::TargetMismatch.into());
         }
 
         let mut reducer_state = previous_reducer_state
             .clone()
-            .unwrap_or_else(|| AdminDocumentReducerState::new(target));
+            .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_event = reducer_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::RealmConfigNodeRemoved {
@@ -223,7 +223,7 @@ impl RemoveDeviceNodeOperation {
             self.config.actor.node_id,
             document_target,
             Vec::new(),
-            DocumentSyncOutboxEvent::admin(admin_event),
+            DocumentOutboxEvent::admin(admin_event),
             placement,
             false,
         );
@@ -231,7 +231,7 @@ impl RemoveDeviceNodeOperation {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
-        self.state = RemoveDeviceNodeState::WriteDocumentAndAdminState {
+        self.state = RemoveNodeState::WriteDocumentAndAdminState {
             document,
             stale_conflict_deletes,
         };
@@ -244,22 +244,22 @@ impl RemoveDeviceNodeOperation {
 
     fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.fail(RemoveDeviceNodeError::MissingTransaction);
+            return self.fail(RemoveNodeError::MissingTransaction);
         };
-        self.state = RemoveDeviceNodeState::CommitTransaction { document };
+        self.state = RemoveNodeState::CommitTransaction { document };
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
-    fn fail(&mut self, error: RemoveDeviceNodeError) -> Effects {
+    fn fail(&mut self, error: RemoveNodeError) -> Effects {
         let cleanup = self.abort();
-        self.state = RemoveDeviceNodeState::Error;
+        self.state = RemoveNodeState::Error;
         self.output = Some(Err(error));
         cleanup
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
-        self.fail(RemoveDeviceNodeError::UnexpectedEvent {
+        self.fail(RemoveNodeError::UnexpectedEvent {
             state,
             expected,
             got,
@@ -267,12 +267,12 @@ impl RemoveDeviceNodeOperation {
     }
 }
 
-impl Operation for RemoveDeviceNodeOperation {
+impl Operation for RemoveNodeOperation {
     type Output = RealmConfigDocument;
-    type Error = RemoveDeviceNodeError;
+    type Error = RemoveNodeError;
 
     fn start(&mut self) -> Effects {
-        self.state = RemoveDeviceNodeState::StartTransaction;
+        self.state = RemoveNodeState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
         })]
@@ -280,14 +280,14 @@ impl Operation for RemoveDeviceNodeOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state.clone() {
-            RemoveDeviceNodeState::StartTransaction => match event {
+            RemoveNodeState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("transaction start result", format!("{other:?}")),
             },
-            RemoveDeviceNodeState::ReadCurrent => match event {
+            RemoveNodeState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
                         return self.unexpected_event(
@@ -305,16 +305,16 @@ impl Operation for RemoveDeviceNodeOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            RemoveDeviceNodeState::WriteDocumentAndAdminState {
+            RemoveNodeState::WriteDocumentAndAdminState {
                 document,
                 stale_conflict_deletes,
             } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
-                        return self.fail(RemoveDeviceNodeError::MissingTransaction);
+                        return self.fail(RemoveNodeError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state = RemoveDeviceNodeState::DeleteStaleAdminConflicts { document };
+                        self.state = RemoveNodeState::DeleteStaleAdminConflicts { document };
                         return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                             deletes: stale_conflict_deletes,
                             txn_id: Some(txn_id),
@@ -325,18 +325,17 @@ impl Operation for RemoveDeviceNodeOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             },
-            RemoveDeviceNodeState::DeleteStaleAdminConflicts { document } => match event {
+            RemoveNodeState::DeleteStaleAdminConflicts { document } => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
             },
-            RemoveDeviceNodeState::CommitTransaction { document } => match event {
+            RemoveNodeState::CommitTransaction { document } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state =
-                        RemoveDeviceNodeState::ScheduleDocumentSyncOutboxDrain { document };
+                    self.state = RemoveNodeState::ScheduleDocumentSyncOutboxDrain { document };
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -345,14 +344,14 @@ impl Operation for RemoveDeviceNodeOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            RemoveDeviceNodeState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
+            RemoveNodeState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = RemoveDeviceNodeState::Finish;
+                    self.state = RemoveNodeState::Finish;
                     smallvec![]
                 }
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     warn!(error = %message, "Failed to schedule device removal outbox drain; durable outbox remains retryable");
-                    self.state = RemoveDeviceNodeState::Finish;
+                    self.state = RemoveNodeState::Finish;
                     smallvec![]
                 }
                 other => self.unexpected_event(
@@ -360,24 +359,18 @@ impl Operation for RemoveDeviceNodeOperation {
                     format!("{other:?}"),
                 ),
             },
-            RemoveDeviceNodeState::Finish
-            | RemoveDeviceNodeState::Error
-            | RemoveDeviceNodeState::Init => {
+            RemoveNodeState::Finish | RemoveNodeState::Error | RemoveNodeState::Init => {
                 smallvec![]
             }
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            RemoveDeviceNodeState::Finish | RemoveDeviceNodeState::Error
-        )
+        matches!(self.state, RemoveNodeState::Finish | RemoveNodeState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(RemoveDeviceNodeError::NotFinished))
+        self.output.unwrap_or(Err(RemoveNodeError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -392,9 +385,9 @@ impl Operation for RemoveDeviceNodeOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::realm::get_config::GetRealmConfigOperation;
+    use crate::realm::get_config::GetConfigOperation;
     use aruna_core::UserId;
-    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::document::DocumentTarget;
     use aruna_core::events::StorageEvent;
     use aruna_core::structs::{RealmId, RealmNodeKind};
     use tempfile::tempdir;
@@ -424,7 +417,7 @@ mod tests {
     }
 
     async fn seed(ctx: &DriverContext, actor: &Actor, document: &RealmConfigDocument) {
-        let target = DocumentSyncTarget::RealmConfig {
+        let target = DocumentTarget::RealmConfig {
             realm_id: actor.realm_id,
         };
         match ctx
@@ -449,8 +442,8 @@ mod tests {
         document
     }
 
-    fn removal(actor: &Actor, scope: DeviceEvictionScope) -> RemoveDeviceNodeConfig {
-        RemoveDeviceNodeConfig {
+    fn removal(actor: &Actor, scope: DeviceEvictionScope) -> RemoveNodeConfig {
+        RemoveNodeConfig {
             actor: actor.clone(),
             node_id: node(2),
             scope,
@@ -473,7 +466,7 @@ mod tests {
         .await;
 
         let stored = drive(
-            RemoveDeviceNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
+            RemoveNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
             &ctx,
         )
         .await
@@ -481,7 +474,7 @@ mod tests {
         let device = node(2).to_string();
         assert!(stored.nodes.iter().all(|node| node.node_id != device));
 
-        let reread = drive(GetRealmConfigOperation::new(realm_id), &ctx)
+        let reread = drive(GetConfigOperation::new(realm_id), &ctx)
             .await
             .expect("config reads");
         assert_eq!(reread.nodes.len(), 1);
@@ -498,17 +491,14 @@ mod tests {
         seed(&ctx, &actor, &realm_with_device(realm_id, &actor, other)).await;
 
         let error = drive(
-            RemoveDeviceNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
+            RemoveNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
             &ctx,
         )
         .await
         .expect_err("a foreign device is refused");
-        assert!(matches!(
-            error,
-            RemoveDeviceNodeError::DeviceNotFound { .. }
-        ));
+        assert!(matches!(error, RemoveNodeError::DeviceNotFound { .. }));
 
-        let reread = drive(GetRealmConfigOperation::new(realm_id), &ctx)
+        let reread = drive(GetConfigOperation::new(realm_id), &ctx)
             .await
             .expect("config reads");
         assert_eq!(reread.nodes.len(), 2);
@@ -527,15 +517,15 @@ mod tests {
 
         assert!(matches!(
             drive(
-                RemoveDeviceNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
+                RemoveNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
                 &ctx,
             )
             .await,
-            Err(RemoveDeviceNodeError::DeviceNotFound { .. })
+            Err(RemoveNodeError::DeviceNotFound { .. })
         ));
 
         let stored = drive(
-            RemoveDeviceNodeOperation::new(removal(&actor, DeviceEvictionScope::RealmAdmin)),
+            RemoveNodeOperation::new(removal(&actor, DeviceEvictionScope::RealmAdmin)),
             &ctx,
         )
         .await
@@ -559,17 +549,14 @@ mod tests {
         seed(&ctx, &actor, &document).await;
 
         let error = drive(
-            RemoveDeviceNodeOperation::new(removal(&actor, DeviceEvictionScope::RealmAdmin)),
+            RemoveNodeOperation::new(removal(&actor, DeviceEvictionScope::RealmAdmin)),
             &ctx,
         )
         .await
         .expect_err("a server node is not a device");
-        assert!(matches!(
-            error,
-            RemoveDeviceNodeError::DeviceNotFound { .. }
-        ));
+        assert!(matches!(error, RemoveNodeError::DeviceNotFound { .. }));
 
-        let reread = drive(GetRealmConfigOperation::new(realm_id), &ctx)
+        let reread = drive(GetConfigOperation::new(realm_id), &ctx)
             .await
             .expect("config reads");
         assert_eq!(reread.nodes.len(), 2);
@@ -595,11 +582,11 @@ mod tests {
         seed(&ctx, &actor, &document).await;
 
         let error = drive(
-            RemoveDeviceNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
+            RemoveNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
             &ctx,
         )
         .await
         .expect_err("a server node is refused");
-        assert_eq!(error, RemoveDeviceNodeError::NotManagementNode);
+        assert_eq!(error, RemoveNodeError::NotManagementNode);
     }
 }

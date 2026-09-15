@@ -6,7 +6,7 @@ use std::time::Duration;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
-use aruna_core::metadata::{MetadataAuthToken, MetadataError};
+use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::structs::{Actor, AuthContext, RealmConfigDocument, RealmId};
 use aruna_core::structured_id::StructuredId;
 use aruna_core::task::TaskKey;
@@ -20,11 +20,11 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, mint_forward_document,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
+    mint_forward_document,
 };
 use crate::metadata::forward::{apply_batch_routed, route_metadata_create};
-use crate::metadata::update_document::UpdateMetadataDocumentError;
+use crate::metadata::update_document::UpdateDocumentError;
 use crate::placement::process_placements::load_realm_config;
 
 use super::backlog::{ForwardOutcome, QueueDrain, arm_timer, drain_queue, exhausted, retry_due_ms};
@@ -314,24 +314,17 @@ async fn forward_entry(
     if matches!(entry.kind, PublishKind::Edit { .. }) {
         return publish_edit(context, realm_id, entry, claim, auth).await;
     }
-    let operation =
-        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
-            actor,
-            group_id: entry.group_id,
-            document_id,
-            document_path: entry.document_path.clone(),
-            public: entry.public,
-            payload: CreateMetadataDocumentPayload::RoCrate {
-                jsonld: entry.jsonld.clone(),
-            },
-        });
-    match route_metadata_create(
-        operation,
-        context.clone(),
-        Some(MetadataAuthToken::internal(auth)),
-    )
-    .await
-    {
+    let operation = CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+        actor,
+        group_id: entry.group_id,
+        document_id,
+        document_path: entry.document_path.clone(),
+        public: entry.public,
+        payload: CreateDocumentPayload::RoCrate {
+            jsonld: entry.jsonld.clone(),
+        },
+    });
+    match route_metadata_create(operation, context.clone(), Some(AuthToken::internal(auth))).await {
         Ok(_) => {
             info!(draft_id = %entry.draft_id, document_id = %document_id, "Published a queued draft");
             track_created(
@@ -345,7 +338,7 @@ async fn forward_entry(
         }
         // The id was minted for this entry alone, so an existing document under
         // it is this entry's own earlier forward.
-        Err(MetadataWriteError::Create(CreateMetadataDocumentError::DocumentAlreadyExists)) => {
+        Err(MetadataWriteError::Create(CreateDocumentError::DocumentAlreadyExists)) => {
             track_created(
                 context,
                 document_id,
@@ -393,7 +386,7 @@ async fn publish_edit(
         *document_id,
         batch.clone(),
         authored.clone(),
-        MetadataAuthToken::internal(auth),
+        AuthToken::internal(auth),
     )
     .await
     {
@@ -429,7 +422,7 @@ fn permanent(error: &MetadataWriteError) -> bool {
         MetadataWriteError::Unauthorized
             | MetadataWriteError::Forbidden
             | MetadataWriteError::NotFound
-            | MetadataWriteError::Update(UpdateMetadataDocumentError::MetadataError(
+            | MetadataWriteError::Update(UpdateDocumentError::MetadataError(
                 MetadataError::InvalidInput(_)
             ))
     )
@@ -512,7 +505,7 @@ mod tests {
     };
     use crate::driver::{DriverContext, drive};
     use crate::forward::transport::MetadataWriteError;
-    use crate::tests::fixtures::device::context;
+    use crate::tests::device::context;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::RealmId;

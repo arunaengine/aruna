@@ -6,18 +6,18 @@ use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::ensure_record_readable;
 use crate::metadata::api::load_live_record;
-use crate::metadata::handle::MetadataWritePeerError;
+use crate::metadata::handle::WritePeerError;
+use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::DeviceGroupDocuments;
 use crate::metadata::protocol::GraphState;
 use crate::metadata::protocol::MAX_DEVICE_GROUPS;
-use crate::metadata::protocol::MetadataAuthToken;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::RealmDocuments;
 use crate::metadata::raw_revision::load_raw_view;
-use crate::metadata::update_document::UpdateMetadataDocumentConfig;
-use crate::metadata::update_document::UpdateMetadataDocumentError;
-use crate::metadata::update_document::UpdateMetadataDocumentMutation;
-use crate::metadata::update_document::UpdateMetadataDocumentOperation;
+use crate::metadata::update_document::UpdateDocumentConfig;
+use crate::metadata::update_document::UpdateDocumentError;
+use crate::metadata::update_document::UpdateDocumentMutation;
+use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_document::update_metadata_document;
 use crate::node::node_info::read_info_documents;
 use crate::placement::process_placements::load_realm_config;
@@ -25,7 +25,7 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentClock;
 use aruna_core::admin_documents::AdminDocumentTarget;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
 use aruna_core::events::StorageEvent;
@@ -33,7 +33,7 @@ use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
 use aruna_core::metadata::MetadataEffect;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataEvent;
-use aruna_core::reducer::AdminDocumentReducerState;
+use aruna_core::reducer::AdminDocumentState;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::Actor;
 use aruna_core::structs::Group;
@@ -79,7 +79,7 @@ pub(crate) async fn serve_realm_documents(
 pub(super) async fn read_realm_documents(
     context: &Arc<DriverContext>,
     peer: NodeId,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
 ) -> Result<RealmDocuments, SyncRefusal> {
     let net_handle = context
         .net_handle
@@ -101,22 +101,22 @@ pub(super) async fn read_realm_documents(
         .authorize_write_peer(peer, Some(auth_token))
         .await
         .map_err(|error| match error {
-            MetadataWritePeerError::Unauthorized => SyncRefusal::Unauthorized,
-            MetadataWritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
+            WritePeerError::Unauthorized => SyncRefusal::Unauthorized,
+            WritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
         })?;
     // The documents are this realm's own; nothing about another realm is served.
     if auth.realm_id != realm_id || !peer_acts_for(&config, peer, auth.user_id) {
         return Err(SyncRefusal::Unauthorized);
     }
-    let realm_config = read_document(context, DocumentSyncTarget::RealmConfig { realm_id })
+    let realm_config = read_document(context, DocumentTarget::RealmConfig { realm_id })
         .await?
         .ok_or(SyncRefusal::NotFound)?;
     let realm_authorization =
-        read_document(context, DocumentSyncTarget::RealmAuthorization { realm_id }).await?;
+        read_document(context, DocumentTarget::RealmAuthorization { realm_id }).await?;
     // The token's own subject: for a device that is its owner by the check above.
     let owner = read_document(
         context,
-        DocumentSyncTarget::User {
+        DocumentTarget::User {
             user_id: auth.user_id,
         },
     )
@@ -255,7 +255,7 @@ pub(super) async fn applied_clock(
     else {
         return AdminDocumentClock::default();
     };
-    postcard::from_bytes::<AdminDocumentReducerState>(&bytes)
+    postcard::from_bytes::<AdminDocumentState>(&bytes)
         .map(|state| state.clock)
         .unwrap_or_default()
 }
@@ -263,7 +263,7 @@ pub(super) async fn applied_clock(
 /// One stored document, or `None` when this node holds it not (yet).
 pub(super) async fn read_document(
     context: &Arc<DriverContext>,
-    target: DocumentSyncTarget,
+    target: DocumentTarget,
 ) -> Result<Option<Vec<u8>>, SyncRefusal> {
     match context
         .storage_handle
@@ -309,7 +309,7 @@ pub(crate) async fn serve_graph_state(
 pub(super) async fn read_graph_state(
     context: &Arc<DriverContext>,
     peer: NodeId,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
     document_id: Ulid,
 ) -> Result<GraphState, SyncRefusal> {
     let net_handle = context
@@ -331,8 +331,8 @@ pub(super) async fn read_graph_state(
         .authorize_write_peer(peer, Some(auth_token))
         .await
         .map_err(|error| match error {
-            MetadataWritePeerError::Unauthorized => SyncRefusal::Unauthorized,
-            MetadataWritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
+            WritePeerError::Unauthorized => SyncRefusal::Unauthorized,
+            WritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
         })?;
     if auth.realm_id != realm_id || !peer_acts_for(&config, peer, auth.user_id) {
         return Err(SyncRefusal::Unauthorized);
@@ -447,7 +447,7 @@ pub(super) async fn run_device_batch(
             ForwardAuthError::Forbidden => SyncRefusal::Forbidden,
             ForwardAuthError::Unavailable(_) => SyncRefusal::Unavailable,
         })?;
-    let operation = UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+    let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
         actor: Actor {
             node_id: net_handle.node_id(),
             user_id: auth.user_id,
@@ -456,12 +456,12 @@ pub(super) async fn run_device_batch(
         group_id: record.group_id,
         document_id,
         public: record.public,
-        mutation: UpdateMetadataDocumentMutation::ApplyBatch { batch, authored },
+        mutation: UpdateDocumentMutation::ApplyBatch { batch, authored },
     });
     update_metadata_document(operation, context.as_ref())
         .await
         .map_err(|error| match error {
-            UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)) => {
+            UpdateDocumentError::MetadataError(MetadataError::InvalidInput(message)) => {
                 SyncRefusal::Invalid(message)
             }
             other => {
@@ -478,7 +478,7 @@ mod tests {
     use crate::driver::DriverContext;
     use aruna_core::NodeId;
     use aruna_core::UserId;
-    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::Event;
     use aruna_core::events::StorageEvent;
@@ -535,11 +535,11 @@ mod tests {
             );
             for (target, bytes) in [
                 (
-                    DocumentSyncTarget::Group { group_id },
+                    DocumentTarget::Group { group_id },
                     group.to_bytes(&actor).unwrap(),
                 ),
                 (
-                    DocumentSyncTarget::GroupAuthorization { group_id },
+                    DocumentTarget::GroupAuthorization { group_id },
                     authorization.to_bytes(&actor).unwrap(),
                 ),
             ] {

@@ -1,6 +1,6 @@
 use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::create_document::CreateMetadataDocumentConfig;
+use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::accepted_create_matches;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::get_document::load_document_record;
@@ -12,7 +12,7 @@ use aruna_core::events::Event;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
 use aruna_core::keyspaces::METADATA_PENDING_PROJECTION_KEYSPACE;
-use aruna_core::metadata::MetadataCreateEventRecord;
+use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::storage_entries::create_acceptance_key;
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::structs::PlacementRef;
@@ -44,7 +44,7 @@ pub(crate) fn routed_record_matches(
 }
 
 pub(crate) fn create_record_matches(
-    config: &CreateMetadataDocumentConfig,
+    config: &CreateDocumentConfig,
     document_id: Ulid,
     placement: &PlacementRef,
     record: &MetadataRegistryRecord,
@@ -83,7 +83,7 @@ pub(crate) fn update_record_matches(
 
 pub(crate) async fn forwarded_create_replay(
     context: &Arc<DriverContext>,
-    config: &CreateMetadataDocumentConfig,
+    config: &CreateDocumentConfig,
 ) -> Result<Option<MetadataTransportMessage>, String> {
     let Some(record) = existing_record(context, config.document_id).await? else {
         return Ok(None);
@@ -107,7 +107,7 @@ pub(crate) async fn forwarded_create_replay(
 pub(crate) async fn accepted_create(
     context: &Arc<DriverContext>,
     document_id: Ulid,
-) -> Result<Option<MetadataCreateEventRecord>, String> {
+) -> Result<Option<MetadataEventRecord>, String> {
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {

@@ -19,7 +19,7 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetConfigOperation;
 use crate::staging::offered_directory::{
     OfferDirectoryInput, OfferedDirectoryError, WithdrawOfferInput, offer_directory, withdraw_offer,
 };
@@ -107,7 +107,7 @@ pub async fn bind_folder(
     {
         return Err(FolderError::BucketBound(local_bucket));
     }
-    let config = drive(GetRealmConfigOperation::new(input.realm_id), context)
+    let config = drive(GetConfigOperation::new(input.realm_id), context)
         .await
         .map_err(|_| FolderError::Unavailable)?;
     let eligible = config
@@ -131,7 +131,7 @@ pub async fn bind_folder(
             .request_forwarded_write(
                 input.remote.node_id,
                 MetadataTransportMessage::ForwardCreateBucket {
-                    auth_token: aruna_core::metadata::MetadataAuthToken::internal(auth.clone()),
+                    auth_token: aruna_core::metadata::AuthToken::internal(auth.clone()),
                     bucket: input.remote.bucket.clone(),
                     group_id: input.group_id,
                 },
@@ -530,7 +530,7 @@ pub async fn list_transfers(context: &Arc<DriverContext>) -> Result<Vec<SyncUplo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::fixtures::device::context;
+    use crate::tests::device::context;
     use aruna_core::structs::{EntrySide, SyncedBytes};
 
     #[test]

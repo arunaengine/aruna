@@ -11,13 +11,13 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentClock;
 use aruna_core::auth::revocation_live;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     DEVICE_MANAGEMENT_URL_KEYSPACE, DEVICE_REALM_MARKER_KEYSPACE, GROUP_KEYSPACE,
 };
-use aruna_core::metadata::MetadataAuthToken;
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, NodeInfoDocument, RealmConfigDocument,
     RealmId, SyncRefusal,
@@ -220,7 +220,7 @@ async fn ask_realm(context: &Arc<DriverContext>, plan: &FetchPlan) -> Selection 
     };
     for peer in &plan.peers {
         let message = MetadataTransportMessage::FetchRealmDocuments {
-            auth_token: MetadataAuthToken::internal(plan.auth.clone()),
+            auth_token: AuthToken::internal(plan.auth.clone()),
         };
         match metadata.request_forwarded_write(*peer, message).await {
             Ok(MetadataTransportMessage::FetchedRealmDocuments {
@@ -338,7 +338,7 @@ async fn install_documents(
     let mut config = accepted.config;
     let stored_config = read_bytes(
         context,
-        DocumentSyncTarget::RealmConfig {
+        DocumentTarget::RealmConfig {
             realm_id: plan.realm_id,
         },
     )
@@ -373,12 +373,12 @@ async fn install_documents(
 
     let stored_authorization = read_bytes(
         context,
-        DocumentSyncTarget::RealmAuthorization {
+        DocumentTarget::RealmAuthorization {
             realm_id: plan.realm_id,
         },
     )
     .await;
-    let owner_target = DocumentSyncTarget::User {
+    let owner_target = DocumentTarget::User {
         user_id: plan.owner,
     };
     let stored_owner = read_bytes(context, owner_target.clone()).await;
@@ -403,12 +403,12 @@ async fn install_documents(
     }
 
     writes.push((
-        DocumentSyncTarget::RealmConfig {
+        DocumentTarget::RealmConfig {
             realm_id: plan.realm_id,
         }
         .storage_keyspace()
         .to_string(),
-        DocumentSyncTarget::RealmConfig {
+        DocumentTarget::RealmConfig {
             realm_id: plan.realm_id,
         }
         .storage_key(),
@@ -416,12 +416,12 @@ async fn install_documents(
     ));
     if let Some(authorization) = accepted.documents.realm_authorization {
         writes.push((
-            DocumentSyncTarget::RealmAuthorization {
+            DocumentTarget::RealmAuthorization {
                 realm_id: plan.realm_id,
             }
             .storage_keyspace()
             .to_string(),
-            DocumentSyncTarget::RealmAuthorization {
+            DocumentTarget::RealmAuthorization {
                 realm_id: plan.realm_id,
             }
             .storage_key(),
@@ -508,7 +508,7 @@ async fn installed_group_docs(context: &Arc<DriverContext>) -> Vec<DeviceGroupDo
         };
         let read = read_bytes(
             context,
-            DocumentSyncTarget::GroupAuthorization {
+            DocumentTarget::GroupAuthorization {
                 group_id: group.group_id,
             },
         )
@@ -533,8 +533,8 @@ fn group_doc_writes(
     actor: &Actor,
 ) -> Option<[(String, Key, Value); 2]> {
     let group_id = documents.group.group_id;
-    let group = DocumentSyncTarget::Group { group_id };
-    let authorization = DocumentSyncTarget::GroupAuthorization { group_id };
+    let group = DocumentTarget::Group { group_id };
+    let authorization = DocumentTarget::GroupAuthorization { group_id };
     Some([
         (
             group.storage_keyspace().to_string(),
@@ -651,7 +651,7 @@ async fn store_marker(context: &Arc<DriverContext>, realm_id: RealmId, marker: &
 }
 
 /// One stored document, or `None` when this device holds it not (yet).
-async fn read_bytes(context: &Arc<DriverContext>, target: DocumentSyncTarget) -> Option<Vec<u8>> {
+async fn read_bytes(context: &Arc<DriverContext>, target: DocumentTarget) -> Option<Vec<u8>> {
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -833,7 +833,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         });
-        let target = DocumentSyncTarget::RealmConfig { realm_id: realm() };
+        let target = DocumentTarget::RealmConfig { realm_id: realm() };
         let bytes = config
             .to_bytes(&Actor {
                 node_id: node(1),
@@ -874,12 +874,9 @@ mod tests {
                 behind: 2,
             },
         };
-        let stored = read_bytes(
-            &context,
-            DocumentSyncTarget::RealmConfig { realm_id: realm() },
-        )
-        .await
-        .expect("the device holds a configuration");
+        let stored = read_bytes(&context, DocumentTarget::RealmConfig { realm_id: realm() })
+            .await
+            .expect("the device holds a configuration");
 
         assert!(install_documents(&context, &plan, answer(&[1, 2], &[(1, 6)]), 0).await);
 
@@ -891,11 +888,7 @@ mod tests {
             }
         );
         assert_eq!(
-            read_bytes(
-                &context,
-                DocumentSyncTarget::RealmConfig { realm_id: realm() }
-            )
-            .await,
+            read_bytes(&context, DocumentTarget::RealmConfig { realm_id: realm() }).await,
             Some(stored),
             "the documents themselves are not rewritten"
         );
@@ -953,7 +946,7 @@ mod tests {
         let actor = owner_actor();
         let kept = group_docs(1, "kept");
         let dropped = group_docs(2, "dropped");
-        let realm_auth = DocumentSyncTarget::RealmAuthorization { realm_id: realm() };
+        let realm_auth = DocumentTarget::RealmAuthorization { realm_id: realm() };
         assert!(
             write_batch(
                 &context,
@@ -992,7 +985,7 @@ mod tests {
         assert!(
             read_bytes(
                 &context,
-                DocumentSyncTarget::Group {
+                DocumentTarget::Group {
                     group_id: dropped.group.group_id
                 }
             )
