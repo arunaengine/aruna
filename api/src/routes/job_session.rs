@@ -16,7 +16,6 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::lifecycle::ids::session_of;
-use aruna_operations::jobs::lifecycle::routing::session_job;
 use aruna_operations::jobs::service::read_session_reason;
 use aruna_operations::jobs::service::submit_copy_job;
 use aruna_operations::realm::get_config::GetRealmConfigOperation;
@@ -43,9 +42,9 @@ use utoipa_axum::routes;
 
 use crate::auth::{blob_permission_path, ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::jobs::owned_session_job;
 use crate::routes::jobs::{
-    JobStatusResponse, coded_response, job_status_response, map_job_route, map_submit_error,
-    parse_job_id,
+    JobStatusResponse, coded_response, job_status_response, map_submit_error,
 };
 use crate::routes::staging::queue_live_replication;
 use crate::server_state::ServerState;
@@ -229,38 +228,6 @@ pub struct SessionInputsResponse {
     /// Items that did not land, named so a partial result stays reconcilable.
     #[serde(default)]
     pub failed: Vec<FailedInputResponse>,
-}
-
-/// The caller's session job on this node. Absence and foreign ownership are
-/// deliberately indistinguishable.
-async fn owned_session_job(
-    state: &ServerState,
-    auth: &AuthContext,
-    raw_job_id: &str,
-) -> ServerResult<(JobRecord, Option<JobId>)> {
-    session_job(&state.get_ctx(), auth.user_id, parse_job_id(raw_job_id)?)
-        .await
-        .map_err(map_job_route)
-}
-
-/// The caller's live session on this node, for callers that have no coded
-/// answer of their own. Absence reads as 404 like every other session route.
-pub(crate) async fn caller_session(
-    state: &ServerState,
-    auth: &AuthContext,
-    raw_job_id: &str,
-) -> ServerResult<Arc<Session>> {
-    let (record, physical_job_id) = owned_session_job(state, auth, raw_job_id).await?;
-    if record.owner_node_id != state.get_node_id() {
-        return Err(ServerError::NotFound);
-    }
-    let job_id = physical_job_id.ok_or(ServerError::NotFound)?;
-    state
-        .get_ctx()
-        .compute_handle
-        .as_ref()
-        .and_then(|registry| registry.sessions().get(&job_id.to_string()))
-        .ok_or(ServerError::NotFound)
 }
 
 /// The live session, or the coded answer that says why there is none here.

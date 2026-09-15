@@ -10,6 +10,7 @@ pub mod csp;
 mod download;
 pub mod error;
 pub mod forwarded;
+pub mod jobs;
 pub mod mcp;
 pub mod metadata;
 pub mod monitoring;
