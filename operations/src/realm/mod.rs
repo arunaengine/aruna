@@ -4,6 +4,7 @@ pub mod assign_role;
 pub mod claim_admin;
 pub mod create_realm;
 pub mod ensure_config;
+pub mod forward;
 pub mod get_config;
 pub mod get_nodes;
 pub mod mutate_placement;
