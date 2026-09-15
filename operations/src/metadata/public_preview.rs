@@ -8,11 +8,11 @@ use serde_json::Value as JsonValue;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::blob::holders::GetBlobHoldersOperation;
-use crate::blob::permission_paths::ResolveBlobPermissionPathsOperation;
+use crate::blob::holders::GetHoldersOperation;
+use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::driver::{DriverContext, drive, drive_until};
 use crate::jobs::export::{EntityIdentity, entity_identity};
-use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetConfigOperation;
 use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::LocationSummaryRequest;
 
@@ -71,7 +71,7 @@ pub async fn restricted_files(
     let files = draft_files(rocrate);
     let mut complete = files.len() <= MAX_DRAFT_FILES;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let remote_possible = drive(GetRealmConfigOperation::new(realm_id), context)
+    let remote_possible = drive(GetConfigOperation::new(realm_id), context)
         .await
         .map_or(true, |config| {
             !config.has_node(node_id)
@@ -130,7 +130,7 @@ pub async fn restricted_files(
         }
         if remote_possible && let Some(hash) = identity.hash {
             checked &= matches!(
-                drive_until(GetBlobHoldersOperation::new(hash, realm_id, node_id), context, deadline).await,
+                drive_until(GetHoldersOperation::new(hash, realm_id, node_id), context, deadline).await,
                 Ok(holders) if holders.is_empty()
             );
         }
@@ -221,7 +221,7 @@ async fn entity_paths(
     let Some(hash) = hash else {
         return Ok(ResolvedPaths { paths, complete });
     };
-    let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), context)
+    let aliases = drive(ResolvePathsOperation::new(hash), context)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     for alias in aliases.iter().filter(|alias| alias.realm_id == realm_id) {
@@ -329,7 +329,7 @@ mod tests {
         S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
-        ARUNA_DATA_PREFIX, Actor, BucketInfo, Group, GroupAuthorizationDocument, HashPathIndexKey,
+        ARUNA_DATA_PREFIX, Actor, BucketInfo, Group, GroupAuthorizationDocument, HashIndex,
         RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, Role,
     };
     use serde_json::json;
@@ -350,7 +350,7 @@ mod tests {
     }
 
     async fn fixture(anonymous_read: bool) -> Fixture {
-        let staging = crate::tests::fixtures::staging::setup_driver_context().await;
+        let staging = crate::tests::staging::setup_driver_context().await;
         let context = staging.driver_context;
         let realm_id = RealmId::from_bytes([61; 32]);
         let owner = UserId::local(Ulid::from_bytes([62; 16]), realm_id);
@@ -398,8 +398,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
         };
-        let alias =
-            HashPathIndexKey::new(hash, version_id, realm_id, group_id, node_id, BUCKET, KEY);
+        let alias = HashIndex::new(hash, version_id, realm_id, group_id, node_id, BUCKET, KEY);
         let writes = vec![
             (
                 REALM_CONFIG_KEYSPACE.to_string(),
@@ -557,7 +556,7 @@ mod tests {
     }
 
     async fn add_alias(fixture: &Fixture, group_id: GroupId, key: &str) {
-        let alias = HashPathIndexKey::new(
+        let alias = HashIndex::new(
             fixture.hash,
             Ulid::generate(),
             fixture.realm_id,
