@@ -11,7 +11,7 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{BackendConfig, BackendState, BlobState, MultipartUploadPartKey, Status};
+use aruna_core::structs::{BackendConfig, BackendState, BlobState, MultipartPartKey, Status};
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
@@ -591,7 +591,7 @@ impl BlobHandler {
                 blob,
             } => {
                 Box::pin(self.write_blob_part(
-                    MultipartUploadPartKey::new(upload_id, part_number),
+                    MultipartPartKey::new(upload_id, part_number),
                     resolved,
                     created_by,
                     compressed,
@@ -700,7 +700,7 @@ impl BlobHandler {
         match super::control_plane::with_timeout(
             self.net.open_stream(node_id, Alpn::Bao),
             self.connect_timeout(),
-            super::ControlPlaneTimeoutKind::Connection,
+            super::ControlPlaneKind::Connection,
             "opening bao replication stream",
         )
         .await

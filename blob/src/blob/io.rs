@@ -15,7 +15,7 @@ use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
-    HiddenBlobKey, MultipartUploadPartKey, ResolvedBackend,
+    HiddenBlobKey, MultipartPartKey, ResolvedBackend,
 };
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -793,7 +793,7 @@ impl BlobHandler {
 
     pub async fn write_blob_part(
         &self,
-        part: MultipartUploadPartKey,
+        part: MultipartPartKey,
         resolved: ResolvedBackend,
         created_by: UserId,
         compressed: bool,

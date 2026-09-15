@@ -7,8 +7,7 @@ use aruna_core::keyspaces::{
     GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
 };
 use aruna_core::structs::{
-    Backend, BackendConfig, BackendRef, GroupBackendKind, GroupStorageBackend,
-    GroupStorageBackendSecret,
+    Backend, BackendConfig, BackendRef, GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
 use aruna_core::types::Key;
 use std::collections::HashMap;
@@ -35,8 +34,8 @@ fn container_key(kind: GroupBackendKind) -> &'static str {
 /// `multipart_bucket` names the tenant's own container, which also keeps the
 /// backend out of the minted-bucket stats accounting.
 pub(super) fn group_entry(
-    record: &GroupStorageBackend,
-    secret: &GroupStorageBackendSecret,
+    record: &GroupStorage,
+    secret: &GroupStorageSecret,
     timeouts: aruna_core::structs::BlobTimeoutConfig,
 ) -> Result<NodeBackend, BlobError> {
     let mut service_config: HashMap<String, String> = record.public_config.clone();
@@ -282,9 +281,9 @@ impl BlobHandler {
             )));
         };
         let record =
-            GroupStorageBackend::from_bytes(record.as_ref()).map_err(BlobError::ConversionError)?;
-        let secret = GroupStorageBackendSecret::from_bytes(secret.as_ref())
-            .map_err(BlobError::ConversionError)?;
+            GroupStorage::from_bytes(record.as_ref()).map_err(BlobError::ConversionError)?;
+        let secret =
+            GroupStorageSecret::from_bytes(secret.as_ref()).map_err(BlobError::ConversionError)?;
         group_entry(&record, &secret, self.registry.timeouts())
     }
 
@@ -292,8 +291,8 @@ impl BlobHandler {
     /// reachable through the guard: a sentinel object is written and removed.
     pub(super) async fn check_group_backend(
         &self,
-        record: GroupStorageBackend,
-        secret: GroupStorageBackendSecret,
+        record: GroupStorage,
+        secret: GroupStorageSecret,
     ) -> BlobEvent {
         let entry = match group_entry(&record, &secret, self.registry.timeouts()) {
             Ok(entry) => entry,
@@ -326,15 +325,15 @@ mod tests {
     use super::{group_entry, group_ids};
     use aruna_core::effects::BlobEffect;
     use aruna_core::structs::{
-        Backend, BackendRef, BlobTimeoutConfig, GroupBackendKind, GroupStorageBackend,
-        GroupStorageBackendSecret, ResolvedBackend,
+        Backend, BackendRef, BlobTimeoutConfig, GroupBackendKind, GroupStorage, GroupStorageSecret,
+        ResolvedBackend,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
 
-    fn record(kind: GroupBackendKind, public: &[(&str, &str)]) -> GroupStorageBackend {
-        GroupStorageBackend {
+    fn record(kind: GroupBackendKind, public: &[(&str, &str)]) -> GroupStorage {
+        GroupStorage {
             backend_id: Ulid::from_bytes([1u8; 16]),
             group_id: Ulid::from_bytes([2u8; 16]),
             name: "tenant".to_string(),
@@ -351,8 +350,8 @@ mod tests {
         }
     }
 
-    fn secret() -> GroupStorageBackendSecret {
-        GroupStorageBackendSecret {
+    fn secret() -> GroupStorageSecret {
+        GroupStorageSecret {
             backend_id: Ulid::from_bytes([1u8; 16]),
             secret_config: HashMap::from([("account_key".to_string(), "key".to_string())]),
             updated_at: SystemTime::UNIX_EPOCH,

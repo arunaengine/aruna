@@ -374,4 +374,5 @@ fn map_source_error(error: opendal::Error, stat: bool) -> StagingSourceError {
 }
 
 #[cfg(test)]
+#[path = "opendal_tests.rs"]
 mod tests;

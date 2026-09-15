@@ -203,4 +203,5 @@ fn guarded_client(
 }
 
 #[cfg(test)]
+#[path = "egress_tests.rs"]
 mod tests;

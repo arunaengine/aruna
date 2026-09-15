@@ -638,10 +638,10 @@ mod tests {
         EgressGuard::new(EgressPolicy::loopback()).unwrap()
     }
 
-    const NGINX_FIXTURE: &str = include_str!("../tests/fixtures/data/autoindex_nginx.html");
-    const APACHE_PRE_FIXTURE: &str = include_str!("../tests/fixtures/data/apache_pre.html");
-    const APACHE_TABLE_FIXTURE: &str = include_str!("../tests/fixtures/data/apache_table.html");
-    const NON_INDEX_FIXTURE: &str = include_str!("../tests/fixtures/data/non_index.html");
+    const NGINX_FIXTURE: &str = include_str!("../tests/fixtures/autoindex_nginx.html");
+    const APACHE_PRE_FIXTURE: &str = include_str!("../tests/fixtures/apache_pre.html");
+    const APACHE_TABLE_FIXTURE: &str = include_str!("../tests/fixtures/apache_table.html");
+    const NON_INDEX_FIXTURE: &str = include_str!("../tests/fixtures/non_index.html");
 
     fn epoch(seconds: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
