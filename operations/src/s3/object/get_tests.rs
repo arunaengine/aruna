@@ -5,7 +5,7 @@ use crate::replication::protocol::{BaoReadRefusal, ReferenceAdvance};
 use crate::replication::queue::LiveObligationRecord;
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, HolderFailures,
-    MAX_AUTO_ADVANCES, MAX_DRIFT_ADVANCE_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest,
+    MAX_AUTO_ADVANCES, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest,
     RoutedRead, get_object_routed, routed_info,
 };
 use aruna_blob::blob::BlobHandler;
@@ -16,7 +16,7 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::events::SubOperationEvent;
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE,
 };
 use aruna_core::operation::Operation;
@@ -1241,7 +1241,7 @@ async fn drift_creates_successor() {
     let Event::Storage(StorageEvent::IterResult { values, .. }) = driver_ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
-            key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: 16,
@@ -1353,13 +1353,13 @@ fn advance_to_reread(operation: &mut GetObjectOperation, headed: Ulid) -> Ulid {
     let txn_id = Ulid::generate();
     operation.resolved_version_id = Some(headed);
     operation.txn_id = Some(txn_id);
-    operation.state = GetObjectState::ReadHeadForAdvance;
+    operation.state = GetObjectState::ReadHeadAdvance;
     let effects = operation.step(head_read(headed));
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { .. })]
     ));
-    assert_eq!(operation.state, GetObjectState::ReadCurrentForAdvance);
+    assert_eq!(operation.state, GetObjectState::ReadAdvance);
     txn_id
 }
 
@@ -1387,7 +1387,7 @@ fn advance_conflict_restarts() {
     let txn_id = Ulid::generate();
     operation.resolved_version_id = Some(Ulid::generate());
     operation.txn_id = Some(txn_id);
-    operation.state = GetObjectState::ReadHeadForAdvance;
+    operation.state = GetObjectState::ReadHeadAdvance;
 
     // The head already names a different (winning) successor.
     let effects = operation.step(head_read(Ulid::generate()));
@@ -1432,7 +1432,7 @@ fn advance_writes_obligation() {
     assert_ne!(successor.created_by, operation.input.user_identity);
     assert_eq!(successor.metadata, operation.metadata);
     let next_pointer = CurrentVersionPointer::from_bytes(head_value.as_ref()).unwrap();
-    assert_eq!(key_space, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE);
+    assert_eq!(key_space, REPLICATION_OBLIGATION_KEYSPACE);
     let record = LiveObligationRecord::from_bytes(obligation_value.as_ref()).unwrap();
     assert_eq!(Some(record.version_id), operation.resolved_version_id);
     assert_ne!(record.version_id, headed);
@@ -1611,7 +1611,7 @@ fn successor_charges_size() {
 #[test]
 fn drift_limit_fails() {
     let mut operation = drifted_operation();
-    operation.drift_attempts = MAX_DRIFT_ADVANCE_ATTEMPTS;
+    operation.drift_attempts = MAX_DRIFT_ATTEMPTS;
     operation.state = GetObjectState::HeadReferenceSource;
 
     let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {

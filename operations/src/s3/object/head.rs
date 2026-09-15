@@ -493,13 +493,13 @@ impl HeadObjectOperation {
 
     fn handle_reference_access(&mut self, event: Event) -> Effects {
         match event {
-            Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+            Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                 result: Ok(access),
             }) => {
                 self.state = HeadObjectState::HeadReferenceSource;
                 smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
             }
-            Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+            Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                 result: Err(error),
             }) => self.emit_error(error.into()),
             other => self.emit_error(HeadObjectError::InvalidStateEvent {
@@ -920,7 +920,7 @@ mod tests {
             version: Some(version_id.to_string()),
         };
         let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::VersionSourceAccessResolved {
+            SubOperationEvent::VersionAccessResolved {
                 result: Ok(access.clone()),
             },
         ));

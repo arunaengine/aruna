@@ -4,7 +4,7 @@ use crate::blob::cleanup::PendingCleanup;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE};
+use aruna_core::keyspaces::{UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
 use aruna_core::structs::storage::blob::BlobCleanupWork;
 use aruna_core::structs::storage::multipart::{MultipartPart, MultipartPartKey};
 use aruna_core::types::TxnId;
@@ -116,10 +116,10 @@ pub(crate) fn delete_records_effect(
     let mut deletes = Vec::with_capacity(parts.len() + 1);
     for part in parts {
         let key = MultipartPartKey::new(upload_id, part.part_number).to_bytes()?;
-        deletes.push((S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(), key.into()));
+        deletes.push((UPLOAD_PART_KEYSPACE.to_string(), key.into()));
     }
     deletes.push((
-        S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+        UPLOAD_KEYSPACE.to_string(),
         upload_id.to_bytes().to_vec().into(),
     ));
     Ok(Effect::Storage(StorageEffect::BatchDelete {

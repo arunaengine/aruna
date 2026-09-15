@@ -16,7 +16,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -25,7 +25,7 @@ use aruna_core::structs::storage::blob::{
     ManagedCopyKey, ManagedCopyRecord, VersionKey,
 };
 use aruna_core::structs::placement::policy_attachment::{
-    POLICY_BULK_INTENT_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyBlockedReason, PolicyIntent,
+    BULK_INTENT_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyBlockedReason, PolicyIntent,
     PolicyIntentOutcome, PolicyMutationParams, PolicyMutationRecord, PolicyRefMode,
 };
 use aruna_core::structs::placement::placement_policy::{
@@ -302,7 +302,7 @@ impl SuccessorMint {
         };
         self.state = MintState::ReadIntent;
         Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: POLICY_BULK_INTENT_KEYSPACE.to_string(),
+            key_space: BULK_INTENT_KEYSPACE.to_string(),
             key: intent.key().to_bytes()?.into(),
             txn_id,
         })]))
@@ -536,7 +536,7 @@ impl SuccessorMint {
         let mut record = intent.clone();
         record.outcome = PolicyIntentOutcome::Blocked(reason);
         let writes = vec![(
-            POLICY_BULK_INTENT_KEYSPACE.to_string(),
+            BULK_INTENT_KEYSPACE.to_string(),
             Key::from(record.key().to_bytes()?),
             Value::from(record.to_bytes()?),
         )];
@@ -598,7 +598,7 @@ impl SuccessorMint {
                 .copied()
                 .ok_or(SuccessorError::VersionMissing)?;
             writes.push((
-                HASH_PATHS_INDEX_KEYSPACE.to_string(),
+                PATHS_INDEX_KEYSPACE.to_string(),
                 self.plan
                     .context
                     .path_index_key(hash, version_id)
@@ -638,7 +638,7 @@ impl SuccessorMint {
                 materialized: location.is_some(),
             };
             writes.push((
-                POLICY_BULK_INTENT_KEYSPACE.to_string(),
+                BULK_INTENT_KEYSPACE.to_string(),
                 receipt.key().to_bytes()?.into(),
                 receipt.to_bytes()?.into(),
             ));
@@ -1013,7 +1013,7 @@ mod pure_tests {
     use aruna_core::structs::execution::job::JobId;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
     use aruna_core::structs::placement::policy_attachment::{
-        POLICY_BULK_INTENT_KEYSPACE, PolicyBlockedReason, PolicyIntent, PolicyIntentOutcome,
+        BULK_INTENT_KEYSPACE, PolicyBlockedReason, PolicyIntent, PolicyIntentOutcome,
         PolicyMutationRecord, PolicyRefMode,
     };
     use aruna_core::structs::placement::placement_policy::{
@@ -1727,7 +1727,7 @@ mod pure_tests {
         let writes = batch_writes(effect);
 
         assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].0, POLICY_BULK_INTENT_KEYSPACE);
+        assert_eq!(writes[0].0, BULK_INTENT_KEYSPACE);
         let stored = PolicyIntent::from_bytes(&writes[0].2).expect("intent decodes");
         assert_eq!(
             stored.outcome,
@@ -1807,7 +1807,7 @@ mod pure_tests {
         .expect("the quota read follows");
 
         let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-        config.quota.default_group_quota_bytes = Some(1);
+        config.quota.default_quota_bytes = Some(1);
         config.quota.grace_factor_percent = 100;
         let actor = Actor {
             node_id: node_id(),

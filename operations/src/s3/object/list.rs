@@ -51,7 +51,7 @@ pub enum ListBucketError {
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("ListObjectsV2 failed")]
-    ListObjectsV2Failed,
+    ListObjectsFailed,
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -462,7 +462,7 @@ impl ListBucketOperation {
 
         let candidates = std::mem::take(&mut self.round_candidates);
         if values.len() != candidates.len() {
-            return self.emit_error(ListBucketError::ListObjectsV2Failed);
+            return self.emit_error(ListBucketError::ListObjectsFailed);
         }
 
         let max_keys = self.max_keys();
@@ -626,13 +626,13 @@ impl ListBucketOperation {
                     governed,
                 } => {
                     let Some((_key, value)) = locations.next() else {
-                        return self.emit_error(ListBucketError::ListObjectsV2Failed);
+                        return self.emit_error(ListBucketError::ListObjectsFailed);
                     };
                     let registration = match governed.as_ref() {
                         Some(_) => match locations.next() {
                             Some((_, value)) => value,
                             None => {
-                                return self.emit_error(ListBucketError::ListObjectsV2Failed);
+                                return self.emit_error(ListBucketError::ListObjectsFailed);
                             }
                         },
                         None => None,

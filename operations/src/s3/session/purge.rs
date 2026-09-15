@@ -5,7 +5,7 @@ use super::{
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    S3_SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, S3_SESSION_OWNER_KEYSPACE,
+    SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, SESSION_OWNER_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::s3_session::S3Session;
@@ -97,7 +97,7 @@ impl PurgeSessionsOperation {
         self.txn_id = Some(txn_id);
         self.state = PurgeSessionState::ScanExpiry;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_SESSION_EXPIRY_KEYSPACE.to_string(),
+            key_space: SESSION_EXPIRY_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: PURGE_BATCH,
@@ -218,7 +218,7 @@ impl PurgeSessionsOperation {
             reads: self
                 .removals
                 .keys()
-                .map(|key| (S3_SESSION_OWNER_KEYSPACE.to_string(), key.clone().into()))
+                .map(|key| (SESSION_OWNER_KEYSPACE.to_string(), key.clone().into()))
                 .collect(),
             txn_id: Some(txn_id),
         })]
@@ -242,14 +242,14 @@ impl PurgeSessionsOperation {
             }
             if index.is_empty() {
                 self.deletes
-                    .push((S3_SESSION_OWNER_KEYSPACE.to_string(), key));
+                    .push((SESSION_OWNER_KEYSPACE.to_string(), key));
             } else {
                 let value = match encode_index(&index) {
                     Ok(value) => value,
                     Err(error) => return self.fail(error),
                 };
                 self.writes
-                    .push((S3_SESSION_OWNER_KEYSPACE.to_string(), key, value));
+                    .push((SESSION_OWNER_KEYSPACE.to_string(), key, value));
             }
         }
         self.write_owners()
@@ -317,7 +317,7 @@ impl PurgeSessionsOperation {
 
     fn delete_index(&mut self, index_key: Key) {
         self.deletes
-            .push((S3_SESSION_EXPIRY_KEYSPACE.to_string(), index_key));
+            .push((SESSION_EXPIRY_KEYSPACE.to_string(), index_key));
         self.result.removed += 1;
     }
 

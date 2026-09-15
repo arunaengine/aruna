@@ -63,7 +63,7 @@ pub enum PutObjectState {
     ReadPreassignedCopy,
     ReadGateBucket,
     PolicyGate,
-    CheckPurgeFenceBeforeWrite,
+    CheckPurgeWrite,
     WriteBlob,
     CleanupFailedWrite,
     QueueCleanupRow,
@@ -77,16 +77,16 @@ pub enum PutObjectState {
     ReadObjectLookup,
     ReadLivenessVersion,
     WriteBlobHead,
-    WriteHashPathIndex,
-    CreateBlobVersionRecord,
+    WritePathIndex,
+    CreateVersionRecord,
     RegisterManagedCopy,
-    WriteLiveReplicationObligation,
+    WriteReplicationObligation,
     EnforceQuota,
     QuotaRejectAbort,
     UpdateUsage,
     CommitTransaction,
     ReleaseReservation,
-    RegisterBlobInDht,
+    RegisterBlobDht,
     CleanupDuplicate,
     Finish,
     Error,
@@ -522,7 +522,7 @@ impl PutObjectOperation {
     }
 
     fn check_write_fence(&mut self) -> Effects {
-        self.state = PutObjectState::CheckPurgeFenceBeforeWrite;
+        self.state = PutObjectState::CheckPurgeWrite;
         smallvec![write_fence_read(&self.config.request.bucket, None)]
     }
 
@@ -905,7 +905,7 @@ impl PutObjectOperation {
             Ok(effect) => effect,
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
-        self.state = PutObjectState::WriteHashPathIndex;
+        self.state = PutObjectState::WritePathIndex;
         smallvec![effect]
     }
 
@@ -948,7 +948,7 @@ impl PutObjectOperation {
                 Ok(effect) => effect,
                 Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
             };
-            self.state = PutObjectState::CreateBlobVersionRecord;
+            self.state = PutObjectState::CreateVersionRecord;
             smallvec![effect]
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
@@ -1024,7 +1024,7 @@ impl PutObjectOperation {
             Ok(effect) => effect,
             Err(err) => return self.emit_error(err.into()),
         };
-        self.state = PutObjectState::WriteLiveReplicationObligation;
+        self.state = PutObjectState::WriteReplicationObligation;
         smallvec![effect]
     }
 
@@ -1307,7 +1307,7 @@ impl PutObjectOperation {
         let Some(blake3_hash) = location.get_blake3() else {
             return self.continue_after_registration();
         };
-        self.state = PutObjectState::RegisterBlobInDht;
+        self.state = PutObjectState::RegisterBlobDht;
         match dht_registration_effect(blake3_hash, self.config.realm_id, &self.rocrate_limits) {
             Ok(effect) => smallvec![effect],
             Err(_) => self.continue_after_registration(),
@@ -1496,7 +1496,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadPreassignedCopy => self.handle_preassigned_copy(event),
             PutObjectState::ReadGateBucket => self.handle_gate_bucket(event),
             PutObjectState::PolicyGate => self.handle_policy_gate(event),
-            PutObjectState::CheckPurgeFenceBeforeWrite => self.write_fence_checked(event),
+            PutObjectState::CheckPurgeWrite => self.write_fence_checked(event),
             PutObjectState::WriteBlob => self.handle_write_finished(event),
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
@@ -1510,16 +1510,16 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadObjectLookup => self.object_lookup_read(event),
             PutObjectState::ReadLivenessVersion => self.liveness_read(event),
             PutObjectState::WriteBlobHead => self.head_written(event),
-            PutObjectState::WriteHashPathIndex => self.path_index_created(event),
-            PutObjectState::CreateBlobVersionRecord => self.version_created(event),
+            PutObjectState::WritePathIndex => self.path_index_created(event),
+            PutObjectState::CreateVersionRecord => self.version_created(event),
             PutObjectState::RegisterManagedCopy => self.handle_copy_registered(event),
-            PutObjectState::WriteLiveReplicationObligation => self.obligation_written(event),
+            PutObjectState::WriteReplicationObligation => self.obligation_written(event),
             PutObjectState::EnforceQuota => self.handle_enforce_quota(event),
             PutObjectState::QuotaRejectAbort => self.abort_quota_reject(event),
             PutObjectState::UpdateUsage => self.handle_usage_update(event),
             PutObjectState::CommitTransaction => self.handle_transaction_committed(event),
             PutObjectState::ReleaseReservation => self.handle_release(event),
-            PutObjectState::RegisterBlobInDht => self.blob_registered(event),
+            PutObjectState::RegisterBlobDht => self.blob_registered(event),
             PutObjectState::CleanupDuplicate => self.handle_duplicate_cleanup(event),
             PutObjectState::Finish => self.emit_finish(),
             PutObjectState::Error => self.abort(),

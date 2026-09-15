@@ -18,7 +18,7 @@ use irokle::Storage as _;
 
 use crate::driver::DriverContext;
 
-const SHARD_MANIFEST_SCAN_PAGE: usize = 512;
+const MANIFEST_SCAN_PAGE: usize = 512;
 
 /// Builds the local node's [`ShardManifest`] for one shard on demand: a prefix
 /// scan of the manifest keyspace for the entry set, plus the shard topic's
@@ -85,7 +85,7 @@ async fn scan_manifest_entries(
                 key_space: SHARD_MANIFEST_KEYSPACE.to_string(),
                 prefix: Some(prefix.clone()),
                 start: start_after.take().map(IterStart::After),
-                limit: SHARD_MANIFEST_SCAN_PAGE,
+                limit: MANIFEST_SCAN_PAGE,
                 txn_id: None,
             })
             .await

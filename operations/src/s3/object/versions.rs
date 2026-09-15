@@ -55,7 +55,7 @@ pub enum ListVersionsState {
     Init,
     StartTransaction,
     ReadHeads,
-    ReadVersionsForKey,
+    ReadVersionsKey,
     ReadBlobLocations,
     CommitTransaction,
     Finish,
@@ -77,7 +77,7 @@ pub enum ListVersionsError {
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("ListObjectVersions failed")]
-    ListObjectVersionsFailed,
+    ListVersionsFailed,
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -116,7 +116,7 @@ pub struct ListVersionsResult {
     pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_key_marker: Option<String>,
-    pub next_version_id_marker: Option<Ulid>,
+    pub next_version_marker: Option<Ulid>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -157,7 +157,7 @@ pub struct ListVersionsOperation {
     is_truncated: bool,
     last_marker: Option<(String, Option<Ulid>)>,
     next_key_marker: Option<String>,
-    next_version_id_marker: Option<Ulid>,
+    next_version_marker: Option<Ulid>,
     output: Option<Result<ListVersionsResult, ListVersionsError>>,
 }
 
@@ -189,7 +189,7 @@ impl ListVersionsOperation {
             is_truncated: false,
             last_marker: None,
             next_key_marker: None,
-            next_version_id_marker: None,
+            next_version_marker: None,
             output: None,
         }
     }
@@ -235,7 +235,7 @@ impl ListVersionsOperation {
                 common_prefixes: Vec::new(),
                 is_truncated: false,
                 next_key_marker: None,
-                next_version_id_marker: None,
+                next_version_marker: None,
             }));
             return smallvec![];
         }
@@ -426,7 +426,7 @@ impl ListVersionsOperation {
             Err(err) => return self.emit_error(err.into()),
         };
         let start = self.version_scan_cursor.take().map(IterStart::After);
-        self.state = ListVersionsState::ReadVersionsForKey;
+        self.state = ListVersionsState::ReadVersionsKey;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
@@ -450,7 +450,7 @@ impl ListVersionsOperation {
         };
 
         let Some((key, head_version_id)) = self.current_key.clone() else {
-            return self.emit_error(ListVersionsError::ListObjectVersionsFailed);
+            return self.emit_error(ListVersionsError::ListVersionsFailed);
         };
 
         for (version_key, value) in values {
@@ -622,14 +622,14 @@ impl ListVersionsOperation {
                     governed,
                 } => {
                     let Some((_key, value)) = locations.next() else {
-                        return self.emit_error(ListVersionsError::ListObjectVersionsFailed);
+                        return self.emit_error(ListVersionsError::ListVersionsFailed);
                     };
                     let registration = match governed.as_ref() {
                         Some(_) => match locations.next() {
                             Some((_, value)) => value,
                             None => {
                                 return self
-                                    .emit_error(ListVersionsError::ListObjectVersionsFailed);
+                                    .emit_error(ListVersionsError::ListVersionsFailed);
                             }
                         },
                         None => None,
@@ -699,7 +699,7 @@ impl ListVersionsOperation {
         self.is_truncated = true;
         if let Some((key, version_id)) = self.last_marker.clone() {
             self.next_key_marker = Some(key);
-            self.next_version_id_marker = version_id;
+            self.next_version_marker = version_id;
         }
     }
 
@@ -714,7 +714,7 @@ impl ListVersionsOperation {
             common_prefixes: self.prefixes.take(),
             is_truncated: self.is_truncated,
             next_key_marker: self.next_key_marker.take(),
-            next_version_id_marker: self.next_version_id_marker.take(),
+            next_version_marker: self.next_version_marker.take(),
         }));
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -750,7 +750,7 @@ impl Operation for ListVersionsOperation {
             ListVersionsState::Init => self.handle_init(),
             ListVersionsState::StartTransaction => self.handle_transaction_started(event),
             ListVersionsState::ReadHeads => self.handle_heads_read(event),
-            ListVersionsState::ReadVersionsForKey => self.handle_versions_read(event),
+            ListVersionsState::ReadVersionsKey => self.handle_versions_read(event),
             ListVersionsState::ReadBlobLocations => self.handle_locations_read(event),
             ListVersionsState::CommitTransaction => self.handle_transaction_committed(event),
             ListVersionsState::Finish | ListVersionsState::Error => smallvec![],
@@ -1093,7 +1093,7 @@ mod test {
 
             if result.is_truncated {
                 key_marker = result.next_key_marker.clone();
-                version_id_marker = result.next_version_id_marker;
+                version_id_marker = result.next_version_marker;
                 assert!(key_marker.is_some());
             } else {
                 break;
@@ -1288,7 +1288,7 @@ mod test {
                 prefix: None,
                 delimiter: Some("/".to_string()),
                 key_marker: first.next_key_marker.clone(),
-                version_id_marker: first.next_version_id_marker,
+                version_id_marker: first.next_version_marker,
                 max_keys: Some(3),
             })
             .with_round_limit(2),

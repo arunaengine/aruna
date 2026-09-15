@@ -6,8 +6,8 @@ use aruna_blob::blob::BlobHandler;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-    USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE,
+    NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::storage::blob::{
@@ -89,7 +89,7 @@ fn audit_record(effects: &[Effect]) -> aruna_core::structs::storage::delete_audi
     else {
         panic!("expected one audit write, got {effects:?}")
     };
-    assert_eq!(key_space, BLOB_DELETE_AUDIT_KEYSPACE);
+    assert_eq!(key_space, DELETE_AUDIT_KEYSPACE);
     aruna_core::structs::storage::delete_audit::BlobAuditRecord::from_bytes(value.as_ref()).expect("audit record decodes")
 }
 
@@ -302,7 +302,7 @@ fn drifted_counter_commits() {
     assert!(
         writes
             .iter()
-            .any(|(key_space, ..)| key_space == USAGE_NODE_STATS_KEYSPACE)
+            .any(|(key_space, ..)| key_space == NODE_STATS_KEYSPACE)
     );
 
     let effects = op.handle_usage_update(Event::Storage(StorageEvent::BatchWriteResult {
@@ -375,7 +375,7 @@ fn marker_queues_nothing() {
     else {
         panic!("expected the audit write, got {effects:?}")
     };
-    assert_eq!(key_space, BLOB_DELETE_AUDIT_KEYSPACE);
+    assert_eq!(key_space, DELETE_AUDIT_KEYSPACE);
     assert_eq!(*txn_id, op.txn_id);
 }
 
@@ -679,7 +679,7 @@ async fn creates_tombstone() {
 
     let historical_hash_path = read_value(
         &context,
-        HASH_PATHS_INDEX_KEYSPACE,
+        PATHS_INDEX_KEYSPACE,
         HashIndex::new(
             put_result
                 .location
@@ -832,7 +832,7 @@ async fn deletes_version() {
 
     let restored_hash_path = read_value(
         &context,
-        HASH_PATHS_INDEX_KEYSPACE,
+        PATHS_INDEX_KEYSPACE,
         HashIndex::new(
             put_result
                 .location
@@ -942,7 +942,7 @@ async fn deletes_version() {
     assert!(
         read_value(
             &context,
-            HASH_PATHS_INDEX_KEYSPACE,
+            PATHS_INDEX_KEYSPACE,
             HashIndex::new(
                 put_result
                     .location
@@ -967,7 +967,7 @@ async fn deletes_version() {
     assert!(
         read_value(
             &context,
-            HASH_PATHS_INDEX_KEYSPACE,
+            PATHS_INDEX_KEYSPACE,
             HashIndex::new(
                 put_result
                     .location

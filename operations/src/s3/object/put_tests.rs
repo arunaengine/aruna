@@ -12,7 +12,7 @@ use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
-    HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE, S3_PURGE_FENCE_KEYSPACE,
+    PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE, PURGE_FENCE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
@@ -190,7 +190,7 @@ fn recreate_rejected() {
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { key_space, .. })]
-            if key_space == S3_PURGE_FENCE_KEYSPACE
+            if key_space == PURGE_FENCE_KEYSPACE
     ));
     let effects = op.step(fence_clear());
     assert!(matches!(
@@ -975,7 +975,7 @@ pub async fn test_put_object() {
     }) = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
+            key_space: PATHS_INDEX_KEYSPACE.to_string(),
             key: HashIndex::new(
                 result.location.get_blake3().unwrap().try_into().unwrap(),
                 result.version_id,
@@ -1214,7 +1214,7 @@ pub async fn deduplicates_blob() {
 
         let hash_path_value = read_value(
             &context,
-            HASH_PATHS_INDEX_KEYSPACE,
+            PATHS_INDEX_KEYSPACE,
             HashIndex::new(
                 blob_hash,
                 expected_version_id,
@@ -1632,7 +1632,7 @@ pub async fn overwrite_retains_index() {
 
     let historical_hash_path = read_value(
         &context,
-        HASH_PATHS_INDEX_KEYSPACE,
+        PATHS_INDEX_KEYSPACE,
         HashIndex::new(
             first_hash,
             first.version_id,
@@ -1651,7 +1651,7 @@ pub async fn overwrite_retains_index() {
 
     let new_hash_path = read_value(
         &context,
-        HASH_PATHS_INDEX_KEYSPACE,
+        PATHS_INDEX_KEYSPACE,
         HashIndex::new(
             second_hash,
             second.version_id,

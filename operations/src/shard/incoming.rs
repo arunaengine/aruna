@@ -19,7 +19,7 @@ use crate::placement::{bucket_membership, resolve_shard_holders};
 use crate::shard::assemble_shard_manifest;
 use crate::shard::client::{SHARD_IO_TIMEOUT, close_stream};
 use crate::shard::protocol::{
-    ManifestPagePlan, SHARD_MAX_RESPONSE_SIZE, ShardTransportMessage, ShardTransportResponse,
+    ManifestPagePlan, MAX_RESPONSE_SIZE, ShardTransportMessage, ShardTransportResponse,
     plan_manifest_pages, read_shard_request, write_manifest_pages, write_shard_response,
 };
 
@@ -164,7 +164,7 @@ async fn build_response(
     match assemble_shard_manifest(context, realm_id, placement).await {
         Ok(manifest) => {
             let entries = manifest.entries.len();
-            let response = match plan_manifest_pages(&manifest, SHARD_MAX_RESPONSE_SIZE) {
+            let response = match plan_manifest_pages(&manifest, MAX_RESPONSE_SIZE) {
                 Ok(plan) => PreparedShardResponse::ManifestPages {
                     manifest: Box::new(manifest),
                     plan,

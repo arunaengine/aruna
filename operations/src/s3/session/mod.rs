@@ -25,7 +25,7 @@ use aruna_core::events::Event;
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::auth::PathRestriction;
-use aruna_core::structs::identity::s3_session::{S3_SESSION_ACCESS_PREFIX, S3Session};
+use aruna_core::structs::identity::s3_session::{SESSION_ACCESS_PREFIX, S3Session};
 use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
 use rand::distr::Alphanumeric;
@@ -180,7 +180,7 @@ fn expiry_parts(key: &[u8]) -> Option<(u64, String)> {
 fn session_age(session: &S3Session) -> (u128, SystemTime) {
     let issued = session
         .access_key
-        .strip_prefix(S3_SESSION_ACCESS_PREFIX)
+        .strip_prefix(SESSION_ACCESS_PREFIX)
         .and_then(|key_id| key_id.parse::<Ulid>().ok())
         .map_or(0, u128::from);
     (issued, session.expiry)
@@ -270,9 +270,9 @@ mod tests {
     use crate::s3::access::list::{ListUserInput, ListUserOperation};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{S3_SESSION_EXPIRY_KEYSPACE, S3_SESSION_OWNER_KEYSPACE};
+    use aruna_core::keyspaces::{SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::identity::s3_session::S3_SESSION_MAX_TTL;
+    use aruna_core::structs::identity::s3_session::SESSION_MAX_TTL;
     use aruna_storage::FjallStorage;
     use tempfile::TempDir;
     use ulid::Ulid;
@@ -318,7 +318,7 @@ mod tests {
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: S3_SESSION_OWNER_KEYSPACE.to_string(),
+                key_space: SESSION_OWNER_KEYSPACE.to_string(),
                 key: owner_key(user, group),
                 txn_id: None,
             })
@@ -356,7 +356,7 @@ mod tests {
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let issued = drive(
             CreateS3Operation::new(
-                session_config(user, group, start, start + S3_SESSION_MAX_TTL, issuer),
+                session_config(user, group, start, start + SESSION_MAX_TTL, issuer),
                 encryption_key.clone(),
             ),
             &context,
@@ -383,7 +383,7 @@ mod tests {
                     user_identity: user,
                     group_id: group,
                     now: early,
-                    expiry: early + S3_SESSION_MAX_TTL,
+                    expiry: early + SESSION_MAX_TTL,
                     path_restrictions: None,
                     issued_by: issuer,
                 },
@@ -403,7 +403,7 @@ mod tests {
                     user_identity: user,
                     group_id: group,
                     now: boundary,
-                    expiry: boundary + S3_SESSION_MAX_TTL,
+                    expiry: boundary + SESSION_MAX_TTL,
                     path_restrictions: None,
                     issued_by: issuer,
                 },
@@ -471,7 +471,7 @@ mod tests {
         let owner = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: S3_SESSION_OWNER_KEYSPACE.to_string(),
+                key_space: SESSION_OWNER_KEYSPACE.to_string(),
                 key: owner_key(user, group),
                 txn_id: None,
             })
@@ -483,7 +483,7 @@ mod tests {
         let expiry = context
             .storage_handle
             .send_storage_effect(StorageEffect::Iter {
-                key_space: S3_SESSION_EXPIRY_KEYSPACE.to_string(),
+                key_space: SESSION_EXPIRY_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
                 limit: 1,
@@ -637,7 +637,7 @@ mod tests {
         let expiry = context
             .storage_handle
             .send_storage_effect(StorageEffect::Iter {
-                key_space: S3_SESSION_EXPIRY_KEYSPACE.to_string(),
+                key_space: SESSION_EXPIRY_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
                 limit: 16,

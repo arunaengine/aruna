@@ -24,15 +24,15 @@ use crate::shard::{assemble_shard_manifest, manifest_entry_digest};
 use crate::sync::shard_placement::{placement_key, placement_prefix};
 
 /// Page size for scanning persisted shard verification markers.
-const VERIFIED_SHARD_SCAN_PAGE_SIZE: usize = 256;
+const SHARD_PAGE_SIZE: usize = 256;
 
 /// A new holder retries digest reconciliation this many times against the first
 /// reachable co-holder before leaving it unverified for the next pass.
-pub const SHARD_VERIFICATION_MAX_ATTEMPTS: usize = 3;
+pub const VERIFICATION_MAX_ATTEMPTS: usize = 3;
 
 /// Limits startup verification work while allowing independent shards to make
 /// progress concurrently. Matches the existing bounded metadata fanout.
-const SHARD_VERIFICATION_CONCURRENCY_LIMIT: usize = 8;
+const VERIFICATION_CONCURRENCY_LIMIT: usize = 8;
 
 /// Persisted proof that the local node reconciled a shard against a co-holder.
 /// Presence of the row (keyed like a pending placement) means verified, so a
@@ -119,7 +119,7 @@ pub async fn verify_held_shards(
             (shard_index, shard_summary)
         },
     ))
-    .buffer_unordered(SHARD_VERIFICATION_CONCURRENCY_LIMIT);
+    .buffer_unordered(VERIFICATION_CONCURRENCY_LIMIT);
     futures_util::pin_mut!(pending);
 
     let mut shard_summaries = Vec::new();
@@ -247,7 +247,7 @@ pub async fn converge_with_barrier(
 
         // Reconcile against this source with a bounded number of anti-entropy
         // passes; on non-convergence continue to the next source.
-        for _ in 0..SHARD_VERIFICATION_MAX_ATTEMPTS {
+        for _ in 0..VERIFICATION_MAX_ATTEMPTS {
             let local = match assemble_shard_manifest(context, realm_id, placement).await {
                 Ok(manifest) => manifest,
                 Err(error) => {
@@ -324,7 +324,7 @@ pub async fn load_verified_topics(
                 key_space: SHARD_VERIFICATION_KEYSPACE.to_string(),
                 prefix: Some(placement_prefix(realm_id)),
                 start: start_after.take().map(IterStart::After),
-                limit: VERIFIED_SHARD_SCAN_PAGE_SIZE,
+                limit: SHARD_PAGE_SIZE,
                 txn_id: None,
             })
             .await

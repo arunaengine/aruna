@@ -5,7 +5,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, REFERENCE_METADATA_REFRESH_JOB_KEYSPACE};
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, REFRESH_JOB_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
 use aruna_core::structs::execution::source_access::SourceMetadata;
@@ -25,10 +25,10 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 
-const REFRESH_SCAN_PAGE_SIZE: usize = 512;
+const REFRESH_SCAN_PAGE: usize = 512;
 const REFRESH_BATCH_SIZE: usize = 64;
 
-pub const REFERENCE_METADATA_REFRESH_RETRY_AFTER: Duration = Duration::from_secs(1);
+pub const REFRESH_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferenceRefresh {
@@ -85,7 +85,7 @@ struct ReferenceRefreshIdentity<'a> {
 struct ReferenceRefreshScan {
     jobs: Vec<(Vec<u8>, ReferenceRefreshRecord)>,
     has_more_due: bool,
-    next_due_at_ms: Option<u64>,
+    next_due_ms: Option<u64>,
 }
 
 impl ReferenceRefreshRecord {
@@ -113,7 +113,7 @@ pub fn job_key(refresh: &ReferenceRefresh) -> Result<Key, ConversionError> {
 
 fn job_entry(record: &ReferenceRefreshRecord) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((
-        REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
+        REFRESH_JOB_KEYSPACE.to_string(),
         job_key(&record.refresh)?,
         ByteView::from(postcard::to_allocvec(record)?),
     ))
@@ -125,7 +125,7 @@ fn job_preferred(candidate: &ReferenceRefreshRecord, current: &ReferenceRefreshR
 
 pub fn schedule_drain() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainReferenceMetadataRefreshQueue,
+        key: TaskKey::DrainRefreshQueue,
         after: Duration::ZERO,
     })
 }
@@ -169,7 +169,7 @@ impl QueueRefreshOperation {
         };
         self.state = QueueRefreshState::ReadExisting;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
+            key_space: REFRESH_JOB_KEYSPACE.to_string(),
             key,
             txn_id: None,
         })]
@@ -426,7 +426,7 @@ pub async fn restore_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
         Ok(Some(after)) => {
             let event = task_handle
                 .send_effect(Effect::Task(TaskEffect::ResetTimer {
-                    key: TaskKey::DrainReferenceMetadataRefreshQueue,
+                    key: TaskKey::DrainRefreshQueue,
                     after,
                 }))
                 .await;
@@ -441,7 +441,7 @@ pub async fn restore_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
 pub async fn jobs_exist(storage: &StorageHandle) -> Result<bool, ReferenceRefreshError> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
+            key_space: REFRESH_JOB_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: 1,
@@ -465,7 +465,7 @@ pub async fn next_timer(
     }
 
     Ok(scan
-        .next_due_at_ms
+        .next_due_ms
         .map(|due_at_ms| due_after(now_ms, due_at_ms)))
 }
 
@@ -475,7 +475,7 @@ pub async fn process_batch(
     let batch_started = Instant::now();
     let now_ms = unix_timestamp_millis();
     let scan = scan_due_jobs(&context.storage_handle, now_ms, REFRESH_BATCH_SIZE).await?;
-    let mut next_due_at_ms = scan.next_due_at_ms;
+    let mut next_due_ms = scan.next_due_ms;
     let has_more_due = scan.has_more_due;
     let scan_elapsed = batch_started.elapsed();
     let job_count = scan.jobs.len();
@@ -497,7 +497,7 @@ pub async fn process_batch(
             Err(error) => {
                 let retry_due_at =
                     reschedule_job(&context.storage_handle, job_key, &job, error).await?;
-                next_due_at_ms = min_due_at(next_due_at_ms, retry_due_at);
+                next_due_ms = min_due_at(next_due_ms, retry_due_at);
                 failed = failed.saturating_add(1);
             }
         }
@@ -525,7 +525,7 @@ pub async fn process_batch(
         next_due_after: if has_more_due {
             None
         } else {
-            next_due_at_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms))
+            next_due_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms))
         },
     })
 }
@@ -537,14 +537,14 @@ async fn scan_due_jobs(
 ) -> Result<ReferenceRefreshScan, ReferenceRefreshError> {
     let mut start_after = None;
     let mut jobs = Vec::new();
-    let mut next_due_at_ms = None;
+    let mut next_due_ms = None;
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
+                key_space: REFRESH_JOB_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
-                limit: REFRESH_SCAN_PAGE_SIZE,
+                limit: REFRESH_SCAN_PAGE,
                 txn_id: None,
             })
             .await;
@@ -577,7 +577,7 @@ async fn scan_due_jobs(
                 {
                     delete_job(storage, key).await?;
                     if existing.due_at_ms > now_ms {
-                        next_due_at_ms = min_due_at(next_due_at_ms, existing.due_at_ms);
+                        next_due_ms = min_due_at(next_due_ms, existing.due_at_ms);
                         continue;
                     }
                     jobs.push((canonical_key, existing));
@@ -585,7 +585,7 @@ async fn scan_due_jobs(
                         return Ok(ReferenceRefreshScan {
                             jobs,
                             has_more_due: true,
-                            next_due_at_ms,
+                            next_due_ms,
                         });
                     }
                     continue;
@@ -607,7 +607,7 @@ async fn scan_due_jobs(
                     delete_job(storage, key).await?;
                 }
                 if existing.due_at_ms > now_ms {
-                    next_due_at_ms = min_due_at(next_due_at_ms, existing.due_at_ms);
+                    next_due_ms = min_due_at(next_due_ms, existing.due_at_ms);
                     continue;
                 }
                 jobs.push((existing_canonical_key, existing));
@@ -615,13 +615,13 @@ async fn scan_due_jobs(
                     return Ok(ReferenceRefreshScan {
                         jobs,
                         has_more_due: true,
-                        next_due_at_ms,
+                        next_due_ms,
                     });
                 }
                 continue;
             }
             if job.due_at_ms > now_ms {
-                next_due_at_ms = min_due_at(next_due_at_ms, job.due_at_ms);
+                next_due_ms = min_due_at(next_due_ms, job.due_at_ms);
                 continue;
             }
             jobs.push((key, job));
@@ -629,7 +629,7 @@ async fn scan_due_jobs(
                 return Ok(ReferenceRefreshScan {
                     jobs,
                     has_more_due: true,
-                    next_due_at_ms,
+                    next_due_ms,
                 });
             }
         }
@@ -640,7 +640,7 @@ async fn scan_due_jobs(
                 return Ok(ReferenceRefreshScan {
                     jobs,
                     has_more_due: false,
-                    next_due_at_ms,
+                    next_due_ms,
                 });
             }
         }
@@ -658,10 +658,10 @@ async fn find_duplicate(
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
+                key_space: REFRESH_JOB_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
-                limit: REFRESH_SCAN_PAGE_SIZE,
+                limit: REFRESH_SCAN_PAGE,
                 txn_id: None,
             })
             .await;
@@ -708,7 +708,7 @@ async fn read_job(
 ) -> Result<Option<ReferenceRefreshRecord>, ReferenceRefreshError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
+            key_space: REFRESH_JOB_KEYSPACE.to_string(),
             key: ByteView::from(key.to_vec()),
             txn_id: None,
         })
@@ -748,7 +748,7 @@ async fn write_job(
 async fn delete_job(storage: &StorageHandle, key: Vec<u8>) -> Result<(), ReferenceRefreshError> {
     match storage
         .send_storage_effect(StorageEffect::Delete {
-            key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
+            key_space: REFRESH_JOB_KEYSPACE.to_string(),
             key: ByteView::from(key),
             txn_id: None,
         })
@@ -776,7 +776,7 @@ async fn reschedule_job(
     };
     match storage
         .send_storage_effect(StorageEffect::Write {
-            key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
+            key_space: REFRESH_JOB_KEYSPACE.to_string(),
             key: ByteView::from(key),
             value: ByteView::from(postcard::to_allocvec(&next_job).map_err(ConversionError::from)?),
             txn_id: None,
@@ -954,7 +954,7 @@ mod tests {
     async fn read_jobs(storage: &StorageHandle) -> Vec<ReferenceRefreshRecord> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
+                key_space: REFRESH_JOB_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
                 limit: 16,
@@ -973,7 +973,7 @@ mod tests {
     async fn write_corrupt_job(storage: &StorageHandle, key: &str) {
         match storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
+                key_space: REFRESH_JOB_KEYSPACE.to_string(),
                 key: ByteView::from(key.as_bytes().to_vec()),
                 value: ByteView::from(Vec::new()),
                 txn_id: None,

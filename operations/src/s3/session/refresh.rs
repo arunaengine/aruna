@@ -6,11 +6,11 @@ use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    S3_SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, S3_SESSION_OWNER_KEYSPACE,
+    SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, SESSION_OWNER_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::PathRestriction;
-use aruna_core::structs::identity::s3_session::{S3_SESSION_MAX_TTL, S3Session};
+use aruna_core::structs::identity::s3_session::{SESSION_MAX_TTL, S3Session};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use std::time::SystemTime;
@@ -77,7 +77,7 @@ impl RefreshS3Operation {
         let Ok(ttl) = self.config.expiry.duration_since(self.config.now) else {
             return self.fail(S3SessionError::InvalidExpiry);
         };
-        if ttl.is_zero() || ttl > S3_SESSION_MAX_TTL {
+        if ttl.is_zero() || ttl > SESSION_MAX_TTL {
             return self.fail(S3SessionError::InvalidExpiry);
         }
         self.state = RefreshSessionState::StartTransaction;
@@ -99,7 +99,7 @@ impl RefreshS3Operation {
                     self.config.access_key.as_bytes().into(),
                 ),
                 (
-                    S3_SESSION_OWNER_KEYSPACE.to_string(),
+                    SESSION_OWNER_KEYSPACE.to_string(),
                     owner_key(self.config.user_identity, self.config.group_id),
                 ),
             ],
@@ -172,7 +172,7 @@ impl RefreshS3Operation {
         self.pending = Some(pending);
         self.state = RefreshSessionState::DeleteExpiry;
         smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: S3_SESSION_EXPIRY_KEYSPACE.to_string(),
+            key_space: SESSION_EXPIRY_KEYSPACE.to_string(),
             key: old_key,
             txn_id: Some(txn_id),
         })]
@@ -206,7 +206,7 @@ impl RefreshS3Operation {
                     session_bytes.into(),
                 ),
                 (
-                    S3_SESSION_EXPIRY_KEYSPACE.to_string(),
+                    SESSION_EXPIRY_KEYSPACE.to_string(),
                     expiry_key,
                     owner_key,
                 ),

@@ -3,7 +3,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    S3_SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, S3_SESSION_OWNER_KEYSPACE,
+    SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, SESSION_OWNER_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::s3_session::S3Session;
@@ -114,7 +114,7 @@ impl RevokeS3Operation {
                 S3_SESSION_KEYSPACE.to_string(),
                 session.access_key.as_bytes().into(),
             ),
-            (S3_SESSION_EXPIRY_KEYSPACE.to_string(), expiry_key),
+            (SESSION_EXPIRY_KEYSPACE.to_string(), expiry_key),
         ];
         let owner_key = owner_key(session.user_identity, session.group_id);
         self.owner_key = Some(owner_key.clone());
@@ -123,7 +123,7 @@ impl RevokeS3Operation {
         };
         self.state = RevokeSessionState::ReadIndex;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_SESSION_OWNER_KEYSPACE.to_string(),
+            key_space: SESSION_OWNER_KEYSPACE.to_string(),
             key: owner_key,
             txn_id: Some(txn_id),
         })]
@@ -143,7 +143,7 @@ impl RevokeS3Operation {
         };
         if index.is_empty() {
             self.deletes
-                .push((S3_SESSION_OWNER_KEYSPACE.to_string(), owner_key));
+                .push((SESSION_OWNER_KEYSPACE.to_string(), owner_key));
             return self.delete_rows();
         }
         let index_bytes = match encode_index(&index) {
@@ -152,7 +152,7 @@ impl RevokeS3Operation {
         };
         self.state = RevokeSessionState::WriteIndex;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_SESSION_OWNER_KEYSPACE.to_string(),
+            key_space: SESSION_OWNER_KEYSPACE.to_string(),
             key: owner_key,
             value: index_bytes,
             txn_id: Some(txn_id),

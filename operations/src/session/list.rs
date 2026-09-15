@@ -3,7 +3,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{USER_SESSION_KEYSPACE, USER_SESSION_OWNER_KEYSPACE};
+use aruna_core::keyspaces::{USER_SESSION_KEYSPACE, USER_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::user_session::UserSession;
 use aruna_core::types::{Effects, TxnId};
@@ -83,7 +83,7 @@ impl ListSessionOperation {
         self.txn_id = Some(txn_id);
         self.state = ListSessionState::ReadOwnerIndex;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_SESSION_OWNER_KEYSPACE.to_string(),
+            key_space: USER_OWNER_KEYSPACE.to_string(),
             key: owner_key(self.user_id),
             txn_id: Some(txn_id),
         })]

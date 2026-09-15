@@ -7,11 +7,11 @@ use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    S3_SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, S3_SESSION_OWNER_KEYSPACE,
+    SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, SESSION_OWNER_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::PathRestriction;
-use aruna_core::structs::identity::s3_session::{S3_SESSION_MAX_TTL, S3Session};
+use aruna_core::structs::identity::s3_session::{SESSION_MAX_TTL, S3Session};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
@@ -86,7 +86,7 @@ impl CreateS3Operation {
         let Ok(ttl) = self.config.expiry.duration_since(self.config.now) else {
             return self.fail(S3SessionError::InvalidExpiry);
         };
-        if ttl.is_zero() || ttl > S3_SESSION_MAX_TTL {
+        if ttl.is_zero() || ttl > SESSION_MAX_TTL {
             return self.fail(S3SessionError::InvalidExpiry);
         }
         let access_key = match S3Session::build_access_key(&self.key_id) {
@@ -119,7 +119,7 @@ impl CreateS3Operation {
         self.txn_id = Some(txn_id);
         self.state = CreateSessionState::ReadIndex;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_SESSION_OWNER_KEYSPACE.to_string(),
+            key_space: SESSION_OWNER_KEYSPACE.to_string(),
             key: owner_key(self.config.user_identity, self.config.group_id),
             txn_id: Some(txn_id),
         })]
@@ -233,7 +233,7 @@ impl CreateS3Operation {
                 S3_SESSION_KEYSPACE.to_string(),
                 session.access_key.as_bytes().into(),
             ));
-            deletes.push((S3_SESSION_EXPIRY_KEYSPACE.to_string(), expiry_key));
+            deletes.push((SESSION_EXPIRY_KEYSPACE.to_string(), expiry_key));
         }
         self.state = CreateSessionState::DeleteSessions { index };
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
@@ -278,12 +278,12 @@ impl CreateS3Operation {
                     session_bytes.into(),
                 ),
                 (
-                    S3_SESSION_OWNER_KEYSPACE.to_string(),
+                    SESSION_OWNER_KEYSPACE.to_string(),
                     owner_key.clone(),
                     index_bytes,
                 ),
                 (
-                    S3_SESSION_EXPIRY_KEYSPACE.to_string(),
+                    SESSION_EXPIRY_KEYSPACE.to_string(),
                     expiry_key,
                     owner_key,
                 ),

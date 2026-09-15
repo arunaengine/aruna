@@ -24,7 +24,7 @@ use crate::auth::request_policy::{
 use crate::driver::{DriverContext, drive};
 
 const HEAD_SCAN_BATCH: usize = 1_000;
-pub const OBJECT_SEARCH_MAX_LIMIT: usize = 100;
+pub const SEARCH_MAX_LIMIT: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ObjectKeyMatch {
@@ -124,7 +124,7 @@ pub async fn search_local_objects(
     context: &DriverContext,
     input: SearchObjectsInput,
 ) -> Result<SearchNodePage, SearchObjectsError> {
-    let limit = input.limit.clamp(1, OBJECT_SEARCH_MAX_LIMIT);
+    let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
     let mut start_after = input.start_after.clone();
     let mut visible = Vec::with_capacity(limit + 1);
     let mut evaluators: HashMap<(RealmId, GroupId), PolicyEvaluator> = HashMap::new();

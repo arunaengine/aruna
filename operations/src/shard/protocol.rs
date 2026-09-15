@@ -14,11 +14,11 @@ use crate::shard::manifest_entry_digest;
 /// A manifest request has only fixed-size identifiers and integer fields. This
 /// small envelope leaves encoding headroom without permitting a large body to
 /// be allocated before peer authorization.
-pub const SHARD_MAX_REQUEST_SIZE: usize = 128;
+pub const MAX_REQUEST_SIZE: usize = 128;
 
 /// A shard manifest can carry one entry per document held in the shard; 16 MiB
 /// bounds a large response while still refusing a hostile oversized frame.
-pub const SHARD_MAX_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
+pub const MAX_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
 
 /// New-holder request: give me your paged manifest for this shard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -179,7 +179,7 @@ pub(crate) async fn write_manifest_pages(
             index + 1 == plan.ranges.len(),
             &manifest.entries[range.clone()],
         );
-        write_frame(stream, &response, SHARD_MAX_RESPONSE_SIZE).await?;
+        write_frame(stream, &response, MAX_RESPONSE_SIZE).await?;
     }
     Ok(())
 }
@@ -380,22 +380,22 @@ pub async fn write_shard_request(
     stream: &mut BiStream,
     message: &ShardTransportMessage,
 ) -> Result<(), String> {
-    write_frame(stream, message, SHARD_MAX_REQUEST_SIZE).await
+    write_frame(stream, message, MAX_REQUEST_SIZE).await
 }
 
 pub async fn read_shard_request(stream: &mut BiStream) -> Result<ShardTransportMessage, String> {
-    read_frame(stream, SHARD_MAX_REQUEST_SIZE).await
+    read_frame(stream, MAX_REQUEST_SIZE).await
 }
 
 pub async fn write_shard_response(
     stream: &mut BiStream,
     message: &ShardTransportResponse,
 ) -> Result<(), String> {
-    write_frame(stream, message, SHARD_MAX_RESPONSE_SIZE).await
+    write_frame(stream, message, MAX_RESPONSE_SIZE).await
 }
 
 pub async fn read_shard_response(stream: &mut BiStream) -> Result<ShardTransportResponse, String> {
-    read_frame(stream, SHARD_MAX_RESPONSE_SIZE).await
+    read_frame(stream, MAX_RESPONSE_SIZE).await
 }
 
 async fn write_frame<T: Serialize>(
@@ -485,7 +485,7 @@ mod tests {
             placement,
         };
         let bytes = postcard::to_allocvec(&message).unwrap();
-        assert!(bytes.len() <= SHARD_MAX_REQUEST_SIZE);
+        assert!(bytes.len() <= MAX_REQUEST_SIZE);
         assert_eq!(
             postcard::from_bytes::<ShardTransportMessage>(&bytes).unwrap(),
             message
@@ -521,7 +521,7 @@ mod tests {
             reject
         );
 
-        let page = partition_manifest(&manifest, SHARD_MAX_RESPONSE_SIZE)
+        let page = partition_manifest(&manifest, MAX_RESPONSE_SIZE)
             .unwrap()
             .remove(0);
         let response = ShardTransportResponse::ManifestPage(Box::new(page));

@@ -19,7 +19,7 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::placement::policy_attachment::{
-    POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, PolicyBlockedReason, PolicyBulkRun,
+    BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, PolicyBlockedReason, PolicyBulkRun,
     PolicyIntent, PolicyIntentKey, PolicyIntentOutcome, PolicyRefMode, PolicyStatus,
 };
 use aruna_core::structs::placement::placement_policy::{
@@ -268,7 +268,7 @@ impl PolicyBulkOperation {
                     Key::from(self.config.bucket.as_bytes().to_vec()),
                 ),
                 (
-                    POLICY_BULK_RUN_KEYSPACE.to_string(),
+                    BULK_RUN_KEYSPACE.to_string(),
                     Key::from(PolicyBulkRun::key(self.config.operation_id)?),
                 ),
             ],
@@ -353,7 +353,7 @@ impl PolicyBulkOperation {
         self.run = Some(run);
         self.state = BulkState::WriteRun;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: POLICY_BULK_RUN_KEYSPACE.to_string(),
+            key_space: BULK_RUN_KEYSPACE.to_string(),
             key: key.into(),
             value: value.into(),
             txn_id: self.txn_id,
@@ -557,7 +557,7 @@ impl PolicyBulkOperation {
                 Ok(encoded) => encoded,
                 Err(error) => return self.fail(error.into()),
             };
-            reads.push((POLICY_BULK_INTENT_KEYSPACE.to_string(), Key::from(encoded)));
+            reads.push((BULK_INTENT_KEYSPACE.to_string(), Key::from(encoded)));
         }
         self.state = BulkState::ReadIntents;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -725,7 +725,7 @@ impl PolicyBulkOperation {
             Err(error) => return self.fail(error.into()),
         };
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: POLICY_BULK_RUN_KEYSPACE.to_string(),
+            key_space: BULK_RUN_KEYSPACE.to_string(),
             key: key.into(),
             txn_id: Some(txn_id),
         })]
@@ -757,7 +757,7 @@ impl PolicyBulkOperation {
         self.run = Some(run);
         self.state = BulkState::WriteStatus;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: POLICY_BULK_RUN_KEYSPACE.to_string(),
+            key_space: BULK_RUN_KEYSPACE.to_string(),
             key: key.into(),
             value: value.into(),
             txn_id: self.txn_id,
@@ -980,7 +980,7 @@ mod tests {
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
-        PLACEMENT_POLICY_CACHE_KEYSPACE, S3_BUCKET_KEYSPACE,
+        POLICY_CACHE_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
@@ -990,7 +990,7 @@ mod tests {
         CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, VersionKey,
     };
     use aruna_core::structs::placement::policy_attachment::{
-        POLICY_BULK_INTENT_KEYSPACE, PolicyBlockedReason, PolicyIntent, PolicyIntentKey,
+        BULK_INTENT_KEYSPACE, PolicyBlockedReason, PolicyIntent, PolicyIntentKey,
         PolicyIntentOutcome, PolicyStatus,
     };
     use aruna_core::structs::placement::placement_policy::{
@@ -1355,7 +1355,7 @@ mod tests {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: POLICY_BULK_INTENT_KEYSPACE.to_string(),
+                key_space: BULK_INTENT_KEYSPACE.to_string(),
                 key: PolicyIntentKey::new(operation_id, key)
                     .to_bytes()
                     .expect("key encodes")
@@ -1501,7 +1501,7 @@ mod tests {
         let _ = context
             .storage_handle
             .send_storage_effect(StorageEffect::Delete {
-                key_space: PLACEMENT_POLICY_CACHE_KEYSPACE.to_string(),
+                key_space: POLICY_CACHE_KEYSPACE.to_string(),
                 key: cache_key(&policy.policy_ref()),
                 txn_id: None,
             })
@@ -1605,7 +1605,7 @@ mod tests {
         let _ = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: POLICY_BULK_INTENT_KEYSPACE.to_string(),
+                key_space: BULK_INTENT_KEYSPACE.to_string(),
                 key: intent.key().to_bytes().expect("key encodes").into(),
                 value: intent.to_bytes().expect("intent encodes").into(),
                 txn_id: None,
@@ -1831,12 +1831,12 @@ mod tests {
         // A bucket whose heads reference more policies than one evaluation may
         // resolve must still mint: each object only carries its own refs.
         use aruna_core::structs::placement::placement_policy::{
-            MAX_POLICY_REF_INPUT, PlacementDecision, PolicyResolution, evaluate_placement,
+            MAX_REF_INPUT, PlacementDecision, PolicyResolution, evaluate_placement,
         };
         use std::collections::BTreeMap;
 
         let node_id = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
-        let refs = (1..=MAX_POLICY_REF_INPUT as u8 + 5)
+        let refs = (1..=MAX_REF_INPUT as u8 + 5)
             .map(|seed| PlacementPolicyRef {
                 policy_id: Ulid::from_bytes([seed; 16]),
                 digest: [seed; 32],

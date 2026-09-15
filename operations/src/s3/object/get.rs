@@ -21,7 +21,7 @@ use aruna_core::errors::{
 };
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
@@ -49,7 +49,7 @@ use thiserror::Error;
 use tracing::warn;
 
 /// Maximum successors attempted before a still-changing current read fails.
-const MAX_DRIFT_ADVANCE_ATTEMPTS: u8 = 3;
+const MAX_DRIFT_ATTEMPTS: u8 = 3;
 /// Minimum age of the current reference version before a read may mint another
 /// successor. Rate-limits a READ-only caller pointing at a source they control.
 pub const MIN_ADVANCE_INTERVAL: Duration = Duration::from_secs(60);
@@ -71,8 +71,8 @@ pub enum GetObjectState {
     CommitTransaction,
     HeadReferenceSource,
     StartAdvanceTransaction,
-    ReadHeadForAdvance,
-    ReadCurrentForAdvance,
+    ReadHeadAdvance,
+    ReadAdvance,
     WriteSuccessor,
     UpdateReferenceUsage,
     CommitAdvance,
@@ -628,13 +628,13 @@ impl GetObjectOperation {
 
     fn reference_access_resolved(&mut self, event: Event) -> Effects {
         match event {
-            Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+            Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                 result: Ok(access),
             }) => {
                 self.reference_access = Some(access);
                 self.read_reference()
             }
-            Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+            Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                 result: Err(error),
             }) => self.emit_error(error.into()),
             other => self.emit_error(GetObjectError::InvalidStateEvent {
@@ -769,7 +769,7 @@ impl GetObjectOperation {
                     }
                     // Current drift records a same-binding successor, but repeated
                     // change fails rather than serving mismatched bytes.
-                    if self.drift_attempts < MAX_DRIFT_ADVANCE_ATTEMPTS {
+                    if self.drift_attempts < MAX_DRIFT_ATTEMPTS {
                         return self.begin_reference_advance(metadata);
                     }
                     return self.emit_error(GetObjectError::ReferenceSourceChanged);
@@ -838,7 +838,7 @@ impl GetObjectOperation {
             Ok(key) => key.into(),
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
-        self.state = GetObjectState::ReadHeadForAdvance;
+        self.state = GetObjectState::ReadHeadAdvance;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             key,
@@ -873,7 +873,7 @@ impl GetObjectOperation {
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
         self.advance_pointer = Some(pointer);
-        self.state = GetObjectState::ReadCurrentForAdvance;
+        self.state = GetObjectState::ReadAdvance;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             key,
@@ -1306,8 +1306,8 @@ impl Operation for GetObjectOperation {
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
             GetObjectState::HeadReferenceSource => self.reference_head_received(event),
             GetObjectState::StartAdvanceTransaction => self.handle_advance_started(event),
-            GetObjectState::ReadHeadForAdvance => self.handle_advance_head(event),
-            GetObjectState::ReadCurrentForAdvance => self.handle_advance_version(event),
+            GetObjectState::ReadHeadAdvance => self.handle_advance_head(event),
+            GetObjectState::ReadAdvance => self.handle_advance_version(event),
             GetObjectState::WriteSuccessor => self.handle_successor_written(event),
             GetObjectState::UpdateReferenceUsage => self.handle_advance_usage(event),
             GetObjectState::CommitAdvance => self.handle_advance_committed(event),
@@ -1654,7 +1654,7 @@ async fn local_multipart_summary(
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            key_space: OBJECT_METADATA_KEYSPACE.to_string(),
             key: key.into(),
             txn_id: None,
         })

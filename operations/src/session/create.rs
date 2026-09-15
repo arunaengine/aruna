@@ -6,7 +6,7 @@ use aruna_core::compute::Secret;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{USER_SESSION_KEYSPACE, USER_SESSION_OWNER_KEYSPACE};
+use aruna_core::keyspaces::{USER_SESSION_KEYSPACE, USER_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{NodeCapabilities, SessionKind, SessionRef};
 use aruna_core::structs::identity::realm::RealmId;
@@ -172,7 +172,7 @@ impl CreateSessionOperation {
         self.txn_id = Some(txn_id);
         self.state = CreateSessionState::ReadOwnerIndex;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_SESSION_OWNER_KEYSPACE.to_string(),
+            key_space: USER_OWNER_KEYSPACE.to_string(),
             key: owner_key(self.config.user_id),
             txn_id: Some(txn_id),
         })]
@@ -300,7 +300,7 @@ impl CreateSessionOperation {
                     session_bytes.into(),
                 ),
                 (
-                    USER_SESSION_OWNER_KEYSPACE.to_string(),
+                    USER_OWNER_KEYSPACE.to_string(),
                     owner_key(self.config.user_id),
                     index_bytes,
                 ),
@@ -498,7 +498,7 @@ mod pure_tests {
         };
         let stored_index = writes
             .iter()
-            .find(|(key_space, _, _)| key_space == USER_SESSION_OWNER_KEYSPACE)
+            .find(|(key_space, _, _)| key_space == USER_OWNER_KEYSPACE)
             .map(|(_, _, value)| value)
             .unwrap();
         assert_eq!(
