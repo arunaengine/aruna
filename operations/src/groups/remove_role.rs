@@ -1,7 +1,7 @@
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -9,7 +9,7 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -32,7 +32,7 @@ use crate::sync::document_outbox::{
 use aruna_core::structs::Permission;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct RemoveGroupRoleConfig {
+pub struct RemoveGroupConfig {
     pub auth_context: AuthContext,
     pub actor: Actor,
     pub realm_id: RealmId,
@@ -41,18 +41,18 @@ pub struct RemoveGroupRoleConfig {
 }
 
 #[derive(PartialEq)]
-pub struct RemoveGroupRoleOperation {
-    input: RemoveGroupRoleConfig,
+pub struct RemoveGroupOperation {
+    input: RemoveGroupConfig,
     /// Bucket the authorization rows publish onto, read inside the write
     /// transaction.
     fence: crate::placement::fence::WriteFence,
-    state: RemoveGroupRoleState,
-    output: Option<Result<(Group, GroupAuthorizationDocument), RemoveGroupRoleError>>,
+    state: RemoveGroupState,
+    output: Option<Result<(Group, GroupAuthorizationDocument), RemoveGroupError>>,
 }
 
-impl std::fmt::Debug for RemoveGroupRoleOperation {
+impl std::fmt::Debug for RemoveGroupOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoveGroupRoleOperation")
+        f.debug_struct("RemoveGroupOperation")
             .field("input", &self.input)
             .field("state", &self.state)
             .field("output", &self.output)
@@ -61,7 +61,7 @@ impl std::fmt::Debug for RemoveGroupRoleOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum RemoveGroupRoleState {
+pub enum RemoveGroupState {
     Init,
     Auth,
     StartTransaction,
@@ -106,13 +106,13 @@ pub enum RemoveGroupRoleState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum RemoveGroupRoleError {
+pub enum RemoveGroupError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
-    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
+    AdminDocumentError(#[from] AdminDocumentError),
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
     #[error("the group's bucket cut over to a new holder set; retry the change")]
@@ -135,18 +135,18 @@ pub enum RemoveGroupRoleError {
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: RemoveGroupRoleState,
+        state: RemoveGroupState,
         expected: &'static str,
         got: String,
     },
 }
 
-impl RemoveGroupRoleOperation {
-    pub fn new(input: RemoveGroupRoleConfig) -> Self {
-        RemoveGroupRoleOperation {
+impl RemoveGroupOperation {
+    pub fn new(input: RemoveGroupConfig) -> Self {
+        RemoveGroupOperation {
             input,
             fence: Default::default(),
-            state: RemoveGroupRoleState::Init,
+            state: RemoveGroupState::Init,
             output: None,
         }
     }
@@ -155,7 +155,7 @@ impl RemoveGroupRoleOperation {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
             return self.unexpected_event(
-                RemoveGroupRoleState::Auth,
+                RemoveGroupState::Auth,
                 "Event::SubOperation(SubOperationEvent::AuthorizationResult)",
                 got,
             );
@@ -170,14 +170,14 @@ impl RemoveGroupRoleOperation {
     fn emit_start_transaction(
         &mut self,
         auth_result: Result<bool, AuthorizationError>,
-    ) -> Result<Effects, RemoveGroupRoleError> {
+    ) -> Result<Effects, RemoveGroupError> {
         if auth_result? {
-            self.state = RemoveGroupRoleState::StartTransaction;
+            self.state = RemoveGroupState::StartTransaction;
             Ok(smallvec![Effect::Storage(
                 StorageEffect::StartTransaction { read: false }
             )])
         } else {
-            Err(RemoveGroupRoleError::Unauthorized)
+            Err(RemoveGroupError::Unauthorized)
         }
     }
 
@@ -185,7 +185,7 @@ impl RemoveGroupRoleOperation {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
-                RemoveGroupRoleState::StartTransaction,
+                RemoveGroupState::StartTransaction,
                 "Event::Storage(StorageEvent::TransactionStarted)",
                 got,
             );
@@ -196,8 +196,8 @@ impl RemoveGroupRoleOperation {
         }
     }
 
-    fn emit_get_group(&mut self, txn_id: TxnId) -> Result<Effects, RemoveGroupRoleError> {
-        self.state = RemoveGroupRoleState::GetGroup { txn_id };
+    fn emit_get_group(&mut self, txn_id: TxnId) -> Result<Effects, RemoveGroupError> {
+        self.state = RemoveGroupState::GetGroup { txn_id };
         let key = self.input.group_id.to_bytes().into();
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
             key_space: GROUP_KEYSPACE.to_string(),
@@ -226,10 +226,10 @@ impl RemoveGroupRoleOperation {
         &mut self,
         group: Option<ByteView>,
         txn_id: TxnId,
-    ) -> Result<Effects, RemoveGroupRoleError> {
-        let group = Group::from_bytes(&group.ok_or_else(|| RemoveGroupRoleError::GroupNotFound)?)?;
+    ) -> Result<Effects, RemoveGroupError> {
+        let group = Group::from_bytes(&group.ok_or_else(|| RemoveGroupError::GroupNotFound)?)?;
 
-        self.state = RemoveGroupRoleState::GetAuthDocAndAdminState { txn_id, group };
+        self.state = RemoveGroupState::GetAuthDocAndAdminState { txn_id, group };
 
         let target = AdminDocumentTarget::Group {
             group_id: self.input.group_id,
@@ -292,16 +292,16 @@ impl RemoveGroupRoleOperation {
         auth_doc: Option<ByteView>,
         reducer_state_value: Option<ByteView>,
         realm_config_value: Option<ByteView>,
-    ) -> Result<Effects, RemoveGroupRoleError> {
+    ) -> Result<Effects, RemoveGroupError> {
         let mut auth_doc =
-            super::parse_auth_record(auth_doc)?.ok_or(RemoveGroupRoleError::AuthDocNotFound)?;
+            super::parse_auth_record(auth_doc)?.ok_or(RemoveGroupError::AuthDocNotFound)?;
         let role = auth_doc
             .roles
             .get(&self.input.role_id)
-            .ok_or_else(|| RemoveGroupRoleError::RoleNotFound)?;
+            .ok_or_else(|| RemoveGroupError::RoleNotFound)?;
         // The admin role is the only guaranteed management entry point of a group.
         if role.name == "admin" {
-            return Err(RemoveGroupRoleError::AdminRoleUndeletable);
+            return Err(RemoveGroupError::AdminRoleUndeletable);
         }
         let target = AdminDocumentTarget::Group {
             group_id: self.input.group_id,
@@ -317,12 +317,12 @@ impl RemoveGroupRoleOperation {
             .as_ref()
             .is_some_and(|state| state.target != target)
         {
-            return Err(AdminDocumentReducerError::TargetMismatch.into());
+            return Err(AdminDocumentError::TargetMismatch.into());
         }
 
         let mut reducer_state = previous_reducer_state
             .clone()
-            .unwrap_or_else(|| AdminDocumentReducerState::new(target));
+            .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
         materialize_role_removal(
             &mut group,
@@ -349,7 +349,7 @@ impl RemoveGroupRoleOperation {
             ),
             reducer_state_entry(&reducer_state)?,
         ];
-        let document_target = DocumentSyncTarget::GroupAuthorization {
+        let document_target = DocumentTarget::GroupAuthorization {
             group_id: self.input.group_id,
         };
         let realm_config = realm_config_value
@@ -371,7 +371,7 @@ impl RemoveGroupRoleOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::admin(event.clone()),
+                DocumentOutboxEvent::admin(event.clone()),
                 placement,
                 false,
             )
@@ -380,7 +380,7 @@ impl RemoveGroupRoleOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = RemoveGroupRoleState::WriteGroupAuthDocAndAdminState {
+        self.state = RemoveGroupState::WriteGroupAuthDocAndAdminState {
             txn_id,
             group,
             auth_doc,
@@ -413,7 +413,7 @@ impl RemoveGroupRoleOperation {
         };
 
         if !stale_conflict_delete_keys.is_empty() {
-            self.state = RemoveGroupRoleState::DeleteStaleAdminConflicts {
+            self.state = RemoveGroupState::DeleteStaleAdminConflicts {
                 txn_id,
                 group,
                 auth_doc,
@@ -463,7 +463,7 @@ impl RemoveGroupRoleOperation {
         if self.fence.is_empty() {
             return self.emit_commit(txn_id, group, auth_doc, admin_outbox_written);
         }
-        self.state = RemoveGroupRoleState::ReadBucketFence {
+        self.state = RemoveGroupState::ReadBucketFence {
             txn_id,
             group,
             auth_doc,
@@ -492,7 +492,7 @@ impl RemoveGroupRoleOperation {
             );
         };
         if !self.fence.admits(&values) {
-            return self.fail(RemoveGroupRoleError::PlacementFenced);
+            return self.fail(RemoveGroupError::PlacementFenced);
         }
         self.emit_commit(txn_id, group, auth_doc, admin_outbox_written)
     }
@@ -504,7 +504,7 @@ impl RemoveGroupRoleOperation {
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
     ) -> Effects {
-        self.state = RemoveGroupRoleState::CommitTransaction {
+        self.state = RemoveGroupState::CommitTransaction {
             txn_id,
             group,
             auth_doc,
@@ -529,11 +529,11 @@ impl RemoveGroupRoleOperation {
             );
         };
         if admin_outbox_written {
-            self.state = RemoveGroupRoleState::ScheduleAdminDocumentOutboxDrain { group, auth_doc };
+            self.state = RemoveGroupState::ScheduleAdminDocumentOutboxDrain { group, auth_doc };
             return smallvec![schedule_drain_effect()];
         }
 
-        self.state = RemoveGroupRoleState::Finish;
+        self.state = RemoveGroupState::Finish;
         self.output = Some(Ok((group, auth_doc)));
         smallvec![]
     }
@@ -547,7 +547,7 @@ impl RemoveGroupRoleOperation {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. })
             | Event::Task(TaskEvent::Error { .. }) => {
-                self.state = RemoveGroupRoleState::Finish;
+                self.state = RemoveGroupState::Finish;
                 self.output = Some(Ok((group, auth_doc)));
                 smallvec![]
             }
@@ -559,30 +559,26 @@ impl RemoveGroupRoleOperation {
         }
     }
 
-    fn fail(&mut self, err: RemoveGroupRoleError) -> Effects {
+    fn fail(&mut self, err: RemoveGroupError) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(err, cleanup_effects)
     }
 
-    fn fail_with_cleanup(
-        &mut self,
-        err: RemoveGroupRoleError,
-        cleanup_effects: Effects,
-    ) -> Effects {
-        self.state = RemoveGroupRoleState::Error;
+    fn fail_with_cleanup(&mut self, err: RemoveGroupError, cleanup_effects: Effects) -> Effects {
+        self.state = RemoveGroupState::Error;
         self.output = Some(Err(err));
         cleanup_effects
     }
 
     fn unexpected_event(
         &mut self,
-        state: RemoveGroupRoleState,
+        state: RemoveGroupState,
         expected: &'static str,
         got: String,
     ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
-            RemoveGroupRoleError::UnexpectedEvent {
+            RemoveGroupError::UnexpectedEvent {
                 state,
                 expected,
                 got,
@@ -600,13 +596,13 @@ impl RemoveGroupRoleOperation {
     }
 }
 
-impl Operation for RemoveGroupRoleOperation {
+impl Operation for RemoveGroupOperation {
     type Output = (Group, GroupAuthorizationDocument);
 
-    type Error = RemoveGroupRoleError;
+    type Error = RemoveGroupError;
 
     fn start(&mut self) -> Effects {
-        self.state = RemoveGroupRoleState::Auth;
+        self.state = RemoveGroupState::Auth;
 
         let auth_config = CheckPermissionsConfig {
             auth_context: self.input.auth_context.clone(),
@@ -628,13 +624,13 @@ impl Operation for RemoveGroupRoleOperation {
         };
 
         match self.state.clone() {
-            RemoveGroupRoleState::Auth => self.handle_authorization(event),
-            RemoveGroupRoleState::StartTransaction => self.handle_start_transaction(event),
-            RemoveGroupRoleState::GetGroup { txn_id } => self.handle_get_group(event, txn_id),
-            RemoveGroupRoleState::GetAuthDocAndAdminState { txn_id, group } => {
+            RemoveGroupState::Auth => self.handle_authorization(event),
+            RemoveGroupState::StartTransaction => self.handle_start_transaction(event),
+            RemoveGroupState::GetGroup { txn_id } => self.handle_get_group(event, txn_id),
+            RemoveGroupState::GetAuthDocAndAdminState { txn_id, group } => {
                 self.handle_auth_read(event, txn_id, group)
             }
-            RemoveGroupRoleState::WriteGroupAuthDocAndAdminState {
+            RemoveGroupState::WriteGroupAuthDocAndAdminState {
                 txn_id,
                 group,
                 auth_doc,
@@ -648,30 +644,28 @@ impl Operation for RemoveGroupRoleOperation {
                 admin_outbox_written,
                 stale_conflict_delete_keys,
             ),
-            RemoveGroupRoleState::DeleteStaleAdminConflicts {
+            RemoveGroupState::DeleteStaleAdminConflicts {
                 txn_id,
                 group,
                 auth_doc,
                 admin_outbox_written,
             } => self.handle_conflict_deletes(event, txn_id, group, auth_doc, admin_outbox_written),
-            RemoveGroupRoleState::ReadBucketFence {
+            RemoveGroupState::ReadBucketFence {
                 txn_id,
                 group,
                 auth_doc,
                 admin_outbox_written,
             } => self.handle_bucket_fence(event, txn_id, group, auth_doc, admin_outbox_written),
-            RemoveGroupRoleState::CommitTransaction {
+            RemoveGroupState::CommitTransaction {
                 group,
                 auth_doc,
                 admin_outbox_written,
                 ..
             } => self.handle_commit_transaction(event, group, auth_doc, admin_outbox_written),
-            RemoveGroupRoleState::ScheduleAdminDocumentOutboxDrain { group, auth_doc } => {
+            RemoveGroupState::ScheduleAdminDocumentOutboxDrain { group, auth_doc } => {
                 self.handle_drain_schedule(event, group, auth_doc)
             }
-            RemoveGroupRoleState::Init
-            | RemoveGroupRoleState::Finish
-            | RemoveGroupRoleState::Error => {
+            RemoveGroupState::Init | RemoveGroupState::Finish | RemoveGroupState::Error => {
                 smallvec![]
             }
         }
@@ -680,23 +674,22 @@ impl Operation for RemoveGroupRoleOperation {
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            RemoveGroupRoleState::Finish | RemoveGroupRoleState::Error
+            RemoveGroupState::Finish | RemoveGroupState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .ok_or_else(|| RemoveGroupRoleError::NotFinished)?
+        self.output.ok_or_else(|| RemoveGroupError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            RemoveGroupRoleState::GetGroup { txn_id }
-            | RemoveGroupRoleState::GetAuthDocAndAdminState { txn_id, .. }
-            | RemoveGroupRoleState::WriteGroupAuthDocAndAdminState { txn_id, .. }
-            | RemoveGroupRoleState::DeleteStaleAdminConflicts { txn_id, .. }
-            | RemoveGroupRoleState::ReadBucketFence { txn_id, .. }
-            | RemoveGroupRoleState::CommitTransaction { txn_id, .. } => {
+            RemoveGroupState::GetGroup { txn_id }
+            | RemoveGroupState::GetAuthDocAndAdminState { txn_id, .. }
+            | RemoveGroupState::WriteGroupAuthDocAndAdminState { txn_id, .. }
+            | RemoveGroupState::DeleteStaleAdminConflicts { txn_id, .. }
+            | RemoveGroupState::ReadBucketFence { txn_id, .. }
+            | RemoveGroupState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
 
@@ -706,9 +699,9 @@ impl Operation for RemoveGroupRoleOperation {
 }
 
 fn apply_reducer_updates(
-    state: &mut AdminDocumentReducerState,
-    input: &RemoveGroupRoleConfig,
-) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
+    state: &mut AdminDocumentState,
+    input: &RemoveGroupConfig,
+) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let event = state.apply_operation(
         &input.actor,
         AdminDocumentOperation::GroupRoleRemoved {
@@ -722,7 +715,7 @@ fn materialize_role_removal(
     group: &mut Group,
     auth_doc: &mut GroupAuthorizationDocument,
     role_id: RoleId,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
 ) {
     if reducer_state.materialized_group_roles().contains(&role_id) {
         group.roles.insert(role_id);
@@ -739,9 +732,7 @@ pub mod test {
     use aruna_core::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
     use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-    use aruna_core::document::{
-        DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
-    };
+    use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::structs::{
@@ -755,11 +746,9 @@ pub mod test {
     use ulid::Ulid;
 
     use crate::driver::{DriverContext, drive};
-    use crate::groups::add_role::{AddGroupRoleConfig, AddGroupRoleOperation};
+    use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::groups::remove_role::{
-        RemoveGroupRoleConfig, RemoveGroupRoleError, RemoveGroupRoleOperation,
-    };
+    use crate::groups::remove_role::{RemoveGroupConfig, RemoveGroupError, RemoveGroupOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 
     async fn test_context() -> (DriverContext, NetHandle, TempDir) {
@@ -857,7 +846,7 @@ pub mod test {
             policies: Vec::new(),
             roles: HashMap::from([(role_id, role)]),
         };
-        let mut operation = RemoveGroupRoleOperation::new(RemoveGroupRoleConfig {
+        let mut operation = RemoveGroupOperation::new(RemoveGroupConfig {
             auth_context: auth_context(&actor),
             actor: actor.clone(),
             realm_id,
@@ -885,7 +874,7 @@ pub mod test {
                     .iter()
                     .find(|(keyspace, _, _)| keyspace == AUTH_KEYSPACE)
                     .expect("auth doc write is included");
-                let outbox_records: Vec<DocumentSyncOutboxRecord> = writes
+                let outbox_records: Vec<DocumentOutboxRecord> = writes
                     .iter()
                     .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
                     .map(|(_, _, value)| postcard::from_bytes(value.as_ref()).unwrap())
@@ -904,10 +893,10 @@ pub mod test {
         assert_eq!(outbox_records.len(), 1);
         assert_eq!(
             outbox_records[0].target,
-            DocumentSyncTarget::GroupAuthorization { group_id }
+            DocumentTarget::GroupAuthorization { group_id }
         );
         let event = match &outbox_records[0].event {
-            DocumentSyncOutboxEvent::AdminOperation { event, .. } => event.as_ref(),
+            DocumentOutboxEvent::AdminOperation { event, .. } => event.as_ref(),
             other => panic!("unexpected outbox event: {other:?}"),
         };
         assert_eq!(event.target, AdminDocumentTarget::Group { group_id });
@@ -932,27 +921,27 @@ pub mod test {
             )]),
             assigned_users: HashSet::new(),
         };
-        let add_config = AddGroupRoleConfig {
+        let add_config = AddRoleConfig {
             auth_context: auth_context(&actor),
             actor: actor.clone(),
             realm_id: actor.realm_id,
             group_id: group.group_id,
             role: role.clone(),
         };
-        let (group, auth_doc) = drive(AddGroupRoleOperation::new(add_config), &context)
+        let (group, auth_doc) = drive(AddRoleOperation::new(add_config), &context)
             .await
             .unwrap();
         assert!(group.roles.contains(&role.role_id));
         assert!(auth_doc.roles.contains_key(&role.role_id));
 
-        let remove_config = RemoveGroupRoleConfig {
+        let remove_config = RemoveGroupConfig {
             auth_context: auth_context(&actor),
             actor: actor.clone(),
             realm_id: actor.realm_id,
             group_id: group.group_id,
             role_id: role.role_id,
         };
-        let (group, auth_doc) = drive(RemoveGroupRoleOperation::new(remove_config), &context)
+        let (group, auth_doc) = drive(RemoveGroupOperation::new(remove_config), &context)
             .await
             .unwrap();
         assert!(!group.roles.contains(&role.role_id));
@@ -972,18 +961,15 @@ pub mod test {
             .unwrap()
             .0;
 
-        let remove_config = RemoveGroupRoleConfig {
+        let remove_config = RemoveGroupConfig {
             auth_context: auth_context(&actor),
             actor: actor.clone(),
             realm_id: actor.realm_id,
             group_id: group.group_id,
             role_id: admin_role_id,
         };
-        let result = drive(RemoveGroupRoleOperation::new(remove_config), &context).await;
-        assert_eq!(
-            result.unwrap_err(),
-            RemoveGroupRoleError::AdminRoleUndeletable
-        );
+        let result = drive(RemoveGroupOperation::new(remove_config), &context).await;
+        assert_eq!(result.unwrap_err(), RemoveGroupError::AdminRoleUndeletable);
 
         net_handle.shutdown().await;
     }
