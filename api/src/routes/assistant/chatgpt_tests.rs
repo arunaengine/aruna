@@ -1,5 +1,5 @@
 use super::*;
-use crate::tests::fixtures::assistant::{setup_state, spawn_mock};
+use crate::tests::assistant::{setup_state, spawn_mock};
 use axum::Router;
 use axum::routing::post;
 use serde::Deserialize;

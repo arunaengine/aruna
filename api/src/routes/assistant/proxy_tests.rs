@@ -1,6 +1,6 @@
 use super::*;
 use crate::server_state::ServerState;
-use crate::tests::fixtures::assistant::{setup_state, spawn_mock};
+use crate::tests::assistant::{setup_state, spawn_mock};
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::structs::{AssistantHeaders, AssistantProviderSecret, AssistantProviderStatus};
@@ -510,7 +510,7 @@ fn capture_logs() -> (
 /// captured output nor any formatted error may disclose them, and the refresh
 /// path talks to a controlled local issuer instead of a live one.
 #[tokio::test]
-async fn proxy_paths_do_not_disclose_synthetic_secrets() {
+async fn proxy_redacts_secrets() {
     const API_KEY: &str = "synthetic-api-key-7f3a";
     const ACCESS: &str = "synthetic-access-7f3a";
     const REFRESH: &str = "synthetic-refresh-7f3a";
@@ -687,7 +687,7 @@ async fn proxy_paths_do_not_disclose_synthetic_secrets() {
 }
 
 #[test]
-fn secret_types_redact_in_debug_output() {
+fn debug_redacts_secrets() {
     assert_eq!(
         format!("{:?}", Secret::new("synthetic-secret")),
         "Secret(***)"
