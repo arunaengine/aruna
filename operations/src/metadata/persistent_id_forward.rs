@@ -530,7 +530,7 @@ pub(crate) async fn apply_forwarded_pid(
             }
         }
         // Without a registry row there is no permission path that can authorize a transition.
-        (_, None) => return MetadataTransportMessage::ForwardedWriteNotFound,
+        (_, None) => return MetadataTransportMessage::WriteNotFound,
     }
 
     let outcome = match request {
@@ -612,7 +612,7 @@ pub(crate) async fn apply_forwarded_pid(
         Err(
             crate::metadata::persistent_id::PersistentIdError::DocumentMissing
             | crate::metadata::persistent_id::PersistentIdError::IntentMissing,
-        ) => MetadataTransportMessage::ForwardedWriteNotFound,
+        ) => MetadataTransportMessage::WriteNotFound,
         Err(error) => {
             warn!(%document_id, ?error, "Forwarded persistent id transition failed");
             MetadataTransportMessage::ForwardedWriteUnavailable

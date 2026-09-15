@@ -1,7 +1,7 @@
 use super::*;
 use aruna_core::NodeId;
 use aruna_core::keyspaces::{
-    METADATA_IRI_REFERENCE_INDEX_KEYSPACE, METADATA_RAW_REVISION_KEYSPACE,
+    IRI_INDEX_KEYSPACE, RAW_REVISION_KEYSPACE,
 };
 use aruna_core::storage_entries::{create_event_entry, raw_revision_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -116,7 +116,7 @@ async fn older_exists(
 async fn index_job_keys(storage: &StorageHandle) -> Vec<(u64, Ulid, Ulid)> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+            key_space: MATERIALIZATION_JOB_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: 4096,
@@ -140,7 +140,7 @@ async fn corrupt_job_only() {
     write_entries(
         &storage,
         vec![(
-            METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+            MATERIALIZATION_JOB_KEYSPACE.to_string(),
             ByteView::from(corrupt_key.clone()),
             ByteView::from(vec![1, 2, 3]),
         )],
@@ -162,7 +162,7 @@ async fn corrupt_job_only() {
     assert_eq!(result.processed, 0);
     assert!(!result.has_more_due);
     assert!(
-        !storage_key_exists(&storage, METADATA_MATERIALIZATION_JOB_KEYSPACE, corrupt_key).await
+        !storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, corrupt_key).await
     );
 }
 
@@ -181,7 +181,7 @@ async fn jobs_exist_deletes() {
         &storage,
         vec![
             (
-                METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                MATERIALIZATION_JOB_KEYSPACE.to_string(),
                 ByteView::from(corrupt_key.clone()),
                 ByteView::from(vec![1, 2, 3]),
             ),
@@ -194,7 +194,7 @@ async fn jobs_exist_deletes() {
 
     assert!(materialization_jobs_exist(&storage).await.unwrap());
     assert!(
-        !storage_key_exists(&storage, METADATA_MATERIALIZATION_JOB_KEYSPACE, corrupt_key).await
+        !storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, corrupt_key).await
     );
 }
 
@@ -219,7 +219,7 @@ async fn corrupt_global_job() {
         &storage,
         vec![
             (
-                METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                MATERIALIZATION_JOB_KEYSPACE.to_string(),
                 global_key.clone(),
                 ByteView::from(vec![1, 2, 3]),
             ),
@@ -244,7 +244,7 @@ async fn corrupt_global_job() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_MATERIALIZATION_JOB_KEYSPACE,
+            MATERIALIZATION_JOB_KEYSPACE,
             global_key.to_vec()
         )
         .await
@@ -252,7 +252,7 @@ async fn corrupt_global_job() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
+            DOCUMENT_JOB_KEYSPACE,
             document_key.to_vec()
         )
         .await
@@ -275,7 +275,7 @@ async fn orphan_malformed_sidecar() {
     write_entries(
         &storage,
         vec![(
-            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+            DOCUMENT_JOB_KEYSPACE.to_string(),
             document_key.clone(),
             ByteView::from(vec![1, 2, 3]),
         )],
@@ -290,7 +290,7 @@ async fn orphan_malformed_sidecar() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
+            DOCUMENT_JOB_KEYSPACE,
             document_key.to_vec()
         )
         .await
@@ -323,7 +323,7 @@ async fn orphan_valid_sidecar() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
+            DOCUMENT_JOB_KEYSPACE,
             document_key.to_vec()
         )
         .await
@@ -371,7 +371,7 @@ async fn orphan_global_job() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_MATERIALIZATION_JOB_KEYSPACE,
+            MATERIALIZATION_JOB_KEYSPACE,
             global_key.to_vec()
         )
         .await
@@ -379,7 +379,7 @@ async fn orphan_global_job() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
+            DOCUMENT_JOB_KEYSPACE,
             document_key.to_vec()
         )
         .await
@@ -397,7 +397,7 @@ async fn corrupt_job_deleted() {
     write_entries(
         &storage,
         vec![(
-            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+            DOCUMENT_JOB_KEYSPACE.to_string(),
             ByteView::from(corrupt_key.clone()),
             ByteView::from(vec![1, 2, 3]),
         )],
@@ -412,7 +412,7 @@ async fn corrupt_job_deleted() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
+            DOCUMENT_JOB_KEYSPACE,
             corrupt_key
         )
         .await
@@ -456,7 +456,7 @@ async fn scan_stops_early() {
     write_entries(&storage, writes).await;
 
     let before = storage.snapshot_metrics().requests_total;
-    let (jobs, has_more_due, next_due_at_ms) =
+    let (jobs, has_more_due, next_due_ms) =
         scan_due_jobs(&storage, now_ms, MATERIALIZATION_BATCH_SIZE)
             .await
             .unwrap();
@@ -467,7 +467,7 @@ async fn scan_stops_early() {
         vec![(materialization_job_key(&due_job).to_vec(), due_job)]
     );
     assert!(!has_more_due);
-    assert!(next_due_at_ms.is_some());
+    assert!(next_due_ms.is_some());
     assert!(delta <= 10, "scan issued {delta} storage requests");
 }
 
@@ -588,7 +588,7 @@ async fn stale_index_pruned() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_MATERIALIZATION_JOB_KEYSPACE,
+            MATERIALIZATION_JOB_KEYSPACE,
             orphan_key.to_vec()
         )
         .await
@@ -596,7 +596,7 @@ async fn stale_index_pruned() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_MATERIALIZATION_JOB_KEYSPACE,
+            MATERIALIZATION_JOB_KEYSPACE,
             mismatched_key.to_vec()
         )
         .await
@@ -692,7 +692,7 @@ async fn failure_cap_parks() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_MATERIALIZATION_JOB_KEYSPACE,
+            MATERIALIZATION_JOB_KEYSPACE,
             index_key.to_vec()
         )
         .await
@@ -700,7 +700,7 @@ async fn failure_cap_parks() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
+            DOCUMENT_JOB_KEYSPACE,
             sidecar_key.to_vec()
         )
         .await
@@ -1128,14 +1128,14 @@ async fn park_skips_superseded() {
         !plan
             .writes
             .iter()
-            .any(|(key_space, _, _)| key_space == METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE)
+            .any(|(key_space, _, _)| key_space == DEAD_LETTER_KEYSPACE)
     );
     assert!(plan.deletes.contains(&(
-        METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+        MATERIALIZATION_JOB_KEYSPACE.to_string(),
         job_key.clone()
     )));
     assert!(plan.deletes.contains(&(
-        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+        DOCUMENT_JOB_KEYSPACE.to_string(),
         document_job_key(document_id, old_event_id)
     )));
 }
@@ -1583,12 +1583,12 @@ async fn finish_not_regress() {
                 ),
                 status: Some(materialization_success_status(&old_job, &old_event, None)),
                 iri_index_writes: vec![(
-                    METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                    IRI_INDEX_KEYSPACE.to_string(),
                     ByteView::from(stale_index_key.clone()),
                     ByteView::from(vec![1]),
                 )],
                 raw_state_write: Some((
-                    METADATA_RAW_REVISION_KEYSPACE.to_string(),
+                    RAW_REVISION_KEYSPACE.to_string(),
                     raw_state_key.clone(),
                     ByteView::from(vec![1]),
                 )),
@@ -1609,7 +1609,7 @@ async fn finish_not_regress() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_IRI_REFERENCE_INDEX_KEYSPACE,
+            IRI_INDEX_KEYSPACE,
             stale_index_key,
         )
         .await
@@ -1617,14 +1617,14 @@ async fn finish_not_regress() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_RAW_REVISION_KEYSPACE,
+            RAW_REVISION_KEYSPACE,
             raw_state_key.to_vec(),
         )
         .await
     );
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+            key_space: MATERIALIZATION_JOB_KEYSPACE.to_string(),
             key: old_job_key,
             txn_id: None,
         })
@@ -1635,7 +1635,7 @@ async fn finish_not_regress() {
     }
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+            key_space: DOCUMENT_JOB_KEYSPACE.to_string(),
             key: document_job_key(old_job.document_id, old_job.event_id),
             txn_id: None,
         })
@@ -1668,12 +1668,12 @@ async fn supersedes_prior_rows() {
             document_job_key: Some(document_job_key(document_id, event_id).to_vec()),
             status: Some(materialization_success_status(&job, &event, None)),
             iri_index_writes: vec![(
-                METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                IRI_INDEX_KEYSPACE.to_string(),
                 aruna_core::storage_entries::iri_reference_key("p", "o", document_id, event_id),
                 ByteView::from(vec![1u8]),
             )],
             raw_state_write: Some((
-                METADATA_RAW_REVISION_KEYSPACE.to_string(),
+                RAW_REVISION_KEYSPACE.to_string(),
                 raw_revision_key(document_id),
                 ByteView::from(event_id.to_bytes().to_vec()),
             )),
@@ -1705,7 +1705,7 @@ async fn supersedes_prior_rows() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_IRI_REFERENCE_INDEX_KEYSPACE,
+            IRI_INDEX_KEYSPACE,
             key_of(first)
         )
         .await,
@@ -1714,7 +1714,7 @@ async fn supersedes_prior_rows() {
     assert!(
         storage_key_exists(
             &storage,
-            METADATA_IRI_REFERENCE_INDEX_KEYSPACE,
+            IRI_INDEX_KEYSPACE,
             key_of(second)
         )
         .await,
@@ -1722,7 +1722,7 @@ async fn supersedes_prior_rows() {
     );
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_RAW_REVISION_KEYSPACE.to_string(),
+            key_space: RAW_REVISION_KEYSPACE.to_string(),
             key: raw_revision_key(document_id),
             txn_id: None,
         })
@@ -1748,7 +1748,7 @@ async fn prune_resumes_parked() {
         &storage,
         vec![
             (
-                METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                IRI_INDEX_KEYSPACE.to_string(),
                 stale_key.clone(),
                 ByteView::from(vec![1u8]),
             ),
@@ -1764,7 +1764,7 @@ async fn prune_resumes_parked() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_IRI_REFERENCE_INDEX_KEYSPACE,
+            IRI_INDEX_KEYSPACE,
             stale_key.to_vec()
         )
         .await
@@ -1772,7 +1772,7 @@ async fn prune_resumes_parked() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_MATERIALIZATION_PRUNE_KEYSPACE,
+            MATERIALIZATION_PRUNE_KEYSPACE,
             materialization_prune_key(document_id).to_vec()
         )
         .await
@@ -1796,7 +1796,7 @@ async fn older_check_local() {
                 key,
                 txn_id: None,
             } => {
-                assert_eq!(key_space, METADATA_MATERIALIZATION_STATUS_KEYSPACE);
+                assert_eq!(key_space, MATERIALIZATION_STATUS_KEYSPACE);
                 assert_eq!(key, materialization_status_key(document_id));
                 key
             }
@@ -1817,10 +1817,10 @@ async fn older_check_local() {
                 limit,
                 txn_id: None,
             } => {
-                assert_eq!(key_space, METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE);
+                assert_eq!(key_space, DOCUMENT_JOB_KEYSPACE);
                 assert_eq!(prefix, Some(document_job_prefix(document_id)));
                 assert_eq!(start, None);
-                assert_eq!(limit, MATERIALIZATION_SCAN_PAGE_SIZE);
+                assert_eq!(limit, MATERIALIZATION_PAGE_SIZE);
             }
             other => panic!("unexpected storage effect: {other:?}"),
         }
@@ -1965,7 +1965,7 @@ async fn reschedules_batched() {
         assert!(
             !storage_key_exists(
                 &storage,
-                METADATA_MATERIALIZATION_JOB_KEYSPACE,
+                MATERIALIZATION_JOB_KEYSPACE,
                 old_key.to_vec()
             )
             .await
@@ -2027,7 +2027,7 @@ async fn failing_apply_reschedules() {
     assert!(
         !storage_key_exists(
             &storage,
-            METADATA_MATERIALIZATION_JOB_KEYSPACE,
+            MATERIALIZATION_JOB_KEYSPACE,
             old_index_key.to_vec()
         )
         .await

@@ -8,9 +8,9 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    METADATA_EVENT_LOG_KEYSPACE, METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE,
-    METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
-    METADATA_MATERIALIZATION_PRUNE_KEYSPACE, METADATA_MATERIALIZATION_STATUS_KEYSPACE,
+    EVENT_LOG_KEYSPACE, DEAD_LETTER_KEYSPACE,
+    DOCUMENT_JOB_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+    MATERIALIZATION_PRUNE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
 };
 use aruna_core::metadata::{
     ApplyRoCrateRequest, DeadLetterRecord, MaterializationState, MaterializationStatusRecord,
@@ -52,24 +52,24 @@ use super::repository::{
     read_status_effect,
 };
 
-const MATERIALIZATION_SCAN_PAGE_SIZE: usize = 512;
+const MATERIALIZATION_PAGE_SIZE: usize = 512;
 const MATERIALIZATION_BATCH_SIZE: usize = 512;
 // Only application failures count here: infrastructure errors retry forever with
 // backoff, so an overloaded node never parks work it could still finish.
 const MATERIALIZATION_MAX_FAILURES: u32 = 10;
 // Parked jobs return to the queue on this backoff, doubling per park up to the
 // cap, so a node recovers on its own once the cause clears.
-const DEAD_LETTER_REQUEUE_BASE_MS: u64 = 60_000;
-const DEAD_LETTER_REQUEUE_MAX_MS: u64 = 3_600_000;
-const DEAD_LETTER_REQUEUE_PAGE_SIZE: usize = 256;
+const REQUEUE_BASE_MS: u64 = 60_000;
+const REQUEUE_MAX_MS: u64 = 3_600_000;
+const REQUEUE_PAGE_SIZE: usize = 256;
 // Jobs per finish transaction. Small enough that a failed commit costs little,
 // large enough that a full batch commits in a handful of transactions.
 const MATERIALIZATION_FINISH_CHUNK: usize = 256;
-const METADATA_GRAPH_FENCE_SHARDS: usize = 32;
+const GRAPH_FENCE_SHARDS: usize = 32;
 
 // Craqle already serializes same-graph writes internally. This bounded fence
 // extends that ordering over the lifecycle read performed by the Aruna handle.
-static METADATA_GRAPH_FENCES: LazyLock<[Semaphore; METADATA_GRAPH_FENCE_SHARDS]> =
+static METADATA_GRAPH_FENCES: LazyLock<[Semaphore; GRAPH_FENCE_SHARDS]> =
     LazyLock::new(|| std::array::from_fn(|_| Semaphore::new(1)));
 
 pub(crate) fn metadata_graph_fence(graph_iri: &str) -> &'static Semaphore {
@@ -77,13 +77,13 @@ pub(crate) fn metadata_graph_fence(graph_iri: &str) -> &'static Semaphore {
     let mut prefix = [0u8; 8];
     prefix.copy_from_slice(&hash.as_bytes()[..8]);
     let shard = u64::from_be_bytes(prefix) as usize;
-    &METADATA_GRAPH_FENCES[shard % METADATA_GRAPH_FENCE_SHARDS]
+    &METADATA_GRAPH_FENCES[shard % GRAPH_FENCE_SHARDS]
 }
 
-pub const METADATA_MATERIALIZATION_POLL_AFTER: Duration = Duration::from_secs(5);
-pub const METADATA_MATERIALIZATION_RETRY_AFTER: Duration = Duration::from_secs(1);
+pub const MATERIALIZATION_POLL_AFTER: Duration = Duration::from_secs(5);
+pub const MATERIALIZATION_RETRY_AFTER: Duration = Duration::from_secs(1);
 // The bulk storage lane enforces fairness when immediate timer refires bypass this gap.
-pub const METADATA_MATERIALIZATION_NEXT_BATCH_AFTER: Duration = Duration::from_millis(25);
+pub const NEXT_BATCH_AFTER: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
 pub struct MetadataDrainResult {
@@ -160,7 +160,7 @@ pub enum MetadataMaterializationError {
     #[error("metadata handle missing")]
     MetadataHandleMissing,
     #[error("metadata create event log record not found for {document_id}/{event_id}")]
-    MetadataCreateEventMissing { document_id: Ulid, event_id: Ulid },
+    CreateEventMissing { document_id: Ulid, event_id: Ulid },
     #[error("unexpected event while processing metadata materialization queue: {0}")]
     UnexpectedEvent(String),
     #[error("inconsistent metadata raw event log: {0}")]
@@ -201,7 +201,7 @@ impl From<MetadataIriError> for MetadataMaterializationError {
 
 pub fn schedule_materialization() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainMetadataMaterializationQueue,
+        key: TaskKey::DrainMaterializationQueue,
         after: Duration::ZERO,
     })
 }
@@ -226,7 +226,7 @@ pub async fn restore_materialization_timer(storage: &StorageHandle, task_handle:
         Ok(Some(after)) => {
             let event = task_handle
                 .send_effect(Effect::Task(TaskEffect::ResetTimer {
-                    key: TaskKey::DrainMetadataMaterializationQueue,
+                    key: TaskKey::DrainMaterializationQueue,
                     after,
                 }))
                 .await;
@@ -242,11 +242,11 @@ pub async fn next_timer_after(
     storage: &StorageHandle,
 ) -> Result<Option<Duration>, MetadataMaterializationError> {
     let now_ms = unix_timestamp_millis();
-    let (jobs, has_more_due, next_due_at_ms) = scan_due_jobs(storage, now_ms, 1).await?;
+    let (jobs, has_more_due, next_due_ms) = scan_due_jobs(storage, now_ms, 1).await?;
     if !jobs.is_empty() || has_more_due {
         return Ok(Some(Duration::ZERO));
     }
-    Ok(next_due_at_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms)))
+    Ok(next_due_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms)))
 }
 
 pub async fn process_materialization_batch(
@@ -254,7 +254,7 @@ pub async fn process_materialization_batch(
 ) -> Result<MetadataDrainResult, MetadataMaterializationError> {
     let batch_started = Instant::now();
     let now_ms = unix_timestamp_millis();
-    let (jobs, has_more_due, next_due_at_ms) =
+    let (jobs, has_more_due, next_due_ms) =
         scan_due_jobs(&context.storage_handle, now_ms, MATERIALIZATION_BATCH_SIZE).await?;
     let scan_elapsed = batch_started.elapsed();
     let job_count = jobs.len();
@@ -285,7 +285,7 @@ pub async fn process_materialization_batch(
         next_due_after: if has_more_due {
             Some(Duration::ZERO)
         } else {
-            next_due_at_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms))
+            next_due_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms))
         },
     })
 }
@@ -455,7 +455,7 @@ async fn schedule_completed_syncs(
     };
     for sync in syncs {
         match metadata_handle
-            .send_effect(Effect::Metadata(MetadataEffect::SyncGraphBestEffort {
+            .send_effect(Effect::Metadata(MetadataEffect::SyncBestEffort {
                 graph_iri: sync.graph_iri.clone(),
                 peers: sync.peers,
             }))
@@ -556,10 +556,10 @@ async fn read_pending_prunes(
 ) -> Result<HashMap<Ulid, Ulid>, MetadataMaterializationError> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: METADATA_MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
+            key_space: MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
             prefix: None,
             start: None,
-            limit: MATERIALIZATION_SCAN_PAGE_SIZE,
+            limit: MATERIALIZATION_PAGE_SIZE,
             txn_id: None,
         })
         .await
@@ -575,7 +575,7 @@ async fn read_pending_prunes(
                     delete_materialization_entries(
                         storage,
                         vec![(
-                            METADATA_MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
+                            MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
                             key.clone(),
                         )],
                     )
@@ -624,7 +624,7 @@ async fn delete_pending_prunes(
         .into_iter()
         .map(|document_id| {
             (
-                METADATA_MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
+                MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
                 materialization_prune_key(document_id),
             )
         })
@@ -699,12 +699,12 @@ async fn plan_finish_chunk(
                     }
                 }
                 plan.deletes.push((
-                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                    MATERIALIZATION_JOB_KEYSPACE.to_string(),
                     ByteView::from(job.job_key),
                 ));
                 if let Some(document_job_key) = job.document_job_key {
                     plan.deletes.push((
-                        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                        DOCUMENT_JOB_KEYSPACE.to_string(),
                         ByteView::from(document_job_key),
                     ));
                 }
@@ -715,14 +715,14 @@ async fn plan_finish_chunk(
                 status,
             } => {
                 let old_index_delete = (
-                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                    MATERIALIZATION_JOB_KEYSPACE.to_string(),
                     ByteView::from(job_key),
                 );
                 let current = guard_status(&snapshot, &planned, job.document_id);
                 if current.is_some_and(|current| retry_already_advanced(current, &job)) {
                     plan.deletes.push(old_index_delete);
                     plan.deletes.push((
-                        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                        DOCUMENT_JOB_KEYSPACE.to_string(),
                         document_job_key(job.document_id, job.event_id),
                     ));
                     continue;
@@ -752,11 +752,11 @@ async fn plan_finish_chunk(
                 let current = guard_status(&snapshot, &planned, job.document_id);
                 let job_deletes = [
                     (
-                        METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                        MATERIALIZATION_JOB_KEYSPACE.to_string(),
                         ByteView::from(job_key),
                     ),
                     (
-                        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                        DOCUMENT_JOB_KEYSPACE.to_string(),
                         document_job_key(job.document_id, job.event_id),
                     ),
                 ];
@@ -831,7 +831,7 @@ async fn read_status_map(
         .iter()
         .map(|document_id| {
             (
-                METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
+                MATERIALIZATION_STATUS_KEYSPACE.to_string(),
                 materialization_status_key(*document_id),
             )
         })
@@ -867,7 +867,7 @@ async fn read_dead_letters(
         .iter()
         .map(|(document_id, event_id)| {
             (
-                METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE.to_string(),
+                DEAD_LETTER_KEYSPACE.to_string(),
                 dead_letter_key(*document_id, *event_id),
             )
         })
@@ -926,8 +926,8 @@ fn parked_dead_letter(
 fn requeue_after_ms(parks: u32) -> u64 {
     crate::tasks::queue_backoff::retry_after_ms(
         parks.saturating_sub(1),
-        DEAD_LETTER_REQUEUE_BASE_MS,
-        DEAD_LETTER_REQUEUE_MAX_MS,
+        REQUEUE_BASE_MS,
+        REQUEUE_MAX_MS,
     )
 }
 
@@ -939,7 +939,7 @@ async fn read_dead_letter(
 ) -> Result<Option<DeadLetterRecord>, MetadataMaterializationError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE.to_string(),
+            key_space: DEAD_LETTER_KEYSPACE.to_string(),
             key: dead_letter_key(document_id, event_id),
             txn_id: None,
         })
@@ -968,10 +968,10 @@ pub async fn requeue_dead_letters(
     loop {
         let (values, next_start_after) = match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE.to_string(),
+                key_space: DEAD_LETTER_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
-                limit: DEAD_LETTER_REQUEUE_PAGE_SIZE,
+                limit: REQUEUE_PAGE_SIZE,
                 txn_id: None,
             })
             .await
@@ -1054,7 +1054,7 @@ async fn requeue_dead_letter(
     };
     let event = match read_create_event(storage, job.document_id, job.event_id).await {
         Ok(event) => event,
-        Err(MetadataMaterializationError::MetadataCreateEventMissing { .. }) => {
+        Err(MetadataMaterializationError::CreateEventMissing { .. }) => {
             delete_dead_letter(
                 storage,
                 dead_letter_key(job.document_id, job.event_id).to_vec(),
@@ -1096,7 +1096,7 @@ async fn requeue_in_txn(
     status: &MaterializationStatusRecord,
 ) -> Result<bool, MetadataMaterializationError> {
     let dead_letter_delete = vec![(
-        METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE.to_string(),
+        DEAD_LETTER_KEYSPACE.to_string(),
         dead_letter_key(job.document_id, job.event_id),
     )];
     if let Some(current) =
@@ -1134,7 +1134,7 @@ async fn delete_dead_letter(
     delete_materialization_entries(
         storage,
         vec![(
-            METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE.to_string(),
+            DEAD_LETTER_KEYSPACE.to_string(),
             ByteView::from(key),
         )],
     )
@@ -1219,7 +1219,7 @@ async fn read_document_job(
     let key = document_job_key(document_id, event_id);
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+            key_space: DOCUMENT_JOB_KEYSPACE.to_string(),
             key: key.clone(),
             txn_id: None,
         })
@@ -1262,10 +1262,10 @@ async fn scan_due_jobs(
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                key_space: MATERIALIZATION_JOB_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
-                limit: MATERIALIZATION_SCAN_PAGE_SIZE,
+                limit: MATERIALIZATION_PAGE_SIZE,
                 txn_id: None,
             })
             .await;
@@ -1284,19 +1284,19 @@ async fn scan_due_jobs(
 
         let mut stale = Vec::new();
         let mut candidates = Vec::new();
-        let mut next_due_at_ms = None;
+        let mut next_due_ms = None;
         for (key, _value) in values {
             let key = key.to_vec();
             let Some((due_at_ms, document_id, event_id)) = job_key_parts(&key) else {
                 warn!(key = ?key, "Deleting malformed metadata materialization index row");
                 stale.push((
-                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                    MATERIALIZATION_JOB_KEYSPACE.to_string(),
                     ByteView::from(key),
                 ));
                 continue;
             };
             if due_at_ms > now_ms {
-                next_due_at_ms = Some(due_at_ms);
+                next_due_ms = Some(due_at_ms);
                 break;
             }
             candidates.push((key, due_at_ms, document_id, event_id));
@@ -1321,7 +1321,7 @@ async fn scan_due_jobs(
         }
         delete_materialization_entries(storage, stale).await?;
 
-        if let Some(due_at_ms) = next_due_at_ms {
+        if let Some(due_at_ms) = next_due_ms {
             return Ok((jobs, false, Some(due_at_ms)));
         }
 
@@ -1356,12 +1356,12 @@ async fn resolve_due_jobs(
             // stale. A missing or malformed sidecar is dropped with it.
             sidecar => {
                 stale.push((
-                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                    MATERIALIZATION_JOB_KEYSPACE.to_string(),
                     ByteView::from(key.clone()),
                 ));
                 if sidecar.is_none() {
                     stale.push((
-                        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                        DOCUMENT_JOB_KEYSPACE.to_string(),
                         document_job_key(*document_id, *event_id),
                     ));
                 }
@@ -1372,11 +1372,11 @@ async fn resolve_due_jobs(
     let (live, dead) = filter_live_jobs(storage, due).await?;
     for (key, job) in dead {
         stale.push((
-            METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+            MATERIALIZATION_JOB_KEYSPACE.to_string(),
             ByteView::from(key),
         ));
         stale.push((
-            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+            DOCUMENT_JOB_KEYSPACE.to_string(),
             document_job_key(job.document_id, job.event_id),
         ));
     }
@@ -1394,7 +1394,7 @@ async fn read_document_jobs(
         .iter()
         .map(|(document_id, event_id)| {
             (
-                METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                DOCUMENT_JOB_KEYSPACE.to_string(),
                 document_job_key(*document_id, *event_id),
             )
         })
@@ -1426,7 +1426,7 @@ async fn filter_live_jobs(
         .iter()
         .map(|(_, job)| {
             (
-                METADATA_EVENT_LOG_KEYSPACE.to_string(),
+                EVENT_LOG_KEYSPACE.to_string(),
                 event_log_key(job.document_id, job.event_id),
             )
         })
@@ -1554,7 +1554,7 @@ async fn process_materialization_job(
 
     let event = match event {
         Ok(event) => event,
-        Err(MetadataMaterializationError::MetadataCreateEventMissing { .. }) => {
+        Err(MetadataMaterializationError::CreateEventMissing { .. }) => {
             return Ok(ProcessedMaterializationJob::completed(
                 CompletedMaterializationJob {
                     job_key,
@@ -1673,10 +1673,10 @@ async fn load_group_jobs(
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                key_space: DOCUMENT_JOB_KEYSPACE.to_string(),
                 prefix: Some(prefix.clone()),
                 start: start_after.take().map(IterStart::After),
-                limit: MATERIALIZATION_SCAN_PAGE_SIZE,
+                limit: MATERIALIZATION_PAGE_SIZE,
                 txn_id: None,
             })
             .await;
@@ -1700,7 +1700,7 @@ async fn load_group_jobs(
                 Err(error) => {
                     warn!(error = %error, key = ?key.to_vec(), "Deleting malformed metadata materialization document job");
                     malformed.push((
-                        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                        DOCUMENT_JOB_KEYSPACE.to_string(),
                         key,
                     ));
                 }
@@ -1752,7 +1752,7 @@ async fn read_create_event(
 ) -> Result<MetadataEventRecord, MetadataMaterializationError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+            key_space: EVENT_LOG_KEYSPACE.to_string(),
             key: event_log_key(document_id, event_id),
             txn_id: None,
         })
@@ -1771,7 +1771,7 @@ async fn read_create_event(
             Ok(event)
         }
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            Err(MetadataMaterializationError::MetadataCreateEventMissing {
+            Err(MetadataMaterializationError::CreateEventMissing {
                 document_id,
                 event_id,
             })
@@ -1873,7 +1873,7 @@ pub async fn materialization_jobs_exist(
     loop {
         let (values, next_start_after) = match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                key_space: MATERIALIZATION_JOB_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
                 limit: 1,
@@ -1922,12 +1922,12 @@ async fn delete_materialization_job(
     key: Vec<u8>,
 ) -> Result<(), MetadataMaterializationError> {
     let mut deletes = vec![(
-        METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+        MATERIALIZATION_JOB_KEYSPACE.to_string(),
         ByteView::from(key.clone()),
     )];
     if let Some((document_id, event_id)) = job_key_target(&key) {
         deletes.push((
-            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+            DOCUMENT_JOB_KEYSPACE.to_string(),
             document_job_key(document_id, event_id),
         ));
     }
@@ -1941,7 +1941,7 @@ async fn delete_global_job(
     delete_materialization_entries(
         storage,
         vec![(
-            METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+            MATERIALIZATION_JOB_KEYSPACE.to_string(),
             ByteView::from(key),
         )],
     )
@@ -1955,7 +1955,7 @@ async fn delete_job(
     delete_materialization_entries(
         storage,
         vec![(
-            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+            DOCUMENT_JOB_KEYSPACE.to_string(),
             ByteView::from(key),
         )],
     )
@@ -2374,7 +2374,7 @@ async fn materialization_event_exists(
 ) -> Result<bool, MetadataMaterializationError> {
     match read_create_event(storage, job.document_id, job.event_id).await {
         Ok(_) => Ok(true),
-        Err(MetadataMaterializationError::MetadataCreateEventMissing { .. }) => Ok(false),
+        Err(MetadataMaterializationError::CreateEventMissing { .. }) => Ok(false),
         Err(error) => Err(error),
     }
 }

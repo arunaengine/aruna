@@ -11,7 +11,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{METADATA_AUDIT_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE};
+use aruna_core::keyspaces::{METADATA_AUDIT_KEYSPACE, ID_MAPPING_KEYSPACE};
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
@@ -58,7 +58,7 @@ pub enum PersistentIdError {
 
 pub fn read_mapping_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
-        key_space: PERSISTENT_ID_MAPPING_KEYSPACE.to_string(),
+        key_space: ID_MAPPING_KEYSPACE.to_string(),
         key: ByteView::from(persistent_id_key(document_id)),
         txn_id,
     })
@@ -442,7 +442,7 @@ pub fn transition_entries(
 ) -> Result<Vec<TransitionEntry>, PersistentIdError> {
     let target = persistent_id_target(mapping.target);
     let mut writes = vec![(
-        PERSISTENT_ID_MAPPING_KEYSPACE.to_string(),
+        ID_MAPPING_KEYSPACE.to_string(),
         ByteView::from(persistent_id_key(mapping.target)),
         ByteView::from(mapping.to_bytes().map_err(PersistentIdError::Conversion)?),
     )];
@@ -936,7 +936,7 @@ mod tests {
         let entry = writes
             .iter()
             .find(|(key_space, _, _)| {
-                key_space == aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE
+                key_space == aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE
             })
             .expect("the transition publishes an outbox row");
         postcard::from_bytes(entry.2.as_ref()).expect("outbox row decodes")

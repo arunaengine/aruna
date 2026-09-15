@@ -11,8 +11,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-    METADATA_PENDING_PROJECTION_KEYSPACE,
+    EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
+    PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationStatusRecord, MetadataError, MetadataEventRecord,
@@ -52,8 +52,8 @@ use crate::sync::shard_placement::sort_node_ids;
 use crate::tasks::task_persistence::persist_task_effect;
 
 const REPLAY_PAGE_SIZE: usize = 1_024;
-const PENDING_PROJECTION_PAGE_SIZE: usize = 256;
-pub const METADATA_PROJECTION_RETRY_AFTER: Duration = Duration::from_secs(5);
+const PROJECTION_PAGE_SIZE: usize = 256;
+pub const PROJECTION_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingProjectionResult {
@@ -65,7 +65,7 @@ pub struct PendingProjectionResult {
 /// Conflict resolution is last-writer-wins on wall-clock time, so an event
 /// stamped far ahead would win forever. Events beyond the configured skew are
 /// deferred until retry; operators must run NTP.
-const DEFAULT_MAX_CLOCK_SKEW_SECS: u64 = 300;
+const MAX_SKEW_SECS: u64 = 300;
 
 static CLOCK_SKEW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 
@@ -75,7 +75,7 @@ fn max_clock_skew() -> u64 {
         std::env::var("MAX_CLOCK_SKEW_SECS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_MAX_CLOCK_SKEW_SECS)
+            .unwrap_or(MAX_SKEW_SECS)
             .saturating_mul(1000)
     })
 }
@@ -96,7 +96,7 @@ pub enum MetadataProjectionError {
     #[error("metadata handle missing")]
     MetadataHandleMissing,
     #[error("metadata create event log record not found for {document_id}/{event_id}")]
-    MetadataCreateEventMissing { document_id: Ulid, event_id: Ulid },
+    CreateEventMissing { document_id: Ulid, event_id: Ulid },
     #[error("deferred {deferred} metadata create event(s) stamped too far in the future")]
     ClockSkewDeferred { deferred: usize },
     #[error("the document's bucket cut over to a new holder set; retry the projection")]
@@ -107,7 +107,7 @@ pub enum MetadataProjectionError {
 
 fn pending_drain_effect(after: Duration) -> TaskEffect {
     TaskEffect::ResetTimer {
-        key: TaskKey::DrainMetadataProjectionQueue,
+        key: TaskKey::DrainProjectionQueue,
         after,
     }
 }
@@ -138,7 +138,7 @@ pub async fn schedule_projection_drain(
 pub async fn restore_projection_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     let event = storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: 1,
@@ -186,7 +186,7 @@ pub async fn replay_until_stopped(
         let page = context
             .storage_handle
             .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+                key_space: EVENT_LOG_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
                 limit: REPLAY_PAGE_SIZE,
@@ -226,10 +226,10 @@ pub async fn drain_projection_queue(
     let page = context
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
-            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
             prefix: None,
             start: None,
-            limit: PENDING_PROJECTION_PAGE_SIZE,
+            limit: PROJECTION_PAGE_SIZE,
             txn_id: None,
         })
         .await;
@@ -303,18 +303,18 @@ async fn project_logged_batch(
         }
         match read_create_event(context, document_id, event_id).await {
             Ok(event) => events.push(event),
-            Err(MetadataProjectionError::MetadataCreateEventMissing {
+            Err(MetadataProjectionError::CreateEventMissing {
                 document_id,
                 event_id,
             }) if delete_orphan_markers => {
                 warn!(%document_id, %event_id, "Deleting orphan metadata pending projection marker");
                 missing_event_markers.insert((document_id, event_id));
             }
-            Err(MetadataProjectionError::MetadataCreateEventMissing {
+            Err(MetadataProjectionError::CreateEventMissing {
                 document_id,
                 event_id,
             }) => {
-                return Err(MetadataProjectionError::MetadataCreateEventMissing {
+                return Err(MetadataProjectionError::CreateEventMissing {
                     document_id,
                     event_id,
                 });
@@ -339,7 +339,7 @@ async fn read_create_event(
     let value = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+            key_space: EVENT_LOG_KEYSPACE.to_string(),
             key: event_log_key(document_id, event_id),
             txn_id: None,
         })
@@ -354,7 +354,7 @@ async fn read_create_event(
         }
     };
     let Some(value) = value else {
-        return Err(MetadataProjectionError::MetadataCreateEventMissing {
+        return Err(MetadataProjectionError::CreateEventMissing {
             document_id,
             event_id,
         });
@@ -637,7 +637,7 @@ pub async fn project_create_events(
     write_pending_markers(context, &mint_retry_targets).await?;
     delete_pending_markers(context, pending_projection_delete_targets).await?;
     if !mint_retry_targets.is_empty() {
-        schedule_projection_drain(context, METADATA_PROJECTION_RETRY_AFTER).await?;
+        schedule_projection_drain(context, PROJECTION_RETRY_AFTER).await?;
     }
 
     if !pending_projection_retry_targets.is_empty() {
@@ -657,7 +657,7 @@ async fn pending_projection_marker(
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
             key: pending_projection_key(document_id, event_id),
             txn_id: None,
         })
@@ -712,7 +712,7 @@ async fn transactional_projection_write(
         .iter()
         .map(|graph_iri| {
             (
-                METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+                GRAPH_LIFECYCLE_KEYSPACE.to_string(),
                 graph_lifecycle_key(graph_iri),
             )
         })
@@ -819,7 +819,7 @@ async fn write_pending_markers(
         .iter()
         .map(|(document_id, event_id)| {
             (
-                METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                PENDING_PROJECTION_KEYSPACE.to_string(),
                 pending_projection_key(*document_id, *event_id),
                 ByteView::from(Vec::new()),
             )
@@ -879,7 +879,7 @@ async fn delete_marker_keys(
         .into_iter()
         .map(|key| {
             (
-                METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                PENDING_PROJECTION_KEYSPACE.to_string(),
                 ByteView::from(key),
             )
         })
@@ -1299,7 +1299,7 @@ mod tests {
     async fn outbox_rows(storage: &StorageHandle) -> Vec<DocumentOutboxRecord> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                key_space: aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
                 limit: 64,
@@ -1430,7 +1430,7 @@ mod tests {
     async fn pending_marker_exists(storage: &StorageHandle, key: Vec<u8>) -> bool {
         match storage
             .send_storage_effect(StorageEffect::Read {
-                key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
                 key: ByteView::from(key),
                 txn_id: None,
             })
@@ -1509,7 +1509,7 @@ mod tests {
         write_entries(
             &storage,
             vec![(
-                METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                PENDING_PROJECTION_KEYSPACE.to_string(),
                 ByteView::from(corrupt_key.clone()),
                 ByteView::from(Vec::new()),
             )],
@@ -1546,13 +1546,13 @@ mod tests {
             &storage,
             vec![
                 (
-                    METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                    PENDING_PROJECTION_KEYSPACE.to_string(),
                     ByteView::from(corrupt_key.clone()),
                     ByteView::from(Vec::new()),
                 ),
                 create_event_entry(&event).expect("event log entry"),
                 (
-                    METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                    PENDING_PROJECTION_KEYSPACE.to_string(),
                     valid_key.clone(),
                     ByteView::from(Vec::new()),
                 ),
@@ -1589,7 +1589,7 @@ mod tests {
         write_entries(
             &storage,
             vec![(
-                METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                PENDING_PROJECTION_KEYSPACE.to_string(),
                 marker_key.clone(),
                 ByteView::from(Vec::new()),
             )],
@@ -1624,7 +1624,7 @@ mod tests {
             vec![
                 create_event_entry(&event).expect("event log entry"),
                 (
-                    METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                    PENDING_PROJECTION_KEYSPACE.to_string(),
                     pending_projection_key(event.record.document_id, event.event_id),
                     ByteView::from(Vec::new()),
                 ),
@@ -1643,7 +1643,7 @@ mod tests {
             .await
             .expect("restored projection timer should fire")
             .expect("recording handler should receive timer key");
-        assert_eq!(restored_key, TaskKey::DrainMetadataProjectionQueue);
+        assert_eq!(restored_key, TaskKey::DrainProjectionQueue);
     }
 
     #[test]
@@ -1700,7 +1700,7 @@ mod tests {
         // bucket, the registry row onto the everywhere-bound registry class.
         let records = match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                key_space: aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
                 limit: 4,
@@ -1777,7 +1777,7 @@ mod tests {
 
         let outboxes = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                key_space: aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
                 limit: 1,
@@ -2033,7 +2033,7 @@ mod tests {
             vec![
                 create_event_entry(&event).expect("event log entry"),
                 (
-                    METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                    PENDING_PROJECTION_KEYSPACE.to_string(),
                     marker_key.clone(),
                     ByteView::from(Vec::new()),
                 ),

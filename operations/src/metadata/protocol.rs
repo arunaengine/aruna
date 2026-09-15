@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
-use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
+use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_PAGE_BYTES};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
@@ -44,7 +44,7 @@ pub use aruna_core::metadata::{AuthToken, AuthTokenError};
 
 pub(crate) const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const AUDIT_FRAME_OVERHEAD: usize = 256;
-pub(crate) const METADATA_INBOUND_FRAME_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const INBOUND_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const STANDARD_FRAME: u8 = 0;
 const AUDIT_FRAME: u8 = 1;
 const POSTCARD_VARIANT_BYTES: usize = 5;
@@ -129,7 +129,8 @@ pub enum MetadataTransportMessage {
     Reject(String),
     /// A permanent update validation failure. Appended after `Reject` so the
     /// postcard discriminants of existing control messages remain stable.
-    ForwardedUpdateInvalidInput {
+    #[serde(rename = "ForwardedUpdateInvalidInput")]
+    UpdateInvalidInput {
         message: String,
     },
     FilteredSearchGraphs {
@@ -191,7 +192,8 @@ pub enum MetadataTransportMessage {
     ForwardedPathResolution {
         result: Result<Box<MetadataPathResolution>, MetadataReadError>,
     },
-    ForwardedWriteNotFound,
+    #[serde(rename = "ForwardedWriteNotFound")]
+    WriteNotFound,
     ForwardedWriteUnavailable,
     /// An RO-Crate export forwarded to a holder with the caller's bearer or
     /// peer-attested internal principal for another READ check.
@@ -232,8 +234,10 @@ pub enum MetadataTransportMessage {
         token: String,
     },
     ForwardedTokenRevoked,
-    ForwardedTokenRevocationCapacity,
-    ForwardedMetadataHistoryCapacity,
+    #[serde(rename = "ForwardedTokenRevocationCapacity")]
+    TokenRevocationCapacity,
+    #[serde(rename = "ForwardedMetadataHistoryCapacity")]
+    MetadataHistoryCapacity,
     /// A PID mapping transition or landing resolution routed to a document
     /// holder, which is the mapping's authority. Appended last so the postcard
     /// variant indices the frame classifier depends on stay stable.
@@ -259,13 +263,15 @@ pub enum MetadataTransportMessage {
     /// A realm-admin publication routed to a holder of the policy's bucket,
     /// because only a holder may commit the immutable document. Appended last so
     /// existing variant indices stay stable.
-    ForwardCreatePlacementPolicy {
+    #[serde(rename = "ForwardCreatePlacementPolicy")]
+    ForwardCreatePolicy {
         auth_token: Option<AuthToken>,
         policy: Box<PlacementPolicy>,
         created_at_ms: u64,
     },
     /// The document the holder committed, or the identical one it already had.
-    ForwardedPlacementPolicyCreated {
+    #[serde(rename = "ForwardedPlacementPolicyCreated")]
+    PlacementPolicyCreated {
         document: Box<PlacementPolicyDocument>,
     },
     /// One immutable job-family record offered to a holder of the family
@@ -280,7 +286,8 @@ pub enum MetadataTransportMessage {
         result: Result<(), JobRecordRejection>,
     },
     /// A bounded page of one submission's immutable records read from a holder.
-    ForwardJobRecordPage {
+    #[serde(rename = "ForwardJobRecordPage")]
+    ForwardRecordPage {
         placement: PlacementRef,
         submission_id: SubmissionId,
         /// `None` reads every request family of the submission.
@@ -288,7 +295,8 @@ pub enum MetadataTransportMessage {
         cursor: Option<FetchCursor>,
         limit: PageLimit,
     },
-    ForwardedJobRecordPage {
+    #[serde(rename = "ForwardedJobRecordPage")]
+    ForwardedRecordPage {
         result: Result<JobPageReply, JobRecordRejection>,
     },
     /// One scheduler's launch offer to an execution target. It carries no
@@ -332,13 +340,15 @@ pub enum MetadataTransportMessage {
     },
     /// Read or deterministically recompute a document's revision-bound Profile
     /// status on a holder, under the caller's READ authority.
-    ForwardProfileValidationStatus {
+    #[serde(rename = "ForwardProfileValidationStatus")]
+    ForwardValidationStatus {
         auth_token: Option<AuthToken>,
         config_digest: [u8; 32],
         document_id: Ulid,
         revalidate: bool,
     },
-    ForwardedProfileValidationStatus {
+    #[serde(rename = "ForwardedProfileValidationStatus")]
+    ForwardedValidationStatus {
         result: Result<Box<ProfileValidationStatus>, MetadataReadError>,
     },
     /// One node's exact-IRI backlink and location-impact partition. Appended after
@@ -359,7 +369,8 @@ pub enum MetadataTransportMessage {
         placement: PlacementRef,
         origin_signature: iroh::Signature,
     },
-    ForwardedAdminEventQueued,
+    #[serde(rename = "ForwardedAdminEventQueued")]
+    AdminEventQueued,
     /// A User node cannot originate a realm administrative event, so its local
     /// group create travels to a sync-eligible ingress under the caller's own
     /// token. That ingress authorizes the caller and originates the event.
@@ -371,7 +382,8 @@ pub enum MetadataTransportMessage {
         group: Box<Group>,
         authorization: Box<GroupAuthorizationDocument>,
     },
-    ForwardedGroupCreateConflict {
+    #[serde(rename = "ForwardedGroupCreateConflict")]
+    GroupCreateConflict {
         reason: String,
     },
     /// One device version a synced folder asks its realm node to pull and commit
@@ -751,7 +763,7 @@ where
 }
 
 fn audit_frame_cap() -> usize {
-    MAX_AUDIT_PAGE_BYTES.saturating_add(AUDIT_FRAME_OVERHEAD)
+    MAX_PAGE_BYTES.saturating_add(AUDIT_FRAME_OVERHEAD)
 }
 
 fn parse_variant(prefix: &[u8]) -> Result<Option<u32>, ()> {
@@ -793,7 +805,7 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::audit::{AuditPageEntry, AuditPageRequest};
-    use aruna_core::metadata::MAX_METADATA_BEARER_TOKEN_LEN;
+    use aruna_core::metadata::MAX_TOKEN_LEN;
     use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord,
@@ -932,7 +944,7 @@ mod tests {
     fn token_revoke_roundtrip() {
         for response in [
             MetadataTransportMessage::ForwardedTokenRevoked,
-            MetadataTransportMessage::ForwardedTokenRevocationCapacity,
+            MetadataTransportMessage::TokenRevocationCapacity,
         ] {
             let bytes = postcard::to_allocvec(&response).unwrap();
 
@@ -945,7 +957,7 @@ mod tests {
 
     #[test]
     fn history_capacity_roundtrip() {
-        let message = MetadataTransportMessage::ForwardedMetadataHistoryCapacity;
+        let message = MetadataTransportMessage::MetadataHistoryCapacity;
         let bytes = postcard::to_allocvec(&message).unwrap();
 
         assert_eq!(
@@ -1016,7 +1028,7 @@ mod tests {
             vec![9, 0]
         );
         assert_eq!(
-            postcard::to_allocvec(&MetadataTransportMessage::ForwardedUpdateInvalidInput {
+            postcard::to_allocvec(&MetadataTransportMessage::UpdateInvalidInput {
                 message: String::new(),
             })
             .unwrap(),
@@ -1035,7 +1047,7 @@ mod tests {
 
     #[test]
     fn oversized_tokens_rejected() {
-        let oversized = "x".repeat(MAX_METADATA_BEARER_TOKEN_LEN + 1);
+        let oversized = "x".repeat(MAX_TOKEN_LEN + 1);
 
         assert!(AuthToken::bearer(oversized).is_err());
     }
@@ -1078,13 +1090,13 @@ mod tests {
             .write_all(&[AUDIT_REQUEST_VARIANT as u8])
             .await
             .unwrap();
-        let budget = Arc::new(Semaphore::new(METADATA_INBOUND_FRAME_BYTES));
+        let budget = Arc::new(Semaphore::new(INBOUND_FRAME_BYTES));
 
         let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
             .await
             .unwrap_err();
         assert_eq!(error, "metadata audit frame exceeds maximum size");
-        assert_eq!(budget.available_permits(), METADATA_INBOUND_FRAME_BYTES);
+        assert_eq!(budget.available_permits(), INBOUND_FRAME_BYTES);
     }
 
     #[test]
@@ -1129,13 +1141,13 @@ mod tests {
         writer.write_all(&[STANDARD_FRAME]).await.unwrap();
         writer.write_all(&length.to_be_bytes()).await.unwrap();
         writer.write_all(&[0x9f, 0]).await.unwrap();
-        let budget = Arc::new(Semaphore::new(METADATA_INBOUND_FRAME_BYTES));
+        let budget = Arc::new(Semaphore::new(INBOUND_FRAME_BYTES));
 
         let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
             .await
             .unwrap_err();
         assert_eq!(error, "metadata audit frame exceeds maximum size");
-        assert_eq!(budget.available_permits(), METADATA_INBOUND_FRAME_BYTES);
+        assert_eq!(budget.available_permits(), INBOUND_FRAME_BYTES);
     }
 
     #[tokio::test]
@@ -1149,13 +1161,13 @@ mod tests {
             writer.write_all(&[STANDARD_FRAME]).await.unwrap();
             writer.write_all(&length.to_be_bytes()).await.unwrap();
             writer.write_all(&prefix).await.unwrap();
-            let budget = Arc::new(Semaphore::new(METADATA_INBOUND_FRAME_BYTES));
+            let budget = Arc::new(Semaphore::new(INBOUND_FRAME_BYTES));
 
             let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
                 .await
                 .unwrap_err();
             assert_eq!(error, "metadata frame variant is invalid");
-            assert_eq!(budget.available_permits(), METADATA_INBOUND_FRAME_BYTES);
+            assert_eq!(budget.available_permits(), INBOUND_FRAME_BYTES);
         }
     }
 
@@ -1260,7 +1272,7 @@ mod tests {
                         realm_id,
                         group_id: Ulid::from_bytes([2u8; 16]),
                         document_id: Ulid::from_bytes([3u8; 16]),
-                        graph_iri: "x".repeat(MAX_AUDIT_PAGE_BYTES + AUDIT_FRAME_OVERHEAD),
+                        graph_iri: "x".repeat(MAX_PAGE_BYTES + AUDIT_FRAME_OVERHEAD),
                         user_id: UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
                         node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
                         operation: MetadataAuditOperation::Create,
@@ -1364,7 +1376,7 @@ mod tests {
 
         let bytes = postcard::to_allocvec(&RawTransportMessage::QueryGraphs {
             auth_token: Some(RawAuthToken::Bearer(
-                "x".repeat(MAX_METADATA_BEARER_TOKEN_LEN + 1),
+                "x".repeat(MAX_TOKEN_LEN + 1),
             )),
             graph_iris: None,
             sparql: "ASK {}".to_string(),
@@ -1384,7 +1396,7 @@ mod tests {
                         realm_id: RealmId([1u8; 32]),
                         group_id: Ulid::from_bytes([2u8; 16]),
                         document_id: Ulid::from_bytes([3u8; 16]),
-                        graph_iri: "x".repeat(MAX_AUDIT_PAGE_BYTES + AUDIT_FRAME_OVERHEAD),
+                        graph_iri: "x".repeat(MAX_PAGE_BYTES + AUDIT_FRAME_OVERHEAD),
                         user_id: UserId::local(Ulid::from_bytes([4u8; 16]), RealmId([1u8; 32])),
                         node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
                         operation: MetadataAuditOperation::Create,

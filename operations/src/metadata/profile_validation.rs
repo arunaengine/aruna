@@ -4,7 +4,7 @@ use std::sync::Arc;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::METADATA_PROFILE_VALIDATION_STATUS_KEYSPACE;
+use aruna_core::keyspaces::VALIDATION_STATUS_KEYSPACE;
 use aruna_core::metadata::{
     MetadataError, MetadataRawRevision, MetadataValidationViolation, ProfileValidationCompleteness,
     ProfileValidationFinding, ProfileValidationSeverity, ProfileValidationState,
@@ -34,11 +34,11 @@ const SH: &str = "http://www.w3.org/ns/shacl#";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const DCTERMS_CONFORMS_TO: &str = "http://purl.org/dc/terms/conformsTo";
 const SCHEMA_CONFORMS_TO: &str = "http://schema.org/conformsTo";
-const SCHEMA_HTTPS_CONFORMS_TO: &str = "https://schema.org/conformsTo";
+const SCHEMA_HTTPS_CONFORMS: &str = "https://schema.org/conformsTo";
 const SCHEMA_ABOUT: &str = "http://schema.org/about";
 const SCHEMA_HTTPS_ABOUT: &str = "https://schema.org/about";
 const SCHEMA_ENCODING_FORMAT: &str = "http://schema.org/encodingFormat";
-const SCHEMA_HTTPS_ENCODING_FORMAT: &str = "https://schema.org/encodingFormat";
+const HTTPS_ENCODING_FORMAT: &str = "https://schema.org/encodingFormat";
 const SCHEMA_TEXT: &str = "http://schema.org/text";
 const SCHEMA_HTTPS_TEXT: &str = "https://schema.org/text";
 const DX_PROFILE: &str = "http://www.w3.org/ns/dx/prof/Profile";
@@ -552,7 +552,7 @@ pub async fn load_validation_status(
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_PROFILE_VALIDATION_STATUS_KEYSPACE.to_string(),
+            key_space: VALIDATION_STATUS_KEYSPACE.to_string(),
             key: profile_validation_key(document_id),
             txn_id,
         })
@@ -928,7 +928,7 @@ fn profile_tags(dataset: &Dataset, root: &NamedOrBlankNode) -> Vec<String> {
     for predicate in [
         DCTERMS_CONFORMS_TO,
         SCHEMA_CONFORMS_TO,
-        SCHEMA_HTTPS_CONFORMS_TO,
+        SCHEMA_HTTPS_CONFORMS,
     ] {
         for object in objects(dataset, root, predicate) {
             if let Term::NamedNode(iri) = object
@@ -943,7 +943,7 @@ fn profile_tags(dataset: &Dataset, root: &NamedOrBlankNode) -> Vec<String> {
 
 fn profile_shapes(dataset: &Dataset) -> Result<Vec<String>, String> {
     let mut candidates = HashSet::new();
-    for predicate in [SCHEMA_ENCODING_FORMAT, SCHEMA_HTTPS_ENCODING_FORMAT] {
+    for predicate in [SCHEMA_ENCODING_FORMAT, HTTPS_ENCODING_FORMAT] {
         let predicate = NamedNode::new_unchecked(predicate);
         for quad in dataset.quads_for_predicate(&predicate) {
             if quad.graph_name.is_default_graph()
@@ -1074,7 +1074,7 @@ fn unavailable_error(code: &str, message: &str, revision: Option<&str>) -> Metad
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::metadata::PROCESS_RUN_CRATE_PROFILE_IRI;
+    use aruna_core::metadata::CRATE_PROFILE_IRI;
     use aruna_core::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
     use craqle::{EncodedTerm, ShaclMessage};
 
@@ -1443,12 +1443,12 @@ mod tests {
     #[test]
     fn builtin_tag_resolves() {
         // The built-in Profile must survive the specification-marker filter.
-        let document = crate_with_tag(Some(PROCESS_RUN_CRATE_PROFILE_IRI));
+        let document = crate_with_tag(Some(CRATE_PROFILE_IRI));
         let (data, root) = data_graph(&document).unwrap();
         assert_eq!(
             single_profile_tag(&data, &root).unwrap().as_deref(),
-            Some(PROCESS_RUN_CRATE_PROFILE_IRI)
+            Some(CRATE_PROFILE_IRI)
         );
-        assert!(builtin_shapes(PROCESS_RUN_CRATE_PROFILE_IRI).is_some());
+        assert!(builtin_shapes(CRATE_PROFILE_IRI).is_some());
     }
 }
