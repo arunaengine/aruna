@@ -1,11 +1,11 @@
 use super::field;
 
 use super::{
-    Arc, BoxFuture, BucketSearchExecution, BucketSearchHit, BucketSearchRequest, DriverContext,
-    HashSet, Instant, METADATA_DISTRIBUTED_QUERY_DEADLINE, METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT,
-    METADATA_DISTRIBUTED_QUERY_MAX_NODES, METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_ROWS,
-    MetadataApiError, MetadataApiQueryMode, MetadataAuthToken, MetadataReadError, NodeId, RealmId,
-    SearchBucketsInput, Span, debug_span, deduplicate_fanout_nodes, discover_realm_nodes,
+    ApiQueryMode, Arc, AuthToken, BoxFuture, BucketSearchExecution, BucketSearchHit,
+    BucketSearchRequest, DriverContext, HashSet, Instant, METADATA_DISTRIBUTED_QUERY_DEADLINE,
+    METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT, METADATA_DISTRIBUTED_QUERY_MAX_NODES,
+    METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_ROWS, MetadataApiError, MetadataReadError, NodeId,
+    RealmId, SearchBucketsInput, Span, debug_span, deduplicate_fanout_nodes, discover_realm_nodes,
     map_read_error, query_fingerprint, record_elapsed_ms, search_local_buckets,
     select_fanout_nodes, short_display_id, stream, warn,
 };
@@ -15,9 +15,9 @@ use futures_util::StreamExt;
 use futures_util::future::FutureExt;
 use tracing::Instrument;
 
-pub(super) fn ensure_query_mode(mode: &Option<MetadataApiQueryMode>) {
+pub(super) fn ensure_query_mode(mode: &Option<ApiQueryMode>) {
     match mode {
-        None | Some(MetadataApiQueryMode::Local) | Some(MetadataApiQueryMode::Distributed) => {}
+        None | Some(ApiQueryMode::Local) | Some(ApiQueryMode::Distributed) => {}
     }
 }
 
@@ -187,17 +187,15 @@ fn union_pattern_safe(pattern: &spargebra::algebra::GraphPattern) -> bool {
     }
 }
 
-pub fn forwarded_bearer(
-    token: Option<&str>,
-) -> Result<Option<MetadataAuthToken>, MetadataApiError> {
+pub fn forwarded_bearer(token: Option<&str>) -> Result<Option<AuthToken>, MetadataApiError> {
     token
-        .map(MetadataAuthToken::bearer)
+        .map(AuthToken::bearer)
         .transpose()
         .map_err(|_| MetadataApiError::BadRequest)
 }
 
-pub(super) fn fanout_bearer(token: Option<&str>) -> Option<MetadataAuthToken> {
-    token.and_then(|token| MetadataAuthToken::bearer(token).ok())
+pub(super) fn fanout_bearer(token: Option<&str>) -> Option<AuthToken> {
+    token.and_then(|token| AuthToken::bearer(token).ok())
 }
 
 pub(super) type MetadataNodeCall<T> =
@@ -332,11 +330,11 @@ pub(super) async fn metadata_fanout_nodes(
     span: &Span,
     target_nodes: Option<Vec<NodeId>>,
     deadline: tokio::time::Instant,
-) -> MetadataRealmNodeDiscovery {
+) -> RealmNodeDiscovery {
     match target_nodes {
         Some(nodes) => {
             span.record("discovery_ms", 0u64);
-            MetadataRealmNodeDiscovery {
+            RealmNodeDiscovery {
                 nodes: deduplicate_fanout_nodes(nodes),
                 failed: false,
             }
@@ -351,7 +349,7 @@ pub(super) async fn metadata_fanout_nodes(
                 ),
             )
             .await
-            .unwrap_or(MetadataRealmNodeDiscovery {
+            .unwrap_or(RealmNodeDiscovery {
                 nodes: vec![local_node_id],
                 failed: true,
             });
@@ -388,8 +386,8 @@ where
     let deadline = scope_deadline
         .unwrap_or_else(|| tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE);
     ensure_query_mode(&mode);
-    match mode.unwrap_or(MetadataApiQueryMode::Distributed) {
-        MetadataApiQueryMode::Local => {
+    match mode.unwrap_or(ApiQueryMode::Distributed) {
+        ApiQueryMode::Local => {
             let result = run_fanout_node(
                 operation,
                 local_node_id,
@@ -412,7 +410,7 @@ where
                 Err(error) => Err(map_local_error(error)),
             }
         }
-        MetadataApiQueryMode::Distributed => {
+        ApiQueryMode::Distributed => {
             let discovery = metadata_fanout_nodes(
                 context,
                 realm_id,
@@ -578,7 +576,7 @@ pub async fn search_buckets_distributed(
     let subject = query_fingerprint(
         &request.query,
         None,
-        Some(MetadataApiQueryMode::Distributed),
+        Some(ApiQueryMode::Distributed),
         None,
         None,
     );
@@ -623,13 +621,9 @@ pub async fn search_buckets_distributed(
         context,
         realm_id,
         local_node_id,
-        MetadataFanoutScope::new(
-            Some(MetadataApiQueryMode::Distributed),
-            request.target_nodes,
-            true,
-        )
-        .with_subject(subject)
-        .with_deadline(deadline),
+        MetadataFanoutScope::new(Some(ApiQueryMode::Distributed), request.target_nodes, true)
+            .with_subject(subject)
+            .with_deadline(deadline),
         MetadataFanoutOperation::BucketSearch,
         local_call,
         remote_call,
@@ -654,14 +648,14 @@ pub struct MetadataFanoutStats {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct MetadataRealmNodeDiscovery {
+pub(crate) struct RealmNodeDiscovery {
     pub(crate) nodes: Vec<NodeId>,
     pub(crate) failed: bool,
 }
 
 #[derive(Debug)]
 pub(super) struct MetadataFanoutScope {
-    pub(super) mode: Option<MetadataApiQueryMode>,
+    pub(super) mode: Option<ApiQueryMode>,
     pub(super) target_nodes: Option<Vec<NodeId>>,
     pub(super) allow_partial: bool,
     pub(super) discovery_failed: bool,
@@ -671,7 +665,7 @@ pub(super) struct MetadataFanoutScope {
 
 impl MetadataFanoutScope {
     pub(super) fn new(
-        mode: Option<MetadataApiQueryMode>,
+        mode: Option<ApiQueryMode>,
         target_nodes: Option<Vec<NodeId>>,
         allow_partial: bool,
     ) -> Self {

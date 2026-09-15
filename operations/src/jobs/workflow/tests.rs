@@ -11,7 +11,7 @@ use crate::jobs::store::{
 };
 use crate::jobs::workflow::workspace::mint_workspace_credential;
 use crate::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
-use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::session::{EndReason, Session};
 use aruna_core::UserId;
@@ -34,7 +34,7 @@ use tempfile::tempdir;
 use tokio::sync::Notify;
 use ulid::Ulid;
 
-use crate::tests::fixtures::workflow::{execution_spec, node_id};
+use crate::tests::workflow::{execution_spec, node_id};
 
 fn job_id() -> JobId {
     crate::jobs::submit::mint_job_id(
@@ -270,13 +270,10 @@ async fn denied_write_blocks() {
     assert_eq!(error.kind, JobErrorKind::Permanent);
     assert!(
         matches!(
-            drive(
-                GetBucketInfoOperation::new(bucket.clone()),
-                context.as_ref()
-            )
-            .await
-            .unwrap_err(),
-            GetBucketInfoError::NotFound
+            drive(GetBucketOperation::new(bucket.clone()), context.as_ref())
+                .await
+                .unwrap_err(),
+            GetBucketError::NotFound
         ),
         "a run never creates the bucket it names"
     );
@@ -1371,7 +1368,7 @@ async fn lose_claim(storage: &StorageHandle, job_id: JobId, token: ulid::Ulid) -
 // The reconciliation select may consume the heartbeat's completion when the
 // claim is lost; polling the finished handle again panics and must not adopt.
 #[tokio::test]
-async fn lost_claim_consumes_heartbeat() {
+async fn heartbeat_consumed_once() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let backend = StubBackend::new(StubReconcile::Pending);
@@ -1435,7 +1432,7 @@ async fn recovery_wins_adoption() {
 // A lease renewal failure ends the run while preparation is still pending; the
 // lost claim must not be written to or submitted to.
 #[tokio::test]
-async fn heartbeat_failure_stops_run() {
+async fn heartbeat_failure_stops() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let backend = StubBackend::new(StubReconcile::NotFound);

@@ -12,8 +12,8 @@ use aruna_core::keyspaces::{
     METADATA_PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataError,
-    MetadataGraphLifecycleRecord, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
+    GraphLifecycleRecord, MetadataError, MetadataEventRecord, MetadataLifecycleRecord,
+    MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::storage_entries::{
     document_lifecycle_key, event_log_key, graph_lifecycle_key, pending_projection_target,
@@ -21,7 +21,7 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::{
     ARUNA_DATA_PREFIX, AuthContext, BlobHeadKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, MetadataRegistryRecord, PathClaimRecord, Permission, PlacementRef,
-    RealmConfigDocument, RealmId, VersionKey, W3idDataIdentifier, bucket_permission_path,
+    RealmConfigDocument, RealmId, VersionKey, W3idIdentifier, bucket_permission_path,
     object_permission_path,
 };
 use aruna_core::telemetry::record_elapsed_ms;
@@ -66,7 +66,7 @@ pub(crate) use self::read::{
     metadata_read_request,
 };
 pub use self::read::{query_metadata, query_metadata_document, references_metadata};
-use super::MetadataAuthToken;
+use super::AuthToken;
 use super::forward::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::handle::{
     METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS,
@@ -84,7 +84,7 @@ use super::search_cursor::{
 use super::summary_cache::summary_cache;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::permission_rules::GroupPermissionRules;
-use crate::blob::permission_paths::ResolveBlobPermissionPathsOperation;
+use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::driver::{DriverContext, drive};
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::get_document::{load_document_record, record_materialized_read};
@@ -99,13 +99,12 @@ use crate::placement::{
     holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
     registry_strategy, resolve_holders_limit, resolve_shard_holders,
 };
-use crate::realm::get_config::GetRealmConfigOperation;
-use crate::realm::get_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
-use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::realm::get_config::GetConfigOperation;
+use crate::realm::get_nodes::{GetNodesOperation, REALM_DISCOVERY_TIMEOUT};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
 use crate::s3::search_objects::{
-    ObjectInventoryHit, ObjectKeyMatch, ObjectSearchNodePage, SearchObjectsInput,
-    search_local_objects,
+    ObjectInventoryHit, ObjectKeyMatch, SearchNodePage, SearchObjectsInput, search_local_objects,
 };
 
 mod distributed;
@@ -119,44 +118,38 @@ mod search;
 
 pub use self::distributed::MetadataQueryForm;
 pub use self::export::{
-    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
-    MetadataRoCrateExportView,
+    ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
 };
 use self::fanout::MetadataFanoutScope;
 pub use self::fanout::MetadataFanoutStats;
-pub(crate) use self::fanout::MetadataRealmNodeDiscovery;
+pub(crate) use self::fanout::RealmNodeDiscovery;
 pub use self::list::{
-    ListVisibleMetadataDocumentsRequest, ListVisibleMetadataDocumentsResult,
-    ListedMetadataDocument, MetadataListOrder, list_visible_documents,
+    ListVisibleRequest, ListVisibleResult, ListedMetadataDocument, MetadataListOrder,
+    list_visible_documents,
 };
 pub(crate) use self::path::resolve_local_path;
-pub use self::path::{MetadataPathLookupRequest, MetadataPathLookupResult, lookup_metadata_path};
+pub use self::path::{MetadataLookupRequest, MetadataLookupResult, lookup_metadata_path};
 #[cfg(test)]
 use self::path::{PathShardView, merge_path_views, reduce_path_candidates, select_path_holders};
 pub use self::preflight::{
-    MetadataPreflightExcludedForm, MetadataPreflightIndexState, MetadataPreflightLocation,
-    MetadataPreflightNodeFreshness, MetadataPreflightResolvedTarget,
-    MetadataPreflightStorageOperation, MetadataPreflightVisibleReference,
-    MetadataReferencePreflightCoverage, MetadataReferencePreflightExecution,
-    MetadataReferencePreflightNodeExecution, MetadataReferencePreflightNodeRequest,
-    MetadataReferencePreflightNodeTarget, MetadataReferencePreflightRequest,
-    MetadataReferencePreflightTarget, MetadataReferencePreflightTargetExecution,
-    references_preflight,
+    MetadataExcludedForm, MetadataIndexState, MetadataNodeFreshness, MetadataPreflightLocation,
+    MetadataResolvedTarget, MetadataStorageOperation, MetadataVisibleReference, ReferenceCoverage,
+    ReferenceExecution, ReferenceNodeExecution, ReferenceNodeRequest, ReferenceNodeTarget,
+    ReferenceRequest, ReferenceTarget, ReferenceTargetExecution, references_preflight,
 };
 #[cfg(test)]
 use self::preflight::{authorized_realm_nodes, preflight_fingerprint};
 pub use self::read::{
-    MetadataApiQueryMode, MetadataDocumentQueryRequest, MetadataQueryExecution,
-    MetadataQueryRequest, MetadataReferenceEntry, MetadataReferencesExecution,
-    MetadataReferencesRequest,
+    ApiQueryMode, DocumentQueryRequest, MetadataQueryExecution, MetadataQueryRequest,
+    MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
 };
 pub use self::search::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
-    ObjectSearchExecution, ObjectSearchPartitionCoverage, ObjectSearchQueryMode,
-    ObjectSearchRequest, search_metadata, search_objects,
+    ObjectExecution, ObjectPartitionCoverage, ObjectQueryMode, SearchQueryRequest, search_metadata,
+    search_objects,
 };
 #[cfg(test)]
-use self::search::{ObjectSearchCursor, ObjectSearchPartitionState};
+use self::search::{ObjectCursor, ObjectPartitionState};
 
 const METADATA_REFERENCES_DEFAULT_LIMIT: usize = 25;
 

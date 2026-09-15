@@ -11,6 +11,7 @@ pub mod connectors;
 pub mod device;
 pub mod document_repository;
 pub mod driver;
+pub(crate) mod effect_adapters;
 pub(crate) mod endpoint_screening;
 pub mod forward;
 pub mod groups;

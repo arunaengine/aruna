@@ -1,14 +1,13 @@
 use super::{
-    AuthContext, AuthFailure, DriverContext, GroupId, GroupPermissionRules, HashSet,
+    AuthContext, AuthFailure, AuthToken, DriverContext, GroupId, GroupPermissionRules, HashSet,
     METADATA_DISTRIBUTED_QUERY_DEADLINE, METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT,
     METADATA_DISTRIBUTED_QUERY_MAX_NODES, METADATA_REGISTRY_CANDIDATE_LIMIT, MetaResourceId,
-    MetadataApiError, MetadataAuthToken, MetadataPathCandidate, MetadataPathResolution,
-    MetadataPathWinner, MetadataReadError, MetadataRegistryRecord, MetadataTransportMessage,
-    NodeId, PathClaimRecord, PlacementRef, ROLE_NODE, ReadDecision, RealmConfigDocument, RealmId,
-    Ulid, holds_placement, load_realm_config, meta_bucket_subject, metadata_read_request,
-    neg_log2_q48, peer_rank, reduce_holder_reads, registry_placement, registry_placement_for,
-    registry_strategy, resolve_holders_limit, resolve_shard_holders, select_top_peers,
-    selector_hash, stream,
+    MetadataApiError, MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner,
+    MetadataReadError, MetadataRegistryRecord, MetadataTransportMessage, NodeId, PathClaimRecord,
+    PlacementRef, ROLE_NODE, ReadDecision, RealmConfigDocument, RealmId, Ulid, holds_placement,
+    load_realm_config, meta_bucket_subject, metadata_read_request, neg_log2_q48, peer_rank,
+    reduce_holder_reads, registry_placement, registry_placement_for, registry_strategy,
+    resolve_holders_limit, resolve_shard_holders, select_top_peers, selector_hash, stream,
 };
 
 use super::read::load_claim_records;
@@ -193,11 +192,11 @@ pub(super) async fn forward_path_resolution(
     context: &DriverContext,
     realm_id: RealmId,
     config: &RealmConfigDocument,
-    request: MetadataPathLookupRequest,
-    auth_token: Option<MetadataAuthToken>,
+    request: MetadataLookupRequest,
+    auth_token: Option<AuthToken>,
     config_digest: [u8; 32],
     deadline: tokio::time::Instant,
-) -> Result<MetadataPathLookupResult, MetadataApiError> {
+) -> Result<MetadataLookupResult, MetadataApiError> {
     if request.auth.is_some() && auth_token.is_none() {
         return Err(MetadataApiError::Unauthorized);
     }
@@ -241,7 +240,7 @@ pub(super) async fn forward_path_resolution(
     let mut divergent = false;
     let mut not_found = false;
     let mut unavailable = false;
-    let mut success: Option<MetadataPathLookupResult> = None;
+    let mut success: Option<MetadataLookupResult> = None;
     loop {
         let response = match tokio::time::timeout_at(deadline, requests.next()).await {
             Ok(response) => response,
@@ -260,7 +259,7 @@ pub(super) async fn forward_path_resolution(
                 )
                 .is_ok()
                 {
-                    let candidate = MetadataPathLookupResult {
+                    let candidate = MetadataLookupResult {
                         winner: result.winner,
                         conflicts: result.conflicts,
                     };
@@ -292,12 +291,12 @@ pub(super) async fn forward_path_resolution(
 }
 
 pub(super) fn reduce_path_response(
-    success: Option<MetadataPathLookupResult>,
+    success: Option<MetadataLookupResult>,
     auth_error: Option<MetadataReadError>,
     divergent: bool,
     not_found: bool,
     unavailable: bool,
-) -> Result<MetadataPathLookupResult, MetadataApiError> {
+) -> Result<MetadataLookupResult, MetadataApiError> {
     let conflict = divergent || (success.is_some() && (not_found || unavailable));
     match reduce_holder_reads(
         success,
@@ -400,7 +399,7 @@ pub(super) async fn load_path_holder(
     group_id: GroupId,
     document_path: &str,
     holder: NodeId,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
     config_digest: [u8; 32],
     deadline: tokio::time::Instant,
 ) -> Result<Vec<MetadataPathCandidate>, MetadataApiError> {
@@ -586,7 +585,7 @@ pub(super) fn select_fanout_nodes(
 
 pub(super) fn reduce_path_candidates(
     candidates: Vec<MetadataPathCandidate>,
-) -> Result<MetadataPathLookupResult, MetadataApiError> {
+) -> Result<MetadataLookupResult, MetadataApiError> {
     let claims = candidates
         .iter()
         .map(|candidate| candidate.claim.clone())
@@ -610,7 +609,7 @@ pub(super) fn reduce_path_candidates(
                 .map(|record| record.document_id)
         })
         .collect::<Vec<_>>();
-    Ok(MetadataPathLookupResult { winner, conflicts })
+    Ok(MetadataLookupResult { winner, conflicts })
 }
 
 pub(super) fn sanitize_path_winner(
@@ -643,14 +642,14 @@ pub(super) fn sanitize_path_winner(
 }
 
 #[derive(Debug, Clone)]
-pub struct MetadataPathLookupRequest {
+pub struct MetadataLookupRequest {
     pub group_id: GroupId,
     pub document_path: String,
     pub auth: Option<AuthContext>,
 }
 
 #[derive(Debug, Clone)]
-pub struct MetadataPathLookupResult {
+pub struct MetadataLookupResult {
     pub winner: MetadataPathWinner,
     pub conflicts: Vec<Ulid>,
 }
@@ -664,9 +663,9 @@ pub(super) struct PathHolderSelection {
 pub async fn lookup_metadata_path(
     context: &DriverContext,
     realm_id: RealmId,
-    request: MetadataPathLookupRequest,
-    auth_token: Option<MetadataAuthToken>,
-) -> Result<MetadataPathLookupResult, MetadataApiError> {
+    request: MetadataLookupRequest,
+    auth_token: Option<AuthToken>,
+) -> Result<MetadataLookupResult, MetadataApiError> {
     let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
     let normalized = MetadataRegistryRecord::normalize_document_path(&request.document_path);
     if normalized.is_empty() {
@@ -712,7 +711,7 @@ pub async fn lookup_metadata_path(
         .digest()
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let shard_count = strategy.shard_count;
-    let auth_token = auth_token.or_else(|| request.auth.clone().map(MetadataAuthToken::internal));
+    let auth_token = auth_token.or_else(|| request.auth.clone().map(AuthToken::internal));
     let group_id = request.group_id;
     let auth = request.auth.as_ref();
     let (holders, replica_counts) = select_path_holders(
@@ -819,8 +818,8 @@ pub async fn lookup_metadata_path(
 pub(crate) async fn resolve_local_path(
     context: &DriverContext,
     realm_id: RealmId,
-    request: MetadataPathLookupRequest,
-) -> Result<MetadataPathLookupResult, MetadataApiError> {
+    request: MetadataLookupRequest,
+) -> Result<MetadataLookupResult, MetadataApiError> {
     let normalized = MetadataRegistryRecord::normalize_document_path(&request.document_path);
     if normalized.is_empty() {
         return Err(MetadataApiError::BadRequest);
