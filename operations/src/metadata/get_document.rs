@@ -1,8 +1,7 @@
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::metadata::{
-    MetadataDocumentView, MetadataEffect, MetadataError, MetadataEvent,
-    MetadataMaterializationState,
+    MaterializationState, MetadataDocumentView, MetadataEffect, MetadataError, MetadataEvent,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::MetadataRegistryRecord;
@@ -18,16 +17,16 @@ use crate::metadata::repository::{
 };
 
 #[derive(Debug, PartialEq)]
-pub struct GetMetadataDocumentOperation {
+pub struct GetDocumentOperation {
     group_id: GroupId,
     document_id: Ulid,
     record: Option<MetadataRegistryRecord>,
-    state: GetMetadataDocumentState,
-    output: Option<Result<MetadataDocumentView, GetMetadataDocumentError>>,
+    state: GetDocumentState,
+    output: Option<Result<MetadataDocumentView, GetDocumentError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum GetMetadataDocumentState {
+enum GetDocumentState {
     Init,
     ReadRecord,
     ReadGraphLifecycle,
@@ -38,7 +37,7 @@ enum GetMetadataDocumentState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum GetMetadataDocumentError {
+pub enum GetDocumentError {
     #[error(transparent)]
     StorageError(#[from] aruna_core::errors::StorageError),
     #[error(transparent)]
@@ -57,26 +56,26 @@ pub enum GetMetadataDocumentError {
     },
 }
 
-impl GetMetadataDocumentOperation {
+impl GetDocumentOperation {
     pub fn new(group_id: GroupId, document_id: Ulid) -> Self {
         Self {
             group_id,
             document_id,
             record: None,
-            state: GetMetadataDocumentState::Init,
+            state: GetDocumentState::Init,
             output: None,
         }
     }
 
-    fn fail(&mut self, error: GetMetadataDocumentError) -> Effects {
-        self.state = GetMetadataDocumentState::Error;
+    fn fail(&mut self, error: GetDocumentError) -> Effects {
+        self.state = GetDocumentState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
-        self.fail(GetMetadataDocumentError::UnexpectedEvent {
+        self.fail(GetDocumentError::UnexpectedEvent {
             state,
             expected,
             got,
@@ -109,58 +108,58 @@ pub async fn record_materialized_read(
     // Registry rows can replicate ahead of the document event, so only a status
     // recorded for exactly this cursor proves the graph matches the record.
     Ok(status.event_id == record.last_event_id
-        && matches!(status.state, MetadataMaterializationState::Materialized))
+        && matches!(status.state, MaterializationState::Materialized))
 }
 
-impl Operation for GetMetadataDocumentOperation {
+impl Operation for GetDocumentOperation {
     type Output = MetadataDocumentView;
-    type Error = GetMetadataDocumentError;
+    type Error = GetDocumentError;
 
     fn start(&mut self) -> Effects {
-        self.state = GetMetadataDocumentState::ReadRecord;
+        self.state = GetDocumentState::ReadRecord;
         smallvec![read_registry_effect(self.group_id, self.document_id, None)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            GetMetadataDocumentState::ReadRecord => match parse_registry_read(event) {
+            GetDocumentState::ReadRecord => match parse_registry_read(event) {
                 Ok(Some(record)) => {
                     let graph_iri = record.graph_iri.clone();
                     self.record = Some(record);
-                    self.state = GetMetadataDocumentState::ReadGraphLifecycle;
+                    self.state = GetDocumentState::ReadGraphLifecycle;
                     smallvec![read_lifecycle_effect(&graph_iri, None)]
                 }
-                Ok(None) => self.fail(GetMetadataDocumentError::DocumentNotFound),
+                Ok(None) => self.fail(GetDocumentError::DocumentNotFound),
                 Err(StorageReadError::Storage(error)) => self.fail(error.into()),
                 Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
             },
-            GetMetadataDocumentState::ReadGraphLifecycle => match parse_lifecycle_read(event) {
+            GetDocumentState::ReadGraphLifecycle => match parse_lifecycle_read(event) {
                 Ok(Some(record)) if record.is_deleted() => {
-                    self.fail(GetMetadataDocumentError::DocumentNotFound)
+                    self.fail(GetDocumentError::DocumentNotFound)
                 }
                 Ok(_) => {
                     let Some(record) = self.record.as_ref() else {
-                        return self.fail(GetMetadataDocumentError::DocumentNotFound);
+                        return self.fail(GetDocumentError::DocumentNotFound);
                     };
-                    self.state = GetMetadataDocumentState::ReadMaterializationStatus;
+                    self.state = GetDocumentState::ReadMaterializationStatus;
                     smallvec![read_status_effect(record.document_id, None)]
                 }
                 Err(StorageReadError::Storage(error)) => self.fail(error.into()),
                 Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
             },
-            GetMetadataDocumentState::ReadMaterializationStatus => match parse_status_read(event) {
+            GetDocumentState::ReadMaterializationStatus => match parse_status_read(event) {
                 Ok(status) => {
                     let Some(record) = self.record.as_ref() else {
-                        return self.fail(GetMetadataDocumentError::DocumentNotFound);
+                        return self.fail(GetDocumentError::DocumentNotFound);
                     };
                     if status.is_some_and(|status| {
                         status.event_id == record.last_event_id
-                            && !matches!(status.state, MetadataMaterializationState::Materialized)
+                            && !matches!(status.state, MaterializationState::Materialized)
                     }) {
                         return self.fail(MetadataError::GraphNotFound.into());
                     }
                     let graph_iri = record.graph_iri.clone();
-                    self.state = GetMetadataDocumentState::ExportRoCrate;
+                    self.state = GetDocumentState::ExportRoCrate;
                     smallvec![aruna_core::effects::Effect::Metadata(
                         MetadataEffect::ExportRoCrate { graph_iri },
                     )]
@@ -168,34 +167,33 @@ impl Operation for GetMetadataDocumentOperation {
                 Err(StorageReadError::Storage(error)) => self.fail(error.into()),
                 Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
             },
-            GetMetadataDocumentState::ExportRoCrate => match event {
+            GetDocumentState::ExportRoCrate => match event {
                 Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => {
                     let Some(record) = self.record.take() else {
-                        return self.fail(GetMetadataDocumentError::DocumentNotFound);
+                        return self.fail(GetDocumentError::DocumentNotFound);
                     };
-                    self.state = GetMetadataDocumentState::Finish;
+                    self.state = GetDocumentState::Finish;
                     self.output = Some(Ok(MetadataDocumentView { record, jsonld }));
                     smallvec![]
                 }
                 Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
                 other => self.unexpected_event("metadata export result", format!("{other:?}")),
             },
-            GetMetadataDocumentState::Finish
-            | GetMetadataDocumentState::Error
-            | GetMetadataDocumentState::Init => smallvec![],
+            GetDocumentState::Finish | GetDocumentState::Error | GetDocumentState::Init => {
+                smallvec![]
+            }
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            GetMetadataDocumentState::Finish | GetMetadataDocumentState::Error
+            GetDocumentState::Finish | GetDocumentState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(GetMetadataDocumentError::NotFinished))
+        self.output.unwrap_or(Err(GetDocumentError::NotFinished))
     }
 
     // A read of a document that does not exist yet, or whose graph has not
@@ -203,8 +201,8 @@ impl Operation for GetMetadataDocumentOperation {
     fn expected_error(error: &Self::Error) -> bool {
         matches!(
             error,
-            GetMetadataDocumentError::DocumentNotFound
-                | GetMetadataDocumentError::MetadataError(MetadataError::GraphNotFound)
+            GetDocumentError::DocumentNotFound
+                | GetDocumentError::MetadataError(MetadataError::GraphNotFound)
         )
     }
 
@@ -218,7 +216,7 @@ mod tests {
     use super::{DriverContext, record_materialized_read};
     use aruna_core::effects::StorageEffect;
     use aruna_core::handle::Handle;
-    use aruna_core::metadata::{MetadataMaterializationState, MetadataMaterializationStatusRecord};
+    use aruna_core::metadata::{MaterializationState, MaterializationStatusRecord};
     use aruna_core::storage_entries::materialization_status_entry;
     use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use aruna_storage::storage::FjallStorage;
@@ -251,14 +249,14 @@ mod tests {
         }
     }
 
-    fn make_status(document_id: Ulid, event_id: Ulid) -> MetadataMaterializationStatusRecord {
-        MetadataMaterializationStatusRecord {
+    fn make_status(document_id: Ulid, event_id: Ulid) -> MaterializationStatusRecord {
+        MaterializationStatusRecord {
             document_id,
             event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
             context_digest: None,
             dataset_digest: None,
-            state: MetadataMaterializationState::Materialized,
+            state: MaterializationState::Materialized,
             attempts: 1,
             failures: 0,
             last_error: None,

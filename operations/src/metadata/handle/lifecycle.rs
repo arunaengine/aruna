@@ -9,9 +9,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE};
-use aruna_core::metadata::{
-    MetadataEffect, MetadataError, MetadataEvent, MetadataGraphLifecycleRecord,
-};
+use aruna_core::metadata::{GraphLifecycleRecord, MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::GroupId;
@@ -23,7 +21,7 @@ use ulid::Ulid;
 
 use super::entity_convert::error_from_craqle;
 use super::{
-    LifecycleDeletedCacheEntry, METADATA_GRAPH_SYNC_ATTEMPTS, METADATA_GRAPH_SYNC_RETRY_AFTER,
+    LifecycleDeletedEntry, METADATA_GRAPH_SYNC_ATTEMPTS, METADATA_GRAPH_SYNC_RETRY_AFTER,
     METADATA_REGISTRY_CANDIDATE_LIMIT, METADATA_VISIBILITY_CACHE_TTL, MetadataHandle,
     MetadataInner, MetadataVisibilityCache, RegistryCacheEntry, VisibilityFillResult,
     metadata_graph_fence, summary_cache,
@@ -147,7 +145,7 @@ impl MetadataVisibilityCache {
         for (graph_iri, deleted) in lifecycle_entries {
             lifecycle.insert(
                 graph_iri,
-                LifecycleDeletedCacheEntry {
+                LifecycleDeletedEntry {
                     deleted,
                     expires_at,
                 },
@@ -192,7 +190,7 @@ impl MetadataVisibilityCache {
         Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
         lifecycle.insert(
             graph_iri,
-            LifecycleDeletedCacheEntry {
+            LifecycleDeletedEntry {
                 deleted,
                 expires_at: now + METADATA_VISIBILITY_CACHE_TTL,
             },
@@ -224,7 +222,7 @@ impl MetadataVisibilityCache {
         for (graph_iri, deleted) in entries {
             lifecycle.insert(
                 graph_iri,
-                LifecycleDeletedCacheEntry {
+                LifecycleDeletedEntry {
                     deleted,
                     expires_at,
                 },
@@ -234,7 +232,7 @@ impl MetadataVisibilityCache {
     }
 
     pub(super) fn trim_lifecycle_deleted(
-        lifecycle: &mut HashMap<String, LifecycleDeletedCacheEntry>,
+        lifecycle: &mut HashMap<String, LifecycleDeletedEntry>,
         protected: &HashSet<String>,
         now: Instant,
     ) {
@@ -288,7 +286,7 @@ impl MetadataVisibilityCache {
         for (graph_iri, deleted) in entries {
             lifecycle.insert(
                 graph_iri,
-                LifecycleDeletedCacheEntry {
+                LifecycleDeletedEntry {
                     deleted,
                     expires_at,
                 },
@@ -517,7 +515,7 @@ impl MetadataHandle {
 async fn graph_lifecycle_record(
     storage_handle: StorageHandle,
     graph_iri: &str,
-) -> Result<Option<MetadataGraphLifecycleRecord>, MetadataError> {
+) -> Result<Option<GraphLifecycleRecord>, MetadataError> {
     let event = storage_handle
         .send_effect(read_lifecycle_effect(graph_iri, None))
         .await;
@@ -933,7 +931,7 @@ pub(super) async fn list_deleted_iris(
             ));
         }
         for (_, value) in values {
-            let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&value)
+            let record: GraphLifecycleRecord = postcard::from_bytes(&value)
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
             if record.is_deleted() {
                 deleted.insert(record.graph_iri);

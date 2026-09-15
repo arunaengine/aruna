@@ -1,8 +1,8 @@
 use aruna_core::NodeId;
 use aruna_core::metadata::{
-    MetadataBatch, MetadataBatchSource, MetadataCreateCrateRequest, MetadataDot, MetadataError,
+    MetadataBatch, MetadataBatchSource, MetadataCrateRequest, MetadataDot, MetadataError,
     MetadataGraphPolicy, MetadataQuadOp, MetadataRequestDurability, MetadataRoCratePage,
-    MetadataSearchHit, MetadataUpsertEntityRequest, MetadataValidationViolation,
+    MetadataSearchHit, MetadataValidationViolation, UpsertEntityRequest,
 };
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_storage::FjallPersistPolicy;
@@ -19,7 +19,7 @@ use crate::metadata::search_enrichment::{hit_snippet, hit_title, hit_types};
 pub(super) fn upsert_data_entity(
     node: &CraqleNode,
     auth: &AllowAllAuthorizer,
-    request: MetadataUpsertEntityRequest,
+    request: UpsertEntityRequest,
 ) -> Result<MetadataBatch, CraqleError> {
     let graph = GraphId::new(&request.graph_iri);
     let actor = request.deterministic_actor.map(ActorId::from_bytes);
@@ -36,7 +36,7 @@ pub(super) fn upsert_data_entity(
 pub(super) fn upsert_contextual_entity(
     node: &CraqleNode,
     auth: &AllowAllAuthorizer,
-    request: MetadataUpsertEntityRequest,
+    request: UpsertEntityRequest,
 ) -> Result<MetadataBatch, CraqleError> {
     let graph = GraphId::new(&request.graph_iri);
     let actor = request.deterministic_actor.map(ActorId::from_bytes);
@@ -486,7 +486,7 @@ fn metadata_violations(violations: Vec<craqle::CrateViolation>) -> MetadataError
     )
 }
 
-pub(super) fn craqle_create_request(request: MetadataCreateCrateRequest) -> CreateCrateRequest {
+pub(super) fn craqle_create_request(request: MetadataCrateRequest) -> CreateCrateRequest {
     CreateCrateRequest::new(
         GraphId::new(&request.graph_iri),
         request.name,

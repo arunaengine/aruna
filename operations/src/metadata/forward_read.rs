@@ -1,11 +1,11 @@
 use crate::device::replica::ReplicaRecord;
 use crate::device::replica::read_replica;
 use crate::driver::DriverContext;
-use crate::metadata::api::ExportMetadataRoCrateRequest;
-use crate::metadata::api::ExportMetadataRoCrateResult;
-use crate::metadata::api::GetVisibleMetadataDocumentRequest;
+use crate::metadata::api::ExportMetadataRequest;
+use crate::metadata::api::ExportMetadataResult;
+use crate::metadata::api::GetVisibleRequest;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::MetadataRoCrateExportView;
+use crate::metadata::api::RoCrateExportView;
 use crate::metadata::api::ensure_record_readable;
 use crate::metadata::api::export_metadata_rocrate;
 use crate::metadata::api::get_visible_document;
@@ -13,7 +13,7 @@ use crate::metadata::api::load_live_record;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::profile_validation::current_validation_status;
 use crate::metadata::profile_validation::revalidate_current;
-use crate::metadata::protocol::MetadataAuthToken;
+use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::raw_revision::MetadataRawView;
@@ -23,11 +23,11 @@ use crate::placement::read_holder_sets;
 use crate::realm::peer_trust::PeerTrust;
 use crate::realm::peer_trust::ensure_peer_trust;
 use aruna_core::NodeId;
-use aruna_core::metadata::MetadataMaterializationState;
+use aruna_core::metadata::MaterializationState;
 use aruna_core::metadata::MetadataMergedRevision;
-use aruna_core::metadata::MetadataProfileValidationStatus;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::metadata::MetadataRawRevision;
+use aruna_core::metadata::ProfileValidationStatus;
 use aruna_core::metadata::raw_context_digest;
 use aruna_core::structs::AuthContext;
 use aruna_core::structs::MetadataRegistryRecord;
@@ -106,8 +106,8 @@ pub(super) async fn device_replica(
 pub(super) async fn device_export(
     context: &Arc<DriverContext>,
     replica: ReplicaRecord,
-    request: &ExportMetadataRoCrateRequest,
-) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
+    request: &ExportMetadataRequest,
+) -> Result<ExportMetadataResult, MetadataApiError> {
     let record = replica
         .record
         .map(|record| *record)
@@ -125,11 +125,11 @@ pub(super) async fn device_export(
         .clone()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     match request.view {
-        MetadataRoCrateExportView::Full => Ok(ExportMetadataRoCrateResult::Full {
+        RoCrateExportView::Full => Ok(ExportMetadataResult::Full {
             jsonld: replica.displayed_jsonld,
             record,
         }),
-        MetadataRoCrateExportView::Raw => {
+        RoCrateExportView::Raw => {
             let merged = if replica.findings > 0 {
                 Some(
                     handle
@@ -140,7 +140,7 @@ pub(super) async fn device_export(
             } else {
                 None
             };
-            Ok(ExportMetadataRoCrateResult::Raw {
+            Ok(ExportMetadataResult::Raw {
                 raw: MetadataRawView {
                     revision: device_raw_revision(
                         &replica.displayed_jsonld,
@@ -149,21 +149,21 @@ pub(super) async fn device_export(
                         record.last_event_id,
                         merged,
                     ),
-                    projection_state: MetadataMaterializationState::Materialized,
+                    projection_state: MaterializationState::Materialized,
                     projected_event_id: Some(record.last_event_id),
                 },
                 dataset_digest: replica.dataset_digest,
                 record,
             })
         }
-        MetadataRoCrateExportView::Summary => Ok(ExportMetadataRoCrateResult::Summary {
+        RoCrateExportView::Summary => Ok(ExportMetadataResult::Summary {
             jsonld: handle
                 .export_summary_jsonld(record.graph_iri.clone())
                 .await
                 .map_err(|_| MetadataApiError::ServiceUnavailable)?,
             record,
         }),
-        MetadataRoCrateExportView::Page => Ok(ExportMetadataRoCrateResult::Page {
+        RoCrateExportView::Page => Ok(ExportMetadataResult::Page {
             page: handle
                 .export_rocrate_page(
                     record.graph_iri.clone(),
@@ -197,8 +197,8 @@ pub(super) fn device_raw_revision(
 pub async fn get_metadata_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
-    request: GetVisibleMetadataDocumentRequest,
-    auth_token: Option<MetadataAuthToken>,
+    request: GetVisibleRequest,
+    auth_token: Option<AuthToken>,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
     if context.net_handle.is_none() {
         return get_visible_document(context.as_ref(), realm_id, request).await;
@@ -328,10 +328,10 @@ pub async fn get_metadata_routed(
 pub async fn route_profile_status(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
-    request: GetVisibleMetadataDocumentRequest,
-    auth_token: Option<MetadataAuthToken>,
+    request: GetVisibleRequest,
+    auth_token: Option<AuthToken>,
     revalidate: bool,
-) -> Result<MetadataProfileValidationStatus, MetadataApiError> {
+) -> Result<ProfileValidationStatus, MetadataApiError> {
     let registry = load_live_record(context.as_ref(), request.document_id).await?;
     if context.net_handle.is_none() {
         ensure_record_readable(
@@ -450,8 +450,8 @@ pub async fn route_profile_status(
 }
 
 pub(super) fn keep_status(
-    current: &mut Option<MetadataProfileValidationStatus>,
-    incoming: MetadataProfileValidationStatus,
+    current: &mut Option<ProfileValidationStatus>,
+    incoming: ProfileValidationStatus,
     expected_revision: Ulid,
 ) {
     let incoming_exact = incoming.dataset_revision == expected_revision;
@@ -468,10 +468,10 @@ pub(super) fn keep_status(
 pub async fn export_rocrate_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
-    request: ExportMetadataRoCrateRequest,
-    forward_token: Option<MetadataAuthToken>,
+    request: ExportMetadataRequest,
+    forward_token: Option<AuthToken>,
     metadata_bytes: u64,
-) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
+) -> Result<ExportMetadataResult, MetadataApiError> {
     if context.net_handle.is_none() {
         let export = export_metadata_rocrate(context.as_ref(), realm_id, request).await?;
         ensure_export_limit(&export, metadata_bytes)?;
@@ -572,14 +572,14 @@ pub async fn export_rocrate_routed(
 }
 
 pub(super) fn ensure_export_limit(
-    export: &ExportMetadataRoCrateResult,
+    export: &ExportMetadataResult,
     metadata_bytes: u64,
 ) -> Result<(), MetadataApiError> {
     let length = match export {
-        ExportMetadataRoCrateResult::Full { jsonld, .. }
-        | ExportMetadataRoCrateResult::Summary { jsonld, .. } => jsonld.len(),
-        ExportMetadataRoCrateResult::Page { page, .. } => page.jsonld.len(),
-        ExportMetadataRoCrateResult::Raw { raw, .. } => raw.revision.jsonld.len(),
+        ExportMetadataResult::Full { jsonld, .. }
+        | ExportMetadataResult::Summary { jsonld, .. } => jsonld.len(),
+        ExportMetadataResult::Page { page, .. } => page.jsonld.len(),
+        ExportMetadataResult::Raw { raw, .. } => raw.revision.jsonld.len(),
     };
     if u64::try_from(length).unwrap_or(u64::MAX) > metadata_bytes {
         return Err(MetadataApiError::ServiceUnavailable);
@@ -599,7 +599,7 @@ pub(crate) async fn export_profile_routed(
     realm_id: RealmId,
     profile_id: Ulid,
     expected_revision: Ulid,
-) -> Result<ExportMetadataRoCrateResult, MetadataReadError> {
+) -> Result<ExportMetadataResult, MetadataReadError> {
     let Some(net_handle) = context.net_handle.as_ref() else {
         return export_profile_local(context.as_ref(), realm_id, profile_id, expected_revision)
             .await;
@@ -657,13 +657,10 @@ pub(crate) async fn export_profile_routed(
 /// Any answer is the exact revision that was asked for, so a lagging holder's
 /// not-found never outranks a holder that served that revision.
 pub(super) fn collect_profile_export(
-    responses: Vec<(
-        NodeId,
-        Result<ExportMetadataRoCrateResult, MetadataReadError>,
-    )>,
+    responses: Vec<(NodeId, Result<ExportMetadataResult, MetadataReadError>)>,
     holder_count: usize,
     timed_out: bool,
-) -> Result<ExportMetadataRoCrateResult, MetadataReadError> {
+) -> Result<ExportMetadataResult, MetadataReadError> {
     let mut not_found = 0usize;
     let mut success = None;
     let mut auth_error = None;
@@ -746,7 +743,7 @@ pub(super) async fn export_as_owner(
     realm_id: RealmId,
     local_node: NodeId,
     profile_id: Ulid,
-) -> Result<ExportMetadataRoCrateResult, MetadataReadError> {
+) -> Result<ExportMetadataResult, MetadataReadError> {
     let owner = crate::realm::mutate_placement::node_kind(config, local_node)
         .and_then(|kind| kind.owner())
         .ok_or(MetadataReadError::Unavailable)?;
@@ -759,15 +756,15 @@ pub(super) async fn export_as_owner(
     export_rocrate_routed(
         context,
         realm_id,
-        ExportMetadataRoCrateRequest {
+        ExportMetadataRequest {
             document_id: profile_id,
             auth: Some(auth.clone()),
-            view: MetadataRoCrateExportView::Raw,
+            view: RoCrateExportView::Raw,
             limit: None,
             offset: None,
             after: None,
         },
-        Some(MetadataAuthToken::internal(auth)),
+        Some(AuthToken::internal(auth)),
         u64::MAX,
     )
     .await
@@ -782,7 +779,7 @@ pub async fn export_profile_local(
     realm_id: RealmId,
     profile_id: Ulid,
     expected_revision: Ulid,
-) -> Result<ExportMetadataRoCrateResult, MetadataReadError> {
+) -> Result<ExportMetadataResult, MetadataReadError> {
     let record = load_live_record(context, profile_id)
         .await
         .map_err(read_error)?;
@@ -804,7 +801,7 @@ pub async fn export_profile_local(
         return Err(MetadataReadError::Unavailable);
     }
     let dataset_digest = raw.revision.dataset_digest;
-    Ok(ExportMetadataRoCrateResult::Raw {
+    Ok(ExportMetadataResult::Raw {
         record,
         raw,
         dataset_digest,
@@ -825,7 +822,7 @@ pub(crate) async fn apply_forwarded_profile(
     peer: NodeId,
     message: MetadataTransportMessage,
     local_limit: u64,
-) -> Result<(ExportMetadataRoCrateResult, u64), MetadataReadError> {
+) -> Result<(ExportMetadataResult, u64), MetadataReadError> {
     let MetadataTransportMessage::ForwardExportProfile {
         config_digest,
         profile_id,
@@ -862,7 +859,7 @@ pub(crate) async fn apply_forwarded_export(
     peer: NodeId,
     message: MetadataTransportMessage,
     local_limit: u64,
-) -> Result<(ExportMetadataRoCrateResult, u64), MetadataReadError> {
+) -> Result<(ExportMetadataResult, u64), MetadataReadError> {
     let MetadataTransportMessage::ForwardExportDocument {
         auth_token,
         config_digest,
@@ -900,7 +897,7 @@ pub(crate) async fn apply_forwarded_export(
     let export = export_metadata_rocrate(
         context.as_ref(),
         realm_id,
-        ExportMetadataRoCrateRequest {
+        ExportMetadataRequest {
             document_id,
             auth,
             view,
@@ -953,7 +950,7 @@ pub(crate) async fn apply_document_query(
     let record = get_visible_document(
         context.as_ref(),
         realm_id,
-        GetVisibleMetadataDocumentRequest {
+        GetVisibleRequest {
             document_id,
             auth: auth.clone(),
         },

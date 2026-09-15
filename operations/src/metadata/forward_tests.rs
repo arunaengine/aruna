@@ -10,7 +10,7 @@ use crate::forward::routing::holds_metadata_id;
 use crate::forward::routing::write_route;
 use crate::forward::transport::RetryDisposition;
 use crate::forward::transport::retry_disposition;
-use crate::metadata::create_document::CreateMetadataDocumentConfig;
+use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::handle::MetadataRequestDelivery;
 use crate::metadata::protocol::MetadataReadError;
@@ -20,7 +20,7 @@ use aruna_core::NodeId;
 use aruna_core::StructuredId;
 use aruna_core::UserId;
 use aruna_core::metadata::MetadataMergedRevision;
-use aruna_core::metadata::MetadataProfileValidationStatus;
+use aruna_core::metadata::ProfileValidationStatus;
 use aruna_core::structs::Actor;
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::structs::PlacementRef;
@@ -35,7 +35,7 @@ use super::read::keep_status;
 use super::*;
 
 use crate::device::replica::ReplicaOrigin;
-use aruna_core::metadata::{MetadataProfileValidationCompleteness, MetadataProfileValidationState};
+use aruna_core::metadata::{ProfileValidationCompleteness, ProfileValidationState};
 use aruna_core::structs::{METADATA_HANDLE, PlacementStrategy};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 
@@ -43,18 +43,18 @@ fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-fn validation_status(revision: Ulid) -> MetadataProfileValidationStatus {
-    MetadataProfileValidationStatus {
+fn validation_status(revision: Ulid) -> ProfileValidationStatus {
+    ProfileValidationStatus {
         document_id: Ulid::nil(),
         dataset_revision: revision,
-        state: MetadataProfileValidationState::NotProfiled,
+        state: ProfileValidationState::NotProfiled,
         profile_id: None,
         profile_iri: None,
         profile_revision: None,
         evaluator: "test".to_string(),
         validated_at_ms: None,
         findings: Vec::new(),
-        completeness: MetadataProfileValidationCompleteness::Complete,
+        completeness: ProfileValidationCompleteness::Complete,
         stale_reason: None,
         dataset_digest: None,
     }
@@ -332,7 +332,7 @@ fn response_records_checked() {
         &substituted,
     ));
 
-    let create = CreateMetadataDocumentConfig {
+    let create = CreateDocumentConfig {
         actor: Actor {
             node_id: node(1),
             user_id: aruna_core::UserId::local(Ulid::from_bytes([6u8; 16]), realm_id),
@@ -342,7 +342,7 @@ fn response_records_checked() {
         document_id: Ulid::nil(),
         document_path: "/docs/one/".to_string(),
         public: true,
-        payload: crate::metadata::create_document::CreateMetadataDocumentPayload::Scaffold {
+        payload: crate::metadata::create_document::CreateDocumentPayload::Scaffold {
             name: "one".to_string(),
             description: String::new(),
             date_published: "2026-01-01".to_string(),
