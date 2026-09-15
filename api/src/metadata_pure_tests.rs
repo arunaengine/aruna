@@ -2,9 +2,9 @@
 //! runtime, storage, or network.
 
 use super::*;
-use crate::auth::ValidatedArunaBearerTokenCarrier;
+use crate::auth::ValidatedBearer;
 use aruna_core::metadata::MetadataQueryResults;
-use aruna_operations::metadata::MetadataAuthToken;
+use aruna_operations::metadata::AuthToken;
 use aruna_operations::metadata::api::{
     MetadataQueryForm as QueryForm, aggregate_query_results, deduplicate_fanout_nodes,
     query_select_limit,
@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 #[test]
 fn maps_conflict_409() {
     use axum::response::IntoResponse;
-    let mapped = map_create_error(CreateMetadataDocumentError::StorageError(
+    let mapped = map_create_error(CreateDocumentError::StorageError(
         StorageError::TransactionConflict,
     ));
     assert!(matches!(mapped, ServerError::Conflict(_)));
@@ -61,12 +61,12 @@ fn fanout_order_preserved() {
 
 #[test]
 fn bearer_limits() {
-    let limit = ValidatedArunaBearerTokenCarrier::new_for_test("x".repeat(4096));
-    let oversized = ValidatedArunaBearerTokenCarrier::new_for_test("x".repeat(4097));
+    let limit = ValidatedBearer::new_for_test("x".repeat(4096));
+    let oversized = ValidatedBearer::new_for_test("x".repeat(4097));
 
     assert!(matches!(
         forwarded_auth_token(Some(limit)),
-        Ok(Some(MetadataAuthToken::Bearer(_)))
+        Ok(Some(AuthToken::Bearer(_)))
     ));
     assert!(matches!(
         forwarded_auth_token(Some(oversized)),
