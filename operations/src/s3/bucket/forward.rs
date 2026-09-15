@@ -1,11 +1,11 @@
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::metadata::protocol::MetadataAuthToken;
+use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;
-use crate::s3::create_bucket::CreateBucketError;
-use crate::s3::create_bucket::CreateBucketOperation;
-use crate::s3::get_bucket::GetBucketInfoOperation;
+use crate::s3::bucket::create::CreateBucketError;
+use crate::s3::bucket::create::CreateBucketOperation;
+use crate::s3::bucket::get::GetBucketOperation;
 use aruna_core::NodeId;
 use aruna_core::structs::BucketInfo;
 use aruna_core::structs::Permission;
@@ -46,7 +46,7 @@ pub(crate) async fn apply_bucket_create(
 pub(super) async fn create_remote_bucket(
     context: &Arc<DriverContext>,
     peer: NodeId,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
     bucket: &str,
     group_id: GroupId,
 ) -> Result<(), SyncRefusal> {
@@ -99,7 +99,7 @@ pub(super) async fn create_remote_bucket(
         Ok(_) => Ok(()),
         Err(CreateBucketError::BucketAlreadyExists) => {
             match drive(
-                GetBucketInfoOperation::new(bucket.to_string()),
+                GetBucketOperation::new(bucket.to_string()),
                 context.as_ref(),
             )
             .await

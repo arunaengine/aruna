@@ -466,7 +466,7 @@ impl Operation for DeleteBucketOperation {
 mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::s3::create_bucket::CreateBucketOperation;
+    use crate::s3::bucket::create::CreateBucketOperation;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{

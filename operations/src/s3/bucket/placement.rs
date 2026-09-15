@@ -24,7 +24,7 @@ use crate::placement::policy::read::ReadPolicyError;
 use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PutBucketPlacementInput {
+pub struct PutPlacementInput {
     pub bucket: String,
     pub group_id: GroupId,
     pub policies: Vec<PlacementPolicyRef>,
@@ -58,7 +58,7 @@ enum PutPlacementState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum PutBucketPlacementError {
+pub enum PutPlacementError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -96,16 +96,16 @@ pub enum PutBucketPlacementError {
 /// Sets the bucket default ref set and advances `placement_policy_generation`
 /// in the same transaction, so a write that read an older default is detectable.
 #[derive(Debug, PartialEq)]
-pub struct PutBucketPlacementOperation {
-    input: PutBucketPlacementInput,
+pub struct PutPlacementOperation {
+    input: PutPlacementInput,
     state: PutPlacementState,
     resolver: Option<PolicySetResolver>,
     txn_id: Option<TxnId>,
-    output: Option<Result<BucketPlacementDefault, PutBucketPlacementError>>,
+    output: Option<Result<BucketPlacementDefault, PutPlacementError>>,
 }
 
-impl PutBucketPlacementOperation {
-    pub fn new(input: PutBucketPlacementInput) -> Self {
+impl PutPlacementOperation {
+    pub fn new(input: PutPlacementInput) -> Self {
         Self {
             input,
             state: PutPlacementState::Init,
@@ -159,7 +159,7 @@ impl PutBucketPlacementOperation {
                 });
                 self.resolver = None;
                 if let Some(policy_id) = foreign {
-                    return self.fail(PutBucketPlacementError::ForeignPolicy { policy_id });
+                    return self.fail(PutPlacementError::ForeignPolicy { policy_id });
                 }
                 self.state = PutPlacementState::StartTransaction;
                 smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -168,7 +168,7 @@ impl PutBucketPlacementOperation {
             }
             ResolveStep::Failed(policy_ref, source) => {
                 self.resolver = None;
-                self.fail(PutBucketPlacementError::PolicyUnavailable {
+                self.fail(PutPlacementError::PolicyUnavailable {
                     policy_id: policy_ref.policy_id,
                     source,
                 })
@@ -190,7 +190,7 @@ impl PutBucketPlacementOperation {
         ))]
     }
 
-    fn fail(&mut self, error: PutBucketPlacementError) -> Effects {
+    fn fail(&mut self, error: PutPlacementError) -> Effects {
         self.state = PutPlacementState::Error;
         self.output = Some(Err(error));
         self.abort()
@@ -198,12 +198,12 @@ impl PutBucketPlacementOperation {
 
     fn invalid_event(&mut self) -> Effects {
         let state = self.state_name();
-        self.fail(PutBucketPlacementError::InvalidStateEvent { state })
+        self.fail(PutPlacementError::InvalidStateEvent { state })
     }
 
     fn finish(&mut self, default: BucketPlacementDefault) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.fail(PutBucketPlacementError::NoTransactionFound);
+            return self.fail(PutPlacementError::NoTransactionFound);
         };
         self.output = Some(Ok(default));
         self.state = PutPlacementState::CommitTransaction;
@@ -215,19 +215,19 @@ impl PutBucketPlacementOperation {
             return self.invalid_event();
         };
         let Some(value) = value else {
-            return self.fail(PutBucketPlacementError::NoSuchBucket);
+            return self.fail(PutPlacementError::NoSuchBucket);
         };
         let current = match BucketInfo::from_bytes(value.as_ref()) {
             Ok(current) => current,
             Err(error) => return self.fail(error.into()),
         };
         if current.group_id != self.input.group_id {
-            return self.fail(PutBucketPlacementError::GroupMismatch);
+            return self.fail(PutPlacementError::GroupMismatch);
         }
         if let Some(expected) = self.input.expected_generation
             && expected != current.placement_policy_generation
         {
-            return self.fail(PutBucketPlacementError::GenerationConflict {
+            return self.fail(PutPlacementError::GenerationConflict {
                 expected,
                 current: current.placement_policy_generation,
             });
@@ -248,7 +248,7 @@ impl PutBucketPlacementOperation {
         }
         match generation.checked_add(1) {
             Some(next) => self.write_default(updated, next),
-            None => self.fail(PutBucketPlacementError::GenerationExhausted),
+            None => self.fail(PutPlacementError::GenerationExhausted),
         }
     }
 
@@ -273,9 +273,9 @@ impl PutBucketPlacementOperation {
     }
 }
 
-impl Operation for PutBucketPlacementOperation {
+impl Operation for PutPlacementOperation {
     type Output = BucketPlacementDefault;
-    type Error = PutBucketPlacementError;
+    type Error = PutPlacementError;
 
     fn start(&mut self) -> Effects {
         self.state = PutPlacementState::Authorize;
@@ -305,7 +305,7 @@ impl Operation for PutBucketPlacementOperation {
                     }
                     Err(error) => {
                         warn!(error = %error, "Bucket placement authorization check failed");
-                        self.fail(PutBucketPlacementError::Unauthorized)
+                        self.fail(PutPlacementError::Unauthorized)
                     }
                 }
             }
@@ -316,10 +316,10 @@ impl Operation for PutBucketPlacementOperation {
                 };
                 match allowed {
                     Ok(true) => self.resolve_refs(),
-                    Ok(false) => self.fail(PutBucketPlacementError::Unauthorized),
+                    Ok(false) => self.fail(PutPlacementError::Unauthorized),
                     Err(error) => {
                         warn!(error = %error, "Bucket placement authorization check failed");
-                        self.fail(PutBucketPlacementError::Unauthorized)
+                        self.fail(PutPlacementError::Unauthorized)
                     }
                 }
             }
@@ -348,7 +348,7 @@ impl Operation for PutBucketPlacementOperation {
                     return self.invalid_event();
                 };
                 let Some(txn_id) = self.txn_id else {
-                    return self.fail(PutBucketPlacementError::NoTransactionFound);
+                    return self.fail(PutPlacementError::NoTransactionFound);
                 };
                 self.state = PutPlacementState::CommitTransaction;
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
@@ -376,7 +376,7 @@ impl Operation for PutBucketPlacementOperation {
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         match self.output {
             Some(result) => result,
-            None => Err(PutBucketPlacementError::InvalidStateEvent { state: "Finish" }),
+            None => Err(PutPlacementError::InvalidStateEvent { state: "Finish" }),
         }
     }
 
@@ -394,21 +394,21 @@ impl Operation for PutBucketPlacementOperation {
     fn expected_error(error: &Self::Error) -> bool {
         matches!(
             error,
-            PutBucketPlacementError::Unauthorized
-                | PutBucketPlacementError::NoSuchBucket
-                | PutBucketPlacementError::GroupMismatch
-                | PutBucketPlacementError::GenerationConflict { .. }
-                | PutBucketPlacementError::PolicyUnavailable { .. }
-                | PutBucketPlacementError::Policy(_)
+            PutPlacementError::Unauthorized
+                | PutPlacementError::NoSuchBucket
+                | PutPlacementError::GroupMismatch
+                | PutPlacementError::GenerationConflict { .. }
+                | PutPlacementError::PolicyUnavailable { .. }
+                | PutPlacementError::Policy(_)
         )
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{PutBucketPlacementError, PutBucketPlacementInput, PutBucketPlacementOperation};
+    use super::{PutPlacementError, PutPlacementInput, PutPlacementOperation};
     use crate::placement::policy::cache::PolicyCacheEntry;
-    use crate::tests::fixtures::policy::signed_document;
+    use crate::tests::policy::signed_document;
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -463,8 +463,8 @@ mod pure_tests {
     fn operation(
         policies: &[VerifiedPolicy],
         expected_generation: Option<u64>,
-    ) -> PutBucketPlacementOperation {
-        PutBucketPlacementOperation::new(PutBucketPlacementInput {
+    ) -> PutPlacementOperation {
+        PutPlacementOperation::new(PutPlacementInput {
             bucket: "bucket".to_string(),
             group_id: group_id(),
             policies: policies.iter().map(VerifiedPolicy::policy_ref).collect(),
@@ -496,14 +496,14 @@ mod pure_tests {
     }
 
     /// Drives authorization and ref resolution up to the open transaction.
-    fn started(operation: &mut PutBucketPlacementOperation, policies: &[VerifiedPolicy]) {
+    fn started(operation: &mut PutPlacementOperation, policies: &[VerifiedPolicy]) {
         operation.start();
         operation.step(authorized(true));
         let mut refs: Vec<&VerifiedPolicy> = policies.iter().collect();
         refs.sort_by_key(|policy| policy.policy_ref());
         for policy in refs {
             operation.step(cached(policy));
-            operation.step(crate::tests::fixtures::policy::authority(realm_id()));
+            operation.step(crate::tests::policy::authority(realm_id()));
         }
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([4u8; 16]),
@@ -573,7 +573,7 @@ mod pure_tests {
         ));
         assert_eq!(
             operation.finalize(),
-            Err(PutBucketPlacementError::GenerationConflict {
+            Err(PutPlacementError::GenerationConflict {
                 expected: 2,
                 current: 3
             })
@@ -588,10 +588,7 @@ mod pure_tests {
         foreign.group_id = Ulid::from_bytes([9u8; 16]);
         operation.step(read(&foreign));
 
-        assert_eq!(
-            operation.finalize(),
-            Err(PutBucketPlacementError::GroupMismatch)
-        );
+        assert_eq!(operation.finalize(), Err(PutPlacementError::GroupMismatch));
     }
 
     #[test]
@@ -605,10 +602,7 @@ mod pure_tests {
         let effects = operation.step(authorized(false));
 
         assert!(effects.is_empty(), "nothing is opened for a denied caller");
-        assert_eq!(
-            operation.finalize(),
-            Err(PutBucketPlacementError::Unauthorized)
-        );
+        assert_eq!(operation.finalize(), Err(PutPlacementError::Unauthorized));
     }
 
     fn owned_policy(seed: u8, owner: Ulid) -> VerifiedPolicy {
@@ -638,7 +632,7 @@ mod pure_tests {
         operation.step(authorized(false));
         operation.step(authorized(true));
         operation.step(cached(&policies[0]));
-        operation.step(crate::tests::fixtures::policy::group_authority(
+        operation.step(crate::tests::policy::group_authority(
             realm_id(),
             group_id(),
         ));
@@ -662,15 +656,12 @@ mod pure_tests {
         operation.start();
         operation.step(authorized(true));
         operation.step(cached(&policies[0]));
-        let effects = operation.step(crate::tests::fixtures::policy::group_authority(
-            realm_id(),
-            foreign,
-        ));
+        let effects = operation.step(crate::tests::policy::group_authority(realm_id(), foreign));
 
         assert!(effects.is_empty(), "a foreign rule opens no transaction");
         assert_eq!(
             operation.finalize(),
-            Err(PutBucketPlacementError::ForeignPolicy {
+            Err(PutPlacementError::ForeignPolicy {
                 policy_id: Ulid::from_bytes([1u8; 16])
             })
         );
@@ -696,7 +687,7 @@ mod pure_tests {
         assert!(effects.is_empty(), "a failed resolve opens no transaction");
         assert!(matches!(
             operation.finalize(),
-            Err(PutBucketPlacementError::PolicyUnavailable { .. })
+            Err(PutPlacementError::PolicyUnavailable { .. })
         ));
     }
 
@@ -715,7 +706,7 @@ mod pure_tests {
         ));
         assert_eq!(
             operation.finalize(),
-            Err(PutBucketPlacementError::GenerationExhausted)
+            Err(PutPlacementError::GenerationExhausted)
         );
     }
 }
