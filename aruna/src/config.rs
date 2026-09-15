@@ -5,7 +5,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::onboarding::{OnboardingMode, OnboardingPhase, OnboardingSecretError};
+use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::{
     BlobTimeoutConfig, DynamicDiscoveryMethod, NodeBackendsConfig, NodeCapabilities,
     OidcProviderConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
@@ -14,8 +14,9 @@ use aruna_core::structs::{
 use aruna_net::{DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_config};
 
 use crate::identity::{
-    BootOrigin, EnrollmentPlan, IdentityStore, PersistedNodeState, PersistedNodeStatus,
-    bootstrap_node_state, plan_enrollment, refresh_onboarding_bootstrap,
+    BootOrigin, EnrollmentPlan, IdentityError, IdentityStore, PersistedNodeState,
+    PersistedNodeStatus, bootstrap_node_state, onboarding_realm_endpoints, plan_enrollment,
+    refresh_onboarding_bootstrap,
 };
 use crate::settings::{Settings, invalid_config_value, normalize_env_value, validate_relay_urls};
 use aruna_operations::metadata::MetadataSearchStorage;
@@ -23,7 +24,6 @@ use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle, errors::Sto
 use byteview::ByteView;
 use iroh::EndpointAddr;
 use iroh::KeyParsingError;
-use std::array::TryFromSliceError;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::num::ParseIntError;
@@ -151,14 +151,6 @@ pub enum SetupError {
     #[error(transparent)]
     KeyPairParsingError(#[from] ConversionError),
     #[error(transparent)]
-    FromSliceError(#[from] TryFromSliceError),
-    #[error(transparent)]
-    Base64Error(#[from] base64::DecodeError),
-    #[error(transparent)]
-    SPKIError(#[from] ed25519_dalek::pkcs8::spki::Error),
-    #[error(transparent)]
-    PKCSError(#[from] ed25519_dalek::pkcs8::Error),
-    #[error(transparent)]
     IrohKeyError(#[from] KeyParsingError),
     #[error(transparent)]
     ParseIntError(#[from] ParseIntError),
@@ -169,21 +161,11 @@ pub enum SetupError {
     #[error("persisted node state does not match derived realm id")]
     PersistedNodeStateMismatch,
     #[error(transparent)]
-    OnboardingSecretError(#[from] OnboardingSecretError),
-    #[error(transparent)]
-    ReqwestError(#[from] reqwest::Error),
+    Identity(#[from] IdentityError),
     #[error("failed to read the backends file: {0}")]
     BackendsFileError(#[from] std::io::Error),
-    #[error(transparent)]
-    Utf8Error(#[from] std::string::FromUtf8Error),
-    #[error("onboarding bootstrap failed: {0}")]
-    OnboardingBootstrapFailed(String),
-    #[error("missing onboarding bootstrap material for {0:?} node")]
-    MissingOnboardingMaterial(OnboardingMode),
     #[error("missing required config value {0}")]
     MissingConfigValue(&'static str),
-    #[error("onboarding mode mismatch between secret and bootstrap response")]
-    OnboardingModeMismatch,
     #[error("unexpected storage event while loading node state: {0}")]
     UnexpectedStorageEvent(String),
     #[error("invalid {key} value {value:?}: {message}")]
@@ -247,16 +229,21 @@ pub fn open_storage(settings: &Settings) -> Result<StorageHandle, SetupError> {
 /// the resource owner exists before the identity I/O.
 pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHandle), SetupError> {
     let storage_handle = open_storage(&settings)?;
-    let config = resolve_config(settings, storage_handle.clone()).await?;
+    let stop = tokio_util::sync::CancellationToken::new();
+    let config = resolve_config(settings, storage_handle.clone(), &stop)
+        .await?
+        .expect("a resolution with a fresh stop token always resolves");
     Ok((config, storage_handle))
 }
 
 /// Resolves or bootstraps the persisted node state on an already-open store and
-/// derives the realm network configuration from it.
+/// derives the realm network configuration from it. `Ok(None)` means a stop was
+/// accepted before an identity mutation or enrollment request.
 pub async fn resolve_config(
     settings: Settings,
     storage_handle: StorageHandle,
-) -> Result<Config, SetupError> {
+    stop: &tokio_util::sync::CancellationToken,
+) -> Result<Option<Config>, SetupError> {
     let Settings {
         storage_path,
         metadata_storage_path,
@@ -311,6 +298,11 @@ pub async fn resolve_config(
     let identity = IdentityStore::from_storage(storage_handle.clone());
     let loaded = identity.load().await?;
     let plan = plan_enrollment(loaded.as_ref(), onboarding_secret.is_some())?;
+    // A stop accepted before the identity decision must not mint, persist, or
+    // enroll a new identity.
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
     let (mut node_state, mut temporary_bootstrap_endpoint, mut enrollment_endpoints) = match plan {
         EnrollmentPlan::Generate => {
             let state = identity.generate()?;
@@ -351,6 +343,11 @@ pub async fn resolve_config(
     }
     validate_s3_profile(s3_address.as_deref(), &node_capabilities)?;
 
+    // A stop accepted before the refresh must not send an enrollment request or
+    // persist refreshed bootstrap material.
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
     // A pending bootstrapped enrollment refreshes after the local checks, so a
     // bad local configuration never sends an enrollment request.
     if matches!(plan, EnrollmentPlan::Refresh) {
@@ -367,7 +364,7 @@ pub async fn resolve_config(
         )
         .await?;
         temporary_bootstrap_endpoint = Some(response.temporary_bootstrap_endpoint);
-        enrollment_endpoints = IdentityStore::onboarding_endpoints(&response.realm_endpoints);
+        enrollment_endpoints = onboarding_realm_endpoints(&response.realm_endpoints);
         node_state.onboarding_sync_ticket = Some(response.onboarding_sync_ticket);
         identity.persist(&node_state).await?;
     }
@@ -396,7 +393,7 @@ pub async fn resolve_config(
     // realm reachability after it disappears and before discovery completes.
     peer_endpoints.extend(enrollment_endpoints);
 
-    Ok(Config {
+    Ok(Some(Config {
         storage_path,
         metadata_storage_path,
         metadata_search_storage,
@@ -453,7 +450,7 @@ pub async fn resolve_config(
         node_labels,
         node_location,
         node_weight,
-    })
+    }))
 }
 
 /// Convenience for callers outside the node startup path, such as the
@@ -1035,5 +1032,28 @@ mod tests {
             super::StartupMode::InitializeRealm { .. }
         ));
         assert_eq!(config.node_state, generated);
+    }
+
+    // A stop accepted before the identity decision resolves no configuration
+    // and leaves the store without a generated identity.
+    #[tokio::test]
+    async fn cancelled_resolution_skips_identity() {
+        let tempdir = tempdir().unwrap();
+        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let env = settings_env(&[("STORAGE_PATH", tempdir.path().to_str().unwrap())]);
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+
+        let resolved =
+            super::resolve_config(read_settings_from(&env).unwrap(), storage.clone(), &stop)
+                .await
+                .unwrap();
+
+        assert!(
+            resolved.is_none(),
+            "a cancelled stop resolves no configuration"
+        );
+        let identity = crate::identity::IdentityStore::from_storage(storage);
+        assert!(identity.load().await.unwrap().is_none());
     }
 }

@@ -1,8 +1,6 @@
-//! Construction of the long-lived node resources.
-//!
-//! Each resource is acquired in the order the node needs it. `Acquired` owns
-//! everything obtained so far, so a failure part-way through runs the ordered
-//! teardown for exactly the acquired subset instead of leaking detached tasks.
+//! Construction of the long-lived node resources, acquired in the order the
+//! node needs them. `Acquired` owns everything obtained so far, so a failure
+//! part-way releases exactly the acquired subset instead of leaking tasks.
 
 use std::sync::Arc;
 
@@ -91,16 +89,11 @@ impl Acquired {
         }
     }
 
-    /// Runs the ordered teardown for the acquired subset: ingress (none here),
-    /// admissions, tasks, jobs, background children, network, metadata, blob,
-    /// then storage, and aborts the ops listener last. The monitoring sampler is
-    /// stopped by the sequence before storage closes.
+    /// Runs the ordered teardown for the acquired subset: admissions, tasks,
+    /// jobs, background, network, metadata, blob, storage. The ops task and
+    /// driver context join after it; the sampler stops before storage closes.
     pub(crate) async fn cleanup(self) {
         info!("Startup stopped early; releasing the acquired resources");
-        // The ops task and the driver context are stopped after the ordered
-        // teardown and joined, so no detached clone keeps storage open when
-        // cleanup returns. The monitoring sampler is stopped and awaited by the
-        // sequence before storage closes.
         let ops = self.ops_handle;
         let driver_ctx = self.driver_ctx;
         NodeShutdown {
@@ -188,6 +181,10 @@ impl std::error::Error for StartupStopped {}
 pub(crate) async fn acquire(
     stop: &tokio_util::sync::CancellationToken,
 ) -> Result<Option<NodeResources>, Box<dyn std::error::Error>> {
+    // A pre-cancelled startup must not open the store or touch identity.
+    if stop.is_cancelled() {
+        return Ok(None);
+    }
     // Parsing operator settings is pure; the store is the first owned
     // resource, established before identity and enrollment I/O.
     let settings = crate::settings::read_settings()?;
@@ -199,9 +196,8 @@ pub(crate) async fn acquire(
 }
 
 /// Acquires the node resources from parsed settings and an already-open store,
-/// so identity loading, enrollment, and every later stage run inside the
-/// explicit cleanup boundary. `Ok(None)` means a stop was accepted and exactly
-/// the acquired subset was released.
+/// so identity loading, enrollment, and later stages run inside the explicit
+/// cleanup boundary. `Ok(None)` means a stop released exactly the acquired set.
 pub(crate) async fn acquire_with_storage(
     settings: Settings,
     storage_handle: aruna_storage::StorageHandle,
@@ -210,8 +206,18 @@ pub(crate) async fn acquire_with_storage(
     mut checkpoint: impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<Option<NodeResources>, Box<dyn std::error::Error>> {
     let mut acquired = Acquired::new(storage_handle, task_handle);
-    let config = match resolve_config(settings, acquired.storage_handle.clone()).await {
-        Ok(config) => config,
+    // A stop accepted before configuration resolution must not read or write
+    // identity or send enrollment traffic.
+    if stop.is_cancelled() {
+        acquired.cleanup().await;
+        return Ok(None);
+    }
+    let config = match resolve_config(settings, acquired.storage_handle.clone(), stop).await {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            acquired.cleanup().await;
+            return Ok(None);
+        }
         Err(error) => {
             acquired.cleanup().await;
             return Err(error.into());
@@ -638,5 +644,44 @@ mod tests {
                 reopened.err()
             );
         }
+    }
+
+    // A pre-cancelled startup must release the store without loading,
+    // generating, or persisting an identity or sending enrollment traffic.
+    #[tokio::test]
+    async fn pre_cancelled_startup_skips_identity_and_enrollment() {
+        use crate::settings::read_settings_from;
+
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().to_str().expect("utf8 path").to_string();
+        let map: std::collections::BTreeMap<String, String> = [
+            ("STORAGE_PATH".to_string(), path.clone()),
+            ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("P2P_SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("S3_HOST".to_string(), "127.0.0.1:0".to_string()),
+            ("S3_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("PORTAL_MODE".to_string(), "disabled".to_string()),
+            ("ARUNA_FJALL_PERSIST_MODE".to_string(), "buffer".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let settings = read_settings_from(&map).expect("settings parse");
+        let storage = crate::config::open_storage(&settings).expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+
+        let outcome = acquire_with_storage(settings, storage, task_handle, &stop, |_| Ok(()))
+            .await
+            .expect("an accepted stop is not a failure");
+        assert!(outcome.is_none());
+
+        let reopened =
+            aruna_storage::FjallStorage::open(&path).expect("cleanup released the store");
+        let identity = crate::identity::IdentityStore::from_storage(reopened);
+        assert!(
+            identity.load().await.unwrap().is_none(),
+            "a pre-cancelled startup must not generate or persist an identity"
+        );
     }
 }

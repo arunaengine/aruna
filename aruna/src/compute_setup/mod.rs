@@ -166,12 +166,10 @@ pub(crate) async fn build_registry(
                 session_s3,
             });
         }
-        BackendSettings::Docker(docker) => build_docker(&settings, docker, config).await,
-        BackendSettings::Apptainer(apptainer) => {
-            build_apptainer(&settings, apptainer, config).await
-        }
+        BackendSettings::Docker(docker) => build_docker(settings, docker, config).await,
+        BackendSettings::Apptainer(apptainer) => build_apptainer(settings, apptainer, config).await,
         BackendSettings::Kubernetes(kubernetes) => {
-            build_kubernetes(&settings, kubernetes, config).await
+            build_kubernetes(settings, kubernetes, config).await
         }
     };
     let registry = match result {
