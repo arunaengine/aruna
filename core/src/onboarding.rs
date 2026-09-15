@@ -108,8 +108,10 @@ pub struct BootstrapOnboardingResponse {
     pub realm_id: String,
     pub mode: OnboardingMode,
     pub temporary_bootstrap_endpoint: EndpointAddr,
-    pub wrapped_realm_private_key: Option<String>,
-    pub wrapped_realm_private_key_nonce: Option<String>,
+    #[serde(rename = "wrapped_realm_private_key")]
+    pub wrapped_realm_key: Option<String>,
+    #[serde(rename = "wrapped_realm_private_key_nonce")]
+    pub wrapped_key_nonce: Option<String>,
     pub wrapping_public_key: Option<String>,
     pub delegation_signature: Option<String>,
     pub onboarding_sync_ticket: String,

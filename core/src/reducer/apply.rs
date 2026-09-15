@@ -22,19 +22,19 @@ impl AdminDocumentState {
         }
         let stale_on_all_paths = !matches!(
             &event.op,
-            AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
-                | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
-                | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
-                | AdminDocumentOperation::RealmConfigTokenRevoked { .. }
-                | AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
-                | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
-                | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
-                | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
-                | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
-                | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
-                | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
-                | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
-                | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
+            AdminDocumentOperation::PlacementBindingAppended { .. }
+                | AdminDocumentOperation::HandleRangeGranted { .. }
+                | AdminDocumentOperation::BandPoolAssigned { .. }
+                | AdminDocumentOperation::ConfigTokenRevoked { .. }
+                | AdminDocumentOperation::CandidateMapPublished { .. }
+                | AdminDocumentOperation::ConfigActivationsInitialized { .. }
+                | AdminDocumentOperation::ConfigTransitionStarted { .. }
+                | AdminDocumentOperation::TransitionBarrierReported { .. }
+                | AdminDocumentOperation::TransitionProofSubmitted { .. }
+                | AdminDocumentOperation::ConfigTransitionAborted { .. }
+                | AdminDocumentOperation::TransitionBucketForced { .. }
+                | AdminDocumentOperation::TransitionStallReported { .. }
+                | AdminDocumentOperation::TransitionDrainReported { .. }
         ) && operation_paths(&event.op)
             .iter()
             .all(|path| self.event_path_stale(event, path));

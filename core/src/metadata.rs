@@ -13,15 +13,15 @@ use crate::structs::storage::metadata_registry::{MetadataAuditOperation, Metadat
 use crate::structs::identity::realm::RealmId;
 use crate::types::GroupId;
 
-pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
+pub const MAX_TOKEN_LEN: usize = 4096;
 
 /// The community Profile the node carries shapes for, so a crate tagged with it
 /// is validated without a realm document registering it.
-pub const PROCESS_RUN_CRATE_PROFILE_IRI: &str = "https://w3id.org/ro/wfrun/process/0.5";
+pub const CRATE_PROFILE_IRI: &str = "https://w3id.org/ro/wfrun/process/0.5";
 
 /// Whether the node validates this IRI from its own embedded shapes.
 pub fn is_builtin_profile(iri: &str) -> bool {
-    iri == PROCESS_RUN_CRATE_PROFILE_IRI
+    iri == CRATE_PROFILE_IRI
 }
 
 /// Supported RO-Crate specification IRIs and the remaining RO-Crate community profiles (workflow run
@@ -38,7 +38,7 @@ pub fn is_rocrate_specification(iri: &str) -> bool {
 
 #[cfg(test)]
 mod specification_tests {
-    use super::{PROCESS_RUN_CRATE_PROFILE_IRI, is_builtin_profile, is_rocrate_specification};
+    use super::{CRATE_PROFILE_IRI, is_builtin_profile, is_rocrate_specification};
 
     #[test]
     fn community_profiles_markers() {
@@ -58,8 +58,8 @@ mod specification_tests {
     #[test]
     fn builtin_profile_tags() {
         // The built-in Profile must tag, so it is never a bare version marker.
-        assert!(is_builtin_profile(PROCESS_RUN_CRATE_PROFILE_IRI));
-        assert!(!is_rocrate_specification(PROCESS_RUN_CRATE_PROFILE_IRI));
+        assert!(is_builtin_profile(CRATE_PROFILE_IRI));
+        assert!(!is_rocrate_specification(CRATE_PROFILE_IRI));
         assert!(!is_builtin_profile("https://w3id.org/ro/wfrun/process/0.4"));
     }
 }
@@ -94,7 +94,7 @@ impl std::fmt::Debug for MetadataBearerToken {
 impl MetadataBearerToken {
     pub fn new(token: impl Into<String>) -> Result<Self, AuthTokenError> {
         let token = token.into();
-        if token.len() > MAX_METADATA_BEARER_TOKEN_LEN {
+        if token.len() > MAX_TOKEN_LEN {
             return Err(AuthTokenError {
                 length: token.len(),
             });
@@ -118,7 +118,7 @@ impl<'de> Deserialize<'de> for MetadataBearerToken {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("metadata bearer token length {length} exceeds maximum {MAX_METADATA_BEARER_TOKEN_LEN}")]
+#[error("metadata bearer token length {length} exceeds maximum {MAX_TOKEN_LEN}")]
 pub struct AuthTokenError {
     length: usize,
 }
@@ -281,8 +281,8 @@ pub struct MetadataMergedRevision {
     pub findings: u32,
 }
 
-pub const METADATA_RAW_EVENT_LIMIT: u32 = 1024;
-pub const METADATA_RAW_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
+pub const EVENT_LIMIT: u32 = 1024;
+pub const RAW_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawOriginBudget {
@@ -300,7 +300,7 @@ pub fn raw_quotas(
     creator: NodeId,
     create_bytes: u64,
 ) -> Option<Vec<RawOriginBudget>> {
-    if create_bytes > METADATA_RAW_BYTES_LIMIT || origins.is_empty() {
+    if create_bytes > RAW_BYTES_LIMIT || origins.is_empty() {
         return None;
     }
     let mut origins = origins.to_vec();
@@ -308,10 +308,10 @@ pub fn raw_quotas(
     origins.dedup();
     let creator_index = origins.iter().position(|origin| *origin == creator)?;
     let origin_count = u32::try_from(origins.len()).ok()?;
-    let remaining_events = METADATA_RAW_EVENT_LIMIT.checked_sub(1)?;
+    let remaining_events = EVENT_LIMIT.checked_sub(1)?;
     let event_share = remaining_events / origin_count;
     let event_remainder = remaining_events % origin_count;
-    let remaining_bytes = METADATA_RAW_BYTES_LIMIT.checked_sub(create_bytes)?;
+    let remaining_bytes = RAW_BYTES_LIMIT.checked_sub(create_bytes)?;
     let origin_count_bytes = u64::from(origin_count);
     let byte_share = remaining_bytes / origin_count_bytes;
     let byte_remainder = remaining_bytes % origin_count_bytes;
@@ -675,7 +675,8 @@ impl MetadataLifecycleRecord {
 pub struct MetadataDeleteRecord {
     pub event_id: Ulid,
     pub tombstone: GraphLifecycleRecord,
-    pub deleted_after_event_id: Ulid,
+    #[serde(rename = "deleted_after_event_id")]
+    pub deleted_after_id: Ulid,
 }
 
 /// CRDT actor used when materializing `event_id` into the local graph store,
@@ -992,7 +993,7 @@ pub enum MetadataEffect {
         graph_iri: String,
         node_id: NodeId,
     },
-    SyncGraphBestEffort {
+    SyncBestEffort {
         graph_iri: String,
         peers: Vec<NodeId>,
     },
@@ -1233,7 +1234,7 @@ pub struct ProfileValidationStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        GraphLifecycleRecord, METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT,
+        GraphLifecycleRecord, RAW_BYTES_LIMIT, EVENT_LIMIT,
         MetadataBearerToken, MetadataClockRelation, MetadataDeleteRecord, MetadataEventPayload,
         MetadataEventRecord, MetadataLifecycleRecord, MetadataQueryResults,
         ProfileValidationCompleteness, ProfileValidationSeverity, ProfileValidationState,
@@ -1360,11 +1361,11 @@ mod tests {
         assert_eq!(budgets[1].node_id, expected[1]);
         assert_eq!(
             budgets.iter().map(|budget| budget.event_limit).sum::<u32>(),
-            METADATA_RAW_EVENT_LIMIT
+            EVENT_LIMIT
         );
         assert_eq!(
             budgets.iter().map(|budget| budget.byte_limit).sum::<u64>(),
-            METADATA_RAW_BYTES_LIMIT
+            RAW_BYTES_LIMIT
         );
         let creator = budgets
             .iter()
@@ -1389,7 +1390,7 @@ mod tests {
                 document_id,
                 &[node(1)],
                 node(1),
-                METADATA_RAW_BYTES_LIMIT + 1,
+                RAW_BYTES_LIMIT + 1,
             )
             .is_none()
         );
@@ -1633,7 +1634,7 @@ mod tests {
     fn metadata_document_fence() {
         let document_id = Ulid::generate();
         let event_id = Ulid::generate();
-        let deleted_after_event_id = Ulid::generate();
+        let deleted_after_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let group_id = Ulid::generate();
         let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
@@ -1644,7 +1645,7 @@ mod tests {
             event: MetadataDeleteRecord {
                 event_id,
                 tombstone: tombstone.clone(),
-                deleted_after_event_id,
+                deleted_after_id,
             },
         };
 
@@ -1654,7 +1655,7 @@ mod tests {
             panic!("expected delete lifecycle record");
         };
         assert_eq!(event.tombstone, tombstone);
-        assert_eq!(event.deleted_after_event_id, deleted_after_event_id);
+        assert_eq!(event.deleted_after_id, deleted_after_id);
     }
 
     #[test]
