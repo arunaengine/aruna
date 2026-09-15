@@ -199,7 +199,8 @@ async fn run_node_owned(
     // One acquired owner stays whole through realm preparation, listener
     // binding, and background startup. Every failure and accepted cancellation
     // releases exactly this owner; only a completed handoff takes it apart.
-    let resources = match startup::resources::acquire(&stop_token).await {
+    let mut on_drain = || signals.arm_escalation();
+    let resources = match startup::resources::acquire(&stop_token, &mut on_drain).await {
         Ok(Some(resources)) => resources,
         Ok(None) => return Ok(ProcessOutcome::StartupCancelled),
         Err(error) => return Err(error),
@@ -905,6 +906,162 @@ mod tests {
         assert!(signals.first.is_none());
         assert!(signals.escalation.is_none());
         assert!(signals.escalation_action.is_none());
+    }
+
+    fn startup_settings(path: &str) -> crate::settings::Settings {
+        let map: std::collections::BTreeMap<String, String> = [
+            ("STORAGE_PATH".to_string(), path.to_string()),
+            ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("P2P_SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("S3_HOST".to_string(), "127.0.0.1:0".to_string()),
+            ("S3_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("PORTAL_MODE".to_string(), "disabled".to_string()),
+            ("ARUNA_FJALL_PERSIST_MODE".to_string(), "buffer".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        crate::settings::read_settings_from(&map).expect("settings parse")
+    }
+
+    // A stop accepted between acquisition stages releases the acquired subset
+    // on the escalation policy: the drain callback arms the second-signal task
+    // while the acquisition future is still draining.
+    #[tokio::test]
+    async fn escalation_during_acquisition() {
+        use crate::startup::resources::{StartupStage, acquire_with_storage};
+
+        let aborted = Arc::new(AtomicBool::new(false));
+        let (signal, _fire) = ControlledSignal::new(aborted.clone());
+        let mut escalation = ControlledEscalation::new();
+        let action = escalation.action();
+        let mut signals = SignalTasks::with_signals(signal, action);
+        let stop = signals.stop();
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().to_str().expect("utf8 path").to_string();
+        let settings = startup_settings(&path);
+        let storage = crate::config::open_storage(&settings).expect("storage opens");
+        let task_handle = aruna_tasks::TaskHandle::new();
+
+        let drain_stop = stop.clone();
+        let mut checkpoint = move |stage: StartupStage| {
+            if stage == StartupStage::Net {
+                drain_stop.cancel();
+            }
+            Ok(())
+        };
+        let mut on_drain = || signals.arm_escalation();
+        let mut acquisition = Box::pin(acquire_with_storage(
+            settings,
+            storage,
+            task_handle,
+            &stop,
+            &mut checkpoint,
+            &mut on_drain,
+        ));
+
+        tokio::select! {
+            _ = &mut acquisition => {
+                panic!("acquisition returned before the escalation action armed");
+            }
+            () = escalation.wait_until_armed() => {}
+        }
+        escalation.fire_second();
+        escalation.wait_until_completed().await;
+
+        let outcome = acquisition
+            .await
+            .expect("an accepted stop is not a failure");
+        assert!(
+            outcome.is_none(),
+            "an accepted stop must release the acquired subset"
+        );
+
+        signals.finish().await;
+        assert!(signals.first.is_none());
+        assert!(signals.escalation.is_none());
+        assert!(signals.escalation_action.is_none());
+        assert!(aborted.load(Ordering::SeqCst));
+        assert!(escalation.dropped.load(Ordering::SeqCst));
+    }
+
+    // A real acquisition failure drains with the same callback even though no
+    // signal fired: escalation is armed, and finishing drops the still-waiting
+    // action through the recorder instead of detaching it.
+    #[tokio::test]
+    async fn escalation_during_failure() {
+        use crate::startup::resources::{StartupStage, acquire_with_storage};
+
+        let aborted = Arc::new(AtomicBool::new(false));
+        let (signal, _fire) = ControlledSignal::new(aborted.clone());
+        let mut escalation = ControlledEscalation::new();
+        let action = escalation.action();
+        let mut signals = SignalTasks::with_signals(signal, action);
+        let stop = signals.stop();
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().to_str().expect("utf8 path").to_string();
+        let settings = startup_settings(&path);
+        let storage = crate::config::open_storage(&settings).expect("storage opens");
+        let task_handle = aruna_tasks::TaskHandle::new();
+
+        let mut checkpoint = |stage: StartupStage| -> Result<(), Box<dyn std::error::Error>> {
+            if stage == StartupStage::Net {
+                Err("injected acquisition failure".into())
+            } else {
+                Ok(())
+            }
+        };
+        let drained = Arc::new(AtomicBool::new(false));
+        let drained_flag = drained.clone();
+        let mut on_drain = || {
+            drained_flag.store(true, Ordering::SeqCst);
+            signals.arm_escalation();
+        };
+        let error = match acquire_with_storage(
+            settings,
+            storage,
+            task_handle,
+            &stop,
+            &mut checkpoint,
+            &mut on_drain,
+        )
+        .await
+        {
+            Ok(_) => panic!("the injected failure must stop acquisition"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("injected acquisition failure"));
+        assert!(
+            drained.load(Ordering::SeqCst),
+            "an acquisition failure must run the drain callback"
+        );
+        assert!(
+            !signals
+                .escalation
+                .as_ref()
+                .expect("the failure drain arms escalation")
+                .is_finished(),
+            "no signal fired, so the escalation stays waiting"
+        );
+        assert!(
+            !escalation.dropped.load(Ordering::SeqCst),
+            "the escalation action must still wait"
+        );
+
+        stop.cancel();
+        escalation.wait_until_armed().await;
+        assert!(!signals.escalation.as_ref().expect("retained").is_finished());
+
+        signals.finish().await;
+        assert!(signals.first.is_none());
+        assert!(signals.escalation.is_none());
+        assert!(signals.escalation_action.is_none());
+        assert!(aborted.load(Ordering::SeqCst));
+        assert!(
+            escalation.dropped.load(Ordering::SeqCst),
+            "finish must drop the waiting escalation action"
+        );
     }
 
     // Repeated application runs share one runtime, so each owner must clear

@@ -217,6 +217,7 @@ fn cleanup_stop_outcome(
 
 pub(crate) async fn acquire(
     stop: &tokio_util::sync::CancellationToken,
+    on_drain: &mut impl FnMut(),
 ) -> Result<Option<NodeResources>, Box<dyn std::error::Error>> {
     // A pre-cancelled startup must not open the store or touch identity.
     if stop.is_cancelled() {
@@ -229,33 +230,47 @@ pub(crate) async fn acquire(
     // The node runtime always exists here; a missing one is a concrete startup
     // error, never a scheduler-less handle that only looks started.
     let task_handle = TaskHandle::try_new().map_err(std::io::Error::other)?;
-    acquire_with_storage(settings, storage_handle, task_handle, stop, |_| Ok(())).await
+    acquire_with_storage(
+        settings,
+        storage_handle,
+        task_handle,
+        stop,
+        |_| Ok(()),
+        on_drain,
+    )
+    .await
 }
 
 /// Acquires the node resources from parsed settings and an already-open store,
 /// so identity loading, enrollment, and later stages run inside the explicit
 /// cleanup boundary. `Ok(None)` means a stop released exactly the acquired set
 /// and every ordered teardown step completed; an incomplete release is a typed
-/// error instead.
+/// error instead. `on_drain` runs before every cleanup this acquisition enters,
+/// so the caller arms its escalation policy for every drain, not only the
+/// normal shutdown.
 pub(crate) async fn acquire_with_storage(
     settings: Settings,
     storage_handle: aruna_storage::StorageHandle,
     task_handle: TaskHandle,
     stop: &tokio_util::sync::CancellationToken,
     mut checkpoint: impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
+    on_drain: &mut impl FnMut(),
 ) -> Result<Option<NodeResources>, Box<dyn std::error::Error>> {
     let mut acquired = Acquired::new(storage_handle, task_handle);
     // A stop accepted before configuration resolution must not read or write
     // identity or send enrollment traffic.
     if stop.is_cancelled() {
+        on_drain();
         return cleanup_stop_outcome(acquired.cleanup(shutdown_grace_env()).await);
     }
     let config = match resolve_config(settings, acquired.storage_handle.clone(), stop).await {
         Ok(Some(config)) => config,
         Ok(None) => {
+            on_drain();
             return cleanup_stop_outcome(acquired.cleanup(shutdown_grace_env()).await);
         }
         Err(error) => {
+            on_drain();
             let cleanup = acquired.cleanup(shutdown_grace_env()).await;
             if !cleanup.complete() {
                 warn!(
@@ -269,6 +284,7 @@ pub(crate) async fn acquire_with_storage(
     match fill(&config, &mut acquired, stop, &mut checkpoint).await {
         Ok(()) => Ok(Some(acquired.finish(config))),
         Err(error) => {
+            on_drain();
             let cleanup = acquired.cleanup(shutdown_grace_env()).await;
             match error.downcast::<StartupStopped>() {
                 Ok(_) => cleanup_stop_outcome(cleanup),
@@ -763,9 +779,16 @@ mod tests {
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();
 
-        let outcome = acquire_with_storage(settings, storage, task_handle, &stop, |_| Ok(()))
-            .await
-            .expect("an accepted stop is not a failure");
+        let outcome = acquire_with_storage(
+            settings,
+            storage,
+            task_handle,
+            &stop,
+            |_| Ok(()),
+            &mut || {},
+        )
+        .await
+        .expect("an accepted stop is not a failure");
         assert!(outcome.is_none());
 
         let reopened =
