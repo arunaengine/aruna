@@ -392,9 +392,7 @@ impl Operation for SetQuotaOperation {
 /// `net::irokle`: only a non-conflicted materialized value updates the stored quota,
 /// so a conflicted path leaves the last agreed quota untouched.
 fn apply_reducer_quota(document: &mut RealmConfigDocument, reducer_state: &AdminDocumentState) {
-    if !reducer_state
-        .conflicts
-        .contains_key(CONFIG_QUOTA_PATH)
+    if !reducer_state.conflicts.contains_key(CONFIG_QUOTA_PATH)
         && let Some(quota) = reducer_state.materialized_realm_quota()
     {
         document.quota = quota;

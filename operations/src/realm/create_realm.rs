@@ -10,12 +10,12 @@ use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::reducer_state_entry;
 use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::{
+    OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+};
 use aruna_core::structs::placement::placement_record::{
     BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE, HandleRange,
     NodePlacementEntry, PlacementBinding, PlacementScope, band_start, normalize_placement_input,
-};
-use aruna_core::structs::identity::realm::{
-    OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
 };
 use aruna_core::structured_id::{FieldError, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -596,17 +596,16 @@ mod test {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::{
+        OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+    };
     use aruna_core::structs::placement::placement_record::{
         BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
-    };
-    use aruna_core::structs::identity::realm::{
-        OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-        RealmNodeKind,
     };
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_core::types::{Key, KeySpace, TxnId, Value};
@@ -650,7 +649,10 @@ mod test {
         let entry = CreateRealmOperation::new(clamped)
             .creating_node_placement()
             .unwrap();
-        assert_eq!(entry.weight, aruna_core::structs::placement::placement_record::MAX_NODE_WEIGHT);
+        assert_eq!(
+            entry.weight,
+            aruna_core::structs::placement::placement_record::MAX_NODE_WEIGHT
+        );
         assert_eq!(entry.location, "eu-west");
 
         let mut too_long = config(actor);
@@ -1120,10 +1122,7 @@ mod test {
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id,
         }));
-        assert_eq!(
-            operation.state,
-            super::CreateRealmState::ScheduleSyncDrain
-        );
+        assert_eq!(operation.state, super::CreateRealmState::ScheduleSyncDrain);
         assert_eq!(
             effects.first(),
             Some(&Effect::Task(TaskEffect::ResetTimer {

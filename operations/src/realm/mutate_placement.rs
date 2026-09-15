@@ -16,7 +16,9 @@ use aruna_core::storage_entries::{
     stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::binding_directory::BindingError;
+use aruna_core::structs::placement::node_subject::storage_subject;
 use aruna_core::structs::placement::placement_record::{
     BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
     PlacementBinding, PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy,
@@ -25,11 +27,9 @@ use aruna_core::structs::placement::placement_record::{
 use aruna_core::structs::placement::placement_transition::{
     BucketPlan, CandidatePlacementMap, CompletionProof, TransitionPlan,
 };
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::policy_document::policy_admin_path;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::reserved_label;
-use aruna_core::structs::placement::node_subject::storage_subject;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -128,37 +128,27 @@ impl RealmPlacementMutation {
             Self::RemoveNode(node_id) => {
                 AdminDocumentOperation::NodePlacementRemoved { node_id: *node_id }
             }
-            Self::UpsertStrategy(strategy) => {
-                AdminDocumentOperation::PlacementStrategyUpserted {
-                    strategy: strategy.clone(),
-                }
-            }
-            Self::RemoveStrategy(strategy_id) => {
-                AdminDocumentOperation::PlacementStrategyRemoved {
-                    strategy_id: *strategy_id,
-                }
-            }
-            Self::SetDefaultStrategy(strategy_id) => {
-                AdminDocumentOperation::ConfigStrategySet {
-                    strategy_id: *strategy_id,
-                }
-            }
+            Self::UpsertStrategy(strategy) => AdminDocumentOperation::PlacementStrategyUpserted {
+                strategy: strategy.clone(),
+            },
+            Self::RemoveStrategy(strategy_id) => AdminDocumentOperation::PlacementStrategyRemoved {
+                strategy_id: *strategy_id,
+            },
+            Self::SetDefaultStrategy(strategy_id) => AdminDocumentOperation::ConfigStrategySet {
+                strategy_id: *strategy_id,
+            },
             Self::SetBinding(binding) => AdminDocumentOperation::StrategyBindingSet {
                 binding: binding.clone(),
             },
-            Self::RemoveBinding(scope) => {
-                AdminDocumentOperation::StrategyBindingRemoved {
-                    scope: scope.clone(),
-                }
-            }
+            Self::RemoveBinding(scope) => AdminDocumentOperation::StrategyBindingRemoved {
+                scope: scope.clone(),
+            },
             Self::SetOverride(record) => AdminDocumentOperation::PlacementOverrideSet {
                 record: record.clone(),
             },
-            Self::RemoveOverride(subject) => {
-                AdminDocumentOperation::PlacementOverrideRemoved {
-                    subject: subject.clone(),
-                }
-            }
+            Self::RemoveOverride(subject) => AdminDocumentOperation::PlacementOverrideRemoved {
+                subject: subject.clone(),
+            },
             Self::AppendPlacementBinding(binding) => {
                 AdminDocumentOperation::PlacementBindingAppended {
                     binding: binding.clone(),

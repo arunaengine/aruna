@@ -3,20 +3,20 @@ use aruna_blob::hash::Hasher;
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
-use aruna_core::structs::storage::replication::{
-    ArunaArn, ReplicationItemKind, ReplicationNegotiationResult, VersionedObjectArn,
-};
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::blob::{BackendLocation, CopyOrigin};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::placement_policy::{
     MAX_REF_INPUT, PlacementPolicyRef, PlacementSubject,
 };
+use aruna_core::structs::storage::blob::{BackendLocation, CopyOrigin};
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
 };
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::execution::source_access::SourceMetadata;
-use aruna_core::structs::execution::staging::VersionSourceBinding;
+use aruna_core::structs::storage::replication::{
+    ArunaArn, ReplicationItemKind, ReplicationNegotiationResult, VersionedObjectArn,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use ulid::Ulid;
@@ -108,11 +108,7 @@ impl VersionReplicationManifest {
                 ));
             }
             check_map(&mut budget, &descriptor.public_config)?;
-            check_text(
-                &mut budget,
-                &descriptor.source_path,
-                MAX_VALUE_BYTES,
-            )?;
+            check_text(&mut budget, &descriptor.source_path, MAX_VALUE_BYTES)?;
             if let Some(selector) = &descriptor.version_selector {
                 check_text(&mut budget, selector, MAX_VALUE_BYTES)?;
             }
@@ -309,8 +305,7 @@ impl ManifestBudget {
         self.work = self.work.checked_add(work).ok_or_else(|| {
             ConversionError::FromStrError("replication manifest work budget overflow".to_string())
         })?;
-        if self.bytes > MAX_MANIFEST_BYTES || self.work > MAX_MANIFEST_WORK
-        {
+        if self.bytes > MAX_MANIFEST_BYTES || self.work > MAX_MANIFEST_WORK {
             return Err(ConversionError::FromStrError(
                 "replication manifest budget exceeded".to_string(),
             ));
@@ -392,11 +387,7 @@ fn check_location(
         check_text(budget, storage_class, MAX_VALUE_BYTES)?;
     }
     check_text(budget, &location.root, MAX_VALUE_BYTES)?;
-    check_text(
-        budget,
-        &location.storage_bucket,
-        MAX_VALUE_BYTES,
-    )?;
+    check_text(budget, &location.storage_bucket, MAX_VALUE_BYTES)?;
     check_text(budget, &location.backend_path, MAX_VALUE_BYTES)?;
     if location.hashes.len() > MAX_REPLICATION_HASHES {
         return Err(ConversionError::FromStrError(
@@ -642,28 +633,28 @@ mod pure_tests {
     use std::time::Duration;
 
     use super::{
-        BaoReadRefusal, BaoReadRequest, BaoReadTarget, MAX_HASH_BYTES,
-        MAX_REPLICATION_HASHES, MAX_REPLICATION_PARTS, MAX_REPLICATION_SOURCES,
-        MAX_VALUE_BYTES, MaterializedBlobInfo, MultipartObjectMetadata,
-        ReferenceAdvance, SyncOrigin, VersionReplicationManifest, VersionReplicationMessage,
+        BaoReadRefusal, BaoReadRequest, BaoReadTarget, MAX_HASH_BYTES, MAX_REPLICATION_HASHES,
+        MAX_REPLICATION_PARTS, MAX_REPLICATION_SOURCES, MAX_VALUE_BYTES, MaterializedBlobInfo,
+        MultipartObjectMetadata, ReferenceAdvance, SyncOrigin, VersionReplicationManifest,
+        VersionReplicationMessage,
     };
     use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
     use aruna_core::errors::ConversionError;
     use aruna_core::structs::checksum::HASH_SHA256;
-    use aruna_core::structs::storage::replication::{ArunaArn, ReplicationItemKind};
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
     use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::storage::multipart::{
         MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
     };
-    use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
-    use aruna_core::structs::execution::staging::{
-        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
-    };
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::storage::replication::{ArunaArn, ReplicationItemKind};
     use std::collections::{BTreeMap, HashMap};
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -817,13 +808,15 @@ mod pure_tests {
             )
             .unwrap(),
         );
-        manifest.reference_metadata = Some(aruna_core::structs::execution::source_access::SourceMetadata {
-            content_length: 42,
-            content_type: Some("text/plain".to_string()),
-            etag: Some("etag-1".to_string()),
-            last_modified: Some(SystemTime::UNIX_EPOCH),
-            source_version: None,
-        });
+        manifest.reference_metadata = Some(
+            aruna_core::structs::execution::source_access::SourceMetadata {
+                content_length: 42,
+                content_type: Some("text/plain".to_string()),
+                etag: Some("etag-1".to_string()),
+                last_modified: Some(SystemTime::UNIX_EPOCH),
+                source_version: None,
+            },
+        );
         manifest
             .metadata
             .insert("mtime".to_string(), "1753272000.123456789".to_string());
@@ -1015,10 +1008,9 @@ mod pure_tests {
     #[test]
     fn rejects_metadata_size() {
         let mut manifest = make_manifest();
-        manifest.metadata.insert(
-            "metadata".to_string(),
-            "x".repeat(MAX_VALUE_BYTES + 1),
-        );
+        manifest
+            .metadata
+            .insert("metadata".to_string(), "x".repeat(MAX_VALUE_BYTES + 1));
         let bytes = VersionReplicationMessage::VersionManifest(manifest)
             .to_bytes()
             .unwrap();
@@ -1055,10 +1047,7 @@ mod pure_tests {
         let part = MultipartObjectPart {
             part_number: 1,
             size: 5,
-            hashes: HashMap::from([(
-                HASH_SHA256.to_string(),
-                vec![1u8; MAX_HASH_BYTES + 1],
-            )]),
+            hashes: HashMap::from([(HASH_SHA256.to_string(), vec![1u8; MAX_HASH_BYTES + 1])]),
         };
         let mut manifest = make_manifest();
         manifest.multipart = Some(MultipartObjectMetadata {

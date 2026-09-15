@@ -5,7 +5,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
@@ -554,9 +554,7 @@ impl Operation for RealmRoleOperation {
         match self.state.clone() {
             RealmRoleState::Auth => self.handle_authorization(event),
             RealmRoleState::StartTransaction => self.handle_start_transaction(event),
-            RealmRoleState::GetAdminState { txn_id } => {
-                self.handle_auth_read(event, txn_id)
-            }
+            RealmRoleState::GetAdminState { txn_id } => self.handle_auth_read(event, txn_id),
             RealmRoleState::WriteAuthState {
                 txn_id,
                 auth_doc,
@@ -688,8 +686,7 @@ pub mod test {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
-        SYNC_OUTBOX_KEYSPACE,
+        AUTH_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
@@ -986,10 +983,7 @@ pub mod test {
         assert_eq!(
             effects.first().unwrap(),
             &Effect::Storage(StorageEffect::BatchDelete {
-                deletes: vec![(
-                    DOCUMENT_CONFLICT_KEYSPACE.to_string(),
-                    stale_conflict_key,
-                )],
+                deletes: vec![(DOCUMENT_CONFLICT_KEYSPACE.to_string(), stale_conflict_key,)],
                 txn_id: Some(txn_id),
             })
         );

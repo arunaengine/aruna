@@ -16,8 +16,8 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::events::Event;
 use aruna_core::events::StorageEvent;
 use aruna_core::handle::Handle;
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -193,11 +193,11 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentEvent;
     use aruna_core::structs::identity::auth::Actor;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
-    use aruna_core::structs::placement::placement_record::PlacementStrategy;
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::placement_record::PlacementStrategy;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

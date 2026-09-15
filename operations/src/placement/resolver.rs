@@ -5,11 +5,13 @@ use std::collections::{BTreeMap, HashSet};
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
+use aruna_core::structs::identity::realm::{ClassStrategyError, RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::placement_record::{
     AffinityEffect, BindingScope, DocumentClass, LabelMatch, PlacementOverride, PlacementStrategy,
 };
-use aruna_core::structs::placement::placement_transition::{CandidateMapNode, CandidatePlacementMap};
-use aruna_core::structs::identity::realm::{ClassStrategyError, RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::placement_transition::{
+    CandidateMapNode, CandidatePlacementMap,
+};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 
@@ -419,11 +421,11 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentTarget;
     use aruna_core::reducer::{AdminDocumentState, overlay_placement};
+    use aruna_core::structs::identity::realm::{RealmId, RealmNode, RealmNodeKind};
     use aruna_core::structs::placement::placement_record::{
         AffinityRule, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, NodePlacementEntry, StrategyBinding,
     };
     use aruna_core::structs::storage::node_info::{KIND_LABEL_KEY, LOCATION_LABEL_KEY};
-    use aruna_core::structs::identity::realm::{RealmId, RealmNode, RealmNodeKind};
     use proptest::prelude::*;
     use ulid::Ulid;
 

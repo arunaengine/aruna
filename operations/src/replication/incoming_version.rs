@@ -30,23 +30,25 @@ use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, Sub
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE, OBJECT_METADATA_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     BucketInfo, CopyOrigin, CurrentVersionPointer, ResolvedBackend, VersionKey, WriteOwner,
     bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
+use aruna_core::structs::storage::multipart::MultipartObjectKey;
+use aruna_core::structs::storage::replication::{
+    ReplicationItemKind, ReplicationNegotiationResult,
+};
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, NodeRouting, RoutingError, StorageRoutingRule, resolve_backend,
 };
-use aruna_core::structs::storage::multipart::MultipartObjectKey;
-use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
-use aruna_core::structs::storage::replication::{ReplicationItemKind, ReplicationNegotiationResult};
-use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId};
@@ -772,7 +774,9 @@ impl IncomingVersionOperation {
         advance: &ReferenceAdvance,
         version_id: Ulid,
     ) -> bool {
-        if previous.descriptor.kind != aruna_core::structs::execution::source_connector::SourceConnectorKind::ArunaNative {
+        if previous.descriptor.kind
+            != aruna_core::structs::execution::source_connector::SourceConnectorKind::ArunaNative
+        {
             return previous == incoming;
         }
         let previous_selector = format!("version:{}", advance.predecessor);
@@ -836,7 +840,9 @@ impl IncomingVersionOperation {
             .source
             .clone()
             .ok_or(IncomingVersionError::MissingReferenceSource)?;
-        if source.descriptor.kind == aruna_core::structs::execution::source_connector::SourceConnectorKind::LocalDirectory {
+        if source.descriptor.kind
+            == aruna_core::structs::execution::source_connector::SourceConnectorKind::LocalDirectory
+        {
             return Err(IncomingVersionError::LocalReferenceSource);
         }
         let metadata = self
@@ -1272,10 +1278,7 @@ impl IncomingVersionOperation {
             Ok(key) => key.into(),
             Err(error) => return self.fail(error.into()),
         };
-        deletes.push((
-            OBJECT_METADATA_KEYSPACE.to_string(),
-            summary_key,
-        ));
+        deletes.push((OBJECT_METADATA_KEYSPACE.to_string(), summary_key));
         deletes.extend(
             values
                 .into_iter()

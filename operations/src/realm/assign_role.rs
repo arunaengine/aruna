@@ -6,7 +6,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
@@ -533,9 +533,7 @@ impl Operation for AssignRolesOperation {
         match self.state.clone() {
             AssignRolesState::Auth => self.handle_authorization(event),
             AssignRolesState::StartTransaction => self.handle_start_transaction(event),
-            AssignRolesState::ReadAdminState { txn_id } => {
-                self.handle_auth_read(event, txn_id)
-            }
+            AssignRolesState::ReadAdminState { txn_id } => self.handle_auth_read(event, txn_id),
             AssignRolesState::WriteAdminState {
                 txn_id,
                 auth_doc,
@@ -651,8 +649,7 @@ pub mod test {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
-        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
-        SYNC_OUTBOX_KEYSPACE,
+        AUTH_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::reducer::{

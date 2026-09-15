@@ -5,13 +5,13 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::events::StorageEvent;
 use aruna_core::metadata::{MetadataEventPayload, MetadataEventRecord};
 use aruna_core::storage_entries::{create_projection_entries, registry_write_entries};
+use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
 use aruna_core::structs::placement::placement_record::{
     AffinityEffect, AffinityRule, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT, DocumentClass,
     FIRST_GRANTABLE_HANDLE, HandleRange, LabelMatch, PlacementBinding, PlacementRef,
     PlacementScope,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
 use aruna_core::structured_id::PlacementHandle;
 use aruna_core::task::{TaskEffect, TaskKey};
 use tempfile::tempdir;
@@ -1004,13 +1004,18 @@ fn preserves_affinity_data() {
         replica_count: None,
         distinct_locations: false,
         shard_count: 64,
-        affinity: vec![aruna_core::structs::placement::placement_record::AffinityRule {
-            matcher: aruna_core::structs::placement::placement_record::LabelMatch {
-                key: "tier".to_string(),
-                value: "hot".to_string(),
+        affinity: vec![
+            aruna_core::structs::placement::placement_record::AffinityRule {
+                matcher: aruna_core::structs::placement::placement_record::LabelMatch {
+                    key: "tier".to_string(),
+                    value: "hot".to_string(),
+                },
+                effect:
+                    aruna_core::structs::placement::placement_record::AffinityEffect::Multiply {
+                        permille: 1500,
+                    },
             },
-            effect: aruna_core::structs::placement::placement_record::AffinityEffect::Multiply { permille: 1500 },
-        }],
+        ],
     };
     let mutation = RealmPlacementMutation::UpsertStrategy(strategy.clone());
     let document = RealmConfigDocument::new(RealmId::from_bytes([7; 32]), Vec::new(), 3);

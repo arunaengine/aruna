@@ -15,11 +15,11 @@ use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::placement_record::{
     BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE, HandleRange,
     PlacementBinding, PlacementScope, band_start, coordinator_spans, owned_pools,
 };
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structured_id::PlacementHandle;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
@@ -744,8 +744,8 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
-        SYNC_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        SYNC_OUTBOX_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::reducer::{
@@ -753,12 +753,12 @@ mod pure_tests {
     };
     use aruna_core::storage_entries::reducer_conflict_key;
     use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::structs::placement::placement_record::{
         BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS,
         HANDLE_RANGE_SIZE, HandleRange, NodePlacementEntry, PlacementOverride, PlacementStrategy,
         StrategyBinding, band_start, coordinator_spans,
     };
-    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
     use std::collections::BTreeMap;
@@ -1178,17 +1178,19 @@ mod pure_tests {
         document.ensure_node(actor.node_id, RealmNodeKind::Management);
         document.placement_handle_ranges.push(range);
         // The reserved JobControl binding already exists: nothing to append.
-        document
-            .placement_bindings
-            .push(aruna_core::structs::placement::placement_record::PlacementBinding {
+        document.placement_bindings.push(
+            aruna_core::structs::placement::placement_record::PlacementBinding {
                 handle: aruna_core::structured_id::PlacementHandle::new(range.start).unwrap(),
-                scope: aruna_core::structs::placement::placement_record::PlacementScope::Realm(realm_id),
+                scope: aruna_core::structs::placement::placement_record::PlacementScope::Realm(
+                    realm_id,
+                ),
                 document_class: DocumentClass::JobControl,
                 strategy_id: Ulid::from_bytes([12; 16]),
                 allocator_range_id: Some(range.range_id),
                 allocated_by: Some(actor.node_id),
                 allocated_at_ms: Some(1),
-            });
+            },
+        );
 
         let mut operation = EnsureConfigOperation::new(config(actor.clone(), 3));
         let txn_id = TxnId::generate();
@@ -1384,11 +1386,7 @@ mod pure_tests {
                 .unwrap();
         }
 
-        assert!(
-            state
-                .conflicts
-                .contains_key(CONFIG_STRATEGY_PATH)
-        );
+        assert!(state.conflicts.contains_key(CONFIG_STRATEGY_PATH));
         assert_eq!(state.materialized_default_strategy(), None);
 
         overlay_reducer_state(&mut config, &state, 0);

@@ -8,8 +8,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use byteview::ByteView;
@@ -854,8 +854,8 @@ async fn abort_release_txn(
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::placement::placement_record::{PlacementRef, PlacementStrategy};
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::structs::placement::placement_record::{PlacementRef, PlacementStrategy};
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

@@ -408,9 +408,7 @@ impl Operation for SetPoliciesOperation {
 /// Overlays the reducer's materialized policy set onto the config document,
 /// mirroring the replicated materialization in `net::irokle`.
 fn apply_reducer_policies(document: &mut RealmConfigDocument, reducer_state: &AdminDocumentState) {
-    if !reducer_state
-        .conflicts
-        .contains_key(CONFIG_POLICIES_PATH)
+    if !reducer_state.conflicts.contains_key(CONFIG_POLICIES_PATH)
         && let Some(policies) = reducer_state.materialized_realm_policies()
     {
         document.request_policies = policies;

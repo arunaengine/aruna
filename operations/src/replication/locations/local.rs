@@ -15,22 +15,22 @@ use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CurrentVersionPointer, ManagedCopyKey, VersionKey, bucket_permission_path,
     object_permission_path,
 };
-use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::storage::group_backend::GroupStorage;
-use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
-use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use std::time::SystemTime;
@@ -787,9 +787,11 @@ mod pure_tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, BlobVersion, BucketInfo};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+    use aruna_core::structs::storage::blob::{
+        BackendLocation, BackendRef, BlobVersion, BucketInfo,
+    };
     use aruna_core::structs::storage::blob::{CopyOrigin, VersionKey};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -968,17 +970,21 @@ mod pure_tests {
     }
 
     /// Copy row plus subject row, the pair a governed answer reads at once.
-    fn serve_batch(record: &aruna_core::structs::storage::blob::ManagedCopyRecord, blocked: bool) -> Event {
-        let mut subject =
-            aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(aruna_core::structs::placement::placement_policy::PlacementSubject {
+    fn serve_batch(
+        record: &aruna_core::structs::storage::blob::ManagedCopyRecord,
+        blocked: bool,
+    ) -> Event {
+        let mut subject = aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(
+            aruna_core::structs::placement::placement_policy::PlacementSubject {
                 node_id: node_id(5),
                 generation: 1,
                 location: "eu-west".to_string(),
                 labels: Default::default(),
                 executor_kind: None,
                 local_to_controller: true,
-            })
-            .expect("subject is valid");
+            },
+        )
+        .expect("subject is valid");
         subject.serving_blocked = blocked;
         Event::Storage(StorageEvent::BatchReadResult {
             values: vec![

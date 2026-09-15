@@ -11,27 +11,29 @@ use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
+    S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, BlobVersionState,
     BucketInfo, CurrentVersionPointer, HashIndex, WriteOwner,
 };
+use aruna_core::structs::storage::cleanup::ReclaimCandidateKey;
+use aruna_core::structs::storage::multipart::MultipartObjectKey;
+use aruna_core::structs::storage::replication::{
+    ReplicationItemKind, ReplicationNegotiationResult,
+};
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, NodeRouting, RoutingTarget, StorageRoutingRule,
 };
-use aruna_core::structs::execution::job::JobId;
-use aruna_core::structs::storage::multipart::MultipartObjectKey;
-use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, RealmId};
-use aruna_core::structs::storage::cleanup::ReclaimCandidateKey;
-use aruna_core::structs::storage::replication::{ReplicationItemKind, ReplicationNegotiationResult};
-use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-use aruna_core::structs::execution::source_access::SourceMetadata;
-use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEvent, TaskKey};
@@ -1167,10 +1169,9 @@ fn hop_limit_rejects() {
 #[test]
 fn rejects_manifest_size() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-    manifest.metadata.insert(
-        "metadata".to_string(),
-        "x".repeat(MAX_VALUE_BYTES + 1),
-    );
+    manifest
+        .metadata
+        .insert("metadata".to_string(), "x".repeat(MAX_VALUE_BYTES + 1));
     let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(24, 24),
         iroh::SecretKey::from_bytes(&[76; 32]).public(),
@@ -1666,7 +1667,11 @@ fn indexes_noncurrent_version() {
         aruna_core::structs::storage::blob::ManagedCopyRecord::from_bytes(value.as_ref())
             .unwrap()
             .version,
-        aruna_core::structs::storage::blob::VersionKey::new(&manifest.bucket, &manifest.key, manifest.version_id)
+        aruna_core::structs::storage::blob::VersionKey::new(
+            &manifest.bucket,
+            &manifest.key,
+            manifest.version_id
+        )
     );
 
     let effects = op.step(Event::Storage(StorageEvent::WriteResult {
@@ -2472,8 +2477,9 @@ fn failure_deletes_blobs() {
         RealmId::from_bytes([7u8; 32]),
         manifest,
     );
-    op.negotiation_result =
-        Some(aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobVersion);
+    op.negotiation_result = Some(
+        aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobVersion,
+    );
     op.state = IncomingVersionState::WriteBlobLocation;
     op.txn_id = Some(txn_id);
     op.received_blob = Some(ReceivedBlob::reserved(received.clone()));
@@ -2692,8 +2698,9 @@ fn failure_without_delete() {
         RealmId::from_bytes([7u8; 32]),
         manifest,
     );
-    op.negotiation_result =
-        Some(aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedVersionOnly);
+    op.negotiation_result = Some(
+        aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedVersionOnly,
+    );
     op.state = IncomingVersionState::ApplyHeadTransition;
     op.txn_id = Some(txn_id);
 
@@ -2730,8 +2737,9 @@ fn commit_preserves_blob() {
         RealmId::from_bytes([7u8; 32]),
         manifest,
     );
-    op.negotiation_result =
-        Some(aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobVersion);
+    op.negotiation_result = Some(
+        aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobVersion,
+    );
     op.state = IncomingVersionState::RegisterBlobDht;
     op.received_blob = Some(ReceivedBlob::owned(received));
     op.apply_committed = true;
@@ -3179,7 +3187,9 @@ fn reclaim_uses_enqueue() {
         panic!("expected reclaim candidate write");
     };
     assert_eq!(key_space, BLOB_RECLAIM_KEYSPACE);
-    let candidate = aruna_core::structs::storage::cleanup::ReclaimCandidate::from_bytes(value.as_ref()).unwrap();
+    let candidate =
+        aruna_core::structs::storage::cleanup::ReclaimCandidate::from_bytes(value.as_ref())
+            .unwrap();
     assert_eq!(candidate.enqueued_at, enqueued_at);
     assert_ne!(candidate.enqueued_at, started_at);
 }
