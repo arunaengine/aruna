@@ -5,7 +5,7 @@
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     AttemptIntent, EffectiveResources, ExecutionReceipt, JobClaim, JobFamilyRecord, JobId,
     JobPayload, JobRecord, JobResultPayload, JobState, LogicalJobState, OutputObject,
     PhysicalExecutionState,

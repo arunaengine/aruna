@@ -6,7 +6,9 @@ use aruna_core::effects::{Effect, FetchCursor, IterStart, PageLimit, StorageEffe
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{JobFamilyId, JobRecordEnvelope, JobRecordKey, SubmissionId};
+use aruna_core::structs::execution::job::{
+    JobFamilyId, JobRecordEnvelope, JobRecordKey, SubmissionId,
+};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 

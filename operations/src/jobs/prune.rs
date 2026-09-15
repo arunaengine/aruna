@@ -4,8 +4,9 @@ use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
-use aruna_core::structs::{
-    HiddenBlobKey, JOB_PRUNE_INDEX_PREFIX, JobPayload, JobRecord, JobResultPayload, cleanup_job_id,
+use aruna_core::structs::storage::blob::HiddenBlobKey;
+use aruna_core::structs::execution::job::{
+    JOB_PRUNE_INDEX_PREFIX, JobPayload, JobRecord, JobResultPayload, cleanup_job_id,
     parse_schedule_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -209,11 +210,13 @@ mod tests {
     use aruna_core::keyspaces::{
         JOB_ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE,
     };
-    use aruna_core::structs::{
-        AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateResult,
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::execution::job::{
+        ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateResult,
         ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload,
-        JobProgress, JobRecord, JobResultPayload, JobState, RealmId, RoCrateLimits,
+        JobProgress, JobRecord, JobResultPayload, JobState, RoCrateLimits,
     };
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
     use ulid::Ulid;

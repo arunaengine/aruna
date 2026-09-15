@@ -14,11 +14,11 @@ use aruna_core::keyspaces::{
     JOB_OWNER_INDEX_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, LogicalJobSpec,
-    RealmConfigDocument, RealmId, RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode,
-    job_record_key, owner_index_key,
+    RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode, job_record_key, owner_index_key,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use tracing::{debug, warn};

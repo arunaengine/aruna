@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionRole, ExecutionUpdate, JobFamilyId,
     JobFamilyRecord, JobId, JobProjection, JobRecordBody, JobRecordEnvelope, JobRecordError,
     LogicalJobState, OutputSet, PhysicalExecutionState, ProjectedExecution, SubmissionClaim,

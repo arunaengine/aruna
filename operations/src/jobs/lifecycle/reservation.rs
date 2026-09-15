@@ -12,10 +12,10 @@ use aruna_core::keyspaces::{
     JOB_RESERVATION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    EffectiveResources, JobFamilyRecord, JobId, JobRecord, LaunchIntent, RealmConfigDocument,
-    RealmId, RecordVerdict,
+use aruna_core::structs::execution::job::{
+    EffectiveResources, JobFamilyRecord, JobId, JobRecord, LaunchIntent, RecordVerdict,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 
 use smallvec::smallvec;
@@ -185,7 +185,7 @@ impl ReserveExecutionOperation {
         }
     }
 
-    fn family(&self) -> aruna_core::structs::JobFamilyId {
+    fn family(&self) -> aruna_core::structs::execution::job::JobFamilyId {
         self.config.receipt.envelope().family()
     }
 

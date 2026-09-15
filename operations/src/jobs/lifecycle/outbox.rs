@@ -14,7 +14,9 @@ use aruna_core::keyspaces::{
     JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE, NODE_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{JobRecordEnvelope, JobRecordKey, PlacementRef, RealmId};
+use aruna_core::structs::execution::job::{JobRecordEnvelope, JobRecordKey};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -514,7 +516,7 @@ mod tests {
         let fixture = Family::new([12u8; 32]);
         let envelope = fixture.sign(
             &fixture.holder,
-            aruna_core::structs::JobFamilyRecord::Spec(Box::new(fixture.spec())),
+            aruna_core::structs::execution::job::JobFamilyRecord::Spec(Box::new(fixture.spec())),
         );
         let key = envelope.key();
         let frame = JobRecordFrame::new(envelope).expect("record frame");
@@ -557,7 +559,7 @@ mod tests {
         let spec = fixture.spec();
         let envelope = fixture.sign(
             &fixture.holder,
-            aruna_core::structs::JobFamilyRecord::Spec(Box::new(spec)),
+            aruna_core::structs::execution::job::JobFamilyRecord::Spec(Box::new(spec)),
         );
         let key = envelope.key();
         let frame = JobRecordFrame::new(envelope).expect("record frame");

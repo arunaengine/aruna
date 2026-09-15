@@ -11,10 +11,12 @@ use aruna_core::effects::{
 use aruna_core::events::{
     JobRecordEvent, JobRecordPage, JobRecordRejection, LaunchDecline, LaunchOfferEvent,
 };
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind,
-    PhysicalExecutionState, PlacementRef, RealmConfigDocument, RealmId, SubmissionId,
+    PhysicalExecutionState, SubmissionId,
 };
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use futures_util::future::join_all;
 use tokio::time::timeout_at;
 use tracing::warn;
@@ -508,7 +510,7 @@ pub async fn serve_launch_offer(
 mod pure_tests {
     use super::*;
     use crate::tests::records::Family;
-    use aruna_core::structs::JobRecordBody;
+    use aruna_core::structs::execution::job::JobRecordBody;
 
     #[test]
     fn error_rearms_family() {

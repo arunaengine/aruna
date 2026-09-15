@@ -5,10 +5,12 @@
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse};
-use aruna_core::structs::{
-    AuthContext, CancelAuthority, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobId,
-    JobRecordEnvelope, JobRecordKind, LogicalJobSpec, Permission, group_permission_path,
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::execution::job::{
+    CancelAuthority, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope,
+    JobRecordKind, LogicalJobSpec,
 };
+use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::time::unix_timestamp_millis;
 use tracing::{debug, warn};
 use ulid::Ulid;
@@ -120,7 +122,7 @@ async fn publish_cancel(
     let config = load_realm_config(context, realm_id)
         .await
         .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
-    let family = aruna_core::structs::JobFamilyId {
+    let family = aruna_core::structs::execution::job::JobFamilyId {
         submission_id: spec.submission_id,
         request_digest: spec.request_digest,
     };

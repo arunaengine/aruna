@@ -10,12 +10,20 @@ use aruna_core::scheduling::{
     ExecutionPlan, InputHolder, MAX_INPUT_HOLDERS, MAX_TARGET_SCAN, PlanRequest, Planner,
     ResolvedInput, TargetCandidate,
 };
-use aruna_core::structs::{
-    AuthContext, BlobVersion, BlobVersionState, CapturedInput, InputSource, LogicalJobSpec,
-    NodeInfoDocument, Permission, PlacementPolicyRef, PlacementSubject, PolicyResolution,
-    RealmConfigDocument, RealmNodeKind, VersionKey, VersionedObjectArn, WorkspaceMode,
-    group_permission_path, storage_subject,
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{
+    BlobVersion, BlobVersionState, VersionKey, group_permission_path,
 };
+use aruna_core::structs::execution::job::{
+    CapturedInput, InputSource, LogicalJobSpec, WorkspaceMode,
+};
+use aruna_core::structs::storage::node_info::NodeInfoDocument;
+use aruna_core::structs::placement::placement_policy::{
+    PlacementPolicyRef, PlacementSubject, PolicyResolution,
+};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::structs::placement::node_subject::storage_subject;
 use thiserror::Error;
 use tracing::{debug, warn};
 use ulid::Ulid;
@@ -353,7 +361,7 @@ pub async fn version_hash(
 async fn input_holders(
     context: &DriverContext,
     config: &RealmConfigDocument,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     local: NodeId,
     source_node: NodeId,
     blake3: [u8; 32],
@@ -468,9 +476,10 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
     use aruna_core::scheduling::plan_execution;
-    use aruna_core::structs::{
-        AdvertisementEpoch, InputMode, InputSelection, NodeUrls, NodeUtilization, node_info_key,
+    use aruna_core::structs::storage::node_info::{
+        AdvertisementEpoch, NodeUrls, NodeUtilization, node_info_key,
     };
+    use aruna_core::structs::execution::job::{InputMode, InputSelection};
 
     /// A realm of `members` servers, each advertising eight backends, which is
     /// more advertisements than one planning page screens.

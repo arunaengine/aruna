@@ -7,8 +7,9 @@ use aruna_core::UserId;
 use aruna_core::effects::{JobRecordFrame, LaunchFrame};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
-use aruna_core::structs::{
-    AuthContext, JobFamilyRecord, JobId, JobRecordKind, JobState, PhysicalExecutionState,
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::execution::job::{
+    JobFamilyRecord, JobId, JobRecordKind, JobState, PhysicalExecutionState,
 };
 
 use super::admission_race::{config, envelope, rows, seed};

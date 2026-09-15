@@ -8,12 +8,14 @@ use aruna_core::errors::StorageError;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE};
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::{
-    AuthContext, CapturedInput, ExecutionSpec, JobAdmissionRecord, JobFamilyId, JobFamilyRecord,
-    JobId, JobRecordEnvelope, JobRecordKind, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
-    OutputDestination, Permission, RealmConfigDocument, SubmissionClaim, SubmissionId,
-    WorkspaceMode, group_permission_path,
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::execution::job::{
+    CapturedInput, ExecutionSpec, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobId,
+    JobRecordEnvelope, JobRecordKind, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
+    OutputDestination, SubmissionClaim, SubmissionId, WorkspaceMode,
 };
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::time::unix_timestamp_millis;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -41,8 +43,8 @@ use crate::jobs::submit::SubmitJobError;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::{AuthToken, WritePeerError};
-use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
 /// stored in the immutable spec, so a later config change cannot widen it.
@@ -187,7 +189,7 @@ async fn forward_device(
 /// be present here. Local presence is the admitting holder's check.
 fn reference_shape(spec: &ExecutionSpec) -> Result<(), SubmitJobError> {
     for input in &spec.inputs {
-        let aruna_core::structs::InputSource::S3 {
+        let aruna_core::structs::execution::job::InputSource::S3 {
             bucket,
             key,
             version_id,
@@ -223,13 +225,13 @@ async fn resolve_inputs(
 ) -> Result<
     (
         Vec<CapturedInput>,
-        Vec<aruna_core::structs::PlacementPolicyRef>,
+        Vec<aruna_core::structs::placement::placement_policy::PlacementPolicyRef>,
     ),
     SubmitJobError,
 > {
     let mut captured_inputs = Vec::with_capacity(spec.inputs.len());
     for input in &spec.inputs {
-        let aruna_core::structs::InputSource::S3 {
+        let aruna_core::structs::execution::job::InputSource::S3 {
             bucket,
             key,
             version_id,
@@ -291,7 +293,7 @@ async fn resolve_inputs(
                     .map(|metadata| metadata.content_length)
             })
             .unwrap_or_default();
-        let policies = aruna_core::structs::PlacementPolicyRef::canonical_set(
+        let policies = aruna_core::structs::placement::placement_policy::PlacementPolicyRef::canonical_set(
             &head.source_policies,
         )
         .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?;
@@ -350,7 +352,7 @@ async fn resolve_inputs(
         }
         output_policies.extend(info.placement_policies);
     }
-    output_policies = aruna_core::structs::PlacementPolicyRef::canonical_set(&output_policies)
+    output_policies = aruna_core::structs::placement::placement_policy::PlacementPolicyRef::canonical_set(&output_policies)
         .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
     Ok((captured_inputs, output_policies))
 }
@@ -606,7 +608,7 @@ async fn has_claim(context: &DriverContext, family: &JobFamilyId) -> Result<bool
 
 fn sign_frame(
     context: &DriverContext,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     record: JobFamilyRecord,
 ) -> Result<JobRecordFrame, SubmitJobError> {
     let net = context.net_handle.as_ref().ok_or_else(|| {
@@ -856,9 +858,10 @@ mod tests {
     use super::*;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::structs::{
-        InputMode, InputSelection, InputSource, OutputSelection, RealmId, WorkspaceOutput,
+    use aruna_core::structs::execution::job::{
+        InputMode, InputSelection, InputSource, OutputSelection, WorkspaceOutput,
     };
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::Key;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -919,7 +922,7 @@ mod tests {
             version: crate::jobs::records::rows::PROJECTION_CACHE_VERSION,
             revision: 1,
             stale: false,
-            projection: Some(aruna_core::structs::JobProjection {
+            projection: Some(aruna_core::structs::execution::job::JobProjection {
                 submission_id: family.submission_id,
                 request_digest: family.request_digest,
                 canonical_job_id: JobId::from_bytes([7u8; 16]),
@@ -927,7 +930,7 @@ mod tests {
                 state,
                 canonical_execution_id: None,
                 executions: Vec::new(),
-                outputs: aruna_core::structs::OutputSet::new(Vec::new()).expect("empty outputs"),
+                outputs: aruna_core::structs::execution::job::OutputSet::new(Vec::new()).expect("empty outputs"),
                 cancel_requested: false,
             }),
         };

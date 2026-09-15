@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
 };
 
@@ -158,7 +158,7 @@ fn retains_non_holder() {
     let mut family = Family::new([5u8; 32]);
     family
         .config
-        .ensure_node(node(7), aruna_core::structs::RealmNodeKind::Server);
+        .ensure_node(node(7), aruna_core::structs::identity::realm::RealmNodeKind::Server);
     let view = family.view();
     assert!(view.is_member(node(7)) && !view.holds(node(7)));
     let member = secret(7);
@@ -262,7 +262,7 @@ fn waits_for_predecessor() {
         &receipt,
         1,
         [9u8; 32],
-        aruna_core::structs::PhysicalExecutionState::Running,
+        aruna_core::structs::execution::job::PhysicalExecutionState::Running,
         None,
     );
     let candidate = family.sign(&family.target, JobFamilyRecord::Update(Box::new(update)));

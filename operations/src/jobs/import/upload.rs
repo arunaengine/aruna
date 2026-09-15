@@ -5,8 +5,9 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{ROCRATE_UPLOAD_CLEANUP_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
-    HiddenBlobKey, JobId, RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord,
+use aruna_core::structs::storage::blob::HiddenBlobKey;
+use aruna_core::structs::execution::job::{
+    JobId, RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, TxnId};
@@ -642,7 +643,9 @@ fn upload_key(upload_id: Ulid) -> ByteView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{BackendLocation, BackendRef, RealmId, RoCrateMediaType};
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::execution::job::RoCrateMediaType;
     use aruna_storage::FjallStorage;
     use std::collections::HashMap;
     use std::time::SystemTime;

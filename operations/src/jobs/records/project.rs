@@ -7,7 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE};
 use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyId, JobId, JobProjection, JobRecord, JobRecordEnvelope, JobRecordKey, JobState,
     LogicalJobState, job_record_key, validate_transition,
 };
@@ -286,7 +286,7 @@ impl ProjectFamilyOperation {
                     .executions
                     .iter()
                     .filter(|execution| {
-                        execution.role == aruna_core::structs::ExecutionRole::DuplicateSuccess
+                        execution.role == aruna_core::structs::execution::job::ExecutionRole::DuplicateSuccess
                     })
                     .count()
             })

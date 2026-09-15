@@ -3,7 +3,7 @@
 
 use aruna_core::NodeId;
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::{JobProjection, JobRecordEnvelope, JobRecordKind};
+use aruna_core::structs::execution::job::{JobProjection, JobRecordEnvelope, JobRecordKind};
 use serde::{Deserialize, Serialize};
 
 /// What a pending record is still waiting for. A pending record is never

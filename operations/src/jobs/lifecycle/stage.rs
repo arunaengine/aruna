@@ -3,9 +3,9 @@
 //! them through the policy-gated workspace write, verified against the stored hash.
 
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::{
-    AuthContext, InputSelection, InputSource, JobError, JobRecord, VersionedObjectArn,
-};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::execution::job::{InputSelection, InputSource, JobError, JobRecord};
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use tracing::{debug, warn};
 use ulid::Ulid;
 

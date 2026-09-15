@@ -1,6 +1,6 @@
 //! The reducer must be a function of the record set alone.
 
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     ExecutionRole, JobFamilyRecord, JobId, JobProjection, JobRecordBody, JobRecordEnvelope,
     LogicalJobState, PhysicalExecutionState, canonical_execution_key,
 };

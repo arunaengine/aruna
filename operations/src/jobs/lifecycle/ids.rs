@@ -10,10 +10,11 @@ use aruna_core::compute::runtimes::{
 };
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
-use aruna_core::structs::{
-    CapturedInput, EffectiveResources, ExecutionSpec, JobFamilyId, LabelMatch, MAX_SELECTOR_LABELS,
-    PlacementPolicyRef, SubmissionId, WorkspaceMode,
+use aruna_core::structs::execution::job::{
+    CapturedInput, EffectiveResources, ExecutionSpec, JobFamilyId, SubmissionId, WorkspaceMode,
 };
+use aruna_core::structs::placement::placement_record::LabelMatch;
+use aruna_core::structs::placement::placement_policy::{MAX_SELECTOR_LABELS, PlacementPolicyRef};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -243,7 +244,7 @@ pub fn effective_resources(spec: &ExecutionSpec) -> EffectiveResources {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::structs::ComputeResources;
+    use aruna_core::structs::execution::job::ComputeResources;
 
     use super::*;
 

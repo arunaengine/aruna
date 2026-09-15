@@ -6,7 +6,9 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, PageLimit, StorageEffect};
 use aruna_core::events::{JobRecordRejection, LaunchDecline};
 use aruna_core::handle::Handle;
-use aruna_core::structs::{Actor, JobFamilyRecord, RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::execution::job::JobFamilyRecord;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::TempDir;
@@ -163,7 +165,7 @@ async fn refuses_unknown_offer() {
 async fn refuses_page_mismatch() {
     // A peer cannot use a valid local placement to read another submission.
     let (_dir, context, net, family) = fixture().await;
-    let placement = aruna_core::structs::PlacementRef {
+    let placement = aruna_core::structs::placement::placement_record::PlacementRef {
         strategy_id: family.placement.strategy_id,
         shard: family.placement.shard + 1,
     };

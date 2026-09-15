@@ -1,6 +1,6 @@
 use aruna_core::errors::StorageError;
 use aruna_core::metadata::{MetadataError, MetadataValidationViolation};
-use aruna_core::structs::BindingError;
+use aruna_core::structs::placement::binding_directory::BindingError;
 
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::create_document::CreateDocumentError;

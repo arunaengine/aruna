@@ -13,11 +13,13 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
     REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, Backend, BackendConfig, BackendRef, BlobLocationKey,
-    GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
-    RoCrateLimits,
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef, BlobLocationKey};
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
 };
+use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::FjallStorage;
 use std::collections::HashMap;
@@ -159,7 +161,7 @@ async fn seed_bao(
     let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
     let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
     // Policy loading resolves the group record before group policies apply.
-    let group = aruna_core::structs::Group {
+    let group = aruna_core::structs::identity::group::Group {
         display_name: "export".to_string(),
         group_id,
         realm_id,
@@ -259,7 +261,7 @@ fn file_entity(id: &str, local_path: Option<&str>) -> JsonValue {
         "@type": "File",
         "contentUrl": format!(
             "{}{}",
-            aruna_core::structs::ARUNA_DATA_PREFIX,
+            aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX,
             "11".repeat(32)
         ),
     });
@@ -520,7 +522,7 @@ async fn assert_roundtrip(handle: &BlobHandle, eln: bool, version: &str, seed: u
                     w3id: arn.to_w3id(),
                     hash_w3id: format!(
                         "{}{}",
-                        aruna_core::structs::ARUNA_DATA_PREFIX,
+                        aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX,
                         hex::encode(payload_hash)
                     ),
                     local_path: path.clone(),
@@ -733,7 +735,7 @@ async fn remote_read_ephemeral() {
         .as_ref()
         .unwrap()
         .send_blob_effect(BlobEffect::Write {
-            resolved: aruna_core::structs::ResolvedBackend::node_default(),
+            resolved: aruna_core::structs::storage::blob::ResolvedBackend::node_default(),
             bucket: "remote".to_string(),
             key: "payload".to_string(),
             created_by: owner,
@@ -819,7 +821,7 @@ fn job_context(driver: Arc<DriverContext>, owner_node_id: NodeId) -> JobContext 
         final_attempt: false,
         cancel: tokio_util::sync::CancellationToken::new(),
         shutdown: tokio_util::sync::CancellationToken::new(),
-        progress: ProgressReporter::from_progress(&aruna_core::structs::JobProgress {
+        progress: ProgressReporter::from_progress(&aruna_core::structs::execution::job::JobProgress {
             current: 0,
             total: None,
             unit: "entries".to_string(),
@@ -842,7 +844,7 @@ async fn local_candidate() -> (BaoNode, UserId, ExportCandidate) {
         .as_ref()
         .unwrap()
         .send_blob_effect(BlobEffect::Write {
-            resolved: aruna_core::structs::ResolvedBackend::node_default(),
+            resolved: aruna_core::structs::storage::blob::ResolvedBackend::node_default(),
             bucket: "remote".to_string(),
             key: "payload".to_string(),
             created_by: owner,
@@ -1338,7 +1340,7 @@ fn recognizes_context_aliases() {
             "typeAlias": "File",
             "downloadAlias": format!(
                 "{}{}",
-                aruna_core::structs::ARUNA_DATA_PREFIX,
+                aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX,
                 "11".repeat(32)
             ),
             "pathAlias": "data/a.txt"
@@ -1357,7 +1359,7 @@ fn keeps_import_path() {
     let mut entity = file_entity(
         &format!(
             "{}{}",
-            aruna_core::structs::ARUNA_DATA_PREFIX,
+            aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX,
             "11".repeat(32)
         ),
         None,
@@ -1484,7 +1486,7 @@ fn stored_file(hash: u8, location: &str) -> JsonValue {
     json!({
         "@id": format!(
             "{}{}",
-            aruna_core::structs::ARUNA_DATA_PREFIX,
+            aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX,
             hex::encode([hash; 32])
         ),
         "@type": "File",

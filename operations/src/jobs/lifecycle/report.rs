@@ -8,9 +8,10 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::JobStatusView;
 use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE};
 use aruna_core::scheduling::{PlanCandidate, PlannedInput};
-use aruna_core::structs::{
-    AuthContext, ExecutionRole, JobFamilyId, JobFamilyRecord, JobId, JobProjection,
-    JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::execution::job::{
+    ExecutionRole, JobFamilyId, JobFamilyRecord, JobId, JobProjection, JobRecordEnvelope,
+    JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
     PhysicalExecutionResult, PhysicalExecutionState, ProjectedExecution, SubmissionId,
 };
 use aruna_core::types::Key;

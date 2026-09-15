@@ -4,7 +4,7 @@
 
 use aruna_core::NodeId;
 use aruna_core::effects::{FetchCursor, FrameBoundsError};
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JOB_RECORD_KEY_BYTES, JobFamilyId, JobId, JobRecordError, JobRecordKey, JobRecordKind,
     SubmissionId,
 };

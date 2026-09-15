@@ -6,7 +6,9 @@ use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::metadata::AuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{AuthContext, JobFamilyId, JobId, JobPayload, RealmId};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::execution::job::{JobFamilyId, JobId, JobPayload};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
 use bytes::Bytes;
@@ -674,7 +676,7 @@ async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, Str
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::{JobProgress, JobState, WorkspaceMode};
+    use aruna_core::structs::execution::job::{JobProgress, JobState, WorkspaceMode};
     use ulid::Ulid;
 
     use crate::jobs::service::JobKind;

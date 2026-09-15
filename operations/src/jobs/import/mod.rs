@@ -23,14 +23,18 @@ use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE};
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::{
-    ARUNA_DATA_PREFIX, Actor, AuthContext, BackendLocation, BucketInfo, ImportReportDetail,
-    ImportReportRow, ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec,
-    JOB_SYSTEM_ENTRY_PREFIX, JobError, JobResultPayload, MetadataRegistryRecord,
-    OBJECT_CONTENT_TYPE_KEY, Permission, ReasonCode, RoCrateCheckpointRefs, RoCrateMediaType,
-    VersionedObjectArn, bucket_permission_path, job_entry_key, object_permission_path,
-    rocrate_plan_key,
+use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BucketInfo, OBJECT_CONTENT_TYPE_KEY, bucket_permission_path,
+    object_permission_path,
 };
+use aruna_core::structs::execution::job::{
+    ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
+    ImportRoCrateSpec, JOB_SYSTEM_ENTRY_PREFIX, JobError, JobResultPayload, ReasonCode,
+    RoCrateCheckpointRefs, RoCrateMediaType, job_entry_key, rocrate_plan_key,
+};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use bytes::Bytes;
 use byteview::ByteView;
 use futures_util::{StreamExt, stream};
@@ -60,11 +64,11 @@ use crate::metadata::forward::route_metadata_create;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
-use crate::s3::delete_object::DeleteObjectError;
-use crate::s3::delete_objects::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
-use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::object::delete::DeleteObjectError;
+use crate::s3::object::delete_bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 
 const PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;
@@ -1635,7 +1639,7 @@ fn precheck_size(size: u64, limit: u64) -> Result<(), ImportFailure> {
 }
 
 fn source_permission_path(
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     group_id: Ulid,
     node_id: aruna_core::NodeId,
     connector_id: Ulid,
@@ -1891,10 +1895,11 @@ pub(crate) mod tests {
 
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::structs::{
+    use aruna_core::structs::execution::job::{
         ImportMetadataTarget, ImportRoCrateTarget, JobClaim, JobId, JobPayload, JobRecord,
-        JobState, RealmId, RoCrateUploadRecord,
+        JobState, RoCrateUploadRecord,
     };
+    use aruna_core::structs::identity::realm::RealmId;
     use tokio_util::sync::CancellationToken;
 
     use crate::jobs::executor::ProgressReporter;
@@ -2205,7 +2210,7 @@ pub(crate) mod tests {
         let JobRunOutcome::Failed(error) = cleanup_after_panic(&ctx, &spec).await else {
             panic!("panic cleanup must fail the job")
         };
-        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(error.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
         assert!(
             load_rocrate_upload(&driver, upload_id)
                 .await

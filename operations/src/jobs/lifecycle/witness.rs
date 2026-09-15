@@ -15,10 +15,12 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
-    PhysicalExecutionState, PlacementDecision, RealmConfigDocument, WitnessBudgetRecord,
+    PhysicalExecutionState, WitnessBudgetRecord,
 };
+use aruna_core::structs::placement::placement_policy::PlacementDecision;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, Key, TxnId};
 use serde::{Deserialize, Serialize};
@@ -272,7 +274,7 @@ mod tests {
         let (_dir, ctx) = context(&fixture.config, fixture.holder.public()).await;
         for index in 0..=WITNESS_DRAIN_BATCH {
             let family = JobFamilyId {
-                submission_id: aruna_core::structs::SubmissionId([index as u8; 32]),
+                submission_id: aruna_core::structs::execution::job::SubmissionId([index as u8; 32]),
                 request_digest: [index as u8; 32],
             };
             assert!(
@@ -353,7 +355,7 @@ mod tests {
     #[test]
     fn deadlines_ordered() {
         let family = JobFamilyId {
-            submission_id: aruna_core::structs::SubmissionId([1; 32]),
+            submission_id: aruna_core::structs::execution::job::SubmissionId([1; 32]),
             request_digest: [2; 32],
         };
         assert!(deadline_key(&family, 1) < deadline_key(&family, 2));
@@ -609,7 +611,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
 /// One launch offer round: the durable launch, its target, and the delays this
 /// witness answers with.
 struct Offer {
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     local: NodeId,
     family: JobFamilyId,
     frame: JobRecordFrame,
@@ -800,7 +802,7 @@ fn holder_generation(config: &RealmConfigDocument, view: &FamilyView) -> u64 {
 
 fn sign_record(
     context: &DriverContext,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     record: JobFamilyRecord,
 ) -> Option<JobRecordFrame> {
     let net = context.net_handle.as_ref()?;
@@ -813,7 +815,7 @@ fn sign_record(
 
 async fn append_local(
     context: &DriverContext,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     local: NodeId,
     record: JobRecordFrame,
     now_ms: u64,
@@ -866,7 +868,7 @@ fn deadline_family(key: &[u8]) -> Option<JobFamilyId> {
     let submission: [u8; 32] = key.get(8..40)?.try_into().ok()?;
     let request_digest: [u8; 32] = key.get(40..72)?.try_into().ok()?;
     Some(JobFamilyId {
-        submission_id: aruna_core::structs::SubmissionId(submission),
+        submission_id: aruna_core::structs::execution::job::SubmissionId(submission),
         request_digest,
     })
 }

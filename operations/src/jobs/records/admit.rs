@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyRecord, JobId, JobRecordEnvelope, JobRecordError, JobRecordKey, LocalExecution,
     RecordVerdict,
 };

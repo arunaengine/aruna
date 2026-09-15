@@ -39,7 +39,7 @@ pub const JOB_EXTERNAL_CONCURRENCY_CAP: usize = 64;
 /// Attempts before a retryable failure becomes terminal `Failed`.
 pub const JOB_MAX_ATTEMPTS: u32 = 5;
 /// Default terminal-state retention before pruning.
-pub const JOB_RETENTION_MS: u64 = aruna_core::structs::DEFAULT_JOB_RETENTION_MS;
+pub const JOB_RETENTION_MS: u64 = aruna_core::structs::execution::job::DEFAULT_JOB_RETENTION_MS;
 /// Minimum spacing between throttled progress flushes.
 pub const JOB_PROGRESS_FLUSH_INTERVAL_MS: u64 = 500;
 /// Bounded OCC retries when a job mutation transaction conflicts.

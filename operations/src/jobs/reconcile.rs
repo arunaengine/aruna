@@ -1,4 +1,4 @@
-use aruna_core::structs::JobRecord;
+use aruna_core::structs::execution::job::JobRecord;
 use aruna_storage::StorageHandle;
 
 /// Reconciliation seam for lost external attempts. A lost lease or node restart

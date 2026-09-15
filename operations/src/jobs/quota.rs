@@ -10,7 +10,8 @@ use aruna_core::compute_quota::{
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::JOB_ADMISSION_QUOTA_KEYSPACE;
-use aruna_core::structs::{EffectiveResources, RealmConfigDocument};
+use aruna_core::structs::execution::job::EffectiveResources;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{GroupId, Key};
 use tracing::{info, warn};
 

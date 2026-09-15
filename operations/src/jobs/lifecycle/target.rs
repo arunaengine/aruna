@@ -15,13 +15,17 @@ use aruna_core::events::{DeclinedPolicy, Event, JobRecordEvent, LaunchDecline, N
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::{
-    AuthContext, CapturedInput, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord,
-    JobPayload, JobRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
-    Permission, PhysicalExecutionState, PlacementDecision, PlacementPolicyRef, PlacementSubject,
-    PolicyResolution, RealmConfigDocument, WorkspaceMode, evaluate_placement,
-    group_permission_path,
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::execution::job::{
+    CapturedInput, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobPayload,
+    JobRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
+    PhysicalExecutionState, WorkspaceMode,
 };
+use aruna_core::structs::placement::placement_policy::{
+    PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, evaluate_placement,
+};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -172,7 +176,7 @@ async fn family_records(
 
 /// Everything one receipt round decides over, resolved before it starts.
 struct ReceiptRound {
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     local: NodeId,
     spec: LogicalJobSpec,
     intent: LaunchIntent,
@@ -236,7 +240,7 @@ async fn store_receipt(
         .flatten()
         .map(|document| document.epoch.membership_generation)
         .unwrap_or_default();
-    let launch_digest = match aruna_core::structs::JobRecordBody::digest(&round.intent) {
+    let launch_digest = match aruna_core::structs::execution::job::JobRecordBody::digest(&round.intent) {
         Ok(digest) => digest,
         Err(_) => return Err(LaunchDecline::Unauthorized),
     };
@@ -431,7 +435,7 @@ async fn committed_receipt(
 fn materialize_local(
     spec: &LogicalJobSpec,
     intent: &LaunchIntent,
-    job_id: aruna_core::structs::JobId,
+    job_id: aruna_core::structs::execution::job::JobId,
     local: NodeId,
     now_ms: u64,
 ) -> Result<JobRecord, LaunchDecline> {
@@ -508,7 +512,7 @@ pub(crate) fn existing_receipt(
     records: &[JobRecordEnvelope],
     intent: &LaunchIntent,
 ) -> Option<Result<ReceiptFrame, LaunchDecline>> {
-    let digest = aruna_core::structs::JobRecordBody::digest(intent).ok()?;
+    let digest = aruna_core::structs::execution::job::JobRecordBody::digest(intent).ok()?;
     records.iter().find_map(|envelope| match &envelope.record {
         JobFamilyRecord::Receipt(receipt) if receipt.launch_id == intent.launch_id => {
             match receipt.launch_digest == digest {
@@ -769,7 +773,7 @@ async fn placement_verdict(
 
 async fn append_record(
     context: &Arc<DriverContext>,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     local: NodeId,
     envelope: JobRecordEnvelope,
     origin: RecordOrigin,
@@ -803,7 +807,7 @@ async fn append_record(
 async fn fetch_family(
     context: &Arc<DriverContext>,
     config: &RealmConfigDocument,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     family: JobFamilyId,
     scheduler: NodeId,
 ) {
@@ -911,7 +915,7 @@ impl Operation for FetchFamilyOperation {
 #[cfg(test)]
 mod pure_tests {
     use aruna_core::scheduling::PlannedInput;
-    use aruna_core::structs::{InputMode, InputSelection, JobId, WorkspaceOutput};
+    use aruna_core::structs::execution::job::{InputMode, InputSelection, JobId, WorkspaceOutput};
 
     use super::*;
     use crate::tests::records::Family;

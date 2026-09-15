@@ -5,11 +5,13 @@
 use std::collections::BTreeSet;
 
 use aruna_core::NodeId;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     ExecutionReceipt, ExecutionUpdate, HolderView, JobFamilyId, JobFamilyRecord, JobId,
     JobRecordContext, JobRecordKey, JobRecordKind, LaunchIntent, LocalExecution, LogicalJobSpec,
-    PlacementRef, RealmConfigDocument, RealmId, WitnessBudgetRecord,
+    WitnessBudgetRecord,
 };
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use ulid::Ulid;
 
 use super::keys::{budget_key, id_key};

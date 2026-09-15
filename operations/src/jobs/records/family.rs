@@ -6,7 +6,9 @@ use std::future::Future;
 
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::JOB_FAMILY_RECORD_KEYSPACE;
-use aruna_core::structs::{JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind};
+use aruna_core::structs::execution::job::{
+    JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind,
+};
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
@@ -118,7 +120,7 @@ where
 mod tests {
     use std::cell::Cell;
 
-    use aruna_core::structs::PhysicalExecutionState;
+    use aruna_core::structs::execution::job::PhysicalExecutionState;
 
     use super::*;
     use crate::jobs::records::keys::record_key;

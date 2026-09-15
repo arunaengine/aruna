@@ -1,6 +1,6 @@
 //! Witness ranking, launch suppression, stored budgets, and staging refusals.
 
-use aruna_core::structs::{JobErrorKind, JobFamilyRecord, PhysicalExecutionState};
+use aruna_core::structs::execution::job::{JobErrorKind, JobFamilyRecord, PhysicalExecutionState};
 use std::collections::BTreeSet;
 
 use crate::jobs::lifecycle::stage::stage_error;

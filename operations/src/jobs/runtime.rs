@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JOB_LEASE_INDEX_PREFIX, JobError, JobErrorKind, JobExecutionClass, JobId, JobPayload,
     JobRecord, JobState, parse_schedule_key,
 };
@@ -882,11 +882,13 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::ROCRATE_JOB_STATE_KEYSPACE;
-    use aruna_core::structs::{
-        AttemptIntent, AuthContext, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
-        ImportRoCrateSpec, ImportRoCrateTarget, JobClaim, JobPayload, JobResultPayload, RealmId,
+    use aruna_core::structs::execution::job::{
+        AttemptIntent, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
+        ImportRoCrateSpec, ImportRoCrateTarget, JobClaim, JobPayload, JobResultPayload,
         RoCrateLimits,
     };
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;

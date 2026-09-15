@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use aruna_blob::blob::BlobHandle;
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::structs::BackendLocation;
+use aruna_core::structs::storage::blob::BackendLocation;
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf, SeekFrom};

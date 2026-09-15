@@ -6,10 +6,11 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::JOB_FAMILY_RECORD_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
-    PhysicalExecutionState, RealmNodeKind,
+    PhysicalExecutionState,
 };
+use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 

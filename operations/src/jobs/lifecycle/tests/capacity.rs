@@ -5,10 +5,11 @@ use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     CapturedInput, EffectiveResources, JobFamilyRecord, JobPayload, JobRecord, JobRecordBody,
-    LaunchIntent, LogicalJobSpec, PhysicalExecutionState, VersionedObjectArn,
+    LaunchIntent, LogicalJobSpec, PhysicalExecutionState,
 };
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -125,8 +126,8 @@ fn holds_static_ceilings() {
     // concurrency ceiling admits nothing at all.
     let held = vec![ExecutionReservation {
         execution_id: Ulid::from_bytes([1u8; 16]),
-        job_id: aruna_core::structs::JobId::from_bytes([2u8; 16]),
-        logical_job_id: aruna_core::structs::JobId::from_bytes([2u8; 16]),
+        job_id: aruna_core::structs::execution::job::JobId::from_bytes([2u8; 16]),
+        logical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([2u8; 16]),
         resources: resources(),
         created_at_ms: 1,
         subject_generation: 1,

@@ -1,6 +1,6 @@
 use aruna_core::NodeId;
 use aruna_core::effects::JobRecordFrame;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     AttemptControl, ExecutionOutputRecord, JobError, JobFamilyRecord, JobId, JobRecord,
     JobRecordEnvelope, LocalExecution, OutputObject, OutputSet, SubmissionId,
 };
@@ -206,9 +206,10 @@ async fn append_output_record(
 #[cfg(test)]
 mod tests {
     use aruna_core::UserId;
-    use aruna_core::structs::{
-        AttemptIntent, ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobState, RealmId,
+    use aruna_core::structs::execution::job::{
+        AttemptIntent, ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobState,
     };
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
     use ulid::Ulid;
