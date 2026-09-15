@@ -8,23 +8,23 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
-    WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE,
-};
-use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
-use aruna_core::structs::execution::notification_watch::{
-    WATCH_USER_CAP, WatchAuthorizationBinding, WatchEvent, WatchEventDetail,
-    WatchEventKind, WatchEventMask, WatchInterestDigest, WatchSubscription, interest_node_key,
-    watch_notification_id, watch_resource_path,
+    AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    SYNC_OUTBOX_KEYSPACE, WATCH_INTEREST_KEYSPACE,
 };
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::execution::notification_watch::{
+    WATCH_USER_CAP, WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind,
+    WatchEventMask, WatchInterestDigest, WatchSubscription, interest_node_key,
+    watch_notification_id, watch_resource_path,
+};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{DocumentEffect, NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -523,8 +523,7 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
     .await?;
     // The row and outbox record commit atomically; wait until the record has
     // published into topic history before changing which node holds the inbox.
-    wait_for(|| async { iter_len(old_holder_node, SYNC_OUTBOX_KEYSPACE).await == 0 })
-        .await?;
+    wait_for(|| async { iter_len(old_holder_node, SYNC_OUTBOX_KEYSPACE).await == 0 }).await?;
 
     // Deliver once before the rerank, so the post-rerank delivery below proves
     // the subscription moved rather than that it never worked.

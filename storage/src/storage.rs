@@ -26,8 +26,7 @@ pub use persistence::FjallPersistPolicy;
 pub use worker::FjallStorage;
 
 pub(in crate::storage) use handle::{
-    EFFECT_QUEUE_CAPACITY, CleanupEntry, CleanupKind, MAX_TRANSACTION_CLEANUP,
-    QUEUE_CAPACITY,
+    CleanupEntry, CleanupKind, EFFECT_QUEUE_CAPACITY, MAX_TRANSACTION_CLEANUP, QUEUE_CAPACITY,
 };
 pub(in crate::storage) use metrics::WorkerLifecycleGuard;
 pub(in crate::storage) use worker::{

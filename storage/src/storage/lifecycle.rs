@@ -7,9 +7,8 @@ use crate::compaction::Compactor;
 use crate::errors::StorageLibError;
 
 use super::{
-    EFFECT_QUEUE_CAPACITY, BULK_POOL_THREADS, FjallPersistPolicy, FjallStorage,
-    READ_POOL_THREADS, QUEUE_CAPACITY, StorageHandle, Store, WorkerLifecycleGuard,
-    spawn_read_pool,
+    BULK_POOL_THREADS, EFFECT_QUEUE_CAPACITY, FjallPersistPolicy, FjallStorage, QUEUE_CAPACITY,
+    READ_POOL_THREADS, StorageHandle, Store, WorkerLifecycleGuard, spawn_read_pool,
 };
 
 impl FjallStorage {
