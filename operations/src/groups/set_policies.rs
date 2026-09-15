@@ -1,13 +1,11 @@
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState, GROUP_POLICIES_PATH,
-};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, GROUP_POLICIES_PATH};
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -29,7 +27,7 @@ use crate::sync::document_outbox::{
 };
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SetGroupPoliciesConfig {
+pub struct SetGroupConfig {
     pub actor: Actor,
     /// The caller's own token context, so a path-restricted credential stays
     /// restricted; it is never derived from `actor`.
@@ -45,18 +43,18 @@ pub struct SetGroupPoliciesConfig {
 /// document machinery, mirroring the realm-scoped set: the value replicates as
 /// one last-writer-wins register carried on the group authorization document.
 #[derive(Debug, PartialEq)]
-pub struct SetGroupPoliciesOperation {
-    config: SetGroupPoliciesConfig,
+pub struct SetGroupOperation {
+    config: SetGroupConfig,
     txn_id: Option<TxnId>,
     /// Bucket the authorization row publishes onto, read inside the write
     /// transaction.
     fence: crate::placement::fence::WriteFence,
-    state: SetGroupPoliciesState,
-    output: Option<Result<GroupAuthorizationDocument, SetGroupPoliciesError>>,
+    state: SetGroupState,
+    output: Option<Result<GroupAuthorizationDocument, SetGroupError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum SetGroupPoliciesState {
+enum SetGroupState {
     Init,
     Auth,
     StartTransaction,
@@ -82,13 +80,13 @@ enum SetGroupPoliciesState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum SetGroupPoliciesError {
+pub enum SetGroupError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
-    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
+    AdminDocumentError(#[from] AdminDocumentError),
     #[error("group authorization document missing")]
     GroupAuthDocNotFound,
     #[error("caller may not write the group configuration")]
@@ -111,19 +109,19 @@ pub enum SetGroupPoliciesError {
     },
 }
 
-impl SetGroupPoliciesOperation {
-    pub fn new(config: SetGroupPoliciesConfig) -> Self {
+impl SetGroupOperation {
+    pub fn new(config: SetGroupConfig) -> Self {
         Self {
             config,
             txn_id: None,
             fence: Default::default(),
-            state: SetGroupPoliciesState::Init,
+            state: SetGroupState::Init,
             output: None,
         }
     }
 
-    fn document_ref(&self) -> DocumentSyncTarget {
-        DocumentSyncTarget::GroupAuthorization {
+    fn document_ref(&self) -> DocumentTarget {
+        DocumentTarget::GroupAuthorization {
             group_id: self.config.group_id,
         }
     }
@@ -143,7 +141,7 @@ impl SetGroupPoliciesOperation {
 
     fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
         self.txn_id = Some(txn_id);
-        self.state = SetGroupPoliciesState::ReadCurrent;
+        self.state = SetGroupState::ReadCurrent;
         let document = self.document_ref();
         let target = self.admin_target();
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -170,22 +168,22 @@ impl SetGroupPoliciesOperation {
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
         realm_config_value: Option<Value>,
-    ) -> Result<Effects, SetGroupPoliciesError> {
+    ) -> Result<Effects, SetGroupError> {
         let Some(txn_id) = self.txn_id else {
-            return Err(SetGroupPoliciesError::MissingTransaction);
+            return Err(SetGroupError::MissingTransaction);
         };
         validate_policy_set(&self.config.policies)
-            .map_err(|reason| SetGroupPoliciesError::InvalidPolicies { reason })?;
+            .map_err(|reason| SetGroupError::InvalidPolicies { reason })?;
 
         let Some(document_value) = document_value else {
-            return Err(SetGroupPoliciesError::GroupAuthDocNotFound);
+            return Err(SetGroupError::GroupAuthDocNotFound);
         };
         let mut document = GroupAuthorizationDocument::from_bytes(&document_value)?;
 
         if let Some(expected) = self.config.expected_hash
             && policy_set_hash(&document.policies) != expected
         {
-            return Err(SetGroupPoliciesError::StaleHash);
+            return Err(SetGroupError::StaleHash);
         }
 
         let target = self.admin_target();
@@ -200,12 +198,12 @@ impl SetGroupPoliciesOperation {
             .as_ref()
             .is_some_and(|state| state.target != target)
         {
-            return Err(AdminDocumentReducerError::TargetMismatch.into());
+            return Err(AdminDocumentError::TargetMismatch.into());
         }
 
         let mut reducer_state = previous_reducer_state
             .clone()
-            .unwrap_or_else(|| AdminDocumentReducerState::new(target));
+            .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_event = reducer_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::GroupPoliciesSet {
@@ -242,7 +240,7 @@ impl SetGroupPoliciesOperation {
             self.config.actor.node_id,
             document_target,
             Vec::new(),
-            DocumentSyncOutboxEvent::admin(admin_event),
+            DocumentOutboxEvent::admin(admin_event),
             placement,
             false,
         )
@@ -251,7 +249,7 @@ impl SetGroupPoliciesOperation {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
-        self.state = SetGroupPoliciesState::WriteDocumentAndAdminState {
+        self.state = SetGroupState::WriteDocumentAndAdminState {
             document,
             stale_conflict_deletes,
         };
@@ -266,12 +264,12 @@ impl SetGroupPoliciesOperation {
     /// departing holder's close rejects or conflicts this write.
     fn emit_commit_transaction(&mut self, document: GroupAuthorizationDocument) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.fail(SetGroupPoliciesError::MissingTransaction);
+            return self.fail(SetGroupError::MissingTransaction);
         };
         if self.fence.is_empty() {
             return self.emit_commit(document);
         }
-        self.state = SetGroupPoliciesState::ReadBucketFence { document };
+        self.state = SetGroupState::ReadBucketFence { document };
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: self.fence.reads(),
             txn_id: Some(txn_id),
@@ -280,22 +278,22 @@ impl SetGroupPoliciesOperation {
 
     fn emit_commit(&mut self, document: GroupAuthorizationDocument) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.fail(SetGroupPoliciesError::MissingTransaction);
+            return self.fail(SetGroupError::MissingTransaction);
         };
-        self.state = SetGroupPoliciesState::CommitTransaction { document };
+        self.state = SetGroupState::CommitTransaction { document };
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
-    fn fail(&mut self, error: SetGroupPoliciesError) -> Effects {
+    fn fail(&mut self, error: SetGroupError) -> Effects {
         let cleanup = self.abort();
-        self.state = SetGroupPoliciesState::Error;
+        self.state = SetGroupState::Error;
         self.output = Some(Err(error));
         cleanup
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
-        self.fail(SetGroupPoliciesError::UnexpectedEvent {
+        self.fail(SetGroupError::UnexpectedEvent {
             state,
             expected,
             got,
@@ -303,15 +301,15 @@ impl SetGroupPoliciesOperation {
     }
 }
 
-impl Operation for SetGroupPoliciesOperation {
+impl Operation for SetGroupOperation {
     type Output = GroupAuthorizationDocument;
-    type Error = SetGroupPoliciesError;
+    type Error = SetGroupError;
 
     fn start(&mut self) -> Effects {
         if self.config.auth_context.realm_id != self.config.actor.realm_id {
-            return self.fail(SetGroupPoliciesError::Unauthorized);
+            return self.fail(SetGroupError::Unauthorized);
         }
-        self.state = SetGroupPoliciesState::Auth;
+        self.state = SetGroupState::Auth;
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: self.config.auth_context.clone(),
@@ -324,37 +322,37 @@ impl Operation for SetGroupPoliciesOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state.clone() {
-            SetGroupPoliciesState::Auth => match event {
+            SetGroupState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
                         Ok(true) => {
-                            self.state = SetGroupPoliciesState::StartTransaction;
+                            self.state = SetGroupState::StartTransaction;
                             smallvec![Effect::Storage(StorageEffect::StartTransaction {
                                 read: false
                             })]
                         }
-                        Ok(false) => self.fail(SetGroupPoliciesError::Unauthorized),
+                        Ok(false) => self.fail(SetGroupError::Unauthorized),
                         Err(error) => {
                             warn!(error = %error, "Group policy authorization check failed");
                             match error {
                                 AuthorizationError::StorageError(error) => {
-                                    self.fail(SetGroupPoliciesError::StorageError(error))
+                                    self.fail(SetGroupError::StorageError(error))
                                 }
-                                _ => self.fail(SetGroupPoliciesError::Unauthorized),
+                                _ => self.fail(SetGroupError::Unauthorized),
                             }
                         }
                     }
                 }
                 other => self.unexpected_event("authorization result", format!("{other:?}")),
             },
-            SetGroupPoliciesState::StartTransaction => match event {
+            SetGroupState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("transaction start result", format!("{other:?}")),
             },
-            SetGroupPoliciesState::ReadCurrent => match event {
+            SetGroupState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [
                         (_, document_value),
@@ -379,16 +377,16 @@ impl Operation for SetGroupPoliciesOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            SetGroupPoliciesState::WriteDocumentAndAdminState {
+            SetGroupState::WriteDocumentAndAdminState {
                 document,
                 stale_conflict_deletes,
             } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
-                        return self.fail(SetGroupPoliciesError::MissingTransaction);
+                        return self.fail(SetGroupError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state = SetGroupPoliciesState::DeleteStaleAdminConflicts { document };
+                        self.state = SetGroupState::DeleteStaleAdminConflicts { document };
                         return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                             deletes: stale_conflict_deletes,
                             txn_id: Some(txn_id),
@@ -399,29 +397,28 @@ impl Operation for SetGroupPoliciesOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             },
-            SetGroupPoliciesState::DeleteStaleAdminConflicts { document } => match event {
+            SetGroupState::DeleteStaleAdminConflicts { document } => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
             },
-            SetGroupPoliciesState::ReadBucketFence { document } => match event {
+            SetGroupState::ReadBucketFence { document } => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     if self.fence.admits(&values) {
                         self.emit_commit(document)
                     } else {
-                        self.fail(SetGroupPoliciesError::PlacementFenced)
+                        self.fail(SetGroupError::PlacementFenced)
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("bucket fence read result", format!("{other:?}")),
             },
-            SetGroupPoliciesState::CommitTransaction { document } => match event {
+            SetGroupState::CommitTransaction { document } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state =
-                        SetGroupPoliciesState::ScheduleDocumentSyncOutboxDrain { document };
+                    self.state = SetGroupState::ScheduleDocumentSyncOutboxDrain { document };
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -430,14 +427,14 @@ impl Operation for SetGroupPoliciesOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            SetGroupPoliciesState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
+            SetGroupState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = SetGroupPoliciesState::Finish;
+                    self.state = SetGroupState::Finish;
                     smallvec![]
                 }
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                    self.state = SetGroupPoliciesState::Finish;
+                    self.state = SetGroupState::Finish;
                     smallvec![]
                 }
                 other => self.unexpected_event(
@@ -445,24 +442,18 @@ impl Operation for SetGroupPoliciesOperation {
                     format!("{other:?}"),
                 ),
             },
-            SetGroupPoliciesState::Finish
-            | SetGroupPoliciesState::Error
-            | SetGroupPoliciesState::Init => {
+            SetGroupState::Finish | SetGroupState::Error | SetGroupState::Init => {
                 smallvec![]
             }
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            SetGroupPoliciesState::Finish | SetGroupPoliciesState::Error
-        )
+        matches!(self.state, SetGroupState::Finish | SetGroupState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(SetGroupPoliciesError::NotFinished))
+        self.output.unwrap_or(Err(SetGroupError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -477,7 +468,7 @@ impl Operation for SetGroupPoliciesOperation {
 /// mirroring the replicated materialization in `net::irokle`.
 fn apply_reducer_policies(
     document: &mut GroupAuthorizationDocument,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
 ) {
     if !reducer_state.conflicts.contains_key(GROUP_POLICIES_PATH)
         && let Some(policies) = reducer_state.materialized_group_policies()
@@ -488,7 +479,7 @@ fn apply_reducer_policies(
 
 #[cfg(test)]
 mod tests {
-    use super::{SetGroupPoliciesConfig, SetGroupPoliciesError, SetGroupPoliciesOperation};
+    use super::{SetGroupConfig, SetGroupError, SetGroupOperation};
     use crate::driver::{DriverContext, drive};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::groups::get_group::{GetGroupConfig, GetGroupOperation};
@@ -527,8 +518,8 @@ mod tests {
         group_id: Ulid,
         policies: Vec<RequestPolicy>,
         expected_hash: Option<[u8; 32]>,
-    ) -> SetGroupPoliciesConfig {
-        SetGroupPoliciesConfig {
+    ) -> SetGroupConfig {
+        SetGroupConfig {
             actor: actor.clone(),
             auth_context: auth(actor),
             group_id,
@@ -600,7 +591,7 @@ mod tests {
         let (_dir, context, actor, group_id) = setup_group().await;
         let policies = vec![policy("permission == 'write'")];
         let document = drive(
-            SetGroupPoliciesOperation::new(group_config(&actor, group_id, policies.clone(), None)),
+            SetGroupOperation::new(group_config(&actor, group_id, policies.clone(), None)),
             &context,
         )
         .await
@@ -625,7 +616,7 @@ mod tests {
         let empty_hash = policy_set_hash(&[]);
         let first = vec![policy("permission == 'write'")];
         drive(
-            SetGroupPoliciesOperation::new(group_config(
+            SetGroupOperation::new(group_config(
                 &actor,
                 group_id,
                 first.clone(),
@@ -637,7 +628,7 @@ mod tests {
         .unwrap();
 
         let stale = drive(
-            SetGroupPoliciesOperation::new(group_config(
+            SetGroupOperation::new(group_config(
                 &actor,
                 group_id,
                 vec![policy("permission == 'read'")],
@@ -646,7 +637,7 @@ mod tests {
             &context,
         )
         .await;
-        assert!(matches!(stale, Err(SetGroupPoliciesError::StaleHash)));
+        assert!(matches!(stale, Err(SetGroupError::StaleHash)));
 
         let (_, auth_doc) = drive(
             GetGroupOperation::new(GetGroupConfig { group_id }),
@@ -662,7 +653,7 @@ mod tests {
         // An uncompilable expression is refused at administration time.
         let (_dir, context, actor, group_id) = setup_group().await;
         let result = drive(
-            SetGroupPoliciesOperation::new(group_config(
+            SetGroupOperation::new(group_config(
                 &actor,
                 group_id,
                 vec![policy("path.startsWith(")],
@@ -671,10 +662,7 @@ mod tests {
             &context,
         )
         .await;
-        assert!(matches!(
-            result,
-            Err(SetGroupPoliciesError::InvalidPolicies { .. })
-        ));
+        assert!(matches!(result, Err(SetGroupError::InvalidPolicies { .. })));
     }
 
     #[tokio::test]
@@ -686,7 +674,7 @@ mod tests {
             ..actor.clone()
         };
         let error = drive(
-            SetGroupPoliciesOperation::new(group_config(
+            SetGroupOperation::new(group_config(
                 &outsider,
                 group_id,
                 vec![policy("permission == 'write'")],
@@ -696,7 +684,7 @@ mod tests {
         )
         .await
         .expect_err("an unauthorized caller is refused");
-        assert_eq!(error, SetGroupPoliciesError::Unauthorized);
+        assert_eq!(error, SetGroupError::Unauthorized);
 
         let (_, auth_doc) = drive(
             GetGroupOperation::new(GetGroupConfig { group_id }),
@@ -713,7 +701,7 @@ mod tests {
         let group_id = Ulid::from_bytes([5u8; 16]);
         let actor = actor(realm_id);
         let mut operation =
-            SetGroupPoliciesOperation::new(group_config(&actor, group_id, Vec::new(), None));
+            SetGroupOperation::new(group_config(&actor, group_id, Vec::new(), None));
         let effects = operation.start();
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
         let emitted = format!("{effects:?}");
@@ -725,7 +713,7 @@ mod tests {
     fn denied_is_terminal() {
         let realm_id = RealmId([23u8; 32]);
         let actor = actor(realm_id);
-        let mut operation = SetGroupPoliciesOperation::new(group_config(
+        let mut operation = SetGroupOperation::new(group_config(
             &actor,
             Ulid::from_bytes([5u8; 16]),
             Vec::new(),
@@ -737,10 +725,7 @@ mod tests {
         ));
         assert!(effects.is_empty());
         assert!(operation.is_complete());
-        assert_eq!(
-            operation.finalize(),
-            Err(SetGroupPoliciesError::Unauthorized)
-        );
+        assert_eq!(operation.finalize(), Err(SetGroupError::Unauthorized));
     }
 
     #[test]
@@ -748,7 +733,7 @@ mod tests {
         // Storage exhaustion inside the check is infrastructure, not a verdict.
         let realm_id = RealmId([23u8; 32]);
         let actor = actor(realm_id);
-        let mut operation = SetGroupPoliciesOperation::new(group_config(
+        let mut operation = SetGroupOperation::new(group_config(
             &actor,
             Ulid::from_bytes([5u8; 16]),
             Vec::new(),
@@ -765,9 +750,7 @@ mod tests {
         assert!(operation.is_complete());
         assert_eq!(
             operation.finalize(),
-            Err(SetGroupPoliciesError::StorageError(
-                StorageError::CleanupCapacity
-            ))
+            Err(SetGroupError::StorageError(StorageError::CleanupCapacity))
         );
     }
 
@@ -775,7 +758,7 @@ mod tests {
     fn allowed_starts_transaction() {
         let realm_id = RealmId([23u8; 32]);
         let actor = actor(realm_id);
-        let mut operation = SetGroupPoliciesOperation::new(group_config(
+        let mut operation = SetGroupOperation::new(group_config(
             &actor,
             Ulid::from_bytes([5u8; 16]),
             Vec::new(),
