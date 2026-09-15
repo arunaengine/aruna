@@ -2,9 +2,9 @@ use aruna_core::errors::StorageError;
 use aruna_core::metadata::{MetadataError, MetadataValidationViolation};
 use aruna_core::structs::BindingError;
 
+use crate::forward::transport::MetadataWriteError;
 use crate::metadata::create_document::CreateMetadataDocumentError;
 use crate::metadata::delete_document::DeleteMetadataDocumentError;
-use crate::metadata::forward::MetadataWriteError;
 use crate::metadata::update_document::UpdateMetadataDocumentError;
 
 /// What a job should do about a failed metadata write, shared by every job that

@@ -18,6 +18,7 @@ use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::forward::transport::MetadataWriteError;
 use crate::harvest::oai_pmh::mapping::dc_to_jsonld;
 use crate::harvest::oai_pmh::parse::{
     OaiParseError, OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page,
@@ -37,7 +38,7 @@ use crate::metadata::create_document::{
     CreateMetadataDocumentPayload, mint_job_document,
 };
 use crate::metadata::forward::{
-    MetadataWriteError, route_metadata_create, route_metadata_delete, route_metadata_update,
+    route_metadata_create, route_metadata_delete, route_metadata_update,
 };
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::update_document::UpdateMetadataDocumentMutation;

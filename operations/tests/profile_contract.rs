@@ -19,13 +19,14 @@ use aruna_core::structs::{
     RealmId, RealmNodeKind,
 };
 use aruna_operations::driver::DriverContext;
+use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, mint_local_document,
 };
 use aruna_operations::metadata::forward::{
-    MetadataWriteError, admits_profile_peer, export_profile_local, route_metadata_create,
+    admits_profile_peer, export_profile_local, route_metadata_create,
 };
 use aruna_operations::metadata::profile_validation::{
     current_validation_status, load_validation_status, preview_submission, profile_public_iri,

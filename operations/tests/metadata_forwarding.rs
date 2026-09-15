@@ -31,6 +31,7 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
+use aruna_operations::auth::forward::forward_token_revoke;
 use aruna_operations::device::drain::{DrainOutcome, drain_publish_queue};
 use aruna_operations::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
 use aruna_operations::device::inspect_draft::InspectDraftOperation;
@@ -38,17 +39,16 @@ use aruna_operations::device::publish_queue::{
     PUBLISH_PAGE_SIZE, PublishEntry, PublishState, publish_entry,
 };
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_operations::groups::forward::{ForwardGroupError, forward_group_create};
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_forward_document, mint_local_document,
 };
-use aruna_operations::metadata::forward::{
-    ForwardGroupError, MetadataWriteError, forward_group_create, forward_token_revoke,
-    route_metadata_create, route_metadata_update,
-};
+use aruna_operations::metadata::forward::{route_metadata_create, route_metadata_update};
 use aruna_operations::metadata::get_document::load_document_record;
 use aruna_operations::metadata::update_document::{
     UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
@@ -973,7 +973,7 @@ async fn read_group_auth(
     }
 }
 
-/// Mints the D8 blind-bucket structured id a non-holder forward carries, so the
+/// Mints the blind-bucket structured id a non-holder forward carries, so the
 /// forwarded create routes to that bucket's holders regardless of the origin.
 fn forward_id(
     config: &RealmConfigDocument,
