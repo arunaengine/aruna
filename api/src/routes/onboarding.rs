@@ -832,9 +832,7 @@ pub async fn bootstrap_onboarding(
             mode: OnboardingMode::Management,
             temporary_bootstrap_endpoint: bootstrap_endpoint,
             wrapped_realm_key: wrapped_management_key.as_ref().map(|value| value.0.clone()),
-            wrapped_key_nonce: wrapped_management_key
-                .as_ref()
-                .map(|value| value.1.clone()),
+            wrapped_key_nonce: wrapped_management_key.as_ref().map(|value| value.1.clone()),
             wrapping_public_key: wrapped_management_key.as_ref().map(|value| value.2.clone()),
             delegation_signature: None,
             onboarding_sync_ticket: finalized.onboarding_sync_ticket,

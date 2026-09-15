@@ -446,7 +446,10 @@ impl ArunaValidationState for RevocationBlindState<'_> {
         Ok(false)
     }
 
-    async fn is_trusted_realm(&self, realm_id: &aruna_core::structs::identity::realm::RealmId) -> bool {
+    async fn is_trusted_realm(
+        &self,
+        realm_id: &aruna_core::structs::identity::realm::RealmId,
+    ) -> bool {
         self.0.is_trusted_realm(realm_id).await
     }
 
@@ -639,8 +642,8 @@ pub(crate) fn blob_permission_path(
 #[cfg(test)]
 mod test {
     use crate::auth::{
-        CACHE_TTL_SECS, OidcValidator, blob_permission_path,
-        extract_auth_context, extract_auth_parts, handle_token, map_authorize_error,
+        CACHE_TTL_SECS, OidcValidator, blob_permission_path, extract_auth_context,
+        extract_auth_parts, handle_token, map_authorize_error,
     };
     use crate::error::{ServerError, TokenError};
     use crate::server::ServerState;
@@ -652,8 +655,8 @@ mod test {
     use aruna_core::handle::Handle;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
-    use aruna_core::structs::identity::realm::OidcProviderConfig;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, TokenClaims};
+    use aruna_core::structs::identity::realm::OidcProviderConfig;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
@@ -1221,9 +1224,7 @@ mod test {
 
         validator.validate(&provider, &token).await.unwrap();
         let expired_at = Instant::now()
-            .checked_sub(Duration::from_secs(
-                CACHE_TTL_SECS + 1,
-            ))
+            .checked_sub(Duration::from_secs(CACHE_TTL_SECS + 1))
             .unwrap();
         validator
             .provider_metadata_cache

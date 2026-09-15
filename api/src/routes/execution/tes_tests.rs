@@ -9,9 +9,9 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
+use aruna_core::structs::execution::job::{JobError, OutputObject};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
-use aruna_core::structs::execution::job::{JobError, OutputObject};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
@@ -903,8 +903,8 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
         EffectiveResources, JobAdmissionRecord, JobProgress, JobRetryPolicy, LogicalJobSpec,
         LogicalJobState, OutputObject, SubmissionId, WorkspaceMode,
     };
-    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_operations::jobs::lifecycle::FamilyReport;
 
     let realm_id = RealmId([1u8; 32]);

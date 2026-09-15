@@ -17,9 +17,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::GROUP_KEYSPACE;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
-use aruna_core::structs::placement::placement_record::{DocumentClass, PlacementScope};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
+use aruna_core::structs::placement::placement_record::{DocumentClass, PlacementScope};
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::placement::allocate_handle::{
@@ -379,8 +379,8 @@ async fn usage_requires_auth() {
 #[tokio::test]
 async fn usage_counts_documents() {
     use aruna_core::storage_entries::registry_write_entries;
-    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 
     let storage_dir = tempdir().unwrap();
     let metadata_dir = tempdir().unwrap();
@@ -1607,10 +1607,12 @@ async fn device_never_connected() {
     .unwrap();
     let device = iroh::SecretKey::from_bytes(&[43u8; 32]).public();
     for node_id in [device, state.get_node_id()] {
-        config.nodes.push(aruna_core::structs::identity::realm::RealmNode {
-            node_id: node_id.to_string(),
-            kind: aruna_core::structs::identity::realm::RealmNodeKind::User { owner },
-        });
+        config
+            .nodes
+            .push(aruna_core::structs::identity::realm::RealmNode {
+                node_id: node_id.to_string(),
+                kind: aruna_core::structs::identity::realm::RealmNodeKind::User { owner },
+            });
     }
 
     let present = HashSet::from([device, state.get_node_id()]);
@@ -1654,10 +1656,12 @@ async fn reports_device_seen() {
     let recent = iroh::SecretKey::from_bytes(&[44u8; 32]).public();
     let stale = iroh::SecretKey::from_bytes(&[45u8; 32]).public();
     for node_id in [recent, stale, state.get_node_id()] {
-        config.nodes.push(aruna_core::structs::identity::realm::RealmNode {
-            node_id: node_id.to_string(),
-            kind: aruna_core::structs::identity::realm::RealmNodeKind::User { owner },
-        });
+        config
+            .nodes
+            .push(aruna_core::structs::identity::realm::RealmNode {
+                node_id: node_id.to_string(),
+                kind: aruna_core::structs::identity::realm::RealmNodeKind::User { owner },
+            });
     }
     let now_ms = 1_000_000;
     let window = aruna_operations::metadata::PEER_CONTACT_WINDOW.as_millis() as u64;

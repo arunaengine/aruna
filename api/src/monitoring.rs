@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{SYNC_OUTBOX_KEYSPACE, NODE_STATE_KEYSPACE};
+use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::telemetry::QUEUE_LAG_INTERVAL;
 use aruna_core::time::unix_timestamp_millis;
@@ -180,9 +180,7 @@ pub fn router(state: Arc<MonitoringState>) -> Router {
                     StatusCode::REQUEST_TIMEOUT,
                     OPS_REQUEST_TIMEOUT,
                 ))
-                .layer(GlobalConcurrencyLimitLayer::new(
-                    OPS_MAX_REQUESTS,
-                )),
+                .layer(GlobalConcurrencyLimitLayer::new(OPS_MAX_REQUESTS)),
         )
 }
 
@@ -531,9 +529,7 @@ impl QueueMetrics {
             self.oldest_age_seconds.get_or_create(&labels).set(0.0);
             self.depth_capped.get_or_create(&labels).set(0);
             self.probe_up.get_or_create(&labels).set(0);
-            self.last_success_seconds
-                .get_or_create(&labels)
-                .set(0);
+            self.last_success_seconds.get_or_create(&labels).set(0);
         }
     }
 
@@ -565,15 +561,9 @@ impl QueueMetrics {
             METADATA_MATERIALIZATION_QUEUE,
             sample.metadata_materialization,
         );
-        self.apply(
-            DEAD_LETTER_QUEUE,
-            sample.materialization_dead_letters,
-        );
+        self.apply(DEAD_LETTER_QUEUE, sample.materialization_dead_letters);
         self.apply(BLOB_REPLICATION_QUEUE, sample.blob_replication);
-        self.apply(
-            METADATA_REFRESH_QUEUE,
-            sample.reference_metadata_refresh,
-        );
+        self.apply(METADATA_REFRESH_QUEUE, sample.reference_metadata_refresh);
     }
 }
 
@@ -994,10 +984,7 @@ mod tests {
             .get();
         assert!(last_success > 0);
 
-        queue_metrics.apply(
-            SYNC_OUTBOX_QUEUE,
-            Err("storage closed".to_string()),
-        );
+        queue_metrics.apply(SYNC_OUTBOX_QUEUE, Err("storage closed".to_string()));
         assert_eq!(queue_metrics.depth.get_or_create(&labels).get(), 7);
         assert_eq!(queue_metrics.depth_capped.get_or_create(&labels).get(), 1);
         assert_eq!(queue_metrics.probe_up.get_or_create(&labels).get(), 0);

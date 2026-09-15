@@ -5,12 +5,12 @@ use crate::error::ServerError;
 use crate::forwarded::{client_ip, external_base_url};
 use crate::rate_limit::LocalKey;
 use crate::server_state::ServerState;
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{BackendLocation, object_permission_path};
 use aruna_core::structs::storage::replication::{
     ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{BackendLocation, object_permission_path};
-use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::realm::get_config::GetConfigOperation;
@@ -962,7 +962,10 @@ async fn resolve_content_hash(
     state: &ServerState,
     auth: &AuthContext,
     requested_id: &str,
-    requested_scope: Option<(aruna_core::structs::identity::realm::RealmId, aruna_core::NodeId)>,
+    requested_scope: Option<(
+        aruna_core::structs::identity::realm::RealmId,
+        aruna_core::NodeId,
+    )>,
     hash: &[u8; 32],
 ) -> Result<ResolveOutcome, DrsError> {
     if let Some((realm_id, node_id)) = requested_scope

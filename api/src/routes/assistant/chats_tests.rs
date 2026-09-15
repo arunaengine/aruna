@@ -3,11 +3,10 @@ use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
-use aruna_core::structs::{
-    MAX_ASSISTANT_BYTES, MAX_ASSISTANT_TURNS, MAX_ASSISTANT_CHATS,
-    MAX_TURN_BYTES,
-};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::{
+    MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS, MAX_ASSISTANT_TURNS, MAX_TURN_BYTES,
+};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use axum::response::IntoResponse;
 use tempfile::TempDir;
@@ -397,15 +396,9 @@ async fn refuses_over_budget() {
             .await
             .unwrap();
     }
-    let error = save_turn(
-        &state,
-        &auth,
-        "c-2",
-        fitting - MAX_ASSISTANT_TURNS,
-        "y",
-    )
-    .await
-    .unwrap_err();
+    let error = save_turn(&state, &auth, "c-2", fitting - MAX_ASSISTANT_TURNS, "y")
+        .await
+        .unwrap_err();
     assert_eq!(
         error.into_response().status(),
         StatusCode::PAYLOAD_TOO_LARGE

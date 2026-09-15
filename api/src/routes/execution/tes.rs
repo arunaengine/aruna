@@ -8,12 +8,12 @@ use crate::routes::routes_at;
 use aruna_core::compute::{
     has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
 };
-use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::execution::job::{
     ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId, JobPayload,
     JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
     OutputSelection, PhysicalExecutionResult, ResultMessage, WorkspaceMode,
 };
+use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
 use aruna_operations::driver::drive;
@@ -59,12 +59,7 @@ const ID_TAG_KEY: &str = "aruna-engine.org/job-id";
 const STATE_TAG_KEY: &str = "aruna-engine.org/logical-state";
 const KIND_TAG_KEY: &str = "aruna-engine.org/executor-kind";
 const TRANSFER_TAG_KEY: &str = "aruna-engine.org/estimated-transfer-bytes";
-const DERIVED_TAG_KEYS: [&str; 4] = [
-    ID_TAG_KEY,
-    STATE_TAG_KEY,
-    KIND_TAG_KEY,
-    TRANSFER_TAG_KEY,
-];
+const DERIVED_TAG_KEYS: [&str; 4] = [ID_TAG_KEY, STATE_TAG_KEY, KIND_TAG_KEY, TRANSFER_TAG_KEY];
 
 const DEFAULT_PAGE_SIZE: usize = 256;
 const MAX_PAGE_SIZE: usize = 512;

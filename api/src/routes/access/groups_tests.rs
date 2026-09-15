@@ -17,13 +17,13 @@ use aruna_core::keyspaces::{
     GROUP_KEYSPACE, S3_BUCKET_KEYSPACE, USER_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Role};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CurrentVersionPointer, VersionKey, bucket_permission_path, object_permission_path,
 };
-use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
-use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
-use aruna_core::structs::identity::user::User;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::driver::drive;
 use aruna_operations::groups::list_groups::ListGroupOperation;
@@ -144,8 +144,10 @@ async fn setup_state() -> (Arc<ServerState>, TempDir) {
     seed_realm_auth(&state.get_ctx(), realm_id, &actor).await;
     // Policy loading fails closed without the realm config document, and a
     // node the configuration does not name has no resolvable kind.
-    let mut config =
-        aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    let mut config = aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(
+        realm_id,
+        Vec::new(),
+    );
     config.ensure_node(state.get_node_id(), RealmNodeKind::Management);
     store_bytes(
         &state,

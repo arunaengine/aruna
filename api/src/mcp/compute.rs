@@ -8,10 +8,10 @@ use aruna_core::compute::runtimes::{
     SessionRuntime, quick_runtime,
 };
 use aruna_core::structs::execution::job::JobPayload;
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{
     CONTENT_TYPE_KEY, group_permission_path, key_content_type,
 };
-use aruna_core::structs::identity::auth::Permission;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::command::{
     CollisionPolicy, ExecutionInput, ExecutionOutput, ExecutionTarget, InputMode, SessionMountSpec,
@@ -962,7 +962,9 @@ fn parse_job(id: &str) -> Result<aruna_core::structs::execution::job::JobId, Cal
     })
 }
 
-fn parse_job_state(value: &str) -> Result<aruna_core::structs::execution::job::JobState, CallToolResult> {
+fn parse_job_state(
+    value: &str,
+) -> Result<aruna_core::structs::execution::job::JobState, CallToolResult> {
     crate::routes::jobs::parse_state(value).map_err(|_| {
         bad_request(
             "state must be one of queued, claimed, preparing, ready, running, cancelling, \

@@ -383,7 +383,9 @@ mod tests {
     /// Assigns every realm role, including `realm_admin`, to one user.
     async fn grant_realm_admin(ctx: &DriverContext, realm_id: RealmId, user_id: UserId) {
         let mut auth_doc =
-            aruna_core::structs::identity::realm::RealmAuthorizationDocument::default_realm_doc(realm_id);
+            aruna_core::structs::identity::realm::RealmAuthorizationDocument::default_realm_doc(
+                realm_id,
+            );
         for role in auth_doc.roles.values_mut() {
             role.assigned_users.insert(user_id);
         }

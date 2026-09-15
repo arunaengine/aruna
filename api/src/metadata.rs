@@ -210,9 +210,9 @@ pub(crate) fn map_create_error(error: CreateDocumentError) -> ServerError {
         CreateDocumentError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent metadata create conflict; retry".to_string())
         }
-        CreateDocumentError::PlacementBinding(aruna_core::structs::placement::binding_directory::BindingError::Conflicted(_)) => {
-            ServerError::ServiceUnavailableReason("placement_binding_conflict".to_string())
-        }
+        CreateDocumentError::PlacementBinding(
+            aruna_core::structs::placement::binding_directory::BindingError::Conflicted(_),
+        ) => ServerError::ServiceUnavailableReason("placement_binding_conflict".to_string()),
         CreateDocumentError::PlacementBinding(_)
         | CreateDocumentError::PlacementBindingUnavailable(_) => {
             ServerError::ServiceUnavailableReason("placement_binding_unavailable".to_string())

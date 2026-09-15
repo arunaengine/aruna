@@ -10,14 +10,14 @@ use crate::routes::storage::connectors::ApiConnectorKind;
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::execution::job::{
     JobPayload, JobRecord, JobState, StagingJobCheckpoint, StagingJobItem, StagingJobPhase,
     StagingJobPrefix, StagingJobSpec,
 };
 use aruna_core::structs::execution::source_access::{SourceEntry, SourceEntryKind};
 use aruna_core::structs::execution::staging::StagingStrategy;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use aruna_operations::jobs::staging::read_staging_checkpoint;
@@ -831,8 +831,8 @@ pub async fn get_staging_job(
     AxumPath(job_id): AxumPath<String>,
 ) -> ServerResult<(StatusCode, Json<StagingJobResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
-    let job_id =
-        aruna_core::structs::execution::job::JobId::from_str(&job_id).map_err(|_| ServerError::BadRequest)?;
+    let job_id = aruna_core::structs::execution::job::JobId::from_str(&job_id)
+        .map_err(|_| ServerError::BadRequest)?;
     // The owner is the sole 404 authority; a non-owner routes or reports 503.
     let (record, checkpoint) = read_staging_routed(
         &state.get_ctx(),

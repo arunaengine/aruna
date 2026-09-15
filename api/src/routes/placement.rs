@@ -7,13 +7,13 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
 use crate::server_state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
-use aruna_core::structs::placement::placement_record::LabelMatch;
 use aruna_core::structs::placement::placement_policy::{
     PlacementPolicy, PlacementPolicyError, PlacementPolicyRef, PlacementSelector,
 };
-use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
+use aruna_core::structs::placement::placement_record::LabelMatch;
 use aruna_core::structs::placement::policy_attachment::{PolicyBlockedReason, PolicyStatus};
+use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
+use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
 use aruna_operations::driver::{drive, gate_context, now_ms};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
@@ -31,10 +31,10 @@ use aruna_operations::placement::policy::{
     PolicyForwardError, PolicyGateError, QuarantineError, ResolveQuarantineConfig,
     ResolveQuarantineOperation, create_policy_routed,
 };
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::placement::{
     PutPlacementError, PutPlacementInput, PutPlacementOperation,
 };
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::placement::{
     ObjectPlacementError, ObjectPlacementInput, ObjectPlacementOperation,
 };
@@ -657,10 +657,18 @@ async fn ensure_placement_writer(
         return Ok(());
     }
     let path = match crate::routes::access::groups::get_bucket_group(state, bucket).await? {
-        Some(group_id) => aruna_core::structs::placement::policy_document::group_admin_path(realm_id, group_id),
+        Some(group_id) => {
+            aruna_core::structs::placement::policy_document::group_admin_path(realm_id, group_id)
+        }
         None => config_admin,
     };
-    crate::auth::ensure_permission(state, auth, path, aruna_core::structs::identity::auth::Permission::WRITE).await
+    crate::auth::ensure_permission(
+        state,
+        auth,
+        path,
+        aruna_core::structs::identity::auth::Permission::WRITE,
+    )
+    .await
 }
 
 async fn local_subject(
@@ -1677,7 +1685,9 @@ pub async fn get_placement_diagnostics(
                 key: violation.version.key.clone(),
                 version_id: violation.version.version_id.to_string(),
                 state: match violation.state {
-                    aruna_core::structs::storage::blob::ManagedCopyState::Registered => "registered".to_string(),
+                    aruna_core::structs::storage::blob::ManagedCopyState::Registered => {
+                        "registered".to_string()
+                    }
                     aruna_core::structs::storage::blob::ManagedCopyState::Quarantined(_) => {
                         "quarantined".to_string()
                     }

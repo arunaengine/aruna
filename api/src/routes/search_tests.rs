@@ -14,12 +14,12 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
-use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::structs::identity::user::User;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;

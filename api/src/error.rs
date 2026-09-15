@@ -125,9 +125,7 @@ impl From<ArunaBearerError> for TokenError {
             ArunaBearerError::AuthContextConversion(error) => Self::AuthContextConversion(error),
             ArunaBearerError::PublicKeyError(error) => Self::PublicKeyError(error),
             ArunaBearerError::FromSliceError(error) => Self::FromSliceError(error),
-            ArunaBearerError::PublicConversionError(error) => {
-                Self::PublicConversionError(error)
-            }
+            ArunaBearerError::PublicConversionError(error) => Self::PublicConversionError(error),
             ArunaBearerError::JwtError(error) => Self::JWTError(error),
             ArunaBearerError::Base64Error(error) => Self::Base64Error(error),
         }

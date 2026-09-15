@@ -7,12 +7,12 @@ use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::placement_record::PlacementScope;
 use aruna_core::structs::placement::policy_document::policy_admin_path;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::{backend_used_bytes, drive};
@@ -106,7 +106,9 @@ pub enum NodeCapabilityKind {
 impl From<&aruna_core::structs::identity::auth::NodeCapabilities> for NodeCapabilityKind {
     fn from(capabilities: &aruna_core::structs::identity::auth::NodeCapabilities) -> Self {
         match capabilities {
-            aruna_core::structs::identity::auth::NodeCapabilities::Management { .. } => Self::Management,
+            aruna_core::structs::identity::auth::NodeCapabilities::Management { .. } => {
+                Self::Management
+            }
             aruna_core::structs::identity::auth::NodeCapabilities::Server { .. } => Self::Server,
             aruna_core::structs::identity::auth::NodeCapabilities::User { .. } => Self::User,
         }
@@ -602,8 +604,12 @@ impl RealmPlacementResponse {
     }
 }
 
-impl From<&aruna_core::structs::placement::placement_record::PlacementStrategy> for RealmPlacementStrategy {
-    fn from(strategy: &aruna_core::structs::placement::placement_record::PlacementStrategy) -> Self {
+impl From<&aruna_core::structs::placement::placement_record::PlacementStrategy>
+    for RealmPlacementStrategy
+{
+    fn from(
+        strategy: &aruna_core::structs::placement::placement_record::PlacementStrategy,
+    ) -> Self {
         Self {
             strategy_id: strategy.strategy_id.to_string(),
             name: strategy.name.clone(),
@@ -629,7 +635,9 @@ impl From<&aruna_core::structs::placement::placement_record::PlacementStrategy> 
 }
 
 impl RealmPlacementStrategy {
-    fn into_core(self) -> ServerResult<aruna_core::structs::placement::placement_record::PlacementStrategy> {
+    fn into_core(
+        self,
+    ) -> ServerResult<aruna_core::structs::placement::placement_record::PlacementStrategy> {
         Ok(aruna_core::structs::placement::placement_record::PlacementStrategy {
             strategy_id: parse_ulid(&self.strategy_id, "strategy_id")?,
             name: self.name,
@@ -666,11 +674,15 @@ impl From<&aruna_core::structs::placement::placement_record::StrategyBinding> fo
 }
 
 impl RealmBinding {
-    fn into_core(self) -> ServerResult<aruna_core::structs::placement::placement_record::StrategyBinding> {
-        Ok(aruna_core::structs::placement::placement_record::StrategyBinding {
-            scope: self.scope.into_core()?,
-            strategy_id: parse_ulid(&self.strategy_id, "strategy_id")?,
-        })
+    fn into_core(
+        self,
+    ) -> ServerResult<aruna_core::structs::placement::placement_record::StrategyBinding> {
+        Ok(
+            aruna_core::structs::placement::placement_record::StrategyBinding {
+                scope: self.scope.into_core()?,
+                strategy_id: parse_ulid(&self.strategy_id, "strategy_id")?,
+            },
+        )
     }
 }
 
@@ -678,48 +690,70 @@ impl From<&aruna_core::structs::placement::placement_record::BindingScope> for R
     fn from(scope: &aruna_core::structs::placement::placement_record::BindingScope) -> Self {
         match scope {
             aruna_core::structs::placement::placement_record::BindingScope::Realm => Self::Realm,
-            aruna_core::structs::placement::placement_record::BindingScope::Group(group_id) => Self::Group {
-                group_id: group_id.to_string(),
-            },
-            aruna_core::structs::placement::placement_record::BindingScope::Class(document_class) => Self::Class {
-                document_class: RealmPlacementClass::from(*document_class),
-            },
-            aruna_core::structs::placement::placement_record::BindingScope::MetadataPathPrefix(prefix) => {
-                Self::MetadataPathPrefix {
-                    prefix: prefix.clone(),
+            aruna_core::structs::placement::placement_record::BindingScope::Group(group_id) => {
+                Self::Group {
+                    group_id: group_id.to_string(),
                 }
             }
+            aruna_core::structs::placement::placement_record::BindingScope::Class(
+                document_class,
+            ) => Self::Class {
+                document_class: RealmPlacementClass::from(*document_class),
+            },
+            aruna_core::structs::placement::placement_record::BindingScope::MetadataPathPrefix(
+                prefix,
+            ) => Self::MetadataPathPrefix {
+                prefix: prefix.clone(),
+            },
         }
     }
 }
 
 impl RealmBindingScope {
-    fn into_core(self) -> ServerResult<aruna_core::structs::placement::placement_record::BindingScope> {
+    fn into_core(
+        self,
+    ) -> ServerResult<aruna_core::structs::placement::placement_record::BindingScope> {
         Ok(match self {
             Self::Realm => aruna_core::structs::placement::placement_record::BindingScope::Realm,
             Self::Group { group_id } => {
-                aruna_core::structs::placement::placement_record::BindingScope::Group(parse_ulid(&group_id, "group_id")?)
+                aruna_core::structs::placement::placement_record::BindingScope::Group(parse_ulid(
+                    &group_id, "group_id",
+                )?)
             }
             Self::Class { document_class } => {
-                aruna_core::structs::placement::placement_record::BindingScope::Class(document_class.into())
+                aruna_core::structs::placement::placement_record::BindingScope::Class(
+                    document_class.into(),
+                )
             }
             Self::MetadataPathPrefix { prefix } => {
-                aruna_core::structs::placement::placement_record::BindingScope::MetadataPathPrefix(prefix)
+                aruna_core::structs::placement::placement_record::BindingScope::MetadataPathPrefix(
+                    prefix,
+                )
             }
         })
     }
 }
 
 impl From<aruna_core::structs::placement::placement_record::DocumentClass> for RealmPlacementClass {
-    fn from(document_class: aruna_core::structs::placement::placement_record::DocumentClass) -> Self {
+    fn from(
+        document_class: aruna_core::structs::placement::placement_record::DocumentClass,
+    ) -> Self {
         match document_class {
             aruna_core::structs::placement::placement_record::DocumentClass::Admin => Self::Admin,
             aruna_core::structs::placement::placement_record::DocumentClass::Group => Self::Group,
             aruna_core::structs::placement::placement_record::DocumentClass::User => Self::User,
-            aruna_core::structs::placement::placement_record::DocumentClass::Metadata => Self::Metadata,
-            aruna_core::structs::placement::placement_record::DocumentClass::MetadataRegistry => Self::MetadataRegistry,
-            aruna_core::structs::placement::placement_record::DocumentClass::JobControl => Self::JobControl,
-            aruna_core::structs::placement::placement_record::DocumentClass::PlacementPolicy => Self::PlacementPolicy,
+            aruna_core::structs::placement::placement_record::DocumentClass::Metadata => {
+                Self::Metadata
+            }
+            aruna_core::structs::placement::placement_record::DocumentClass::MetadataRegistry => {
+                Self::MetadataRegistry
+            }
+            aruna_core::structs::placement::placement_record::DocumentClass::JobControl => {
+                Self::JobControl
+            }
+            aruna_core::structs::placement::placement_record::DocumentClass::PlacementPolicy => {
+                Self::PlacementPolicy
+            }
         }
     }
 }
@@ -738,7 +772,9 @@ impl From<RealmPlacementClass> for aruna_core::structs::placement::placement_rec
     }
 }
 
-impl From<&aruna_core::structs::placement::placement_record::PlacementOverride> for RealmPlacementOverride {
+impl From<&aruna_core::structs::placement::placement_record::PlacementOverride>
+    for RealmPlacementOverride
+{
     fn from(record: &aruna_core::structs::placement::placement_record::PlacementOverride) -> Self {
         Self {
             subject: hex::encode(&record.subject),
@@ -750,16 +786,20 @@ impl From<&aruna_core::structs::placement::placement_record::PlacementOverride> 
 }
 
 impl RealmPlacementOverride {
-    fn into_core(self) -> ServerResult<aruna_core::structs::placement::placement_record::PlacementOverride> {
-        Ok(aruna_core::structs::placement::placement_record::PlacementOverride {
-            subject: parse_subject(&self.subject)?,
-            pinned: parse_node_ids(self.pinned, "pinned")?,
-            excluded: parse_node_ids(self.excluded, "excluded")?,
-            strategy_id: self
-                .strategy_id
-                .map(|id| parse_ulid(&id, "strategy_id"))
-                .transpose()?,
-        })
+    fn into_core(
+        self,
+    ) -> ServerResult<aruna_core::structs::placement::placement_record::PlacementOverride> {
+        Ok(
+            aruna_core::structs::placement::placement_record::PlacementOverride {
+                subject: parse_subject(&self.subject)?,
+                pinned: parse_node_ids(self.pinned, "pinned")?,
+                excluded: parse_node_ids(self.excluded, "excluded")?,
+                strategy_id: self
+                    .strategy_id
+                    .map(|id| parse_ulid(&id, "strategy_id"))
+                    .transpose()?,
+            },
+        )
     }
 }
 
@@ -1223,7 +1263,10 @@ pub(crate) async fn run_realm_info(
 /// realm-config order. The caller decides where its own node belongs.
 pub(crate) fn management_node_urls(
     config: &RealmConfigDocument,
-    node_info_docs: &BTreeMap<aruna_core::NodeId, aruna_core::structs::storage::node_info::NodeInfoDocument>,
+    node_info_docs: &BTreeMap<
+        aruna_core::NodeId,
+        aruna_core::structs::storage::node_info::NodeInfoDocument,
+    >,
 ) -> Vec<(aruna_core::NodeId, Option<String>)> {
     config
         .nodes
@@ -1244,7 +1287,10 @@ pub(crate) fn management_node_urls(
 fn management_urls(
     state: &ServerState,
     config: &RealmConfigDocument,
-    node_info_docs: &BTreeMap<aruna_core::NodeId, aruna_core::structs::storage::node_info::NodeInfoDocument>,
+    node_info_docs: &BTreeMap<
+        aruna_core::NodeId,
+        aruna_core::structs::storage::node_info::NodeInfoDocument,
+    >,
     own_url: Option<&str>,
 ) -> Vec<String> {
     let current = state.get_node_id();
@@ -1286,7 +1332,9 @@ pub(crate) async fn load_node_documents(
     }
 }
 
-fn map_node_document(document: &aruna_core::structs::storage::node_info::NodeInfoDocument) -> NodeDocumentResponse {
+fn map_node_document(
+    document: &aruna_core::structs::storage::node_info::NodeInfoDocument,
+) -> NodeDocumentResponse {
     NodeDocumentResponse {
         executors: document
             .executors
@@ -2068,7 +2116,10 @@ fn map_realm_nodes(
     state: &ServerState,
     config: &RealmConfigDocument,
     present_nodes: HashSet<aruna_core::NodeId>,
-    node_info_docs: BTreeMap<aruna_core::NodeId, aruna_core::structs::storage::node_info::NodeInfoDocument>,
+    node_info_docs: BTreeMap<
+        aruna_core::NodeId,
+        aruna_core::structs::storage::node_info::NodeInfoDocument,
+    >,
     contacts: &PeerContacts,
     now_ms: u64,
 ) -> Vec<NodeInfoResponse> {

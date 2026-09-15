@@ -29,8 +29,7 @@ const BASELINE_CSP: &str = "frame-ancestors 'none'";
 const OIDC_ORIGIN_TTL: Duration = Duration::from_secs(60);
 const OIDC_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-const ORIGIN_OPENER_POLICY: HeaderName =
-    HeaderName::from_static("cross-origin-opener-policy");
+const ORIGIN_OPENER_POLICY: HeaderName = HeaderName::from_static("cross-origin-opener-policy");
 
 /// Extra origins the portal document may connect to, on top of this node's own
 /// REST origin, its S3 interface and the realm's OIDC providers. Needed when a

@@ -998,7 +998,9 @@ mod authorization_tests {
         seed_group_docs, seed_realm_auth, test_context, test_state, test_storage, write_doc,
     };
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction, Permission};
+    use aruna_core::structs::identity::auth::{
+        Actor, NodeCapabilities, PathRestriction, Permission,
+    };
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::drive;

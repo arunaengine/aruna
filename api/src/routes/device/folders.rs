@@ -17,10 +17,10 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::StagingSourceError;
 use aruna_core::id::NodeId;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{
     ActionKind, ActionOutcome, ActionScope, FolderMode, FolderState, RemoteBinding, SyncRefusal,
 };
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::Key;
 use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{
