@@ -12,9 +12,9 @@ use crate::UserId;
 use crate::compute::ExecutionTargetId;
 use crate::compute::runtimes::{SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK};
 use crate::errors::ConversionError;
-use crate::structs::invert_timestamp_ms;
+use crate::structs::execution::notification::invert_timestamp_ms;
 use crate::structs::{
-    AuthContext, BackendLocation, HarvestJobSpec, HiddenBlobKey, MintPersistentIdSpec,
+    AuthContext, BackendLocation, HarvestJobSpec, HiddenBlobKey, MintPersistentSpec,
     PlacementPolicyRef, PlacementRef, RealmId, StagingStrategy, StoragePurgeResult,
     StoragePurgeScope, StoragePurgeSpec,
 };

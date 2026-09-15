@@ -546,7 +546,7 @@ impl ExecutionSpec {
 }
 
 /// Closed job payload enum, keeping the typed-queue discipline of `TaskKey` and
-/// `DocumentSyncOutboxEvent`. Additive-only until a version envelope lands (#286).
+/// `DocumentOutboxEvent`. Additive-only until a version envelope lands (#286).
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobPayload {
@@ -582,7 +582,7 @@ pub enum JobPayload {
     Harvest(HarvestJobSpec),
     /// Idempotent w3id persistent-identifier registration for a document.
     /// Idempotency key is the document id; a re-mint returns the same PID.
-    MintPersistentId(MintPersistentIdSpec),
+    MintPersistentId(MintPersistentSpec),
     /// One server-side permanent purge family, scoped to a file, prefix, or bucket.
     StoragePurge(StoragePurgeSpec),
     /// One object copy the request path handed off because its source must be
