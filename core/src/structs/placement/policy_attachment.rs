@@ -3,7 +3,7 @@
 //! stored version, so every record here describes a successor that is minted instead.
 
 use crate::errors::ConversionError;
-use crate::structs::blob::checked_refs;
+use crate::structs::storage::blob::checked_refs;
 use crate::structs::{BucketIdentity, CurrentVersionPointer, PlacementPolicyRef};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -70,7 +70,7 @@ impl PolicyMutationRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum PolicyBulkStatus {
+pub enum PolicyStatus {
     Active,
     /// Every observed head carried the captured refs at the end of a pass.
     Completed,
@@ -87,7 +87,7 @@ pub struct PolicyBulkRun {
     pub bucket_identity: BucketIdentity,
     pub generation: u64,
     pub target_refs: Vec<PlacementPolicyRef>,
-    pub status: PolicyBulkStatus,
+    pub status: PolicyStatus,
 }
 
 impl PolicyBulkRun {
@@ -108,12 +108,12 @@ impl PolicyBulkRun {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PolicyBulkIntentKey {
+pub struct PolicyIntentKey {
     pub operation_id: Ulid,
     pub key: String,
 }
 
-impl PolicyBulkIntentKey {
+impl PolicyIntentKey {
     pub fn new(operation_id: Ulid, key: impl Into<String>) -> Self {
         Self {
             operation_id,
@@ -161,7 +161,7 @@ pub enum PolicyIntentOutcome {
 /// One object's durable place in a bulk run. `observed_head` is the only head a
 /// mint may advance from, so a concurrent write is superseded and replanned.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PolicyBulkIntent {
+pub struct PolicyIntent {
     pub operation_id: Ulid,
     pub key: String,
     pub observed_head: CurrentVersionPointer,
@@ -169,9 +169,9 @@ pub struct PolicyBulkIntent {
     pub outcome: PolicyIntentOutcome,
 }
 
-impl PolicyBulkIntent {
-    pub fn key(&self) -> PolicyBulkIntentKey {
-        PolicyBulkIntentKey::new(self.operation_id, self.key.clone())
+impl PolicyIntent {
+    pub fn key(&self) -> PolicyIntentKey {
+        PolicyIntentKey::new(self.operation_id, self.key.clone())
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -186,8 +186,8 @@ impl PolicyBulkIntent {
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyBulkIntent, PolicyBulkIntentKey, PolicyBulkRun, PolicyBulkStatus,
-        PolicyIntentOutcome, PolicyMutationParams, PolicyMutationRecord, PolicyRefMode,
+        PolicyBulkRun, PolicyIntent, PolicyIntentKey, PolicyIntentOutcome, PolicyMutationParams,
+        PolicyMutationRecord, PolicyRefMode, PolicyStatus,
     };
     use crate::UserId;
     use crate::structs::{CurrentVersionPointer, PlacementPolicyRef};
@@ -250,7 +250,7 @@ mod tests {
             bucket_identity: (Ulid::from_bytes([2u8; 16]), UNIX_EPOCH, UserId::default()),
             generation: 3,
             target_refs: vec![policy_ref(6), policy_ref(1)],
-            status: PolicyBulkStatus::Active,
+            status: PolicyStatus::Active,
         };
         assert!(run.to_bytes().is_err());
     }
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn key_prefixes_run() {
         let operation_id = Ulid::from_bytes([7u8; 16]);
-        let intent = PolicyBulkIntent {
+        let intent = PolicyIntent {
             operation_id,
             key: "path/file.txt".to_string(),
             observed_head: CurrentVersionPointer::new(Ulid::from_bytes([8u8; 16])),
@@ -267,15 +267,15 @@ mod tests {
         };
         let bytes = intent.to_bytes().expect("intent encodes");
         assert_eq!(
-            PolicyBulkIntent::from_bytes(&bytes).expect("intent decodes"),
+            PolicyIntent::from_bytes(&bytes).expect("intent decodes"),
             intent
         );
 
         let key = intent.key().to_bytes().expect("key encodes");
-        let prefix = PolicyBulkIntentKey::run_prefix(operation_id).expect("prefix encodes");
+        let prefix = PolicyIntentKey::run_prefix(operation_id).expect("prefix encodes");
         assert!(key.starts_with(&prefix));
         assert!(!key.starts_with(
-            &PolicyBulkIntentKey::run_prefix(Ulid::from_bytes([6u8; 16])).expect("prefix encodes")
+            &PolicyIntentKey::run_prefix(Ulid::from_bytes([6u8; 16])).expect("prefix encodes")
         ));
     }
 }
