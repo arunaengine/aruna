@@ -6,7 +6,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::auth::oidc_subject_key;
 use aruna_core::types::{Effects, TxnId};
-use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
+use aruna_core::{USER_KEYSPACE, SUBJECT_INDEX_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -112,7 +112,7 @@ impl GetOidcOperation {
         self.state = GetOidcState::ReadSubjectIndex { txn_id };
         let key = ByteView::from(self.subject_key()?.into_bytes());
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+            key_space: SUBJECT_INDEX_KEYSPACE.to_string(),
             key,
             txn_id: Some(txn_id),
         })])

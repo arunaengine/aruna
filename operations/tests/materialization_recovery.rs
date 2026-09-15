@@ -6,7 +6,7 @@ use std::sync::Arc;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::METADATA_MATERIALIZATION_JOB_KEYSPACE;
+use aruna_core::keyspaces::MATERIALIZATION_JOB_KEYSPACE;
 use aruna_core::metadata::{
     ApplyRoCrateRequest, MaterializationState, MaterializationStatusRecord, MetadataBatch,
     MetadataCrateRequest, MetadataEffect, MetadataEvent, MetadataEventPayload, MetadataEventRecord,
@@ -583,7 +583,7 @@ async fn read_status(
 ) -> Result<Option<MaterializationStatusRecord>, Box<dyn std::error::Error>> {
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: aruna_core::keyspaces::METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
+            key_space: aruna_core::keyspaces::MATERIALIZATION_STATUS_KEYSPACE.to_string(),
             key: materialization_status_key(document_id),
             txn_id: None,
         })
@@ -601,7 +601,7 @@ async fn read_status(
 async fn job_count(storage: &StorageHandle) -> Result<usize, Box<dyn std::error::Error>> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+            key_space: MATERIALIZATION_JOB_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: 10,

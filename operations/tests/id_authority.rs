@@ -8,7 +8,7 @@ use aruna_core::StructuredId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{METADATA_PENDING_PROJECTION_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE};
+use aruna_core::keyspaces::{PENDING_PROJECTION_KEYSPACE, ID_MAPPING_KEYSPACE};
 use aruna_core::storage_entries::pending_projection_key;
 use aruna_core::structs::execution::job::{JobId, pid_dedup_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -674,7 +674,7 @@ fn withdrawn_mapping(document_id: Ulid, minted_by: aruna_core::UserId) -> Persis
 async fn write_mapping(node: &TestNode, mapping: PersistentIdMapping) -> TestResult<()> {
     write_entry(
         node,
-        PERSISTENT_ID_MAPPING_KEYSPACE,
+        ID_MAPPING_KEYSPACE,
         persistent_id_key(mapping.target),
         mapping.to_bytes()?,
     )
@@ -685,7 +685,7 @@ async fn write_mapping(node: &TestNode, mapping: PersistentIdMapping) -> TestRes
 async fn queue_projection(node: &TestNode, document_id: Ulid) -> TestResult<()> {
     write_entry(
         node,
-        METADATA_PENDING_PROJECTION_KEYSPACE,
+        PENDING_PROJECTION_KEYSPACE,
         pending_projection_key(document_id, Ulid::generate()).to_vec(),
         Vec::new(),
     )

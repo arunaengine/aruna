@@ -11,7 +11,7 @@ use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::audit::{
     AUDIT_DEADLINE_SECS, AuditAggregate, ListAuditOperation, ListAuditRequest, LocalPageOperation,
-    MAX_AUDIT_PAGE_SIZE, list_audit,
+    AUDIT_PAGE_LIMIT, list_audit,
 };
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
@@ -202,7 +202,7 @@ async fn fan_out(
                         None,
                         peers.to_vec(),
                         None,
-                        MAX_AUDIT_PAGE_SIZE,
+                        AUDIT_PAGE_LIMIT,
                         Some(realm.bearer_token()),
                         realm.config.digest()?,
                     ),
@@ -299,7 +299,7 @@ async fn audit_has_document(node: &TestNode, group_id: Ulid, document_id: Ulid) 
             group_id,
             Some(document_id),
             None,
-            MAX_AUDIT_PAGE_SIZE,
+            AUDIT_PAGE_LIMIT,
         ),
         node.context.as_ref(),
     )

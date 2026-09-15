@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-pub(crate) const QUEUE_RETRY_BASE_MS: u64 = 250;
-pub(crate) const QUEUE_RETRY_MAX_MS: u64 = 30_000;
+pub(crate) const RETRY_BASE_MS: u64 = 250;
+pub(crate) const RETRY_MAX_MS: u64 = 30_000;
 
 pub(crate) fn retry_delay_ms(attempts: u32) -> u64 {
-    retry_after_ms(attempts, QUEUE_RETRY_BASE_MS, QUEUE_RETRY_MAX_MS)
+    retry_after_ms(attempts, RETRY_BASE_MS, RETRY_MAX_MS)
 }
 
 pub(crate) fn retry_after_ms(attempts: u32, base_ms: u64, max_ms: u64) -> u64 {

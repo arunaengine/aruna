@@ -10,7 +10,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::StructuredId;
 use aruna_core::UserId;
-use aruna_core::auth::{TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
+use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
 };
@@ -501,7 +501,7 @@ async fn outbox_len(node: &TestNode) -> Result<usize, Box<dyn std::error::Error>
         .context
         .storage_handle
         .send_storage_effect(aruna_core::effects::StorageEffect::Iter {
-            key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+            key_space: aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: 64,
@@ -1167,7 +1167,7 @@ async fn install_realm_config(
         write(
             node,
             API_STATE_KEYSPACE,
-            TRUSTED_REALMS_LIST_KEY.to_vec(),
+            REALMS_LIST_KEY.to_vec(),
             postcard::to_allocvec(&trusted)?,
         )
         .await?;

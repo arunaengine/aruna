@@ -8,9 +8,9 @@ use std::time::Duration;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_REPLICATION_JOB_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE,
-    METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
-    REFERENCE_METADATA_REFRESH_JOB_KEYSPACE,
+    REPLICATION_JOB_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    DEAD_LETTER_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+    REFRESH_JOB_KEYSPACE,
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
@@ -18,8 +18,8 @@ use byteview::ByteView;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-const QUEUE_SCAN_PAGE_SIZE: usize = 1_024;
-const QUEUE_SCAN_PAGE_LIMIT: usize = 8;
+const SCAN_SIZE: usize = 1_024;
+const SCAN_PAGE_LIMIT: usize = 8;
 const QUEUE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Depth and age of a durable work queue at one probe instant.
@@ -70,19 +70,19 @@ impl QueueLagReporter {
         let storage_in_flight = storage.in_flight();
         let blob_replication = probe_with_timeout(probe_queue_depth(
             storage,
-            BLOB_REPLICATION_JOB_KEYSPACE,
+            REPLICATION_JOB_KEYSPACE,
             false,
         ))
         .await;
         let reference_metadata_refresh = probe_with_timeout(probe_queue_depth(
             storage,
-            REFERENCE_METADATA_REFRESH_JOB_KEYSPACE,
+            REFRESH_JOB_KEYSPACE,
             false,
         ))
         .await;
         let materialization_dead_letters = probe_with_timeout(probe_queue_depth(
             storage,
-            METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE,
+            DEAD_LETTER_KEYSPACE,
             false,
         ))
         .await;
@@ -187,11 +187,11 @@ pub async fn probe_outbox_lag(
     let mut capped = false;
     let mut oldest_record_ms: Option<u64> = None;
     let mut start_after: Option<ByteView> = None;
-    for page in 0..QUEUE_SCAN_PAGE_LIMIT {
+    for page in 0..SCAN_PAGE_LIMIT {
         let limit = first_page_limit(page, assume_active);
         let (keys, next) = iter_page(
             storage,
-            DOCUMENT_SYNC_OUTBOX_KEYSPACE,
+            SYNC_OUTBOX_KEYSPACE,
             start_after.take(),
             limit,
         )
@@ -231,11 +231,11 @@ pub async fn probe_materialization_lag(
     let mut capped = false;
     let mut oldest_due_ms: Option<u64> = None;
     let mut start_after: Option<ByteView> = None;
-    for page in 0..QUEUE_SCAN_PAGE_LIMIT {
+    for page in 0..SCAN_PAGE_LIMIT {
         let limit = first_page_limit(page, assume_active);
         let (keys, next) = iter_page(
             storage,
-            METADATA_MATERIALIZATION_JOB_KEYSPACE,
+            MATERIALIZATION_JOB_KEYSPACE,
             start_after.take(),
             limit,
         )
@@ -274,7 +274,7 @@ pub async fn probe_queue_depth(
     let mut depth = 0usize;
     let mut capped = false;
     let mut start_after: Option<ByteView> = None;
-    for page in 0..QUEUE_SCAN_PAGE_LIMIT {
+    for page in 0..SCAN_PAGE_LIMIT {
         let limit = first_page_limit(page, assume_active);
         let (keys, next) = iter_page(storage, key_space, start_after.take(), limit).await?;
         depth += keys.len();
@@ -295,7 +295,7 @@ fn first_page_limit(page: usize, assume_active: bool) -> usize {
     if page == 0 && !assume_active {
         1
     } else {
-        QUEUE_SCAN_PAGE_SIZE
+        SCAN_SIZE
     }
 }
 
@@ -308,7 +308,7 @@ fn advance(
     capped: &mut bool,
 ) -> bool {
     match next {
-        Some(next) if page + 1 < QUEUE_SCAN_PAGE_LIMIT => {
+        Some(next) if page + 1 < SCAN_PAGE_LIMIT => {
             *start_after = Some(next);
             true
         }
@@ -411,7 +411,7 @@ mod tests {
         for ulid in [old, recent] {
             let mut key = b"upsert/".to_vec();
             key.extend_from_slice(&ulid.to_bytes());
-            write_key(&storage, DOCUMENT_SYNC_OUTBOX_KEYSPACE, key).await;
+            write_key(&storage, SYNC_OUTBOX_KEYSPACE, key).await;
         }
 
         let snapshot = probe_outbox_lag(&storage, false).await.unwrap();
@@ -427,14 +427,14 @@ mod tests {
         for index in 0u32..3 {
             write_key(
                 &storage,
-                aruna_core::keyspaces::BLOB_REPLICATION_JOB_KEYSPACE,
+                aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE,
                 index.to_be_bytes().to_vec(),
             )
             .await;
         }
         let snapshot = probe_queue_depth(
             &storage,
-            aruna_core::keyspaces::BLOB_REPLICATION_JOB_KEYSPACE,
+            aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE,
             false,
         )
         .await

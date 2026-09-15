@@ -8,9 +8,9 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    DOCUMENT_SYNC_OUTBOX_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
-    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
-    METADATA_PENDING_PROJECTION_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    SYNC_OUTBOX_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+    PENDING_PROJECTION_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventPayload, MetadataEventRecord};
 use aruna_core::storage_entries::{
@@ -468,13 +468,13 @@ async fn queue_recovers_create() -> Result<(), Box<dyn std::error::Error>> {
     let report = task_handle.shutdown(Duration::from_secs(30)).await;
     assert!(report.drained(), "projection task did not drain");
     assert_eq!(
-        iter_keyspace_count(&test, METADATA_PENDING_PROJECTION_KEYSPACE).await?,
+        iter_keyspace_count(&test, PENDING_PROJECTION_KEYSPACE).await?,
         0
     );
     let materialized = process_materialization_batch(test.context.as_ref()).await?;
     assert!(materialized.processed <= 1);
     assert_eq!(
-        iter_keyspace_count(&test, METADATA_MATERIALIZATION_JOB_KEYSPACE).await?,
+        iter_keyspace_count(&test, MATERIALIZATION_JOB_KEYSPACE).await?,
         0
     );
     let fetched = drive(
@@ -552,14 +552,14 @@ async fn projected_replay_idempotent() -> Result<(), Box<dyn std::error::Error>>
     let projected = replay_event_log(test.context.as_ref()).await?;
     assert_eq!(projected, 1);
     assert_eq!(
-        iter_keyspace_count(&test, METADATA_MATERIALIZATION_JOB_KEYSPACE).await?,
+        iter_keyspace_count(&test, MATERIALIZATION_JOB_KEYSPACE).await?,
         1
     );
 
     let replayed_again = replay_event_log(test.context.as_ref()).await?;
     assert_eq!(replayed_again, 0);
     assert_eq!(
-        iter_keyspace_count(&test, METADATA_MATERIALIZATION_JOB_KEYSPACE).await?,
+        iter_keyspace_count(&test, MATERIALIZATION_JOB_KEYSPACE).await?,
         1
     );
 
@@ -801,7 +801,7 @@ async fn projection_marker_exists(
         .context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
             key: pending_projection_key(document_id, event_id),
             txn_id: None,
         })
@@ -875,7 +875,7 @@ async fn assert_projection_absent(
     assert!(
         read_storage_value(
             test,
-            METADATA_DOCUMENT_INDEX_KEYSPACE,
+            DOCUMENT_INDEX_KEYSPACE,
             metadata_document_key(record.document_id),
         )
         .await?
@@ -891,11 +891,11 @@ async fn assert_projection_absent(
         .is_none()
     );
     assert_eq!(
-        iter_keyspace_count(test, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await?,
+        iter_keyspace_count(test, SYNC_OUTBOX_KEYSPACE).await?,
         0
     );
     assert_eq!(
-        iter_keyspace_count(test, METADATA_MATERIALIZATION_JOB_KEYSPACE).await?,
+        iter_keyspace_count(test, MATERIALIZATION_JOB_KEYSPACE).await?,
         0
     );
     let fetched = drive(
@@ -958,7 +958,7 @@ async fn read_create_events(
         .context
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
-            key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+            key_space: EVENT_LOG_KEYSPACE.to_string(),
             prefix: Some(event_log_prefix(document_id)),
             start: None,
             limit: 10,

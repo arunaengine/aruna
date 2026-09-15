@@ -20,7 +20,7 @@ use aruna_operations::notifications::dispatch::{
     NotificationDispatchError, list_for_user, mark_for_user, unread_for_user,
 };
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
-use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
+use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::sync::incoming::initialize_net_holder;
@@ -33,7 +33,7 @@ use ulid::Ulid;
 mod convergence;
 use convergence::wait_for_convergence;
 
-const LIST_LIMIT: u32 = LIST_NOTIFICATIONS_MAX_LIMIT as u32;
+const LIST_LIMIT: u32 = LIST_MAX_LIMIT as u32;
 
 struct TestNode {
     _temp_dir: Option<TempDir>,

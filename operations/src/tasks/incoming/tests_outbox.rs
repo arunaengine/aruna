@@ -412,7 +412,7 @@ fn rotation_holds_boundary() {
 async fn close_routes_defer() {
     let _clock = freeze_clock();
     let (_dir, handler, task_handle) = outbox_handler();
-    let key = TaskKey::DrainDocumentSyncOutbox;
+    let key = TaskKey::DrainSyncOutbox;
     handler
         .retry_backoff
         .lock()
@@ -432,7 +432,7 @@ async fn close_routes_defer() {
 
     assert_eq!(
         scheduled_after(&task_handle).await,
-        DOCUMENT_SYNC_DEFER_RETRY_AFTER
+        DEFER_RETRY_AFTER
     );
     assert!(
         !handler
@@ -448,7 +448,7 @@ async fn close_routes_defer() {
 async fn close_keeps_retry() {
     let _clock = freeze_clock();
     let (_dir, handler, task_handle) = outbox_handler();
-    let key = TaskKey::DrainDocumentSyncOutbox;
+    let key = TaskKey::DrainSyncOutbox;
     handler
         .retry_backoff
         .lock()
@@ -480,7 +480,7 @@ async fn close_keeps_retry() {
 async fn close_resets_progress() {
     let _clock = freeze_clock();
     let (_dir, handler, task_handle) = outbox_handler();
-    let key = TaskKey::DrainDocumentSyncOutbox;
+    let key = TaskKey::DrainSyncOutbox;
     handler
         .retry_backoff
         .lock()
@@ -518,7 +518,7 @@ async fn close_resets_progress() {
 async fn retry_suffix_closes() {
     let _clock = freeze_clock();
     let (_dir, handler, task_handle) = outbox_handler();
-    let key = TaskKey::DrainDocumentSyncOutbox;
+    let key = TaskKey::DrainSyncOutbox;
     // The first page retried; a clean suffix made progress before the
     // rotation reached its observed high-water boundary.
     let rotation = OutboxRotation {
@@ -556,7 +556,7 @@ async fn retry_suffix_closes() {
 async fn midpoint_retry_keeps() {
     let _clock = freeze_clock();
     let (_dir, handler, task_handle) = outbox_handler();
-    let key = TaskKey::DrainDocumentSyncOutbox;
+    let key = TaskKey::DrainSyncOutbox;
     let topic = irokle::TopicId::hash(b"midpoint-retry-topic");
     handler
         .retry_backoff
@@ -629,7 +629,7 @@ async fn config_reloads_between() {
 fn outbox_bound_finite() {
     assert_eq!(
         OUTBOX_INVOCATION_RECORDS,
-        OUTBOX_INVOCATION_PAGES * OUTBOX_DRAIN_BATCH_SIZE
+        OUTBOX_INVOCATION_PAGES * OUTBOX_DRAIN_SIZE
     );
     assert_ne!(OUTBOX_INVOCATION_RECORDS, 0);
 }
@@ -686,7 +686,7 @@ fn unheld_bucket_undeliverable() {
 async fn empty_resets_backoff() {
     let _clock = freeze_clock();
     let (_dir, handler, _task_handle) = outbox_handler();
-    let key = TaskKey::DrainDocumentSyncOutbox;
+    let key = TaskKey::DrainSyncOutbox;
     handler
         .retry_backoff
         .lock()
@@ -728,7 +728,7 @@ async fn blocked_keeps_backoff() {
     });
     let handler =
         OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 1);
-    let key = TaskKey::DrainDocumentSyncOutbox;
+    let key = TaskKey::DrainSyncOutbox;
     handler
         .retry_backoff
         .lock()
@@ -756,7 +756,7 @@ async fn blocked_keeps_backoff() {
 
     assert_eq!(
         scheduled_after(&task_handle).await,
-        DOCUMENT_SYNC_DEFER_RETRY_AFTER
+        DEFER_RETRY_AFTER
     );
     assert_eq!(
         handler
@@ -820,8 +820,8 @@ async fn deferred_head_paginates() {
         group_id: Ulid::from_parts(1, 1),
         document_id: Ulid::from_parts(2, 2),
     };
-    let mut writes = Vec::with_capacity(OUTBOX_DRAIN_BATCH_SIZE + 1);
-    for index in 0..OUTBOX_DRAIN_BATCH_SIZE {
+    let mut writes = Vec::with_capacity(OUTBOX_DRAIN_SIZE + 1);
+    for index in 0..OUTBOX_DRAIN_SIZE {
         let record = crate::sync::document_outbox::new_identified_record(
             Ulid::from_parts(1, index as u128),
             node(1),
@@ -876,17 +876,17 @@ async fn deferred_head_paginates() {
         None,
         "the later-page record must publish despite an all-deferred first page"
     );
-    let remaining = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_BATCH_SIZE + 8)
+    let remaining = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_SIZE + 8)
         .await
         .expect("read remaining");
     assert_eq!(
         remaining.records.len(),
-        OUTBOX_DRAIN_BATCH_SIZE,
+        OUTBOX_DRAIN_SIZE,
         "every deferred record is retained for the next run"
     );
     assert_eq!(
         scheduled_after(&task_handle).await,
-        DOCUMENT_SYNC_DEFER_RETRY_AFTER,
+        DEFER_RETRY_AFTER,
         "an early defer followed by a clean suffix keeps the aggregate retry"
     );
 
@@ -911,7 +911,7 @@ async fn boundary_appends_wait() {
     harness.assert_rotation(2, true, 0);
     assert_eq!(
         scheduled_after(&harness.task_handle).await,
-        DOCUMENT_SYNC_DEFER_RETRY_AFTER
+        DEFER_RETRY_AFTER
     );
 
     harness.append_later().await;
@@ -998,7 +998,7 @@ async fn rotation_streak() {
     );
     assert_eq!(
         scheduled_after(&task_handle).await,
-        DOCUMENT_SYNC_DEFER_RETRY_AFTER
+        DEFER_RETRY_AFTER
     );
     for _ in 0..4 {
         handler.drain_sync_outbox().await;

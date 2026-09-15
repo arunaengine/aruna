@@ -20,8 +20,8 @@ use ulid::Ulid;
 
 const CHILD_MODE_ENV: &str = "ARUNA_JOB_RESTART_CHILD";
 const CHILD_STORAGE_ENV: &str = "ARUNA_JOB_RESTART_STORAGE";
-const CHILD_MARKER_A_ENV: &str = "ARUNA_JOB_RESTART_MARKER_A";
-const CHILD_MARKER_B_ENV: &str = "ARUNA_JOB_RESTART_MARKER_B";
+const MARKER_A_ENV: &str = "ARUNA_JOB_RESTART_MARKER_A";
+const MARKER_B_ENV: &str = "ARUNA_JOB_RESTART_MARKER_B";
 const CHILD_TEST_NAME: &str = "restart_recovery_child";
 
 fn node_id(seed: u8) -> NodeId {
@@ -72,8 +72,8 @@ async fn restart_recovers_jobs() -> Result<(), Box<dyn std::error::Error>> {
         .arg("--nocapture")
         .env(CHILD_MODE_ENV, "1")
         .env(CHILD_STORAGE_ENV, storage_dir.path())
-        .env(CHILD_MARKER_A_ENV, &marker_a)
-        .env(CHILD_MARKER_B_ENV, &marker_b)
+        .env(MARKER_A_ENV, &marker_a)
+        .env(MARKER_B_ENV, &marker_b)
         .output()?;
     if !output.status.success() {
         return Err(format!(
@@ -155,8 +155,8 @@ async fn restart_recovery_child() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let storage_path = child_env(CHILD_STORAGE_ENV)?;
-    let marker_a = child_env(CHILD_MARKER_A_ENV)?;
-    let marker_b = child_env(CHILD_MARKER_B_ENV)?;
+    let marker_a = child_env(MARKER_A_ENV)?;
+    let marker_b = child_env(MARKER_B_ENV)?;
 
     let storage = FjallStorage::open_with_policy(
         storage_path.to_str().ok_or("invalid storage path")?,

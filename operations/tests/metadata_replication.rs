@@ -13,7 +13,7 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    METADATA_EVENT_LOG_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    EVENT_LOG_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
     REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
@@ -909,7 +909,7 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
         event: MetadataDeleteRecord {
             event_id: delete_event_id,
             tombstone,
-            deleted_after_event_id: event_id,
+            deleted_after_id: event_id,
         },
     };
     // All records of this document ride the bucket stamped on the record, so one shard topic.
@@ -1278,7 +1278,7 @@ async fn read_event_value(
         .context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+            key_space: EVENT_LOG_KEYSPACE.to_string(),
             key: event_log_key(document_id, event_id),
             txn_id: None,
         }))

@@ -6,7 +6,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, PLACEMENT_POLICY_CACHE_KEYSPACE};
+use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, POLICY_CACHE_KEYSPACE};
 use aruna_core::structs::identity::auth::{Actor, Permission, Role};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy_document::{
@@ -202,7 +202,7 @@ pub async fn seed_gate(
         let _ = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: PLACEMENT_POLICY_CACHE_KEYSPACE.to_string(),
+                key_space: POLICY_CACHE_KEYSPACE.to_string(),
                 key: cache_key(&policy.policy_ref()),
                 value: entry.to_bytes().expect("entry encodes").into(),
                 txn_id: None,

@@ -4,7 +4,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USER_VAULT_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::user_vault::{MAX_USER_VAULT_BYTES, UserVault};
+use aruna_core::structs::identity::user_vault::{MAX_VAULT_BYTES, UserVault};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -263,7 +263,7 @@ impl Operation for WriteVaultOperation {
     type Error = VaultStoreError;
 
     fn start(&mut self) -> Effects {
-        if self.payload.len() > MAX_USER_VAULT_BYTES {
+        if self.payload.len() > MAX_VAULT_BYTES {
             return self.fail(VaultStoreError::TooLarge(VAULT_CAP));
         }
         self.state = WriteVaultState::StartTransaction;
@@ -624,7 +624,7 @@ mod pure_tests {
     #[test]
     fn refuses_large_payload() {
         // Over the cap stops before any effect; exactly the cap goes on.
-        let mut operation = write_op(&"x".repeat(MAX_USER_VAULT_BYTES + 1), None);
+        let mut operation = write_op(&"x".repeat(MAX_VAULT_BYTES + 1), None);
         assert!(operation.start().is_empty());
         assert!(operation.is_complete());
         assert_eq!(
@@ -632,7 +632,7 @@ mod pure_tests {
             VaultStoreError::TooLarge(VAULT_CAP)
         );
 
-        let mut operation = write_op(&"x".repeat(MAX_USER_VAULT_BYTES), None);
+        let mut operation = write_op(&"x".repeat(MAX_VAULT_BYTES), None);
         assert_eq!(operation.start().len(), 1);
     }
 

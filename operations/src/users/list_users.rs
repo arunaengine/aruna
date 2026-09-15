@@ -32,7 +32,7 @@ pub struct ListUsersOperation {
     input: ListUsersInput,
     state: ListUsersState,
     users: Vec<User>,
-    next_storage_start_after: Option<Key>,
+    storage_start_after: Option<Key>,
     output: Option<Result<ListUsersOutput, ListUsersError>>,
 }
 
@@ -72,7 +72,7 @@ impl ListUsersOperation {
             input,
             state: ListUsersState::Init,
             users: Vec::new(),
-            next_storage_start_after: None,
+            storage_start_after: None,
             output: None,
         }
     }
@@ -99,7 +99,7 @@ impl ListUsersOperation {
     }
 
     fn start_after_key(&self) -> Result<Option<Key>, ListUsersError> {
-        match (&self.next_storage_start_after, &self.input.start_after) {
+        match (&self.storage_start_after, &self.input.start_after) {
             (Some(key), _) => Ok(Some(key.clone())),
             (None, Some(user_id)) => {
                 Ok(Some(UserId::from_string(user_id)?.to_storage_key().into()))
@@ -178,7 +178,7 @@ impl ListUsersOperation {
         }
 
         if let Some(next_start_after) = next_start_after {
-            self.next_storage_start_after = Some(next_start_after);
+            self.storage_start_after = Some(next_start_after);
             return self.emit_list_users();
         }
 

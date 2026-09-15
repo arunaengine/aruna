@@ -10,7 +10,7 @@ use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use tracing::warn;
 
-const TASK_TIMER_RESTORE_PAGE_SIZE: usize = 256;
+const RESTORE_PAGE_SIZE: usize = 256;
 
 pub(crate) async fn persist_task_effect(
     storage: &StorageHandle,
@@ -37,16 +37,16 @@ fn timer_is_restored(effect: &TaskEffect) -> bool {
     };
     matches!(
         key,
-        TaskKey::DrainMetadataMaterializationQueue
-            | TaskKey::DrainMetadataGraphPruneQueue
-            | TaskKey::DrainBlobReplicationQueue
-            | TaskKey::DrainReferenceMetadataRefreshQueue
+        TaskKey::DrainMaterializationQueue
+            | TaskKey::DrainPruneQueue
+            | TaskKey::DrainReplicationQueue
+            | TaskKey::DrainRefreshQueue
             | TaskKey::DrainNotificationOutbox
             | TaskKey::PruneNotifications
             | TaskKey::PublishNodeInfo
             | TaskKey::DrainJobQueue
             | TaskKey::PruneJobs
-            | TaskKey::DrainSyncMirrorRepair
+            | TaskKey::DrainMirrorRepair
             | TaskKey::DrainDeviceIntake
     )
 }
@@ -65,7 +65,7 @@ pub async fn restore_task_timers(storage: &StorageHandle, task_handle: &TaskHand
                 key_space: TASK_TIMER_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
-                limit: TASK_TIMER_RESTORE_PAGE_SIZE,
+                limit: RESTORE_PAGE_SIZE,
                 txn_id: None,
             })
             .await;
@@ -95,7 +95,7 @@ pub async fn restore_task_timers(storage: &StorageHandle, task_handle: &TaskHand
                 }
             };
             let after =
-                Duration::from_millis(record.due_at_unix_millis.saturating_sub(now_millis()));
+                Duration::from_millis(record.due_unix_millis.saturating_sub(now_millis()));
             let event = task_handle
                 .send_effect(Effect::Task(TaskEffect::ResetTimer {
                     key: record.key,
@@ -119,12 +119,12 @@ async fn write_timer(
     key: &TaskKey,
     after: Duration,
 ) -> Result<(), String> {
-    let due_at_unix_millis = due_at_millis(after)?;
+    let due_unix_millis = due_at_millis(after)?;
     write_record(
         storage,
         &PersistedTaskTimer {
             key: key.clone(),
-            due_at_unix_millis,
+            due_unix_millis,
         },
     )
     .await
@@ -137,13 +137,13 @@ async fn shorten_timer(
 ) -> Result<(), String> {
     let requested_due_at = due_at_millis(after)?;
     match read_timer(storage, key).await? {
-        Some(existing) if existing.due_at_unix_millis <= requested_due_at => Ok(()),
+        Some(existing) if existing.due_unix_millis <= requested_due_at => Ok(()),
         _ => {
             write_record(
                 storage,
                 &PersistedTaskTimer {
                     key: key.clone(),
-                    due_at_unix_millis: requested_due_at,
+                    due_unix_millis: requested_due_at,
                 },
             )
             .await
@@ -291,7 +291,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
             .expect("storage opens");
-        let key = TaskKey::DrainDocumentSyncOutbox;
+        let key = TaskKey::DrainSyncOutbox;
         let reset_after = Duration::from_secs(3600);
 
         persist_task_effect(
@@ -325,7 +325,7 @@ mod tests {
             .expect("shortened timer reads")
             .expect("shortened timer exists");
         assert_eq!(shortened_timer.key, key);
-        assert!(shortened_timer.due_at_unix_millis < reset_timer.due_at_unix_millis);
+        assert!(shortened_timer.due_unix_millis < reset_timer.due_unix_millis);
 
         let task_handle = TaskHandle::new();
         restore_task_timers(&storage, &task_handle).await;
@@ -349,7 +349,7 @@ mod tests {
         persist_task_effect(
             &storage,
             &TaskEffect::ResetTimer {
-                key: TaskKey::DrainMetadataGraphPruneQueue,
+                key: TaskKey::DrainPruneQueue,
                 after: Duration::ZERO,
             },
         )
@@ -406,18 +406,18 @@ mod tests {
         persist_task_effect(
             &storage,
             &TaskEffect::ResetTimer {
-                key: TaskKey::DrainMetadataProjectionQueue,
+                key: TaskKey::DrainProjectionQueue,
                 after: Duration::ZERO,
             },
         )
         .await
         .expect("projection timer persists");
 
-        let timer = read_timer(&storage, &TaskKey::DrainMetadataProjectionQueue)
+        let timer = read_timer(&storage, &TaskKey::DrainProjectionQueue)
             .await
             .expect("timer reads")
             .expect("projection timer exists");
-        assert_eq!(timer.key, TaskKey::DrainMetadataProjectionQueue);
+        assert_eq!(timer.key, TaskKey::DrainProjectionQueue);
     }
 
     #[tokio::test]
@@ -448,7 +448,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
             .expect("storage opens");
-        let key = TaskKey::DrainMetadataProjectionQueue;
+        let key = TaskKey::DrainProjectionQueue;
 
         persist_task_effect(
             &storage,

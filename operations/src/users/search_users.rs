@@ -35,7 +35,7 @@ pub struct SearchUsersOperation {
     input: SearchUsersInput,
     state: SearchUsersState,
     matches: Vec<SearchUsersMatch>,
-    next_storage_start_after: Option<Key>,
+    storage_start_after: Option<Key>,
     output: Option<Result<SearchUsersOutput, SearchUsersError>>,
 }
 
@@ -70,7 +70,7 @@ impl SearchUsersOperation {
             input,
             state: SearchUsersState::Init,
             matches: Vec::new(),
-            next_storage_start_after: None,
+            storage_start_after: None,
             output: None,
         }
     }
@@ -97,7 +97,7 @@ impl SearchUsersOperation {
     }
 
     fn start_after_key(&self) -> Result<Option<Key>, SearchUsersError> {
-        match (&self.next_storage_start_after, &self.input.start_after) {
+        match (&self.storage_start_after, &self.input.start_after) {
             (Some(key), _) => Ok(Some(key.clone())),
             (None, Some(user_id)) => {
                 Ok(Some(UserId::from_string(user_id)?.to_storage_key().into()))
@@ -163,7 +163,7 @@ impl SearchUsersOperation {
         }
 
         if let Some(next_start_after) = next_start_after {
-            self.next_storage_start_after = Some(next_start_after);
+            self.storage_start_after = Some(next_start_after);
             return self.emit_search_users();
         }
 

@@ -19,7 +19,7 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Effects, TxnId};
-use aruna_core::{USER_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
+use aruna_core::{USER_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::BTreeSet;
@@ -60,7 +60,7 @@ enum ResolveOidcState {
     ReadExistingUser {
         txn_id: TxnId,
     },
-    WriteUserAndDocumentRevision {
+    WriteDocumentRevision {
         txn_id: TxnId,
         user: User,
     },
@@ -77,7 +77,7 @@ enum ResolveOidcState {
         user: User,
         announce: bool,
     },
-    ScheduleAdminDocumentOutboxDrain {
+    ScheduleDocumentDrain {
         user: User,
     },
     Finish,
@@ -164,7 +164,7 @@ impl ResolveOidcOperation {
         let subject_key = ByteView::from(self.subject_key()?.into_bytes());
         Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
-                (USER_SUBJECT_INDEX_KEYSPACE.to_string(), subject_key),
+                (SUBJECT_INDEX_KEYSPACE.to_string(), subject_key),
                 (
                     REALM_CONFIG_KEYSPACE.to_string(),
                     ByteView::from(*self.input.actor.realm_id.as_bytes()),
@@ -223,7 +223,7 @@ impl ResolveOidcOperation {
             attributes: Default::default(),
         };
 
-        self.state = ResolveOidcState::WriteUserAndDocumentRevision {
+        self.state = ResolveOidcState::WriteDocumentRevision {
             txn_id,
             user: user.clone(),
         };
@@ -306,7 +306,7 @@ impl ResolveOidcOperation {
             ));
         };
         writes.push((
-            USER_SUBJECT_CLAIMS_KEYSPACE.to_string(),
+            SUBJECT_CLAIMS_KEYSPACE.to_string(),
             ByteView::from(self.subject_key()?.into_bytes()),
             ByteView::from(claims),
         ));
@@ -407,7 +407,7 @@ impl ResolveOidcOperation {
         };
 
         if announce {
-            self.state = ResolveOidcState::ScheduleAdminDocumentOutboxDrain { user };
+            self.state = ResolveOidcState::ScheduleDocumentDrain { user };
             smallvec![schedule_drain_effect()]
         } else {
             self.emit_finish(user)
@@ -452,7 +452,7 @@ impl Operation for ResolveOidcOperation {
         match self.state.clone() {
             ResolveOidcState::StartTransaction => self.handle_start_txn(event),
             ResolveOidcState::ReadSubjectIndex { txn_id } => self.accept_subject(event, txn_id),
-            ResolveOidcState::WriteUserAndDocumentRevision { txn_id, user } => {
+            ResolveOidcState::WriteDocumentRevision { txn_id, user } => {
                 self.handle_write_user(event, txn_id, user)
             }
             ResolveOidcState::WriteSubjectIndex { txn_id, user } => {
@@ -467,7 +467,7 @@ impl Operation for ResolveOidcOperation {
             ResolveOidcState::CommitTransaction { user, announce } => {
                 self.handle_commit_txn(event, user, announce)
             }
-            ResolveOidcState::ScheduleAdminDocumentOutboxDrain { user } => {
+            ResolveOidcState::ScheduleDocumentDrain { user } => {
                 self.schedule_outbox_drain(event, user)
             }
             ResolveOidcState::Init | ResolveOidcState::Finish | ResolveOidcState::Error => {
@@ -491,7 +491,7 @@ impl Operation for ResolveOidcOperation {
         match self.state {
             ResolveOidcState::ReadSubjectIndex { txn_id }
             | ResolveOidcState::ReadExistingUser { txn_id }
-            | ResolveOidcState::WriteUserAndDocumentRevision { txn_id, .. }
+            | ResolveOidcState::WriteDocumentRevision { txn_id, .. }
             | ResolveOidcState::WriteSubjectIndex { txn_id, .. }
             | ResolveOidcState::ReadBucketFence { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
@@ -511,7 +511,7 @@ fn seed_admin_events(
         AdminDocumentOperation::UserNameSet {
             name: input.name.clone(),
         },
-        AdminDocumentOperation::UserSubjectIdAdded { subject_id },
+        AdminDocumentOperation::SubjectIdAdded { subject_id },
     ] {
         let event = state.apply_operation(&input.actor, operation)?;
         events.push(event);
@@ -552,7 +552,7 @@ mod tests {
     use aruna_core::structs::identity::user::User;
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_core::types::TxnId;
-    use aruna_core::{USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE, UserId};
+    use aruna_core::{SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE, UserId};
     use byteview::ByteView;
     use std::collections::BTreeSet;
     use ulid::Ulid;
@@ -624,11 +624,11 @@ mod tests {
                 let stored_user = User::from_bytes(user_write.2.as_ref()).unwrap();
                 assert_eq!(stored_user, expected_user);
                 assert!(writes.iter().any(
-                    |(keyspace, _, _)| keyspace == aruna_core::DOCUMENT_SYNC_REVISION_KEYSPACE
+                    |(keyspace, _, _)| keyspace == aruna_core::SYNC_REVISION_KEYSPACE
                 ));
                 let reducer_state_write = writes
                     .iter()
-                    .find(|(keyspace, _, _)| keyspace == aruna_core::ADMIN_DOCUMENT_STATE_KEYSPACE)
+                    .find(|(keyspace, _, _)| keyspace == aruna_core::DOCUMENT_STATE_KEYSPACE)
                     .expect("reducer state write is included");
                 assert_eq!(reducer_state_write.1, reducer_state_key(&admin_target));
                 let reducer_state: AdminDocumentState =
@@ -650,7 +650,7 @@ mod tests {
                 let outbox_records: Vec<DocumentOutboxRecord> = writes
                     .iter()
                     .filter(|(keyspace, _, _)| {
-                        keyspace == aruna_core::DOCUMENT_SYNC_OUTBOX_KEYSPACE
+                        keyspace == aruna_core::SYNC_OUTBOX_KEYSPACE
                     })
                     .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
                     .collect();
@@ -673,7 +673,7 @@ mod tests {
                             assert_eq!(event.origin_seq, 1);
                             saw_name = true;
                         }
-                        AdminDocumentOperation::UserSubjectIdAdded {
+                        AdminDocumentOperation::SubjectIdAdded {
                             subject_id: event_subject,
                         } => {
                             assert_eq!(event_subject, subject_id);
@@ -696,12 +696,12 @@ mod tests {
             Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => {
                 assert_eq!(writes.len(), 2);
                 assert!(writes.iter().any(|(keyspace, _, value)| {
-                    keyspace == USER_SUBJECT_INDEX_KEYSPACE
+                    keyspace == SUBJECT_INDEX_KEYSPACE
                         && value.as_ref() == user_id.to_storage_key().as_slice()
                 }));
                 let claims = writes
                     .iter()
-                    .find(|(keyspace, _, _)| keyspace == USER_SUBJECT_CLAIMS_KEYSPACE)
+                    .find(|(keyspace, _, _)| keyspace == SUBJECT_CLAIMS_KEYSPACE)
                     .map(|(_, _, value)| value)
                     .expect("subject claims write exists");
                 assert_eq!(
@@ -714,7 +714,7 @@ mod tests {
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: vec![(
-                aruna_core::USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+                aruna_core::SUBJECT_INDEX_KEYSPACE.to_string(),
                 oidc_subject_key("https://issuer.example", "subject-1")
                     .unwrap()
                     .into_bytes()
@@ -732,13 +732,13 @@ mod tests {
         assert!(matches!(
             effects.first().unwrap(),
             Effect::Task(TaskEffect::ResetTimer {
-                key: TaskKey::DrainDocumentSyncOutbox,
+                key: TaskKey::DrainSyncOutbox,
                 after: std::time::Duration::ZERO,
             })
         ));
 
         let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainDocumentSyncOutbox,
+            key: TaskKey::DrainSyncOutbox,
             after: std::time::Duration::ZERO,
         }));
         assert!(effects.is_empty());
@@ -798,7 +798,7 @@ mod tests {
 
         let (revision_key, revision): (_, DocumentChange) = writes
             .iter()
-            .find(|(keyspace, _, _)| keyspace == aruna_core::DOCUMENT_SYNC_REVISION_KEYSPACE)
+            .find(|(keyspace, _, _)| keyspace == aruna_core::SYNC_REVISION_KEYSPACE)
             .map(|(_, key, value)| {
                 (
                     key,

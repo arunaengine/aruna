@@ -180,7 +180,7 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
     record.claim = Some(JobClaim {
         holder_node_id: harness.node_id,
         claim_token: token,
-        lease_expires_at_ms: unix_timestamp_millis() + 60_000,
+        lease_expires_ms: unix_timestamp_millis() + 60_000,
     });
     insert_job(&harness.driver.storage_handle, &record)
         .await

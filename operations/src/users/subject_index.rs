@@ -7,7 +7,7 @@ use aruna_core::storage_entries::{stale_subject_deletes, subject_index_writes};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::{Effects, TxnId};
-use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
+use aruna_core::{USER_KEYSPACE, SUBJECT_INDEX_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::{BTreeSet, HashSet, VecDeque};
@@ -146,7 +146,7 @@ impl ResolveConflictsOperation {
                 subject: subject.clone(),
             };
             return Ok(smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+                key_space: SUBJECT_INDEX_KEYSPACE.to_string(),
                 key: ByteView::from(subject.into_bytes()),
                 txn_id: Some(self.input.txn_id),
             })]);
@@ -436,7 +436,7 @@ mod pure_tests {
     use aruna_core::structs::identity::auth::{Actor, oidc_subject_key};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;
-    use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE, UserId};
+    use aruna_core::{USER_KEYSPACE, SUBJECT_INDEX_KEYSPACE, UserId};
     use byteview::ByteView;
     use std::collections::HashSet;
     use ulid::Ulid;
@@ -503,7 +503,7 @@ mod pure_tests {
                 assert_eq!(id, &Some(txn_id));
                 assert_eq!(writes.len(), 1);
                 let (key_space, key, value) = &writes[0];
-                assert_eq!(key_space, USER_SUBJECT_INDEX_KEYSPACE);
+                assert_eq!(key_space, SUBJECT_INDEX_KEYSPACE);
                 assert_eq!(key.as_ref(), subject.as_bytes());
                 assert_eq!(value.as_ref(), user_id.to_storage_key().as_slice());
             }
@@ -512,7 +512,7 @@ mod pure_tests {
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: vec![(
-                USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+                SUBJECT_INDEX_KEYSPACE.to_string(),
                 ByteView::from(subject.into_bytes()),
             )],
         }));

@@ -113,13 +113,13 @@ impl Family {
             group_id: Ulid::from_bytes([2u8; 16]),
             created_by: user(),
             created_at_ms: 1_000,
-            retention_ms: aruna_core::structs::execution::job::DEFAULT_JOB_RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
             payload: payload(),
             request_digest: self.request_digest,
             spec_digest: [0u8; 32],
             resources,
             retry: JobRetryPolicy {
-                max_launches_per_witness: 2,
+                launches_per_witness: 2,
             },
             admission: JobAdmissionRecord {
                 submission_id: self.submission_id,

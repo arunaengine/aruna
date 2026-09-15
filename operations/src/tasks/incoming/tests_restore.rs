@@ -21,7 +21,7 @@ async fn restore_document_records() {
 
     let restored_key = restore_document_key(&storage).await;
 
-    assert_eq!(restored_key, TaskKey::DrainDocumentSyncOutbox);
+    assert_eq!(restored_key, TaskKey::DrainSyncOutbox);
 }
 
 #[tokio::test(start_paused = true)]
@@ -46,7 +46,7 @@ async fn restore_document_timer() {
     let task_handle = TaskHandle::new();
     match task_handle
         .send_effect(Effect::Task(TaskEffect::ResetTimer {
-            key: TaskKey::DrainDocumentSyncOutbox,
+            key: TaskKey::DrainSyncOutbox,
             after: Duration::from_secs(3600),
         }))
         .await
@@ -58,7 +58,7 @@ async fn restore_document_timer() {
     restore_outbox_timers(&storage, &task_handle).await;
 
     let TaskEvent::TimerScheduled { after, .. } = task_handle
-        .schedule_idle_timer(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
+        .schedule_idle_timer(TaskKey::DrainSyncOutbox, Duration::ZERO)
         .await
     else {
         panic!("expected timer schedule event");
@@ -169,7 +169,7 @@ async fn drain_keeps_timer() {
         .await;
     match task_handle
         .send_effect(Effect::Task(TaskEffect::ResetTimer {
-            key: TaskKey::DrainDocumentSyncOutbox,
+            key: TaskKey::DrainSyncOutbox,
             after: Duration::from_secs(3600),
         }))
         .await
@@ -195,7 +195,7 @@ async fn drain_keeps_timer() {
         "the direct fence must not replace the active timer"
     );
     let TaskEvent::TimerScheduled { after, .. } = task_handle
-        .schedule_idle_timer(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
+        .schedule_idle_timer(TaskKey::DrainSyncOutbox, Duration::ZERO)
         .await
     else {
         panic!("expected timer schedule event");
@@ -234,7 +234,7 @@ async fn outbox_sync_retry() {
 
     let outcome = handler
         .finish_sync_batch(
-            &TaskKey::DrainDocumentSyncOutbox,
+            &TaskKey::DrainSyncOutbox,
             vec![key.clone()],
             Vec::new(),
             Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error {
@@ -282,7 +282,7 @@ async fn retained_outbox_timer() {
 
     let outcome = handler
         .finish_sync_batch(
-            &TaskKey::DrainDocumentSyncOutbox,
+            &TaskKey::DrainSyncOutbox,
             vec![key.clone()],
             Vec::new(),
             Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error {
@@ -301,7 +301,7 @@ async fn retained_outbox_timer() {
     );
 
     let restored_key = restore_document_key(&storage).await;
-    assert_eq!(restored_key, TaskKey::DrainDocumentSyncOutbox);
+    assert_eq!(restored_key, TaskKey::DrainSyncOutbox);
 }
 
 #[tokio::test]
@@ -329,7 +329,7 @@ async fn tombstones_are_return() {
 
     let outcome = handler
         .finish_sync_batch(
-            &TaskKey::DrainDocumentSyncOutbox,
+            &TaskKey::DrainSyncOutbox,
             Vec::new(),
             Vec::new(),
             Event::Net(NetEvent::DocumentSync(
@@ -384,7 +384,7 @@ async fn drain_reconcile_wakes() {
 
     let outcome = handler
         .finish_sync_batch(
-            &TaskKey::DrainDocumentSyncOutbox,
+            &TaskKey::DrainSyncOutbox,
             Vec::new(),
             vec![DocumentTarget::RealmConfig { realm_id }],
             Event::Net(NetEvent::DocumentSync(
@@ -410,9 +410,9 @@ async fn drain_reconcile_wakes() {
 
 #[tokio::test]
 async fn drain_reconcile_summary() {
-    use aruna_core::keyspaces::{USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
+    use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
     use aruna_core::structs::storage::usage::{
-        NODE_USAGE_SUMMARY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, global_shard_key,
+        SUMMARY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, global_shard_key,
         usage_global_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -471,7 +471,7 @@ async fn drain_reconcile_summary() {
     .await;
     write_stat(
         &storage,
-        USAGE_NODE_STATS_KEYSPACE,
+        NODE_STATS_KEYSPACE,
         usage_global_key(remote),
         NodeUsageSnapshot {
             node_id: remote,
@@ -497,7 +497,7 @@ async fn drain_reconcile_summary() {
 
     let outcome = handler
         .finish_sync_batch(
-            &TaskKey::DrainDocumentSyncOutbox,
+            &TaskKey::DrainSyncOutbox,
             Vec::new(),
             Vec::new(),
             Event::Net(NetEvent::DocumentSync(
@@ -519,8 +519,8 @@ async fn drain_reconcile_summary() {
     assert!(!outcome.retry_needed);
     let summary = match storage
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
-            key: NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec().into(),
+            key_space: NODE_STATS_KEYSPACE.to_string(),
+            key: SUMMARY_GLOBAL_KEY.to_vec().into(),
             txn_id: None,
         }))
         .await
@@ -541,8 +541,8 @@ async fn drain_reconcile_summary() {
 
 #[tokio::test]
 async fn drain_reconcile_config() {
-    use aruna_core::keyspaces::USAGE_NODE_STATS_KEYSPACE;
-    use aruna_core::structs::storage::usage::{NODE_USAGE_SUMMARY_GLOBAL_KEY, UsageCounters};
+    use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
+    use aruna_core::structs::storage::usage::{SUMMARY_GLOBAL_KEY, UsageCounters};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 
     let temp_dir = tempdir().expect("temp dir");
@@ -563,8 +563,8 @@ async fn drain_reconcile_config() {
     .expect("net handle");
     match storage
         .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
-            key: NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec().into(),
+            key_space: NODE_STATS_KEYSPACE.to_string(),
+            key: SUMMARY_GLOBAL_KEY.to_vec().into(),
             value: UsageCounters {
                 logical_bytes: 99,
                 ..Default::default()
@@ -592,7 +592,7 @@ async fn drain_reconcile_config() {
 
     let outcome = handler
         .finish_sync_batch(
-            &TaskKey::DrainDocumentSyncOutbox,
+            &TaskKey::DrainSyncOutbox,
             Vec::new(),
             vec![DocumentTarget::RealmConfig { realm_id }],
             Event::Net(NetEvent::DocumentSync(
@@ -610,8 +610,8 @@ async fn drain_reconcile_config() {
     assert!(!outcome.retry_needed);
     match storage
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
-            key: NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec().into(),
+            key_space: NODE_STATS_KEYSPACE.to_string(),
+            key: SUMMARY_GLOBAL_KEY.to_vec().into(),
             txn_id: None,
         }))
         .await
@@ -692,7 +692,7 @@ async fn placement_storage_rearms() {
     let timer: aruna_core::task::PersistedTaskTimer =
         postcard::from_bytes(&persisted[0].1).expect("persisted timer decodes");
     assert_eq!(timer.key, key);
-    let retry_ms = crate::sync::shard_placement::SYNC_PLACEMENT_RETRY_AFTER.as_millis() as u64;
-    assert!(timer.due_at_unix_millis >= before_ms.saturating_add(retry_ms));
-    assert!(timer.due_at_unix_millis <= after_ms.saturating_add(retry_ms));
+    let retry_ms = crate::sync::shard_placement::PLACEMENT_RETRY_AFTER.as_millis() as u64;
+    assert!(timer.due_unix_millis >= before_ms.saturating_add(retry_ms));
+    assert!(timer.due_unix_millis <= after_ms.saturating_add(retry_ms));
 }

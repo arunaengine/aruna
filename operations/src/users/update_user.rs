@@ -25,7 +25,7 @@ use aruna_core::types::{Effects, Key, KeySpace, TxnId};
 use aruna_core::user_validation::{
     UserAttributeError, validate_attribute_count, validate_attribute_key, validate_attribute_value,
 };
-use aruna_core::{ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE};
+use aruna_core::{DOCUMENT_STATE_KEYSPACE, SYNC_REVISION_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::{HashMap, HashSet};
@@ -39,7 +39,7 @@ use crate::sync::document_outbox::{
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
 
-const MAX_USER_NAME_LEN: usize = 256;
+const MAX_USER_LEN: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UpdateUserInput {
@@ -67,16 +67,16 @@ enum UpdateUserState {
     Init,
     Auth,
     StartTransaction,
-    ReadUserAdminStateAndDocumentRevision {
+    ReadStateRevision {
         txn_id: TxnId,
     },
-    WriteUserAdminStateAndDocumentRevision {
+    WriteStateRevision {
         txn_id: TxnId,
         user: User,
         admin_outbox_written: bool,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
-    DeleteStaleAdminConflicts {
+    DeleteAdminConflicts {
         txn_id: TxnId,
         user: User,
         admin_outbox_written: bool,
@@ -91,7 +91,7 @@ enum UpdateUserState {
         user: User,
         admin_outbox_written: bool,
     },
-    ScheduleAdminDocumentOutboxDrain {
+    ScheduleDocumentDrain {
         user: User,
     },
     AnnounceUser {
@@ -109,7 +109,7 @@ pub enum UpdateUserError {
     UserNotFound,
     #[error("stored user id does not match requested user id")]
     UserIdMismatch,
-    #[error("user name must be non-empty and at most {MAX_USER_NAME_LEN} bytes")]
+    #[error("user name must be non-empty and at most {MAX_USER_LEN} bytes")]
     InvalidUserName,
     #[error("invalid user attribute key: {0}")]
     InvalidAttributeKey(String),
@@ -252,7 +252,7 @@ impl UpdateUserOperation {
         let document_target = DocumentTarget::User {
             user_id: target_user_id,
         };
-        self.state = UpdateUserState::ReadUserAdminStateAndDocumentRevision { txn_id };
+        self.state = UpdateUserState::ReadStateRevision { txn_id };
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
                 (
@@ -260,11 +260,11 @@ impl UpdateUserOperation {
                     ByteView::from(target_user_id.to_bytes()),
                 ),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&admin_target),
                 ),
                 (
-                    DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+                    SYNC_REVISION_KEYSPACE.to_string(),
                     sync_revision_key(&document_target),
                 ),
                 (
@@ -397,7 +397,7 @@ impl UpdateUserOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = UpdateUserState::WriteUserAdminStateAndDocumentRevision {
+        self.state = UpdateUserState::WriteStateRevision {
             txn_id,
             user: user.clone(),
             admin_outbox_written: !admin_events.is_empty(),
@@ -422,7 +422,7 @@ impl UpdateUserOperation {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchWriteResult)", got);
         };
         if !stale_conflict_deletes.is_empty() {
-            self.state = UpdateUserState::DeleteStaleAdminConflicts {
+            self.state = UpdateUserState::DeleteAdminConflicts {
                 txn_id,
                 user,
                 admin_outbox_written,
@@ -513,7 +513,7 @@ impl UpdateUserOperation {
             );
         };
         if admin_outbox_written {
-            self.state = UpdateUserState::ScheduleAdminDocumentOutboxDrain { user };
+            self.state = UpdateUserState::ScheduleDocumentDrain { user };
             return smallvec![schedule_drain_effect()];
         }
 
@@ -586,10 +586,10 @@ impl Operation for UpdateUserOperation {
         match self.state.clone() {
             UpdateUserState::Auth => self.handle_auth_result(event),
             UpdateUserState::StartTransaction => self.handle_start_transaction(event),
-            UpdateUserState::ReadUserAdminStateAndDocumentRevision { txn_id } => {
+            UpdateUserState::ReadStateRevision { txn_id } => {
                 self.accept_admin_state(event, txn_id)
             }
-            UpdateUserState::WriteUserAdminStateAndDocumentRevision {
+            UpdateUserState::WriteStateRevision {
                 txn_id,
                 user,
                 admin_outbox_written,
@@ -601,7 +601,7 @@ impl Operation for UpdateUserOperation {
                 admin_outbox_written,
                 stale_conflict_deletes,
             ),
-            UpdateUserState::DeleteStaleAdminConflicts {
+            UpdateUserState::DeleteAdminConflicts {
                 txn_id,
                 user,
                 admin_outbox_written,
@@ -616,7 +616,7 @@ impl Operation for UpdateUserOperation {
                 admin_outbox_written,
                 ..
             } => self.handle_commit_transaction(event, user, admin_outbox_written),
-            UpdateUserState::ScheduleAdminDocumentOutboxDrain { user } => {
+            UpdateUserState::ScheduleDocumentDrain { user } => {
                 self.schedule_outbox_drain(event, user)
             }
             UpdateUserState::AnnounceUser { user } => self.handle_announce_user(event, user),
@@ -637,9 +637,9 @@ impl Operation for UpdateUserOperation {
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            UpdateUserState::ReadUserAdminStateAndDocumentRevision { txn_id }
-            | UpdateUserState::WriteUserAdminStateAndDocumentRevision { txn_id, .. }
-            | UpdateUserState::DeleteStaleAdminConflicts { txn_id, .. }
+            UpdateUserState::ReadStateRevision { txn_id }
+            | UpdateUserState::WriteStateRevision { txn_id, .. }
+            | UpdateUserState::DeleteAdminConflicts { txn_id, .. }
             | UpdateUserState::ReadBucketFence { txn_id, .. }
             | UpdateUserState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
@@ -716,7 +716,7 @@ fn admin_document_operations(input: &UpdateUserInput) -> Vec<AdminDocumentOperat
 fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateUserError> {
     if let Some(name) = input.name.as_ref() {
         let trimmed = name.trim();
-        if trimmed.is_empty() || trimmed.len() > MAX_USER_NAME_LEN {
+        if trimmed.is_empty() || trimmed.len() > MAX_USER_LEN {
             return Err(UpdateUserError::InvalidUserName);
         }
         user.name = trimmed.to_string();
@@ -764,8 +764,8 @@ mod pure_tests {
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::TxnId;
     use aruna_core::{
-        ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
-        DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
+        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
+        SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
     };
     use byteview::ByteView;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -912,9 +912,9 @@ mod pure_tests {
                 assert_eq!(reads.len(), 4);
                 assert_eq!(reads[0].0, USER_KEYSPACE);
                 assert_eq!(reads[0].1.as_ref(), user_id.to_bytes().as_slice());
-                assert_eq!(reads[1].0, ADMIN_DOCUMENT_STATE_KEYSPACE);
+                assert_eq!(reads[1].0, DOCUMENT_STATE_KEYSPACE);
                 assert_eq!(reads[1].1, reducer_state_key(&target));
-                assert_eq!(reads[2].0, DOCUMENT_SYNC_REVISION_KEYSPACE);
+                assert_eq!(reads[2].0, SYNC_REVISION_KEYSPACE);
                 assert_eq!(reads[2].1, sync_revision_key(&document));
                 assert_eq!(reads[3].0, REALM_CONFIG_KEYSPACE);
             }
@@ -941,16 +941,16 @@ mod pure_tests {
                     .expect("user write is included");
                 let reducer_state_write = writes
                     .iter()
-                    .find(|(keyspace, _, _)| keyspace == ADMIN_DOCUMENT_STATE_KEYSPACE)
+                    .find(|(keyspace, _, _)| keyspace == DOCUMENT_STATE_KEYSPACE)
                     .expect("reducer state write is included");
                 assert!(
                     writes
                         .iter()
-                        .all(|(keyspace, _, _)| keyspace != ADMIN_DOCUMENT_CONFLICT_KEYSPACE)
+                        .all(|(keyspace, _, _)| keyspace != DOCUMENT_CONFLICT_KEYSPACE)
                 );
                 let outbox_records: Vec<DocumentOutboxRecord> = writes
                     .iter()
-                    .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+                    .filter(|(keyspace, _, _)| keyspace == SYNC_OUTBOX_KEYSPACE)
                     .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
                     .collect();
                 assert_eq!(outbox_records.len(), 4);
@@ -1010,7 +1010,7 @@ mod pure_tests {
         assert!(matches!(effects.first(), Some(Effect::Task(_))));
 
         let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainDocumentSyncOutbox,
+            key: TaskKey::DrainSyncOutbox,
             after: std::time::Duration::ZERO,
         }));
         assert!(effects.is_empty());
@@ -1072,7 +1072,7 @@ mod pure_tests {
 
         let (revision_key, revision): (_, DocumentChange) = writes
             .iter()
-            .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_REVISION_KEYSPACE)
+            .find(|(keyspace, _, _)| keyspace == SYNC_REVISION_KEYSPACE)
             .map(|(_, key, value)| {
                 (
                     key,
@@ -1126,11 +1126,11 @@ mod pure_tests {
                     .expect("user write is included");
                 let reducer_state_write = writes
                     .iter()
-                    .find(|(keyspace, _, _)| keyspace == ADMIN_DOCUMENT_STATE_KEYSPACE)
+                    .find(|(keyspace, _, _)| keyspace == DOCUMENT_STATE_KEYSPACE)
                     .expect("reducer state write is included");
                 let conflict_writes: Vec<_> = writes
                     .iter()
-                    .filter(|(keyspace, _, _)| keyspace == ADMIN_DOCUMENT_CONFLICT_KEYSPACE)
+                    .filter(|(keyspace, _, _)| keyspace == DOCUMENT_CONFLICT_KEYSPACE)
                     .collect();
                 assert_eq!(conflict_writes.len(), 1);
                 let conflict: AdminConflict =
@@ -1168,7 +1168,7 @@ mod pure_tests {
                 assert_eq!(
                     deletes,
                     &vec![(
-                        ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+                        DOCUMENT_CONFLICT_KEYSPACE.to_string(),
                         reducer_conflict_key(&target, "user.name"),
                     )]
                 );

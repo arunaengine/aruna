@@ -9,7 +9,7 @@ use aruna_core::document::{
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{METADATA_GRAPH_PRUNE_JOB_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{PRUNE_JOB_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::GraphPruneRecord;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
@@ -60,7 +60,7 @@ pub(crate) struct InstalledDrainHandler {
 impl InboundTaskHandler for InstalledDrainHandler {
     async fn handle_timer(&self, key: TaskKey) {
         self.handler.handle_timer(key.clone()).await;
-        if key == TaskKey::DrainDocumentSyncOutbox {
+        if key == TaskKey::DrainSyncOutbox {
             let _ = self.completed.send(()).await;
         }
     }
@@ -130,7 +130,7 @@ pub(crate) fn outbox_handler() -> (tempfile::TempDir, OperationsTaskHandler, Tas
 
 pub(crate) async fn scheduled_after(task_handle: &TaskHandle) -> Duration {
     let TaskEvent::TimerScheduled { after, .. } = task_handle
-        .schedule_idle_timer(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
+        .schedule_idle_timer(TaskKey::DrainSyncOutbox, Duration::ZERO)
         .await
     else {
         panic!("expected timer schedule event");
@@ -220,7 +220,7 @@ pub(crate) async fn read_graph_jobs(
 ) -> Vec<GraphPruneRecord> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+            key_space: PRUNE_JOB_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: 16,
