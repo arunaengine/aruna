@@ -1,7 +1,7 @@
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement::policy::PolicyGateError;
+use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::s3::upload_target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -14,7 +14,7 @@ use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
-    BackendLocation, BlobCleanupWork, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
+    BackendLocation, BlobCleanupWork, MultipartPart, MultipartPartKey, MultipartUpload,
     NODE_SUBJECT_KEY, NodeSubjectRecord, ResolvedBackend, WriteOwner,
 };
 use aruna_core::types::{Effects, Key, TxnId};
@@ -477,12 +477,11 @@ impl UploadPartOperation {
         }
 
         self.state = UploadPartState::ReadExistingPart;
-        let key = match MultipartUploadPartKey::new(self.input.upload_id, self.input.part_number)
-            .to_bytes()
-        {
-            Ok(key) => key,
-            Err(err) => return self.cleanup_failed_write(err.into()),
-        };
+        let key =
+            match MultipartPartKey::new(self.input.upload_id, self.input.part_number).to_bytes() {
+                Ok(key) => key,
+                Err(err) => return self.cleanup_failed_write(err.into()),
+            };
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
             key: key.into(),
@@ -496,7 +495,7 @@ impl UploadPartOperation {
         };
 
         if let Some(value) = value {
-            let existing = match MultipartUploadPart::from_bytes(value.as_ref()) {
+            let existing = match MultipartPart::from_bytes(value.as_ref()) {
                 Ok(existing) => existing,
                 Err(err) => return self.cleanup_failed_write(err.into()),
             };
@@ -506,17 +505,16 @@ impl UploadPartOperation {
         let Some(location) = self.written_location.clone() else {
             return self.emit_error(UploadPartError::UploadPartFailed);
         };
-        let record = MultipartUploadPart {
+        let record = MultipartPart {
             part_number: self.input.part_number,
             location,
             created_at: SystemTime::now(),
         };
-        let key = match MultipartUploadPartKey::new(self.input.upload_id, self.input.part_number)
-            .to_bytes()
-        {
-            Ok(key) => key,
-            Err(err) => return self.cleanup_failed_write(err.into()),
-        };
+        let key =
+            match MultipartPartKey::new(self.input.upload_id, self.input.part_number).to_bytes() {
+                Ok(key) => key,
+                Err(err) => return self.cleanup_failed_write(err.into()),
+            };
         let value = match record.to_bytes() {
             Ok(value) => value,
             Err(err) => return self.cleanup_failed_write(err.into()),
@@ -1420,7 +1418,7 @@ mod test {
     }
 
     fn disabled_record(backend_id: Ulid) -> Vec<u8> {
-        aruna_core::structs::GroupStorageBackend {
+        aruna_core::structs::GroupStorage {
             backend_id,
             group_id: Ulid::from_bytes([7u8; 16]),
             name: "tenant".to_string(),

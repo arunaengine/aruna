@@ -4,7 +4,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus,
+    MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -62,7 +62,7 @@ pub struct ListPartsInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListPartsResult {
     pub upload: MultipartUpload,
-    pub parts: Vec<MultipartUploadPart>,
+    pub parts: Vec<MultipartPart>,
     pub is_truncated: bool,
     pub next_part_number_marker: Option<u16>,
 }
@@ -151,7 +151,7 @@ impl ListPartsOperation {
         }
         self.upload = Some(record);
 
-        let prefix = match MultipartUploadPartKey::prefix(self.input.upload_id) {
+        let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
             Ok(prefix) => prefix,
             Err(err) => return self.emit_error(err.into()),
         };
@@ -176,7 +176,7 @@ impl ListPartsOperation {
 
         let mut parts = Vec::with_capacity(values.len());
         for (_key, value) in values {
-            let part = match MultipartUploadPart::from_bytes(value.as_ref()) {
+            let part = match MultipartPart::from_bytes(value.as_ref()) {
                 Ok(part) => part,
                 Err(err) => return self.emit_error(err.into()),
             };
@@ -348,7 +348,7 @@ mod test {
     }
 
     async fn seed_part(storage_handle: &storage::StorageHandle, upload_id: Ulid, part_number: u16) {
-        let record = MultipartUploadPart {
+        let record = MultipartPart {
             part_number,
             location: part_location(),
             created_at: SystemTime::UNIX_EPOCH,
@@ -356,7 +356,7 @@ mod test {
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
-                key: MultipartUploadPartKey::new(upload_id, part_number)
+                key: MultipartPartKey::new(upload_id, part_number)
                     .to_bytes()
                     .unwrap()
                     .into(),

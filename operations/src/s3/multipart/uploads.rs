@@ -15,7 +15,7 @@ use ulid::Ulid;
 use crate::s3::listing::{ListMarker, build_page, retain_after_marker};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ListMultipartUploadsState {
+pub enum ListUploadsState {
     Init,
     StartTransaction,
     ReadUploads,
@@ -25,7 +25,7 @@ pub enum ListMultipartUploadsState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ListMultipartUploadsError {
+pub enum ListUploadsError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -34,7 +34,7 @@ pub enum ListMultipartUploadsError {
     ScanBudgetExceeded,
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
     InvalidStateEvent {
-        state: ListMultipartUploadsState,
+        state: ListUploadsState,
         expected: &'static str,
         received: Event,
     },
@@ -47,7 +47,7 @@ pub enum ListMultipartUploadsError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ListMultipartUploadsInput {
+pub struct ListUploadsInput {
     pub bucket: String,
     pub prefix: Option<String>,
     pub delimiter: Option<String>,
@@ -57,7 +57,7 @@ pub struct ListMultipartUploadsInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ListMultipartUploadsResult {
+pub struct ListUploadsResult {
     pub uploads: Vec<MultipartUpload>,
     pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
@@ -66,9 +66,9 @@ pub struct ListMultipartUploadsResult {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ListMultipartUploadsOperation {
-    input: ListMultipartUploadsInput,
-    state: ListMultipartUploadsState,
+pub struct ListUploadsOperation {
+    input: ListUploadsInput,
+    state: ListUploadsState,
     txn_id: Option<Ulid>,
     uploads: Vec<MultipartUpload>,
     scan_cursor: Option<Key>,
@@ -76,18 +76,18 @@ pub struct ListMultipartUploadsOperation {
     scan_round_limit: usize,
     max_scan_rows: usize,
     include_in_progress: bool,
-    output: Option<Result<ListMultipartUploadsResult, ListMultipartUploadsError>>,
+    output: Option<Result<ListUploadsResult, ListUploadsError>>,
 }
 
-impl ListMultipartUploadsOperation {
+impl ListUploadsOperation {
     pub const DEFAULT_MAX_UPLOADS: usize = 1_000;
     const SCAN_ROUND_LIMIT: usize = 100;
     const MAX_SCAN_ROWS: usize = 10_000;
 
-    pub fn new(input: ListMultipartUploadsInput) -> Self {
+    pub fn new(input: ListUploadsInput) -> Self {
         Self {
             input,
-            state: ListMultipartUploadsState::Init,
+            state: ListUploadsState::Init,
             txn_id: None,
             uploads: Vec::new(),
             scan_cursor: None,
@@ -125,8 +125,8 @@ impl ListMultipartUploadsOperation {
         self
     }
 
-    fn emit_error(&mut self, error: ListMultipartUploadsError) -> Effects {
-        self.state = ListMultipartUploadsState::Error;
+    fn emit_error(&mut self, error: ListUploadsError) -> Effects {
+        self.state = ListUploadsState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
@@ -135,8 +135,8 @@ impl ListMultipartUploadsOperation {
         // Mirror the key listings: max_uploads=0 returns an empty,
         // non-truncated result instead of truncating without a resume marker.
         if self.input.max_uploads == 0 {
-            self.state = ListMultipartUploadsState::Finish;
-            self.output = Some(Ok(ListMultipartUploadsResult {
+            self.state = ListUploadsState::Finish;
+            self.output = Some(Ok(ListUploadsResult {
                 uploads: Vec::new(),
                 common_prefixes: Vec::new(),
                 is_truncated: false,
@@ -146,7 +146,7 @@ impl ListMultipartUploadsOperation {
             return smallvec![];
         }
 
-        self.state = ListMultipartUploadsState::StartTransaction;
+        self.state = ListUploadsState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: true
         })]
@@ -154,7 +154,7 @@ impl ListMultipartUploadsOperation {
 
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(ListMultipartUploadsError::InvalidStateEvent {
+            return self.emit_error(ListUploadsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
                 received: event,
@@ -167,12 +167,12 @@ impl ListMultipartUploadsOperation {
 
     fn issue_upload_round(&mut self) -> Effects {
         let Some(remaining) = self.max_scan_rows.checked_sub(self.scan_rows) else {
-            return self.emit_error(ListMultipartUploadsError::ScanBudgetExceeded);
+            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
         };
         if remaining == 0 {
-            return self.emit_error(ListMultipartUploadsError::ScanBudgetExceeded);
+            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
         }
-        self.state = ListMultipartUploadsState::ReadUploads;
+        self.state = ListUploadsState::ReadUploads;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             prefix: None,
@@ -195,7 +195,7 @@ impl ListMultipartUploadsOperation {
             next_start_after,
         }) = event
         else {
-            return self.emit_error(ListMultipartUploadsError::InvalidStateEvent {
+            return self.emit_error(ListUploadsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
                 received: event,
@@ -203,10 +203,10 @@ impl ListMultipartUploadsOperation {
         };
 
         let Some(remaining) = self.max_scan_rows.checked_sub(self.scan_rows) else {
-            return self.emit_error(ListMultipartUploadsError::ScanBudgetExceeded);
+            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
         };
         if values.len() > remaining {
-            return self.emit_error(ListMultipartUploadsError::ScanBudgetExceeded);
+            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
         }
         self.scan_rows += values.len();
 
@@ -235,7 +235,7 @@ impl ListMultipartUploadsOperation {
             return self.finish_upload_scan();
         }
         if self.scan_rows >= self.max_scan_rows {
-            return self.emit_error(ListMultipartUploadsError::ScanBudgetExceeded);
+            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
         }
 
         self.scan_cursor = next_start_after;
@@ -269,7 +269,7 @@ impl ListMultipartUploadsOperation {
 
     fn finish(&mut self, uploads: Vec<MultipartUpload>) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(ListMultipartUploadsError::NoTransactionFound);
+            return self.emit_error(ListUploadsError::NoTransactionFound);
         };
 
         let page = build_page(
@@ -288,8 +288,8 @@ impl ListMultipartUploadsOperation {
                 None => (None, None),
             };
 
-        self.state = ListMultipartUploadsState::CommitTransaction;
-        self.output = Some(Ok(ListMultipartUploadsResult {
+        self.state = ListUploadsState::CommitTransaction;
+        self.output = Some(Ok(ListUploadsResult {
             uploads: page.entries,
             common_prefixes: page.prefixes,
             is_truncated: page.truncated,
@@ -301,21 +301,21 @@ impl ListMultipartUploadsOperation {
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(ListMultipartUploadsError::InvalidStateEvent {
+            return self.emit_error(ListUploadsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                 received: event,
             });
         };
 
-        self.state = ListMultipartUploadsState::Finish;
+        self.state = ListUploadsState::Finish;
         smallvec![]
     }
 }
 
-impl Operation for ListMultipartUploadsOperation {
-    type Output = ListMultipartUploadsResult;
-    type Error = ListMultipartUploadsError;
+impl Operation for ListUploadsOperation {
+    type Output = ListUploadsResult;
+    type Error = ListUploadsError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -323,24 +323,22 @@ impl Operation for ListMultipartUploadsOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(ListMultipartUploadsError::StorageError(error));
+            return self.emit_error(ListUploadsError::StorageError(error));
         }
 
         match self.state {
-            ListMultipartUploadsState::Init => self.handle_init(),
-            ListMultipartUploadsState::StartTransaction => self.handle_transaction_started(event),
-            ListMultipartUploadsState::ReadUploads => self.handle_uploads_read(event),
-            ListMultipartUploadsState::CommitTransaction => {
-                self.handle_transaction_committed(event)
-            }
-            ListMultipartUploadsState::Finish | ListMultipartUploadsState::Error => smallvec![],
+            ListUploadsState::Init => self.handle_init(),
+            ListUploadsState::StartTransaction => self.handle_transaction_started(event),
+            ListUploadsState::ReadUploads => self.handle_uploads_read(event),
+            ListUploadsState::CommitTransaction => self.handle_transaction_committed(event),
+            ListUploadsState::Finish | ListUploadsState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            ListMultipartUploadsState::Finish | ListMultipartUploadsState::Error
+            ListUploadsState::Finish | ListUploadsState::Error
         )
     }
 
@@ -348,7 +346,7 @@ impl Operation for ListMultipartUploadsOperation {
         match self.output {
             Some(Ok(value)) => Ok(value),
             Some(Err(error)) => Err(error),
-            None => Err(ListMultipartUploadsError::NotFinished),
+            None => Err(ListUploadsError::NotFinished),
         }
     }
 
@@ -422,8 +420,8 @@ mod test {
             .await;
     }
 
-    fn input(bucket: &str, max_uploads: usize) -> ListMultipartUploadsInput {
-        ListMultipartUploadsInput {
+    fn input(bucket: &str, max_uploads: usize) -> ListUploadsInput {
+        ListUploadsInput {
             bucket: bucket.to_string(),
             prefix: None,
             delimiter: None,
@@ -457,10 +455,7 @@ mod test {
         .await;
 
         let result = drive(
-            ListMultipartUploadsOperation::new(input(
-                "bucket",
-                ListMultipartUploadsOperation::DEFAULT_MAX_UPLOADS,
-            )),
+            ListUploadsOperation::new(input("bucket", ListUploadsOperation::DEFAULT_MAX_UPLOADS)),
             &driver_ctx,
         )
         .await
@@ -499,7 +494,7 @@ mod test {
         .await;
 
         let result = drive(
-            ListMultipartUploadsOperation::new(input("bucket", 1)).with_scan_limit(1),
+            ListUploadsOperation::new(input("bucket", 1)).with_scan_limit(1),
             &driver_ctx,
         )
         .await
@@ -526,12 +521,12 @@ mod test {
         }
 
         let result = drive(
-            ListMultipartUploadsOperation::new(input("bucket", 1)).with_scan_budget(2),
+            ListUploadsOperation::new(input("bucket", 1)).with_scan_budget(2),
             &driver_ctx,
         )
         .await;
 
-        assert_eq!(result, Err(ListMultipartUploadsError::ScanBudgetExceeded));
+        assert_eq!(result, Err(ListUploadsError::ScanBudgetExceeded));
     }
 
     #[tokio::test]
@@ -558,7 +553,7 @@ mod test {
         .await;
 
         let result = drive(
-            ListMultipartUploadsOperation::new(input("bucket", 1)).with_scan_limit(2),
+            ListUploadsOperation::new(input("bucket", 1)).with_scan_limit(2),
             &driver_ctx,
         )
         .await
@@ -582,12 +577,9 @@ mod test {
         )
         .await;
 
-        let result = drive(
-            ListMultipartUploadsOperation::new(input("bucket", 0)),
-            &driver_ctx,
-        )
-        .await
-        .unwrap();
+        let result = drive(ListUploadsOperation::new(input("bucket", 0)), &driver_ctx)
+            .await
+            .unwrap();
 
         assert!(result.uploads.is_empty());
         assert!(!result.is_truncated);
@@ -619,10 +611,7 @@ mod test {
         .await;
 
         let result = drive(
-            ListMultipartUploadsOperation::new(input(
-                "bucket",
-                ListMultipartUploadsOperation::DEFAULT_MAX_UPLOADS,
-            )),
+            ListUploadsOperation::new(input("bucket", ListUploadsOperation::DEFAULT_MAX_UPLOADS)),
             &driver_ctx,
         )
         .await
@@ -683,10 +672,7 @@ mod test {
         .await;
 
         let result = drive(
-            ListMultipartUploadsOperation::new(input(
-                "bucket",
-                ListMultipartUploadsOperation::DEFAULT_MAX_UPLOADS,
-            )),
+            ListUploadsOperation::new(input("bucket", ListUploadsOperation::DEFAULT_MAX_UPLOADS)),
             &driver_ctx,
         )
         .await
@@ -720,7 +706,7 @@ mod test {
         let mut collected = Vec::new();
         loop {
             let result = drive(
-                ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
+                ListUploadsOperation::new(ListUploadsInput {
                     bucket: "bucket".to_string(),
                     prefix: None,
                     delimiter: None,
@@ -772,7 +758,7 @@ mod test {
         }
 
         let first = drive(
-            ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
+            ListUploadsOperation::new(ListUploadsInput {
                 bucket: "bucket".to_string(),
                 prefix: None,
                 delimiter: None,
@@ -795,7 +781,7 @@ mod test {
         );
 
         let second = drive(
-            ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
+            ListUploadsOperation::new(ListUploadsInput {
                 bucket: "bucket".to_string(),
                 prefix: None,
                 delimiter: None,
@@ -831,7 +817,7 @@ mod test {
         .await;
 
         let result = drive(
-            ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
+            ListUploadsOperation::new(ListUploadsInput {
                 bucket: "bucket".to_string(),
                 prefix: None,
                 delimiter: None,
@@ -871,13 +857,13 @@ mod test {
         }
 
         let result = drive(
-            ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
+            ListUploadsOperation::new(ListUploadsInput {
                 bucket: "bucket".to_string(),
                 prefix: Some("docs/".to_string()),
                 delimiter: None,
                 key_marker: None,
                 upload_id_marker: None,
-                max_uploads: ListMultipartUploadsOperation::DEFAULT_MAX_UPLOADS,
+                max_uploads: ListUploadsOperation::DEFAULT_MAX_UPLOADS,
             }),
             &driver_ctx,
         )
@@ -908,13 +894,13 @@ mod test {
         }
 
         let result = drive(
-            ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
+            ListUploadsOperation::new(ListUploadsInput {
                 bucket: "bucket".to_string(),
                 prefix: None,
                 delimiter: Some("/".to_string()),
                 key_marker: None,
                 upload_id_marker: None,
-                max_uploads: ListMultipartUploadsOperation::DEFAULT_MAX_UPLOADS,
+                max_uploads: ListUploadsOperation::DEFAULT_MAX_UPLOADS,
             }),
             &driver_ctx,
         )
