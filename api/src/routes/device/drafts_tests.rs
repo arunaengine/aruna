@@ -1,6 +1,6 @@
 use super::{DeviceDraft, preview_draft};
 use crate::error::ServerError;
-use crate::metadata::ProfileValidationPreviewRequest;
+use crate::metadata::ProfilePreviewRequest;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -93,7 +93,7 @@ async fn preview_refuses_group() {
     let result = preview_draft(
         State(state),
         Extension(Some(auth)),
-        Json(ProfileValidationPreviewRequest {
+        Json(ProfilePreviewRequest {
             rocrate: serde_json::json!({
                 "@context": "https://w3id.org/ro/crate/1.2/context",
                 "@graph": []
@@ -112,7 +112,7 @@ async fn preview_marks_unchecked() {
     let (_dir, state, auth) = user_node().await;
     let file = format!("https://w3id.org/aruna/data/{}", "09".repeat(32));
     let (_, Json(preview)) = preview_draft(
-            State(state), Extension(Some(auth)), Json(ProfileValidationPreviewRequest {
+            State(state), Extension(Some(auth)), Json(ProfilePreviewRequest {
                 rocrate: serde_json::json!({
                     "@context": "https://w3id.org/ro/crate/1.3/context",
                     "@graph": [
