@@ -1,6 +1,6 @@
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::sessions::unix_rfc3339;
+use crate::routes::access::sessions::unix_rfc3339;
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{AuthContext, UserVault};
@@ -210,7 +210,7 @@ pub async fn delete_vault(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::fixtures::users::{realm_auth, setup_state};
+    use crate::tests::users::{realm_auth, setup_state};
     use aruna_core::structs::MAX_USER_VAULT_BYTES;
     use axum::response::IntoResponse;
 
