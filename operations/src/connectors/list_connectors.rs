@@ -11,17 +11,17 @@ use crate::connectors::repository::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ListSourceConnectorsInput {
+pub struct ListSourceInput {
     pub group_id: GroupId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ListSourceConnectorsResult {
+pub struct ListSourceResult {
     pub connectors: Vec<SourceConnector>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ListSourceConnectorsState {
+pub enum ListSourceState {
     Init,
     IterConnectors,
     Finish,
@@ -29,7 +29,7 @@ pub enum ListSourceConnectorsState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ListSourceConnectorsError {
+pub enum ListSourceError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -38,7 +38,7 @@ pub enum ListSourceConnectorsError {
     ListSourceConnectorsFailed,
 }
 
-impl From<StorageReadError> for ListSourceConnectorsError {
+impl From<StorageReadError> for ListSourceError {
     fn from(value: StorageReadError) -> Self {
         match value {
             StorageReadError::Storage(error) => Self::StorageError(error),
@@ -48,33 +48,33 @@ impl From<StorageReadError> for ListSourceConnectorsError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ListSourceConnectorsOperation {
-    input: ListSourceConnectorsInput,
-    state: ListSourceConnectorsState,
+pub struct ListSourceOperation {
+    input: ListSourceInput,
+    state: ListSourceState,
     next_start_after: Option<Key>,
     connectors: Vec<SourceConnector>,
-    output: Option<Result<ListSourceConnectorsResult, ListSourceConnectorsError>>,
+    output: Option<Result<ListSourceResult, ListSourceError>>,
 }
 
-impl ListSourceConnectorsOperation {
-    pub fn new(input: ListSourceConnectorsInput) -> Self {
+impl ListSourceOperation {
+    pub fn new(input: ListSourceInput) -> Self {
         Self {
             input,
-            state: ListSourceConnectorsState::Init,
+            state: ListSourceState::Init,
             next_start_after: None,
             connectors: Vec::new(),
             output: None,
         }
     }
 
-    fn emit_error(&mut self, error: ListSourceConnectorsError) -> Effects {
-        self.state = ListSourceConnectorsState::Error;
+    fn emit_error(&mut self, error: ListSourceError) -> Effects {
+        self.state = ListSourceState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
     fn handle_init(&mut self) -> Effects {
-        self.state = ListSourceConnectorsState::IterConnectors;
+        self.state = ListSourceState::IterConnectors;
         smallvec![iter_connectors_effect(self.input.group_id, None, None)]
     }
 
@@ -92,8 +92,8 @@ impl ListSourceConnectorsOperation {
                     )];
                 }
 
-                self.state = ListSourceConnectorsState::Finish;
-                self.output = Some(Ok(ListSourceConnectorsResult {
+                self.state = ListSourceState::Finish;
+                self.output = Some(Ok(ListSourceResult {
                     connectors: self.connectors.clone(),
                 }));
                 smallvec![]
@@ -103,9 +103,9 @@ impl ListSourceConnectorsOperation {
     }
 }
 
-impl Operation for ListSourceConnectorsOperation {
-    type Output = ListSourceConnectorsResult;
-    type Error = ListSourceConnectorsError;
+impl Operation for ListSourceOperation {
+    type Output = ListSourceResult;
+    type Error = ListSourceError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -113,30 +113,27 @@ impl Operation for ListSourceConnectorsOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            ListSourceConnectorsState::Init => self.handle_init(),
-            ListSourceConnectorsState::IterConnectors => self.handle_connector_iter(event),
-            ListSourceConnectorsState::Finish => smallvec![],
-            ListSourceConnectorsState::Error => self.abort(),
+            ListSourceState::Init => self.handle_init(),
+            ListSourceState::IterConnectors => self.handle_connector_iter(event),
+            ListSourceState::Finish => smallvec![],
+            ListSourceState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ListSourceConnectorsState::Finish | ListSourceConnectorsState::Error
-        )
+        matches!(self.state, ListSourceState::Finish | ListSourceState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ListSourceConnectorsState::Error {
+        if self.state == ListSourceState::Error {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(ListSourceConnectorsError::ListSourceConnectorsFailed);
+            return Err(ListSourceError::ListSourceConnectorsFailed);
         }
 
         self.output
-            .ok_or(ListSourceConnectorsError::ListSourceConnectorsFailed)?
+            .ok_or(ListSourceError::ListSourceConnectorsFailed)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -147,9 +144,7 @@ impl Operation for ListSourceConnectorsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::create_connector::{
-        CreateSourceConnectorInput, CreateSourceConnectorOperation,
-    };
+    use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
     use crate::driver::{DriverContext, drive};
     use aruna_core::structs::SourceConnectorKind;
     use aruna_storage::storage;
@@ -171,7 +166,7 @@ mod tests {
         let group_id = ulid::Ulid::generate();
 
         let created = drive(
-            CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
+            SourceConnectorOperation::new(SourceConnectorInput {
                 group_id,
                 created_by: Default::default(),
                 name: "refdata".to_string(),
@@ -189,7 +184,7 @@ mod tests {
         .unwrap();
 
         let listed = drive(
-            ListSourceConnectorsOperation::new(ListSourceConnectorsInput { group_id }),
+            ListSourceOperation::new(ListSourceInput { group_id }),
             &context,
         )
         .await

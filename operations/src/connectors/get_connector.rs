@@ -13,19 +13,19 @@ use crate::connectors::repository::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GetSourceConnectorInput {
+pub struct GetSourceInput {
     pub group_id: GroupId,
     pub connector_id: Ulid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GetSourceConnectorResult {
+pub struct GetSourceResult {
     pub connector: SourceConnector,
     pub has_secret_config: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GetSourceConnectorState {
+pub enum GetSourceState {
     Init,
     ReadConnector,
     ReadSecret,
@@ -34,7 +34,7 @@ pub enum GetSourceConnectorState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum GetSourceConnectorError {
+pub enum GetSourceError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -45,7 +45,7 @@ pub enum GetSourceConnectorError {
     GetSourceConnectorFailed,
 }
 
-impl From<StorageReadError> for GetSourceConnectorError {
+impl From<StorageReadError> for GetSourceError {
     fn from(value: StorageReadError) -> Self {
         match value {
             StorageReadError::Storage(error) => Self::StorageError(error),
@@ -55,33 +55,33 @@ impl From<StorageReadError> for GetSourceConnectorError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct GetSourceConnectorOperation {
-    input: GetSourceConnectorInput,
-    state: GetSourceConnectorState,
+pub struct GetSourceOperation {
+    input: GetSourceInput,
+    state: GetSourceState,
     connector: Option<SourceConnector>,
     has_secret_config: bool,
-    output: Option<Result<GetSourceConnectorResult, GetSourceConnectorError>>,
+    output: Option<Result<GetSourceResult, GetSourceError>>,
 }
 
-impl GetSourceConnectorOperation {
-    pub fn new(input: GetSourceConnectorInput) -> Self {
+impl GetSourceOperation {
+    pub fn new(input: GetSourceInput) -> Self {
         Self {
             input,
-            state: GetSourceConnectorState::Init,
+            state: GetSourceState::Init,
             connector: None,
             has_secret_config: false,
             output: None,
         }
     }
 
-    fn emit_error(&mut self, error: GetSourceConnectorError) -> Effects {
-        self.state = GetSourceConnectorState::Error;
+    fn emit_error(&mut self, error: GetSourceError) -> Effects {
+        self.state = GetSourceState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
     fn handle_init(&mut self) -> Effects {
-        self.state = GetSourceConnectorState::ReadConnector;
+        self.state = GetSourceState::ReadConnector;
         smallvec![read_connector_effect(
             self.input.group_id,
             self.input.connector_id,
@@ -93,10 +93,10 @@ impl GetSourceConnectorOperation {
         match parse_connector_read(event) {
             Ok(Some(connector)) => {
                 self.connector = Some(connector);
-                self.state = GetSourceConnectorState::ReadSecret;
+                self.state = GetSourceState::ReadSecret;
                 smallvec![read_secret_effect(self.input.connector_id, None)]
             }
-            Ok(None) => self.emit_error(GetSourceConnectorError::NotFound),
+            Ok(None) => self.emit_error(GetSourceError::NotFound),
             Err(error) => self.emit_error(error.into()),
         }
     }
@@ -106,10 +106,10 @@ impl GetSourceConnectorOperation {
             Ok(secret) => {
                 self.has_secret_config = secret.is_some();
                 let Some(connector) = self.connector.clone() else {
-                    return self.emit_error(GetSourceConnectorError::GetSourceConnectorFailed);
+                    return self.emit_error(GetSourceError::GetSourceConnectorFailed);
                 };
-                self.state = GetSourceConnectorState::Finish;
-                self.output = Some(Ok(GetSourceConnectorResult {
+                self.state = GetSourceState::Finish;
+                self.output = Some(Ok(GetSourceResult {
                     connector,
                     has_secret_config: self.has_secret_config,
                 }));
@@ -120,9 +120,9 @@ impl GetSourceConnectorOperation {
     }
 }
 
-impl Operation for GetSourceConnectorOperation {
-    type Output = GetSourceConnectorResult;
-    type Error = GetSourceConnectorError;
+impl Operation for GetSourceOperation {
+    type Output = GetSourceResult;
+    type Error = GetSourceError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -130,31 +130,28 @@ impl Operation for GetSourceConnectorOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            GetSourceConnectorState::Init => self.handle_init(),
-            GetSourceConnectorState::ReadConnector => self.handle_connector_read(event),
-            GetSourceConnectorState::ReadSecret => self.handle_secret_read(event),
-            GetSourceConnectorState::Finish => smallvec![],
-            GetSourceConnectorState::Error => self.abort(),
+            GetSourceState::Init => self.handle_init(),
+            GetSourceState::ReadConnector => self.handle_connector_read(event),
+            GetSourceState::ReadSecret => self.handle_secret_read(event),
+            GetSourceState::Finish => smallvec![],
+            GetSourceState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            GetSourceConnectorState::Finish | GetSourceConnectorState::Error
-        )
+        matches!(self.state, GetSourceState::Finish | GetSourceState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == GetSourceConnectorState::Error {
+        if self.state == GetSourceState::Error {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(GetSourceConnectorError::GetSourceConnectorFailed);
+            return Err(GetSourceError::GetSourceConnectorFailed);
         }
 
         self.output
-            .ok_or(GetSourceConnectorError::GetSourceConnectorFailed)?
+            .ok_or(GetSourceError::GetSourceConnectorFailed)?
     }
 
     fn abort(&mut self) -> Effects {
