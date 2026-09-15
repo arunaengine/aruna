@@ -1,8 +1,6 @@
-//! Audit-page adapter: bounded fan-out to every node's local audit page.
-//!
-//! An unreachable or denied node is reported so the aggregator records it
-//! missing, and every node past the cap is reported missing as well. An empty
-//! page must never read as an almost complete audit trail.
+//! Audit-page adapter: bounded fan-out to every node's local audit page. An
+//! unreachable, denied, or over-cap node is reported missing, so an empty page
+//! can never read as an almost complete audit trail.
 
 use std::collections::BTreeSet;
 

@@ -1,13 +1,6 @@
-//! Routing-input assembly for operation configs.
-//!
-//! Callers build their routing snapshot, destination gate, or quota-marked
-//! catalog before an operation starts; operations themselves never fetch this
-//! from inside a step. The functions here turn typed storage results into that
-//! policy and reuse the existing record decoders (`parse_read`) instead of
-//! carrying their own event parsing.
-//!
-//! `crate::driver` re-exports the public entry points, so callers keep using
-//! `aruna_operations::driver::{...}`.
+//! Routing-input assembly for operation configs: callers build the snapshot,
+//! gate, or quota-marked catalog before the operation starts, operations never
+//! fetch it mid-step, and `crate::driver` re-exports the public entry points.
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
@@ -24,7 +17,7 @@ use tracing::warn;
 
 use crate::driver::DriverContext;
 use crate::groups::backends::{RecordReadError, parse_read};
-use crate::groups::storage_routing::{GroupRoutingInputsError, GroupRoutingInputsOperation};
+use crate::groups::storage_routing::{GroupInputsError, GroupInputsOperation};
 use crate::placement::policy::GateContext;
 
 /// Node-local routing inputs for a caller assembling an operation config.
@@ -42,7 +35,7 @@ pub fn node_routing(context: &DriverContext) -> NodeRouting {
 #[derive(Debug, Error, PartialEq)]
 pub enum RoutingInputsError {
     #[error("group routing inputs unavailable: {0}")]
-    GroupInputs(#[from] GroupRoutingInputsError),
+    GroupInputs(#[from] GroupInputsError),
     #[error("bucket routing rules unavailable: {0}")]
     BucketRules(#[from] RecordReadError),
     /// Not `#[from]`: `BucketRules` already owns the conversion from a read.
@@ -57,9 +50,9 @@ impl RoutingInputsError {
     /// read failure from a record that will never decode.
     pub fn storage(&self) -> Option<&StorageError> {
         let read = match self {
-            Self::GroupInputs(GroupRoutingInputsError::Read(read)) => read,
+            Self::GroupInputs(GroupInputsError::Read(read)) => read,
             Self::BucketRules(read) | Self::BackendUsage(read) | Self::NodeSubject(read) => read,
-            Self::GroupInputs(GroupRoutingInputsError::Incomplete) => return None,
+            Self::GroupInputs(GroupInputsError::Incomplete) => return None,
         };
         match read {
             RecordReadError::Storage(error) => Some(error),
@@ -74,7 +67,7 @@ async fn group_inputs(
     context: &DriverContext,
     group_id: GroupId,
 ) -> Result<GroupRoutingInputs, RoutingInputsError> {
-    Ok(crate::driver::drive(GroupRoutingInputsOperation::new(group_id), context).await?)
+    Ok(crate::driver::drive(GroupInputsOperation::new(group_id), context).await?)
 }
 
 /// Bucket rules for callers that do not already hold the bucket record. A
@@ -251,11 +244,11 @@ pub async fn backend_used_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::fixtures::staging::setup_driver_context;
+    use crate::tests::staging::setup_driver_context;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{GROUP_STORAGE_ROUTING_KEYSPACE, NODE_SUBJECT_KEYSPACE};
     use aruna_core::structs::{
-        BackendRef, GroupBackendKind, GroupStorageBackend, GroupStorageRouting, PlacementSubject,
+        BackendRef, GroupBackendKind, GroupStorage, GroupStorageRouting, PlacementSubject,
         ResolvedBackend, RoutingTarget, StorageRoutingRule, UsageCounters, resolve_backend,
         usage_backend_key,
     };
@@ -280,7 +273,7 @@ mod tests {
     }
 
     async fn register(context: &DriverContext, group_id: Ulid) -> Ulid {
-        let record = GroupStorageBackend {
+        let record = GroupStorage {
             backend_id: Ulid::generate(),
             group_id,
             name: "tenant".to_string(),

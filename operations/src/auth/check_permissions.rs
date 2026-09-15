@@ -95,11 +95,11 @@ mod test {
 
     use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
     use crate::driver::{DriverContext, drive};
-    use crate::groups::add_member::{AddUserToGroupInput, AddUserToGroupOperation};
-    use crate::groups::add_role::{AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation};
+    use crate::groups::add_member::{AddUserInput, AddUserOperation};
+    use crate::groups::add_role::{AddRoleConfig, AddRoleError, AddRoleOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::realm::assign_role::{AddUserToRealmRolesInput, AddUserToRealmRolesOperation};
-    use crate::realm::claim_admin::{ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation};
+    use crate::realm::assign_role::{AssignRolesInput, AssignRolesOperation};
+    use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 
     #[tokio::test]
@@ -151,7 +151,7 @@ mod test {
         .await
         .unwrap();
         drive(
-            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+            ClaimInitialOperation::new(ClaimInitialInput {
                 actor: actor.clone(),
             }),
             &context,
@@ -173,7 +173,7 @@ mod test {
 
         // A role assigned to the Everyone principal grants READ on the public path.
         drive(
-            AddGroupRoleOperation::new(AddGroupRoleConfig {
+            AddRoleOperation::new(AddRoleConfig {
                 auth_context: AuthContext {
                     user_id: admin_id,
                     realm_id,
@@ -244,7 +244,7 @@ mod test {
             ("public-deny", Permission::DENY),
         ] {
             let result = drive(
-                AddGroupRoleOperation::new(AddGroupRoleConfig {
+                AddRoleOperation::new(AddRoleConfig {
                     auth_context: AuthContext {
                         user_id: admin_id,
                         realm_id,
@@ -267,7 +267,7 @@ mod test {
                 &context,
             )
             .await;
-            assert!(matches!(result, Err(AddGroupRoleError::InvalidPublicRole)));
+            assert!(matches!(result, Err(AddRoleError::InvalidPublicRole)));
         }
 
         net_handle.shutdown().await;
@@ -320,7 +320,7 @@ mod test {
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let (_result, realm_auth_doc) = drive(realm_operation, &context).await.unwrap();
         drive(
-            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+            ClaimInitialOperation::new(ClaimInitialInput {
                 actor: realm_config.actor.clone(),
             }),
             &context,
@@ -405,7 +405,7 @@ mod test {
 
         // A viewer cannot write group metadata.
         let reader = UserId::local(Ulid::generate(), realm_id);
-        let add_user_input = AddUserToGroupInput {
+        let add_user_input = AddUserInput {
             actor: Actor {
                 node_id,
                 user_id,
@@ -420,7 +420,7 @@ mod test {
                 .collect(),
         };
 
-        let add_user_operation = AddUserToGroupOperation::new(add_user_input.clone());
+        let add_user_operation = AddUserOperation::new(add_user_input.clone());
         let _auth_doc = drive(add_user_operation, &context).await.unwrap();
 
         let mut perm_config = CheckPermissionsConfig {
@@ -448,7 +448,7 @@ mod test {
 
         // A deny role overrides read permission.
         let denied_user = UserId::local(Ulid::generate(), realm_id);
-        let add_role_input = AddGroupRoleConfig {
+        let add_role_input = AddRoleConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id,
                 realm_id,
@@ -473,7 +473,7 @@ mod test {
             },
         };
 
-        let add_role_operation = AddGroupRoleOperation::new(add_role_input.clone());
+        let add_role_operation = AddRoleOperation::new(add_role_input.clone());
         let _result = drive(add_role_operation, &context).await.unwrap();
 
         let perm_config = CheckPermissionsConfig {
@@ -536,7 +536,7 @@ mod test {
             .collect();
         let new_admin = UserId::local(Ulid::generate(), realm_id);
 
-        let add_user_input = AddUserToRealmRolesInput {
+        let add_user_input = AssignRolesInput {
             actor: Actor {
                 node_id,
                 user_id: admin_id,
@@ -547,7 +547,7 @@ mod test {
             role_ids: admin_role,
         };
 
-        let add_user_operation = AddUserToRealmRolesOperation::new(add_user_input.clone());
+        let add_user_operation = AssignRolesOperation::new(add_user_input.clone());
         let _auth_doc = drive(add_user_operation, &context).await.unwrap();
 
         let perm_config = CheckPermissionsConfig {

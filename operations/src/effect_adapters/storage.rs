@@ -1,9 +1,6 @@
 //! Storage adapter: one storage effect plus the peer refresh a successful
-//! realm-config write or transaction commit triggers.
-//!
-//! The refresh happens after the storage event was produced, is bounded by its
-//! own timeout, and never replaces the storage event: a failed refresh warns
-//! but does not fail the effect.
+//! realm-config write or transaction commit triggers. The bounded refresh runs
+//! after the event and never replaces it: a failure warns but does not fail.
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -308,7 +305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_handle_keeps_explicit_result() {
+    async fn missing_handle_result() {
         // Reduced-capability nodes must still see the storage result, not a
         // dropped effect; the peer link is only a post-write side channel.
         let directory = tempdir().unwrap();

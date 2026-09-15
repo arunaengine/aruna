@@ -22,13 +22,13 @@ enum ListHeadsState {
 
 /// Lists one user's live chat heads, newest change first.
 #[derive(Debug, PartialEq)]
-pub struct ListChatHeadsOperation {
+pub struct ListChatOperation {
     user_id: UserId,
     state: ListHeadsState,
     output: Option<Result<Vec<AssistantChatHead>, ChatStoreError>>,
 }
 
-impl ListChatHeadsOperation {
+impl ListChatOperation {
     pub fn new(user_id: UserId) -> Self {
         Self {
             user_id,
@@ -44,7 +44,7 @@ impl ListChatHeadsOperation {
     }
 }
 
-impl Operation for ListChatHeadsOperation {
+impl Operation for ListChatOperation {
     type Output = Vec<AssistantChatHead>;
     type Error = ChatStoreError;
 
@@ -106,7 +106,7 @@ enum WriteHeadState {
 /// older revision than the node holds, so a second browser cannot silently
 /// drop what the first one saved.
 #[derive(Debug, PartialEq)]
-pub struct WriteChatHeadOperation {
+pub struct WriteChatOperation {
     user_id: UserId,
     chat_id: String,
     title: String,
@@ -118,7 +118,7 @@ pub struct WriteChatHeadOperation {
     output: Option<Result<AssistantChatHead, ChatStoreError>>,
 }
 
-impl WriteChatHeadOperation {
+impl WriteChatOperation {
     pub fn new(
         user_id: UserId,
         chat_id: String,
@@ -253,7 +253,7 @@ impl WriteChatHeadOperation {
     }
 }
 
-impl Operation for WriteChatHeadOperation {
+impl Operation for WriteChatOperation {
     type Output = AssistantChatHead;
     type Error = ChatStoreError;
 

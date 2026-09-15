@@ -4,7 +4,7 @@
 
 use crate::driver::{DriverContext, drive};
 use crate::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
-use crate::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
+use crate::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_core::request_policy::{
     CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyRequest, PolicySession,
     RequestPolicy, policy_set_hash,
@@ -190,9 +190,9 @@ async fn realm_scope(
     context: &DriverContext,
     realm_id: RealmId,
 ) -> Result<Arc<CompiledPolicySet>, PolicyEnforcementError> {
-    match drive(GetRealmConfigOperation::new(realm_id), context).await {
+    match drive(GetConfigOperation::new(realm_id), context).await {
         Ok(config) => compile_scope(&config.request_policies, "realm"),
-        Err(GetRealmConfigError::DocumentNotFound) => Err(realm_unavailable()),
+        Err(GetConfigError::DocumentNotFound) => Err(realm_unavailable()),
         Err(error) => Err(PolicyEnforcementError::Unavailable(error.to_string())),
     }
 }
@@ -223,14 +223,9 @@ async fn realm_txn_scope(
     realm_id: RealmId,
     txn_id: TxnId,
 ) -> Result<Arc<CompiledPolicySet>, PolicyEnforcementError> {
-    match drive(
-        GetRealmConfigOperation::new_with_txn(realm_id, txn_id),
-        context,
-    )
-    .await
-    {
+    match drive(GetConfigOperation::new_with_txn(realm_id, txn_id), context).await {
         Ok(config) => compile_scope(&config.request_policies, "realm"),
-        Err(GetRealmConfigError::DocumentNotFound) => Err(realm_unavailable()),
+        Err(GetConfigError::DocumentNotFound) => Err(realm_unavailable()),
         Err(error) => Err(PolicyEnforcementError::Unavailable(error.to_string())),
     }
 }

@@ -1,17 +1,12 @@
-//! Network adapters: the handle-backed net effects, the job-control frame
-//! round-trip, and the no-handle document-publication fallback.
-//!
-//! Job control runs its frame I/O here because the runner holds the context;
-//! the net crate never sees that effect. A node without a net handle reports
-//! `ChannelClosed` for every net effect except a document publication, whose
-//! established reduced-capability outcome is the target list the operation
-//! already selected.
+//! Network adapters: handle-backed net effects, the job-control frame round-trip
+//! (run here because the runner holds the context), and the no-handle
+//! publication fallback that reports the targets the operation already selected.
 
 use aruna_core::document::DocumentSyncPublish;
 use aruna_core::effects::{Effect, JobControlEffect, NetEffect};
 use aruna_core::events::{Event, JobControlEvent, NetError, NetEvent};
 use aruna_core::handle::Handle;
-use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent, DocumentSyncTarget};
+use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 
 use crate::driver::DriverContext;
 
@@ -35,9 +30,9 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
         Box::pin(net_handle.send_effect(Effect::Net(effect))).await
     } else {
         match effect {
-            NetEffect::DocumentSync(DocumentSyncEffect::PublishDocuments { documents, .. }) => {
+            NetEffect::DocumentSync(DocumentEffect::PublishDocuments { documents, .. }) => {
                 Event::Net(NetEvent::DocumentSync(
-                    DocumentSyncNetEvent::DocumentsPublished {
+                    DocumentNetEvent::DocumentsPublished {
                         targets: publication_targets(&documents),
                     },
                 ))
@@ -50,7 +45,7 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
 /// Targets a publication without a net handle still reports: exactly the
 /// documents the operation selected. Kept pure so the reduced-capability
 /// outcome is testable.
-fn publication_targets(documents: &[DocumentSyncPublish]) -> Vec<DocumentSyncTarget> {
+fn publication_targets(documents: &[DocumentSyncPublish]) -> Vec<DocumentTarget> {
     documents
         .iter()
         .map(|document| document.target().clone())
@@ -61,21 +56,21 @@ fn publication_targets(documents: &[DocumentSyncPublish]) -> Vec<DocumentSyncTar
 mod pure_tests {
     use super::publication_targets;
     use aruna_core::document::{
-        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncPublish, DocumentSyncRevision,
-        DocumentSyncTarget,
+        DocumentChange, DocumentChangeKind, DocumentSyncPublish, DocumentSyncRevision,
+        DocumentTarget,
     };
     use aruna_core::structs::PlacementRef;
     use aruna_core::types::GroupId;
     use ulid::Ulid;
 
     #[test]
-    fn no_handle_publication_reports_selected_targets() {
+    fn publication_targets_reported() {
         let group_id = GroupId::from_bytes([8u8; 16]);
-        let target = DocumentSyncTarget::Group { group_id };
+        let target = DocumentTarget::Group { group_id };
         let publish = DocumentSyncPublish::Delete {
             event_id: Ulid::from_parts(1, 1),
             target: target.clone(),
-            change: DocumentSyncChange {
+            change: DocumentChange {
                 base: None,
                 current: DocumentSyncRevision {
                     generation: 1,
@@ -83,7 +78,7 @@ mod pure_tests {
                     actor: iroh::SecretKey::from_bytes(&[2u8; 32]).public(),
                     updated_at_ms: 0,
                 },
-                kind: DocumentSyncChangeKind::Delete,
+                kind: DocumentChangeKind::Delete,
                 placement: PlacementRef::NIL,
             },
             allow_genesis: false,
