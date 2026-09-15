@@ -75,6 +75,10 @@ enum TaskCommand {
     AbortAllRunningHandlers {
         response: oneshot::Sender<usize>,
     },
+    #[cfg(test)]
+    RegisteredDrainWaiters {
+        response: oneshot::Sender<usize>,
+    },
 }
 
 /// Outcome of draining the scheduler's timer handlers on shutdown. This is the
@@ -556,6 +560,10 @@ impl SchedulerState {
             TaskCommand::AbortAllRunningHandlers { response } => {
                 let _ = response.send(self.abort_all_handlers(command_tx));
             }
+            #[cfg(test)]
+            TaskCommand::RegisteredDrainWaiters { response } => {
+                let _ = response.send(self.drained_waiters.len());
+            }
         }
     }
 }
@@ -789,7 +797,7 @@ impl TaskHandle {
         {
             return None;
         }
-        Some(stopped.await.unwrap_or(0))
+        stopped.await.ok()
     }
 
     /// Stops admitting timer handlers, waits up to `drain`, then forces a stop
@@ -1088,6 +1096,16 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("expected {expected} handler runs"));
+    }
+
+    async fn registered_drain_waiters(handle: &TaskHandle) -> usize {
+        let (response, count) = oneshot::channel();
+        handle
+            .command_tx
+            .send(TaskCommand::RegisteredDrainWaiters { response })
+            .await
+            .expect("drain waiter query should reach the scheduler");
+        count.await.expect("drain waiter query should be answered")
     }
 
     async fn wait_for_records(runs: &Arc<Mutex<Vec<(TaskKey, Instant)>>>, expected: usize) {
@@ -1650,10 +1668,14 @@ mod tests {
         let first = handle.shutdown(Duration::from_secs(5));
         let second = handle.shutdown(Duration::from_secs(5));
         let release = async {
-            // Let both drains register before the handler may finish.
-            for _ in 0..16 {
-                tokio::task::yield_now().await;
-            }
+            // Both drains must have registered before the handler may finish.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while registered_drain_waiters(&handle).await < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("both drains should register");
             gate.add_permits(1);
         };
         let (first, second, ()) = tokio::join!(first, second, release);
@@ -1696,6 +1718,29 @@ mod tests {
         scheduler.await.expect("fake scheduler should finish");
 
         assert_eq!(report.in_flight, 1);
+        assert!(report.scheduler_unavailable);
+        assert!(!report.drained());
+    }
+
+    // A dropped stop-admission response must not become a confirmed zero
+    // in-flight count and a clean report.
+    #[tokio::test]
+    async fn lost_stop_unavailable() {
+        let (command_tx, mut command_rx) = mpsc::channel(TASK_COMMAND_BUFFER);
+        let handle = TaskHandle {
+            command_tx,
+            admission_closed: Arc::new(AtomicBool::new(false)),
+        };
+        let scheduler = tokio::spawn(async move {
+            match command_rx.recv().await {
+                Some(TaskCommand::StopAdmission { response }) => drop(response),
+                _ => panic!("expected stop admission command"),
+            }
+        });
+
+        let report = handle.shutdown(Duration::from_secs(1)).await;
+        scheduler.await.expect("fake scheduler should finish");
+
         assert!(report.scheduler_unavailable);
         assert!(!report.drained());
     }
@@ -1925,6 +1970,8 @@ mod tests {
         let second = handle.shutdown(Duration::from_millis(10)).await;
 
         assert!(!first.scheduler_unavailable);
+        assert_eq!(first.in_flight, 0);
+        assert!(first.drained());
         assert!(!second.scheduler_unavailable);
         assert_eq!(second.in_flight, 0);
         assert_eq!(second.aborted, 0);
