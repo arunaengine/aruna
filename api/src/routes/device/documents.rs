@@ -17,7 +17,7 @@ use aruna_core::structs::AuthContext;
 use aruna_operations::device::replica::{ReplicaOrigin, ReplicaRecord, list_replicas};
 use aruna_operations::device::selection::{SelectionError, deselect_document, select_document};
 
-use super::require_owner;
+use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()

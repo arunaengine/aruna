@@ -19,7 +19,7 @@ use aruna_operations::device::wipe::{
 };
 use aruna_operations::driver::drive;
 
-use super::require_owner;
+use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(wipe_device))

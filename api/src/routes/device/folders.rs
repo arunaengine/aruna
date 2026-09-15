@@ -36,7 +36,7 @@ use super::dto::{
     ActionRecordPage, ActionScopeName, EntryAction, FolderEntryPage, FolderEntryView,
     SyncedFolderList, SyncedFolderView, action_view, entry_view, folder_view,
 };
-use super::require_owner;
+use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -1098,7 +1098,9 @@ async fn list_folder_actions(
 }
 
 #[cfg(test)]
+#[path = "folders_tests.rs"]
 mod tests;
 
 #[cfg(test)]
+#[path = "folders_routes_tests.rs"]
 mod test_routes;

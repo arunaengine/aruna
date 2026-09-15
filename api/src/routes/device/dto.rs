@@ -446,4 +446,5 @@ pub fn download_view(
 }
 
 #[cfg(test)]
+#[path = "dto_pure_tests.rs"]
 mod pure_tests;
