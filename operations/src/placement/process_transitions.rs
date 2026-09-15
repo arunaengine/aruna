@@ -20,8 +20,8 @@ use crate::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
 };
 use crate::realm::mutate_placement::{
-    CONFLICT_ATTEMPTS, MutateRealmPlacementConfig, MutateRealmPlacementError,
-    MutateRealmPlacementOperation, RealmPlacementMutation, drive_placement_mutation, is_management,
+    CONFLICT_ATTEMPTS, MutatePlacementConfig, MutatePlacementError, MutatePlacementOperation,
+    RealmPlacementMutation, drive_placement_mutation, is_management,
 };
 use crate::shard::verify::converge_with_barrier;
 use crate::shard::{assemble_shard_manifest, frontier_root};
@@ -465,13 +465,13 @@ async fn submit_steps(
     let mut attempts = 0;
     loop {
         match drive(
-            MutateRealmPlacementOperation::batch(actor.clone(), steps.clone()),
+            MutatePlacementOperation::batch(actor.clone(), steps.clone()),
             context,
         )
         .await
         {
             Ok(_) => return false,
-            Err(MutateRealmPlacementError::StorageError(StorageError::TransactionConflict))
+            Err(MutatePlacementError::StorageError(StorageError::TransactionConflict))
                 if attempts < CONFLICT_ATTEMPTS =>
             {
                 tokio::time::sleep(crate::tasks::queue_backoff::conflict_backoff(
@@ -707,7 +707,7 @@ async fn submit_mutation(
     local_node_id: NodeId,
     mutation: RealmPlacementMutation,
 ) -> bool {
-    let config = MutateRealmPlacementConfig {
+    let config = MutatePlacementConfig {
         actor: Actor {
             node_id: local_node_id,
             user_id: UserId::nil(realm_id),
@@ -729,10 +729,10 @@ mod tests {
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
-    use aruna_core::reducer::{AdminDocumentReducerState, overlay_placement};
+    use aruna_core::reducer::{AdminDocumentState, overlay_placement};
     use std::path::Path;
 
-    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::{BucketCompletion, PlacementStrategy, RealmNodeKind};
@@ -797,12 +797,12 @@ mod tests {
     /// authored locally so the decoder keeps it.
     fn local_eviction(net_handle: &NetHandle, placement: PlacementRef) -> irokle::TopicEviction {
         let event_id = Ulid::from_bytes([44; 16]);
-        let event = aruna_core::document::DocumentSyncEvent::Delete {
+        let event = aruna_core::document::DocumentEvent::Delete {
             event_id,
-            target: DocumentSyncTarget::MetadataDocumentLifecycle {
+            target: DocumentTarget::MetadataDocumentLifecycle {
                 document_id: event_id,
             },
-            change: aruna_core::document::DocumentSyncChange {
+            change: aruna_core::document::DocumentChange {
                 base: None,
                 current: aruna_core::document::DocumentSyncRevision {
                     generation: 0,
@@ -810,7 +810,7 @@ mod tests {
                     actor: node(1),
                     updated_at_ms: 1,
                 },
-                kind: aruna_core::document::DocumentSyncChangeKind::Delete,
+                kind: aruna_core::document::DocumentChangeKind::Delete,
                 placement,
             },
         };
@@ -859,7 +859,7 @@ mod tests {
     }
 
     async fn store_config(context: &DriverContext, document: &RealmConfigDocument) {
-        let target = DocumentSyncTarget::RealmConfig {
+        let target = DocumentTarget::RealmConfig {
             realm_id: document.realm_id,
         };
         let event = context
@@ -1110,7 +1110,7 @@ mod tests {
         generation: u64,
         seed: u8,
     ) -> Vec<u8> {
-        let change = aruna_core::document::DocumentSyncChange {
+        let change = aruna_core::document::DocumentChange {
             base: None,
             current: aruna_core::document::DocumentSyncRevision {
                 generation,
@@ -1118,17 +1118,17 @@ mod tests {
                 actor: node(1),
                 updated_at_ms: 1,
             },
-            kind: aruna_core::document::DocumentSyncChangeKind::Delete,
+            kind: aruna_core::document::DocumentChangeKind::Delete,
             placement,
         };
         let record = crate::sync::document_outbox::new_identified_record(
             Ulid::from_bytes([seed; 16]),
             node(1),
-            DocumentSyncTarget::MetadataDocumentLifecycle {
+            DocumentTarget::MetadataDocumentLifecycle {
                 document_id: Ulid::from_bytes([seed; 16]),
             },
             vec![node(2)],
-            aruna_core::document::DocumentSyncOutboxEvent::Delete { change },
+            aruna_core::document::DocumentOutboxEvent::Delete { change },
             placement,
             false,
         )
@@ -1288,7 +1288,7 @@ mod tests {
         let map = document.freeze_map(2);
         assert_eq!(map, document.freeze_map(2));
 
-        let publish = |state: &mut AdminDocumentReducerState, seed: u8, origin: NodeId, map| {
+        let publish = |state: &mut AdminDocumentState, seed: u8, origin: NodeId, map| {
             state
                 .apply(&AdminDocumentEvent {
                     event_id: Ulid::from_bytes([seed; 16]),
@@ -1301,21 +1301,19 @@ mod tests {
                 })
                 .expect("the publication applies");
         };
-        let materialize = |state: &AdminDocumentReducerState| {
+        let materialize = |state: &AdminDocumentState| {
             let mut materialized = document.clone();
             overlay_placement(&mut materialized, state, 0);
             materialized
         };
 
-        let mut agreed =
-            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        let mut agreed = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
         publish(&mut agreed, 70, node(1), map.clone());
         publish(&mut agreed, 71, node(2), map.clone());
         assert_eq!(materialize(&agreed).candidate_map(2), Some(&map));
 
         // Divergent values at one epoch are exactly what a single issuer avoids.
-        let mut divergent =
-            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        let mut divergent = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
         let mut rival = map.clone();
         rival.nodes.pop();
         publish(&mut divergent, 72, node(1), map);

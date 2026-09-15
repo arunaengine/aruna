@@ -1,7 +1,7 @@
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::{
-    OnboardingSecretRecord, OnboardingSecretState, OnboardingSecretStateRecord,
+    OnboardingSecretRecord, OnboardingSecretState, OnboardingStateRecord,
 };
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
@@ -15,7 +15,7 @@ pub fn secret_state_entry(
     enrollment_id: Ulid,
     state: OnboardingSecretState,
 ) -> Result<(String, Key, Value), ConversionError> {
-    let record = OnboardingSecretStateRecord {
+    let record = OnboardingStateRecord {
         enrollment_id,
         state,
     };
@@ -32,7 +32,7 @@ pub fn resolve_secret_state(
 ) -> Result<OnboardingSecretState, ConversionError> {
     match value {
         Some(value) => {
-            let state_record: OnboardingSecretStateRecord = postcard::from_bytes(value)?;
+            let state_record: OnboardingStateRecord = postcard::from_bytes(value)?;
             if state_record.enrollment_id != record.enrollment_id {
                 return Err(ConversionError::InvalidOperationConversion(format!(
                     "onboarding secret state enrollment {} does not match record {}",

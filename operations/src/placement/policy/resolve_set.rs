@@ -182,7 +182,7 @@ mod pure_tests {
 
     fn cached(policy: &VerifiedPolicy) -> Event {
         let entry = super::super::cache::PolicyCacheEntry::verified(
-            &crate::tests::fixtures::policy::signed_document(realm(), policy, 1),
+            &crate::tests::policy::signed_document(realm(), policy, 1),
             10,
         );
         Event::Storage(StorageEvent::ReadResult {
@@ -209,7 +209,7 @@ mod pure_tests {
             ResolveStep::Pending(_)
         ));
         assert!(matches!(
-            resolver.step(crate::tests::fixtures::policy::authority(realm())),
+            resolver.step(crate::tests::policy::authority(realm())),
             ResolveStep::Pending(_)
         ));
         assert!(matches!(
@@ -217,7 +217,7 @@ mod pure_tests {
             ResolveStep::Pending(_)
         ));
         assert_eq!(
-            resolver.step(crate::tests::fixtures::policy::authority(realm())),
+            resolver.step(crate::tests::policy::authority(realm())),
             ResolveStep::Done
         );
 

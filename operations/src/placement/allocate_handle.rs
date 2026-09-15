@@ -22,10 +22,9 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::realm::get_config::GetRealmConfigError;
+use crate::realm::get_config::GetConfigError;
 use crate::realm::mutate_placement::{
-    MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
-    drive_placement_mutation,
+    MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
 };
 
 /// Node-local key for the durable allocation cursor. Kept in the non-replicated
@@ -64,9 +63,9 @@ pub enum HandleAllocationError {
     #[error("placement_handle_exhausted: node {node} has spent every handle in its granted ranges")]
     PlacementHandleExhausted { node: NodeId },
     #[error(transparent)]
-    Append(#[from] MutateRealmPlacementError),
+    Append(#[from] MutatePlacementError),
     #[error(transparent)]
-    ReadConfig(#[from] GetRealmConfigError),
+    ReadConfig(#[from] GetConfigError),
     #[error("placement strategy {0} does not exist")]
     StrategyNotFound(Ulid),
 }
@@ -213,7 +212,7 @@ pub async fn allocate_handle(
 ) -> Result<AllocatedHandle, HandleAllocationError> {
     let _guard = allocation_lock().lock().await;
     let config = crate::driver::drive(
-        crate::realm::get_config::GetRealmConfigOperation::new(realm_id),
+        crate::realm::get_config::GetConfigOperation::new(realm_id),
         context,
     )
     .await?;
@@ -251,7 +250,7 @@ pub async fn allocate_placement_binding(
         allocated_at_ms: Some(allocated.allocated_at_ms),
     };
     drive_placement_mutation(
-        MutateRealmPlacementConfig {
+        MutatePlacementConfig {
             actor,
             mutation: RealmPlacementMutation::AppendPlacementBinding(binding.clone()),
         },
@@ -272,7 +271,7 @@ pub async fn provision_metadata_binding(
 ) -> Result<PlacementBinding, HandleAllocationError> {
     let _guard = provision_lock().lock().await;
     let config = crate::driver::drive(
-        crate::realm::get_config::GetRealmConfigOperation::new(actor.realm_id),
+        crate::realm::get_config::GetConfigOperation::new(actor.realm_id),
         context,
     )
     .await?;
@@ -306,7 +305,7 @@ fn provision_lock() -> &'static tokio::sync::Mutex<()> {
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::document::DocumentTarget;
     use aruna_core::events::Event;
     use aruna_core::structs::{
         FIRST_GRANTABLE_HANDLE, HandleRange, RealmConfigDocument, RealmNodeKind,
@@ -345,7 +344,7 @@ mod tests {
         document.seed_default_placement();
         document.ensure_node(actor.node_id, RealmNodeKind::Management);
         document.placement_handle_ranges.push(range);
-        let target = DocumentSyncTarget::RealmConfig {
+        let target = DocumentTarget::RealmConfig {
             realm_id: actor.realm_id,
         };
         let event = context

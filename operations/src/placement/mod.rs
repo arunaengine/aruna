@@ -11,7 +11,7 @@ pub mod selector;
 pub mod transition;
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::structs::{
     CandidatePlacementMap, DocumentClass, PlacementOverride, PlacementRef, PlacementStrategy,
     RealmConfigDocument, shard_for_subject,
@@ -55,7 +55,7 @@ pub(crate) fn shard_override<'a>(
 /// [`PlacementRef::NIL`] only when the realm has no strategies (early bootstrap).
 pub fn target_placement_ref(
     config: &RealmConfigDocument,
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     context: PlacementResolutionContext<'_>,
 ) -> PlacementRef {
     match strategy_for_target(config, target, context) {
@@ -85,7 +85,7 @@ pub(crate) fn registry_placement_for(
     let Some(strategy) = registry_strategy(config) else {
         return PlacementRef::NIL;
     };
-    let target = DocumentSyncTarget::MetadataRegistry {
+    let target = DocumentTarget::MetadataRegistry {
         group_id,
         document_id,
     };
@@ -113,7 +113,7 @@ pub struct TargetPlacementPlan {
 /// never an empty placement.
 pub fn plan_target_placement(
     config: &RealmConfigDocument,
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     context: PlacementResolutionContext<'_>,
 ) -> Result<Option<TargetPlacementPlan>, PlacementResolveError> {
     let Some((strategy, _override)) = strategy_for_target(config, target, context) else {
@@ -710,7 +710,7 @@ pub fn choose_origin_bucket(
 mod pure_tests {
     use super::*;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-    use aruna_core::reducer::{AdminDocumentReducerState, overlay_placement};
+    use aruna_core::reducer::{AdminDocumentState, overlay_placement};
     use aruna_core::structs::{
         Actor, AffinityRule, BindingScope, CandidateMapNode, CandidatePlacementMap,
         MetadataRegistryRecord, NodePlacementEntry, PlacementActivation, RealmId, RealmNodeKind,
@@ -1195,7 +1195,7 @@ mod pure_tests {
             strategy_id: config.default_strategy_id.unwrap(),
         }];
         config.snapshot_candidate_map();
-        let target = DocumentSyncTarget::Group {
+        let target = DocumentTarget::Group {
             group_id: Ulid::from_bytes([6u8; 16]),
         };
         let pinned = plan_target_placement(&config, &target, Default::default())
@@ -1388,9 +1388,8 @@ mod pure_tests {
 
     /// Reduces a full two-bucket handoff from map one onto map two and returns
     /// the state that replays it.
-    fn reduced_handoff(realm_id: RealmId, strategy_id: Ulid) -> AdminDocumentReducerState {
-        let mut state =
-            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+    fn reduced_handoff(realm_id: RealmId, strategy_id: Ulid) -> AdminDocumentState {
+        let mut state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
         let actor = |seed: u8| Actor {
             node_id: node(seed),
             user_id: aruna_core::UserId::nil(realm_id),

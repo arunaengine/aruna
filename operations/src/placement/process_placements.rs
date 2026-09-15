@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncTarget, shard_topic_id};
+use aruna_core::document::{DocumentTarget, shard_topic_id};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -375,7 +375,7 @@ impl PlacementReconcileOutcome {
     }
 }
 
-enum RealmConfigLoadOutcome {
+enum RealmLoadOutcome {
     Found(RealmConfigDocument),
     Absent,
     StorageFailure,
@@ -410,12 +410,12 @@ async fn reconcile_placements(
     run_transitions: bool,
 ) -> PlacementReconcileOutcome {
     let config = match load_config_outcome(context, realm_id).await {
-        RealmConfigLoadOutcome::Found(config) => config,
-        RealmConfigLoadOutcome::Absent => {
+        RealmLoadOutcome::Found(config) => config,
+        RealmLoadOutcome::Absent => {
             warn!(%realm_id, "Cannot process shard placements without a realm config");
             return PlacementReconcileOutcome::clean();
         }
-        RealmConfigLoadOutcome::StorageFailure => {
+        RealmLoadOutcome::StorageFailure => {
             return PlacementReconcileOutcome::storage_failure();
         }
     };
@@ -664,11 +664,8 @@ fn has_transition_work(config: &RealmConfigDocument, now_ms: u64) -> bool {
         })
 }
 
-async fn load_config_outcome(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-) -> RealmConfigLoadOutcome {
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+async fn load_config_outcome(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmLoadOutcome {
+    let target = DocumentTarget::RealmConfig { realm_id };
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -681,22 +678,20 @@ async fn load_config_outcome(
         Event::Storage(StorageEvent::ReadResult {
             value: Some(bytes), ..
         }) => match RealmConfigDocument::from_bytes(&bytes) {
-            Ok(config) => RealmConfigLoadOutcome::Found(config),
+            Ok(config) => RealmLoadOutcome::Found(config),
             Err(error) => {
                 warn!(%realm_id, error = %error, "Failed to decode realm config for shard placements");
-                RealmConfigLoadOutcome::StorageFailure
+                RealmLoadOutcome::StorageFailure
             }
         },
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            RealmConfigLoadOutcome::Absent
-        }
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => RealmLoadOutcome::Absent,
         Event::Storage(StorageEvent::Error { error }) => {
             warn!(%realm_id, error = %error, "Failed to read realm config for shard placements");
-            RealmConfigLoadOutcome::StorageFailure
+            RealmLoadOutcome::StorageFailure
         }
         other => {
             warn!(%realm_id, event = ?other, "Unexpected realm config read result for shard placements");
-            RealmConfigLoadOutcome::StorageFailure
+            RealmLoadOutcome::StorageFailure
         }
     }
 }
@@ -706,8 +701,8 @@ pub(crate) async fn load_realm_config(
     realm_id: RealmId,
 ) -> Option<RealmConfigDocument> {
     match load_config_outcome(context, realm_id).await {
-        RealmConfigLoadOutcome::Found(config) => Some(config),
-        RealmConfigLoadOutcome::Absent | RealmConfigLoadOutcome::StorageFailure => None,
+        RealmLoadOutcome::Found(config) => Some(config),
+        RealmLoadOutcome::Absent | RealmLoadOutcome::StorageFailure => None,
     }
 }
 
@@ -741,7 +736,7 @@ async fn prune_released_transitions(
     {
         return false;
     }
-    let document = DocumentSyncTarget::RealmConfig { realm_id };
+    let document = DocumentTarget::RealmConfig { realm_id };
     let target = aruna_core::admin_documents::AdminDocumentTarget::RealmConfig { realm_id };
     let storage = &context.storage_handle;
     let txn_id = match storage

@@ -552,9 +552,9 @@ mod pure_tests {
         let mut operation = operation(vec![first.policy_ref(), second.policy_ref()], "eu-west");
         operation.start();
         operation.step(cached(&PolicyCacheEntry::verified(&document(&first), 10)));
-        operation.step(crate::tests::fixtures::policy::authority(realm()));
+        operation.step(crate::tests::policy::authority(realm()));
         operation.step(cached(&PolicyCacheEntry::verified(&document(&second), 10)));
-        operation.step(crate::tests::fixtures::policy::authority(realm()));
+        operation.step(crate::tests::policy::authority(realm()));
 
         let outcome = operation.finalize().expect("gate decides");
         assert_eq!(
@@ -574,10 +574,7 @@ mod pure_tests {
         let mut operation = operation(vec![rule.policy_ref()], "eu-west");
         operation.start();
         operation.step(cached(&PolicyCacheEntry::verified(&document(&rule), 10)));
-        operation.step(crate::tests::fixtures::policy::group_authority(
-            realm(),
-            owner,
-        ));
+        operation.step(crate::tests::policy::group_authority(realm(), owner));
 
         let outcome = operation.finalize().expect("gate decides");
         assert_eq!(outcome.decision, PlacementDecision::Allowed);
@@ -601,12 +598,9 @@ mod pure_tests {
             &document(&realm_wide),
             10,
         )));
-        operation.step(crate::tests::fixtures::policy::authority(realm()));
+        operation.step(crate::tests::policy::authority(realm()));
         operation.step(cached(&PolicyCacheEntry::verified(&document(&owned), 10)));
-        operation.step(crate::tests::fixtures::policy::group_authority(
-            realm(),
-            group(),
-        ));
+        operation.step(crate::tests::policy::group_authority(realm(), group()));
 
         let outcome = operation.finalize().expect("gate decides");
         assert_eq!(outcome.foreign_owner, None);
@@ -622,10 +616,7 @@ mod pure_tests {
         let mut operation = gate_for(vec![rule.policy_ref()], "eu-west", None);
         operation.start();
         operation.step(cached(&PolicyCacheEntry::verified(&document(&rule), 10)));
-        operation.step(crate::tests::fixtures::policy::group_authority(
-            realm(),
-            owner,
-        ));
+        operation.step(crate::tests::policy::group_authority(realm(), owner));
 
         let outcome = operation.finalize().expect("gate decides");
         assert_eq!(outcome.foreign_owner, None);
@@ -720,7 +711,7 @@ mod pure_tests {
     }
 
     fn document(policy: &VerifiedPolicy) -> aruna_core::structs::PlacementPolicyDocument {
-        crate::tests::fixtures::policy::signed_document(realm(), policy, 1)
+        crate::tests::policy::signed_document(realm(), policy, 1)
     }
 
     fn encoded(policy: &VerifiedPolicy) -> Value {
@@ -734,10 +725,8 @@ mod pure_tests {
         for seed in 1..=4u8 {
             config.ensure_node(node(seed), aruna_core::structs::RealmNodeKind::Server);
         }
-        let (config_value, auth_value) = crate::tests::fixtures::policy::realm_view(
-            &config,
-            crate::tests::fixtures::policy::admin_user(realm()),
-        );
+        let (config_value, auth_value) =
+            crate::tests::policy::realm_view(&config, crate::tests::policy::admin_user(realm()));
         let key = ByteView::from(Vec::new());
         Event::Storage(StorageEvent::BatchReadResult {
             values: vec![

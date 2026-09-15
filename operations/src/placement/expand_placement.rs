@@ -8,10 +8,9 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
-use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::{
-    MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
-    drive_placement_mutation,
+    MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
 };
 
 /// Publishes the realm's first candidate map and initializes every strategy's
@@ -20,7 +19,7 @@ use crate::realm::mutate_placement::{
 pub async fn ensure_activated_map(
     context: &DriverContext,
     actor: &Actor,
-) -> Result<RealmConfigDocument, MutateRealmPlacementError> {
+) -> Result<RealmConfigDocument, MutatePlacementError> {
     let mut config = read_config(context, actor).await?;
     let epoch = match config.newest_map_epoch() {
         Some(epoch) => epoch,
@@ -63,7 +62,7 @@ pub async fn ensure_activated_map(
 pub async fn expand_realm_placement(
     context: &DriverContext,
     actor: &Actor,
-) -> Result<Vec<Ulid>, MutateRealmPlacementError> {
+) -> Result<Vec<Ulid>, MutatePlacementError> {
     let config = ensure_activated_map(context, actor).await?;
     let (next_epoch, map) = next_map(&config);
     // Reuse the durable pending view without skipping its unfinished transition work.
@@ -142,7 +141,7 @@ pub async fn expand_realm_placement(
             }
             // Another driver won the start race; its transition covers the
             // strategy, so this one follows instead of failing onboarding.
-            Err(MutateRealmPlacementError::TransitionInFlight { transition_id }) => {
+            Err(MutatePlacementError::TransitionInFlight { transition_id }) => {
                 tracing::debug!(%strategy_id, %transition_id, "Expansion start race lost");
             }
             Err(error) => return Err(error),
@@ -157,17 +156,17 @@ fn next_map(config: &RealmConfigDocument) -> (u64, CandidatePlacementMap) {
     (epoch, config.freeze_map(epoch))
 }
 
-fn invalid(error: crate::placement::transition::TransitionPlanError) -> MutateRealmPlacementError {
-    MutateRealmPlacementError::InvalidInput(error.to_string())
+fn invalid(error: crate::placement::transition::TransitionPlanError) -> MutatePlacementError {
+    MutatePlacementError::InvalidInput(error.to_string())
 }
 
 async fn read_config(
     context: &DriverContext,
     actor: &Actor,
-) -> Result<RealmConfigDocument, MutateRealmPlacementError> {
-    drive(GetRealmConfigOperation::new(actor.realm_id), context)
+) -> Result<RealmConfigDocument, MutatePlacementError> {
+    drive(GetConfigOperation::new(actor.realm_id), context)
         .await
-        .map_err(|_| MutateRealmPlacementError::RealmConfigNotFound)
+        .map_err(|_| MutatePlacementError::RealmConfigNotFound)
 }
 
 /// Drives one placement mutation with the shared conflict re-drive.
@@ -175,9 +174,9 @@ pub(crate) async fn mutate(
     context: &DriverContext,
     actor: &Actor,
     mutation: RealmPlacementMutation,
-) -> Result<RealmConfigDocument, MutateRealmPlacementError> {
+) -> Result<RealmConfigDocument, MutatePlacementError> {
     drive_placement_mutation(
-        MutateRealmPlacementConfig {
+        MutatePlacementConfig {
             actor: actor.clone(),
             mutation,
         },

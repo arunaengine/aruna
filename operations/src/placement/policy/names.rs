@@ -2,7 +2,7 @@
 //! A ref this node does not hold is absent from the answer: the lookup is a
 //! display convenience, never an existence oracle, and it never fetches.
 
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -88,7 +88,7 @@ impl Operation for PolicyNamesOperation {
             .ids
             .iter()
             .map(|policy_id| {
-                let target = DocumentSyncTarget::PlacementPolicy {
+                let target = DocumentTarget::PlacementPolicy {
                     policy_id: *policy_id,
                 };
                 (target.storage_keyspace().to_string(), target.storage_key())
@@ -189,7 +189,7 @@ mod pure_tests {
             PolicyNamesOperation::new(realm(), &[held.policy_ref(), unknown.policy_ref()]);
         operation.start();
 
-        let document = crate::tests::fixtures::policy::signed_document(realm(), &held, 1);
+        let document = crate::tests::policy::signed_document(realm(), &held, 1);
         operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (
@@ -225,11 +225,8 @@ mod pure_tests {
         let mut operation = PolicyNamesOperation::new(realm(), &[held.policy_ref()]);
         operation.start();
 
-        let document = crate::tests::fixtures::policy::signed_document(
-            RealmId::from_bytes([9u8; 32]),
-            &held,
-            1,
-        );
+        let document =
+            crate::tests::policy::signed_document(RealmId::from_bytes([9u8; 32]), &held, 1);
         operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![(
                 b"a".to_vec().into(),

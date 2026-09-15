@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{authorize_forwarded_caller, forward_auth_error};
 use crate::forward::transport::{MetadataWriteError, forward_to_holders};
-use crate::metadata::protocol::{MetadataAuthToken, MetadataTransportMessage};
+use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
 use crate::placement::policy::create::{
     CreatePolicyConfig, CreatePolicyError, CreatePolicyOperation,
 };
@@ -32,7 +32,7 @@ pub enum PolicyForwardError {
 pub async fn create_policy_routed(
     context: &Arc<DriverContext>,
     config: CreatePolicyConfig,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<PlacementPolicyDocument, PolicyForwardError> {
     let policy = config.policy.clone();
     let created_at_ms = config.created_at_ms;
@@ -88,7 +88,7 @@ pub(crate) async fn apply_forwarded_policy(
     };
     if auth.realm_id != realm_id {
         return MetadataTransportMessage::ForwardedWriteDenied {
-            error: crate::metadata::protocol::MetadataWriteAuthError::Forbidden,
+            error: crate::metadata::protocol::WriteAuthError::Forbidden,
         };
     }
     let config = CreatePolicyConfig {
@@ -111,7 +111,7 @@ pub(crate) async fn apply_forwarded_policy(
             document: Box::new(document),
         },
         Err(CreatePolicyError::Unauthorized) => MetadataTransportMessage::ForwardedWriteDenied {
-            error: crate::metadata::protocol::MetadataWriteAuthError::Forbidden,
+            error: crate::metadata::protocol::WriteAuthError::Forbidden,
         },
         // Another holder may still be able to commit it.
         Err(CreatePolicyError::NotHolder { .. }) => {

@@ -3,7 +3,7 @@
 //! and never change the answer; a missing policy is unavailable, not denied.
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PLACEMENT_POLICY_CACHE_KEYSPACE;
@@ -102,10 +102,10 @@ impl ResolvePolicyOperation {
         let owner = authentic.document.policy.owner_group_id;
         self.cached = Some(authentic);
         self.state = ResolveState::Revalidate;
-        let config = DocumentSyncTarget::RealmConfig {
+        let config = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
-        let auth = DocumentSyncTarget::RealmAuthorization {
+        let auth = DocumentTarget::RealmAuthorization {
             realm_id: self.config.realm_id,
         };
         let mut reads = vec![
@@ -113,7 +113,7 @@ impl ResolvePolicyOperation {
             (auth.storage_keyspace().to_string(), auth.storage_key()),
         ];
         if let Some(group_id) = owner {
-            let group = DocumentSyncTarget::GroupAuthorization { group_id };
+            let group = DocumentTarget::GroupAuthorization { group_id };
             reads.push((group.storage_keyspace().to_string(), group.storage_key()));
         }
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -440,7 +440,7 @@ mod pure_tests {
     }
 
     fn document(policy: &VerifiedPolicy) -> PlacementPolicyDocument {
-        crate::tests::fixtures::policy::signed_document(realm(), policy, 1)
+        crate::tests::policy::signed_document(realm(), policy, 1)
     }
 
     fn encoded(policy: &VerifiedPolicy) -> Value {
@@ -453,10 +453,7 @@ mod pure_tests {
         for seed in 1..=4u8 {
             config.ensure_node(node(seed), RealmNodeKind::Server);
         }
-        crate::tests::fixtures::policy::realm_view(
-            &config,
-            crate::tests::fixtures::policy::admin_user(realm()),
-        )
+        crate::tests::policy::realm_view(&config, crate::tests::policy::admin_user(realm()))
     }
 
     /// The realm view and policy row the inner read starts with.
