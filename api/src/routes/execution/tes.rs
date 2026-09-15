@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use super::routes_at;
+use crate::routes::routes_at;
 use aruna_core::compute::{
     has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
 };
@@ -21,7 +21,7 @@ use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_exte
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
 };
-use aruna_operations::s3::get_access::{GetUserAccessError, GetUserAccessOperation};
+use aruna_operations::s3::get_access::{GetAccessError, GetAccessOperation};
 use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
@@ -34,11 +34,11 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_auth};
+use crate::auth::require_owner;
+use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::error::ServerError;
 use crate::forwarded::external_base_url;
-use crate::routes::device::require_owner;
-use crate::routes::jobs::{ExecutionTarget, map_local_error};
+use crate::routes::execution::jobs::{ExecutionTarget, map_local_error};
 use crate::server_state::ServerState;
 
 /// GA4GH TES version this facade implements.
@@ -85,10 +85,10 @@ const MAX_TASK_IO: usize = 512;
         TesFileType,
         TesState,
         TesExecutorLog,
-        TesOutputFileLog,
+        TesFileLog,
         TesTaskLog,
-        TesCreateTaskResponse,
-        TesListTasksResponse,
+        TesTaskResponse,
+        TesTasksResponse,
         TesErrorPayload
     ))
 )]
@@ -216,7 +216,8 @@ pub struct TesExecutorLog {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-pub struct TesOutputFileLog {
+#[schema(as = TesOutputFileLog)]
+pub struct TesFileLog {
     pub url: String,
     pub path: String,
     pub size_bytes: String,
@@ -233,7 +234,7 @@ pub struct TesTaskLog {
     pub end_time: Option<String>,
     /// Required by TES 1.1: always serialized, empty until outputs exist.
     #[serde(default)]
-    pub outputs: Vec<TesOutputFileLog>,
+    pub outputs: Vec<TesFileLog>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_logs: Vec<String>,
 }
@@ -267,7 +268,8 @@ pub struct TesTask {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct TesCreateTaskResponse {
+#[schema(as = TesCreateTaskResponse)]
+pub struct TesTaskResponse {
     pub id: String,
 }
 
@@ -275,7 +277,8 @@ pub struct TesCreateTaskResponse {
 struct TesCancelResponse {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct TesListTasksResponse {
+#[schema(as = TesListTasksResponse)]
+pub struct TesTasksResponse {
     pub tasks: Vec<TesTask>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_page_token: Option<String>,
@@ -628,7 +631,7 @@ naming a different one; a bearer token requires that tag.
         (
             status = 200,
             description = "Task durably accepted and queued; the body carries the id to poll and cancel with",
-            body = TesCreateTaskResponse,
+            body = TesTaskResponse,
             example = json!({
                 "id": "01JABCDEF0123456789ABCDEFG"
             })
@@ -644,7 +647,7 @@ naming a different one; a bearer token requires that tag.
 pub async fn create_task(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Json(task): Json<TesTask>,
 ) -> Response {
@@ -694,7 +697,7 @@ pub async fn create_task(
         {
             Ok(result) => tes_json_response(
                 StatusCode::OK,
-                TesCreateTaskResponse {
+                TesTaskResponse {
                     id: result.job_id.to_string(),
                 },
             ),
@@ -704,7 +707,7 @@ pub async fn create_task(
 
     let forwarded = match super::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
-            Some(aruna_operations::metadata::MetadataAuthToken::internal(
+            Some(aruna_operations::metadata::AuthToken::internal(
                 caller.auth.clone(),
             ))
         }),
@@ -724,7 +727,7 @@ pub async fn create_task(
     {
         Ok(result) => tes_json_response(
             StatusCode::OK,
-            TesCreateTaskResponse {
+            TesTaskResponse {
                 id: result.job_id.to_string(),
             },
         ),
@@ -858,7 +861,7 @@ answer 404, so the existence of a task is never disclosed.
 pub async fn get_task(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -879,7 +882,7 @@ pub async fn get_task(
 
     let forwarded = match super::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
-            Some(aruna_operations::metadata::MetadataAuthToken::internal(
+            Some(aruna_operations::metadata::AuthToken::internal(
                 caller.auth.clone(),
             ))
         }),
@@ -1000,7 +1003,7 @@ credential additionally sees only tasks of that credential's group.
         (
             status = 200,
             description = "Node-local tasks page; tasks owned by other nodes are omitted, and a missing `next_page_token` means this was the last page",
-            body = TesListTasksResponse,
+            body = TesTasksResponse,
             example = json!({
                 "tasks": [
                     {
@@ -1086,7 +1089,7 @@ pub async fn list_tasks(
 
     tes_json_response(
         StatusCode::OK,
-        TesListTasksResponse {
+        TesTasksResponse {
             tasks,
             next_page_token: next_cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor)),
         },
@@ -1131,7 +1134,7 @@ task, a task outside the group of the basic credential and an id that does not p
 pub async fn cancel_task(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
@@ -1150,7 +1153,7 @@ pub async fn cancel_task(
     };
     let forwarded = match super::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
-            Some(aruna_operations::metadata::MetadataAuthToken::internal(
+            Some(aruna_operations::metadata::AuthToken::internal(
                 caller.auth.clone(),
             ))
         }),
@@ -1873,7 +1876,7 @@ fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
         executor_log.stderr = (!stderr.is_empty()).then(|| stderr.clone());
         outputs = captured
             .iter()
-            .map(|output| TesOutputFileLog {
+            .map(|output| TesFileLog {
                 // Names the exact version, so the caller still retrieves this
                 // output after a later write becomes the object's latest.
                 url: format!(
@@ -1932,13 +1935,13 @@ async fn authenticate_tes(
 
     let (access_key, provided_secret) = parse_basic(headers)?;
     let access = match drive(
-        GetUserAccessOperation::new(access_key.clone()),
+        GetAccessOperation::new(access_key.clone()),
         &state.get_ctx(),
     )
     .await
     {
         Ok(access) => access,
-        Err(GetUserAccessError::NotFound) => return Err(TesError::unauthorized()),
+        Err(GetAccessError::NotFound) => return Err(TesError::unauthorized()),
         Err(error) => return Err(TesError::internal(error.to_string())),
     };
     // The secret is encrypted with this node's issuer-local key, so it opens only for a
@@ -2177,4 +2180,5 @@ impl IntoResponse for TesError {
 }
 
 #[cfg(test)]
+#[path = "tes_tests.rs"]
 mod tests;

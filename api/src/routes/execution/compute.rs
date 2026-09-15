@@ -13,9 +13,9 @@ use aruna_operations::driver::drive;
 use aruna_operations::node::node_info::{
     departure_report, group_demand, read_info_documents, read_operator_drain, set_operator_drain,
 };
-use aruna_operations::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
+use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::set_compute::{
-    SetRealmComputeConfig, SetRealmComputeError, SetRealmComputeOperation,
+    SetComputeConfig, SetComputeError, SetComputeOperation,
 };
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -263,9 +263,9 @@ fn compute_config(body: ComputeConfigBody) -> ServerResult<RealmComputeConfig> {
 
 /// Only a genuinely absent document is a 404; a storage or decode failure must
 /// not read as "this realm has no configuration".
-fn map_config_error(error: GetRealmConfigError) -> ServerError {
+fn map_config_error(error: GetConfigError) -> ServerError {
     match error {
-        GetRealmConfigError::DocumentNotFound => ServerError::NotFound,
+        GetConfigError::DocumentNotFound => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -340,12 +340,9 @@ pub async fn get_compute_config(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<Json<ComputeConfigBody>> {
     let auth = require_config_admin(&state, auth, Permission::READ).await?;
-    let config = drive(
-        GetRealmConfigOperation::new(auth.realm_id),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_config_error)?;
+    let config = drive(GetConfigOperation::new(auth.realm_id), &state.get_ctx())
+        .await
+        .map_err(map_config_error)?;
     Ok(Json(config_body(&config.compute)))
 }
 
@@ -468,7 +465,7 @@ pub async fn put_compute_config(
     let auth = require_config_admin(&state, auth, Permission::WRITE).await?;
     let compute = compute_config(request)?;
     let stored = drive(
-        SetRealmComputeOperation::new(SetRealmComputeConfig {
+        SetComputeOperation::new(SetComputeConfig {
             actor: Actor {
                 node_id: state.get_node_id(),
                 user_id: auth.user_id,
@@ -484,20 +481,18 @@ pub async fn put_compute_config(
     Ok(Json(config_body(&stored.compute)))
 }
 
-fn map_compute_error(error: SetRealmComputeError) -> ServerError {
+fn map_compute_error(error: SetComputeError) -> ServerError {
     use aruna_core::errors::StorageError;
     match error {
-        SetRealmComputeError::RealmConfigNotFound => ServerError::NotFound,
-        SetRealmComputeError::Unauthorized | SetRealmComputeError::NotManagementNode => {
+        SetComputeError::RealmConfigNotFound => ServerError::NotFound,
+        SetComputeError::Unauthorized | SetComputeError::NotManagementNode => {
             ServerError::Forbidden
         }
-        SetRealmComputeError::InvalidCompute { reason } => ServerError::BadRequestReason(reason),
-        SetRealmComputeError::StorageError(StorageError::TransactionConflict) => {
-            ServerError::Conflict(
-                "concurrent realm configuration update conflict; retry".to_string(),
-            )
-        }
-        SetRealmComputeError::StorageError(StorageError::CleanupCapacity) => {
+        SetComputeError::InvalidCompute { reason } => ServerError::BadRequestReason(reason),
+        SetComputeError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
+            "concurrent realm configuration update conflict; retry".to_string(),
+        ),
+        SetComputeError::StorageError(StorageError::CleanupCapacity) => {
             ServerError::ServiceUnavailableReason(
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
@@ -593,7 +588,7 @@ pub async fn get_compute_snapshots(
         .transpose()
         .map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
-    let config = drive(GetRealmConfigOperation::new(auth.realm_id), &context)
+    let config = drive(GetConfigOperation::new(auth.realm_id), &context)
         .await
         .map_err(map_config_error)?;
     let members = config
@@ -724,4 +719,5 @@ pub async fn set_compute_drain(
 }
 
 #[cfg(test)]
+#[path = "compute_tests.rs"]
 mod pure_tests;

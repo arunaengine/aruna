@@ -20,18 +20,19 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::jobs::{JobOutputResponse, hex32, map_job_route, output_response, parse_job_id};
+use super::jobs::{JobOutputResponse, map_job_request, map_job_route, output_response};
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::jobs::hex32;
 use crate::server_state::ServerState;
 
 /// The audit route joins the `jobs` tag the jobs module already declares.
 #[derive(OpenApi)]
 #[openapi()]
-pub struct JobAuditApiDoc;
+pub struct JobAuditDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(JobAuditApiDoc::openapi()).routes(routes!(get_job_audit))
+    OpenApiRouter::with_openapi(JobAuditDoc::openapi()).routes(routes!(get_job_audit))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -319,7 +320,7 @@ pub async fn get_job_audit(
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<(StatusCode, Json<JobAuditResponse>)> {
     let auth: AuthContext = require_unrestricted_auth(&state, auth)?;
-    let job_id = parse_job_id(&job_id)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
     let (range, scope) = parse_range(query.scope.as_deref())?;
     let paging = parse_paging(&query)?;
     let context = state.get_ctx();

@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use aruna_core::structs::{
@@ -40,10 +39,10 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_auth};
+use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::jobs::admit_execution;
+use crate::jobs::{JobRequestError, admit_execution, hex32};
 use crate::rate_limit::LocalKey;
 use crate::server_state::ServerState;
 
@@ -446,7 +445,8 @@ pub struct JobOutputResponse {
 /// One input the plan moves to the target, so a caller can show where the data
 /// comes from and what the move was expected to cost.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobPlacementInputResponse {
+#[schema(as = JobPlacementInputResponse)]
+pub struct JobInputResponse {
     pub destination_key: String,
     pub bytes: u64,
     /// Null when the target already holds the compliant copy, so nothing moves.
@@ -457,7 +457,8 @@ pub struct JobPlacementInputResponse {
 /// One target a planning round looked at, in report order: the selected target
 /// first, then the alternatives by rank, then the rejected ones.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobPlacementCandidateResponse {
+#[schema(as = JobPlacementCandidateResponse)]
+pub struct JobCandidateResponse {
     pub node_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor_kind: Option<String>,
@@ -491,10 +492,10 @@ pub struct JobPlacementResponse {
     /// Rejections the bound dropped, so truncation never reads as agreement.
     pub omitted: u32,
     pub stored_at_ms: u64,
-    pub inputs: Vec<JobPlacementInputResponse>,
+    pub inputs: Vec<JobInputResponse>,
     /// Every target of the planning round. Filled only on the node that planned
     /// the request; empty when the placement comes from a launch record.
-    pub candidates: Vec<JobPlacementCandidateResponse>,
+    pub candidates: Vec<JobCandidateResponse>,
 }
 
 /// One physical execution of the family, canonical or not.
@@ -707,10 +708,6 @@ pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
     }
 }
 
-pub(crate) fn hex32(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 pub(crate) fn output_response(
     output: &aruna_core::structs::OutputObject,
     endpoint_url: Option<&String>,
@@ -789,7 +786,7 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
             inputs: plan
                 .inputs
                 .iter()
-                .map(|input| JobPlacementInputResponse {
+                .map(|input| JobInputResponse {
                     destination_key: input.destination_key.clone(),
                     bytes: input.bytes,
                     source_node_id: input.source_node_id.map(|node| node.to_string()),
@@ -799,7 +796,7 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
             candidates: plan
                 .candidates
                 .iter()
-                .map(|candidate| JobPlacementCandidateResponse {
+                .map(|candidate| JobCandidateResponse {
                     node_id: candidate.node_id.to_string(),
                     executor_kind: candidate.executor_kind.clone(),
                     verdict: candidate.verdict.name().to_string(),
@@ -888,19 +885,11 @@ fn encode_report_cursor(
         .transpose()
 }
 
-pub(crate) fn parse_job_id(raw: &str) -> ServerResult<JobId> {
-    JobId::from_str(raw).map_err(|_| ServerError::NotFound)
-}
-
 pub(crate) fn forwarded_job_auth(
-    bearer: Option<ValidatedArunaBearerTokenCarrier>,
-) -> ServerResult<Option<aruna_operations::metadata::MetadataAuthToken>> {
-    aruna_operations::metadata::api::forwarded_bearer(
-        bearer
-            .as_ref()
-            .map(ValidatedArunaBearerTokenCarrier::as_str),
-    )
-    .map_err(crate::metadata::map_api_error)
+    bearer: Option<ValidatedBearer>,
+) -> ServerResult<Option<aruna_operations::metadata::AuthToken>> {
+    aruna_operations::metadata::api::forwarded_bearer(bearer.as_ref().map(ValidatedBearer::as_str))
+        .map_err(crate::metadata::map_api_error)
 }
 
 pub(crate) fn map_job_route(error: JobRouteError) -> ServerError {
@@ -943,6 +932,24 @@ pub(crate) fn map_submit_error(
         SubmitJobError::QuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
         SubmitJobError::AuthorityDenied => ServerError::Forbidden,
         other => ServerError::InternalError(other.to_string()),
+    }
+}
+
+/// The REST status and body of a transport-independent job refusal.
+pub(crate) fn map_job_request(error: JobRequestError) -> ServerError {
+    match error {
+        JobRequestError::BadRequest => ServerError::BadRequest,
+        JobRequestError::BadRequestMessage(message) => ServerError::BadRequestMessage(message),
+        JobRequestError::Unauthorized => ServerError::Unauthorized,
+        JobRequestError::Forbidden => ServerError::Forbidden,
+        JobRequestError::NotFound => ServerError::NotFound,
+        JobRequestError::Conflict(message) => ServerError::Conflict(message),
+        JobRequestError::JobPlanConflict(message) => ServerError::JobPlanConflict(message),
+        JobRequestError::ComputeQuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
+        JobRequestError::ServiceUnavailableReason(message) => {
+            ServerError::ServiceUnavailableReason(message)
+        }
+        JobRequestError::InternalError(message) => ServerError::InternalError(message),
     }
 }
 
@@ -1223,7 +1230,7 @@ additionally need WRITE on that bucket, which must belong to the same group.
 pub async fn submit_job(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<SubmitExecutionRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitJobResponse>)> {
     let response = admit_execution(
@@ -1233,7 +1240,8 @@ pub async fn submit_job(
         request.into(),
         PolicyRequestExtras::rest(),
     )
-    .await?;
+    .await
+    .map_err(map_job_request)?;
     // The transport owns the HTTP status; the application outcome is `created`.
     let status = if response.created {
         StatusCode::CREATED
@@ -1447,11 +1455,11 @@ caller joined, readable while the caller holds WRITE on the document it mints fo
 pub async fn get_job(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let job_id = parse_job_id(&job_id)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
     // A distributed external job is answered from the replicated family; every
     // other job keeps the owner-routed view.
     if let Some(report) = family_report(&state.get_ctx(), &auth, job_id).await {
@@ -1622,12 +1630,12 @@ Self-scoped like the status read: a job submitted by somebody else answers 404.
 pub async fn get_job_report(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(job_id): Path<String>,
     Query(query): Query<ReportQuery>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let job_id = parse_job_id(&job_id)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
     let cursor = decode_report_cursor(query.cursor.as_deref())?;
     if cursor
         .as_ref()
@@ -1775,13 +1783,13 @@ fn range_error(size: u64) -> Response {
 async fn artifact_response(
     state: Arc<ServerState>,
     auth: Option<AuthContext>,
-    bearer: Option<ValidatedArunaBearerTokenCarrier>,
+    bearer: Option<ValidatedBearer>,
     job_id: String,
     headers: HeaderMap,
     download: bool,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let job_id = parse_job_id(&job_id)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
     let auth_token = forwarded_job_auth(bearer)?;
     let now_ms = aruna_core::time::unix_timestamp_millis();
     let owned = match read_artifact_routed(
@@ -1969,7 +1977,7 @@ kind that produces no crate.
 pub async fn get_job_artifact(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
@@ -2019,7 +2027,7 @@ Self-scoped like the status read: a job submitted by somebody else answers 404.
 pub async fn head_job_artifact(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
@@ -2067,7 +2075,7 @@ pub async fn delete_job(
     Path(job_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let job_id = parse_job_id(&job_id)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
     let outcome = delete_owned_run(&state.get_ctx(), auth.user_id, job_id)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
@@ -2160,11 +2168,11 @@ Self-scoped like the status read: only the submitter may cancel, and anybody els
 pub async fn cancel_job(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let job_id = parse_job_id(&job_id)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
 
     let outcome = cancel_job_routed(
         &state.get_ctx(),
@@ -2188,4 +2196,5 @@ pub async fn cancel_job(
 }
 
 #[cfg(test)]
+#[path = "jobs_tests.rs"]
 mod tests;
