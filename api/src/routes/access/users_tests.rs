@@ -1,6 +1,6 @@
 use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse, enrollment_status};
 use crate::auth::{OidcValidator, handle_token};
-use crate::routes::sessions::{CreateSessionRequest, CreateSessionResponse};
+use crate::routes::access::sessions::{CreateSessionRequest, CreateSessionResponse};
 use crate::server::Server;
 use crate::server::ServerConfig;
 use crate::server_state::ServerState;
@@ -20,18 +20,14 @@ use aruna_core::structs::{
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::onboarding::create_secret::{
-    CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
-};
+use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::realm::announce_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::realm::claim_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-};
+use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::Json;
@@ -252,9 +248,9 @@ async fn spawn_test_node(provider: OidcProviderConfig, claim_initial_admin: bool
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
-    initialize_net_incoming_for_tests(driver_ctx.clone());
+    initialize_incoming_fixture(driver_ctx.clone());
     let shutdown = aruna_core::shutdown::Shutdown::new();
-    install_and_start_task_queues(
+    start_task_queues(
         driver_ctx.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -287,7 +283,7 @@ async fn spawn_test_node(provider: OidcProviderConfig, claim_initial_admin: bool
 
     if claim_initial_admin {
         drive(
-            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+            ClaimInitialOperation::new(ClaimInitialInput {
                 actor: Actor {
                     node_id,
                     user_id: realm_admin_id,
@@ -301,7 +297,7 @@ async fn spawn_test_node(provider: OidcProviderConfig, claim_initial_admin: bool
     }
 
     drive(
-        AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+        AnnouncePresenceOperation::new(AnnouncePresenceConfig {
             realm_id,
             node_id,
             schedule_refresh: false,
@@ -422,7 +418,7 @@ async fn create_local_secret(node: &TestNode) -> String {
         purpose: OnboardingPurpose::InitialAdministrator,
     };
     drive(
-        CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+        CreateSecretOperation::new(CreateSecretInput {
             record: OnboardingSecretRecord {
                 enrollment_id: onboarding_secret.enrollment_id,
                 secret_hash: onboarding_secret.secret_hash(),
@@ -486,7 +482,7 @@ async fn membership_request_flow() {
         .await
         .unwrap();
     assert_eq!(group.status(), StatusCode::CREATED);
-    let group: crate::routes::groups::CreateGroupResponse = group.json().await.unwrap();
+    let group: crate::routes::access::groups::CreateGroupResponse = group.json().await.unwrap();
     let groups = client
         .get(&groups_url)
         .bearer_auth(&member_token)

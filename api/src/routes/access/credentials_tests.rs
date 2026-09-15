@@ -1,6 +1,6 @@
 use super::*;
 use crate::error::ServerError;
-use crate::tests::fixtures::routes::{
+use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state as build_state,
     test_storage,
 };
@@ -74,8 +74,8 @@ async fn revoke_state() -> (TempDir, Arc<ServerState>, AuthContext, String) {
     .await;
 
     let (access_key_id, _, _) = drive(
-        CreateUserAccessOperation::new(
-            CreateUserAccessConfig {
+        CreateUserOperation::new(
+            CreateUserConfig {
                 user_identity: owner,
                 group_id,
                 expiry: SystemTime::now() + Duration::from_secs(3600),
@@ -172,12 +172,12 @@ async fn create_credential(
     state: &Arc<ServerState>,
     auth: &AuthContext,
     group_id: Ulid,
-    path_restrictions: Option<Vec<CreateS3PathRestriction>>,
-) -> ServerResult<(StatusCode, Json<CreateS3CredentialsResponse>)> {
+    path_restrictions: Option<Vec<CreatePathRestriction>>,
+) -> ServerResult<(StatusCode, Json<CreateS3Response>)> {
     create_s3_credentials(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Json(CreateS3CredentialsRequest {
+        Json(CreateS3Request {
             group_id: group_id.to_string(),
             expires_in_seconds: None,
             path_restrictions,
@@ -206,7 +206,7 @@ async fn viewer_takes_credential() {
         &state,
         &auth,
         group_id,
-        Some(vec![CreateS3PathRestriction {
+        Some(vec![CreatePathRestriction {
             pattern: "shared/**".to_string(),
             permission: "READ".to_string(),
         }]),
@@ -230,7 +230,7 @@ async fn viewer_cannot_write() {
         &state,
         &auth,
         group_id,
-        Some(vec![CreateS3PathRestriction {
+        Some(vec![CreatePathRestriction {
             pattern: "shared/**".to_string(),
             permission: "WRITE".to_string(),
         }]),
@@ -287,7 +287,7 @@ async fn subpath_takes_credential() {
             &state,
             &auth,
             group_id,
-            Some(vec![CreateS3PathRestriction {
+            Some(vec![CreatePathRestriction {
                 pattern: "study/imaging/**".to_string(),
                 permission: "READ".to_string(),
             }]),
@@ -325,7 +325,7 @@ async fn writer_cannot_revoke() {
     .unwrap_err();
 
     assert!(matches!(error, ServerError::Forbidden));
-    let credential = drive(GetUserAccessOperation::new(access_key_id), &state.get_ctx())
+    let credential = drive(GetAccessOperation::new(access_key_id), &state.get_ctx())
         .await
         .unwrap();
     assert!(!credential.is_revoked());
@@ -403,7 +403,7 @@ fn relative_paths_normalized() {
 
     assert_eq!(
         normalize_requested_restrictions(
-            Some(vec![CreateS3PathRestriction {
+            Some(vec![CreatePathRestriction {
                 pattern: "nested/path".to_string(),
                 permission: "WRITE".to_string(),
             }]),
@@ -423,7 +423,7 @@ fn empty_path_normalized() {
 
     assert_eq!(
         normalize_requested_restrictions(
-            Some(vec![CreateS3PathRestriction {
+            Some(vec![CreatePathRestriction {
                 pattern: String::new(),
                 permission: "READ".to_string(),
             }]),
@@ -440,7 +440,7 @@ fn empty_path_normalized() {
 #[test]
 fn external_path_rejected() {
     let err = normalize_requested_restrictions(
-        Some(vec![CreateS3PathRestriction {
+        Some(vec![CreatePathRestriction {
             pattern: "/realm/g/other/data/node/object".to_string(),
             permission: "WRITE".to_string(),
         }]),
@@ -454,7 +454,7 @@ fn external_path_rejected() {
 #[test]
 fn wildcards_are_rejected() {
     let err = normalize_requested_restrictions(
-        Some(vec![CreateS3PathRestriction {
+        Some(vec![CreatePathRestriction {
             pattern: "nested/*/path".to_string(),
             permission: "WRITE".to_string(),
         }]),
