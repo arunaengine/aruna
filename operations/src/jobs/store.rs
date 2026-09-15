@@ -33,8 +33,11 @@ use super::lifecycle::ids::session_of;
 use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_MUTATE_MAX_ATTEMPTS, JOB_PRUNE_SCAN_PAGE_SIZE};
 use crate::tasks::queue_backoff::retry_delay_ms;
 
+#[path = "store_attempt.rs"]
 mod attempt;
+#[path = "store_query.rs"]
 mod query;
+#[path = "store_state.rs"]
 mod state;
 
 pub use attempt::*;
@@ -943,4 +946,5 @@ async fn cleanup_dedup_entry(
 }
 
 #[cfg(test)]
+#[path = "store_tests.rs"]
 mod tests;

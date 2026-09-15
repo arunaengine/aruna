@@ -3,8 +3,8 @@ use aruna_core::UserId;
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, ImportMetadataTarget,
     ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
-    ImportRoCrateSpec, ImportRoCrateTarget, JOB_LEASE_INDEX_PREFIX, JobPayload,
-    MintPersistentIdSpec, RealmId, ReasonCode, RoCrateLimits, parse_schedule_key, pid_dedup_key,
+    ImportRoCrateSpec, ImportRoCrateTarget, JOB_LEASE_INDEX_PREFIX, JobPayload, MintPersistentSpec,
+    RealmId, ReasonCode, RoCrateLimits, parse_schedule_key, pid_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_storage::FjallStorage;
@@ -229,7 +229,7 @@ fn pid_record(job_id: JobId, minted_by: UserId) -> JobRecord {
     let document_id = Ulid::from_bytes([0x99u8; 16]);
     JobRecord::new(
         job_id,
-        JobPayload::MintPersistentId(MintPersistentIdSpec {
+        JobPayload::MintPersistentId(MintPersistentSpec {
             document_id,
             minted_by,
         }),

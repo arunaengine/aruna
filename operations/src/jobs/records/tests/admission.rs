@@ -9,7 +9,7 @@ use aruna_core::structs::{
 use crate::jobs::records::admit::{Admission, FamilyState, plan_append, relayable};
 use crate::jobs::records::rows::{PendingNeed, PendingRecord};
 use crate::jobs::records::verify::FamilyView;
-use crate::tests::fixtures::records::{Family, node, secret};
+use crate::tests::records::{Family, node, secret};
 
 type Stored = BTreeMap<JobRecordKey, JobRecordEnvelope>;
 

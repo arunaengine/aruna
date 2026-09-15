@@ -23,7 +23,7 @@ use crate::jobs::records::{
     AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
 };
 use crate::jobs::store::{iter_prefix_page, record_attempt_intent, reserve_output_commits};
-use crate::tests::fixtures::records::{Family, REALM, context};
+use crate::tests::records::{Family, REALM, context};
 
 const TOKEN: Ulid = Ulid(0x7E12);
 

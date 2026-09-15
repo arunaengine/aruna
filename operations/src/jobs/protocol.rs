@@ -4,7 +4,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
-use aruna_core::metadata::MetadataAuthToken;
+use aruna_core::metadata::AuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{AuthContext, JobFamilyId, JobId, JobPayload, RealmId};
 use aruna_core::time::unix_timestamp_millis;
@@ -27,7 +27,7 @@ use super::service::{
 };
 use super::staging::read_staging_checkpoint;
 use crate::driver::DriverContext;
-use crate::metadata::MetadataWritePeerError;
+use crate::metadata::WritePeerError;
 
 pub(crate) use aruna_core::jobs::{
     JobRequest, JobResponse, JobStatusView, WireArtifact, WireRange,
@@ -207,10 +207,10 @@ async fn prepare_response(
         .await
     {
         Ok(auth) => auth,
-        Err(MetadataWritePeerError::Unauthorized) => {
+        Err(WritePeerError::Unauthorized) => {
             return PreparedResponse::new(JobResponse::Unauthorized);
         }
-        Err(MetadataWritePeerError::Unavailable(error)) => {
+        Err(WritePeerError::Unavailable(error)) => {
             return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
         }
     };
@@ -441,7 +441,7 @@ async fn prepare_cancel(
     context: &DriverContext,
     runtime: &Arc<JobsRuntime>,
     auth: &AuthContext,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
     job_id: JobId,
 ) -> PreparedResponse {
     let requested_family = match crate::jobs::lifecycle::routing::family_of_alias(context, job_id)

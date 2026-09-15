@@ -26,7 +26,7 @@ use crate::jobs::records::{
 };
 use crate::jobs::service::kick_drain;
 use crate::jobs::store::{CancelRequestOutcome, JobMutationError, set_cancel_requested};
-use crate::metadata::MetadataAuthToken;
+use crate::metadata::AuthToken;
 use crate::metadata::api::load_realm_config;
 
 /// Cancels one external job through its family. `None` means the alias names no
@@ -35,7 +35,7 @@ pub async fn cancel_family(
     context: &DriverContext,
     auth: &AuthContext,
     job_id: JobId,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Option<Result<(), JobRouteError>> {
     let family = match family_of_alias(context, job_id).await {
         Ok(Some(family)) => family,
@@ -138,7 +138,7 @@ async fn publish_cancel(
                 context,
                 holder,
                 JobRequest::Cancel {
-                    auth_token: MetadataAuthToken::internal(auth.clone()),
+                    auth_token: AuthToken::internal(auth.clone()),
                     job_id: spec.job_id,
                 },
             )
@@ -219,7 +219,7 @@ async fn stop_execution(
     context: &DriverContext,
     executor: aruna_core::id::NodeId,
     job_id: JobId,
-    auth_token: &MetadataAuthToken,
+    auth_token: &AuthToken,
 ) {
     // A local execution has no network cancel: `cancel_local_runs` flagged it.
     if context

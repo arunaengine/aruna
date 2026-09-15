@@ -123,7 +123,7 @@ mod tests {
     use super::*;
     use crate::jobs::records::keys::record_key;
     use crate::jobs::records::rows::to_bytes;
-    use crate::tests::fixtures::records::Family;
+    use crate::tests::records::Family;
 
     fn row(envelope: &JobRecordEnvelope) -> (Key, Value) {
         (

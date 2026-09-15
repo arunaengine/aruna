@@ -22,8 +22,8 @@ use crate::jobs::lifecycle::routing::{family_of_alias, family_status};
 use crate::jobs::lifecycle::{LifecycleError, submit_external_job};
 use crate::jobs::store::iter_prefix_page;
 use crate::jobs::submit::SubmitJobError;
-use crate::metadata::MetadataAuthToken;
-use crate::tests::fixtures::records::{Family, REALM, context, node, payload, secret, user};
+use crate::metadata::AuthToken;
+use crate::tests::records::{Family, REALM, context, node, payload, secret, user};
 
 fn frame(record: JobFamilyRecord, family: &Family) -> JobRecordFrame {
     JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded record")
@@ -368,7 +368,7 @@ async fn device_skips_materialization() {
         WorkspaceMode::None,
         None,
         60_000,
-        Some(MetadataAuthToken::bearer("token").expect("bearer fits")),
+        Some(AuthToken::bearer("token").expect("bearer fits")),
     )
     .await
     .expect_err("a device admits nothing locally");
@@ -395,7 +395,7 @@ async fn device_skips_materialization() {
         WorkspaceMode::None,
         None,
         60_000,
-        Some(MetadataAuthToken::bearer("token").expect("bearer fits")),
+        Some(AuthToken::bearer("token").expect("bearer fits")),
     )
     .await
     .expect_err("the input is not materialized here");

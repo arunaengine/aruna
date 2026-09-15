@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, PageLimit, StorageEffect};
 use aruna_core::events::{JobRecordRejection, LaunchDecline};
 use aruna_core::handle::Handle;
@@ -14,7 +14,7 @@ use tempfile::TempDir;
 use crate::driver::DriverContext;
 use crate::jobs::records::transport::{serve_job_record, serve_launch_offer};
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::tests::fixtures::records::{Family, REALM, secret, user};
+use crate::tests::records::{Family, REALM, secret, user};
 
 async fn fixture() -> (TempDir, Arc<DriverContext>, NetHandle, Family) {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -50,7 +50,7 @@ async fn seed_config(
     config: &RealmConfigDocument,
     node_id: aruna_core::NodeId,
 ) {
-    let target = DocumentSyncTarget::RealmConfig {
+    let target = DocumentTarget::RealmConfig {
         realm_id: RealmId(REALM.0),
     };
     let actor = Actor {
@@ -102,7 +102,7 @@ async fn separates_peer_authority() {
             .expect("bounded record");
     let relayed = serve_job_record(
         &context,
-        crate::tests::fixtures::records::node(2),
+        crate::tests::records::node(2),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
             record: Box::new(forged),
@@ -118,7 +118,7 @@ async fn separates_peer_authority() {
 
     let accepted = serve_job_record(
         &context,
-        crate::tests::fixtures::records::node(2),
+        crate::tests::records::node(2),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
             record: Box::new(record),
@@ -151,7 +151,7 @@ async fn refuses_unknown_offer() {
         }
     );
     assert_eq!(
-        serve_launch_offer(&context, crate::tests::fixtures::records::node(2), offer).await,
+        serve_launch_offer(&context, crate::tests::records::node(2), offer).await,
         MetadataTransportMessage::ForwardedLaunchOffer {
             result: Err(LaunchDecline::Unauthorized),
         }
@@ -169,7 +169,7 @@ async fn refuses_page_mismatch() {
     };
     let response = serve_job_record(
         &context,
-        crate::tests::fixtures::records::node(2),
+        crate::tests::records::node(2),
         MetadataTransportMessage::ForwardJobRecordPage {
             placement,
             submission_id: family.submission_id,

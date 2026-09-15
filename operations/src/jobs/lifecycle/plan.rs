@@ -23,7 +23,7 @@ use ulid::Ulid;
 use super::ids;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::blob::holders::GetBlobHoldersOperation;
+use crate::blob::holders::GetHoldersOperation;
 use crate::driver::{DriverContext, drive};
 use crate::node::node_info::read_info_document;
 use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
@@ -362,15 +362,12 @@ async fn input_holders(
         subject: holder_subject(config, source_node),
         node_id: source_node,
     }];
-    let registered = drive(
-        GetBlobHoldersOperation::new(blake3, realm_id, local),
-        context,
-    )
-    .await
-    .unwrap_or_else(|error| {
-        debug!(error = %error, "Blob holder lookup found no registered copy");
-        Vec::new()
-    });
+    let registered = drive(GetHoldersOperation::new(blake3, realm_id, local), context)
+        .await
+        .unwrap_or_else(|error| {
+            debug!(error = %error, "Blob holder lookup found no registered copy");
+            Vec::new()
+        });
     merge_holders(config, &mut holders, registered);
     holders
 }
@@ -465,7 +462,7 @@ pub(crate) fn network_access(spec: &LogicalJobSpec) -> NetworkAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::fixtures::records::{Family, REALM, context, node};
+    use crate::tests::records::{Family, REALM, context, node};
     use aruna_core::compute::{ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};

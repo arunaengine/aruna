@@ -7,7 +7,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ArtifactRef, AuthContext, CopyJobSpec, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
     FIRST_GRANTABLE_HANDLE, ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord,
-    JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, MintPersistentIdSpec, OutputDestination,
+    JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, MintPersistentSpec, OutputDestination,
     Permission, RealmId, RunCrateStatus, SessionReportDetail, SessionReportRow,
     StagingJobCheckpoint, StagingJobSpec, StoragePurgeSpec, WorkspaceMode, pid_dedup_key,
     shard_for_subject, user_dedup_key,
@@ -339,10 +339,10 @@ pub async fn submit_purge_job(
 /// concurrent re-mint by another user joins the same job across ingress nodes.
 pub async fn submit_mint_pid(
     context: &Arc<DriverContext>,
-    spec: MintPersistentIdSpec,
+    spec: MintPersistentSpec,
     local_node_id: NodeId,
     retention_ms: u64,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     let (job_id, created) = crate::metadata::persistent_id::forward::submit_pid_routed(
         context,
@@ -372,7 +372,7 @@ fn pid_submit_error(error: crate::metadata::api::MetadataApiError) -> SubmitJobE
 /// job-control binding, so the dedup row and the execution share one owner.
 pub(crate) async fn submit_mint_local(
     context: &DriverContext,
-    spec: MintPersistentIdSpec,
+    spec: MintPersistentSpec,
     owner_node_id: NodeId,
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
@@ -555,7 +555,7 @@ pub async fn read_record_routed(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<Option<JobRecord>, JobRouteError> {
     Ok(route_record(context, user_id, job_id, auth_token)
         .await?
@@ -567,7 +567,7 @@ pub async fn read_staging_routed(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<Option<(JobRecord, Option<StagingJobCheckpoint>)>, JobRouteError> {
     route_record(context, user_id, job_id, auth_token).await
 }
@@ -591,7 +591,7 @@ async fn route_record(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<Option<(JobRecord, Option<StagingJobCheckpoint>)>, JobRouteError> {
     let Some(net) = context.net_handle.as_ref() else {
         return read_record_data(context, user_id, job_id)
@@ -739,7 +739,7 @@ pub async fn read_job_routed(
     context: &DriverContext,
     auth: &AuthContext,
     job_id: JobId,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<RoutedJobStatus, JobRouteError> {
     let user_id = auth.user_id;
     // An external job is answered from the family projection, which any node
@@ -871,7 +871,7 @@ pub async fn read_report_routed(
     expected_digest: Option<[u8; 32]>,
     last_key: Option<Vec<u8>>,
     limit: usize,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<JobReportLookup, JobRouteError> {
     let job_id = if family_of_alias(context, job_id).await?.is_some() {
         match super::lifecycle::routing::session_job(context, user_id, job_id).await {
@@ -1032,7 +1032,7 @@ pub async fn read_artifact_routed(
     job_id: JobId,
     now_ms: u64,
     range: Option<Range<u64>>,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<(ArtifactLookup, Option<ArtifactRead>), JobRouteError> {
     if context.net_handle.is_none() {
         let lookup = read_owned_artifact(context, user_id, job_id, now_ms)
@@ -1235,7 +1235,7 @@ async fn family_cancel(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Option<Result<RoutedCancelOutcome, JobRouteError>> {
     let auth = AuthContext {
         user_id,
@@ -1266,7 +1266,7 @@ pub async fn cancel_job_routed(
     runtime: &JobsRuntime,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<RoutedCancelOutcome, JobRouteError> {
     let Some(net) = context.net_handle.as_ref() else {
         return cancel_owned_job(context, runtime, user_id, job_id)

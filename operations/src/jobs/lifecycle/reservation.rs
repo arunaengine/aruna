@@ -3,7 +3,7 @@
 //! so concurrent offers cannot oversubscribe and no work starts before its receipt.
 
 use aruna_core::compute::ResourceEnvelope;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -191,7 +191,7 @@ impl ReserveExecutionOperation {
 
     fn read_config(&mut self) -> Effects {
         self.state = ReserveState::ReadConfig;
-        let target = DocumentSyncTarget::RealmConfig {
+        let target = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
         smallvec![Effect::Storage(StorageEffect::Read {

@@ -263,7 +263,7 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::fixtures::records::{Family, context, node};
+    use crate::tests::records::{Family, context, node};
 
     #[tokio::test]
     async fn keeps_later_deadlines() {
