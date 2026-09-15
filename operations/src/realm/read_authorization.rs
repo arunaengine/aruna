@@ -1,4 +1,4 @@
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
@@ -10,14 +10,14 @@ use thiserror::Error;
 use crate::document_repository::read_effect;
 
 #[derive(Debug, PartialEq)]
-pub struct ReadRealmAuthorizationOperation {
+pub struct ReadAuthorizationOperation {
     realm_id: RealmId,
-    state: ReadRealmAuthorizationState,
-    output: Option<Result<Option<RealmAuthorizationDocument>, ReadRealmAuthorizationError>>,
+    state: ReadAuthorizationState,
+    output: Option<Result<Option<RealmAuthorizationDocument>, ReadAuthorizationError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum ReadRealmAuthorizationState {
+enum ReadAuthorizationState {
     Init,
     ReadAuthorization,
     Finish,
@@ -25,7 +25,7 @@ enum ReadRealmAuthorizationState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ReadRealmAuthorizationError {
+pub enum ReadAuthorizationError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -40,17 +40,17 @@ pub enum ReadRealmAuthorizationError {
     NotFinished,
 }
 
-impl ReadRealmAuthorizationOperation {
+impl ReadAuthorizationOperation {
     pub fn new(realm_id: RealmId) -> Self {
         Self {
             realm_id,
-            state: ReadRealmAuthorizationState::Init,
+            state: ReadAuthorizationState::Init,
             output: None,
         }
     }
 
-    fn fail(&mut self, error: ReadRealmAuthorizationError) -> Effects {
-        self.state = ReadRealmAuthorizationState::Error;
+    fn fail(&mut self, error: ReadAuthorizationError) -> Effects {
+        self.state = ReadAuthorizationState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
@@ -61,12 +61,12 @@ impl ReadRealmAuthorizationOperation {
                 let result = value
                     .map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes).map_err(Into::into))
                     .transpose();
-                self.state = ReadRealmAuthorizationState::Finish;
+                self.state = ReadAuthorizationState::Finish;
                 self.output = Some(result);
                 smallvec![]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.fail(ReadRealmAuthorizationError::UnexpectedEvent {
+            other => self.fail(ReadAuthorizationError::UnexpectedEvent {
                 state: format!("{:?}", self.state),
                 expected: "storage read result",
                 got: format!("{other:?}"),
@@ -75,14 +75,14 @@ impl ReadRealmAuthorizationOperation {
     }
 }
 
-impl Operation for ReadRealmAuthorizationOperation {
+impl Operation for ReadAuthorizationOperation {
     type Output = Option<RealmAuthorizationDocument>;
-    type Error = ReadRealmAuthorizationError;
+    type Error = ReadAuthorizationError;
 
     fn start(&mut self) -> Effects {
-        self.state = ReadRealmAuthorizationState::ReadAuthorization;
+        self.state = ReadAuthorizationState::ReadAuthorization;
         smallvec![read_effect(
-            &DocumentSyncTarget::RealmAuthorization {
+            &DocumentTarget::RealmAuthorization {
                 realm_id: self.realm_id,
             },
             None,
@@ -91,23 +91,22 @@ impl Operation for ReadRealmAuthorizationOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            ReadRealmAuthorizationState::ReadAuthorization => self.handle_authorization_read(event),
-            ReadRealmAuthorizationState::Init
-            | ReadRealmAuthorizationState::Finish
-            | ReadRealmAuthorizationState::Error => smallvec![],
+            ReadAuthorizationState::ReadAuthorization => self.handle_authorization_read(event),
+            ReadAuthorizationState::Init
+            | ReadAuthorizationState::Finish
+            | ReadAuthorizationState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            ReadRealmAuthorizationState::Finish | ReadRealmAuthorizationState::Error
+            ReadAuthorizationState::Finish | ReadAuthorizationState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .ok_or(ReadRealmAuthorizationError::NotFinished)?
+        self.output.ok_or(ReadAuthorizationError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
