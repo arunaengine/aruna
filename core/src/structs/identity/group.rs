@@ -1,7 +1,7 @@
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::Actor;
-use crate::structs::realm::RealmId;
+use crate::structs::identity::realm::RealmId;
 use crate::structs::{Permission, Role};
 use crate::types::{GroupId, RoleId};
 use serde::{Deserialize, Serialize};
