@@ -1,5 +1,5 @@
 use super::bucket::MAX_REPLICATION_TARGETS;
-use super::object::next_marker_of;
+use super::listing::next_marker_of;
 use super::*;
 use crate::s3::checksum::UploadChecksumRequest;
 use crate::s3::scope::resolve_scope;
@@ -21,6 +21,7 @@ use aruna_core::structs::{
     watch_resource_path,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::subscriptions::create_local_watch;
 use aruna_operations::replication::queue::{LiveReplicationObligationRecord, live_obligation_key};
@@ -1759,7 +1760,7 @@ async fn prefix_token_precedence() {
     let mut request = subpath_request(&service, &user_access, group_id, Some("imaging/")).await;
     request.input.start_after = Some("imaging/z".to_string());
     let token =
-        crate::s3::service::object::scoped_marker("study", Some("imaging/0"), None).unwrap();
+        crate::s3::service::listing::scoped_marker("study", Some("imaging/0"), None).unwrap();
     request.input.continuation_token = ArunaS3Service::encode_list_token(token.as_ref()).unwrap();
     let output = service.list_objects_v2(request).await.unwrap().output;
     let prefixes: Vec<_> = output
@@ -2895,11 +2896,9 @@ async fn reference_returns_metadata() {
     assert_eq!(obj.key.as_deref(), Some("ref-object"));
     assert_eq!(obj.size, Some(100));
 
-    // ETag from source_metadata.etag
     let expected_etag = Some(ETag::Strong("ref-etag-value".to_string()));
     assert_eq!(obj.e_tag, expected_etag);
 
-    // last_modified from source_metadata.last_modified
     assert_eq!(
         obj.last_modified,
         Some((UNIX_EPOCH + Duration::from_secs(10)).into())
