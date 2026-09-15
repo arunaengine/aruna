@@ -1,5 +1,5 @@
 use aruna_core::UserId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
@@ -11,14 +11,14 @@ use thiserror::Error;
 use crate::document_repository::read_effect;
 
 #[derive(Debug, PartialEq)]
-pub struct ReadUserDocumentOperation {
+pub struct ReadUserOperation {
     user_id: UserId,
-    state: ReadUserDocumentState,
-    output: Option<Result<User, ReadUserDocumentError>>,
+    state: ReadUserState,
+    output: Option<Result<User, ReadUserError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum ReadUserDocumentState {
+enum ReadUserState {
     Init,
     ReadUser,
     Finish,
@@ -26,7 +26,7 @@ enum ReadUserDocumentState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ReadUserDocumentError {
+pub enum ReadUserError {
     #[error("User not found")]
     NotFound,
     #[error(transparent)]
@@ -43,17 +43,17 @@ pub enum ReadUserDocumentError {
     NotFinished,
 }
 
-impl ReadUserDocumentOperation {
+impl ReadUserOperation {
     pub fn new(user_id: UserId) -> Self {
         Self {
             user_id,
-            state: ReadUserDocumentState::Init,
+            state: ReadUserState::Init,
             output: None,
         }
     }
 
-    fn fail(&mut self, error: ReadUserDocumentError) -> Effects {
-        self.state = ReadUserDocumentState::Error;
+    fn fail(&mut self, error: ReadUserError) -> Effects {
+        self.state = ReadUserState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
@@ -62,14 +62,14 @@ impl ReadUserDocumentOperation {
         match event {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                 let result = value
-                    .ok_or(ReadUserDocumentError::NotFound)
+                    .ok_or(ReadUserError::NotFound)
                     .and_then(|bytes| User::from_bytes(&bytes).map_err(Into::into));
-                self.state = ReadUserDocumentState::Finish;
+                self.state = ReadUserState::Finish;
                 self.output = Some(result);
                 smallvec![]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.fail(ReadUserDocumentError::UnexpectedEvent {
+            other => self.fail(ReadUserError::UnexpectedEvent {
                 state: format!("{:?}", self.state),
                 expected: "storage read result",
                 got: format!("{other:?}"),
@@ -78,14 +78,14 @@ impl ReadUserDocumentOperation {
     }
 }
 
-impl Operation for ReadUserDocumentOperation {
+impl Operation for ReadUserOperation {
     type Output = User;
-    type Error = ReadUserDocumentError;
+    type Error = ReadUserError;
 
     fn start(&mut self) -> Effects {
-        self.state = ReadUserDocumentState::ReadUser;
+        self.state = ReadUserState::ReadUser;
         smallvec![read_effect(
-            &DocumentSyncTarget::User {
+            &DocumentTarget::User {
                 user_id: self.user_id,
             },
             None,
@@ -94,22 +94,17 @@ impl Operation for ReadUserDocumentOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            ReadUserDocumentState::ReadUser => self.handle_user_read(event),
-            ReadUserDocumentState::Init
-            | ReadUserDocumentState::Finish
-            | ReadUserDocumentState::Error => smallvec![],
+            ReadUserState::ReadUser => self.handle_user_read(event),
+            ReadUserState::Init | ReadUserState::Finish | ReadUserState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ReadUserDocumentState::Finish | ReadUserDocumentState::Error
-        )
+        matches!(self.state, ReadUserState::Finish | ReadUserState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ReadUserDocumentError::NotFinished)?
+        self.output.ok_or(ReadUserError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
