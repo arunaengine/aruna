@@ -7,8 +7,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_REPLICATION_JOB_KEYSPACE, NODE_STATE_KEYSPACE,
-    SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
+    REPLICATION_OBLIGATION_KEYSPACE, REPLICATION_JOB_KEYSPACE, NODE_STATE_KEYSPACE,
+    RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::replication::{ArunaArn, ReplicationFailure};
@@ -45,16 +45,16 @@ use crate::s3::bucket::get::GetBucketOperation;
 use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 
-const REPLICATION_SCAN_PAGE_SIZE: usize = 512;
+const REPLICATION_PAGE_SIZE: usize = 512;
 const REPLICATION_BATCH_SIZE: usize = 64;
-const RELATIONSHIP_STATS_PAGE_SIZE: usize = 256;
-const LIVE_REPLICATION_OBLIGATION_BATCH_SIZE: usize = 64;
-const LIVE_REPLICATION_JOB_LIMIT: usize = 64;
-const LIVE_REPLICATION_RELATIONSHIP_LIMIT: usize = 1024;
+const STATS_PAGE_SIZE: usize = 256;
+const OBLIGATION_BATCH_SIZE: usize = 64;
+const REPLICATION_JOB_LIMIT: usize = 64;
+const REPLICATION_RELATIONSHIP_LIMIT: usize = 1024;
 const REPLICATION_CURSOR_KEY: &[u8] = b"blob_replication_cursor";
 
-pub const BLOB_REPLICATION_POLL_AFTER: Duration = Duration::from_secs(5);
-pub const BLOB_REPLICATION_RETRY_AFTER: Duration = Duration::from_secs(1);
+pub const REPLICATION_POLL_AFTER: Duration = Duration::from_secs(5);
+pub const REPLICATION_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobJobRecord {
@@ -140,7 +140,7 @@ struct LiveObligationIdentity<'a> {
 struct BlobJobScan {
     jobs: Vec<(Vec<u8>, BlobJobRecord)>,
     has_more_due: bool,
-    next_due_at_ms: Option<u64>,
+    next_due_ms: Option<u64>,
     next_cursor: ReplicationScanCursor,
 }
 
@@ -159,7 +159,8 @@ struct LiveRepairWrite {
 struct ReplicationScanCursor {
     generation: u64,
     after: Option<Vec<u8>>,
-    next_due_at_ms: Option<u64>,
+    #[serde(rename = "next_due_at_ms")]
+    next_due_ms: Option<u64>,
 }
 
 enum BlobJobOutcome {
@@ -316,7 +317,7 @@ pub fn blob_job_key(record: &BlobJobRecord) -> Result<Key, ConversionError> {
 
 fn blob_job_entry(record: &BlobJobRecord) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((
-        BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+        REPLICATION_JOB_KEYSPACE.to_string(),
         blob_job_key(record)?,
         ByteView::from(record.to_bytes()?),
     ))
@@ -341,7 +342,7 @@ pub(crate) fn live_obligation_entry(
     record: &LiveObligationRecord,
 ) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((
-        BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+        REPLICATION_OBLIGATION_KEYSPACE.to_string(),
         live_obligation_key(record)?,
         ByteView::from(record.to_bytes()?),
     ))
@@ -382,7 +383,7 @@ pub fn build_live_obligation(
 
 pub fn schedule_blob_drain() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainBlobReplicationQueue,
+        key: TaskKey::DrainReplicationQueue,
         after: Duration::ZERO,
     })
 }
@@ -443,7 +444,7 @@ impl QueueBlobOperation {
         };
         self.state = QueueBlobState::ReadExisting;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
             key,
             txn_id: None,
         })]
@@ -650,7 +651,7 @@ impl LiveVersionOperation {
         };
         self.state = LiveVersionState::WriteObligation;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
             key,
             value,
             txn_id: Some(txn_id),
@@ -670,7 +671,7 @@ impl LiveVersionOperation {
         };
         self.state = LiveVersionState::ReadObligation;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
             key,
             txn_id: Some(txn_id),
         })]
@@ -968,7 +969,7 @@ pub async fn restore_blob_timer(storage: &StorageHandle, task_handle: &TaskHandl
         Ok(Some(after)) => {
             let event = task_handle
                 .send_effect(Effect::Task(TaskEffect::ResetTimer {
-                    key: TaskKey::DrainBlobReplicationQueue,
+                    key: TaskKey::DrainReplicationQueue,
                     after,
                 }))
                 .await;
@@ -987,7 +988,7 @@ pub async fn blob_jobs_exist(storage: &StorageHandle) -> Result<bool, BlobQueueE
 
     match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: 1,
@@ -1014,10 +1015,10 @@ pub async fn relationship_job_stats(
         match context
             .storage_handle
             .send_storage_effect(StorageEffect::Iter {
-                key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+                key_space: REPLICATION_JOB_KEYSPACE.to_string(),
                 prefix: None,
                 start: start.map(IterStart::After),
-                limit: RELATIONSHIP_STATS_PAGE_SIZE,
+                limit: STATS_PAGE_SIZE,
                 txn_id: None,
             })
             .await
@@ -1065,14 +1066,14 @@ pub async fn next_blob_timer(storage: &StorageHandle) -> Result<Option<Duration>
     advance_replication_cursor(storage, scan.next_cursor.clone()).await?;
 
     Ok(scan
-        .next_due_at_ms
+        .next_due_ms
         .map(|due_at_ms| due_after(now_ms, due_at_ms)))
 }
 
 async fn live_obligations_exist(storage: &StorageHandle) -> Result<bool, BlobQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: 1,
@@ -1093,7 +1094,7 @@ pub async fn process_blob_batch(
     let repair = process_live_obligations(context).await?;
     let now_ms = unix_timestamp_millis();
     let scan = scan_due_jobs(&context.storage_handle, now_ms, REPLICATION_BATCH_SIZE).await?;
-    let mut next_due_at_ms = scan.next_due_at_ms;
+    let mut next_due_ms = scan.next_due_ms;
     let has_more_due = repair.has_more || scan.has_more_due;
     let scan_elapsed = batch_started.elapsed();
     let job_count = scan.jobs.len();
@@ -1125,7 +1126,7 @@ pub async fn process_blob_batch(
             Err(error) => {
                 let retry_due_at =
                     reschedule_blob_job(&context.storage_handle, job_key, &job, error).await?;
-                next_due_at_ms = min_due_at(next_due_at_ms, retry_due_at);
+                next_due_ms = min_due_at(next_due_ms, retry_due_at);
                 failed = failed.saturating_add(1);
             }
         }
@@ -1157,7 +1158,7 @@ pub async fn process_blob_batch(
         next_due_after: if has_more_due {
             None
         } else {
-            next_due_at_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms))
+            next_due_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms))
         },
     })
 }
@@ -1593,7 +1594,7 @@ async fn read_job_relationships(
         .iter()
         .map(|(bucket, relationship_id)| {
             (
-                SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                RELATIONSHIP_OUT_KEYSPACE.to_string(),
                 sync_relationship_key(bucket, *relationship_id).into(),
             )
         })
@@ -1673,7 +1674,7 @@ async fn process_live_obligations(
     let mut relationship_cache = HashMap::<String, RelationshipPage>::new();
     let mut relationship_work = 0usize;
     for (bucket, start) in starts {
-        let remaining = LIVE_REPLICATION_RELATIONSHIP_LIMIT.saturating_sub(relationship_work);
+        let remaining = REPLICATION_RELATIONSHIP_LIMIT.saturating_sub(relationship_work);
         if remaining == 0 {
             break;
         }
@@ -1734,10 +1735,10 @@ async fn read_live_obligations(
 ) -> Result<(Vec<(Vec<u8>, LiveObligationRecord)>, bool), BlobQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
             prefix: None,
             start: None,
-            limit: LIVE_REPLICATION_OBLIGATION_BATCH_SIZE,
+            limit: OBLIGATION_BATCH_SIZE,
             txn_id: None,
         })
         .await
@@ -1869,7 +1870,7 @@ async fn read_relationships_limit(
     limit: usize,
 ) -> Result<RelationshipPage, BlobQueueError> {
     let mut start_after = start.clone();
-    let mut relationships = Vec::with_capacity(limit.min(REPLICATION_SCAN_PAGE_SIZE));
+    let mut relationships = Vec::with_capacity(limit.min(REPLICATION_PAGE_SIZE));
     if limit == 0 {
         return Ok(RelationshipPage {
             values: relationships,
@@ -1877,10 +1878,10 @@ async fn read_relationships_limit(
         });
     }
     loop {
-        let page_limit = (limit - relationships.len()).min(REPLICATION_SCAN_PAGE_SIZE);
+        let page_limit = (limit - relationships.len()).min(REPLICATION_PAGE_SIZE);
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
                 prefix: Some(sync_relationship_prefix(bucket).into()),
                 start: start_after.take().map(|key| IterStart::After(key.into())),
                 limit: page_limit,
@@ -1955,7 +1956,7 @@ async fn write_live_jobs(
         upstream_sources.push(source);
     }
     let mut cursor = obligation.continuation.clone().unwrap_or_default();
-    let mut relationship_jobs = Vec::with_capacity(LIVE_REPLICATION_JOB_LIMIT);
+    let mut relationship_jobs = Vec::with_capacity(REPLICATION_JOB_LIMIT);
     if !cursor.relationships_complete {
         let Some(page) = relationships else {
             return Ok(LiveRepairWrite {
@@ -2003,12 +2004,12 @@ async fn write_live_jobs(
                     job.with_writer_auth(obligation.auth_context.clone())
                 }
             }) {
-                if relationship_jobs.len() == LIVE_REPLICATION_JOB_LIMIT {
+                if relationship_jobs.len() == REPLICATION_JOB_LIMIT {
                     complete = false;
                     break;
                 }
                 relationship_jobs.push(job);
-                if relationship_jobs.len() == LIVE_REPLICATION_JOB_LIMIT {
+                if relationship_jobs.len() == REPLICATION_JOB_LIMIT {
                     complete = index + 1 == page.values.len() && page.next.is_none();
                     break;
                 }
@@ -2053,7 +2054,7 @@ async fn persist_live_jobs(
         .iter()
         .map(|job| {
             Ok((
-                BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+                REPLICATION_JOB_KEYSPACE.to_string(),
                 blob_job_key(job)?,
             ))
         })
@@ -2119,7 +2120,7 @@ async fn read_inbound_source(
     let key = sync_relationship_key(bucket, origin.relationship_id);
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: SYNC_RELATIONSHIP_IN_KEYSPACE.to_string(),
+            key_space: RELATIONSHIP_IN_KEYSPACE.to_string(),
             key: ByteView::from(key.clone()),
             txn_id: None,
         })
@@ -2163,7 +2164,7 @@ async fn delete_live_obligation(
     };
     let current = match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
             key: ByteView::from(key.clone()),
             txn_id: Some(txn_id),
         })
@@ -2192,7 +2193,7 @@ async fn delete_live_obligation(
     }
     match storage
         .send_storage_effect(StorageEffect::Delete {
-            key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
             key: ByteView::from(key),
             txn_id: Some(txn_id),
         })
@@ -2260,7 +2261,7 @@ fn cursor_merge(
         candidate
     } else {
         ReplicationScanCursor {
-            next_due_at_ms: match (candidate.next_due_at_ms, current.next_due_at_ms) {
+            next_due_ms: match (candidate.next_due_ms, current.next_due_ms) {
                 (Some(candidate), Some(current)) => Some(candidate.min(current)),
                 (Some(candidate), None) => Some(candidate),
                 (None, Some(current)) => Some(current),
@@ -2367,14 +2368,14 @@ async fn scan_due_jobs(
     let cursor = read_replication_cursor(storage).await?;
     let start_after = cursor.after.clone();
     let mut jobs = Vec::new();
-    let mut next_due_at_ms = cursor.next_due_at_ms;
+    let mut next_due_ms = cursor.next_due_ms;
     let mut canonical_changed = false;
     let event = storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
             prefix: None,
             start: start_after.map(|key| IterStart::After(ByteView::from(key))),
-            limit: REPLICATION_SCAN_PAGE_SIZE,
+            limit: REPLICATION_PAGE_SIZE,
             txn_id: None,
         })
         .await;
@@ -2423,7 +2424,7 @@ async fn scan_due_jobs(
             job = existing;
         }
         if job.due_at_ms > now_ms {
-            next_due_at_ms = min_due_at(next_due_at_ms, job.due_at_ms);
+            next_due_ms = min_due_at(next_due_ms, job.due_at_ms);
             continue;
         }
         if merge_due_job(&mut jobs, key, job, limit) {
@@ -2431,11 +2432,11 @@ async fn scan_due_jobs(
                 next_cursor: ReplicationScanCursor {
                     generation: cursor.generation,
                     after: last_key,
-                    next_due_at_ms,
+                    next_due_ms,
                 },
                 jobs,
                 has_more_due: true,
-                next_due_at_ms,
+                next_due_ms,
             });
         }
     }
@@ -2445,11 +2446,11 @@ async fn scan_due_jobs(
             next_cursor: ReplicationScanCursor {
                 generation: cursor.generation,
                 after: Some(next.to_vec()),
-                next_due_at_ms,
+                next_due_ms,
             },
             jobs,
             has_more_due: true,
-            next_due_at_ms,
+            next_due_ms,
         });
     }
 
@@ -2461,11 +2462,11 @@ async fn scan_due_jobs(
                 cursor.generation.saturating_add(1)
             },
             after: None,
-            next_due_at_ms,
+            next_due_ms,
         },
         jobs,
         has_more_due: false,
-        next_due_at_ms,
+        next_due_ms,
     })
 }
 
@@ -2475,7 +2476,7 @@ async fn read_blob_job(
 ) -> Result<Option<BlobJobRecord>, BlobQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
             key: ByteView::from(key.to_vec()),
             txn_id: None,
         })
@@ -2513,7 +2514,7 @@ async fn write_blob_job(
 async fn delete_blob_job(storage: &StorageHandle, key: Vec<u8>) -> Result<(), BlobQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Delete {
-            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
             key: ByteView::from(key),
             txn_id: None,
         })
@@ -2548,7 +2549,7 @@ async fn reschedule_blob_job(
     };
     match storage
         .send_storage_effect(StorageEffect::Write {
-            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
             key: ByteView::from(key),
             value: ByteView::from(next_job.to_bytes()?),
             txn_id: None,
@@ -2591,10 +2592,10 @@ async fn read_relationships(
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
                 prefix: Some(sync_relationship_prefix(bucket).into()),
                 start: start_after.take().map(IterStart::After),
-                limit: REPLICATION_SCAN_PAGE_SIZE,
+                limit: REPLICATION_PAGE_SIZE,
                 txn_id: None,
             })
             .await;
@@ -2687,10 +2688,10 @@ mod tests {
     async fn read_jobs(storage: &StorageHandle) -> Vec<(Vec<u8>, BlobJobRecord)> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+                key_space: REPLICATION_JOB_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
-                limit: LIVE_REPLICATION_RELATIONSHIP_LIMIT,
+                limit: REPLICATION_RELATIONSHIP_LIMIT,
                 txn_id: None,
             })
             .await
@@ -2731,7 +2732,7 @@ mod tests {
     async fn write_corrupt_job(storage: &StorageHandle, key: &str) {
         write_queue_record(
             storage,
-            BLOB_REPLICATION_JOB_KEYSPACE,
+            REPLICATION_JOB_KEYSPACE,
             key.as_bytes().to_vec(),
             Vec::new(),
         )
@@ -2741,7 +2742,7 @@ mod tests {
     async fn write_corrupt_obligation(storage: &StorageHandle, key: &str) {
         write_queue_record(
             storage,
-            BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+            REPLICATION_OBLIGATION_KEYSPACE,
             key.as_bytes().to_vec(),
             Vec::new(),
         )
@@ -2907,7 +2908,7 @@ mod tests {
         let bucket = relationship.source.bucket().unwrap();
         match storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
                 key: sync_relationship_key(bucket, relationship.id).into(),
                 value: relationship.to_bytes().unwrap().into(),
                 txn_id: None,
@@ -2923,7 +2924,7 @@ mod tests {
         let bucket = relationship.target.bucket().unwrap();
         match storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: SYNC_RELATIONSHIP_IN_KEYSPACE.to_string(),
+                key_space: RELATIONSHIP_IN_KEYSPACE.to_string(),
                 key: sync_relationship_key(bucket, relationship.id).into(),
                 value: relationship.to_bytes().unwrap().into(),
                 txn_id: None,
@@ -2987,7 +2988,7 @@ mod tests {
     async fn read_obligations(storage: &StorageHandle) -> Vec<LiveObligationRecord> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+                key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
                 limit: 16,
@@ -3746,7 +3747,7 @@ mod tests {
             &storage,
             &obligation.bucket,
             None,
-            LIVE_REPLICATION_RELATIONSHIP_LIMIT,
+            REPLICATION_RELATIONSHIP_LIMIT,
         )
         .await
         .unwrap();
@@ -4010,7 +4011,7 @@ mod tests {
         write_live_obligation(&storage, Ulid::from_parts(91, 1)).await;
 
         repair_live(&storage).await;
-        assert_eq!(read_jobs(&storage).await.len(), LIVE_REPLICATION_JOB_LIMIT);
+        assert_eq!(read_jobs(&storage).await.len(), REPLICATION_JOB_LIMIT);
         assert_eq!(read_obligations(&storage).await.len(), 1);
 
         repair_live(&storage).await;
@@ -4027,7 +4028,7 @@ mod tests {
             .map(|id| {
                 let relationship = relationship(id, 2, None, true);
                 (
-                    SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                    RELATIONSHIP_OUT_KEYSPACE.to_string(),
                     sync_relationship_key("bucket", relationship.id).into(),
                     relationship.to_bytes().unwrap().into(),
                 )
@@ -4048,16 +4049,16 @@ mod tests {
             &storage,
             "bucket",
             None,
-            LIVE_REPLICATION_RELATIONSHIP_LIMIT,
+            REPLICATION_RELATIONSHIP_LIMIT,
         )
         .await
         .unwrap();
-        assert_eq!(first.values.len(), LIVE_REPLICATION_RELATIONSHIP_LIMIT);
+        assert_eq!(first.values.len(), REPLICATION_RELATIONSHIP_LIMIT);
         let second = read_relationships_limit(
             &storage,
             "bucket",
             Some(first.next.clone().expect("relationship page continues")),
-            LIVE_REPLICATION_RELATIONSHIP_LIMIT,
+            REPLICATION_RELATIONSHIP_LIMIT,
         )
         .await
         .unwrap();
@@ -4223,7 +4224,7 @@ mod tests {
             .expect("canonical job writes");
         write_queue_record(
             &storage,
-            BLOB_REPLICATION_JOB_KEYSPACE,
+            REPLICATION_JOB_KEYSPACE,
             b"legacy-job".to_vec(),
             preferred.to_bytes().expect("job serializes"),
         )
@@ -4372,7 +4373,7 @@ mod tests {
         write_relationship(&storage, &relationship(20, 2, None, true)).await;
         write_relationship(&storage, &relationship(21, 3, None, true)).await;
         write_materialized_version(&storage, "bucket", "key", version_id).await;
-        for index in 0..LIVE_REPLICATION_OBLIGATION_BATCH_SIZE {
+        for index in 0..OBLIGATION_BATCH_SIZE {
             let key = format!("000-corrupt-live-{index:03}");
             write_corrupt_obligation(&storage, &key).await;
         }

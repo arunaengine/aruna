@@ -67,7 +67,7 @@ fn denies_incoming_replica() {
     // would invite bytes is refused instead.
     let rule = policy("us-east");
     let mut operation = governed(&rule).with_gate(gate("eu-west"));
-    operation.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion);
+    operation.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion);
 
     let document = crate::tests::policy::signed_document(realm(), &rule, 9);
     let cached = PolicyCacheEntry::verified(&document, 10)
@@ -88,7 +88,7 @@ fn missing_subject_refuses() {
     // never invites the bytes.
     let rule = policy("eu-west");
     let mut operation = governed(&rule);
-    operation.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion);
+    operation.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion);
     assert!(rejected(&operation));
 }
 

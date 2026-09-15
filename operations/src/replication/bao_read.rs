@@ -1332,13 +1332,13 @@ impl Operation for IncomingBaoOperation {
             IncomingBaoState::ReadExactVersion => self.handle_exact_version(event),
             IncomingBaoState::ReadExactBucket => self.handle_exact_bucket(event),
             IncomingBaoState::ResolveSource => match event {
-                Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+                Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                     result: Ok(access),
                 }) => {
                     self.source_access = Some(access);
                     self.accept_observation()
                 }
-                Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+                Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                     result: Err(_),
                 }) => self.send_refusal(BaoReadRefusal::NotFound),
                 other => self.unexpected(other),

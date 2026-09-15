@@ -5,9 +5,9 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
+use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, REALM_CONFIG_QUOTA_PATH};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, CONFIG_QUOTA_PATH};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -50,17 +50,17 @@ enum SetQuotaState {
     Auth,
     StartTransaction,
     ReadCurrent,
-    WriteDocumentAndAdminState {
+    WriteDocumentState {
         document: RealmConfigDocument,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
-    DeleteStaleAdminConflicts {
+    DeleteAdminConflicts {
         document: RealmConfigDocument,
     },
     CommitTransaction {
         document: RealmConfigDocument,
     },
-    ScheduleDocumentSyncOutboxDrain {
+    ScheduleSyncDrain {
         document: RealmConfigDocument,
     },
     Finish,
@@ -76,7 +76,7 @@ pub enum SetQuotaError {
     #[error(transparent)]
     AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
-    RealmConfigNotFound,
+    ConfigMissing,
     #[error("caller may not write the realm configuration")]
     Unauthorized,
     #[error("this node is not a realm management node")]
@@ -129,7 +129,7 @@ impl SetQuotaOperation {
                     document.storage_key(),
                 ),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
                 ),
             ],
@@ -148,7 +148,7 @@ impl SetQuotaOperation {
         validate_quota(&self.config.quota)?;
 
         let Some(document_value) = document_value else {
-            return Err(SetQuotaError::RealmConfigNotFound);
+            return Err(SetQuotaError::ConfigMissing);
         };
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
         if !is_management(&document, self.config.actor.node_id) {
@@ -175,7 +175,7 @@ impl SetQuotaOperation {
             .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_event = reducer_state.apply_operation(
             &self.config.actor,
-            AdminDocumentOperation::RealmConfigQuotaSet {
+            AdminDocumentOperation::ConfigQuotaSet {
                 quota: self.config.quota.clone(),
             },
         )?;
@@ -207,7 +207,7 @@ impl SetQuotaOperation {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
-        self.state = SetQuotaState::WriteDocumentAndAdminState {
+        self.state = SetQuotaState::WriteDocumentState {
             document,
             stale_conflict_deletes,
         };
@@ -312,7 +312,7 @@ impl Operation for SetQuotaOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            SetQuotaState::WriteDocumentAndAdminState {
+            SetQuotaState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
             } => match event {
@@ -321,7 +321,7 @@ impl Operation for SetQuotaOperation {
                         return self.fail(SetQuotaError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state = SetQuotaState::DeleteStaleAdminConflicts { document };
+                        self.state = SetQuotaState::DeleteAdminConflicts { document };
                         return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                             deletes: stale_conflict_deletes,
                             txn_id: Some(txn_id),
@@ -332,7 +332,7 @@ impl Operation for SetQuotaOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             },
-            SetQuotaState::DeleteStaleAdminConflicts { document } => match event {
+            SetQuotaState::DeleteAdminConflicts { document } => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
@@ -342,7 +342,7 @@ impl Operation for SetQuotaOperation {
             SetQuotaState::CommitTransaction { document } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state = SetQuotaState::ScheduleDocumentSyncOutboxDrain { document };
+                    self.state = SetQuotaState::ScheduleSyncDrain { document };
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -351,7 +351,7 @@ impl Operation for SetQuotaOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            SetQuotaState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
+            SetQuotaState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = SetQuotaState::Finish;
                     smallvec![]
@@ -394,7 +394,7 @@ impl Operation for SetQuotaOperation {
 fn apply_reducer_quota(document: &mut RealmConfigDocument, reducer_state: &AdminDocumentState) {
     if !reducer_state
         .conflicts
-        .contains_key(REALM_CONFIG_QUOTA_PATH)
+        .contains_key(CONFIG_QUOTA_PATH)
         && let Some(quota) = reducer_state.materialized_realm_quota()
     {
         document.quota = quota;
@@ -418,14 +418,14 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetQuotaError> {
             ),
         });
     }
-    if quota.max_devices_per_user == Some(0) {
+    if quota.devices_per_user == Some(0) {
         return Err(SetQuotaError::InvalidQuota {
             reason: "max_devices_per_user must be greater than zero".to_string(),
         });
     }
     // Zero would silence every enrolled device; unset is how a realm stays
     // uncapped, exactly as for the device cap itself.
-    if quota.device_requests_per_minute == Some(0) {
+    if quota.device_request_rate == Some(0) {
         return Err(SetQuotaError::InvalidQuota {
             reason: "device_requests_per_minute must be greater than zero".to_string(),
         });
@@ -461,7 +461,7 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetQuotaError> {
         }
     }
     let mut seen_users = BTreeSet::new();
-    for over in &quota.user_group_cap_overrides {
+    for over in &quota.group_cap_overrides {
         if !seen_users.insert(over.user_id) {
             return Err(SetQuotaError::InvalidQuota {
                 reason: format!("duplicate user cap override for user {}", over.user_id),
@@ -572,7 +572,7 @@ mod tests {
 
     fn custom_quota() -> QuotaConfig {
         QuotaConfig {
-            default_group_quota_bytes: Some(1_000_000),
+            default_quota_bytes: Some(1_000_000),
             grace_factor_percent: 120,
             warn_threshold_percent: 90,
             group_overrides: vec![GroupQuotaOverride {
@@ -580,13 +580,13 @@ mod tests {
                 quota_bytes: Some(2_000_000),
                 grace_factor_percent: Some(150),
             }],
-            max_groups_per_user: Some(5),
-            user_group_cap_overrides: vec![UserCapOverride {
+            groups_per_user: Some(5),
+            group_cap_overrides: vec![UserCapOverride {
                 user_id: UserId::local(Ulid::from_bytes([8; 16]), RealmId::from_bytes([1; 32])),
                 max_groups: Some(10),
             }],
-            max_devices_per_user: Some(4),
-            device_requests_per_minute: Some(600),
+            devices_per_user: Some(4),
+            device_request_rate: Some(600),
             device_concurrent_pulls: Some(8),
         }
     }
@@ -614,8 +614,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reread.quota, quota);
-        assert_eq!(reread.quota.max_devices_per_user, Some(4));
-        assert_eq!(reread.quota.device_requests_per_minute, Some(600));
+        assert_eq!(reread.quota.devices_per_user, Some(4));
+        assert_eq!(reread.quota.device_request_rate, Some(600));
         assert_eq!(reread.quota.device_concurrent_pulls, Some(8));
     }
 
@@ -632,7 +632,7 @@ mod tests {
 
         for quota in [
             QuotaConfig {
-                device_requests_per_minute: Some(0),
+                device_request_rate: Some(0),
                 ..Default::default()
             },
             QuotaConfig {
@@ -664,7 +664,7 @@ mod tests {
         seed_realm_admin(&ctx, &actor).await;
 
         let quota = QuotaConfig {
-            max_devices_per_user: Some(0),
+            devices_per_user: Some(0),
             ..Default::default()
         };
 
@@ -693,7 +693,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error, SetQuotaError::RealmConfigNotFound);
+        assert_eq!(error, SetQuotaError::ConfigMissing);
     }
 
     #[tokio::test]
@@ -850,7 +850,7 @@ mod tests {
     fn rejects_duplicate_user() {
         let mut quota = QuotaConfig::default();
         let user_id = UserId::local(Ulid::from_bytes([4; 16]), RealmId::from_bytes([1; 32]));
-        quota.user_group_cap_overrides = vec![
+        quota.group_cap_overrides = vec![
             UserCapOverride {
                 user_id,
                 max_groups: Some(1),
@@ -939,7 +939,7 @@ mod tests {
                 origin_seq: 1,
                 observed: AdminDocumentClock::default(),
                 actor: actor(seed, realm_id),
-                op: AdminDocumentOperation::RealmConfigQuotaSet { quota },
+                op: AdminDocumentOperation::ConfigQuotaSet { quota },
             };
         // Two concurrent events (neither observes the other) with divergent quota
         // values conflict on the quota path.
@@ -952,19 +952,19 @@ mod tests {
     fn conflicted_quota_skipped() {
         let realm_id = RealmId::from_bytes([9; 32]);
         let quota_a = QuotaConfig {
-            default_group_quota_bytes: Some(1_000),
+            default_quota_bytes: Some(1_000),
             ..QuotaConfig::default()
         };
         let quota_b = QuotaConfig {
-            default_group_quota_bytes: Some(2_000),
+            default_quota_bytes: Some(2_000),
             ..QuotaConfig::default()
         };
         let state = quota_conflict_state(realm_id, quota_a, quota_b);
-        assert!(state.conflicts.contains_key(REALM_CONFIG_QUOTA_PATH));
+        assert!(state.conflicts.contains_key(CONFIG_QUOTA_PATH));
         assert!(state.materialized_realm_quota().is_none());
 
         let original = QuotaConfig {
-            default_group_quota_bytes: Some(42),
+            default_quota_bytes: Some(42),
             ..QuotaConfig::default()
         };
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
@@ -984,7 +984,7 @@ mod tests {
 
         let realm_id = RealmId::from_bytes([9; 32]);
         let quota = QuotaConfig {
-            default_group_quota_bytes: Some(1_000),
+            default_quota_bytes: Some(1_000),
             ..QuotaConfig::default()
         };
         let target = AdminDocumentTarget::RealmConfig { realm_id };
@@ -997,7 +997,7 @@ mod tests {
                 origin_seq: 1,
                 observed: AdminDocumentClock::default(),
                 actor: actor(1, realm_id),
-                op: AdminDocumentOperation::RealmConfigQuotaSet {
+                op: AdminDocumentOperation::ConfigQuotaSet {
                     quota: quota.clone(),
                 },
             })

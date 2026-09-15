@@ -1,7 +1,7 @@
 use super::{IncomingVersionError, IncomingVersionOperation, IncomingVersionState, ReceivedBlob};
 
 use crate::replication::protocol::{
-    MAX_REPLICATION_VALUE_BYTES, MaterializedBlobInfo, ReferenceAdvance, SyncOrigin,
+    MAX_VALUE_BYTES, MaterializedBlobInfo, ReferenceAdvance, SyncOrigin,
     VersionReplicationManifest, VersionReplicationMessage,
 };
 use crate::replication::queue::LiveObligationRecord;
@@ -11,9 +11,9 @@ use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -735,7 +735,7 @@ fn reference_keeps_count() {
     let op = advance_operation(manifest, publisher);
     assert_eq!(
         op.reference_version().unwrap_err(),
-        IncomingVersionError::MissingReferenceAdvanceCount
+        IncomingVersionError::ReferenceCountMissing
     );
 }
 
@@ -755,7 +755,7 @@ fn advance_needs_bucket() {
     assert!(!op.create_attempted);
     expect_rejected_negotiation(
         &effects[0],
-        IncomingVersionError::DestinationBucketNotFound
+        IncomingVersionError::DestinationNotFound
             .to_string()
             .as_str(),
     );
@@ -926,7 +926,7 @@ fn later_head_noop() {
     else {
         panic!("expected downstream obligation write")
     };
-    assert_eq!(key_space, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE);
+    assert_eq!(key_space, REPLICATION_OBLIGATION_KEYSPACE);
     assert_eq!(*write_txn_id, Some(txn_id));
     let obligation = LiveObligationRecord::from_bytes(value).unwrap();
     assert_eq!(obligation.reference_advance, Some(advance));
@@ -967,7 +967,7 @@ fn replacement_cleans_metadata() {
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Iter { key_space, txn_id: effect_txn, .. })]
-            if key_space == S3_MULTIPART_OBJECT_METADATA_KEYSPACE
+            if key_space == OBJECT_METADATA_KEYSPACE
                 && *effect_txn == Some(txn_id)
     ));
 
@@ -986,13 +986,13 @@ fn replacement_cleans_metadata() {
     assert_eq!(effect_txn, Some(txn_id));
     let summary_key = MultipartObjectKey::summary(version_id).to_bytes().unwrap();
     assert!(deletes.iter().any(|(key_space, key)| {
-        key_space == S3_MULTIPART_OBJECT_METADATA_KEYSPACE && key.as_ref() == summary_key
+        key_space == OBJECT_METADATA_KEYSPACE && key.as_ref() == summary_key
     }));
     assert!(deletes.iter().any(|(key_space, key)| {
-        key_space == S3_MULTIPART_OBJECT_METADATA_KEYSPACE && key.as_ref() == part_key
+        key_space == OBJECT_METADATA_KEYSPACE && key.as_ref() == part_key
     }));
     assert!(deletes.iter().any(|(key_space, key)| {
-        key_space == HASH_PATHS_INDEX_KEYSPACE
+        key_space == PATHS_INDEX_KEYSPACE
             && HashIndex::from_bytes(key.as_ref()).is_ok_and(|index| index.blake3_hash == [9u8; 32])
     }));
 
@@ -1169,7 +1169,7 @@ fn rejects_manifest_size() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     manifest.metadata.insert(
         "metadata".to_string(),
-        "x".repeat(MAX_REPLICATION_VALUE_BYTES + 1),
+        "x".repeat(MAX_VALUE_BYTES + 1),
     );
     let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(24, 24),
@@ -1306,7 +1306,7 @@ fn quota_excess_rejects() {
 
     let mut config = RealmConfigDocument::default_for_realm(test_realm_id(), Vec::new());
     config.quota = QuotaConfig {
-        default_group_quota_bytes: Some(1),
+        default_quota_bytes: Some(1),
         grace_factor_percent: 100,
         ..QuotaConfig::default()
     };
@@ -1523,7 +1523,7 @@ fn rejects_missing_generation() {
     assert_eq!(op.state, IncomingVersionState::SendApplyRejected);
     assert!(matches!(
         &op.output,
-        Some(Err(IncomingVersionError::MissingCurrentVersionGeneration))
+        Some(Err(IncomingVersionError::MissingVersionGeneration))
     ));
     assert!(matches!(
         message_from_effect(&effects[0]),
@@ -1641,7 +1641,7 @@ fn indexes_noncurrent_version() {
     let [Effect::Storage(StorageEffect::Write { key_space, key, .. })] = effects.as_slice() else {
         panic!("expected hash path index write")
     };
-    assert_eq!(key_space, HASH_PATHS_INDEX_KEYSPACE);
+    assert_eq!(key_space, PATHS_INDEX_KEYSPACE);
     let index_key = HashIndex::from_bytes(key.as_ref()).unwrap();
     assert_eq!(index_key.blake3_hash, [1u8; 32]);
     assert_eq!(index_key.version_id, manifest.version_id);
@@ -1676,7 +1676,7 @@ fn indexes_noncurrent_version() {
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Write { key_space, .. })]
-            if key_space == BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE
+            if key_space == REPLICATION_OBLIGATION_KEYSPACE
     ));
 
     let effects = op.step(Event::Storage(StorageEvent::WriteResult {
@@ -1926,7 +1926,7 @@ fn mismatch_requests_transfer() {
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
-            aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobAndVersion
+            aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobVersion
         )
     ));
 }
@@ -2103,7 +2103,7 @@ fn rejects_mismatched_blob() {
     let mut mismatched_location = make_location();
     mismatched_location.blob_size += 1;
 
-    op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobAndVersion);
+    op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobVersion);
     op.state = IncomingVersionState::ReceiveBlob;
 
     let effects = op.step(Event::Blob(BlobEvent::ReplicationFinished {
@@ -2136,7 +2136,7 @@ fn write_cleanup_rejects() {
         RealmId::from_bytes([7u8; 32]),
         manifest,
     );
-    op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobAndVersion);
+    op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobVersion);
     op.state = IncomingVersionState::ReceiveBlob;
 
     let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteCleanup {
@@ -2193,7 +2193,7 @@ fn unbuildable_bucket_rejects() {
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
         &effects[0],
-        IncomingVersionError::DestinationBucketNotFound
+        IncomingVersionError::DestinationNotFound
             .to_string()
             .as_str(),
     );
@@ -2417,7 +2417,7 @@ fn missing_blob_transfer() {
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
-            aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobAndVersion
+            aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobVersion
         )
     ));
 }
@@ -2473,7 +2473,7 @@ fn failure_deletes_blobs() {
         manifest,
     );
     op.negotiation_result =
-        Some(aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobAndVersion);
+        Some(aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobVersion);
     op.state = IncomingVersionState::WriteBlobLocation;
     op.txn_id = Some(txn_id);
     op.received_blob = Some(ReceivedBlob::reserved(received.clone()));
@@ -2518,7 +2518,7 @@ fn unknown_commit_preserves() {
         test_realm_id(),
         manifest,
     );
-    op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobAndVersion);
+    op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobVersion);
     op.txn_id = Some(txn_id);
     op.received_blob = Some(ReceivedBlob::reserved(received.clone()));
     let release_id = received.ulid;
@@ -2630,7 +2630,7 @@ fn conflict_commit_deletes() {
         test_realm_id(),
         manifest,
     );
-    op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobAndVersion);
+    op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobVersion);
     op.state = IncomingVersionState::CommitTransaction;
     op.txn_id = Some(txn_id);
     op.received_blob = Some(ReceivedBlob::reserved(received.clone()));
@@ -2731,8 +2731,8 @@ fn commit_preserves_blob() {
         manifest,
     );
     op.negotiation_result =
-        Some(aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobAndVersion);
-    op.state = IncomingVersionState::RegisterBlobInDht;
+        Some(aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobVersion);
+    op.state = IncomingVersionState::RegisterBlobDht;
     op.received_blob = Some(ReceivedBlob::owned(received));
     op.apply_committed = true;
 
@@ -2859,7 +2859,7 @@ fn materialized_trace() {
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
-            ReplicationNegotiationResult::NeedBlobAndVersion
+            ReplicationNegotiationResult::NeedBlobVersion
         )
     ));
 
@@ -2969,10 +2969,10 @@ fn materialized_trace() {
     assert_eq!(op.state, IncomingVersionState::ScheduleLiveDrain);
 
     op.step(Event::Task(TaskEvent::TimerScheduled {
-        key: TaskKey::DrainBlobReplicationQueue,
+        key: TaskKey::DrainReplicationQueue,
         after: Duration::from_secs(1),
     }));
-    assert_eq!(op.state, IncomingVersionState::RegisterBlobInDht);
+    assert_eq!(op.state, IncomingVersionState::RegisterBlobDht);
 
     op.step(Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
         key: DhtKeyId::from_bytes([1u8; 32]),
@@ -3078,7 +3078,7 @@ fn delete_marker_trace() {
     }));
     assert_eq!(op.state, IncomingVersionState::ScheduleLiveDrain);
     op.step(Event::Task(TaskEvent::TimerScheduled {
-        key: TaskKey::DrainBlobReplicationQueue,
+        key: TaskKey::DrainReplicationQueue,
         after: Duration::from_secs(1),
     }));
     assert_eq!(op.state, IncomingVersionState::SendApplyComplete);

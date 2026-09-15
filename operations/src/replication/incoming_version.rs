@@ -30,7 +30,7 @@ use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, Sub
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE, OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::storage::blob::{
@@ -102,7 +102,7 @@ enum IncomingVersionState {
     SendApplyRejected,
     AbortTransaction,
     CleanupReceivedBlob,
-    RegisterBlobInDht,
+    RegisterBlobDht,
     SendApplyComplete,
     CloseConnection,
     Finish,
@@ -136,7 +136,7 @@ pub enum IncomingVersionError {
     #[error("Replication is only allowed within the same realm")]
     RealmMismatch,
     #[error("Destination bucket not found")]
-    DestinationBucketNotFound,
+    DestinationNotFound,
     #[error("could not load the destination group's routing inputs: {0}")]
     RoutingInputsFailed(String),
     #[error("writer_access_denied")]
@@ -150,7 +150,7 @@ pub enum IncomingVersionError {
     #[error("Reference replication manifest is missing source binding")]
     MissingReferenceSource,
     #[error("Reference replication manifest is missing its advance count")]
-    MissingReferenceAdvanceCount,
+    ReferenceCountMissing,
     /// An offered directory resolves against the registration of the device that
     /// offers it, so a binding naming one is never valid on another node.
     #[error("Reference replication manifest names a device-local source")]
@@ -162,9 +162,9 @@ pub enum IncomingVersionError {
     #[error("quota")]
     QuotaExceeded,
     #[error("Current version manifest is missing current pointer generation")]
-    MissingCurrentVersionGeneration,
+    MissingVersionGeneration,
     #[error("Destination current version not found")]
-    CurrentVersionNotFound,
+    CurrentVersionMissing,
     #[error("Invalid reference advance")]
     InvalidReferenceAdvance,
     #[error("Materialized replication manifest is missing blob info")]
@@ -176,7 +176,7 @@ pub enum IncomingVersionError {
     #[error("Replicated blob size does not match manifest")]
     BlobSizeMismatch,
     #[error("Replicated blob storage flags do not match manifest")]
-    BlobStorageFlagsMismatch,
+    StorageFlagsMismatch,
     #[error("Existing blob copy changed before the version committed")]
     ExistingBlobChanged,
     #[error("Replaced multipart metadata exceeds the supported part limit")]
@@ -311,7 +311,7 @@ pub struct IncomingVersionOperation {
     replaced_logical_bytes: u64,
     replaced_reference_bytes: u64,
     pending_head: Option<PendingHeadTransition>,
-    pending_head_transition_effects: VecDeque<Effect>,
+    head_transition_effects: VecDeque<Effect>,
     pending_version_effects: VecDeque<Effect>,
     release_id: Option<Ulid>,
     apply_committed: bool,
@@ -371,7 +371,7 @@ impl IncomingVersionOperation {
             replaced_logical_bytes: 0,
             replaced_reference_bytes: 0,
             pending_head: None,
-            pending_head_transition_effects: VecDeque::new(),
+            head_transition_effects: VecDeque::new(),
             pending_version_effects: VecDeque::new(),
             release_id: None,
             apply_committed: false,
@@ -525,7 +525,7 @@ impl Operation for IncomingVersionOperation {
             IncomingVersionState::ReleaseReservation => self.accept_reservation_release(event),
             IncomingVersionState::ScheduleUsage => self.accept_usage_schedule(event),
             IncomingVersionState::ScheduleLiveDrain => self.accept_live_drain(event),
-            IncomingVersionState::RegisterBlobInDht => self.accept_blob_registration(event),
+            IncomingVersionState::RegisterBlobDht => self.accept_blob_registration(event),
             IncomingVersionState::SendApplyComplete => self.accept_completion_sent(event),
             // Cleanup: reject, abort, delete and close.
             IncomingVersionState::SendApplyRejected => self.accept_apply_rejection(event),
@@ -639,7 +639,7 @@ impl IncomingVersionOperation {
             IncomingVersionState::SendApplyRejected => "SendApplyRejected",
             IncomingVersionState::AbortTransaction => "AbortTransaction",
             IncomingVersionState::CleanupReceivedBlob => "CleanupReceivedBlob",
-            IncomingVersionState::RegisterBlobInDht => "RegisterBlobInDht",
+            IncomingVersionState::RegisterBlobDht => "RegisterBlobInDht",
             IncomingVersionState::SendApplyComplete => "SendApplyComplete",
             IncomingVersionState::CloseConnection => "CloseConnection",
             IncomingVersionState::Finish => "Finish",
@@ -682,7 +682,7 @@ impl IncomingVersionOperation {
             self.negotiation_result,
             Some(
                 ReplicationNegotiationResult::NeedVersionOnly
-                    | ReplicationNegotiationResult::NeedBlobAndVersion
+                    | ReplicationNegotiationResult::NeedBlobVersion
             )
         ) && !self.apply_committed
             && !matches!(
@@ -732,7 +732,7 @@ impl IncomingVersionOperation {
 
     fn alias_context(&self) -> Result<HeadAliasContext, IncomingVersionError> {
         let Some(group_id) = self.destination_group_id else {
-            return Err(IncomingVersionError::DestinationBucketNotFound);
+            return Err(IncomingVersionError::DestinationNotFound);
         };
 
         Ok(HeadAliasContext::new(
@@ -847,7 +847,7 @@ impl IncomingVersionOperation {
         let advance_count = self
             .manifest
             .reference_advance_count
-            .ok_or(IncomingVersionError::MissingReferenceAdvanceCount)?;
+            .ok_or(IncomingVersionError::ReferenceCountMissing)?;
         Ok(BlobVersion::reference(
             source,
             metadata,
@@ -892,13 +892,13 @@ impl IncomingVersionOperation {
             Err(err) => return self.fail(err.into()),
         };
 
-        self.pending_head_transition_effects = effects.into_iter().collect();
+        self.head_transition_effects = effects.into_iter().collect();
         self.state = IncomingVersionState::ApplyHeadTransition;
         self.emit_head_transition()
     }
 
     fn emit_head_transition(&mut self) -> Effects {
-        if let Some(effect) = self.pending_head_transition_effects.pop_front() {
+        if let Some(effect) = self.head_transition_effects.pop_front() {
             return smallvec![effect];
         }
 
@@ -1006,7 +1006,7 @@ impl IncomingVersionOperation {
 
     fn start_quota_check(&mut self, ceiling: u64) -> Effects {
         let Some(group_id) = self.destination_group_id else {
-            return self.fail(IncomingVersionError::DestinationBucketNotFound);
+            return self.fail(IncomingVersionError::DestinationNotFound);
         };
         let logical_bytes = match self.incoming_logical_bytes() {
             Ok(logical_bytes) => logical_bytes,
@@ -1068,7 +1068,7 @@ impl IncomingVersionOperation {
     fn request_blob_version(&mut self) -> Effects {
         match self.destination_full.take() {
             Some(error) => self.reject_negotiation(IncomingVersionError::RoutingFailed(error)),
-            None => self.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion),
+            None => self.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion),
         }
     }
 
@@ -1211,7 +1211,7 @@ impl IncomingVersionOperation {
         };
         self.state = IncomingVersionState::ReadReplacedMetadata;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            key_space: OBJECT_METADATA_KEYSPACE.to_string(),
             prefix: Some(prefix),
             start: None,
             limit: 10_000,
@@ -1273,13 +1273,13 @@ impl IncomingVersionOperation {
             Err(error) => return self.fail(error.into()),
         };
         deletes.push((
-            S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            OBJECT_METADATA_KEYSPACE.to_string(),
             summary_key,
         ));
         deletes.extend(
             values
                 .into_iter()
-                .map(|(key, _)| (S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(), key)),
+                .map(|(key, _)| (OBJECT_METADATA_KEYSPACE.to_string(), key)),
         );
         if let Some(hash) = self
             .replaced_version
@@ -1297,7 +1297,7 @@ impl IncomingVersionOperation {
                 Ok(key) => key.into(),
                 Err(error) => return self.fail(error.into()),
             };
-            deletes.push((HASH_PATHS_INDEX_KEYSPACE.to_string(), key));
+            deletes.push((PATHS_INDEX_KEYSPACE.to_string(), key));
         }
         self.state = IncomingVersionState::DeleteReplacedMetadata;
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
@@ -1364,7 +1364,7 @@ impl IncomingVersionOperation {
             return Err(IncomingVersionError::BlobSizeMismatch);
         }
         if location.compressed != blob.compressed || location.encrypted != blob.encrypted {
-            return Err(IncomingVersionError::BlobStorageFlagsMismatch);
+            return Err(IncomingVersionError::StorageFlagsMismatch);
         }
 
         Ok(())
@@ -1450,7 +1450,7 @@ impl IncomingVersionOperation {
             return self.write_version();
         }
         if self.manifest.current_version_generation.is_none() {
-            return self.fail(IncomingVersionError::MissingCurrentVersionGeneration);
+            return self.fail(IncomingVersionError::MissingVersionGeneration);
         }
 
         self.state = IncomingVersionState::ReadObjectLookup;
@@ -1676,7 +1676,7 @@ impl IncomingVersionOperation {
             Err(err) => return self.fail(err.into()),
         };
         writes.push((
-            S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            OBJECT_METADATA_KEYSPACE.to_string(),
             summary_key.into(),
             summary_value.into(),
         ));
@@ -1693,7 +1693,7 @@ impl IncomingVersionOperation {
                 Err(err) => return self.fail(err.into()),
             };
             writes.push((
-                S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+                OBJECT_METADATA_KEYSPACE.to_string(),
                 key.into(),
                 value.into(),
             ));
@@ -1818,7 +1818,7 @@ impl IncomingVersionOperation {
 
     fn start_commit_quota(&mut self) -> Effects {
         let Some(group_id) = self.destination_group_id else {
-            return self.fail(IncomingVersionError::DestinationBucketNotFound);
+            return self.fail(IncomingVersionError::DestinationNotFound);
         };
         let group_delta = match self.usage_delta() {
             Ok(delta) => delta,
@@ -1973,7 +1973,7 @@ impl IncomingVersionOperation {
             return self.send_apply_complete();
         };
 
-        self.state = IncomingVersionState::RegisterBlobInDht;
+        self.state = IncomingVersionState::RegisterBlobDht;
         let effect =
             match dht_registration_effect(blake3_hash, self.local_realm_id, &self.rocrate_limits) {
                 Ok(effect) => effect,
@@ -2068,10 +2068,10 @@ impl IncomingVersionOperation {
 
         let Some(value) = value else {
             if self.create_attempted {
-                return self.reject_negotiation(IncomingVersionError::DestinationBucketNotFound);
+                return self.reject_negotiation(IncomingVersionError::DestinationNotFound);
             }
             if self.manifest.reference_advance.is_some() {
-                return self.reject_negotiation(IncomingVersionError::DestinationBucketNotFound);
+                return self.reject_negotiation(IncomingVersionError::DestinationNotFound);
             }
             if self.manifest_policy.is_none() {
                 return self.reject_negotiation(IncomingVersionError::ManifestPermissionDenied);
@@ -2265,7 +2265,7 @@ impl IncomingVersionOperation {
             });
         };
         let Some(group_id) = self.destination_group_id else {
-            return self.fail(IncomingVersionError::DestinationBucketNotFound);
+            return self.fail(IncomingVersionError::DestinationNotFound);
         };
         let ceiling = match value
             .map(|value| RealmConfigDocument::from_bytes(value.as_ref()))
@@ -2419,7 +2419,7 @@ impl IncomingVersionOperation {
                 );
                 self.start_transaction()
             }
-            Some(ReplicationNegotiationResult::NeedBlobAndVersion) => {
+            Some(ReplicationNegotiationResult::NeedBlobVersion) => {
                 debug!(
                     bucket = %self.manifest.bucket,
                     key = %self.manifest.key,
@@ -2686,7 +2686,7 @@ impl IncomingVersionOperation {
             return self.fail(if self.manifest.reference_advance.is_some() {
                 IncomingVersionError::InvalidReferenceAdvance
             } else {
-                IncomingVersionError::CurrentVersionNotFound
+                IncomingVersionError::CurrentVersionMissing
             });
         };
         let version = match BlobVersion::from_bytes(value.as_ref()) {

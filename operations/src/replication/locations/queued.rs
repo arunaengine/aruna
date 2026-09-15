@@ -4,15 +4,15 @@ use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScop
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::BLOB_REPLICATION_JOB_KEYSPACE;
+use aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
 use ulid::Ulid;
 
-const QUEUED_JOB_PAGE_SIZE: usize = 256;
-const QUEUED_JOB_MAX_PAGES: usize = 4;
+const JOB_PAGE_SIZE: usize = 256;
+const JOB_MAX_PAGES: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum QueuedState {
@@ -65,10 +65,10 @@ impl QueuedNodesOperation {
         self.pages = self.pages.saturating_add(1);
         self.state = QueuedState::Scan;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
             prefix: None,
             start: start_after.map(IterStart::After),
-            limit: QUEUED_JOB_PAGE_SIZE,
+            limit: JOB_PAGE_SIZE,
             txn_id: None,
         })]
     }
@@ -131,7 +131,7 @@ impl Operation for QueuedNodesOperation {
                     }
                 }
                 match next_start_after {
-                    Some(start) if self.pages < QUEUED_JOB_MAX_PAGES => self.scan(Some(start)),
+                    Some(start) if self.pages < JOB_MAX_PAGES => self.scan(Some(start)),
                     Some(_) => self.finish(true),
                     None => self.finish(false),
                 }
@@ -290,7 +290,7 @@ mod pure_tests {
         );
         operation.start();
 
-        for _ in 0..super::QUEUED_JOB_MAX_PAGES {
+        for _ in 0..super::JOB_MAX_PAGES {
             operation.step(Event::Storage(StorageEvent::IterResult {
                 values: vec![(
                     b"a".to_vec().into(),

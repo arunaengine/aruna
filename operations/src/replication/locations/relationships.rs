@@ -3,7 +3,7 @@ use crate::replication::version_replication::map_sync_key;
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::SYNC_RELATIONSHIP_OUT_KEYSPACE;
+use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, sync_relationship_prefix};
 use aruna_core::types::{Effects, Key};
@@ -60,7 +60,7 @@ impl RelationshipNodesOperation {
     fn scan(&mut self, start_after: Option<Key>) -> Effects {
         self.state = RelationshipState::Scan;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+            key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
             prefix: Some(sync_relationship_prefix(&self.bucket).into()),
             start: start_after.map(IterStart::After),
             limit: RELATIONSHIP_PAGE_SIZE,

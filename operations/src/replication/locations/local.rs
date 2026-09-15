@@ -15,7 +15,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
@@ -292,7 +292,7 @@ impl LocationSummaryOperation {
     fn read_backend(&mut self, backend_id: Ulid) -> Effects {
         self.state = SummaryState::ReadBackend;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+            key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
             key: backend_id.to_bytes().to_vec().into(),
             txn_id: self.txn_id,
         })]
