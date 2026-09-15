@@ -1,5 +1,5 @@
 use super::*;
-use crate::tests::fixtures::routes::{test_context, test_state, test_storage};
+use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::{
@@ -53,16 +53,16 @@ async fn setup_state() -> (TempDir, Arc<ServerState>, AuthContext) {
     (dir, state, auth)
 }
 
-fn head_request(title: &str, revision: Option<u64>) -> Json<SaveChatHeadRequest> {
-    Json(SaveChatHeadRequest {
+fn head_request(title: &str, revision: Option<u64>) -> Json<SaveChatRequest> {
+    Json(SaveChatRequest {
         title: title.to_string(),
         subject: None,
         revision,
     })
 }
 
-fn turn_request(payload: &str, revision: Option<u64>) -> Json<SaveChatTurnRequest> {
-    Json(SaveChatTurnRequest {
+fn turn_request(payload: &str, revision: Option<u64>) -> Json<SaveTurnRequest> {
+    Json(SaveTurnRequest {
         payload: payload.to_string(),
         revision,
     })
@@ -200,7 +200,7 @@ async fn rejects_bad_input() {
         State(state.clone()),
         Extension(Some(auth.clone())),
         Path("c-1".to_string()),
-        Json(SaveChatHeadRequest {
+        Json(SaveChatRequest {
             title: "Title".to_string(),
             subject: Some("s".repeat(201)),
             revision: None,
