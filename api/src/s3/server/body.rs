@@ -653,10 +653,7 @@ mod tests {
     #[test]
     fn caps_delete_body() {
         let body = DeleteObjectsBody::default();
-        assert_eq!(
-            body.append(&vec![0; DELETE_MAX_BODY]),
-            DELETE_MAX_BODY
-        );
+        assert_eq!(body.append(&vec![0; DELETE_MAX_BODY]), DELETE_MAX_BODY);
         assert_eq!(body.append(b"overflow"), 0);
         assert!(body.exceeded());
         assert_eq!(body.take_bytes().len(), DELETE_MAX_BODY);

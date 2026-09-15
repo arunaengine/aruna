@@ -830,9 +830,11 @@ mod tests {
         // caller cannot probe which copies a node holds.
         let codes: Vec<S3ErrorCode> = [
             ManagedCopyError::Unregistered,
-            ManagedCopyError::NotServeable(aruna_core::structs::storage::blob::ManagedCopyState::Quarantined(
-                aruna_core::structs::storage::blob::ManagedCopyQuarantine::Rejoin,
-            )),
+            ManagedCopyError::NotServeable(
+                aruna_core::structs::storage::blob::ManagedCopyState::Quarantined(
+                    aruna_core::structs::storage::blob::ManagedCopyQuarantine::Rejoin,
+                ),
+            ),
             ManagedCopyError::Mismatched,
             ManagedCopyError::NoSubject,
             ManagedCopyError::ServingBlocked,

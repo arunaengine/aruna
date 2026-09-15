@@ -42,10 +42,7 @@ pub(super) fn object_metadata(
     content_type: Option<&str>,
 ) -> std::collections::HashMap<String, String> {
     if let Some(content_type) = content_type {
-        metadata.insert(
-            CONTENT_TYPE_KEY.to_string(),
-            content_type.to_string(),
-        );
+        metadata.insert(CONTENT_TYPE_KEY.to_string(), content_type.to_string());
     }
     metadata
 }

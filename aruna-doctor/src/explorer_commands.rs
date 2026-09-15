@@ -3,14 +3,14 @@
 
 use aruna_core::document::PendingShardPlacement;
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, STORAGE_BACKEND_KEYSPACE, KEYSPACE_CATALOG, NODE_STATE_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, KEYSPACE_CATALOG, NODE_STATE_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
     SYNC_PLACEMENT_KEYSPACE,
 };
-use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
-use aruna_core::structs::storage::backends::BackendsFile;
 use aruna_core::structs::placement::policy_attachment::{
     BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
 };
+use aruna_core::structs::storage::backends::BackendsFile;
+use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_operations::sync::shard_placement::decode_placement;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
 use std::collections::{BTreeSet, HashSet};
@@ -200,10 +200,7 @@ fn known_group_backends(
     {
         return Ok(known);
     }
-    let keyspace = db.keyspace(
-        STORAGE_BACKEND_KEYSPACE,
-        KeyspaceCreateOptions::default,
-    )?;
+    let keyspace = db.keyspace(STORAGE_BACKEND_KEYSPACE, KeyspaceCreateOptions::default)?;
     for entry in db.read_tx().iter(&keyspace) {
         let (key, _) = entry.into_inner()?;
         if let Ok(bytes) = <[u8; 16]>::try_from(key.as_ref()) {
@@ -345,15 +342,15 @@ mod tests {
     use super::super::present::{DecodedField, DecodedValue};
     use super::{list_entries, list_keyspaces, location_scan};
     use aruna_core::keyspaces::{
-        BLOB_LOCATIONS_KEYSPACE, GROUP_KEYSPACE, STORAGE_BACKEND_KEYSPACE, KEYSPACE_CATALOG,
+        BLOB_LOCATIONS_KEYSPACE, GROUP_KEYSPACE, KEYSPACE_CATALOG, STORAGE_BACKEND_KEYSPACE,
     };
     use aruna_core::structs::identity::auth::Actor;
-    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::identity::group::Group;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy_attachment::{
         BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
     };
-    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -397,10 +394,7 @@ mod tests {
                 .keyspace(BLOB_LOCATIONS_KEYSPACE, KeyspaceCreateOptions::default)
                 .unwrap();
             let group_backends = db
-                .keyspace(
-                    STORAGE_BACKEND_KEYSPACE,
-                    KeyspaceCreateOptions::default,
-                )
+                .keyspace(STORAGE_BACKEND_KEYSPACE, KeyspaceCreateOptions::default)
                 .unwrap();
             let mut txn = db.write_tx().unwrap();
             txn.insert(

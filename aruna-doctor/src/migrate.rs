@@ -9,15 +9,13 @@ use aruna_core::keyspaces::{
     FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
     FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::structs::placement::compute_config::{
-    CATCH_UP_MS, IDLE_AFTER_MS,
-};
 use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
     JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};
@@ -56,26 +54,16 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
     let record_rows = db.keyspace(FAMILY_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
     let pending_rows = db.keyspace(FAMILY_PENDING_KEYSPACE, KeyspaceCreateOptions::default)?;
-    let conflict_rows =
-        db.keyspace(FAMILY_CONFLICT_KEYSPACE, KeyspaceCreateOptions::default)?;
-    let cache_rows = db.keyspace(
-        FAMILY_PROJECTION_KEYSPACE,
-        KeyspaceCreateOptions::default,
-    )?;
+    let conflict_rows = db.keyspace(FAMILY_CONFLICT_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let cache_rows = db.keyspace(FAMILY_PROJECTION_KEYSPACE, KeyspaceCreateOptions::default)?;
     let config_rows = db.keyspace(REALM_CONFIG_KEYSPACE, KeyspaceCreateOptions::default)?;
 
-    let records = rewrites::<JobRecordEnvelope, LegacyEnvelope>(
-        &db,
-        &record_rows,
-        FAMILY_RECORD_KEYSPACE,
-    )?;
+    let records =
+        rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
     let pending =
         rewrites::<PendingRecord, LegacyPending>(&db, &pending_rows, FAMILY_PENDING_KEYSPACE)?;
-    let conflicts = rewrites::<ConflictRecord, LegacyConflict>(
-        &db,
-        &conflict_rows,
-        FAMILY_CONFLICT_KEYSPACE,
-    )?;
+    let conflicts =
+        rewrites::<ConflictRecord, LegacyConflict>(&db, &conflict_rows, FAMILY_CONFLICT_KEYSPACE)?;
     let projections = keys(&db, &cache_rows)?;
     let configs = realm_configs(&db, &config_rows)?;
 
@@ -359,14 +347,12 @@ mod tests {
         FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
         FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
-    use aruna_core::structs::placement::compute_config::{
-        CATCH_UP_MS, IDLE_AFTER_MS,
-    };
     use aruna_core::structs::execution::job::{
         ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, ResultMessage,
         SubmissionId,
     };
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+    use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
     use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
     use std::collections::BTreeMap;
@@ -564,20 +550,11 @@ mod tests {
         let rows = read(&path, REALM_CONFIG_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
         let migrated = RealmConfigDocument::from_bytes(&rows[b"old".as_slice()]).unwrap();
-        assert_eq!(
-            migrated.compute.catch_up_ms,
-            CATCH_UP_MS
-        );
-        assert_eq!(
-            migrated.compute.session_idle_ms,
-            IDLE_AFTER_MS
-        );
+        assert_eq!(migrated.compute.catch_up_ms, CATCH_UP_MS);
+        assert_eq!(migrated.compute.session_idle_ms, IDLE_AFTER_MS);
         let newer = RealmConfigDocument::from_bytes(&rows[b"newer".as_slice()]).unwrap();
         assert_eq!(newer.compute.catch_up_ms, CATCH_UP_MS);
-        assert_eq!(
-            newer.compute.session_idle_ms,
-            IDLE_AFTER_MS
-        );
+        assert_eq!(newer.compute.session_idle_ms, IDLE_AFTER_MS);
 
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert_eq!(again.realm_configs_rewritten, 0);

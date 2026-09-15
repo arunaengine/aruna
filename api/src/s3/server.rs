@@ -29,9 +29,9 @@ use crate::telemetry::{RequestCancelGuard, emit_request_completed, make_request_
 use aruna_core::NodeId;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::metrics::{NodeMetrics, RequestLabels, RouteLabels, method_label};
-use aruna_core::structs::storage::blob::BucketCorsConfiguration;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::BucketCorsConfiguration;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use futures_core::future::BoxFuture;
@@ -639,12 +639,8 @@ impl S3Server {
             rate_limits,
             encryption_key,
             connection_limit: Arc::new(Semaphore::new(S3_MAX_CONNECTIONS)),
-            control_limit: Arc::new(Semaphore::new(control_capacity(
-                MAX_CONCURRENT_REQUESTS,
-            ))),
-            bulk_limit: Arc::new(Semaphore::new(bulk_capacity(
-                MAX_CONCURRENT_REQUESTS,
-            ))),
+            control_limit: Arc::new(Semaphore::new(control_capacity(MAX_CONCURRENT_REQUESTS))),
+            bulk_limit: Arc::new(Semaphore::new(bulk_capacity(MAX_CONCURRENT_REQUESTS))),
             read_limit: Arc::new(Semaphore::new(
                 bulk_capacity(MAX_CONCURRENT_REQUESTS).min(EGRESS_LIMIT),
             )),

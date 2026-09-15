@@ -513,8 +513,8 @@ pub fn checksum_mismatch_error() -> S3Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplyChecksums, CONTENT_MD5, ChecksumSelection, CHECKSUM_CRC32, CHECKSUM_MODE,
-        CHECKSUM_TYPE, SDK_CHECKSUM_ALGORITHM, checksum_mode_enabled, encode_checksums,
+        ApplyChecksums, CHECKSUM_CRC32, CHECKSUM_MODE, CHECKSUM_TYPE, CONTENT_MD5,
+        ChecksumSelection, SDK_CHECKSUM_ALGORITHM, checksum_mode_enabled, encode_checksums,
         parse_completion_checksum, parse_upload_checksum, validate_delete_checksum,
         validate_part_count, validate_trailer_headers, verify_trailer_stream,
     };

@@ -7,20 +7,20 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
-    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    GROUP_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::staging::{
+    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
 };
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
     VersionKey,
 };
-use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
-use aruna_core::structs::execution::staging::{
-    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
-};
-use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
 use std::collections::HashMap;
@@ -565,8 +565,9 @@ async fn write_blob_version(
 async fn setup_state() -> TestState {
     let (storage_dir, storage_handle) = test_storage();
     let realm_signing_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
-    let realm_id =
-        aruna_core::structs::identity::realm::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+    let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes(
+        realm_signing_key.verifying_key().to_bytes(),
+    );
     let node_id = iroh::SecretKey::from_bytes(&[13u8; 32]).public();
     let user_with_source_read = UserId::local(Ulid::generate(), realm_id);
     let user_without_source_read = UserId::local(Ulid::generate(), realm_id);

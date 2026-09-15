@@ -5,9 +5,11 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
-use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path, ensure_confined_path};
+use aruna_core::structs::storage::blob::{
+    BucketInfo, bucket_permission_path, ensure_confined_path,
+};
+use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
 };

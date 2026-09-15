@@ -1,8 +1,8 @@
 use crate::s3::auth::Action;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::storage::multipart::{MultipartChecksumHint, MultipartChecksumType};
 use aruna_core::structs::storage::blob::ensure_confined_path;
+use aruna_core::structs::storage::multipart::{MultipartChecksumHint, MultipartChecksumType};
 use aruna_operations::s3::multipart::complete::CompleteMultipartPart;
 use aruna_operations::s3::object::get::ObjectRangeRequest;
 use aruna_operations::s3::object::put::PutObjectInput as BlobPutObjectInput;
@@ -411,8 +411,8 @@ mod tests {
     };
     use crate::s3::auth::Action;
     use crate::s3::checksum::parse_upload_checksum;
-    use aruna_core::structs::storage::multipart::MultipartChecksumType;
     use aruna_core::structs::checksum::ChecksumAlgorithm;
+    use aruna_core::structs::storage::multipart::MultipartChecksumType;
     use aruna_operations::s3::object::get::ObjectRangeRequest;
     use http::HeaderMap;
     use s3s::S3ErrorCode;

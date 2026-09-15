@@ -204,14 +204,10 @@ impl ConfigView {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .or(Some("uploaded-parts".to_string())),
-            connect_timeout_secs: parse_optional_env(
-                "BLOB_CONTROL_PLANE_CONNECT_TIMEOUT_SECS",
-            )?
-            .unwrap_or(30),
-            io_timeout_secs: parse_optional_env(
-                "BLOB_CONTROL_PLANE_IO_TIMEOUT_SECS",
-            )?
-            .unwrap_or(30),
+            connect_timeout_secs: parse_optional_env("BLOB_CONTROL_PLANE_CONNECT_TIMEOUT_SECS")?
+                .unwrap_or(30),
+            io_timeout_secs: parse_optional_env("BLOB_CONTROL_PLANE_IO_TIMEOUT_SECS")?
+                .unwrap_or(30),
             transfer_idle_secs: parse_optional_env("BLOB_TRANSFER_IDLE_TIMEOUT_SECS")?
                 .unwrap_or(30 * 60),
             http_socket_addr: http_socket_addr.to_string(),

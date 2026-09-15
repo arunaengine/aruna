@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
+use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JOB_RETENTION_MS;
 use aruna_operations::jobs::service::submit_purge_job;
@@ -359,8 +359,7 @@ pub async fn deletion_preflight(
                 next_version_marker: next_version_marker.map(|id| id.to_string()),
                 multipart_uploads_truncated: uploads_truncated,
                 next_multipart_key,
-                next_multipart_marker: next_multipart_marker
-                    .map(|id| id.to_string()),
+                next_multipart_marker: next_multipart_marker.map(|id| id.to_string()),
             },
             reference_coverage: ReferenceCoverageResponse {
                 complete: false,

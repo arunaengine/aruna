@@ -23,9 +23,8 @@ static HTTP_LATENCY: LazyLock<LatencyAggregator> = LazyLock::new(|| LatencyAggre
 
 fn slow_request_threshold() -> Duration {
     static THRESHOLD: OnceLock<Duration> = OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        parse_slow_threshold(std::env::var(REQUEST_THRESHOLD_ENV).ok().as_deref())
-    })
+    *THRESHOLD
+        .get_or_init(|| parse_slow_threshold(std::env::var(REQUEST_THRESHOLD_ENV).ok().as_deref()))
 }
 
 fn parse_slow_threshold(value: Option<&str>) -> Duration {

@@ -6,7 +6,7 @@ use crate::tests::routes::{
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, S3_BUCKET_KEYSPACE, MIRROR_REPAIR_KEYSPACE};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, MIRROR_REPAIR_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmId;

@@ -8,10 +8,10 @@ use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::groups::storage_routing::{
     GroupInputsOperation, GroupRoutingOperation, PutGroupError, PutGroupOperation,
 };
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::routing::{
     GetRoutingError, GetRoutingOperation, PutRoutingError, PutRoutingOperation,
 };
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};

@@ -1146,10 +1146,13 @@ mod tests {
 
         let shutdown = aruna_core::shutdown::Shutdown::new();
         shutdown.spawn(std::future::pending());
-        let incomplete =
-            node_shutdown(shutdown, storage_handle, std::time::Duration::from_millis(200))
-                .run()
-                .await;
+        let incomplete = node_shutdown(
+            shutdown,
+            storage_handle,
+            std::time::Duration::from_millis(200),
+        )
+        .run()
+        .await;
         assert!(
             !incomplete.background_drained,
             "a pending child must leave the sequence incomplete: {incomplete:?}"

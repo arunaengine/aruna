@@ -8,38 +8,36 @@ use aruna_core::auth::REALMS_LIST_KEY;
 use aruna_core::compute_quota::{ComputeDepartureReport, JobReservationRecord};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, COMPUTE_DEPARTURE_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE,
-    CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE,
-    APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE, PATHS_INDEX_KEYSPACE,
-    FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
-    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-    OUTPUT_RECORD_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, JOB_RESERVATION_KEYSPACE,
-    DEADLINE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE, MANAGED_COPY_KEYSPACE,
-    NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
-    POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    S3_BUCKET_KEYSPACE, OBJECT_METADATA_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
+    API_STATE_KEYSPACE, APPLIED_OPS_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, COMPUTE_DEPARTURE_KEYSPACE,
+    CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE,
+    DEADLINE_INDEX_KEYSPACE, DHT_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
+    FAMILY_OUTBOX_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
+    FAMILY_RECORD_KEYSPACE, GROUP_KEYSPACE, JOB_RESERVATION_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, OBJECT_METADATA_KEYSPACE, ONBOARDING_KEYSPACE,
+    OUTPUT_RECORD_KEYSPACE, PATHS_INDEX_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, PLAN_EXPLAIN_KEYSPACE,
+    POLICY_CACHE_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+    UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USER_ACCESS_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
+use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope, JobRecordKey};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+};
+use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
+use aruna_core::structs::placement::policy_attachment::{
+    BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyBulkRun, PolicyIntent,
+    PolicyIntentKey, PolicyMutationRecord,
+};
+use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo, CurrentVersionPointer, HashIndex,
     ManagedCopyKey, ManagedCopyRecord, UserAccess, VersionKey,
 };
-use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
-use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope, JobRecordKey};
 use aruna_core::structs::storage::multipart::{
     MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary, MultipartPart,
     MultipartPartKey, MultipartUpload,
-};
-use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
-use aruna_core::structs::placement::policy_attachment::{
-    BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyBulkRun,
-    PolicyIntent, PolicyIntentKey, PolicyMutationRecord,
-};
-use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
-use aruna_core::structs::identity::realm::{
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_net::dht::storage::StoredEntry;
 use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
@@ -361,13 +359,11 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
                 }
             })
         }
-        POLICY_CACHE_KEYSPACE => {
-            decode_value_with(value, PolicyCacheEntry::from_bytes, |data| {
-                DecodedValue::PolicyCacheEntry {
-                    data: JsonCacheEntry(data),
-                }
-            })
-        }
+        POLICY_CACHE_KEYSPACE => decode_value_with(value, PolicyCacheEntry::from_bytes, |data| {
+            DecodedValue::PolicyCacheEntry {
+                data: JsonCacheEntry(data),
+            }
+        }),
         POLICY_MUTATION_KEYSPACE => {
             decode_value_with(value, PolicyMutationRecord::from_bytes, |data| {
                 DecodedValue::PolicyMutationRecord { data }
@@ -379,22 +375,16 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         BULK_INTENT_KEYSPACE => decode_value_with(value, PolicyIntent::from_bytes, |data| {
             DecodedValue::PolicyIntent { data }
         }),
-        UPLOAD_KEYSPACE => {
-            decode_value_with(value, MultipartUpload::from_bytes, |data| {
-                DecodedValue::MultipartUpload { data }
-            })
-        }
-        UPLOAD_PART_KEYSPACE => {
-            decode_value_with(value, MultipartPart::from_bytes, |data| {
-                DecodedValue::MultipartPart { data }
-            })
-        }
+        UPLOAD_KEYSPACE => decode_value_with(value, MultipartUpload::from_bytes, |data| {
+            DecodedValue::MultipartUpload { data }
+        }),
+        UPLOAD_PART_KEYSPACE => decode_value_with(value, MultipartPart::from_bytes, |data| {
+            DecodedValue::MultipartPart { data }
+        }),
         OBJECT_METADATA_KEYSPACE => decode_object_metadata(key, value),
         AUTH_KEYSPACE => decode_auth_value(value),
         API_STATE_KEYSPACE => decode_api_state(key, value),
-        APPLIED_OPS_KEYSPACE => {
-            raw_value(value, Some("document sync applied op".to_string()))
-        }
+        APPLIED_OPS_KEYSPACE => raw_value(value, Some("document sync applied op".to_string())),
         NODE_STATE_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<PersistedNodeState>(bytes),
@@ -533,7 +523,9 @@ fn decode_explain_key(key: &[u8]) -> DecodedField {
 
 fn family_from_key(key: &[u8]) -> Option<JobFamilyId> {
     Some(JobFamilyId {
-        submission_id: aruna_core::structs::execution::job::SubmissionId(key.get(..32)?.try_into().ok()?),
+        submission_id: aruna_core::structs::execution::job::SubmissionId(
+            key.get(..32)?.try_into().ok()?,
+        ),
         request_digest: key.get(32..64)?.try_into().ok()?,
     })
 }
@@ -966,9 +958,8 @@ mod tests {
     };
     use super::super::present::{JsonGraphKey, JsonLogKey, JsonQuadKey, JsonStoredOp};
     use super::{
-        BATCH_ENCODING_TAG, DOT_ENCODING_TAG, GRAPH_META_PREFIX,
-        LOG_BATCH_PREFIX, CraqleQuadOp, CraqleStoredBatch, CraqleStoredMeta, CraqleTermId,
-        decode_entry, raw_field,
+        BATCH_ENCODING_TAG, CraqleQuadOp, CraqleStoredBatch, CraqleStoredMeta, CraqleTermId,
+        DOT_ENCODING_TAG, GRAPH_META_PREFIX, LOG_BATCH_PREFIX, decode_entry, raw_field,
     };
     use aruna::identity::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -978,36 +969,35 @@ mod tests {
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
         COMPUTE_DEPARTURE_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE,
-        CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, PATHS_INDEX_KEYSPACE,
-        FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
-        FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-        OUTPUT_RECORD_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, JOB_RESERVATION_KEYSPACE,
-        WITNESS_DEADLINE_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE,
-        POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
-        S3_BUCKET_KEYSPACE, OBJECT_METADATA_KEYSPACE, UPLOAD_KEYSPACE,
-        UPLOAD_PART_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+        CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, FAMILY_ALIAS_KEYSPACE,
+        FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE, FAMILY_PENDING_KEYSPACE,
+        FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE,
+        NODE_STATE_KEYSPACE, OBJECT_METADATA_KEYSPACE, ONBOARDING_KEYSPACE, OUTPUT_RECORD_KEYSPACE,
+        PATHS_INDEX_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, PLAN_EXPLAIN_KEYSPACE,
+        POLICY_CACHE_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+        UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
+    use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope};
     use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+    use aruna_core::structs::placement::placement_policy::{PlacementPolicy, PlacementPolicyRef};
+    use aruna_core::structs::placement::policy_attachment::{
+        BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyBulkRun,
+        PolicyIntent, PolicyIntentOutcome, PolicyMutationParams, PolicyMutationRecord,
+        PolicyRefMode, PolicyStatus,
+    };
+    use aruna_core::structs::placement::policy_document::{
+        PlacementPolicyDocument, PolicyPublication, placement_policy_key,
+    };
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, HashIndex,
     };
-    use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope};
     use aruna_core::structs::storage::multipart::{
         MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
         MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
     };
-    use aruna_core::structs::placement::policy_attachment::{
-        BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
-        PolicyBulkRun, PolicyIntent, PolicyIntentOutcome, PolicyMutationParams,
-        PolicyMutationRecord, PolicyRefMode, PolicyStatus,
-    };
-    use aruna_core::structs::placement::placement_policy::{PlacementPolicy, PlacementPolicyRef};
-    use aruna_core::structs::placement::policy_document::{
-        PlacementPolicyDocument, PolicyPublication, placement_policy_key,
-    };
-    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_net::dht::storage::StoredEntry;
     use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
     use aruna_operations::jobs::records::rows::PROJECTION_CACHE_VERSION;
@@ -1069,16 +1059,18 @@ mod tests {
         let family = test_family();
         JobRecordEnvelope::sign(
             RealmId::from_bytes([2u8; 32]),
-            aruna_core::structs::execution::job::JobFamilyRecord::Claim(aruna_core::structs::execution::job::SubmissionClaim {
-                submission_id: family.submission_id,
-                job_id: aruna_core::structs::execution::job::JobId::from_bytes(
-                    Ulid::from_bytes([5u8; 16]).to_bytes(),
-                ),
-                request_digest: family.request_digest,
-                spec_digest: [7u8; 32],
-                committing_node_id: test_node(),
-                accepted_at_ms: 11,
-            }),
+            aruna_core::structs::execution::job::JobFamilyRecord::Claim(
+                aruna_core::structs::execution::job::SubmissionClaim {
+                    submission_id: family.submission_id,
+                    job_id: aruna_core::structs::execution::job::JobId::from_bytes(
+                        Ulid::from_bytes([5u8; 16]).to_bytes(),
+                    ),
+                    request_digest: family.request_digest,
+                    spec_digest: [7u8; 32],
+                    committing_node_id: test_node(),
+                    accepted_at_ms: 11,
+                },
+            ),
             &iroh::SecretKey::from_bytes(&[6u8; 32]),
         )
         .unwrap()
@@ -1189,7 +1181,9 @@ mod tests {
         let execution_id = Ulid::from_bytes([1u8; 16]);
         let reservation = JobReservationRecord {
             execution_id,
-            job_id: aruna_core::structs::execution::job::JobId::from_bytes(Ulid::from_bytes([5u8; 16]).to_bytes()),
+            job_id: aruna_core::structs::execution::job::JobId::from_bytes(
+                Ulid::from_bytes([5u8; 16]).to_bytes(),
+            ),
             logical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([5u8; 16]),
             resources: aruna_core::structs::execution::job::EffectiveResources {
                 cpu_cores: 2,
@@ -1375,11 +1369,7 @@ mod tests {
         let mut key = policy_id.to_bytes().to_vec();
         key.extend_from_slice(&policy_ref.digest);
 
-        let decoded = decode_entry(
-            POLICY_CACHE_KEYSPACE,
-            &key,
-            &entry.to_bytes().unwrap(),
-        );
+        let decoded = decode_entry(POLICY_CACHE_KEYSPACE, &key, &entry.to_bytes().unwrap());
 
         assert_eq!(
             decoded.key,
@@ -2021,12 +2011,13 @@ mod tests {
         let node_id = iroh::SecretKey::from_bytes(&[3_u8; 32]).public();
         let created_by = aruna_core::UserId::local(Ulid::from_bytes([6_u8; 16]), realm_id);
         let head_key = BlobHeadKey::new("bucket", "path/file.txt");
-        let head_value = aruna_core::structs::storage::blob::CurrentVersionPointer::new_with_generation(
-            Ulid::from_bytes([4_u8; 16]),
-            7,
-        )
-        .to_bytes()
-        .unwrap();
+        let head_value =
+            aruna_core::structs::storage::blob::CurrentVersionPointer::new_with_generation(
+                Ulid::from_bytes([4_u8; 16]),
+                7,
+            )
+            .to_bytes()
+            .unwrap();
         let location = BackendLocation {
             backend: BackendRef::node_default(),
             storage_class: None,

@@ -176,9 +176,7 @@ async fn redirect_swagger(request: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_BODY_SIZE, Server, ServerConfig, TIMEOUT_EXEMPT_ROUTES, is_exempt,
-    };
+    use super::{MAX_BODY_SIZE, Server, ServerConfig, TIMEOUT_EXEMPT_ROUTES, is_exempt};
     use axum::Router;
     use axum::body::Body;
     use axum::extract::MatchedPath;

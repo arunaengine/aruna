@@ -6,9 +6,9 @@ use super::object::restrictions_reach;
 use crate::s3::auth::map_authorize_error;
 use crate::s3::error::IntoS3Error;
 use crate::s3::scope::SubpathScope;
-use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, bucket_permission_path};
+use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncRelationship};
 use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
 use aruna_operations::auth::request_policy::{

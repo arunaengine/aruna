@@ -788,8 +788,9 @@ mod tests {
         start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
 
         let realm_signing_key = generate_signing_key();
-        let realm_id =
-            aruna_core::structs::identity::realm::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes(
+            realm_signing_key.verifying_key().to_bytes(),
+        );
         let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
         let bootstrap_user = UserId::local(Ulid::generate(), realm_id);
         drive(
