@@ -69,7 +69,7 @@ pub fn plan_enrollment(
     }
 }
 
-const ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct BootstrappedNodeState {
     pub(crate) node_state: PersistedNodeState,
@@ -205,10 +205,10 @@ pub(crate) async fn bootstrap_node_state(
     let identity =
         match response.mode {
             OnboardingMode::Management => {
-                let wrapped_key = response.wrapped_realm_private_key.ok_or(
+                let wrapped_key = response.wrapped_realm_key.ok_or(
                     IdentityError::MissingOnboardingMaterial(OnboardingMode::Management),
                 )?;
-                let wrapped_nonce = response.wrapped_realm_private_key_nonce.ok_or(
+                let wrapped_nonce = response.wrapped_key_nonce.ok_or(
                     IdentityError::MissingOnboardingMaterial(OnboardingMode::Management),
                 )?;
                 let wrapping_public_key = response.wrapping_public_key.ok_or(
@@ -235,17 +235,17 @@ pub(crate) async fn bootstrap_node_state(
                 let ciphertext = base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .decode(wrapped_key)
                     .map_err(IdentityError::Base64Error)?;
-                let realm_private_key_pem =
+                let realm_private_pem =
                     String::from_utf8(cipher.decrypt(&nonce, ciphertext.as_ref()).map_err(
                         |error| IdentityError::OnboardingBootstrapFailed(error.to_string()),
                     )?)?;
 
                 PersistedNodeIdentity::Management {
-                    realm_private_key_pem,
+                    realm_private_pem,
                 }
             }
             OnboardingMode::Server => PersistedNodeIdentity::Server {
-                issuer_private_key_pem: issuer_signing_key
+                private_key_pem: issuer_signing_key
                     .ok_or(IdentityError::MissingOnboardingMaterial(
                         OnboardingMode::Server,
                     ))?
@@ -302,10 +302,10 @@ pub(crate) async fn refresh_onboarding_bootstrap(
         (
             OnboardingMode::Server,
             PersistedNodeIdentity::Server {
-                issuer_private_key_pem,
+                private_key_pem,
                 ..
             },
-        ) => Some(SigningKey::from_pkcs8_pem(issuer_private_key_pem)?),
+        ) => Some(SigningKey::from_pkcs8_pem(private_key_pem)?),
         (OnboardingMode::Server, _) => {
             return Err(IdentityError::MissingOnboardingMaterial(
                 OnboardingMode::Server,
@@ -383,7 +383,7 @@ pub(crate) async fn refresh_onboarding_bootstrap(
 
 fn onboarding_bootstrap_client(timeout: Duration) -> Result<reqwest::Client, IdentityError> {
     Ok(reqwest::Client::builder()
-        .connect_timeout(ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT)
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(timeout)
         .build()?)
 }

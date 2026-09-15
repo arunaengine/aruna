@@ -13,9 +13,9 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_REPLICATION_JOB_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SYNC_RELATIONSHIP_IN_KEYSPACE,
-    SYNC_RELATIONSHIP_OUT_KEYSPACE, USAGE_STATS_KEYSPACE,
+    REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    REPLICATION_JOB_KEYSPACE, BLOB_VERSIONS_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
+    RELATIONSHIP_OUT_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{
@@ -974,7 +974,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
         let relationship_id = relationship.id.parse::<Ulid>()?;
         let stub = read_value(
             harness.seed.context.as_ref(),
-            SYNC_RELATIONSHIP_OUT_KEYSPACE,
+            RELATIONSHIP_OUT_KEYSPACE,
             sync_relationship_key(source_bucket, relationship_id),
         )
         .await?
@@ -992,7 +992,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
                 async move {
                     read_value(
                         context.as_ref(),
-                        SYNC_RELATIONSHIP_IN_KEYSPACE,
+                        RELATIONSHIP_IN_KEYSPACE,
                         sync_relationship_key(target_bucket, relationship_id),
                     )
                     .await
@@ -1045,7 +1045,7 @@ async fn quota_surfaces_failure() -> TestResult<()> {
             .await?;
 
         let quota = RealmQuotaConfig {
-            default_group_quota_bytes: None,
+            default_quota_bytes: None,
             grace_factor_percent: 100,
             warn_threshold_percent: 85,
             group_overrides: vec![RealmQuotaOverride {
@@ -1053,10 +1053,10 @@ async fn quota_surfaces_failure() -> TestResult<()> {
                 quota_bytes: Some(1),
                 grace_factor_percent: Some(100),
             }],
-            max_groups_per_user: Some(3),
-            user_group_cap_overrides: Vec::new(),
-            max_devices_per_user: None,
-            device_requests_per_minute: None,
+            groups_per_user: Some(3),
+            group_cap_overrides: Vec::new(),
+            devices_per_user: None,
+            device_request_rate: None,
             device_concurrent_pulls: None,
         };
         let quota_response = reqwest::Client::new()
@@ -1373,19 +1373,19 @@ async fn chain_blocks_cycle() -> TestResult<()> {
             || async {
                 keyspace_empty(
                     harness.seed.context.as_ref(),
-                    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+                    REPLICATION_OBLIGATION_KEYSPACE,
                 )
                 .await
                     && keyspace_empty(
                         harness.joiner.context.as_ref(),
-                        BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+                        REPLICATION_OBLIGATION_KEYSPACE,
                     )
                     .await
-                    && keyspace_empty(harness.seed.context.as_ref(), BLOB_REPLICATION_JOB_KEYSPACE)
+                    && keyspace_empty(harness.seed.context.as_ref(), REPLICATION_JOB_KEYSPACE)
                         .await
                     && keyspace_empty(
                         harness.joiner.context.as_ref(),
-                        BLOB_REPLICATION_JOB_KEYSPACE,
+                        REPLICATION_JOB_KEYSPACE,
                     )
                     .await
             },
@@ -1669,7 +1669,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
             .context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+                key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
                 key: obligation_key,
                 value: record.to_bytes()?.into(),
                 txn_id: None,
@@ -1686,10 +1686,10 @@ async fn repair_honors_restrictions() -> TestResult<()> {
             || async {
                 keyspace_empty(
                     harness.seed.context.as_ref(),
-                    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+                    REPLICATION_OBLIGATION_KEYSPACE,
                 )
                 .await
-                    && keyspace_empty(harness.seed.context.as_ref(), BLOB_REPLICATION_JOB_KEYSPACE)
+                    && keyspace_empty(harness.seed.context.as_ref(), REPLICATION_JOB_KEYSPACE)
                         .await
             },
         )

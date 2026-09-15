@@ -62,7 +62,7 @@ pub enum IdentityError {
     UnexpectedStorageEvent(String),
 }
 
-const NODE_STATE_RECORD_KEY: &[u8] = b"node_state";
+const STATE_RECORD_KEY: &[u8] = b"node_state";
 
 /// The persisted identity boundary.
 pub struct IdentityStore {
@@ -113,10 +113,12 @@ pub enum PersistedNodeStatus {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistedNodeIdentity {
     Management {
-        realm_private_key_pem: String,
+        #[serde(rename = "realm_private_key_pem")]
+        realm_private_pem: String,
     },
     Server {
-        issuer_private_key_pem: String,
+        #[serde(rename = "issuer_private_key_pem")]
+        private_key_pem: String,
         delegation_signature: String,
     },
     /// Owner-bound device. The owner is copied from the enrollment answer: a
@@ -186,9 +188,9 @@ pub(crate) fn node_capabilities(
 ) -> Result<(RealmId, NodeCapabilities), IdentityError> {
     match &node_state.identity {
         PersistedNodeIdentity::Management {
-            realm_private_key_pem,
+            realm_private_pem,
         } => {
-            let realm_signing_key = SigningKey::from_pkcs8_pem(realm_private_key_pem)?;
+            let realm_signing_key = SigningKey::from_pkcs8_pem(realm_private_pem)?;
             let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
             let realm_verifying_key = realm_signing_key
                 .verifying_key()
@@ -210,12 +212,12 @@ pub(crate) fn node_capabilities(
             ))
         }
         PersistedNodeIdentity::Server {
-            issuer_private_key_pem,
+            private_key_pem,
             delegation_signature,
         } => Ok((
             node_state.realm_id,
             NodeCapabilities::server_node(
-                SigningKey::from_pkcs8_pem(issuer_private_key_pem)?,
+                SigningKey::from_pkcs8_pem(private_key_pem)?,
                 node_state.realm_id,
                 delegation_signature.clone(),
             )?,
@@ -239,7 +241,7 @@ pub(crate) fn generate_node_state() -> Result<PersistedNodeState, IdentityError>
         onboarding_phase: None,
         onboarding_sync_ticket: None,
         identity: PersistedNodeIdentity::Management {
-            realm_private_key_pem: realm_signing_key
+            realm_private_pem: realm_signing_key
                 .to_pkcs8_pem(LineEnding::default())?
                 .to_string(),
         },
@@ -252,7 +254,7 @@ pub(crate) async fn load_node_state(
     match storage
         .send_effect(Effect::Storage(StorageEffect::Read {
             key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(NODE_STATE_RECORD_KEY),
+            key: ByteView::from(STATE_RECORD_KEY),
             txn_id: None,
         }))
         .await
@@ -276,7 +278,7 @@ pub(crate) async fn persist_node_state(
     match storage
         .send_effect(Effect::Storage(StorageEffect::Write {
             key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(NODE_STATE_RECORD_KEY),
+            key: ByteView::from(STATE_RECORD_KEY),
             value: ByteView::from(value),
             txn_id: None,
         }))
@@ -332,7 +334,7 @@ mod tests {
             onboarding_phase: None,
             onboarding_sync_ticket: None,
             identity: PersistedNodeIdentity::Management {
-                realm_private_key_pem: "pem".to_string(),
+                realm_private_pem: "pem".to_string(),
             },
         };
         let encoded = postcard::to_allocvec(&state).expect("state encodes");
@@ -359,7 +361,7 @@ mod tests {
                     onboarding_phase: None,
                     onboarding_sync_ticket: None,
                     identity: PersistedNodeIdentity::Management {
-                        realm_private_key_pem: "pem".to_string(),
+                        realm_private_pem: "pem".to_string(),
                     },
                 },
             ),

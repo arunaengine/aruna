@@ -509,7 +509,7 @@ async fn execution_restart_adopts() -> TestResult<()> {
     // Expire the crashed holder's lease to reproduce that admission condition.
     mutate_job(&fixture.compute_ctx.storage_handle, job_id, |record| {
         if let Some(claim) = record.claim.as_mut() {
-            claim.lease_expires_at_ms = 1;
+            claim.lease_expires_ms = 1;
         }
         Ok(JobMutation::Persist)
     })

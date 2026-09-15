@@ -326,7 +326,7 @@ async fn fill(
     stopped(stop)?;
     let net_handle = NetHandle::new(
         NetConfig {
-            bind_addr: config.p2p_socket_addr,
+            bind_addr: config.p2p_addr,
             secret_key: Some(config.net_secret_key.clone()),
             realm_id: config.realm_id,
             peer_nodes: config.peer_nodes.clone(),
@@ -334,9 +334,9 @@ async fn fill(
             temporary_bootstrap_active: config.temporary_bootstrap_active,
             discovery_method: config.discovery_method.clone(),
             relay_method: config.relay_method.clone(),
-            max_concurrent_uni_streams: config.max_concurrent_uni_streams,
-            max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
-            document_sync_storage_path: Some(config.document_sync_storage_path.clone()),
+            max_uni_streams: config.max_uni_streams,
+            max_bidi_streams: config.max_bidi_streams,
+            sync_storage_path: Some(config.sync_storage_path.clone()),
             document_sync_runtime: Some(config.document_sync_runtime),
             fjall_persist_policy: config.fjall_persist_policy,
         },

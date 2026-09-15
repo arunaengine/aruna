@@ -6,7 +6,7 @@ use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_HIDDEN_RESERVATION_KEYSPACE, BUCKET_STATS_DB,
+    BLOB_CLEANUP_KEYSPACE, HIDDEN_RESERVATION_KEYSPACE, BUCKET_STATS_DB,
 };
 use aruna_core::structs::storage::blob::{
     Backend, BackendBucket, BackendLocation, BackendRef, BlobCleanupWork, HIDDEN_BLOB_PREFIX,
@@ -29,7 +29,7 @@ impl From<BlobError> for BlobLibError {
 
 const BUCKET_STATS_RETRIES: u32 = 32;
 const BUCKET_STATS_BACKOFF: Duration = Duration::from_millis(1);
-const BUCKET_STATS_BACKOFF_CAP: Duration = Duration::from_millis(50);
+const STATS_BACKOFF_CAP: Duration = Duration::from_millis(50);
 // A fresh bucket is private to the reserving writer, so a second round only
 // happens when another writer filled the bucket we picked.
 const BUCKET_RESERVE_ROUNDS: usize = 8;
@@ -77,7 +77,7 @@ impl ReservationGuard {
 fn conflict_backoff(attempt: u32) -> Duration {
     let base = BUCKET_STATS_BACKOFF
         .saturating_mul(1u32 << attempt.min(6))
-        .min(BUCKET_STATS_BACKOFF_CAP);
+        .min(STATS_BACKOFF_CAP);
     let micros = base.as_micros() as u64;
     let spread = u64::from(Ulid::generate().to_bytes()[15]);
     Duration::from_micros(micros / 2 + micros * spread / 510)
@@ -376,7 +376,7 @@ impl BlobHandler {
         let marker_exists = match self
             .storage
             .send_effect(Effect::Storage(StorageEffect::Read {
-                key_space: BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
+                key_space: HIDDEN_RESERVATION_KEYSPACE.to_string(),
                 key: marker.clone(),
                 txn_id: Some(txn_id),
             }))
@@ -425,7 +425,7 @@ impl BlobHandler {
         let event = self
             .storage
             .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
+                key_space: HIDDEN_RESERVATION_KEYSPACE.to_string(),
                 key: marker.clone(),
                 value: ByteView::from(vec![1]),
                 txn_id: Some(txn_id),
@@ -498,7 +498,7 @@ impl BlobHandler {
         let marker_exists = match self
             .storage
             .send_effect(Effect::Storage(StorageEffect::Read {
-                key_space: BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
+                key_space: HIDDEN_RESERVATION_KEYSPACE.to_string(),
                 key: marker.clone(),
                 txn_id: Some(txn_id),
             }))
@@ -544,7 +544,7 @@ impl BlobHandler {
         let event = self
             .storage
             .send_effect(Effect::Storage(StorageEffect::Delete {
-                key_space: BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
+                key_space: HIDDEN_RESERVATION_KEYSPACE.to_string(),
                 key: marker.clone(),
                 txn_id: Some(txn_id),
             }))

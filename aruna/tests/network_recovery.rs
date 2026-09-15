@@ -76,9 +76,9 @@ async fn rejoin_peer(
         temporary_bootstrap_active: false,
         discovery_method: DiscoveryMethod::None,
         relay_method: RelayMethod::None,
-        max_concurrent_uni_streams: joiner.config.max_concurrent_uni_streams,
-        max_concurrent_bidi_streams: joiner.config.max_concurrent_bidi_streams,
-        document_sync_storage_path: Some(directory.path().join("document-sync")),
+        max_uni_streams: joiner.config.max_uni_streams,
+        max_bidi_streams: joiner.config.max_bidi_streams,
+        sync_storage_path: Some(directory.path().join("document-sync")),
         document_sync_runtime: Some(joiner.config.document_sync_runtime),
         fjall_persist_policy: joiner.config.fjall_persist_policy,
     };

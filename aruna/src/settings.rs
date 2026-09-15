@@ -12,7 +12,7 @@ use aruna_api::s3::server::S3ServerTimeouts;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BlobTimeoutConfig};
 use aruna_core::structs::storage::backends::{BackendsFile, NodeBackendsConfig};
 use aruna_core::structs::storage::node_info::{
-    KIND_LABEL_KEY, LOCATION_LABEL_KEY, STORAGE_CLASS_LABEL_PREFIX,
+    KIND_LABEL_KEY, LOCATION_LABEL_KEY, CLASS_LABEL_PREFIX,
 };
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -22,9 +22,9 @@ use aruna_storage::FjallPersistPolicy;
 
 use crate::config::{PortalArtifactConfig, PortalConfig, RateLimitSettings, SetupError};
 
-const DEFAULT_OPS_SOCKET_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3002);
-const DEFAULT_ONBOARDING_BOOTSTRAP_TIMEOUT_SECS: u64 = 120;
-const DEFAULT_ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS: u64 = 60;
+const OPS_SOCKET_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3002);
+const BOOTSTRAP_TIMEOUT_SECS: u64 = 120;
+const SYNC_TIMEOUT_SECS: u64 = 60;
 
 /// The operator-input source. Production reads the process environment (with
 /// any `.env` already loaded into it); tests pass an explicit map.
@@ -60,33 +60,33 @@ pub struct Settings {
     pub metadata_storage_path: String,
     pub metadata_search_storage: MetadataSearchStorage,
     pub fjall_persist_policy: FjallPersistPolicy,
-    pub document_sync_storage_path: PathBuf,
+    pub sync_storage_path: PathBuf,
     pub blob_root: String,
     pub blob_backends: NodeBackendsConfig,
     pub blob_bucket_prefix: Option<String>,
-    pub blob_max_bucket_size: Option<u64>,
+    pub blob_bucket_size: Option<u64>,
     pub blob_multipart_bucket: Option<String>,
-    pub blob_control_plane_connect_timeout_secs: u64,
-    pub blob_control_plane_io_timeout_secs: u64,
-    pub blob_transfer_idle_timeout_secs: u64,
-    pub onboarding_bootstrap_timeout_secs: u64,
-    pub onboarding_document_sync_timeout_secs: u64,
-    pub s3_initial_request_timeout_secs: u64,
-    pub s3_connection_idle_timeout_secs: u64,
-    pub s3_stream_lifetime_timeout_secs: u64,
+    pub connect_timeout_secs: u64,
+    pub io_timeout_secs: u64,
+    pub transfer_idle_secs: u64,
+    pub bootstrap_timeout_secs: u64,
+    pub sync_timeout_secs: u64,
+    pub request_timeout_secs: u64,
+    pub connection_idle_secs: u64,
+    pub stream_lifetime_secs: u64,
     pub http_socket_addr: SocketAddr,
     pub ops_socket_addr: SocketAddr,
-    pub max_http_body_size: usize,
+    pub max_body_size: usize,
     pub cors_allowed_origins: Vec<String>,
     pub desktop_cors: bool,
     pub mcp_enabled: bool,
-    pub portal_csp_extra_origins: Vec<String>,
-    pub p2p_socket_addr: SocketAddr,
+    pub portal_csp_origins: Vec<String>,
+    pub p2p_addr: SocketAddr,
     pub additional_relay_urls: Vec<String>,
-    pub max_concurrent_uni_streams: Option<u64>,
-    pub max_concurrent_bidi_streams: Option<u64>,
+    pub max_uni_streams: Option<u64>,
+    pub max_bidi_streams: Option<u64>,
     pub document_sync_runtime: IrohRuntimeConfig,
-    pub default_metadata_replication_factor: u32,
+    pub metadata_replication_factor: u32,
     /// `None` when `S3_HOST`/`S3_ADDRESS` are unset or empty: no S3 listener.
     pub s3_host: Option<String>,
     pub api_public_url: Option<String>,
@@ -130,7 +130,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         .unwrap_or_else(|| format!("{storage_path}/craqle"));
     let metadata_search_storage = search_storage_env(env)?;
     let fjall_persist_policy = persist_policy_env(env)?;
-    let document_sync_storage_path = env
+    let sync_storage_path = env
         .var("DOCUMENT_SYNC_STORAGE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{storage_path}/document-sync")));
@@ -140,16 +140,16 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         .unwrap_or_else(|| format!("{storage_path}/blobstore"));
     let blob_bucket_prefix = env.var("BLOB_BUCKET_PREFIX");
 
-    let max_concurrent_uni_streams = env
+    let max_uni_streams = env
         .var("MAX_CONCURRENT_UNI_STREAMS")
         .map(|value| value.parse::<u64>())
         .transpose()?;
-    let max_concurrent_bidi_streams = env
+    let max_bidi_streams = env
         .var("MAX_CONCURRENT_BIDI_STREAMS")
         .map(|value| value.parse::<u64>())
         .transpose()?;
 
-    let blob_max_bucket_size = env
+    let blob_bucket_size = env
         .var("BLOB_MAX_BUCKET_SIZE")
         .map(|value| value.parse::<u64>())
         .transpose()?
@@ -158,51 +158,51 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         .var("BLOB_MULTIPART_BUCKET")
         .filter(|value| !value.trim().is_empty())
         .or(Some("uploaded-parts".to_string()));
-    let blob_control_plane_connect_timeout_secs = env
+    let connect_timeout_secs = env
         .var("BLOB_CONTROL_PLANE_CONNECT_TIMEOUT_SECS")
         .map(|value| value.parse::<u64>())
         .transpose()?
         .unwrap_or(30);
-    let blob_control_plane_io_timeout_secs = env
+    let io_timeout_secs = env
         .var("BLOB_CONTROL_PLANE_IO_TIMEOUT_SECS")
         .map(|value| value.parse::<u64>())
         .transpose()?
         .unwrap_or(30);
-    let blob_transfer_idle_timeout_secs = env
+    let transfer_idle_secs = env
         .var("BLOB_TRANSFER_IDLE_TIMEOUT_SECS")
         .map(|value| value.parse::<u64>())
         .transpose()?
         .unwrap_or(30 * 60);
-    let onboarding_bootstrap_timeout_secs = positive_u64_env(
+    let bootstrap_timeout_secs = positive_u64_env(
         env,
         "ONBOARDING_BOOTSTRAP_TIMEOUT_SECS",
-        DEFAULT_ONBOARDING_BOOTSTRAP_TIMEOUT_SECS,
+        BOOTSTRAP_TIMEOUT_SECS,
     )?;
-    let onboarding_document_sync_timeout_secs = positive_u64_env(
+    let sync_timeout_secs = positive_u64_env(
         env,
         "ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS",
-        DEFAULT_ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS,
+        SYNC_TIMEOUT_SECS,
     )?;
     let s3_timeouts = S3ServerTimeouts::default();
-    let s3_initial_request_timeout_secs = positive_u64_env(
+    let request_timeout_secs = positive_u64_env(
         env,
         "S3_INITIAL_REQUEST_TIMEOUT_SECS",
         s3_timeouts.initial_request.as_secs(),
     )?;
-    let s3_connection_idle_timeout_secs = positive_u64_env(
+    let connection_idle_secs = positive_u64_env(
         env,
         "S3_CONNECTION_IDLE_TIMEOUT_SECS",
         s3_timeouts.connection_idle.as_secs(),
     )?;
-    let s3_stream_lifetime_timeout_secs = positive_u64_env(
+    let stream_lifetime_secs = positive_u64_env(
         env,
         "S3_STREAM_LIFETIME_TIMEOUT_SECS",
         s3_timeouts.stream_lifetime.as_secs(),
     )?;
     let blob_timeouts = BlobTimeoutConfig {
-        control_plane_connect_timeout: Duration::from_secs(blob_control_plane_connect_timeout_secs),
-        control_plane_io_timeout: Duration::from_secs(blob_control_plane_io_timeout_secs),
-        transfer_idle_timeout: Duration::from_secs(blob_transfer_idle_timeout_secs),
+        control_connect_timeout: Duration::from_secs(connect_timeout_secs),
+        control_io_timeout: Duration::from_secs(io_timeout_secs),
+        transfer_idle_timeout: Duration::from_secs(transfer_idle_secs),
     };
     let blob_backends = load_backends_config(
         env,
@@ -211,7 +211,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
             root: blob_root.clone(),
             service_config: HashMap::new(),
             bucket_prefix: blob_bucket_prefix.clone(),
-            max_bucket_size: blob_max_bucket_size,
+            max_bucket_size: blob_bucket_size,
             multipart_bucket: blob_multipart_bucket.clone(),
             timeouts: blob_timeouts,
         },
@@ -223,23 +223,23 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         .filter(|value| !value.trim().is_empty())
         .map(|value| SocketAddr::from_str(value.trim()))
         .transpose()?
-        .unwrap_or(DEFAULT_OPS_SOCKET_ADDR);
-    let max_http_body_size = env
+        .unwrap_or(OPS_SOCKET_ADDR);
+    let max_body_size = env
         .var("MAX_HTTP_BODY_SIZE")
         .map(|value| value.parse::<usize>())
         .transpose()?
-        .unwrap_or(aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE);
+        .unwrap_or(aruna_api::server::MAX_BODY_SIZE);
     let cors_allowed_origins = parse_list_env(env, "CORS_ALLOWED_ORIGINS");
     let desktop_cors = desktop_cors_env(env);
     let mcp_enabled = mcp_env(env)?;
-    let portal_csp_extra_origins = parse_list_env(env, "PORTAL_CSP_EXTRA_ORIGINS");
-    let p2p_socket_addr = SocketAddr::from_str(
+    let portal_csp_origins = parse_list_env(env, "PORTAL_CSP_EXTRA_ORIGINS");
+    let p2p_addr = SocketAddr::from_str(
         &env.var("P2P_SOCKET_ADDRESS")
             .unwrap_or_else(|| http_socket_addr.to_string()),
     )?;
     let additional_relay_urls = parse_list_env(env, "P2P_ADDITIONAL_RELAY_URLS");
     validate_relay_urls("P2P_ADDITIONAL_RELAY_URLS", &additional_relay_urls)?;
-    let default_metadata_replication_factor = env
+    let metadata_replication_factor = env
         .var("METADATA_REPLICATION_FACTOR")
         .map(|value| value.parse::<u32>())
         .transpose()?
@@ -295,33 +295,33 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         metadata_storage_path,
         metadata_search_storage,
         fjall_persist_policy,
-        document_sync_storage_path,
+        sync_storage_path,
         blob_root,
         blob_backends,
         blob_bucket_prefix,
-        blob_max_bucket_size,
+        blob_bucket_size,
         blob_multipart_bucket,
-        blob_control_plane_connect_timeout_secs,
-        blob_control_plane_io_timeout_secs,
-        blob_transfer_idle_timeout_secs,
-        onboarding_bootstrap_timeout_secs,
-        onboarding_document_sync_timeout_secs,
-        s3_initial_request_timeout_secs,
-        s3_connection_idle_timeout_secs,
-        s3_stream_lifetime_timeout_secs,
+        connect_timeout_secs,
+        io_timeout_secs,
+        transfer_idle_secs,
+        bootstrap_timeout_secs,
+        sync_timeout_secs,
+        request_timeout_secs,
+        connection_idle_secs,
+        stream_lifetime_secs,
         http_socket_addr,
         ops_socket_addr,
-        max_http_body_size,
+        max_body_size,
         cors_allowed_origins,
         desktop_cors,
         mcp_enabled,
-        portal_csp_extra_origins,
-        p2p_socket_addr,
+        portal_csp_origins,
+        p2p_addr,
         additional_relay_urls,
-        max_concurrent_uni_streams,
-        max_concurrent_bidi_streams,
+        max_uni_streams,
+        max_bidi_streams,
         document_sync_runtime,
-        default_metadata_replication_factor,
+        metadata_replication_factor,
         s3_host,
         api_public_url,
         s3_public_url,
@@ -771,11 +771,11 @@ fn parse_node_labels(env: &dyn SettingsEnv) -> Result<BTreeMap<String, String>, 
                 format!("{LOCATION_LABEL_KEY} is derived from ARUNA_NODE_LOCATION"),
             ));
         }
-        if label_key.starts_with(STORAGE_CLASS_LABEL_PREFIX) {
+        if label_key.starts_with(CLASS_LABEL_PREFIX) {
             return Err(invalid_config_value(
                 KEY,
                 pair,
-                format!("{STORAGE_CLASS_LABEL_PREFIX}* labels are derived from the backends file"),
+                format!("{CLASS_LABEL_PREFIX}* labels are derived from the backends file"),
             ));
         }
         labels.insert(label_key.to_string(), label_value.to_string());
@@ -864,7 +864,7 @@ fn load_oidc_providers(env: &dyn SettingsEnv) -> Result<Vec<OidcProviderConfig>,
 
 fn required_dynamic_var(env: &dyn SettingsEnv, key: &str) -> Result<String, SetupError> {
     env.var(key).ok_or_else(|| {
-        SetupError::ConfigValueNotFound(dotenvy::Error::EnvVar(std::env::VarError::NotPresent))
+        SetupError::ValueNotFound(dotenvy::Error::EnvVar(std::env::VarError::NotPresent))
     })
 }
 
@@ -992,26 +992,26 @@ mod tests {
             ("S3_STREAM_LIFETIME_TIMEOUT_SECS", "600"),
         ])
         .unwrap();
-        assert_eq!(settings.onboarding_bootstrap_timeout_secs, 240);
-        assert_eq!(settings.onboarding_document_sync_timeout_secs, 300);
-        assert_eq!(settings.s3_initial_request_timeout_secs, 45);
-        assert_eq!(settings.s3_connection_idle_timeout_secs, 90);
-        assert_eq!(settings.s3_stream_lifetime_timeout_secs, 600);
+        assert_eq!(settings.bootstrap_timeout_secs, 240);
+        assert_eq!(settings.sync_timeout_secs, 300);
+        assert_eq!(settings.request_timeout_secs, 45);
+        assert_eq!(settings.connection_idle_secs, 90);
+        assert_eq!(settings.stream_lifetime_secs, 600);
 
         let settings = parse(&[]).unwrap();
         let defaults = S3ServerTimeouts::default();
-        assert_eq!(settings.onboarding_bootstrap_timeout_secs, 120);
-        assert_eq!(settings.onboarding_document_sync_timeout_secs, 60);
+        assert_eq!(settings.bootstrap_timeout_secs, 120);
+        assert_eq!(settings.sync_timeout_secs, 60);
         assert_eq!(
-            settings.s3_initial_request_timeout_secs,
+            settings.request_timeout_secs,
             defaults.initial_request.as_secs()
         );
         assert_eq!(
-            settings.s3_connection_idle_timeout_secs,
+            settings.connection_idle_secs,
             defaults.connection_idle.as_secs()
         );
         assert_eq!(
-            settings.s3_stream_lifetime_timeout_secs,
+            settings.stream_lifetime_secs,
             defaults.stream_lifetime.as_secs()
         );
     }
@@ -1131,7 +1131,7 @@ mod tests {
                 ("OIDC_KEYCLOAK_ISSUER", "https://issuer.example"),
             ])
             .unwrap_err(),
-            SetupError::ConfigValueNotFound(_)
+            SetupError::ValueNotFound(_)
         ));
     }
 

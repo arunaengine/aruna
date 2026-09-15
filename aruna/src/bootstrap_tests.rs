@@ -7,7 +7,7 @@ use aruna_core::NodeId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::placement::placement_record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -74,7 +74,7 @@ fn device_identity_routes() {
     assert_eq!(PersistedNodeIdentity::User { owner }.owner(), Some(owner));
     assert_eq!(
         PersistedNodeIdentity::Server {
-            issuer_private_key_pem: String::new(),
+            private_key_pem: String::new(),
             delegation_signature: String::new(),
         }
         .owner(),
@@ -82,7 +82,7 @@ fn device_identity_routes() {
     );
     assert_eq!(
         PersistedNodeIdentity::Management {
-            realm_private_key_pem: String::new(),
+            realm_private_pem: String::new(),
         }
         .owner(),
         None
@@ -154,7 +154,7 @@ async fn write_digest(
         context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                key_space: WATCH_INTEREST_KEYSPACE.to_string(),
                 key: interest_node_key(realm_id, node_id).into(),
                 value: ByteView::from(digest.to_bytes().unwrap()),
                 txn_id: None,
@@ -168,7 +168,7 @@ async fn read_marker(context: &DriverContext, realm_id: RealmId) -> Option<ByteV
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
             key: interest_dirty_key(realm_id).into(),
             txn_id: None,
         })
@@ -657,7 +657,7 @@ async fn read_digest(
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
             key: interest_node_key(realm_id, node_id).into(),
             txn_id: None,
         })
@@ -708,7 +708,7 @@ async fn existing_watch_digest() {
     context
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
             key: interest_node_key(realm_id, node_id).into(),
             value: ByteView::from(digest.to_bytes().unwrap()),
             txn_id: None,

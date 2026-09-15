@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
-use aruna_core::keyspaces::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
+use aruna_core::keyspaces::{USER_KEYSPACE, SUBJECT_INDEX_KEYSPACE};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, oidc_subject_key};
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::identity::user::User;
@@ -166,7 +166,7 @@ async fn read_subject_index(context: &DriverContext, subject_key: &str) -> UserI
     match context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+            key_space: SUBJECT_INDEX_KEYSPACE.to_string(),
             key: ByteView::from(subject_key.as_bytes().to_vec()),
             txn_id: None,
         }))
@@ -275,7 +275,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         state,
         ServerConfig {
             http_addr: addr,
-            max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+            max_body_size: aruna_api::server::MAX_BODY_SIZE,
             cors: aruna_api::cors::CorsConfig::default(),
         },
     )

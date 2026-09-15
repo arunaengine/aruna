@@ -102,7 +102,7 @@ struct FullStorageConfig {
     metadata_storage_path: String,
     blob_root: String,
     blob_bucket_prefix: Option<String>,
-    blob_max_bucket_size: Option<u64>,
+    blob_bucket_size: Option<u64>,
     blob_multipart_bucket: Option<String>,
     blob_timeouts: BlobTimeoutConfig,
 }
@@ -114,7 +114,7 @@ impl FullStorageConfig {
             metadata_storage_path: root.join("craqle").display().to_string(),
             blob_root: root.join("blobstore").display().to_string(),
             blob_bucket_prefix: None,
-            blob_max_bucket_size: Some(100_000),
+            blob_bucket_size: Some(100_000),
             blob_multipart_bucket: Some("uploaded-parts".to_string()),
             blob_timeouts: BlobTimeoutConfig::default(),
         }
@@ -125,7 +125,7 @@ impl FullStorageConfig {
             metadata_storage_path: config.metadata_storage_path.clone(),
             blob_root: config.blob_root.clone(),
             blob_bucket_prefix: config.blob_bucket_prefix.clone(),
-            blob_max_bucket_size: config.blob_max_bucket_size,
+            blob_bucket_size: config.blob_bucket_size,
             blob_multipart_bucket: config.blob_multipart_bucket.clone(),
             blob_timeouts: config.blob_timeout_config(),
         }
@@ -137,7 +137,7 @@ impl FullStorageConfig {
             root: self.blob_root.clone(),
             service_config: HashMap::new(),
             bucket_prefix: self.blob_bucket_prefix.clone(),
-            max_bucket_size: self.blob_max_bucket_size,
+            max_bucket_size: self.blob_bucket_size,
             multipart_bucket: self.blob_multipart_bucket.clone(),
             timeouts: self.blob_timeouts,
         }
@@ -745,7 +745,7 @@ async fn spawn_joiner_mode(
 
     let joiner_net = NetHandle::new(
         NetConfig {
-            bind_addr: config.p2p_socket_addr,
+            bind_addr: config.p2p_addr,
             secret_key: Some(config.net_secret_key.clone()),
             realm_id: config.realm_id,
             peer_nodes: config.peer_nodes.clone(),
@@ -753,9 +753,9 @@ async fn spawn_joiner_mode(
             temporary_bootstrap_active: config.temporary_bootstrap_active,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
-            max_concurrent_uni_streams: config.max_concurrent_uni_streams,
-            max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
-            document_sync_storage_path: Some(config.document_sync_storage_path.clone()),
+            max_uni_streams: config.max_uni_streams,
+            max_bidi_streams: config.max_bidi_streams,
+            sync_storage_path: Some(config.sync_storage_path.clone()),
             document_sync_runtime: Some(config.document_sync_runtime),
             fjall_persist_policy: config.fjall_persist_policy,
         },
@@ -970,7 +970,7 @@ async fn spawn_rest_server(
         state.clone(),
         ServerConfig {
             http_addr: addr,
-            max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+            max_body_size: aruna_api::server::MAX_BODY_SIZE,
             cors: test_cors_config(),
         },
     );

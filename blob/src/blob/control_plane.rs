@@ -1,5 +1,5 @@
 use super::{BlobHandler, ControlPlaneKind};
-use crate::framing::{MAX_CONTROL_PLANE_FRAME, read_frame, write_frame};
+use crate::framing::{MAX_CONTROL_FRAME, read_frame, write_frame};
 use crate::messages::{MessageType, ReplicationMessage};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
@@ -84,7 +84,7 @@ pub(super) async fn send_framed_message(
     action: &'static str,
 ) -> Result<(), BlobEvent> {
     match with_timeout(
-        write_frame(sender, payload, MAX_CONTROL_PLANE_FRAME),
+        write_frame(sender, payload, MAX_CONTROL_FRAME),
         timeout_duration,
         ControlPlaneKind::Write,
         action,
@@ -103,7 +103,7 @@ pub(super) async fn read_framed_message(
     action: &'static str,
 ) -> Result<Vec<u8>, BlobEvent> {
     match with_timeout(
-        read_frame(receiver, MAX_CONTROL_PLANE_FRAME),
+        read_frame(receiver, MAX_CONTROL_FRAME),
         timeout_duration,
         ControlPlaneKind::Read,
         action,
@@ -128,7 +128,7 @@ pub(super) fn validate_init_ack(
     }
 
     match message.msg_type {
-        MessageType::BaoTreeInfoReceived => Ok(()),
+        MessageType::BaoTreeReceived => Ok(()),
         other => Err(BlobError::ReplicationRejected(format!(
             "unexpected replication init response: {other:?}"
         ))),
@@ -159,11 +159,11 @@ pub(super) fn parse_replication_init(
 
 impl BlobHandler {
     pub(super) fn connect_timeout(&self) -> Duration {
-        self.registry.timeouts().control_plane_connect_timeout
+        self.registry.timeouts().control_connect_timeout
     }
 
     pub(super) fn io_timeout(&self) -> Duration {
-        self.registry.timeouts().control_plane_io_timeout
+        self.registry.timeouts().control_io_timeout
     }
 
     pub(super) fn transfer_idle_timeout(&self) -> Duration {

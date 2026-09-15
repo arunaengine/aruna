@@ -270,7 +270,7 @@ async fn provision_realm(
                 },
                 target_node_id: config.node_id,
                 target_node_kind: RealmNodeKind::Management,
-                default_metadata_replication_factor: config.default_metadata_replication_factor,
+                metadata_replication_factor: config.metadata_replication_factor,
                 realm_description: config.realm_description.clone(),
                 create_if_missing: true,
                 reject_kind_mismatch: false,

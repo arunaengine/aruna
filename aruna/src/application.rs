@@ -44,7 +44,7 @@ impl ProcessOutcome {
             Self::Stopped | Self::StartupCancelled => None,
             Self::ServerFailure(_) | Self::StoppedIncomplete => Some(1),
             Self::WipeComplete => Some(device_wipe::WIPED_EXIT_CODE),
-            Self::WipeIncomplete => Some(device_wipe::WIPE_INCOMPLETE_EXIT_CODE),
+            Self::WipeIncomplete => Some(device_wipe::INCOMPLETE_EXIT_CODE),
         }
     }
 
@@ -578,7 +578,7 @@ mod pure_tests {
         );
         assert_eq!(
             ProcessOutcome::WipeIncomplete.exit_code(),
-            Some(device_wipe::WIPE_INCOMPLETE_EXIT_CODE)
+            Some(device_wipe::INCOMPLETE_EXIT_CODE)
         );
     }
 
@@ -886,7 +886,7 @@ mod tests {
     // one is the nonzero incomplete stop, so no accepted stop can report
     // success after a cleanup that left an owner unresolved.
     #[tokio::test]
-    async fn cancellation_outcome_requires_complete_cleanup() {
+    async fn cancellation_requires_cleanup() {
         let dir = tempfile::tempdir().expect("temp dir");
         let storage_handle =
             aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))

@@ -40,30 +40,30 @@ pub struct Config {
     pub metadata_storage_path: String,
     pub metadata_search_storage: MetadataSearchStorage,
     pub fjall_persist_policy: FjallPersistPolicy,
-    pub document_sync_storage_path: PathBuf,
+    pub sync_storage_path: PathBuf,
     pub blob_root: String,
     pub blob_backends: NodeBackendsConfig,
     pub blob_bucket_prefix: Option<String>,
-    pub blob_max_bucket_size: Option<u64>,
+    pub blob_bucket_size: Option<u64>,
     pub blob_multipart_bucket: Option<String>,
-    pub blob_control_plane_connect_timeout_secs: u64,
-    pub blob_control_plane_io_timeout_secs: u64,
-    pub blob_transfer_idle_timeout_secs: u64,
-    pub onboarding_bootstrap_timeout_secs: u64,
-    pub onboarding_document_sync_timeout_secs: u64,
-    pub s3_initial_request_timeout_secs: u64,
-    pub s3_connection_idle_timeout_secs: u64,
-    pub s3_stream_lifetime_timeout_secs: u64,
+    pub connect_timeout_secs: u64,
+    pub io_timeout_secs: u64,
+    pub transfer_idle_secs: u64,
+    pub bootstrap_timeout_secs: u64,
+    pub sync_timeout_secs: u64,
+    pub request_timeout_secs: u64,
+    pub connection_idle_secs: u64,
+    pub stream_lifetime_secs: u64,
     pub http_socket_addr: SocketAddr,
     pub ops_socket_addr: SocketAddr,
-    pub max_http_body_size: usize,
+    pub max_body_size: usize,
     pub cors_allowed_origins: Vec<String>,
     pub desktop_cors: bool,
     pub mcp_enabled: bool,
-    pub portal_csp_extra_origins: Vec<String>,
-    pub p2p_socket_addr: SocketAddr,
-    pub max_concurrent_uni_streams: Option<u64>,
-    pub max_concurrent_bidi_streams: Option<u64>,
+    pub portal_csp_origins: Vec<String>,
+    pub p2p_addr: SocketAddr,
+    pub max_uni_streams: Option<u64>,
+    pub max_bidi_streams: Option<u64>,
     pub node_capabilities: NodeCapabilities,
     pub realm_id: RealmId,
     pub node_id: iroh::PublicKey,
@@ -74,7 +74,7 @@ pub struct Config {
     pub temporary_bootstrap_active: bool,
     pub discovery_method: DiscoveryMethod,
     pub relay_method: RelayMethod,
-    pub default_metadata_replication_factor: u32,
+    pub metadata_replication_factor: u32,
     /// `None` when `S3_HOST`/`S3_ADDRESS` are unset or empty: no S3 listener.
     pub s3_host: Option<String>,
     pub api_public_url: Option<String>,
@@ -148,11 +148,11 @@ pub enum StartupMode {
 #[derive(Error, Debug)]
 pub enum SetupError {
     #[error(transparent)]
-    ConfigValueNotFound(#[from] dotenvy::Error),
+    ValueNotFound(#[from] dotenvy::Error),
     #[error(transparent)]
     SocketParsingError(#[from] std::net::AddrParseError),
     #[error(transparent)]
-    KeyPairParsingError(#[from] ConversionError),
+    KeyPairError(#[from] ConversionError),
     #[error(transparent)]
     IrohKeyError(#[from] KeyParsingError),
     #[error(transparent)]
@@ -162,7 +162,7 @@ pub enum SetupError {
     #[error(transparent)]
     StorageLibError(#[from] StorageLibError),
     #[error("persisted node state does not match derived realm id")]
-    PersistedNodeStateMismatch,
+    NodeStateMismatch,
     #[error(transparent)]
     Identity(#[from] IdentityError),
     #[error("failed to read the backends file: {0}")]
@@ -186,14 +186,14 @@ impl Config {
 
     pub fn blob_timeout_config(&self) -> BlobTimeoutConfig {
         BlobTimeoutConfig {
-            control_plane_connect_timeout: std::time::Duration::from_secs(
-                self.blob_control_plane_connect_timeout_secs,
+            control_connect_timeout: std::time::Duration::from_secs(
+                self.connect_timeout_secs,
             ),
-            control_plane_io_timeout: std::time::Duration::from_secs(
-                self.blob_control_plane_io_timeout_secs,
+            control_io_timeout: std::time::Duration::from_secs(
+                self.io_timeout_secs,
             ),
             transfer_idle_timeout: std::time::Duration::from_secs(
-                self.blob_transfer_idle_timeout_secs,
+                self.transfer_idle_secs,
             ),
         }
     }
@@ -206,14 +206,14 @@ impl Config {
     /// Budget for the onboarding document sync and the placement wait built on
     /// it, both driven from `main.rs` and the integration harness.
     pub fn onboarding_sync_timeout(&self) -> Duration {
-        Duration::from_secs(self.onboarding_document_sync_timeout_secs)
+        Duration::from_secs(self.sync_timeout_secs)
     }
 
     pub fn s3_timeouts(&self) -> S3ServerTimeouts {
         S3ServerTimeouts {
-            initial_request: Duration::from_secs(self.s3_initial_request_timeout_secs),
-            connection_idle: Duration::from_secs(self.s3_connection_idle_timeout_secs),
-            stream_lifetime: Duration::from_secs(self.s3_stream_lifetime_timeout_secs),
+            initial_request: Duration::from_secs(self.request_timeout_secs),
+            connection_idle: Duration::from_secs(self.connection_idle_secs),
+            stream_lifetime: Duration::from_secs(self.stream_lifetime_secs),
         }
     }
 }
@@ -252,33 +252,33 @@ pub async fn resolve_config(
         metadata_storage_path,
         metadata_search_storage,
         fjall_persist_policy,
-        document_sync_storage_path,
+        sync_storage_path,
         blob_root,
         blob_backends,
         blob_bucket_prefix,
-        blob_max_bucket_size,
+        blob_bucket_size,
         blob_multipart_bucket,
-        blob_control_plane_connect_timeout_secs,
-        blob_control_plane_io_timeout_secs,
-        blob_transfer_idle_timeout_secs,
-        onboarding_bootstrap_timeout_secs,
-        onboarding_document_sync_timeout_secs,
-        s3_initial_request_timeout_secs,
-        s3_connection_idle_timeout_secs,
-        s3_stream_lifetime_timeout_secs,
+        connect_timeout_secs,
+        io_timeout_secs,
+        transfer_idle_secs,
+        bootstrap_timeout_secs,
+        sync_timeout_secs,
+        request_timeout_secs,
+        connection_idle_secs,
+        stream_lifetime_secs,
         http_socket_addr,
         ops_socket_addr,
-        max_http_body_size,
+        max_body_size,
         cors_allowed_origins,
         desktop_cors,
         mcp_enabled,
-        portal_csp_extra_origins,
-        p2p_socket_addr,
+        portal_csp_origins,
+        p2p_addr,
         additional_relay_urls,
-        max_concurrent_uni_streams,
-        max_concurrent_bidi_streams,
+        max_uni_streams,
+        max_bidi_streams,
         document_sync_runtime,
-        default_metadata_replication_factor,
+        metadata_replication_factor,
         s3_host,
         api_public_url,
         s3_public_url,
@@ -295,7 +295,7 @@ pub async fn resolve_config(
         node_location,
         node_weight,
     } = settings;
-    let bootstrap_timeout = Duration::from_secs(onboarding_bootstrap_timeout_secs);
+    let bootstrap_timeout = Duration::from_secs(bootstrap_timeout_secs);
     // The store arrived already open and owned; the identity store owns every read and
     // write of the persisted identity record.
     let identity = IdentityStore::from_storage(storage_handle.clone());
@@ -342,7 +342,7 @@ pub async fn resolve_config(
     let node_id = net_secret_key.public();
     let (realm_id, node_capabilities) = identity.capabilities(&node_state)?;
     if realm_id != node_state.realm_id {
-        return Err(SetupError::PersistedNodeStateMismatch);
+        return Err(SetupError::NodeStateMismatch);
     }
     validate_s3_profile(s3_address.as_deref(), &node_capabilities)?;
 
@@ -401,30 +401,30 @@ pub async fn resolve_config(
         metadata_storage_path,
         metadata_search_storage,
         fjall_persist_policy,
-        document_sync_storage_path,
+        sync_storage_path,
         blob_root,
         blob_backends,
         blob_bucket_prefix,
-        blob_max_bucket_size,
+        blob_bucket_size,
         blob_multipart_bucket,
-        blob_control_plane_connect_timeout_secs,
-        blob_control_plane_io_timeout_secs,
-        blob_transfer_idle_timeout_secs,
-        onboarding_bootstrap_timeout_secs,
-        onboarding_document_sync_timeout_secs,
-        s3_initial_request_timeout_secs,
-        s3_connection_idle_timeout_secs,
-        s3_stream_lifetime_timeout_secs,
+        connect_timeout_secs,
+        io_timeout_secs,
+        transfer_idle_secs,
+        bootstrap_timeout_secs,
+        sync_timeout_secs,
+        request_timeout_secs,
+        connection_idle_secs,
+        stream_lifetime_secs,
         http_socket_addr,
         ops_socket_addr,
-        max_http_body_size,
+        max_body_size,
         cors_allowed_origins,
         desktop_cors,
         mcp_enabled,
-        portal_csp_extra_origins,
-        p2p_socket_addr,
-        max_concurrent_uni_streams,
-        max_concurrent_bidi_streams,
+        portal_csp_origins,
+        p2p_addr,
+        max_uni_streams,
+        max_bidi_streams,
         node_capabilities,
         realm_id,
         node_id,
@@ -435,7 +435,7 @@ pub async fn resolve_config(
         temporary_bootstrap_active,
         discovery_method,
         relay_method,
-        default_metadata_replication_factor,
+        metadata_replication_factor,
         s3_host,
         api_public_url,
         s3_public_url,

@@ -1045,7 +1045,7 @@ mod tests {
             .await;
         let _ = task_handle
             .send_effect(Effect::Task(TaskEffect::ResetTimer {
-                key: TaskKey::DrainDocumentSyncOutbox,
+                key: TaskKey::DrainSyncOutbox,
                 after: Duration::ZERO,
             }))
             .await;

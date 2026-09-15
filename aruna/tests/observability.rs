@@ -207,7 +207,7 @@ async fn metrics_s3_label() -> TestResult<()> {
 mod process {
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_storage::{FjallStorage, StorageHandle};
     use std::io::{Read, Seek, SeekFrom};
     use std::net::{TcpListener, UdpSocket};
@@ -454,7 +454,7 @@ mod process {
         loop {
             let event = storage
                 .send_storage_effect(StorageEffect::Iter {
-                    key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                    key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
                     prefix: None,
                     start: start.take().map(IterStart::After),
                     limit: 1024,
@@ -921,12 +921,12 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
+    use aruna_core::keyspaces::{SYNC_OUTBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
     use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_operations::sync::document_outbox::{new_outbox_record, outbox_write_entry};
 
     let storage = env.open_storage().await;
-    clear_space(&storage, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await?;
+    clear_space(&storage, SYNC_OUTBOX_KEYSPACE).await?;
     clear_space(&storage, TASK_TIMER_KEYSPACE).await?;
     let state = load_state(&storage).await?;
     let config = load_realm(&storage).await?;

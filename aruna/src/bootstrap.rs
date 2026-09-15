@@ -4,7 +4,7 @@
 
 use crate::identity::PersistedNodeState;
 use aruna_api::server_state::{
-    INITIAL_LOCAL_ONBOARDING_SECRET_KEY, load_persisted_state, persist_state,
+    ONBOARDING_SECRET_KEY, load_persisted_state, persist_state,
 };
 use aruna_core::document::{DocumentNetEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
@@ -38,10 +38,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
-const ONBOARDING_PLACEMENT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const PLACEMENT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// Ceiling for the doubling retry delay, so a peer that is not ready yet is
 /// asked patiently instead of ten times a second for the whole budget.
-const ONBOARDING_PLACEMENT_RETRY_MAX: Duration = Duration::from_secs(5);
+const PLACEMENT_RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// Longest a device waits on one answer, so a hung peer costs one attempt
 /// rather than the whole onboarding budget.
@@ -49,9 +49,9 @@ const DEVICE_FETCH_BUDGET: Duration = Duration::from_secs(10);
 
 /// Delay before retry `attempt`, doubling from the base interval up to the cap.
 fn backoff(attempt: u32) -> Duration {
-    ONBOARDING_PLACEMENT_RETRY_INTERVAL
+    PLACEMENT_RETRY_INTERVAL
         .saturating_mul(2u32.saturating_pow(attempt.min(16)))
-        .min(ONBOARDING_PLACEMENT_RETRY_MAX)
+        .min(PLACEMENT_RETRY_MAX)
 }
 
 pub async fn realm_bootstrap_exists(
@@ -480,7 +480,7 @@ pub async fn ensure_onboarding_secret(
 ) -> Result<OnboardingSecret, Box<dyn std::error::Error>> {
     if let Some(encrypted) = load_persisted_state::<EncryptedOnboardingSecret>(
         driver_ctx,
-        INITIAL_LOCAL_ONBOARDING_SECRET_KEY,
+        ONBOARDING_SECRET_KEY,
     )
     .await
     {
@@ -525,7 +525,7 @@ pub async fn ensure_onboarding_secret(
     nonce_bytes.copy_from_slice(nonce.as_slice());
     persist_state(
         driver_ctx,
-        INITIAL_LOCAL_ONBOARDING_SECRET_KEY,
+        ONBOARDING_SECRET_KEY,
         &EncryptedOnboardingSecret {
             nonce: nonce_bytes,
             ciphertext,

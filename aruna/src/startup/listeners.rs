@@ -74,7 +74,7 @@ fn wipe_plan(config: &Config) -> (Vec<std::path::PathBuf>, Vec<String>) {
     roots.extend([
         std::path::PathBuf::from(&config.storage_path),
         std::path::PathBuf::from(&config.metadata_storage_path),
-        config.document_sync_storage_path.clone(),
+        config.sync_storage_path.clone(),
         std::path::PathBuf::from(&config.blob_root),
     ]);
     (crate::config::outermost_roots(&roots), unsupported)
@@ -270,7 +270,7 @@ async fn bind_all(
         CorsConfig::new(config.cors_allowed_origins.clone()).with_desktop(config.desktop_cors);
     let server_config = ServerConfig {
         http_addr: config.http_socket_addr,
-        max_http_body_size: config.max_http_body_size,
+        max_body_size: config.max_body_size,
         cors: cors.clone(),
     };
     let server = Server::new(state.clone(), server_config)
@@ -280,7 +280,7 @@ async fn bind_all(
     started.portal = bind_portal(
         &config.portal,
         config.api_public_url.as_deref(),
-        PortalCspConfig::new(config.portal_csp_extra_origins.clone()),
+        PortalCspConfig::new(config.portal_csp_origins.clone()),
         state.clone(),
         shutdown,
     )
