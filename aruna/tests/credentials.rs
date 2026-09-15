@@ -2,7 +2,7 @@
 #![recursion_limit = "256"]
 mod shared;
 
-use aruna_api::routes::credentials::CreateS3PathRestriction;
+use aruna_api::routes::credentials::CreatePathRestriction;
 use aruna_core::structs::{PathRestriction, Permission, group_permission_path};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use reqwest::StatusCode;
@@ -12,8 +12,8 @@ use shared::{
     spawn_seed_node,
 };
 
-fn create_request_restriction(pattern: String, permission: Permission) -> CreateS3PathRestriction {
-    CreateS3PathRestriction {
+fn create_request_restriction(pattern: String, permission: Permission) -> CreatePathRestriction {
+    CreatePathRestriction {
         pattern,
         permission: permission.to_string(),
     }
@@ -23,18 +23,16 @@ async fn post_credentials(
     base_url: &str,
     bearer_token: &str,
     group_id: &str,
-    path_restrictions: Option<Vec<CreateS3PathRestriction>>,
+    path_restrictions: Option<Vec<CreatePathRestriction>>,
 ) -> TestResult<reqwest::Response> {
     Ok(reqwest::Client::new()
         .post(format!("{base_url}/api/v1/access/credentials"))
         .bearer_auth(bearer_token)
-        .json(
-            &aruna_api::routes::credentials::CreateS3CredentialsRequest {
-                group_id: group_id.to_string(),
-                expires_in_seconds: Some(600),
-                path_restrictions,
-            },
-        )
+        .json(&aruna_api::routes::credentials::CreateS3Request {
+            group_id: group_id.to_string(),
+            expires_in_seconds: Some(600),
+            path_restrictions,
+        })
         .send()
         .await?)
 }

@@ -2,7 +2,7 @@
 #![recursion_limit = "256"]
 mod shared;
 
-use aruna_api::routes::groups::AddGroupMemberRequest;
+use aruna_api::routes::groups::AddMemberRequest;
 use aruna_core::UserId;
 use aruna_core::structs::bucket_permission_path;
 use aws_sdk_s3::primitives::ByteStream;
@@ -50,7 +50,7 @@ async fn public_grants_read() -> TestResult<()> {
                 seed.base_url, credential_group.group_id
             ))
             .bearer_auth(&bearer_token)
-            .json(&AddGroupMemberRequest {
+            .json(&AddMemberRequest {
                 user_id: member_id.to_string(),
                 role_ids: None,
             })

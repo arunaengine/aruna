@@ -13,10 +13,8 @@ use aruna_core::structs::{Actor, User};
 use aruna_operations::driver::drive;
 use aruna_operations::node::node_info::read_info_document;
 use aruna_operations::placement::build_view;
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
-use aruna_operations::users::oidc_user::{
-    RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
-};
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
 use byteview::ByteView;
 use shared::{
     TestResult, create_onboarding_secret, shutdown_pair, spawn_joiner_node, spawn_seed_node,
@@ -48,7 +46,7 @@ async fn read_user(
 async fn joiner_bootstraps_documents() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let _user = drive(
-        RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
+        ResolveOidcOperation::new(ResolveOidcInput {
             actor: Actor {
                 node_id: seed.net.node_id(),
                 user_id: seed.user_id,
@@ -96,7 +94,7 @@ async fn joiner_bootstraps_documents() -> TestResult<()> {
     assert_eq!(issuer_info.utilization.documents_held, Some(0));
     assert!(issuer_info.utilization.load_permille.is_some());
     let realm_config = drive(
-        GetRealmConfigOperation::new(joiner.config.realm_id),
+        GetConfigOperation::new(joiner.config.realm_id),
         joiner.context.as_ref(),
     )
     .await?;
@@ -140,7 +138,7 @@ async fn second_joiner_onboards() -> TestResult<()> {
     // Its onboarding must still complete.
     let seed = spawn_seed_node().await?;
     let _user = drive(
-        RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
+        ResolveOidcOperation::new(ResolveOidcInput {
             actor: Actor {
                 node_id: seed.net.node_id(),
                 user_id: seed.user_id,

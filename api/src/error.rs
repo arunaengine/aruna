@@ -1,8 +1,8 @@
 use std::array::TryFromSliceError;
 
 use aruna_core::errors::ConversionError;
-use aruna_core::metadata::{MetadataProfileValidationFinding, MetadataValidationViolation};
-use aruna_operations::auth::bearer_token::ArunaBearerTokenError;
+use aruna_core::metadata::{MetadataValidationViolation, ProfileValidationFinding};
+use aruna_operations::auth::bearer_token::ArunaBearerError;
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -61,7 +61,7 @@ pub enum ServerError {
     #[error("Metadata validation failed")]
     MetadataValidation(Vec<MetadataValidationViolation>),
     #[error("Metadata Profile validation failed")]
-    MetadataProfileValidation(Vec<MetadataProfileValidationFinding>),
+    MetadataProfileValidation(Vec<ProfileValidationFinding>),
     #[error("Bad gateway")]
     BadGateway,
     #[error("{0}")]
@@ -112,26 +112,24 @@ pub enum TokenError {
     Base64Error(#[from] base64::DecodeError),
 }
 
-impl From<ArunaBearerTokenError> for TokenError {
-    fn from(error: ArunaBearerTokenError) -> Self {
+impl From<ArunaBearerError> for TokenError {
+    fn from(error: ArunaBearerError) -> Self {
         match error {
-            ArunaBearerTokenError::RealmNotTrusted => Self::RealmNotTrusted,
-            ArunaBearerTokenError::TokenRevoked => Self::TokenBlacklisted,
-            ArunaBearerTokenError::InvalidIssuerKey => Self::InvalidIssuerKey,
-            ArunaBearerTokenError::Expired => Self::Expired,
-            ArunaBearerTokenError::LifetimeTooLong => Self::LifetimeTooLong,
-            ArunaBearerTokenError::RevocationUnavailable => Self::RevocationUnavailable,
-            ArunaBearerTokenError::InvalidServerToken => Self::InvalidServerToken,
-            ArunaBearerTokenError::AuthContextConversion(error) => {
-                Self::AuthContextConversion(error)
-            }
-            ArunaBearerTokenError::PublicKeyError(error) => Self::PublicKeyError(error),
-            ArunaBearerTokenError::FromSliceError(error) => Self::FromSliceError(error),
-            ArunaBearerTokenError::PublicKeyConversionError(error) => {
+            ArunaBearerError::RealmNotTrusted => Self::RealmNotTrusted,
+            ArunaBearerError::TokenRevoked => Self::TokenBlacklisted,
+            ArunaBearerError::InvalidIssuerKey => Self::InvalidIssuerKey,
+            ArunaBearerError::Expired => Self::Expired,
+            ArunaBearerError::LifetimeTooLong => Self::LifetimeTooLong,
+            ArunaBearerError::RevocationUnavailable => Self::RevocationUnavailable,
+            ArunaBearerError::InvalidServerToken => Self::InvalidServerToken,
+            ArunaBearerError::AuthContextConversion(error) => Self::AuthContextConversion(error),
+            ArunaBearerError::PublicKeyError(error) => Self::PublicKeyError(error),
+            ArunaBearerError::FromSliceError(error) => Self::FromSliceError(error),
+            ArunaBearerError::PublicKeyConversionError(error) => {
                 Self::PublicKeyConversionError(error)
             }
-            ArunaBearerTokenError::JwtError(error) => Self::JWTError(error),
-            ArunaBearerTokenError::Base64Error(error) => Self::Base64Error(error),
+            ArunaBearerError::JwtError(error) => Self::JWTError(error),
+            ArunaBearerError::Base64Error(error) => Self::Base64Error(error),
         }
     }
 }
@@ -179,7 +177,7 @@ pub struct ErrorResponse {
     pub violations: Option<Vec<ValidationViolationResponse>>,
     /// Structured Profile validation findings.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub findings: Option<Vec<ProfileValidationFindingResponse>>,
+    pub findings: Option<Vec<ProfileFindingResponse>>,
     /// The exact standing-quota refusal behind a 409, when one caused it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<QuotaDeniedResponse>,
@@ -232,7 +230,8 @@ pub struct ValidationViolationResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ProfileValidationFindingResponse {
+#[schema(as = ProfileValidationFindingResponse)]
+pub struct ProfileFindingResponse {
     pub code: String,
     pub severity: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -246,8 +245,8 @@ pub struct ProfileValidationFindingResponse {
     pub completeness: String,
 }
 
-impl From<MetadataProfileValidationFinding> for ProfileValidationFindingResponse {
-    fn from(finding: MetadataProfileValidationFinding) -> Self {
+impl From<ProfileValidationFinding> for ProfileFindingResponse {
+    fn from(finding: ProfileValidationFinding) -> Self {
         Self {
             code: finding.code,
             severity: format!("{:?}", finding.severity).to_lowercase(),
@@ -312,7 +311,7 @@ impl ErrorResponse {
 
     #[inline]
     #[must_use]
-    pub fn with_findings(mut self, findings: Vec<ProfileValidationFindingResponse>) -> Self {
+    pub fn with_findings(mut self, findings: Vec<ProfileFindingResponse>) -> Self {
         self.findings = Some(findings);
         self
     }
@@ -446,7 +445,7 @@ impl ServerError {
     }
 }
 
-fn profile_validation_unavailable(findings: &[MetadataProfileValidationFinding]) -> bool {
+fn profile_validation_unavailable(findings: &[ProfileValidationFinding]) -> bool {
     findings.iter().any(|finding| {
         matches!(
             finding.code.as_str(),
@@ -469,8 +468,8 @@ pub enum ServerSetupError {
 mod tests {
     use super::{ErrorResponse, ServerError};
     use aruna_core::metadata::{
-        MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,
-        MetadataProfileValidationSeverity, MetadataValidationViolation,
+        MetadataValidationViolation, ProfileValidationCompleteness, ProfileValidationFinding,
+        ProfileValidationSeverity,
     };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
@@ -497,15 +496,15 @@ mod tests {
 
     #[tokio::test]
     async fn validation_error_structured() {
-        let finding = |code: &str| MetadataProfileValidationFinding {
+        let finding = |code: &str| ProfileValidationFinding {
             code: code.to_string(),
-            severity: MetadataProfileValidationSeverity::Violation,
+            severity: ProfileValidationSeverity::Violation,
             focus_node: Some("https://example.test/dataset".to_string()),
             path: Some("http://schema.org/identifier".to_string()),
             rule: "http://www.w3.org/ns/shacl#minCount".to_string(),
             message: "identifier is required".to_string(),
             profile_revision: None,
-            completeness: MetadataProfileValidationCompleteness::Complete,
+            completeness: ProfileValidationCompleteness::Complete,
         };
         let rejected =
             ServerError::MetadataProfileValidation(vec![finding("constraint_violation")])

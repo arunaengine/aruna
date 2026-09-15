@@ -2,8 +2,8 @@
 #![recursion_limit = "256"]
 mod shared;
 
-use aruna_core::structs::HashPathIndexKey;
-use aruna_operations::blob::permission_paths::ResolveBlobPermissionPathsOperation;
+use aruna_core::structs::HashIndex;
+use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
@@ -25,8 +25,8 @@ fn fixture_bytes() -> Vec<u8> {
 async fn iter_hash_index(
     context: &aruna_operations::driver::DriverContext,
     hash: [u8; 32],
-) -> TestResult<Vec<HashPathIndexKey>> {
-    drive(ResolveBlobPermissionPathsOperation::new(hash), context)
+) -> TestResult<Vec<HashIndex>> {
+    drive(ResolvePathsOperation::new(hash), context)
         .await
         .map_err(Into::into)
 }

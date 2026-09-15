@@ -13,7 +13,7 @@ use crate::keyspaces::{
     NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE,
     PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USER_KEYSPACE,
 };
-use crate::metadata::{MetadataCreateEventRecord, MetadataGraphLifecycleRecord};
+use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
 use crate::storage_entries::{document_lifecycle_key, event_log_key, graph_lifecycle_key};
 use crate::structs::{
     PLACEMENT_EPOCH_PAD, PlacementRef, RealmId, interest_node_key, node_info_key,
@@ -24,7 +24,7 @@ use crate::types::{GroupId, Key};
 use crate::{NodeId, TopicId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum DocumentSyncTarget {
+pub enum DocumentTarget {
     Group {
         group_id: GroupId,
     },
@@ -100,7 +100,7 @@ pub struct PendingShardPlacement {
 /// Per-entry keys avoid a read-modify-write blob on the hot write path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardManifestEntry {
-    pub target: DocumentSyncTarget,
+    pub target: DocumentTarget,
     pub revision: DocumentSyncRevision,
 }
 
@@ -117,12 +117,12 @@ pub struct ShardManifest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DocumentSyncOutboxRecord {
+pub struct DocumentOutboxRecord {
     pub outbox_id: Ulid,
     pub node_id: NodeId,
-    pub target: DocumentSyncTarget,
+    pub target: DocumentTarget,
     pub peers: Vec<NodeId>,
-    pub event: DocumentSyncOutboxEvent,
+    pub event: DocumentOutboxEvent,
     /// Placement reference this record rides under: for `Upsert`/`Delete` the
     /// envelope change's ref, for `AdminOperation` the target's resolved ref.
     /// Does not affect the outbox FIFO key.
@@ -138,7 +138,7 @@ pub struct DocumentSyncOutboxRecord {
     pub allow_genesis: bool,
 }
 
-impl DocumentSyncOutboxRecord {
+impl DocumentOutboxRecord {
     /// Stamps the generation the bucket's write fence admitted this row at.
     pub fn fenced_at(mut self, generation: u64) -> Self {
         self.generation = generation;
@@ -147,10 +147,10 @@ impl DocumentSyncOutboxRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DocumentSyncOutboxEvent {
+pub enum DocumentOutboxEvent {
     Upsert {
         bytes: Vec<u8>,
-        change: DocumentSyncChange,
+        change: DocumentChange,
     },
     AdminOperation {
         event: Box<AdminDocumentEvent>,
@@ -160,11 +160,11 @@ pub enum DocumentSyncOutboxEvent {
         origin_signature: Option<iroh::Signature>,
     },
     Delete {
-        change: DocumentSyncChange,
+        change: DocumentChange,
     },
 }
 
-impl DocumentSyncOutboxEvent {
+impl DocumentOutboxEvent {
     /// Admin record originated by this node; the publisher signs the envelope.
     pub fn admin(event: AdminDocumentEvent) -> Self {
         Self::AdminOperation {
@@ -186,10 +186,10 @@ impl DocumentSyncOutboxEvent {
 /// durable. `event_id` is the evicted event's own id, so repeating the recovery rewrites one stable
 /// outbox row instead of adding a duplicate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DocumentSyncEvictedDocument {
+pub struct DocumentEvictedDocument {
     pub event_id: Ulid,
-    pub target: DocumentSyncTarget,
-    pub event: DocumentSyncOutboxEvent,
+    pub target: DocumentTarget,
+    pub event: DocumentOutboxEvent,
     pub placement: PlacementRef,
     pub allow_genesis: bool,
 }
@@ -203,30 +203,30 @@ pub struct DocumentSyncRevision {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DocumentSyncChange {
+pub struct DocumentChange {
     pub base: Option<DocumentSyncRevision>,
     pub current: DocumentSyncRevision,
-    pub kind: DocumentSyncChangeKind,
+    pub kind: DocumentChangeKind,
     pub placement: PlacementRef,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentSyncConflict {
-    pub target: DocumentSyncTarget,
-    pub local_change: Option<DocumentSyncChange>,
+    pub target: DocumentTarget,
+    pub local_change: Option<DocumentChange>,
     pub local_bytes: Option<Vec<u8>>,
-    pub incoming_change: DocumentSyncChange,
+    pub incoming_change: DocumentChange,
     pub incoming_bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DocumentSyncChangeKind {
+pub enum DocumentChangeKind {
     Upsert,
     Delete,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DocumentSyncApplyDecision {
+pub enum DocumentApplyDecision {
     Apply,
     SkipStale,
     SkipTombstoned,
@@ -237,13 +237,13 @@ pub enum DocumentSyncApplyDecision {
 pub enum DocumentSyncPublish {
     Upsert {
         event_id: Ulid,
-        target: DocumentSyncTarget,
+        target: DocumentTarget,
         bytes: Vec<u8>,
-        change: DocumentSyncChange,
+        change: DocumentChange,
         allow_genesis: bool,
     },
     AdminOperation {
-        target: DocumentSyncTarget,
+        target: DocumentTarget,
         event: Box<AdminDocumentEvent>,
         placement: PlacementRef,
         allow_genesis: bool,
@@ -252,27 +252,27 @@ pub enum DocumentSyncPublish {
     },
     Delete {
         event_id: Ulid,
-        target: DocumentSyncTarget,
-        change: DocumentSyncChange,
+        target: DocumentTarget,
+        change: DocumentChange,
         allow_genesis: bool,
     },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DocumentSyncReconcileResult {
-    pub targets: Vec<DocumentSyncTarget>,
-    pub metadata_create_events: Vec<MetadataCreateEventRecord>,
-    pub metadata_graph_tombstones: Vec<MetadataGraphLifecycleRecord>,
+pub struct DocumentReconcileResult {
+    pub targets: Vec<DocumentTarget>,
+    pub metadata_create_events: Vec<MetadataEventRecord>,
+    pub metadata_graph_tombstones: Vec<GraphLifecycleRecord>,
 }
 
-impl DocumentSyncReconcileResult {
+impl DocumentReconcileResult {
     pub fn applied(&self) -> usize {
         self.targets.len()
     }
 }
 
 impl DocumentSyncPublish {
-    pub fn target(&self) -> &DocumentSyncTarget {
+    pub fn target(&self) -> &DocumentTarget {
         match self {
             Self::Upsert { target, .. }
             | Self::Delete { target, .. }
@@ -296,7 +296,7 @@ impl DocumentSyncPublish {
     }
 }
 
-impl DocumentSyncOutboxEvent {
+impl DocumentOutboxEvent {
     pub fn kind(&self) -> &'static [u8] {
         match self {
             Self::Upsert { .. } => b"upsert",
@@ -314,39 +314,39 @@ pub fn compare_sync_revisions(
 }
 
 pub fn sync_apply_decision(
-    local: Option<&DocumentSyncChange>,
-    incoming: &DocumentSyncChange,
-) -> DocumentSyncApplyDecision {
+    local: Option<&DocumentChange>,
+    incoming: &DocumentChange,
+) -> DocumentApplyDecision {
     let Some(local) = local else {
-        return DocumentSyncApplyDecision::Apply;
+        return DocumentApplyDecision::Apply;
     };
 
     if incoming.current == local.current {
         return if incoming.kind == local.kind {
-            DocumentSyncApplyDecision::Apply
+            DocumentApplyDecision::Apply
         } else {
-            DocumentSyncApplyDecision::Conflict
+            DocumentApplyDecision::Conflict
         };
     }
 
-    if local.kind == DocumentSyncChangeKind::Delete
-        && incoming.kind == DocumentSyncChangeKind::Upsert
+    if local.kind == DocumentChangeKind::Delete
+        && incoming.kind == DocumentChangeKind::Upsert
         && incoming.base.as_ref() != Some(&local.current)
     {
-        return DocumentSyncApplyDecision::SkipTombstoned;
+        return DocumentApplyDecision::SkipTombstoned;
     }
 
     match incoming.current.generation.cmp(&local.current.generation) {
-        Ordering::Less => DocumentSyncApplyDecision::SkipStale,
-        Ordering::Equal => DocumentSyncApplyDecision::Conflict,
+        Ordering::Less => DocumentApplyDecision::SkipStale,
+        Ordering::Equal => DocumentApplyDecision::Conflict,
         Ordering::Greater if incoming.base.as_ref() == Some(&local.current) => {
-            DocumentSyncApplyDecision::Apply
+            DocumentApplyDecision::Apply
         }
-        Ordering::Greater => DocumentSyncApplyDecision::Conflict,
+        Ordering::Greater => DocumentApplyDecision::Conflict,
     }
 }
 
-impl DocumentSyncTarget {
+impl DocumentTarget {
     /// Admin documents (user, group, and realm authorization/config) replicate
     /// only as `AdminOperation` events over their shared topic; they never take
     /// placements or sync as whole documents.
@@ -534,15 +534,15 @@ fn graph_lifecycle_topic(graph_iri: &str) -> Ulid {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]
 #[irokle(type_id = "aruna.document.v3")]
-pub enum DocumentSyncEvent {
+pub enum DocumentEvent {
     Upsert {
         event_id: Ulid,
-        target: DocumentSyncTarget,
+        target: DocumentTarget,
         bytes: Vec<u8>,
-        change: DocumentSyncChange,
+        change: DocumentChange,
     },
     AdminOperation {
-        target: DocumentSyncTarget,
+        target: DocumentTarget,
         event: Box<AdminDocumentEvent>,
         placement: PlacementRef,
         /// The origin's signature over the envelope. Carried on the wire so a
@@ -551,13 +551,13 @@ pub enum DocumentSyncEvent {
     },
     Delete {
         event_id: Ulid,
-        target: DocumentSyncTarget,
-        change: DocumentSyncChange,
+        target: DocumentTarget,
+        change: DocumentChange,
     },
 }
 
-impl DocumentSyncEvent {
-    pub fn target(&self) -> &DocumentSyncTarget {
+impl DocumentEvent {
+    pub fn target(&self) -> &DocumentTarget {
         match self {
             Self::Upsert { target, .. }
             | Self::Delete { target, .. }
@@ -574,7 +574,7 @@ impl DocumentSyncEvent {
 
     /// Placement the event rides under: the envelope change's ref for
     /// `Upsert`/`Delete`, the stamped admin ref for `AdminOperation`. Feeds
-    /// [`DocumentSyncTarget::sync_topic_id`] on both publish and reconcile.
+    /// [`DocumentTarget::sync_topic_id`] on both publish and reconcile.
     pub fn placement(&self) -> PlacementRef {
         match self {
             Self::Upsert { change, .. } | Self::Delete { change, .. } => change.placement,
@@ -584,7 +584,7 @@ impl DocumentSyncEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DocumentSyncEffect {
+pub enum DocumentEffect {
     PublishDocuments {
         documents: Vec<DocumentSyncPublish>,
         peers: Vec<NodeId>,
@@ -600,9 +600,9 @@ pub enum DocumentSyncEffect {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DocumentSyncNetEvent {
+pub enum DocumentNetEvent {
     DocumentsPublished {
-        targets: Vec<DocumentSyncTarget>,
+        targets: Vec<DocumentTarget>,
     },
     DocumentsPartiallyPublished {
         published_indices: Vec<usize>,
@@ -611,15 +611,16 @@ pub enum DocumentSyncNetEvent {
     },
     DocumentsReconciled {
         applied: usize,
-        targets: Vec<DocumentSyncTarget>,
-        metadata_create_events: Vec<MetadataCreateEventRecord>,
-        metadata_graph_tombstones: Vec<MetadataGraphLifecycleRecord>,
+        targets: Vec<DocumentTarget>,
+        metadata_create_events: Vec<MetadataEventRecord>,
+        metadata_graph_tombstones: Vec<GraphLifecycleRecord>,
     },
     Error {
-        target: Option<DocumentSyncTarget>,
+        target: Option<DocumentTarget>,
         error: String,
     },
 }
 
 #[cfg(test)]
+#[path = "document_tests.rs"]
 mod tests;

@@ -436,7 +436,7 @@ mod process {
         /// Exact document-sync outbox rows of the stopped node.
         pub async fn outbox_rows(
             &self,
-        ) -> Vec<(Vec<u8>, aruna_core::document::DocumentSyncOutboxRecord)> {
+        ) -> Vec<(Vec<u8>, aruna_core::document::DocumentOutboxRecord)> {
             let storage = self.open_storage().await;
             let rows = read_outbox(&storage).await;
             // close() waits for the lock release a plain drop only schedules;
@@ -448,7 +448,7 @@ mod process {
 
     pub async fn read_outbox(
         storage: &StorageHandle,
-    ) -> Vec<(Vec<u8>, aruna_core::document::DocumentSyncOutboxRecord)> {
+    ) -> Vec<(Vec<u8>, aruna_core::document::DocumentOutboxRecord)> {
         let mut start: Option<aruna_core::types::Key> = None;
         let mut rows = Vec::new();
         loop {
@@ -915,8 +915,8 @@ async fn clear_space(storage: &aruna_storage::StorageHandle, key_space: &str) ->
 /// Leaves one valid document-sync row for the first post-start drain.
 async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
     use aruna_core::document::{
-        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
-        DocumentSyncTarget,
+        DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision,
+        DocumentTarget,
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -933,14 +933,14 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
     let placement = PlacementRef::NIL;
     let record = new_outbox_record(
         node_id,
-        DocumentSyncTarget::NodeInfo {
+        DocumentTarget::NodeInfo {
             realm_id: config.realm_id,
             node_id,
         },
         Vec::new(),
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: Vec::new(),
-            change: DocumentSyncChange {
+            change: DocumentChange {
                 base: None,
                 current: DocumentSyncRevision {
                     generation: 1,
@@ -948,7 +948,7 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
                     actor: node_id,
                     updated_at_ms: 1,
                 },
-                kind: DocumentSyncChangeKind::Upsert,
+                kind: DocumentChangeKind::Upsert,
                 placement,
             },
         },
