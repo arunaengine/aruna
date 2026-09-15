@@ -9,7 +9,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PutBucketCorsState {
+enum PutCorsState {
     Init,
     StartTransaction,
     ReadBucket,
@@ -20,7 +20,7 @@ enum PutBucketCorsState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum PutBucketCorsError {
+pub enum PutCorsError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -40,27 +40,27 @@ pub enum PutBucketCorsError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct PutBucketCorsOperation {
+pub struct PutCorsOperation {
     bucket: String,
     config: BucketCorsConfiguration,
-    state: PutBucketCorsState,
+    state: PutCorsState,
     txn_id: Option<ulid::Ulid>,
-    output: Option<Result<BucketCorsConfiguration, PutBucketCorsError>>,
+    output: Option<Result<BucketCorsConfiguration, PutCorsError>>,
 }
 
-impl PutBucketCorsOperation {
+impl PutCorsOperation {
     pub fn new(bucket: String, config: BucketCorsConfiguration) -> Self {
         Self {
             bucket,
             config,
-            state: PutBucketCorsState::Init,
+            state: PutCorsState::Init,
             txn_id: None,
             output: None,
         }
     }
 
-    fn fail(&mut self, err: PutBucketCorsError) -> Effects {
-        self.state = PutBucketCorsState::Error;
+    fn fail(&mut self, err: PutCorsError) -> Effects {
+        self.state = PutCorsState::Error;
         self.output = Some(Err(err));
         self.abort()
     }
@@ -71,23 +71,23 @@ impl PutBucketCorsOperation {
 
     fn state_name(&self) -> &'static str {
         match self.state {
-            PutBucketCorsState::Init => "Init",
-            PutBucketCorsState::StartTransaction => "StartTransaction",
-            PutBucketCorsState::ReadBucket => "ReadBucket",
-            PutBucketCorsState::WriteBucket => "WriteBucket",
-            PutBucketCorsState::CommitTransaction => "CommitTransaction",
-            PutBucketCorsState::Finish => "Finish",
-            PutBucketCorsState::Error => "Error",
+            PutCorsState::Init => "Init",
+            PutCorsState::StartTransaction => "StartTransaction",
+            PutCorsState::ReadBucket => "ReadBucket",
+            PutCorsState::WriteBucket => "WriteBucket",
+            PutCorsState::CommitTransaction => "CommitTransaction",
+            PutCorsState::Finish => "Finish",
+            PutCorsState::Error => "Error",
         }
     }
 }
 
-impl Operation for PutBucketCorsOperation {
+impl Operation for PutCorsOperation {
     type Output = BucketCorsConfiguration;
-    type Error = PutBucketCorsError;
+    type Error = PutCorsError;
 
     fn start(&mut self) -> Effects {
-        self.state = PutBucketCorsState::StartTransaction;
+        self.state = PutCorsState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
         })]
@@ -98,36 +98,36 @@ impl Operation for PutBucketCorsOperation {
             return self.fail(error.clone().into());
         }
         match self.state {
-            PutBucketCorsState::Init => self.start(),
-            PutBucketCorsState::StartTransaction => {
+            PutCorsState::Init => self.start(),
+            PutCorsState::StartTransaction => {
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return self.fail(PutBucketCorsError::InvalidStateEvent {
+                    return self.fail(PutCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::TransactionStarted)",
                         received: event,
                     });
                 };
                 self.txn_id = Some(txn_id);
-                self.state = PutBucketCorsState::ReadBucket;
+                self.state = PutCorsState::ReadBucket;
                 smallvec![Effect::Storage(StorageEffect::Read {
                     key_space: S3_BUCKET_KEYSPACE.to_string(),
                     key: self.write_key(),
                     txn_id: Some(txn_id),
                 })]
             }
-            PutBucketCorsState::ReadBucket => {
+            PutCorsState::ReadBucket => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(PutBucketCorsError::InvalidStateEvent {
+                    return self.fail(PutCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
                         received: event,
                     });
                 };
                 let Some(txn_id) = self.txn_id else {
-                    return self.fail(PutBucketCorsError::NoTransactionFound);
+                    return self.fail(PutCorsError::NoTransactionFound);
                 };
                 let Some(bytes) = value else {
-                    return self.fail(PutBucketCorsError::NotFound);
+                    return self.fail(PutCorsError::NotFound);
                 };
                 let mut bucket_info = match BucketInfo::from_bytes(&bytes) {
                     Ok(info) => info,
@@ -138,7 +138,7 @@ impl Operation for PutBucketCorsOperation {
                     Ok(value) => value,
                     Err(err) => return self.fail(err.into()),
                 };
-                self.state = PutBucketCorsState::WriteBucket;
+                self.state = PutCorsState::WriteBucket;
                 smallvec![Effect::Storage(StorageEffect::Write {
                     key_space: S3_BUCKET_KEYSPACE.to_string(),
                     key: self.write_key(),
@@ -146,47 +146,44 @@ impl Operation for PutBucketCorsOperation {
                     txn_id: Some(txn_id),
                 })]
             }
-            PutBucketCorsState::WriteBucket => {
+            PutCorsState::WriteBucket => {
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-                    return self.fail(PutBucketCorsError::InvalidStateEvent {
+                    return self.fail(PutCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::WriteResult)",
                         received: event,
                     });
                 };
                 let Some(txn_id) = self.txn_id else {
-                    return self.fail(PutBucketCorsError::NoTransactionFound);
+                    return self.fail(PutCorsError::NoTransactionFound);
                 };
-                self.state = PutBucketCorsState::CommitTransaction;
+                self.state = PutCorsState::CommitTransaction;
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
-            PutBucketCorsState::CommitTransaction => {
+            PutCorsState::CommitTransaction => {
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return self.fail(PutBucketCorsError::InvalidStateEvent {
+                    return self.fail(PutCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                         received: event,
                     });
                 };
                 self.txn_id = None;
-                self.state = PutBucketCorsState::Finish;
+                self.state = PutCorsState::Finish;
                 self.output = Some(Ok(self.config.clone()));
                 smallvec![]
             }
-            PutBucketCorsState::Finish => smallvec![],
-            PutBucketCorsState::Error => smallvec![],
+            PutCorsState::Finish => smallvec![],
+            PutCorsState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            PutBucketCorsState::Finish | PutBucketCorsState::Error
-        )
+        matches!(self.state, PutCorsState::Finish | PutCorsState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(PutBucketCorsError::NotFinished))
+        self.output.unwrap_or(Err(PutCorsError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -199,7 +196,7 @@ impl Operation for PutBucketCorsOperation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum GetBucketCorsState {
+enum GetCorsState {
     Init,
     ReadBucket,
     Finish,
@@ -207,7 +204,7 @@ enum GetBucketCorsState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum GetBucketCorsError {
+pub enum GetCorsError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -227,43 +224,43 @@ pub enum GetBucketCorsError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct GetBucketCorsOperation {
+pub struct GetCorsOperation {
     bucket: String,
-    state: GetBucketCorsState,
-    output: Option<Result<BucketCorsConfiguration, GetBucketCorsError>>,
+    state: GetCorsState,
+    output: Option<Result<BucketCorsConfiguration, GetCorsError>>,
 }
 
-impl GetBucketCorsOperation {
+impl GetCorsOperation {
     pub fn new(bucket: String) -> Self {
         Self {
             bucket,
-            state: GetBucketCorsState::Init,
+            state: GetCorsState::Init,
             output: None,
         }
     }
 
-    fn fail(&mut self, err: GetBucketCorsError) -> Effects {
-        self.state = GetBucketCorsState::Error;
+    fn fail(&mut self, err: GetCorsError) -> Effects {
+        self.state = GetCorsState::Error;
         self.output = Some(Err(err));
         smallvec![]
     }
 
     fn state_name(&self) -> &'static str {
         match self.state {
-            GetBucketCorsState::Init => "Init",
-            GetBucketCorsState::ReadBucket => "ReadBucket",
-            GetBucketCorsState::Finish => "Finish",
-            GetBucketCorsState::Error => "Error",
+            GetCorsState::Init => "Init",
+            GetCorsState::ReadBucket => "ReadBucket",
+            GetCorsState::Finish => "Finish",
+            GetCorsState::Error => "Error",
         }
     }
 }
 
-impl Operation for GetBucketCorsOperation {
+impl Operation for GetCorsOperation {
     type Output = BucketCorsConfiguration;
-    type Error = GetBucketCorsError;
+    type Error = GetCorsError;
 
     fn start(&mut self) -> Effects {
-        self.state = GetBucketCorsState::ReadBucket;
+        self.state = GetCorsState::ReadBucket;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_BUCKET_KEYSPACE.to_string(),
             key: self.bucket.as_bytes().to_vec().into(),
@@ -276,42 +273,37 @@ impl Operation for GetBucketCorsOperation {
             return self.fail(error.clone().into());
         }
         match self.state {
-            GetBucketCorsState::Init => self.start(),
-            GetBucketCorsState::ReadBucket => {
+            GetCorsState::Init => self.start(),
+            GetCorsState::ReadBucket => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(GetBucketCorsError::InvalidStateEvent {
+                    return self.fail(GetCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
                         received: event,
                     });
                 };
 
-                self.state = GetBucketCorsState::Finish;
+                self.state = GetCorsState::Finish;
                 self.output = Some(match value {
                     Some(bytes) => match BucketInfo::from_bytes(&bytes) {
-                        Ok(info) => info
-                            .cors_configuration
-                            .ok_or(GetBucketCorsError::CorsNotFound),
-                        Err(err) => Err(GetBucketCorsError::ConversionError(err)),
+                        Ok(info) => info.cors_configuration.ok_or(GetCorsError::CorsNotFound),
+                        Err(err) => Err(GetCorsError::ConversionError(err)),
                     },
-                    None => Err(GetBucketCorsError::BucketNotFound),
+                    None => Err(GetCorsError::BucketNotFound),
                 });
                 smallvec![]
             }
-            GetBucketCorsState::Finish => smallvec![],
-            GetBucketCorsState::Error => self.abort(),
+            GetCorsState::Finish => smallvec![],
+            GetCorsState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            GetBucketCorsState::Finish | GetBucketCorsState::Error
-        )
+        matches!(self.state, GetCorsState::Finish | GetCorsState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(GetBucketCorsError::NotFinished))
+        self.output.unwrap_or(Err(GetCorsError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -320,7 +312,7 @@ impl Operation for GetBucketCorsOperation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum DeleteBucketCorsState {
+enum DeleteCorsState {
     Init,
     StartTransaction,
     ReadBucket,
@@ -331,7 +323,7 @@ enum DeleteBucketCorsState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum DeleteBucketCorsError {
+pub enum DeleteCorsError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -351,25 +343,25 @@ pub enum DeleteBucketCorsError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct DeleteBucketCorsOperation {
+pub struct DeleteCorsOperation {
     bucket: String,
-    state: DeleteBucketCorsState,
+    state: DeleteCorsState,
     txn_id: Option<ulid::Ulid>,
-    output: Option<Result<(), DeleteBucketCorsError>>,
+    output: Option<Result<(), DeleteCorsError>>,
 }
 
-impl DeleteBucketCorsOperation {
+impl DeleteCorsOperation {
     pub fn new(bucket: String) -> Self {
         Self {
             bucket,
-            state: DeleteBucketCorsState::Init,
+            state: DeleteCorsState::Init,
             txn_id: None,
             output: None,
         }
     }
 
-    fn fail(&mut self, err: DeleteBucketCorsError) -> Effects {
-        self.state = DeleteBucketCorsState::Error;
+    fn fail(&mut self, err: DeleteCorsError) -> Effects {
+        self.state = DeleteCorsState::Error;
         self.output = Some(Err(err));
         self.abort()
     }
@@ -380,23 +372,23 @@ impl DeleteBucketCorsOperation {
 
     fn state_name(&self) -> &'static str {
         match self.state {
-            DeleteBucketCorsState::Init => "Init",
-            DeleteBucketCorsState::StartTransaction => "StartTransaction",
-            DeleteBucketCorsState::ReadBucket => "ReadBucket",
-            DeleteBucketCorsState::WriteBucket => "WriteBucket",
-            DeleteBucketCorsState::CommitTransaction => "CommitTransaction",
-            DeleteBucketCorsState::Finish => "Finish",
-            DeleteBucketCorsState::Error => "Error",
+            DeleteCorsState::Init => "Init",
+            DeleteCorsState::StartTransaction => "StartTransaction",
+            DeleteCorsState::ReadBucket => "ReadBucket",
+            DeleteCorsState::WriteBucket => "WriteBucket",
+            DeleteCorsState::CommitTransaction => "CommitTransaction",
+            DeleteCorsState::Finish => "Finish",
+            DeleteCorsState::Error => "Error",
         }
     }
 }
 
-impl Operation for DeleteBucketCorsOperation {
+impl Operation for DeleteCorsOperation {
     type Output = ();
-    type Error = DeleteBucketCorsError;
+    type Error = DeleteCorsError;
 
     fn start(&mut self) -> Effects {
-        self.state = DeleteBucketCorsState::StartTransaction;
+        self.state = DeleteCorsState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
         })]
@@ -407,36 +399,36 @@ impl Operation for DeleteBucketCorsOperation {
             return self.fail(error.clone().into());
         }
         match self.state {
-            DeleteBucketCorsState::Init => self.start(),
-            DeleteBucketCorsState::StartTransaction => {
+            DeleteCorsState::Init => self.start(),
+            DeleteCorsState::StartTransaction => {
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return self.fail(DeleteBucketCorsError::InvalidStateEvent {
+                    return self.fail(DeleteCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::TransactionStarted)",
                         received: event,
                     });
                 };
                 self.txn_id = Some(txn_id);
-                self.state = DeleteBucketCorsState::ReadBucket;
+                self.state = DeleteCorsState::ReadBucket;
                 smallvec![Effect::Storage(StorageEffect::Read {
                     key_space: S3_BUCKET_KEYSPACE.to_string(),
                     key: self.write_key(),
                     txn_id: Some(txn_id),
                 })]
             }
-            DeleteBucketCorsState::ReadBucket => {
+            DeleteCorsState::ReadBucket => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(DeleteBucketCorsError::InvalidStateEvent {
+                    return self.fail(DeleteCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
                         received: event,
                     });
                 };
                 let Some(txn_id) = self.txn_id else {
-                    return self.fail(DeleteBucketCorsError::NoTransactionFound);
+                    return self.fail(DeleteCorsError::NoTransactionFound);
                 };
                 let Some(bytes) = value else {
-                    return self.fail(DeleteBucketCorsError::NotFound);
+                    return self.fail(DeleteCorsError::NotFound);
                 };
                 let mut bucket_info = match BucketInfo::from_bytes(&bytes) {
                     Ok(info) => info,
@@ -447,7 +439,7 @@ impl Operation for DeleteBucketCorsOperation {
                     Ok(value) => value,
                     Err(err) => return self.fail(err.into()),
                 };
-                self.state = DeleteBucketCorsState::WriteBucket;
+                self.state = DeleteCorsState::WriteBucket;
                 smallvec![Effect::Storage(StorageEffect::Write {
                     key_space: S3_BUCKET_KEYSPACE.to_string(),
                     key: self.write_key(),
@@ -455,48 +447,44 @@ impl Operation for DeleteBucketCorsOperation {
                     txn_id: Some(txn_id),
                 })]
             }
-            DeleteBucketCorsState::WriteBucket => {
+            DeleteCorsState::WriteBucket => {
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-                    return self.fail(DeleteBucketCorsError::InvalidStateEvent {
+                    return self.fail(DeleteCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::WriteResult)",
                         received: event,
                     });
                 };
                 let Some(txn_id) = self.txn_id else {
-                    return self.fail(DeleteBucketCorsError::NoTransactionFound);
+                    return self.fail(DeleteCorsError::NoTransactionFound);
                 };
-                self.state = DeleteBucketCorsState::CommitTransaction;
+                self.state = DeleteCorsState::CommitTransaction;
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
-            DeleteBucketCorsState::CommitTransaction => {
+            DeleteCorsState::CommitTransaction => {
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return self.fail(DeleteBucketCorsError::InvalidStateEvent {
+                    return self.fail(DeleteCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                         received: event,
                     });
                 };
                 self.txn_id = None;
-                self.state = DeleteBucketCorsState::Finish;
+                self.state = DeleteCorsState::Finish;
                 self.output = Some(Ok(()));
                 smallvec![]
             }
-            DeleteBucketCorsState::Finish => smallvec![],
-            DeleteBucketCorsState::Error => smallvec![],
+            DeleteCorsState::Finish => smallvec![],
+            DeleteCorsState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            DeleteBucketCorsState::Finish | DeleteBucketCorsState::Error
-        )
+        matches!(self.state, DeleteCorsState::Finish | DeleteCorsState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(DeleteBucketCorsError::NotFinished))
+        self.output.unwrap_or(Err(DeleteCorsError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -511,8 +499,8 @@ impl Operation for DeleteBucketCorsOperation {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteBucketCorsError, DeleteBucketCorsOperation, GetBucketCorsError,
-        GetBucketCorsOperation, PutBucketCorsError, PutBucketCorsOperation,
+        DeleteCorsError, DeleteCorsOperation, GetCorsError, GetCorsOperation, PutCorsError,
+        PutCorsOperation,
     };
     use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
@@ -619,7 +607,7 @@ mod tests {
 
         let config = sample_cors();
         let stored = drive(
-            PutBucketCorsOperation::new(bucket.to_string(), config.clone()),
+            PutCorsOperation::new(bucket.to_string(), config.clone()),
             &context,
         )
         .await
@@ -632,12 +620,12 @@ mod tests {
         assert_eq!(persisted.created_by, original.created_by);
         assert_eq!(persisted.cors_configuration, Some(config.clone()));
 
-        let fetched = drive(GetBucketCorsOperation::new(bucket.to_string()), &context)
+        let fetched = drive(GetCorsOperation::new(bucket.to_string()), &context)
             .await
             .unwrap();
         assert_eq!(fetched, config);
 
-        drive(DeleteBucketCorsOperation::new(bucket.to_string()), &context)
+        drive(DeleteCorsOperation::new(bucket.to_string()), &context)
             .await
             .unwrap();
 
@@ -647,12 +635,12 @@ mod tests {
         assert_eq!(cleared.created_by, original.created_by);
         assert_eq!(cleared.cors_configuration, None);
 
-        let missing_cors = drive(GetBucketCorsOperation::new(bucket.to_string()), &context)
+        let missing_cors = drive(GetCorsOperation::new(bucket.to_string()), &context)
             .await
             .unwrap_err();
-        assert_eq!(missing_cors, GetBucketCorsError::CorsNotFound);
+        assert_eq!(missing_cors, GetCorsError::CorsNotFound);
 
-        drive(DeleteBucketCorsOperation::new(bucket.to_string()), &context)
+        drive(DeleteCorsOperation::new(bucket.to_string()), &context)
             .await
             .unwrap();
     }
@@ -663,29 +651,29 @@ mod tests {
 
         let context = make_context();
         let put_missing = drive(
-            PutBucketCorsOperation::new(bucket.clone(), sample_cors()),
+            PutCorsOperation::new(bucket.clone(), sample_cors()),
             &context,
         )
         .await
         .unwrap_err();
-        assert_eq!(put_missing, PutBucketCorsError::NotFound);
+        assert_eq!(put_missing, PutCorsError::NotFound);
 
-        let get_missing = drive(GetBucketCorsOperation::new(bucket.clone()), &context)
+        let get_missing = drive(GetCorsOperation::new(bucket.clone()), &context)
             .await
             .unwrap_err();
-        assert_eq!(get_missing, GetBucketCorsError::BucketNotFound);
+        assert_eq!(get_missing, GetCorsError::BucketNotFound);
 
-        let delete_missing = drive(DeleteBucketCorsOperation::new(bucket.clone()), &context)
+        let delete_missing = drive(DeleteCorsOperation::new(bucket.clone()), &context)
             .await
             .unwrap_err();
-        assert_eq!(delete_missing, DeleteBucketCorsError::NotFound);
+        assert_eq!(delete_missing, DeleteCorsError::NotFound);
 
         let context = make_context();
         write_bucket(&context, &bucket, &bucket_info(None)).await;
 
-        let get_no_config = drive(GetBucketCorsOperation::new(bucket.clone()), &context)
+        let get_no_config = drive(GetCorsOperation::new(bucket.clone()), &context)
             .await
             .unwrap_err();
-        assert_eq!(get_no_config, GetBucketCorsError::CorsNotFound);
+        assert_eq!(get_no_config, GetCorsError::CorsNotFound);
     }
 }
