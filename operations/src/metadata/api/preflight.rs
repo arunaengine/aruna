@@ -6,15 +6,16 @@ use super::{
     METADATA_DISTRIBUTED_QUERY_DEADLINE, METADATA_REFERENCES_DEFAULT_LIMIT,
     METADATA_REFERENCES_MAX_LIMIT, METADATA_REGISTRY_CANDIDATE_LIMIT,
     METADATA_SEARCH_MAX_PAGINATION_DEPTH, MetadataApiError, MetadataApiQueryMode,
-    MetadataAuthToken, MetadataFanoutOperation, MetadataFanoutScope, MetadataNodeCall,
-    MetadataRealmNodeDiscovery, MetadataReferenceEntry, MetadataReferencesRequest,
-    MetadataRegistryRecord, MetadataSearchHit, NodeId, NodeSearchResult, Permission,
-    REALM_DISCOVERY_TIMEOUT, RealmConfigDocument, RealmId, ResolveBlobPermissionPathsOperation,
-    SearchCursor, SearchCursorError, Serialize, StorageEffect, StorageEvent, Ulid, Value,
-    VersionKey, W3idDataIdentifier, bucket_permission_path, can_read_record,
-    deduplicate_fanout_nodes, drive, filter_live_records, forwarded_bearer, load_pending_records,
-    map_internal_error, map_read_error, metadata_node_call, object_permission_path, paginate,
-    record_preflight_node, resume_fetch_limit, run_metadata_fanout, select_fanout_nodes, warn,
+    MetadataAuthToken, MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats,
+    MetadataNodeCall, MetadataRealmNodeDiscovery, MetadataReferenceEntry,
+    MetadataReferencesRequest, MetadataRegistryRecord, MetadataSearchHit, NodeId, NodeSearchResult,
+    Permission, REALM_DISCOVERY_TIMEOUT, RealmConfigDocument, RealmId,
+    ResolveBlobPermissionPathsOperation, SearchCursor, SearchCursorError, SearchWatermark,
+    Serialize, StorageEffect, StorageEvent, Ulid, Value, VersionKey, W3idDataIdentifier,
+    bucket_permission_path, can_read_record, deduplicate_fanout_nodes, drive, filter_live_records,
+    forwarded_bearer, load_pending_records, map_internal_error, map_read_error, metadata_node_call,
+    object_permission_path, paginate, record_preflight_node, resume_fetch_limit,
+    run_metadata_fanout, select_fanout_nodes, warn,
 };
 
 use super::read::ensure_permission;
@@ -799,6 +800,25 @@ pub(super) struct ResolvedPreflightTargets {
     complete: bool,
 }
 
+pub(super) struct PreflightPlan {
+    pub(super) auth: AuthContext,
+    pub(super) bearer_token: Option<String>,
+    pub(super) s3_endpoint: Option<String>,
+    pub(super) cursor: Option<String>,
+    pub(super) page_size: usize,
+    pub(super) mode: Option<MetadataApiQueryMode>,
+    pub(super) target_nodes: Option<Vec<NodeId>>,
+    pub(super) allow_partial: bool,
+}
+
+pub(super) struct PreflightCursorPlan {
+    pub(super) fingerprint: [u8; 32],
+    pub(super) watermark: Option<SearchWatermark>,
+    pub(super) resume: HashMap<NodeId, u32>,
+    pub(super) target_nodes: Option<Vec<NodeId>>,
+    pub(super) discovery_failed: bool,
+}
+
 pub async fn references_preflight(
     context: &DriverContext,
     realm_id: RealmId,
@@ -806,6 +826,36 @@ pub async fn references_preflight(
     request: MetadataReferencePreflightRequest,
 ) -> Result<MetadataReferencePreflightExecution, MetadataApiError> {
     let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let (plan, target) = plan_preflight_request(realm_id, request)?;
+    let resolved = resolve_preflight_targets(
+        context,
+        realm_id,
+        local_node_id,
+        &plan.auth,
+        target,
+        plan.s3_endpoint.as_deref(),
+    )
+    .await?;
+    let cursor =
+        verify_preflight_cursor(context, realm_id, local_node_id, &plan, &resolved, deadline)
+            .await?;
+    let (node_parts, fanout_stats) = run_preflight_fanout(
+        context,
+        realm_id,
+        local_node_id,
+        &plan,
+        &resolved,
+        &cursor,
+        deadline,
+    )
+    .await?;
+    assemble_preflight_execution(context, resolved, &plan, cursor, node_parts, fanout_stats)
+}
+
+pub(super) fn plan_preflight_request(
+    realm_id: RealmId,
+    request: MetadataReferencePreflightRequest,
+) -> Result<(PreflightPlan, MetadataReferencePreflightTarget), MetadataApiError> {
     let MetadataReferencePreflightRequest {
         auth,
         bearer_token,
@@ -814,7 +864,7 @@ pub async fn references_preflight(
         limit,
         cursor,
         mode,
-        mut target_nodes,
+        target_nodes,
         allow_partial,
     } = request;
     if auth.realm_id != realm_id {
@@ -823,22 +873,36 @@ pub async fn references_preflight(
     let page_size = limit
         .unwrap_or(METADATA_REFERENCES_DEFAULT_LIMIT)
         .clamp(1, METADATA_REFERENCES_MAX_LIMIT);
-    let resolved = resolve_preflight_targets(
-        context,
-        realm_id,
-        local_node_id,
-        &auth,
+    Ok((
+        PreflightPlan {
+            auth,
+            bearer_token,
+            s3_endpoint,
+            cursor,
+            page_size,
+            mode,
+            target_nodes,
+            allow_partial,
+        },
         target,
-        s3_endpoint.as_deref(),
-    )
-    .await?;
-    let fingerprint = preflight_fingerprint(&resolved.targets, mode);
+    ))
+}
+
+pub(super) async fn verify_preflight_cursor(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    plan: &PreflightPlan,
+    resolved: &ResolvedPreflightTargets,
+    deadline: tokio::time::Instant,
+) -> Result<PreflightCursorPlan, MetadataApiError> {
+    let fingerprint = preflight_fingerprint(&resolved.targets, plan.mode);
     let mut cursor_discovery = None;
-    let (watermark, resume) = match cursor.as_deref() {
+    let (watermark, resume) = match plan.cursor.as_deref() {
         Some(raw) => {
-            let signer_nodes = match mode.unwrap_or(MetadataApiQueryMode::Distributed) {
+            let signer_nodes = match plan.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
                 MetadataApiQueryMode::Local => vec![local_node_id],
-                MetadataApiQueryMode::Distributed => match target_nodes.as_ref() {
+                MetadataApiQueryMode::Distributed => match plan.target_nodes.as_ref() {
                     Some(nodes) => {
                         let mut signers = nodes.clone();
                         signers.push(local_node_id);
@@ -879,10 +943,10 @@ pub async fn references_preflight(
         }
         None => (None, HashMap::new()),
     };
-    let discovery_failed = if cursor.is_some() {
-        let mut nodes = match target_nodes.as_ref() {
+    let (target_nodes, discovery_failed) = if plan.cursor.is_some() {
+        let mut nodes = match plan.target_nodes.as_ref() {
             Some(nodes) => select_fanout_nodes(nodes, local_node_id, &fingerprint),
-            None => match mode.unwrap_or(MetadataApiQueryMode::Distributed) {
+            None => match plan.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
                 MetadataApiQueryMode::Local => vec![local_node_id],
                 MetadataApiQueryMode::Distributed => cursor_discovery
                     .as_ref()
@@ -895,17 +959,42 @@ pub async fn references_preflight(
                 nodes.push(*node_id);
             }
         }
-        target_nodes = Some(deduplicate_fanout_nodes(nodes));
-        cursor_discovery
-            .as_ref()
-            .is_some_and(|discovery| discovery.failed)
+        (
+            Some(deduplicate_fanout_nodes(nodes)),
+            cursor_discovery
+                .as_ref()
+                .is_some_and(|discovery| discovery.failed),
+        )
     } else {
-        false
+        (plan.target_nodes.clone(), false)
     };
+    Ok(PreflightCursorPlan {
+        fingerprint,
+        watermark,
+        resume,
+        target_nodes,
+        discovery_failed,
+    })
+}
 
-    let resume = Arc::new(resume);
-    let remote_auth = forwarded_bearer(bearer_token.as_deref())?
-        .or_else(|| Some(MetadataAuthToken::internal(auth.clone())));
+pub(super) async fn run_preflight_fanout(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    plan: &PreflightPlan,
+    resolved: &ResolvedPreflightTargets,
+    cursor: &PreflightCursorPlan,
+    deadline: tokio::time::Instant,
+) -> Result<
+    (
+        Vec<(NodeId, MetadataReferencePreflightNodeExecution)>,
+        MetadataFanoutStats,
+    ),
+    MetadataApiError,
+> {
+    let resume = Arc::new(cursor.resume.clone());
+    let remote_auth = forwarded_bearer(plan.bearer_token.as_deref())?
+        .or_else(|| Some(MetadataAuthToken::internal(plan.auth.clone())));
     let handle = context
         .metadata_handle
         .clone()
@@ -914,11 +1003,11 @@ pub async fn references_preflight(
         (
             context.clone(),
             realm_id,
-            auth.clone(),
+            plan.auth.clone(),
             resolved.targets.clone(),
-            s3_endpoint.clone(),
+            plan.s3_endpoint.clone(),
             resume.clone(),
-            page_size,
+            plan.page_size,
         ),
         |(context, realm_id, auth, targets, endpoint, resume, page_size), node_id| async move {
             let limit = resume_fetch_limit(
@@ -936,7 +1025,7 @@ pub async fn references_preflight(
                 endpoint,
             )
             .await
-            .map_err(crate::metadata::forward::read_error)
+            .map_err(crate::forward::transport::read_error)
         },
     );
     let remote_call: MetadataNodeCall<MetadataReferencePreflightNodeExecution> = metadata_node_call(
@@ -945,7 +1034,7 @@ pub async fn references_preflight(
             remote_auth,
             resolved.targets.clone(),
             resume.clone(),
-            page_size,
+            plan.page_size,
         ),
         |(handle, auth_token, targets, resume, page_size), node_id| async move {
             let limit = resume_fetch_limit(
@@ -963,13 +1052,13 @@ pub async fn references_preflight(
                 .await
         },
     );
-    let (node_parts, fanout_stats) = run_metadata_fanout(
+    run_metadata_fanout(
         context,
         realm_id,
         local_node_id,
-        MetadataFanoutScope::new(mode, target_nodes, allow_partial)
-            .with_subject(fingerprint)
-            .with_discovery_failed(discovery_failed)
+        MetadataFanoutScope::new(plan.mode, cursor.target_nodes.clone(), plan.allow_partial)
+            .with_subject(cursor.fingerprint)
+            .with_discovery_failed(cursor.discovery_failed)
             .with_deadline(deadline),
         MetadataFanoutOperation::ReferencePreflight,
         local_call,
@@ -977,8 +1066,17 @@ pub async fn references_preflight(
         record_preflight_node,
         map_read_error,
     )
-    .await?;
+    .await
+}
 
+pub(super) fn assemble_preflight_execution(
+    context: &DriverContext,
+    resolved: ResolvedPreflightTargets,
+    plan: &PreflightPlan,
+    cursor: PreflightCursorPlan,
+    node_parts: Vec<(NodeId, MetadataReferencePreflightNodeExecution)>,
+    fanout_stats: MetadataFanoutStats,
+) -> Result<MetadataReferencePreflightExecution, MetadataApiError> {
     let mut node_results = Vec::new();
     let mut node_freshness = Vec::new();
     let mut hidden = BTreeSet::new();
@@ -1019,8 +1117,8 @@ pub async fn references_preflight(
     node_freshness.sort_by_key(|freshness| freshness.node_id.to_string());
     let page = paginate(
         node_results,
-        watermark,
-        page_size,
+        cursor.watermark,
+        plan.page_size,
         METADATA_SEARCH_MAX_PAGINATION_DEPTH,
     );
     let mut visible_by_target = BTreeMap::<String, Vec<MetadataPreflightVisibleReference>>::new();
@@ -1042,7 +1140,7 @@ pub async fn references_preflight(
         && index_current
         && path_style_endpoint_coverage_complete
         && !page.truncated;
-    if !allow_partial && !complete {
+    if !plan.allow_partial && !complete {
         return Err(MetadataApiError::ServiceUnavailable);
     }
     let targets = resolved
@@ -1078,7 +1176,7 @@ pub async fn references_preflight(
             })?;
             Some(
                 SearchCursor::new_signed(
-                    fingerprint,
+                    cursor.fingerprint,
                     next.watermark,
                     next.resume,
                     net.node_id(),
@@ -1092,7 +1190,7 @@ pub async fn references_preflight(
         None => None,
     };
     let distributed =
-        mode.unwrap_or(MetadataApiQueryMode::Distributed) == MetadataApiQueryMode::Distributed;
+        plan.mode.unwrap_or(MetadataApiQueryMode::Distributed) == MetadataApiQueryMode::Distributed;
     Ok(MetadataReferencePreflightExecution {
         targets,
         next_cursor,
