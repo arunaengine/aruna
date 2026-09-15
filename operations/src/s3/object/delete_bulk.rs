@@ -1,5 +1,5 @@
 use crate::driver::{DriverContext, drive};
-use crate::s3::delete_object::{
+use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
 use aruna_core::UserId;
@@ -9,15 +9,15 @@ use aruna_core::types::GroupId;
 use ulid::Ulid;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct DeleteObjectsEntry {
+pub struct BulkDeleteEntry {
     pub key: String,
     pub version_id: Option<Ulid>,
 }
 
 #[derive(Debug, PartialEq)]
-pub struct DeleteObjectsInput {
+pub struct BulkDeleteInput {
     pub bucket: String,
-    pub entries: Vec<DeleteObjectsEntry>,
+    pub entries: Vec<BulkDeleteEntry>,
     pub group_id: GroupId,
     pub realm_id: RealmId,
     pub node_id: NodeId,
@@ -26,7 +26,7 @@ pub struct DeleteObjectsInput {
 }
 
 #[derive(Debug)]
-pub struct DeleteObjectsEntryOutcome {
+pub struct BulkDeleteOutcome {
     pub key: String,
     pub requested_version_id: Option<Ulid>,
     pub result: Result<DeleteObjectResult, DeleteObjectError>,
@@ -34,8 +34,8 @@ pub struct DeleteObjectsEntryOutcome {
 
 pub async fn delete_objects(
     context: &DriverContext,
-    input: DeleteObjectsInput,
-) -> Vec<DeleteObjectsEntryOutcome> {
+    input: BulkDeleteInput,
+) -> Vec<BulkDeleteOutcome> {
     let mut outcomes = Vec::with_capacity(input.entries.len());
     for entry in input.entries {
         let result = drive(
@@ -53,7 +53,7 @@ pub async fn delete_objects(
         )
         .await;
 
-        outcomes.push(DeleteObjectsEntryOutcome {
+        outcomes.push(BulkDeleteOutcome {
             key: entry.key,
             requested_version_id: entry.version_id,
             result,
@@ -66,7 +66,7 @@ pub async fn delete_objects(
 mod test {
     use super::*;
     use crate::driver::drive;
-    use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{Backend, BackendConfig, RealmId, RoutingSnapshot};
@@ -170,18 +170,18 @@ mod test {
         let missing_version = Ulid::generate();
         let outcomes = delete_objects(
             &context,
-            DeleteObjectsInput {
+            BulkDeleteInput {
                 bucket: "mybucket".to_string(),
                 entries: vec![
-                    DeleteObjectsEntry {
+                    BulkDeleteEntry {
                         key: "present.txt".to_string(),
                         version_id: None,
                     },
-                    DeleteObjectsEntry {
+                    BulkDeleteEntry {
                         key: "absent.txt".to_string(),
                         version_id: None,
                     },
-                    DeleteObjectsEntry {
+                    BulkDeleteEntry {
                         key: "present.txt".to_string(),
                         version_id: Some(missing_version),
                     },
@@ -225,14 +225,14 @@ mod test {
 
         let outcomes = delete_objects(
             &context,
-            DeleteObjectsInput {
+            BulkDeleteInput {
                 bucket: "mybucket".to_string(),
                 entries: vec![
-                    DeleteObjectsEntry {
+                    BulkDeleteEntry {
                         key: "keep.txt".to_string(),
                         version_id: Some(Ulid::generate()),
                     },
-                    DeleteObjectsEntry {
+                    BulkDeleteEntry {
                         key: "keep.txt".to_string(),
                         version_id: None,
                     },

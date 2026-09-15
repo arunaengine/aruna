@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::S3_MULTIPART_OBJECT_METADATA_KEYSPACE;
 use aruna_core::structs::{
-    BackendLocation, BackendRef, BlobLocationKey, ManagedCopyKey, MultipartObjectMetadataKey,
+    BackendLocation, BackendRef, BlobLocationKey, ManagedCopyKey, MultipartObjectKey,
     MultipartObjectSummary, PlacementPolicyRef, VersionKey,
 };
 use ulid::Ulid;
@@ -102,7 +102,7 @@ pub(crate) fn multipart_summary_read(
     version_id: Ulid,
     txn_id: Option<Ulid>,
 ) -> Result<Effect, ConversionError> {
-    let key = MultipartObjectMetadataKey::summary(version_id).to_bytes()?;
+    let key = MultipartObjectKey::summary(version_id).to_bytes()?;
     Ok(Effect::Storage(StorageEffect::Read {
         key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
         key: key.into(),

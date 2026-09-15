@@ -1,7 +1,7 @@
-use crate::blob::holders::GetBlobHoldersOperation;
+use crate::blob::holders::GetHoldersOperation;
 use crate::blob::managed_copy::ManagedCopyError;
 use crate::blob::records::blob_location_read;
-use crate::connectors::{ResolveVersionSourceBindingInput, resolve_binding_effect};
+use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
@@ -9,16 +9,15 @@ use crate::replication::protocol::{
     BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReferenceAdvance,
 };
 use crate::replication::queue::{
-    LiveReplicationObligationRecord, QueueLiveVersionReplicationInput,
-    QueueLiveVersionReplicationOperation, live_obligation_entry,
+    LiveObligationRecord, LiveVersionInput, LiveVersionOperation, live_obligation_entry,
 };
-use crate::s3::object_lookup::{
+use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read, summary_from_read,
 };
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
-    ConversionError, SourceConnectorResolutionError, StagingSourceError, StorageError,
+    ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
@@ -30,7 +29,7 @@ use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType,
-    MultipartObjectMetadataKey, MultipartObjectSummary, PathRestriction, PlacementPolicyError,
+    MultipartObjectKey, MultipartObjectSummary, PathRestriction, PlacementPolicyError,
     PlacementPolicyRef, ResolvedSourceAccess, SourceMetadata, UsageDelta, VersionKey,
     VersionSourceBinding,
 };
@@ -118,7 +117,7 @@ pub enum GetObjectError {
     #[error(transparent)]
     UsageError(#[from] UsageUpdateError),
     #[error(transparent)]
-    ResolveReferenceError(#[from] SourceConnectorResolutionError),
+    ResolveReferenceError(#[from] SourceResolutionError),
     #[error(transparent)]
     StagingSourceError(#[from] StagingSourceError),
     #[error(transparent)]
@@ -545,9 +544,7 @@ impl GetObjectOperation {
                 self.last_refresh = None;
                 self.version_created_at = None;
                 self.state = GetObjectState::ResolveReferenceAccess;
-                smallvec![resolve_binding_effect(ResolveVersionSourceBindingInput {
-                    source
-                },)]
+                smallvec![resolve_binding_effect(ResolveBindingInput { source },)]
             }
         }
     }
@@ -964,7 +961,7 @@ impl GetObjectOperation {
 
         // The durable obligation rides the same transaction as the successor, so
         // a lost enqueue is still discoverable by the repair scanner.
-        let obligation = LiveReplicationObligationRecord::new(
+        let obligation = LiveObligationRecord::new(
             self.input.node_id,
             self.auth_context(),
             self.input.bucket.clone(),
@@ -1080,7 +1077,7 @@ impl GetObjectOperation {
         };
         self.state = GetObjectState::QueueSuccessorReplication;
         smallvec![Effect::SubOperation(boxed_suboperation(
-            QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+            LiveVersionOperation::new(LiveVersionInput {
                 local_node_id: self.input.node_id,
                 auth_context: self.auth_context(),
                 bucket: self.input.bucket.clone(),
@@ -1501,7 +1498,7 @@ async fn routed_blob(
         .ok_or(GetObjectError::GetObjectFailed)?;
     let realm_id = read.user_id.realm_id;
     let holders = drive(
-        GetBlobHoldersOperation::new(read.blake3, realm_id, net_handle.node_id()),
+        GetHoldersOperation::new(read.blake3, realm_id, net_handle.node_id()),
         context,
     )
     .await
@@ -1551,7 +1548,7 @@ async fn routed_metadata(
         .ok_or(GetObjectError::GetObjectFailed)?;
     let realm_id = read.user_id.realm_id;
     let holders = drive(
-        GetBlobHoldersOperation::new(read.blake3, realm_id, net_handle.node_id()),
+        GetHoldersOperation::new(read.blake3, realm_id, net_handle.node_id()),
         context,
     )
     .await
@@ -1646,7 +1643,7 @@ async fn local_multipart_summary(
     let Some(version_id) = version_id else {
         return Ok(None);
     };
-    let key = MultipartObjectMetadataKey::summary(version_id)
+    let key = MultipartObjectKey::summary(version_id)
         .to_bytes()
         .map_err(GetObjectError::ConversionError)?;
     let event = context
@@ -1667,4 +1664,5 @@ async fn local_multipart_summary(
 }
 
 #[cfg(test)]
+#[path = "get_tests.rs"]
 mod test;

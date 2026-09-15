@@ -2,12 +2,12 @@ use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     routing_snapshot,
 };
-use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::head_object::{
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::s3::purge_fence::ensure_write_allowed;
-use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::reference::{
     MaterializeReferenceError, ReferenceWrite, write_reference_version,
 };
@@ -68,7 +68,7 @@ pub struct CopyObjectInput {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct CopyObjectResultData {
+pub struct CopyResultData {
     /// The stored bytes; `None` for a copy that stayed a reference.
     pub location: Option<BackendLocation>,
     pub size: u64,
@@ -175,7 +175,7 @@ pub(crate) fn evaluate_source_conditions(
 pub async fn copy_object(
     context: &DriverContext,
     input: CopyObjectInput,
-) -> Result<CopyObjectResultData, CopyObjectError> {
+) -> Result<CopyResultData, CopyObjectError> {
     copy_object_tracked(context, input, None).await
 }
 
@@ -185,7 +185,7 @@ pub async fn copy_object_tracked(
     context: &DriverContext,
     input: CopyObjectInput,
     progress: Option<Arc<AtomicU64>>,
-) -> Result<CopyObjectResultData, CopyObjectError> {
+) -> Result<CopyResultData, CopyObjectError> {
     ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
         .await
         .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
@@ -309,7 +309,7 @@ pub async fn copy_object_tracked(
     // The new version time owns copy time when dedup reuses an older location.
     let created_at = UNIX_EPOCH + Duration::from_millis(put_result.version_id.timestamp_ms());
 
-    Ok(CopyObjectResultData {
+    Ok(CopyResultData {
         size: put_result.location.blob_size,
         location: Some(put_result.location),
         source_metadata: None,
@@ -327,7 +327,7 @@ async fn preserve_reference(
     input: CopyObjectInput,
     head: HeadObjectResult,
     source_last_modified: Option<SystemTime>,
-) -> Result<CopyObjectResultData, CopyObjectError> {
+) -> Result<CopyResultData, CopyObjectError> {
     let (Some(binding), Some(metadata)) = (head.source_binding, head.source_metadata) else {
         return Err(CopyObjectError::Get(GetObjectError::GetObjectFailed));
     };
@@ -351,7 +351,7 @@ async fn preserve_reference(
         },
     )
     .await?;
-    Ok(CopyObjectResultData {
+    Ok(CopyResultData {
         location: None,
         size: metadata.content_length,
         source_metadata: Some(metadata),
@@ -365,8 +365,8 @@ async fn preserve_reference(
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use crate::s3::get_object::{GetObjectOperation, MAX_AUTO_ADVANCES};
-    use crate::tests::fixtures::policy::{seed_gate, subject};
+    use crate::s3::object::get::{GetObjectOperation, MAX_AUTO_ADVANCES};
+    use crate::tests::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;
     use aruna_core::egress::EgressPolicy;
@@ -832,7 +832,7 @@ pub(crate) mod test {
     // A copy reading a capped reference must surface the exact variant, so the
     // caller learns that only an explicit rebind heals it.
     #[tokio::test]
-    async fn preserved_copy_keeps_reference() {
+    async fn copy_preserves_reference() {
         // A kept reference is cloned from the source version alone: the
         // connector is never contacted, so the source may be unreachable.
         let (_temp, context) = full_context().await;
@@ -912,7 +912,7 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn same_backend_copy_adopts() {
+    async fn backend_copy_adopts() {
         // Bytes the destination's backend already holds are adopted without a
         // stream: nothing passes the progress counter and the location is shared.
         let (_temp, context) = full_context().await;
