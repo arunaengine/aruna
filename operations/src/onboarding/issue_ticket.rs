@@ -1,11 +1,11 @@
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USER_KEYSPACE;
-use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
+use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
 use aruna_core::operation::Operation;
 use aruna_core::structs::RealmId;
 use aruna_core::types::{Effects, Key};
@@ -17,7 +17,7 @@ pub const ONBOARDING_SYNC_TICKET_TTL_SECS: u64 = 300;
 const USER_SYNC_TICKET_PAGE_SIZE: usize = 512;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct IssueOnboardingSyncTicketInput {
+pub struct IssueSyncInput {
     pub realm_signing_key: SigningKey,
     pub realm_id: RealmId,
     /// Node the ticket is issued to.
@@ -29,16 +29,16 @@ pub struct IssueOnboardingSyncTicketInput {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct IssueOnboardingSyncTicketOperation {
-    input: IssueOnboardingSyncTicketInput,
-    state: IssueOnboardingSyncTicketState,
-    documents: Vec<DocumentSyncTarget>,
+pub struct IssueSyncOperation {
+    input: IssueSyncInput,
+    state: IssueSyncState,
+    documents: Vec<DocumentTarget>,
     next_start_after: Option<Key>,
-    output: Option<Result<OnboardingSyncTicket, IssueOnboardingSyncTicketError>>,
+    output: Option<Result<OnboardingTicket, IssueSyncError>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum IssueOnboardingSyncTicketState {
+enum IssueSyncState {
     Init,
     ListUsers,
     Finish,
@@ -46,7 +46,7 @@ enum IssueOnboardingSyncTicketState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum IssueOnboardingSyncTicketError {
+pub enum IssueSyncError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -63,32 +63,32 @@ pub enum IssueOnboardingSyncTicketError {
     },
 }
 
-impl IssueOnboardingSyncTicketOperation {
-    pub fn new(input: IssueOnboardingSyncTicketInput) -> Self {
+impl IssueSyncOperation {
+    pub fn new(input: IssueSyncInput) -> Self {
         let documents = vec![
-            DocumentSyncTarget::RealmAuthorization {
+            DocumentTarget::RealmAuthorization {
                 realm_id: input.realm_id,
             },
-            DocumentSyncTarget::RealmConfig {
+            DocumentTarget::RealmConfig {
                 realm_id: input.realm_id,
             },
-            DocumentSyncTarget::NodeUsage {
+            DocumentTarget::NodeUsage {
                 realm_id: input.realm_id,
                 node_id: input.issuer_node_id,
                 group_id: None,
             },
-            DocumentSyncTarget::NodeInfo {
+            DocumentTarget::NodeInfo {
                 realm_id: input.realm_id,
                 node_id: input.issuer_node_id,
             },
-            DocumentSyncTarget::WatchInterest {
+            DocumentTarget::WatchInterest {
                 realm_id: input.realm_id,
                 node_id: input.issuer_node_id,
             },
         ];
         Self {
             input,
-            state: IssueOnboardingSyncTicketState::Init,
+            state: IssueSyncState::Init,
             documents,
             next_start_after: None,
             output: None,
@@ -96,7 +96,7 @@ impl IssueOnboardingSyncTicketOperation {
     }
 
     fn emit_list_users(&mut self) -> Effects {
-        self.state = IssueOnboardingSyncTicketState::ListUsers;
+        self.state = IssueSyncState::ListUsers;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: USER_KEYSPACE.to_string(),
             prefix: Some(UserId::storage_prefix(self.input.realm_id)),
@@ -107,7 +107,7 @@ impl IssueOnboardingSyncTicketOperation {
     }
 
     fn finish(&mut self) -> Effects {
-        match OnboardingSyncTicket::issue(
+        match OnboardingTicket::issue(
             &self.input.realm_signing_key,
             &self.input.realm_id,
             self.input.node_id,
@@ -115,27 +115,27 @@ impl IssueOnboardingSyncTicketOperation {
             std::mem::take(&mut self.documents),
         ) {
             Ok(ticket) => {
-                self.state = IssueOnboardingSyncTicketState::Finish;
+                self.state = IssueSyncState::Finish;
                 self.output = Some(Ok(ticket));
             }
             Err(error) => {
-                self.state = IssueOnboardingSyncTicketState::Error;
+                self.state = IssueSyncState::Error;
                 self.output = Some(Err(error.into()));
             }
         }
         smallvec![]
     }
 
-    fn fail(&mut self, error: IssueOnboardingSyncTicketError) -> Effects {
-        self.state = IssueOnboardingSyncTicketState::Error;
+    fn fail(&mut self, error: IssueSyncError) -> Effects {
+        self.state = IssueSyncState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 }
 
-impl Operation for IssueOnboardingSyncTicketOperation {
-    type Output = OnboardingSyncTicket;
-    type Error = IssueOnboardingSyncTicketError;
+impl Operation for IssueSyncOperation {
+    type Output = OnboardingTicket;
+    type Error = IssueSyncError;
 
     fn start(&mut self) -> Effects {
         self.emit_list_users()
@@ -143,7 +143,7 @@ impl Operation for IssueOnboardingSyncTicketOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            IssueOnboardingSyncTicketState::ListUsers => match event {
+            IssueSyncState::ListUsers => match event {
                 Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
@@ -151,7 +151,7 @@ impl Operation for IssueOnboardingSyncTicketOperation {
                     for (key, _) in values {
                         match UserId::from_storage_key(&key) {
                             Ok(user_id) if user_id.realm_id == self.input.realm_id => {
-                                self.documents.push(DocumentSyncTarget::User { user_id });
+                                self.documents.push(DocumentTarget::User { user_id });
                             }
                             Ok(_) => {}
                             Err(error) => return self.fail(error.into()),
@@ -165,28 +165,22 @@ impl Operation for IssueOnboardingSyncTicketOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(IssueOnboardingSyncTicketError::UnexpectedEvent {
+                other => self.fail(IssueSyncError::UnexpectedEvent {
                     state: format!("{:?}", self.state),
                     expected: "storage iter result",
                     got: format!("{other:?}"),
                 }),
             },
-            IssueOnboardingSyncTicketState::Init
-            | IssueOnboardingSyncTicketState::Finish
-            | IssueOnboardingSyncTicketState::Error => smallvec![],
+            IssueSyncState::Init | IssueSyncState::Finish | IssueSyncState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            IssueOnboardingSyncTicketState::Finish | IssueOnboardingSyncTicketState::Error
-        )
+        matches!(self.state, IssueSyncState::Finish | IssueSyncState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .ok_or(IssueOnboardingSyncTicketError::NotFinished)?
+        self.output.ok_or(IssueSyncError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -196,13 +190,10 @@ impl Operation for IssueOnboardingSyncTicketOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        IssueOnboardingSyncTicketInput, IssueOnboardingSyncTicketOperation,
-        ONBOARDING_SYNC_TICKET_TTL_SECS,
-    };
+    use super::{IssueSyncInput, IssueSyncOperation, ONBOARDING_SYNC_TICKET_TTL_SECS};
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
-    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USER_KEYSPACE;
@@ -220,15 +211,14 @@ mod tests {
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let joiner_node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
         let issuer_node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
-        let mut operation =
-            IssueOnboardingSyncTicketOperation::new(IssueOnboardingSyncTicketInput {
-                realm_signing_key,
-                realm_id,
-                node_id: joiner_node_id,
-                issuer_node_id,
-                now: 100,
-                ttl_secs: ONBOARDING_SYNC_TICKET_TTL_SECS,
-            });
+        let mut operation = IssueSyncOperation::new(IssueSyncInput {
+            realm_signing_key,
+            realm_id,
+            node_id: joiner_node_id,
+            issuer_node_id,
+            now: 100,
+            ttl_secs: ONBOARDING_SYNC_TICKET_TTL_SECS,
+        });
 
         assert_eq!(operation.start().len(), 1);
         assert!(
@@ -245,18 +235,18 @@ mod tests {
         assert_eq!(
             ticket.payload.documents,
             vec![
-                DocumentSyncTarget::RealmAuthorization { realm_id },
-                DocumentSyncTarget::RealmConfig { realm_id },
-                DocumentSyncTarget::NodeUsage {
+                DocumentTarget::RealmAuthorization { realm_id },
+                DocumentTarget::RealmConfig { realm_id },
+                DocumentTarget::NodeUsage {
                     realm_id,
                     node_id: issuer_node_id,
                     group_id: None,
                 },
-                DocumentSyncTarget::NodeInfo {
+                DocumentTarget::NodeInfo {
                     realm_id,
                     node_id: issuer_node_id,
                 },
-                DocumentSyncTarget::WatchInterest {
+                DocumentTarget::WatchInterest {
                     realm_id,
                     node_id: issuer_node_id,
                 },
@@ -265,7 +255,7 @@ mod tests {
         ticket
             .verify(
                 joiner_node_id,
-                &DocumentSyncTarget::NodeInfo {
+                &DocumentTarget::NodeInfo {
                     realm_id,
                     node_id: issuer_node_id,
                 },
@@ -314,7 +304,7 @@ mod tests {
         }
 
         let ticket = drive(
-            IssueOnboardingSyncTicketOperation::new(IssueOnboardingSyncTicketInput {
+            IssueSyncOperation::new(IssueSyncInput {
                 realm_signing_key,
                 realm_id,
                 node_id,
@@ -331,14 +321,14 @@ mod tests {
             .payload
             .documents
             .iter()
-            .filter(|document| matches!(document, DocumentSyncTarget::User { .. }))
+            .filter(|document| matches!(document, DocumentTarget::User { .. }))
             .count();
         assert_eq!(users, user_count);
         assert!(
             ticket
                 .payload
                 .documents
-                .contains(&DocumentSyncTarget::NodeUsage {
+                .contains(&DocumentTarget::NodeUsage {
                     realm_id,
                     node_id: issuer_node_id,
                     group_id: None,
@@ -348,7 +338,7 @@ mod tests {
             ticket
                 .payload
                 .documents
-                .contains(&DocumentSyncTarget::NodeInfo {
+                .contains(&DocumentTarget::NodeInfo {
                     realm_id,
                     node_id: issuer_node_id,
                 })
@@ -357,7 +347,7 @@ mod tests {
             ticket
                 .payload
                 .documents
-                .contains(&DocumentSyncTarget::WatchInterest {
+                .contains(&DocumentTarget::WatchInterest {
                     realm_id,
                     node_id: issuer_node_id,
                 })

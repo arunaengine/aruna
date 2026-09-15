@@ -19,29 +19,26 @@ use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperat
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::notifications::watch::interest::mark_interest_dirty;
 use crate::onboarding::consume_secret::{
-    ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
+    ConsumeSecretError, ConsumeSecretInput, ConsumeSecretOperation,
 };
 use crate::onboarding::issue_ticket::{
-    IssueOnboardingSyncTicketError, IssueOnboardingSyncTicketInput,
-    IssueOnboardingSyncTicketOperation, ONBOARDING_SYNC_TICKET_TTL_SECS,
+    IssueSyncError, IssueSyncInput, IssueSyncOperation, ONBOARDING_SYNC_TICKET_TTL_SECS,
 };
 use crate::onboarding::reserve_secret::{
-    ReserveOnboardingSecretError, ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
+    ReserveSecretError, ReserveSecretInput, ReserveSecretOperation,
 };
 use crate::placement::expand_placement::{ensure_activated_map, expand_realm_placement};
 use crate::placement::process_placements::reconcile_shard_topics;
-use crate::realm::ensure_config::{
-    EnsureRealmConfigConfig, EnsureRealmConfigError, EnsureRealmConfigOperation,
-};
-use crate::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
-use crate::realm::mutate_placement::{MutateRealmPlacementError, RealmPlacementMutation};
-use crate::realm::read_authorization::ReadRealmAuthorizationOperation;
+use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
+use crate::realm::get_config::{GetConfigError, GetConfigOperation};
+use crate::realm::mutate_placement::{MutatePlacementError, RealmPlacementMutation};
+use crate::realm::read_authorization::ReadAuthorizationOperation;
 
 const ONBOARDING_RESERVATION_TTL_SECS: u64 = 300;
 const REALM_NODE_UPDATE_RETRIES: usize = 5;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct BootstrapOnboardingFinalizeInput {
+pub struct BootstrapFinalizeInput {
     pub enrollment_id: Ulid,
     pub secret_hash: String,
     pub node_id: NodeId,
@@ -59,25 +56,25 @@ pub struct BootstrapOnboardingFinalizeInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BootstrapOnboardingFinalizeOutput {
+pub struct BootstrapFinalizeOutput {
     pub mode: OnboardingMode,
     pub onboarding_sync_ticket: String,
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum BootstrapOnboardingFinalizeError {
+pub enum BootstrapFinalizeError {
     #[error(transparent)]
-    Reserve(#[from] ReserveOnboardingSecretError),
+    Reserve(#[from] ReserveSecretError),
     #[error(transparent)]
-    EnsureRealmConfig(#[from] EnsureRealmConfigError),
+    EnsureRealmConfig(#[from] EnsureConfigError),
     #[error(transparent)]
-    SetNodePlacement(#[from] MutateRealmPlacementError),
+    SetNodePlacement(#[from] MutatePlacementError),
     #[error(transparent)]
-    GetRealmConfig(#[from] GetRealmConfigError),
+    GetRealmConfig(#[from] GetConfigError),
     #[error(transparent)]
-    IssueTicket(#[from] IssueOnboardingSyncTicketError),
+    IssueTicket(#[from] IssueSyncError),
     #[error(transparent)]
-    Consume(#[from] ConsumeOnboardingSecretError),
+    Consume(#[from] ConsumeSecretError),
     #[error(transparent)]
     OnboardingSecret(#[from] OnboardingSecretError),
     #[error("net handle unavailable")]
@@ -93,13 +90,13 @@ pub enum BootstrapOnboardingFinalizeError {
 }
 
 pub async fn bootstrap_onboarding_finalize(
-    input: BootstrapOnboardingFinalizeInput,
+    input: BootstrapFinalizeInput,
     context: Arc<DriverContext>,
-) -> Result<BootstrapOnboardingFinalizeOutput, BootstrapOnboardingFinalizeError> {
+) -> Result<BootstrapFinalizeOutput, BootstrapFinalizeError> {
     let placement_entry = build_joiner_entry(&input)?;
 
     let reserved = drive(
-        ReserveOnboardingSecretOperation::new(ReserveOnboardingSecretInput {
+        ReserveSecretOperation::new(ReserveSecretInput {
             enrollment_id: input.enrollment_id,
             secret_hash: input.secret_hash.clone(),
             node_id: input.node_id.to_string(),
@@ -119,7 +116,7 @@ pub async fn bootstrap_onboarding_finalize(
     process_pending_placements(&input, &context).await;
 
     let ticket = drive(
-        IssueOnboardingSyncTicketOperation::new(IssueOnboardingSyncTicketInput {
+        IssueSyncOperation::new(IssueSyncInput {
             realm_signing_key: input.realm_signing_key,
             realm_id: input.realm_id,
             node_id: input.node_id,
@@ -140,21 +137,21 @@ pub async fn bootstrap_onboarding_finalize(
         let net_handle = context
             .net_handle
             .as_ref()
-            .ok_or(BootstrapOnboardingFinalizeError::NetHandleUnavailable)?;
+            .ok_or(BootstrapFinalizeError::NetHandleUnavailable)?;
         // The issuer may create shared topics. Only rank-zero holders create shard geneses,
         // so the joiner becomes a shard member without minting.
         net_handle
             .ensure_sync_topics(&onboarding_topics.shared, vec![input.node_id])
-            .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
+            .map_err(|error| BootstrapFinalizeError::PeerAdmission(error.to_string()))?;
         let mut all_topics = onboarding_topics.shared;
         all_topics.extend(onboarding_topics.shard);
         net_handle
             .allow_topic_peers(&all_topics, vec![input.node_id])
-            .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
+            .map_err(|error| BootstrapFinalizeError::PeerAdmission(error.to_string()))?;
     }
 
     let consumed = drive(
-        ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
+        ConsumeSecretOperation::new(ConsumeSecretInput {
             enrollment_id: input.enrollment_id,
             secret_hash: input.secret_hash,
             node_id: input.node_id.to_string(),
@@ -168,14 +165,14 @@ pub async fn bootstrap_onboarding_finalize(
         emit_onboarded_notification(input.realm_id, input.node_id, context.as_ref()).await;
     }
 
-    Ok(BootstrapOnboardingFinalizeOutput {
+    Ok(BootstrapFinalizeOutput {
         mode: reserved.mode,
         onboarding_sync_ticket: encoded_ticket,
     })
 }
 
 async fn emit_onboarded_notification(realm_id: RealmId, node_id: NodeId, context: &DriverContext) {
-    let realm_auth = match drive(ReadRealmAuthorizationOperation::new(realm_id), context).await {
+    let realm_auth = match drive(ReadAuthorizationOperation::new(realm_id), context).await {
         Ok(Some(doc)) => doc,
         Ok(None) => {
             warn!(realm_id = %realm_id, "Skipping node onboarding notification: no realm authorization document");
@@ -208,10 +205,10 @@ async fn emit_onboarded_notification(realm_id: RealmId, node_id: NodeId, context
 }
 
 async fn ensure_realm_node(
-    input: &BootstrapOnboardingFinalizeInput,
+    input: &BootstrapFinalizeInput,
     mode: OnboardingMode,
     context: &DriverContext,
-) -> Result<(), EnsureRealmConfigError> {
+) -> Result<(), EnsureConfigError> {
     let mut last_conflict = None;
     for _ in 0..REALM_NODE_UPDATE_RETRIES {
         match ensure_node_once(input, mode, context).await {
@@ -221,25 +218,25 @@ async fn ensure_realm_node(
                 }
                 return Ok(());
             }
-            Err(EnsureRealmConfigError::StorageError(StorageError::TransactionConflict)) => {
+            Err(EnsureConfigError::StorageError(StorageError::TransactionConflict)) => {
                 last_conflict = Some(StorageError::TransactionConflict);
             }
             Err(error) => return Err(error),
         }
     }
 
-    Err(EnsureRealmConfigError::StorageError(
+    Err(EnsureConfigError::StorageError(
         last_conflict.unwrap_or(StorageError::TransactionConflict),
     ))
 }
 
 async fn ensure_node_once(
-    input: &BootstrapOnboardingFinalizeInput,
+    input: &BootstrapFinalizeInput,
     mode: OnboardingMode,
     context: &DriverContext,
-) -> Result<(), EnsureRealmConfigError> {
+) -> Result<(), EnsureConfigError> {
     drive(
-        EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+        EnsureConfigOperation::new(EnsureConfigParams {
             actor: Actor {
                 node_id: input.local_node_id,
                 user_id: UserId::nil(input.realm_id),
@@ -269,16 +266,14 @@ fn onboarding_node_kind(mode: OnboardingMode) -> RealmNodeKind {
 }
 
 fn build_joiner_entry(
-    input: &BootstrapOnboardingFinalizeInput,
-) -> Result<NodePlacementEntry, BootstrapOnboardingFinalizeError> {
+    input: &BootstrapFinalizeInput,
+) -> Result<NodePlacementEntry, BootstrapFinalizeError> {
     if let Some(label) = reserved_label(&input.node_labels) {
-        return Err(BootstrapOnboardingFinalizeError::ReservedNodeLabel(
-            label.to_string(),
-        ));
+        return Err(BootstrapFinalizeError::ReservedNodeLabel(label.to_string()));
     }
     let (location, weight) =
         normalize_placement_input(input.node_location.as_deref(), input.node_weight)
-            .map_err(|_| BootstrapOnboardingFinalizeError::NodeLocationTooLong)?;
+            .map_err(|_| BootstrapFinalizeError::NodeLocationTooLong)?;
 
     Ok(NodePlacementEntry {
         node_id: input.node_id,
@@ -290,7 +285,7 @@ fn build_joiner_entry(
     })
 }
 
-fn realm_actor(input: &BootstrapOnboardingFinalizeInput) -> Actor {
+fn realm_actor(input: &BootstrapFinalizeInput) -> Actor {
     Actor {
         node_id: input.local_node_id,
         user_id: UserId::nil(input.realm_id),
@@ -299,10 +294,10 @@ fn realm_actor(input: &BootstrapOnboardingFinalizeInput) -> Actor {
 }
 
 async fn set_joiner_entry(
-    input: &BootstrapOnboardingFinalizeInput,
+    input: &BootstrapFinalizeInput,
     entry: NodePlacementEntry,
     context: &DriverContext,
-) -> Result<(), BootstrapOnboardingFinalizeError> {
+) -> Result<(), BootstrapFinalizeError> {
     crate::placement::expand_placement::mutate(
         context,
         &realm_actor(input),
@@ -312,10 +307,7 @@ async fn set_joiner_entry(
     Ok(())
 }
 
-async fn process_pending_placements(
-    input: &BootstrapOnboardingFinalizeInput,
-    context: &Arc<DriverContext>,
-) {
+async fn process_pending_placements(input: &BootstrapFinalizeInput, context: &Arc<DriverContext>) {
     // Expansion arms placement timers, keeping transition steps outside bootstrap.
     // Only topic membership is reconciled inline.
     reconcile_shard_topics(context, input.realm_id, input.local_node_id).await;
@@ -333,29 +325,27 @@ async fn onboarding_sync_topics(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     joiner_node_id: NodeId,
-    ticket: &aruna_core::onboarding::OnboardingSyncTicket,
-) -> Result<OnboardingSyncTopics, BootstrapOnboardingFinalizeError> {
-    use aruna_core::document::DocumentSyncTarget;
+    ticket: &aruna_core::onboarding::OnboardingTicket,
+) -> Result<OnboardingSyncTopics, BootstrapFinalizeError> {
+    use aruna_core::document::DocumentTarget;
     use aruna_core::structs::PlacementRef;
-    let config = drive(GetRealmConfigOperation::new(realm_id), context.as_ref()).await?;
+    let config = drive(GetConfigOperation::new(realm_id), context.as_ref()).await?;
     let mut topics = OnboardingSyncTopics {
         shared: Vec::new(),
         shard: Vec::new(),
     };
     for document in &ticket.payload.documents {
         if document.uses_shard_topic() {
-            if !matches!(document, DocumentSyncTarget::User { .. }) {
+            if !matches!(document, DocumentTarget::User { .. }) {
                 continue;
             }
             let placement =
                 crate::placement::target_placement_ref(&config, document, Default::default());
             if placement == PlacementRef::NIL {
-                let DocumentSyncTarget::User { user_id } = document else {
+                let DocumentTarget::User { user_id } = document else {
                     unreachable!("shard onboarding documents are restricted to users");
                 };
-                return Err(BootstrapOnboardingFinalizeError::UserPlacementUnavailable(
-                    *user_id,
-                ));
+                return Err(BootstrapFinalizeError::UserPlacementUnavailable(*user_id));
             }
             if crate::placement::holds_placement(&config, &placement, joiner_node_id) {
                 topics
@@ -374,27 +364,24 @@ async fn onboarding_sync_topics(
 #[cfg(test)]
 mod tests {
     use super::{
-        BootstrapOnboardingFinalizeError, BootstrapOnboardingFinalizeInput,
-        bootstrap_onboarding_finalize, emit_onboarded_notification, onboarding_node_kind,
-        onboarding_sync_topics,
+        BootstrapFinalizeError, BootstrapFinalizeInput, bootstrap_onboarding_finalize,
+        emit_onboarded_notification, onboarding_node_kind, onboarding_sync_topics,
     };
     use crate::driver::{DriverContext, drive};
-    use crate::onboarding::create_secret::{
-        CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
-    };
-    use crate::onboarding::reserve_secret::ReserveOnboardingSecretError;
+    use crate::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
+    use crate::onboarding::reserve_secret::ReserveSecretError;
     use crate::onboarding::secret_state::secret_state_key;
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::realm::get_config::{GetRealmConfigError, GetRealmConfigOperation};
+    use crate::realm::get_config::{GetConfigError, GetConfigOperation};
     use aruna_core::NodeId;
     use aruna_core::UserId;
-    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE, ONBOARDING_KEYSPACE};
     use aruna_core::onboarding::{
         OnboardingMode, OnboardingPurpose, OnboardingSecretRecord, OnboardingSecretState,
-        OnboardingSecretStateRecord, OnboardingSyncTicket,
+        OnboardingStateRecord, OnboardingTicket,
     };
     use aruna_core::structs::{
         Actor, BindingScope, DocumentClass, KIND_LABEL_KEY, NotificationKind,
@@ -478,7 +465,7 @@ mod tests {
 
         let enrollment_id = Ulid::generate();
         drive(
-            CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+            CreateSecretOperation::new(CreateSecretInput {
                 record: OnboardingSecretRecord {
                     enrollment_id,
                     secret_hash: "abc".to_string(),
@@ -509,8 +496,8 @@ mod tests {
         fixture: &FinalizeFixture,
         node_id: NodeId,
         now: u64,
-    ) -> BootstrapOnboardingFinalizeInput {
-        BootstrapOnboardingFinalizeInput {
+    ) -> BootstrapFinalizeInput {
+        BootstrapFinalizeInput {
             enrollment_id: fixture.enrollment_id,
             secret_hash: "abc".to_string(),
             node_id,
@@ -541,12 +528,12 @@ mod tests {
             }) => value,
             other => panic!("unexpected state read result: {other:?}"),
         };
-        let state_record: OnboardingSecretStateRecord = postcard::from_bytes(&state_value).unwrap();
+        let state_record: OnboardingStateRecord = postcard::from_bytes(&state_value).unwrap();
         state_record.state
     }
 
     async fn assert_realm_node(context: &DriverContext, realm_id: RealmId, node_id: NodeId) {
-        let document = drive(GetRealmConfigOperation::new(realm_id), context)
+        let document = drive(GetConfigOperation::new(realm_id), context)
             .await
             .unwrap();
         assert!(
@@ -564,7 +551,7 @@ mod tests {
         location: &str,
         weight: u32,
     ) {
-        let document = drive(GetRealmConfigOperation::new(realm_id), context)
+        let document = drive(GetConfigOperation::new(realm_id), context)
             .await
             .unwrap();
         let entry = document
@@ -575,7 +562,7 @@ mod tests {
     }
 
     async fn assert_realm_excludes(context: &DriverContext, realm_id: RealmId, node_id: NodeId) {
-        let document = drive(GetRealmConfigOperation::new(realm_id), context)
+        let document = drive(GetConfigOperation::new(realm_id), context)
             .await
             .unwrap();
         assert!(!document.has_node(node_id));
@@ -636,7 +623,7 @@ mod tests {
 
     async fn clear_placement_strategies(fixture: &FinalizeFixture) {
         let mut config = drive(
-            GetRealmConfigOperation::new(fixture.realm_id),
+            GetConfigOperation::new(fixture.realm_id),
             fixture.context.as_ref(),
         )
         .await
@@ -647,7 +634,7 @@ mod tests {
             user_id: UserId::nil(fixture.realm_id),
             realm_id: fixture.realm_id,
         };
-        let target = DocumentSyncTarget::RealmConfig {
+        let target = DocumentTarget::RealmConfig {
             realm_id: fixture.realm_id,
         };
         let event = fixture
@@ -695,10 +682,7 @@ mod tests {
             fixture.context.clone(),
         )
         .await;
-        assert_eq!(
-            result,
-            Err(BootstrapOnboardingFinalizeError::NetHandleUnavailable)
-        );
+        assert_eq!(result, Err(BootstrapFinalizeError::NetHandleUnavailable));
         assert_realm_node(
             fixture.context.as_ref(),
             fixture.realm_id,
@@ -733,10 +717,7 @@ mod tests {
             fixture.context.clone(),
         )
         .await;
-        assert_eq!(
-            first,
-            Err(BootstrapOnboardingFinalizeError::NetHandleUnavailable)
-        );
+        assert_eq!(first, Err(BootstrapFinalizeError::NetHandleUnavailable));
 
         let (retry_context, net_handle) = context_with_net(&fixture).await;
         let retry = bootstrap_onboarding_finalize(
@@ -771,11 +752,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let target = DocumentSyncTarget::NodeInfo {
+        let target = DocumentTarget::NodeInfo {
             realm_id: fixture.realm_id,
             node_id: fixture.local_node_id,
         };
-        let ticket = OnboardingSyncTicket::decode(&result.onboarding_sync_ticket).unwrap();
+        let ticket = OnboardingTicket::decode(&result.onboarding_sync_ticket).unwrap();
 
         ticket.verify(fixture.joiner_node_id, &target, 10).unwrap();
         let state = net_handle
@@ -802,7 +783,7 @@ mod tests {
         let owner = UserId::local(Ulid::generate(), fixture.realm_id);
         let device_enrollment = Ulid::generate();
         drive(
-            CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+            CreateSecretOperation::new(CreateSecretInput {
                 record: OnboardingSecretRecord {
                     enrollment_id: device_enrollment,
                     secret_hash: "device".to_string(),
@@ -825,7 +806,7 @@ mod tests {
             .unwrap();
         assert_eq!(device.mode, OnboardingMode::User { owner });
 
-        let shared_topic = DocumentSyncTarget::NodeInfo {
+        let shared_topic = DocumentTarget::NodeInfo {
             realm_id: fixture.realm_id,
             node_id: fixture.local_node_id,
         }
@@ -860,12 +841,12 @@ mod tests {
         let fixture = setup_finalize_fixture().await;
         clear_placement_strategies(&fixture).await;
         let user_id = UserId::local(Ulid::from_bytes([44u8; 16]), fixture.realm_id);
-        let ticket = OnboardingSyncTicket::issue(
+        let ticket = OnboardingTicket::issue(
             &fixture.realm_signing_key,
             &fixture.realm_id,
             fixture.joiner_node_id,
             100,
-            vec![DocumentSyncTarget::User { user_id }],
+            vec![DocumentTarget::User { user_id }],
         )
         .unwrap();
 
@@ -877,11 +858,11 @@ mod tests {
                 &ticket,
             )
             .await,
-            Err(BootstrapOnboardingFinalizeError::UserPlacementUnavailable(id)) if id == user_id
+            Err(BootstrapFinalizeError::UserPlacementUnavailable(id)) if id == user_id
         ));
 
         let missing_realm_id = RealmId::from_bytes([9u8; 32]);
-        let missing_ticket = OnboardingSyncTicket::issue(
+        let missing_ticket = OnboardingTicket::issue(
             &fixture.realm_signing_key,
             &missing_realm_id,
             fixture.joiner_node_id,
@@ -897,8 +878,8 @@ mod tests {
                 &missing_ticket,
             )
             .await,
-            Err(BootstrapOnboardingFinalizeError::GetRealmConfig(
-                GetRealmConfigError::DocumentNotFound
+            Err(BootstrapFinalizeError::GetRealmConfig(
+                GetConfigError::DocumentNotFound
             ))
         ));
     }
@@ -907,7 +888,7 @@ mod tests {
     async fn nonholder_shard_excluded() {
         let fixture = setup_finalize_fixture().await;
         let mut config = drive(
-            GetRealmConfigOperation::new(fixture.realm_id),
+            GetConfigOperation::new(fixture.realm_id),
             fixture.context.as_ref(),
         )
         .await
@@ -936,7 +917,7 @@ mod tests {
             user_id: UserId::nil(fixture.realm_id),
             realm_id: fixture.realm_id,
         };
-        let config_target = DocumentSyncTarget::RealmConfig {
+        let config_target = DocumentTarget::RealmConfig {
             realm_id: fixture.realm_id,
         };
         let event = fixture
@@ -958,7 +939,7 @@ mod tests {
         for seed in 0u16..=u16::MAX {
             let mut bytes = [0u8; 16];
             bytes[..2].copy_from_slice(&seed.to_be_bytes());
-            let target = DocumentSyncTarget::User {
+            let target = DocumentTarget::User {
                 user_id: UserId::local(Ulid::from_bytes(bytes), fixture.realm_id),
             };
             let placement =
@@ -976,7 +957,7 @@ mod tests {
         let nonholder = nonholder.expect("joiner does not hold every capped user shard");
         let held_placement =
             crate::placement::target_placement_ref(&config, &held, Default::default());
-        let ticket = OnboardingSyncTicket::issue(
+        let ticket = OnboardingTicket::issue(
             &fixture.realm_signing_key,
             &fixture.realm_id,
             fixture.joiner_node_id,
@@ -1009,10 +990,7 @@ mod tests {
             fixture.context.clone(),
         )
         .await;
-        assert_eq!(
-            first,
-            Err(BootstrapOnboardingFinalizeError::NetHandleUnavailable)
-        );
+        assert_eq!(first, Err(BootstrapFinalizeError::NetHandleUnavailable));
 
         let other_node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
         let rejected = bootstrap_onboarding_finalize(
@@ -1022,8 +1000,8 @@ mod tests {
         .await;
         assert_eq!(
             rejected,
-            Err(BootstrapOnboardingFinalizeError::Reserve(
-                ReserveOnboardingSecretError::AlreadyClaimed
+            Err(BootstrapFinalizeError::Reserve(
+                ReserveSecretError::AlreadyClaimed
             ))
         );
     }
@@ -1040,10 +1018,7 @@ mod tests {
             fixture.context.clone(),
         )
         .await;
-        assert_eq!(
-            first,
-            Err(BootstrapOnboardingFinalizeError::NetHandleUnavailable)
-        );
+        assert_eq!(first, Err(BootstrapFinalizeError::NetHandleUnavailable));
 
         let (retry_context, net_handle) = context_with_net(&fixture).await;
         let retry = bootstrap_onboarding_finalize(
@@ -1142,10 +1117,7 @@ mod tests {
             fixture.context.clone(),
         )
         .await;
-        assert_eq!(
-            first,
-            Err(BootstrapOnboardingFinalizeError::NetHandleUnavailable)
-        );
+        assert_eq!(first, Err(BootstrapFinalizeError::NetHandleUnavailable));
 
         let (retry_context, net_handle) = context_with_net(&fixture).await;
         let retry = bootstrap_onboarding_finalize(
@@ -1173,10 +1145,7 @@ mod tests {
             fixture.context.clone(),
         )
         .await;
-        assert_eq!(
-            result,
-            Err(BootstrapOnboardingFinalizeError::NetHandleUnavailable)
-        );
+        assert_eq!(result, Err(BootstrapFinalizeError::NetHandleUnavailable));
 
         assert!(read_outbox_rows(&fixture.storage_handle).await.is_empty());
     }
@@ -1192,7 +1161,7 @@ mod tests {
         let result = bootstrap_onboarding_finalize(input, fixture.context.clone()).await;
         assert_eq!(
             result,
-            Err(BootstrapOnboardingFinalizeError::ReservedNodeLabel(
+            Err(BootstrapFinalizeError::ReservedNodeLabel(
                 KIND_LABEL_KEY.to_string()
             ))
         );
@@ -1215,10 +1184,7 @@ mod tests {
         input.node_location = Some("x".repeat(65));
 
         let result = bootstrap_onboarding_finalize(input, fixture.context.clone()).await;
-        assert_eq!(
-            result,
-            Err(BootstrapOnboardingFinalizeError::NodeLocationTooLong)
-        );
+        assert_eq!(result, Err(BootstrapFinalizeError::NodeLocationTooLong));
         assert_eq!(
             read_secret_state(&fixture.storage_handle, fixture.enrollment_id).await,
             OnboardingSecretState::Available

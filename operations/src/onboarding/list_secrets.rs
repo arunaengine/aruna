@@ -12,19 +12,19 @@ use thiserror::Error;
 use crate::onboarding::secret_state::{resolve_secret_state, secret_state_key};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OnboardingSecretListEntry {
+pub struct OnboardingSecretEntry {
     pub record: OnboardingSecretRecord,
     pub state: OnboardingSecretState,
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ListOnboardingSecretsOperation {
-    state: ListOnboardingSecretsState,
-    output: Option<Result<Vec<OnboardingSecretListEntry>, ListOnboardingSecretsError>>,
+pub struct ListSecretsOperation {
+    state: ListSecretsState,
+    output: Option<Result<Vec<OnboardingSecretEntry>, ListSecretsError>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum ListOnboardingSecretsState {
+enum ListSecretsState {
     Init,
     Iter,
     ReadStates {
@@ -35,7 +35,7 @@ enum ListOnboardingSecretsState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ListOnboardingSecretsError {
+pub enum ListSecretsError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -50,27 +50,27 @@ pub enum ListOnboardingSecretsError {
     },
 }
 
-impl Default for ListOnboardingSecretsOperation {
+impl Default for ListSecretsOperation {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ListOnboardingSecretsOperation {
+impl ListSecretsOperation {
     pub fn new() -> Self {
         Self {
-            state: ListOnboardingSecretsState::Init,
+            state: ListSecretsState::Init,
             output: None,
         }
     }
 }
 
-impl Operation for ListOnboardingSecretsOperation {
-    type Output = Vec<OnboardingSecretListEntry>;
-    type Error = ListOnboardingSecretsError;
+impl Operation for ListSecretsOperation {
+    type Output = Vec<OnboardingSecretEntry>;
+    type Error = ListSecretsError;
 
     fn start(&mut self) -> Effects {
-        self.state = ListOnboardingSecretsState::Iter;
+        self.state = ListSecretsState::Iter;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: ONBOARDING_KEYSPACE.to_string(),
             prefix: Some(ByteView::from(b"secret:".as_slice())),
@@ -83,19 +83,19 @@ impl Operation for ListOnboardingSecretsOperation {
     fn step(&mut self, event: Event) -> Effects {
         let event = match event {
             Event::Storage(StorageEvent::Error { error }) => {
-                self.state = ListOnboardingSecretsState::Error;
-                self.output = Some(Err(ListOnboardingSecretsError::StorageError(error)));
+                self.state = ListSecretsState::Error;
+                self.output = Some(Err(ListSecretsError::StorageError(error)));
                 return smallvec![];
             }
             other => other,
         };
 
         match self.state.clone() {
-            ListOnboardingSecretsState::Iter => {
+            ListSecretsState::Iter => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-                    self.state = ListOnboardingSecretsState::Error;
-                    self.output = Some(Err(ListOnboardingSecretsError::UnexpectedEvent {
+                    self.state = ListSecretsState::Error;
+                    self.output = Some(Err(ListSecretsError::UnexpectedEvent {
                         state: "Iter".to_string(),
                         expected: "storage iteration result",
                         got,
@@ -113,7 +113,7 @@ impl Operation for ListOnboardingSecretsOperation {
                     Ok(records) => {
                         if records.is_empty() {
                             self.output = Some(Ok(Vec::new()));
-                            ListOnboardingSecretsState::Finish
+                            ListSecretsState::Finish
                         } else {
                             let reads = records
                                 .iter()
@@ -124,7 +124,7 @@ impl Operation for ListOnboardingSecretsOperation {
                                     )
                                 })
                                 .collect();
-                            self.state = ListOnboardingSecretsState::ReadStates { records };
+                            self.state = ListSecretsState::ReadStates { records };
                             return smallvec![Effect::Storage(StorageEffect::BatchRead {
                                 reads,
                                 txn_id: None,
@@ -132,17 +132,17 @@ impl Operation for ListOnboardingSecretsOperation {
                         }
                     }
                     Err(error) => {
-                        self.output = Some(Err(ListOnboardingSecretsError::ConversionError(error)));
-                        ListOnboardingSecretsState::Error
+                        self.output = Some(Err(ListSecretsError::ConversionError(error)));
+                        ListSecretsState::Error
                     }
                 };
                 smallvec![]
             }
-            ListOnboardingSecretsState::ReadStates { records } => {
+            ListSecretsState::ReadStates { records } => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-                    self.state = ListOnboardingSecretsState::Error;
-                    self.output = Some(Err(ListOnboardingSecretsError::UnexpectedEvent {
+                    self.state = ListSecretsState::Error;
+                    self.output = Some(Err(ListSecretsError::UnexpectedEvent {
                         state: "ReadStates".to_string(),
                         expected: "batch read result",
                         got,
@@ -150,8 +150,8 @@ impl Operation for ListOnboardingSecretsOperation {
                     return smallvec![];
                 };
                 if values.len() != records.len() {
-                    self.state = ListOnboardingSecretsState::Error;
-                    self.output = Some(Err(ListOnboardingSecretsError::UnexpectedEvent {
+                    self.state = ListSecretsState::Error;
+                    self.output = Some(Err(ListSecretsError::UnexpectedEvent {
                         state: "ReadStates".to_string(),
                         expected: "state batch read result matching record count",
                         got: format!("{values:?}"),
@@ -164,37 +164,37 @@ impl Operation for ListOnboardingSecretsOperation {
                     .zip(values)
                     .map(|(record, (_, state_value))| {
                         resolve_secret_state(&record, state_value.as_ref())
-                            .map(|state| OnboardingSecretListEntry { record, state })
+                            .map(|state| OnboardingSecretEntry { record, state })
                     })
                     .collect::<Result<Vec<_>, _>>();
 
                 self.state = match entries {
                     Ok(entries) => {
                         self.output = Some(Ok(entries));
-                        ListOnboardingSecretsState::Finish
+                        ListSecretsState::Finish
                     }
                     Err(error) => {
-                        self.output = Some(Err(ListOnboardingSecretsError::ConversionError(error)));
-                        ListOnboardingSecretsState::Error
+                        self.output = Some(Err(ListSecretsError::ConversionError(error)));
+                        ListSecretsState::Error
                     }
                 };
                 smallvec![]
             }
-            ListOnboardingSecretsState::Init
-            | ListOnboardingSecretsState::Finish
-            | ListOnboardingSecretsState::Error => smallvec![],
+            ListSecretsState::Init | ListSecretsState::Finish | ListSecretsState::Error => {
+                smallvec![]
+            }
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            ListOnboardingSecretsState::Finish | ListOnboardingSecretsState::Error
+            ListSecretsState::Finish | ListSecretsState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ListOnboardingSecretsError::NotFinished)?
+        self.output.ok_or(ListSecretsError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
