@@ -1,0 +1,13 @@
+pub mod attributes;
+pub mod copy;
+pub mod delete;
+pub mod delete_bulk;
+pub mod get;
+pub mod head;
+pub mod list;
+mod lookup;
+pub mod metadata;
+pub mod placement;
+pub mod put;
+pub mod search;
+pub mod versions;

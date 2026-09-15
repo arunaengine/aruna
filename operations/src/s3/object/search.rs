@@ -8,8 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
-    CurrentVersionPointer, Permission, RealmId, VersionKey, W3idDataIdentifier,
-    object_permission_path,
+    CurrentVersionPointer, Permission, RealmId, VersionKey, W3idIdentifier, object_permission_path,
 };
 use aruna_core::types::{GroupId, Key, TxnId};
 use serde::{Deserialize, Serialize};
@@ -71,14 +70,14 @@ pub struct ObjectInventoryHit {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ObjectSearchNodeHit {
+pub struct SearchNodeHit {
     pub hit: ObjectInventoryHit,
     pub cursor_key: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ObjectSearchNodePage {
-    pub hits: Vec<ObjectSearchNodeHit>,
+pub struct SearchNodePage {
+    pub hits: Vec<SearchNodeHit>,
     pub next_start_after: Option<Vec<u8>>,
     pub observed_at: SystemTime,
 }
@@ -111,7 +110,7 @@ struct HeadCandidate {
 
 #[derive(Debug)]
 struct CandidateBatch {
-    candidates: Vec<ObjectSearchNodeHit>,
+    candidates: Vec<SearchNodeHit>,
     next_start_after: Option<Vec<u8>>,
 }
 
@@ -121,7 +120,7 @@ struct CandidateBatch {
 pub async fn search_local_objects(
     context: &DriverContext,
     input: SearchObjectsInput,
-) -> Result<ObjectSearchNodePage, SearchObjectsError> {
+) -> Result<SearchNodePage, SearchObjectsError> {
     let limit = input.limit.clamp(1, OBJECT_SEARCH_MAX_LIMIT);
     let mut start_after = input.start_after.clone();
     let mut visible = Vec::with_capacity(limit + 1);
@@ -176,7 +175,7 @@ pub async fn search_local_objects(
                     .get(limit - 1)
                     .map(|candidate| candidate.cursor_key.clone());
                 visible.truncate(limit);
-                return Ok(ObjectSearchNodePage {
+                return Ok(SearchNodePage {
                     hits: visible,
                     next_start_after,
                     observed_at: SystemTime::now(),
@@ -187,7 +186,7 @@ pub async fn search_local_objects(
         match batch.next_start_after {
             Some(next) => start_after = Some(next),
             None => {
-                return Ok(ObjectSearchNodePage {
+                return Ok(SearchNodePage {
                     hits: visible,
                     next_start_after: None,
                     observed_at: SystemTime::now(),
@@ -343,7 +342,7 @@ async fn build_hits(
     input: &SearchObjectsInput,
     live: Vec<LiveHead>,
     txn_id: TxnId,
-) -> Result<Vec<ObjectSearchNodeHit>, SearchObjectsError> {
+) -> Result<Vec<SearchNodeHit>, SearchObjectsError> {
     if live.is_empty() {
         return Ok(Vec::new());
     }
@@ -404,7 +403,7 @@ async fn build_hits(
             BlobVersionState::Materialized { blob_hash, .. } => {
                 let digest = hex::encode(blob_hash);
                 (
-                    Some(W3idDataIdentifier::ContentHash(*blob_hash).to_w3id()),
+                    Some(W3idIdentifier::ContentHash(*blob_hash).to_w3id()),
                     Some(ObjectInventoryChecksum {
                         algorithm: "blake3".to_string(),
                         value: digest,
@@ -427,7 +426,7 @@ async fn build_hits(
             ),
             BlobVersionState::Deleted => continue,
         };
-        candidates.push(ObjectSearchNodeHit {
+        candidates.push(SearchNodeHit {
             cursor_key: candidate.cursor_key,
             hit: ObjectInventoryHit {
                 node_id: input.node_id,
