@@ -1,8 +1,7 @@
 use super::format_timestamp_ms;
-use crate::error::{ProfileValidationFindingResponse, ValidationViolationResponse};
+use crate::error::{ProfileFindingResponse, ValidationViolationResponse};
 use aruna_core::metadata::{
-    MetadataProfileValidationCompleteness, MetadataProfileValidationState,
-    MetadataProfileValidationStatus,
+    ProfileValidationCompleteness, ProfileValidationState, ProfileValidationStatus,
 };
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_operations::metadata::MetadataPathWinner;
@@ -28,7 +27,8 @@ pub struct MetadataDocumentSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ProfileValidationCapabilitiesResponse {
+#[schema(as = ProfileValidationCapabilitiesResponse)]
+pub struct ProfileCapabilitiesResponse {
     pub evaluator: String,
     pub supported_constraints: Vec<String>,
     pub unsupported_constraint_policy: String,
@@ -37,7 +37,8 @@ pub struct ProfileValidationCapabilitiesResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ProfileValidationPreviewRequest {
+#[schema(as = ProfileValidationPreviewRequest)]
+pub struct ProfilePreviewRequest {
     /// RO-Crate JSON-LD draft. Nothing is stored.
     #[schema(value_type = Object)]
     pub rocrate: Value,
@@ -52,7 +53,8 @@ pub struct ProfileValidationPreviewRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ProfileValidationPreviewResponse {
+#[schema(as = ProfileValidationPreviewResponse)]
+pub struct ProfilePreviewResponse {
     /// Whether a create or replace of this draft would be accepted.
     pub accepted: bool,
     pub state: String,
@@ -63,7 +65,7 @@ pub struct ProfileValidationPreviewResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_revision: Option<String>,
     pub evaluator: String,
-    pub findings: Vec<ProfileValidationFindingResponse>,
+    pub findings: Vec<ProfileFindingResponse>,
     pub completeness: String,
     pub structural_violations: Vec<ValidationViolationResponse>,
     /// Data entities the anonymous principal may not read. Empty unless the
@@ -91,10 +93,10 @@ pub struct RestrictedFileResponse {
     pub key: Option<String>,
 }
 
-impl From<MetadataProfilePreview> for ProfileValidationPreviewResponse {
+impl From<MetadataProfilePreview> for ProfilePreviewResponse {
     fn from(preview: MetadataProfilePreview) -> Self {
         let accepted = preview.accepted();
-        let status = ProfileValidationStatusResponse::from(preview.status);
+        let status = ProfileValidationResponse::from(preview.status);
         Self {
             accepted,
             state: status.state,
@@ -115,7 +117,7 @@ impl From<MetadataProfilePreview> for ProfileValidationPreviewResponse {
     }
 }
 
-impl ProfileValidationPreviewResponse {
+impl ProfilePreviewResponse {
     pub(crate) fn set_restricted(&mut self, preview: RestrictedFilesPreview) {
         self.restricted_files_complete = Some(preview.complete);
         self.restricted_files = preview
@@ -133,7 +135,8 @@ impl ProfileValidationPreviewResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ProfileValidationStatusResponse {
+#[schema(as = ProfileValidationStatusResponse)]
+pub struct ProfileValidationResponse {
     pub document_id: String,
     pub dataset_revision: String,
     pub state: String,
@@ -146,22 +149,22 @@ pub struct ProfileValidationStatusResponse {
     pub evaluator: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validated_at_ms: Option<u64>,
-    pub findings: Vec<ProfileValidationFindingResponse>,
+    pub findings: Vec<ProfileFindingResponse>,
     pub completeness: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_reason: Option<String>,
 }
 
-impl From<MetadataProfileValidationStatus> for ProfileValidationStatusResponse {
-    fn from(status: MetadataProfileValidationStatus) -> Self {
+impl From<ProfileValidationStatus> for ProfileValidationResponse {
+    fn from(status: ProfileValidationStatus) -> Self {
         Self {
             document_id: status.document_id.to_string(),
             dataset_revision: status.dataset_revision.to_string(),
             state: match status.state {
-                MetadataProfileValidationState::NotProfiled => "not_profiled",
-                MetadataProfileValidationState::Valid => "valid",
-                MetadataProfileValidationState::Invalid => "invalid",
-                MetadataProfileValidationState::Stale => "stale",
+                ProfileValidationState::NotProfiled => "not_profiled",
+                ProfileValidationState::Valid => "valid",
+                ProfileValidationState::Invalid => "invalid",
+                ProfileValidationState::Stale => "stale",
             }
             .to_string(),
             profile_id: status.profile_id.map(|id| id.to_string()),
@@ -171,8 +174,8 @@ impl From<MetadataProfileValidationStatus> for ProfileValidationStatusResponse {
             validated_at_ms: status.validated_at_ms,
             findings: status.findings.into_iter().map(Into::into).collect(),
             completeness: match status.completeness {
-                MetadataProfileValidationCompleteness::Complete => "complete",
-                MetadataProfileValidationCompleteness::Incomplete => "incomplete",
+                ProfileValidationCompleteness::Complete => "complete",
+                ProfileValidationCompleteness::Incomplete => "incomplete",
             }
             .to_string(),
             stale_reason: status.stale_reason,
@@ -182,7 +185,8 @@ impl From<MetadataProfileValidationStatus> for ProfileValidationStatusResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct CreateMetadataScaffoldRequest {
+#[schema(as = CreateMetadataScaffoldRequest)]
+pub struct CreateScaffoldRequest {
     pub group_id: String,
     pub path: String,
     pub name: String,
@@ -196,7 +200,8 @@ pub struct CreateMetadataScaffoldRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct CreateMetadataRoCrateRequest {
+#[schema(as = CreateMetadataRoCrateRequest)]
+pub struct CreateRoCrateRequest {
     pub group_id: String,
     pub path: String,
     #[serde(default)]
@@ -208,8 +213,8 @@ pub struct CreateMetadataRoCrateRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum CreateMetadataRequest {
-    Scaffold(CreateMetadataScaffoldRequest),
-    RoCrate(CreateMetadataRoCrateRequest),
+    Scaffold(CreateScaffoldRequest),
+    RoCrate(CreateRoCrateRequest),
 }
 
 /// Response for a metadata create request accepted into the durable
@@ -224,7 +229,7 @@ pub struct CreateMetadataResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ListMetadataResponse {
-    pub documents: Vec<MetadataDocumentListItem>,
+    pub documents: Vec<DocumentListItem>,
     pub limit: usize,
     pub offset: usize,
     pub total_returned: usize,
@@ -236,7 +241,8 @@ pub struct ListMetadataResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataDocumentListItem {
+#[schema(as = MetadataDocumentListItem)]
+pub struct DocumentListItem {
     pub document_id: String,
     pub group_id: String,
     pub document_path: String,
@@ -278,7 +284,8 @@ pub struct ListMetadataQuery {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ReplaceMetadataRoCrateRequest {
+#[schema(as = ReplaceMetadataRoCrateRequest)]
+pub struct ReplaceRoCrateRequest {
     #[schema(value_type = Object)]
     pub rocrate: Value,
     #[serde(default)]
@@ -289,7 +296,7 @@ pub struct ReplaceMetadataRoCrateRequest {
 #[serde(untagged)]
 pub enum MetadataRoCrateResponse {
     Projected(ProjectedRoCrateResponse),
-    Raw(MetadataRawRoCrateResponse),
+    Raw(RawRoCrateResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -303,7 +310,8 @@ pub struct ProjectedRoCrateResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataRawRoCrateResponse {
+#[schema(as = MetadataRawRoCrateResponse)]
+pub struct RawRoCrateResponse {
     #[schema(value_type = Object)]
     pub raw: Value,
     pub winning_event_id: String,
@@ -314,12 +322,13 @@ pub struct MetadataRawRoCrateResponse {
     pub dataset_digest: Option<String>,
     /// Present only while the merged graph fails profile validation.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub merged: Option<MetadataMergedRoCrateResponse>,
+    pub merged: Option<MergedRoCrateResponse>,
 }
 
 /// The merged graph while it is invalid: what the editor opens to fix it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataMergedRoCrateResponse {
+#[schema(as = MetadataMergedRoCrateResponse)]
+pub struct MergedRoCrateResponse {
     #[schema(value_type = Object)]
     pub rocrate: Value,
     pub findings: u32,
@@ -339,7 +348,8 @@ pub enum MetadataRoCrateView {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-pub struct MetadataRoCrateExportParams {
+#[schema(as = MetadataRoCrateExportParams)]
+pub struct RoCrateExportParams {
     #[serde(default)]
     pub view: Option<MetadataRoCrateView>,
     #[serde(default)]
@@ -352,13 +362,15 @@ pub struct MetadataRoCrateExportParams {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SubmitRoCrateExportRequest {
+#[schema(as = SubmitRoCrateExportRequest)]
+pub struct SubmitExportRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SubmitRoCrateExportResponse {
+#[schema(as = SubmitRoCrateExportResponse)]
+pub struct SubmitExportResponse {
     pub job_id: String,
     pub created: bool,
     pub owner_node_url: String,
@@ -386,7 +398,8 @@ pub struct MetadataSearchParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataSearchHitResponse {
+#[schema(as = MetadataSearchHitResponse)]
+pub struct SearchHitResponse {
     pub document_id: String,
     pub group_id: String,
     pub document_path: String,
@@ -406,8 +419,9 @@ pub struct MetadataSearchHitResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataSearchResponse {
-    pub hits: Vec<MetadataSearchHitResponse>,
+#[schema(as = MetadataSearchResponse)]
+pub struct SearchResultsResponse {
+    pub hits: Vec<SearchHitResponse>,
     /// Continuation token for the next page, or `null` when the results are
     /// exhausted. Pass it back as `cursor` to fetch the next page.
     pub next_cursor: Option<String>,
@@ -464,7 +478,8 @@ pub struct MetadataReferencesResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum MetadataReferencePreflightTargetBody {
+#[schema(as = MetadataReferencePreflightTargetBody)]
+pub enum PreflightTargetBody {
     ContentW3ids {
         content_w3ids: Vec<String>,
         #[serde(default)]
@@ -475,21 +490,23 @@ pub enum MetadataReferencePreflightTargetBody {
         #[serde(default)]
         prefix: Option<String>,
         #[serde(default)]
-        operation: MetadataPreflightStorageOperationBody,
+        operation: PreflightStorageBody,
     },
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum MetadataPreflightStorageOperationBody {
+#[schema(as = MetadataPreflightStorageOperationBody)]
+pub enum PreflightStorageBody {
     #[default]
     LatestVersionTombstone,
     AllVersionsPurge,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataReferencePreflightBody {
-    pub target: MetadataReferencePreflightTargetBody,
+#[schema(as = MetadataReferencePreflightBody)]
+pub struct PreflightBody {
+    pub target: PreflightTargetBody,
     #[serde(default)]
     pub mode: Option<MetadataQueryMode>,
     #[serde(default = "default_allow_partial")]
@@ -501,7 +518,8 @@ pub struct MetadataReferencePreflightBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataPreflightLocationResponse {
+#[schema(as = MetadataPreflightLocationResponse)]
+pub struct PreflightLocationResponse {
     pub node_id: String,
     pub bucket: String,
     pub key: String,
@@ -509,55 +527,61 @@ pub struct MetadataPreflightLocationResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataPreflightVisibleReferenceResponse {
+#[schema(as = MetadataPreflightVisibleReferenceResponse)]
+pub struct PreflightVisibleResponse {
     pub document_id: String,
     pub title: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataPreflightTargetResponse {
+#[schema(as = MetadataPreflightTargetResponse)]
+pub struct PreflightTargetResponse {
     pub content_w3id: String,
-    pub targeted_versions: Vec<MetadataPreflightLocationResponse>,
-    pub visible_references: Vec<MetadataPreflightVisibleReferenceResponse>,
+    pub targeted_versions: Vec<PreflightLocationResponse>,
+    pub visible_references: Vec<PreflightVisibleResponse>,
     pub hidden_references_exist: bool,
     pub would_remove_last_resolvable_aruna_location: bool,
     pub location_impact_complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataPreflightExcludedFormResponse {
+#[schema(as = MetadataPreflightExcludedFormResponse)]
+pub struct ExcludedFormResponse {
     pub form: String,
     pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataPreflightNodeFreshnessResponse {
+#[schema(as = MetadataPreflightNodeFreshnessResponse)]
+pub struct PreflightFreshnessResponse {
     pub node_id: String,
     pub index_state: String,
     pub oldest_status_updated_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataPreflightCoverageResponse {
+#[schema(as = MetadataPreflightCoverageResponse)]
+pub struct PreflightCoverageResponse {
     pub queried_scope: String,
     pub queried_forms: Vec<String>,
-    pub excluded_forms: Vec<MetadataPreflightExcludedFormResponse>,
-    pub node_freshness: Vec<MetadataPreflightNodeFreshnessResponse>,
+    pub excluded_forms: Vec<ExcludedFormResponse>,
+    pub node_freshness: Vec<PreflightFreshnessResponse>,
     pub target_resolution_complete: bool,
     pub path_style_endpoint_coverage_complete: bool,
     pub realm_coverage_complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataReferencePreflightResponse {
-    pub targets: Vec<MetadataPreflightTargetResponse>,
+#[schema(as = MetadataReferencePreflightResponse)]
+pub struct PreflightResponse {
+    pub targets: Vec<PreflightTargetResponse>,
     pub next_cursor: Option<String>,
     pub truncated: bool,
     pub nodes_queried: usize,
     pub nodes_failed: usize,
     pub complete: bool,
     pub failed_partitions: Vec<String>,
-    pub coverage: MetadataPreflightCoverageResponse,
+    pub coverage: PreflightCoverageResponse,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -646,7 +670,7 @@ impl From<&MetadataPathWinner> for MetadataDocumentSummary {
     }
 }
 
-impl MetadataDocumentListItem {
+impl DocumentListItem {
     pub(super) fn from_record(
         record: &MetadataRegistryRecord,
         rocrate_summary: Option<Value>,
