@@ -14,7 +14,7 @@ use crate::structured_id::PlacementHandle;
 
 /// The derived view over the replicated handle-range set. Overlapping grants,
 /// or two distinct values re-using one `range_id`, are retained as conflicted
-/// and excluded from allocation, mirroring [`crate::structs::BindingDirectory`].
+/// and excluded from allocation, mirroring [`super::binding_directory::BindingDirectory`].
 #[derive(Debug, Default, Clone)]
 pub struct HandleRangeDirectory {
     by_id: HashMap<Ulid, BTreeSet<HandleRange>>,
