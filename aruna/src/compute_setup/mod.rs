@@ -9,17 +9,13 @@
     allow(dead_code)
 )]
 
-#[path = "compute_setup_settings.rs"]
 mod settings;
 
 #[cfg(feature = "apptainer")]
-#[path = "compute_setup_apptainer.rs"]
 mod apptainer;
 #[cfg(feature = "docker")]
-#[path = "compute_setup_docker.rs"]
 mod docker;
 #[cfg(feature = "kubernetes")]
-#[path = "compute_setup_kubernetes.rs"]
 mod kubernetes;
 
 use aruna_compute::ExecutorRegistry;
