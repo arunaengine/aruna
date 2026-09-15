@@ -8,6 +8,7 @@ pub mod delete_draft;
 pub mod drain;
 pub mod edit;
 pub mod enqueue_draft;
+pub mod forward;
 pub mod inspect_draft;
 pub mod list_drafts;
 pub mod publish_queue;

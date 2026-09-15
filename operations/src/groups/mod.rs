@@ -2,6 +2,7 @@ pub mod add_member;
 pub mod add_role;
 pub mod backends;
 pub mod create_group;
+pub mod forward;
 pub mod get_group;
 pub mod join_request;
 pub mod list_groups;
