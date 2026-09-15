@@ -3,7 +3,7 @@ use crate::forward::authorize::is_sync_eligible;
 use crate::forward::transport::reject;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::protocol::MetadataWriteAuthError;
+use crate::metadata::protocol::WriteAuthError;
 use crate::placement::holds_placement;
 use crate::placement::process_placements::load_realm_config;
 use crate::sync::document_outbox::new_outbox_record;
@@ -11,8 +11,8 @@ use crate::sync::document_outbox::schedule_drain_effect;
 use crate::sync::document_outbox::write_outbox_effect;
 use aruna_core::NodeId;
 use aruna_core::admin_documents::AdminDocumentEvent;
-use aruna_core::document::DocumentSyncOutboxEvent;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentOutboxEvent;
+use aruna_core::document::DocumentTarget;
 use aruna_core::events::Event;
 use aruna_core::events::StorageEvent;
 use aruna_core::handle::Handle;
@@ -33,7 +33,7 @@ pub(super) const ADMIN_RELAY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 pub async fn relay_admin_event(
     context: &Arc<DriverContext>,
     holders: &[NodeId],
-    target: DocumentSyncTarget,
+    target: DocumentTarget,
     event: Box<AdminDocumentEvent>,
     placement: PlacementRef,
     origin_signature: iroh::Signature,
@@ -147,7 +147,7 @@ pub(crate) async fn apply_admin_relay(
         RelayAdmission::Accept => {}
         RelayAdmission::Forbidden => {
             return MetadataTransportMessage::ForwardedWriteDenied {
-                error: MetadataWriteAuthError::Forbidden,
+                error: WriteAuthError::Forbidden,
             };
         }
         RelayAdmission::Reject(reason) => return reject(reason),
@@ -160,7 +160,7 @@ pub(crate) async fn apply_admin_relay(
         net_handle.node_id(),
         target,
         Vec::new(),
-        DocumentSyncOutboxEvent::relayed_admin(*event, origin_signature),
+        DocumentOutboxEvent::relayed_admin(*event, origin_signature),
         placement,
         false,
     );
