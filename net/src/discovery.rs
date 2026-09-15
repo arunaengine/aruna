@@ -29,10 +29,10 @@ use crate::dht::{self, DhtHandle};
 use crate::error::{NetError, Result};
 use crate::unique_peer_nodes;
 
-pub(crate) const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
+pub(crate) const DHT_MAX_SKEW: u64 = 300;
 // The DHT sub-budget of OPEN_STREAM_TIMEOUT, enforced inside the driver so the
 // lookup is released rather than left running when the caller stops waiting.
-pub(crate) const DHT_SIGNED_LOOKUP_TIMEOUT: Duration = Duration::from_secs(4);
+pub(crate) const SIGNED_LOOKUP_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_signed_publisher(
@@ -181,7 +181,7 @@ async fn lookup_signed_endpoint(
         .get(
             &key,
             Some(realm_id),
-            DhtGetOptions::first_usable(DHT_SIGNED_LOOKUP_TIMEOUT, realm_id, peer),
+            DhtGetOptions::first_usable(SIGNED_LOOKUP_TIMEOUT, realm_id, peer),
         )
         .await?;
     let now = unix_timestamp_secs();
@@ -306,7 +306,7 @@ pub(crate) fn validate_endpoint_announcement(
     if announcement.issued_at > announcement.expires_at || announcement.expires_at <= now {
         return Err("announcement is expired or has invalid timestamps".to_string());
     }
-    if announcement.issued_at > now.saturating_add(DHT_SIGNED_MAX_CLOCK_SKEW_SECS) {
+    if announcement.issued_at > now.saturating_add(DHT_MAX_SKEW) {
         return Err("announcement is issued too far in the future".to_string());
     }
     if announcement

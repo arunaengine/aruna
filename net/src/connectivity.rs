@@ -25,10 +25,10 @@ use crate::dht::DhtHandle;
 use crate::discovery::{install_signed_endpoint, resolve_signed_endpoint};
 use crate::unique_peer_nodes;
 
-const PEER_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(5);
-const PEER_MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
-const PEER_SUCCESS_REFRESH_DELAY: Duration = Duration::from_secs(300);
-const PEER_MANAGER_IDLE_DELAY: Duration = Duration::from_secs(300);
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+const SUCCESS_REFRESH_DELAY: Duration = Duration::from_secs(300);
+const MANAGER_IDLE_DELAY: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 pub(crate) struct PeerManagerState {
@@ -49,7 +49,7 @@ pub(crate) struct PeerState {
     node_id: NodeId,
     consecutive_failures: u64,
     last_error: Option<String>,
-    next_retry_in_secs: Option<u64>,
+    retry_in_secs: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -95,7 +95,7 @@ impl PeerManagerState {
         let next_attempt = if immediate {
             now
         } else {
-            now + PEER_SUCCESS_REFRESH_DELAY
+            now + SUCCESS_REFRESH_DELAY
         };
         self.peers
             .push(ManagedPeer::new(node_id, source, next_attempt));
@@ -111,7 +111,7 @@ impl PeerManagerState {
             merge_source(&mut peer.source, source);
             peer.consecutive_failures = 0;
             peer.last_error = None;
-            peer.next_attempt = now + PEER_SUCCESS_REFRESH_DELAY;
+            peer.next_attempt = now + SUCCESS_REFRESH_DELAY;
         }
     }
 
@@ -140,7 +140,7 @@ impl PeerManagerState {
             .iter()
             .map(|peer| peer.next_attempt.saturating_duration_since(now))
             .min()
-            .unwrap_or(PEER_MANAGER_IDLE_DELAY)
+            .unwrap_or(MANAGER_IDLE_DELAY)
     }
 
     fn peer_source(&self, node_id: NodeId) -> String {
@@ -158,7 +158,7 @@ impl PeerManagerState {
                 node_id: peer.node_id,
                 consecutive_failures: peer.consecutive_failures,
                 last_error: peer.last_error.clone(),
-                next_retry_in_secs: Some(
+                retry_in_secs: Some(
                     peer.next_attempt.saturating_duration_since(now).as_secs(),
                 ),
             })
@@ -196,9 +196,9 @@ fn merge_source(existing: &mut String, source: &str) {
 
 fn peer_retry_delay(node_id: NodeId, consecutive_failures: u64) -> Duration {
     let exponent = consecutive_failures.saturating_sub(1).min(8) as u32;
-    let base = PEER_INITIAL_RETRY_DELAY
+    let base = INITIAL_RETRY_DELAY
         .saturating_mul(2u32.saturating_pow(exponent))
-        .min(PEER_MAX_RETRY_DELAY);
+        .min(MAX_RETRY_DELAY);
     let base_ms = base.as_millis() as i128;
     let jitter_window = (base_ms / 5).max(1);
     let jitter_range = (jitter_window * 2 + 1) as u64;
@@ -236,7 +236,7 @@ pub(crate) async fn run_connectivity_manager(
     connection_pool: ConnectionPool,
     discovery_method: DiscoveryMethod,
     realm_id: RealmId,
-    dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
+    signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     state: Arc<Mutex<PeerManagerState>>,
     diagnostics: Arc<Mutex<NetworkDiagnosticsState>>,
     mut event_rx: mpsc::Receiver<PeerEvent>,
@@ -252,7 +252,7 @@ pub(crate) async fn run_connectivity_manager(
                 if shutdown.is_cancelled() {
                     return;
                 }
-                let authorized_nodes = dht_signed_authorized_nodes.read().clone();
+                let authorized_nodes = signed_authorized_nodes.read().clone();
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
                     _ = run_connectivity_attempt(
@@ -327,7 +327,7 @@ async fn run_connectivity_attempt(
     connection_pool: &ConnectionPool,
     discovery_method: &DiscoveryMethod,
     realm_id: RealmId,
-    dht_signed_authorized_nodes: &[NodeId],
+    signed_authorized_nodes: &[NodeId],
     state: &Arc<Mutex<PeerManagerState>>,
     diagnostics: &Arc<Mutex<NetworkDiagnosticsState>>,
     peer: NodeId,
@@ -339,7 +339,7 @@ async fn run_connectivity_attempt(
         match resolve_signed_endpoint(
             dht,
             realm_id,
-            dht_signed_authorized_nodes,
+            signed_authorized_nodes,
             peer,
             discovery_method.dht_signed_config(),
             diagnostics,
@@ -464,7 +464,7 @@ pub(crate) async fn peer_connection_states(
             status,
             active_addresses,
             last_error: health.and_then(|state| state.last_error.clone()),
-            next_retry_in_secs: health.and_then(|state| state.next_retry_in_secs),
+            retry_in_secs: health.and_then(|state| state.retry_in_secs),
         });
     }
 

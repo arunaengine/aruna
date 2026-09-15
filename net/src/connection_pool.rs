@@ -24,7 +24,7 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{Instrument, debug, info_span, trace, warn};
 
 const MONITOR_CHANNEL_CAPACITY: usize = 4096;
-const PARKED_IDLE_TIMER_SECS: u64 = 365 * 24 * 60 * 60;
+const IDLE_TIMER_SECS: u64 = 365 * 24 * 60 * 60;
 // Matches the initial peer retry interval, so a cooled peer is re-probed on the
 // same cadence the connectivity manager already uses.
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
@@ -359,7 +359,7 @@ impl PoolContext {
 
         let counter = ConnectionCounter::new();
         let mut idle_timer = Box::pin(tokio::time::sleep(Duration::from_secs(
-            PARKED_IDLE_TIMER_SECS,
+            IDLE_TIMER_SECS,
         )));
         let mut idle_timer_active = false;
 

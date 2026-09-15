@@ -197,7 +197,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dht::constants::{MAX_MESSAGE_SIZE, MAX_STORED_VALUE_SIZE};
+    use crate::dht::constants::{MAX_MESSAGE_SIZE, MAX_STORED_SIZE};
     use crate::dht::kbucket::K;
 
     fn make_node(bytes: [u8; 32]) -> NodeId {
@@ -354,6 +354,6 @@ mod tests {
 
     #[test]
     fn wire_limit_enforced() {
-        const { assert!(MAX_STORED_VALUE_SIZE + K * 32 + 1024 <= MAX_MESSAGE_SIZE) };
+        const { assert!(MAX_STORED_SIZE + K * 32 + 1024 <= MAX_MESSAGE_SIZE) };
     }
 }

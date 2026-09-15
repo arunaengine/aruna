@@ -174,7 +174,7 @@ impl DocumentSyncService {
         match self
             .storage
             .send_storage_effect(StorageEffect::Delete {
-                key_space: DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                key_space: APPLIED_OPS_KEYSPACE.to_string(),
                 key: topic_cursor_key(topic_id),
                 txn_id: None,
             })

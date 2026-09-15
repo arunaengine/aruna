@@ -9,38 +9,51 @@ use crate::structs::identity::realm::RealmId;
 pub enum TaskKey {
     RealmPresence { realm_id: RealmId, node_id: NodeId },
     SyncPlacements { realm_id: RealmId, node_id: NodeId },
-    DrainDocumentSyncOutbox,
+    #[serde(rename = "DrainDocumentSyncOutbox")]
+    DrainSyncOutbox,
     PublishUsageSnapshots,
     PublishNodeInfo,
-    DrainMetadataProjectionQueue,
-    DrainMetadataMaterializationQueue,
-    DrainMetadataGraphPruneQueue,
-    DrainBlobReplicationQueue,
-    DrainReferenceMetadataRefreshQueue,
+    #[serde(rename = "DrainMetadataProjectionQueue")]
+    DrainProjectionQueue,
+    #[serde(rename = "DrainMetadataMaterializationQueue")]
+    DrainMaterializationQueue,
+    #[serde(rename = "DrainMetadataGraphPruneQueue")]
+    DrainPruneQueue,
+    #[serde(rename = "DrainBlobReplicationQueue")]
+    DrainReplicationQueue,
+    #[serde(rename = "DrainReferenceMetadataRefreshQueue")]
+    DrainRefreshQueue,
     DrainNotificationOutbox,
     PruneNotifications,
     PublishWatchInterest,
     DrainJobQueue,
     PruneJobs,
-    DrainSyncMirrorRepair,
+    #[serde(rename = "DrainSyncMirrorRepair")]
+    DrainMirrorRepair,
     SweepHiddenBlobs,
-    DrainBlobCleanupQueue,
+    #[serde(rename = "DrainBlobCleanupQueue")]
+    DrainCleanupQueue,
     RefreshBlobHolders,
     // Unit variant indices are persistent storage keys. Append variants only, because insertion would
     // decode every later persisted timer as a different task.
-    DrainBlobReclaimQueue,
-    DrainJobFamilyOutbox,
-    DrainJobWitnessQueue,
+    #[serde(rename = "DrainBlobReclaimQueue")]
+    DrainReclaimQueue,
+    #[serde(rename = "DrainJobFamilyOutbox")]
+    DrainFamilyOutbox,
+    #[serde(rename = "DrainJobWitnessQueue")]
+    DrainWitnessQueue,
     DrainDeviceIntake,
     ReconcileSyncedFolders,
-    DrainSyncUploadOutbox,
+    #[serde(rename = "DrainSyncUploadOutbox")]
+    DrainUploadOutbox,
     SettleJobTerminals,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedTaskTimer {
     pub key: TaskKey,
-    pub due_at_unix_millis: u64,
+    #[serde(rename = "due_at_unix_millis")]
+    pub due_unix_millis: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

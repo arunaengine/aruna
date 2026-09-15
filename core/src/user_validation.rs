@@ -1,8 +1,8 @@
 use thiserror::Error;
 
 pub const MAX_USER_ATTRIBUTES: usize = 128;
-pub const MAX_USER_ATTRIBUTE_KEY_BYTES: usize = 128;
-pub const MAX_USER_ATTRIBUTE_VALUE_BYTES: usize = 4096;
+pub const ATTRIBUTE_KEY_BYTES: usize = 128;
+pub const ATTRIBUTE_VALUE_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum UserAttributeError {
@@ -16,7 +16,7 @@ pub enum UserAttributeError {
 
 pub fn validate_attribute_key(key: &str) -> Result<(), UserAttributeError> {
     if key.is_empty()
-        || key.len() > MAX_USER_ATTRIBUTE_KEY_BYTES
+        || key.len() > ATTRIBUTE_KEY_BYTES
         || !key
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
@@ -28,7 +28,7 @@ pub fn validate_attribute_key(key: &str) -> Result<(), UserAttributeError> {
 }
 
 pub fn validate_attribute_value(key: &str, value: &str) -> Result<(), UserAttributeError> {
-    if value.len() > MAX_USER_ATTRIBUTE_VALUE_BYTES
+    if value.len() > ATTRIBUTE_VALUE_BYTES
         || value.chars().any(char::is_control)
         || (key.starts_with(crate::user_profile::VISIBILITY_PREFIX)
             && !matches!(value, "public" | "private"))
@@ -50,7 +50,7 @@ pub fn validate_attribute_count(count: usize) -> Result<(), UserAttributeError> 
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_USER_ATTRIBUTE_KEY_BYTES, MAX_USER_ATTRIBUTE_VALUE_BYTES, MAX_USER_ATTRIBUTES,
+        ATTRIBUTE_KEY_BYTES, ATTRIBUTE_VALUE_BYTES, MAX_USER_ATTRIBUTES,
         UserAttributeError, validate_attribute_count, validate_attribute_key,
         validate_attribute_value,
     };
@@ -78,7 +78,7 @@ mod tests {
             );
         }
 
-        let key = "a".repeat(MAX_USER_ATTRIBUTE_KEY_BYTES + 1);
+        let key = "a".repeat(ATTRIBUTE_KEY_BYTES + 1);
         assert_eq!(
             validate_attribute_key(&key),
             Err(UserAttributeError::InvalidKey(key))
@@ -104,7 +104,7 @@ mod tests {
         assert_eq!(
             validate_attribute_value(
                 "department",
-                &"a".repeat(MAX_USER_ATTRIBUTE_VALUE_BYTES + 1)
+                &"a".repeat(ATTRIBUTE_VALUE_BYTES + 1)
             ),
             Err(UserAttributeError::InvalidValue("department".to_string()))
         );

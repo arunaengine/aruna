@@ -16,11 +16,11 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 /// Default flush interval for latency summaries.
 pub const LATENCY_SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
 /// Default maximum distinct non-overflow latency keys per flush window.
-pub const DEFAULT_LATENCY_MAX_KEYS: usize = 1_024;
+pub const LATENCY_MAX_KEYS: usize = 1_024;
 /// Default maximum latency key length in bytes.
-pub const DEFAULT_LATENCY_MAX_KEY_LEN: usize = 256;
+pub const MAX_KEY_LEN: usize = 256;
 /// Default bucket for latency observations whose original key is not retained.
-pub const DEFAULT_LATENCY_OVERFLOW_KEY: &str = "__overflow__";
+pub const LATENCY_OVERFLOW_KEY: &str = "__overflow__";
 /// Default tick interval for queue lag gauges.
 pub const QUEUE_LAG_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -243,9 +243,9 @@ impl Default for LatencyAggregatorOptions {
     fn default() -> Self {
         Self {
             interval: LATENCY_SUMMARY_INTERVAL,
-            max_keys: DEFAULT_LATENCY_MAX_KEYS,
-            max_key_len: DEFAULT_LATENCY_MAX_KEY_LEN,
-            overflow_key: DEFAULT_LATENCY_OVERFLOW_KEY.to_string(),
+            max_keys: LATENCY_MAX_KEYS,
+            max_key_len: MAX_KEY_LEN,
+            overflow_key: LATENCY_OVERFLOW_KEY.to_string(),
         }
     }
 }

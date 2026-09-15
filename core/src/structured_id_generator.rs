@@ -10,7 +10,7 @@ use super::layout;
 use super::{BucketId, PlacementHandle, StructuredId};
 
 /// Realm skew bound default of five minutes (REQ-META-ID-TIME-001).
-pub const DEFAULT_MAX_ID_CLOCK_SKEW_MS: u64 = 300_000;
+pub const MAX_ID_SKEW: u64 = 300_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ClockHealthError {
@@ -118,7 +118,7 @@ pub struct StructuredIdGenerator<E: IdEnvironment = SystemEnvironment> {
 
 impl StructuredIdGenerator<SystemEnvironment> {
     pub fn new() -> Self {
-        Self::with_environment(SystemEnvironment::new(), DEFAULT_MAX_ID_CLOCK_SKEW_MS)
+        Self::with_environment(SystemEnvironment::new(), MAX_ID_SKEW)
     }
 }
 

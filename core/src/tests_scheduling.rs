@@ -149,6 +149,6 @@ pub(crate) fn link(from: &str, to: &str, bandwidth: u64) -> LocationLink {
     LocationLink {
         from: from.to_string(),
         to: to.to_string(),
-        bandwidth_bytes_per_sec: bandwidth,
+        bandwidth_per_sec: bandwidth,
     }
 }

@@ -206,7 +206,7 @@ pub(crate) fn add_subject(event_seed: u8, origin_seed: u8, subject_id: &str) -> 
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::UserSubjectIdAdded {
+        AdminDocumentOperation::SubjectIdAdded {
             subject_id: subject_id.to_string(),
         },
     )
@@ -222,7 +222,7 @@ pub(crate) fn remove_subject(
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::UserSubjectIdRemoved {
+        AdminDocumentOperation::SubjectIdRemoved {
             subject_id: subject_id.to_string(),
         },
     )
@@ -264,7 +264,7 @@ pub(crate) fn rename_group(
         node(origin_seed),
         origin_seq,
         observed,
-        AdminDocumentOperation::GroupDisplayNameSet {
+        AdminDocumentOperation::DisplayNameSet {
             display_name: display_name.to_string(),
         },
     )
@@ -323,7 +323,7 @@ pub(crate) fn assign_group_user(
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id },
+        AdminDocumentOperation::GroupAssignmentAdded { role_id, user_id },
     )
 }
 
@@ -338,7 +338,7 @@ pub(crate) fn remove_group_assignment(
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id },
+        AdminDocumentOperation::GroupAssignmentRemoved { role_id, user_id },
     )
 }
 
@@ -381,7 +381,7 @@ pub(crate) fn assign_realm_user(
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id },
+        AdminDocumentOperation::RealmAssignmentAdded { role_id, user_id },
     )
 }
 
@@ -396,7 +396,7 @@ pub(crate) fn remove_realm_assignment(
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id },
+        AdminDocumentOperation::RealmAssignmentRemoved { role_id, user_id },
     )
 }
 
@@ -411,7 +411,7 @@ pub(crate) fn ensure_realm_node(
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind },
+        AdminDocumentOperation::ConfigNodeEnsured { node_id, kind },
     )
 }
 
@@ -425,7 +425,7 @@ pub(crate) fn upsert_oidc_provider(
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider },
+        AdminDocumentOperation::OidcProviderUpserted { provider },
     )
 }
 
@@ -440,7 +440,7 @@ pub(crate) fn set_realm_settings(
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigSettingsSet {
+        AdminDocumentOperation::ConfigSettingsSet {
             metadata_replication,
             discovery,
         },
@@ -457,7 +457,7 @@ pub(crate) fn set_realm_description(
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigDescriptionSet {
+        AdminDocumentOperation::ConfigDescriptionSet {
             description: description.to_string(),
         },
     )

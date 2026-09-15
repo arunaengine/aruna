@@ -25,8 +25,8 @@ use tracing::{Instrument, Span, debug, debug_span, field, info_span, trace, warn
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::constants::{
-    CMD_CHANNEL_CAPACITY, DHT_KEY_COUNT_KEY, DHT_META_KEYSPACE, DHT_REVISION_KEY,
-    DRIVER_IO_EVENT_CAPACITY, DRIVER_TICK_INTERVAL, INBOUND_STORAGE_BUDGET, MAX_ENTRIES_PER_KEY,
+    CMD_CHANNEL_CAPACITY, KEY_COUNT_KEY, DHT_META_KEYSPACE, DHT_REVISION_KEY,
+    IO_EVENT_CAPACITY, DRIVER_TICK_INTERVAL, INBOUND_STORAGE_BUDGET, ENTRIES_PER_KEY,
     MAX_INBOUND_RPCS, MAX_MESSAGE_SIZE, MAX_STORED_KEYS, RPC_TIMEOUT, STORAGE_MUTATION_RETRIES,
     STORAGE_TIMEOUT,
 };
@@ -375,7 +375,7 @@ impl DhtDriver {
         inbound_rx: InboundReceiver,
         shutdown: CancellationToken,
     ) -> Self {
-        let (io_tx, io_rx) = mpsc::bounded_async(DRIVER_IO_EVENT_CAPACITY);
+        let (io_tx, io_rx) = mpsc::bounded_async(IO_EVENT_CAPACITY);
         let (revision_tx, revision_rx) = tokio::sync::mpsc::channel(CMD_CHANNEL_CAPACITY);
         let revision_task = tokio::spawn(run_revision_allocator(
             storage.clone(),
@@ -1920,7 +1920,7 @@ async fn reserve_key_slot(
             op_id,
             stage,
             txn_id,
-            DHT_KEY_COUNT_KEY,
+            KEY_COUNT_KEY,
             count + 1,
             "count_write",
         )
@@ -2251,7 +2251,7 @@ async fn read_key_count(
 ) -> Result<u64, TransactionFailure> {
     let read = Effect::Storage(StorageEffect::Read {
         key_space: DHT_META_KEYSPACE.to_string(),
-        key: ByteView::from(DHT_KEY_COUNT_KEY),
+        key: ByteView::from(KEY_COUNT_KEY),
         txn_id: Some(txn_id),
     });
     match send_storage_effect(storage, read, op_id, stage, "count_read").await {
@@ -2279,7 +2279,7 @@ async fn decrement_key_count(
         op_id,
         stage,
         txn_id,
-        DHT_KEY_COUNT_KEY,
+        KEY_COUNT_KEY,
         next,
         "count_write",
     )
@@ -2826,7 +2826,7 @@ fn validate_response(response: &DhtResponse) -> Result<(), DhtIoError> {
         DhtResponse::Value {
             entries,
             closer_nodes,
-        } if entries.len() > MAX_ENTRIES_PER_KEY || closer_nodes.len() > K => {
+        } if entries.len() > ENTRIES_PER_KEY || closer_nodes.len() > K => {
             Err(DhtIoError::invalid_response("too many DHT values or nodes"))
         }
         _ => Ok(()),
@@ -2976,7 +2976,7 @@ mod tests {
         };
         assert!(
             validate_response(&DhtResponse::Value {
-                entries: vec![value; MAX_ENTRIES_PER_KEY + 1],
+                entries: vec![value; ENTRIES_PER_KEY + 1],
                 closer_nodes: Vec::new(),
             })
             .is_err()
@@ -3085,7 +3085,7 @@ mod tests {
         IoReceiver,
         tokio::task::JoinHandle<()>,
     ) {
-        let (io_tx, io_rx) = mpsc::bounded_async(DRIVER_IO_EVENT_CAPACITY);
+        let (io_tx, io_rx) = mpsc::bounded_async(IO_EVENT_CAPACITY);
         let (revision_tx, revision_rx) = tokio::sync::mpsc::channel(CMD_CHANNEL_CAPACITY);
         let worker = tokio::spawn(run_revision_allocator(
             storage.clone(),
@@ -3123,7 +3123,7 @@ mod tests {
         let event = storage
             .send_effect(Effect::Storage(StorageEffect::Read {
                 key_space: DHT_META_KEYSPACE.to_string(),
-                key: ByteView::from(DHT_KEY_COUNT_KEY),
+                key: ByteView::from(KEY_COUNT_KEY),
                 txn_id: None,
             }))
             .await;
@@ -3140,7 +3140,7 @@ mod tests {
         let event = storage
             .send_effect(Effect::Storage(StorageEffect::Write {
                 key_space: DHT_META_KEYSPACE.to_string(),
-                key: ByteView::from(DHT_KEY_COUNT_KEY),
+                key: ByteView::from(KEY_COUNT_KEY),
                 value: ByteView::from(count.to_le_bytes().as_slice()),
                 txn_id: None,
             }))
@@ -3464,7 +3464,7 @@ mod tests {
         let event = storage
             .send_effect(Effect::Storage(StorageEffect::Write {
                 key_space: DHT_META_KEYSPACE.to_string(),
-                key: ByteView::from(DHT_KEY_COUNT_KEY),
+                key: ByteView::from(KEY_COUNT_KEY),
                 value: ByteView::from(MAX_STORED_KEYS.to_le_bytes().as_slice()),
                 txn_id: None,
             }))
@@ -3961,7 +3961,7 @@ mod tests {
                 ),
                 (
                     DHT_META_KEYSPACE.to_string(),
-                    ByteView::from(DHT_KEY_COUNT_KEY),
+                    ByteView::from(KEY_COUNT_KEY),
                     ByteView::from(1u64.to_le_bytes().as_slice()),
                 ),
             ];

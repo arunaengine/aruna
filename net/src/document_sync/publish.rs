@@ -517,7 +517,7 @@ impl DocumentSyncService {
                 topic_id,
                 genesis,
                 self.storage_read(
-                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    APPLIED_OPS_KEYSPACE.to_string(),
                     cursor_key.clone(),
                 )
                 .await?,
@@ -525,7 +525,7 @@ impl DocumentSyncService {
             cursor.merge(&clock);
             let value = applied_cursor_value(self.node.storage(), topic_id, genesis, &cursor)?;
             writes.push((
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                APPLIED_OPS_KEYSPACE.to_string(),
                 cursor_key,
                 value,
             ));

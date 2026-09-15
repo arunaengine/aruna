@@ -10,7 +10,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use smallvec::SmallVec;
 
 use super::constants::{
-    LOOKUP_ALPHA, LOOKUP_MAX_QUERIES, MAX_CLOCK_SKEW_SECS, MAX_ENTRIES_PER_KEY, MAX_TTL_SECS,
+    LOOKUP_ALPHA, LOOKUP_MAX_QUERIES, MAX_CLOCK_SKEW, ENTRIES_PER_KEY, MAX_TTL_SECS,
     MAX_VALUE_SIZE, RPC_TIMEOUT_TICKS,
 };
 use super::kbucket::{InsertResult, K, PeerInfo, RoutingTable};
@@ -34,8 +34,8 @@ const MIN_TTL_SECS: u64 = 1;
 
 type PendingMap = HashMap<PendingKey, PendingMeta>;
 
-const LOOKUP_LOG_PEER_LIMIT: usize = 16;
-const LOOKUP_LOG_ERROR_LIMIT: usize = 16;
+const LOG_PEER_LIMIT: usize = 16;
+const LOG_ERROR_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
 struct PendingMeta {
@@ -52,7 +52,7 @@ pub struct DhtStateMachine {
     local_id: NodeId,
     secret_key: iroh::SecretKey,
     routing_table: RoutingTable,
-    next_internal_op_id: OpId,
+    internal_op_id: OpId,
     ops: HashMap<OpId, OpState>,
     cleanup_active: bool,
     cleanup_floor: bool,
@@ -288,7 +288,7 @@ impl DhtStateMachine {
             local_id,
             secret_key,
             routing_table: RoutingTable::new(local_id),
-            next_internal_op_id: INTERNAL_OP_START,
+            internal_op_id: INTERNAL_OP_START,
             ops: HashMap::new(),
             cleanup_active: false,
             cleanup_floor: false,
@@ -825,7 +825,7 @@ impl DhtStateMachine {
                     let existing = op.cache_entries.iter().find(|existing| {
                         existing.publisher == entry.publisher && existing.realm_id == entry.realm_id
                     });
-                    if existing.is_none() && op.cache_entries.len() >= MAX_ENTRIES_PER_KEY {
+                    if existing.is_none() && op.cache_entries.len() >= ENTRIES_PER_KEY {
                         out.push(DhtEffect::Output(DhtOutput::Failed {
                             op_id,
                             error: DhtIoError::StorageFull,
@@ -1603,7 +1603,7 @@ impl DhtStateMachine {
                 if revision == 0
                     || !entry_is_fresh(expires_at, self.now_secs)
                     || expires_at.saturating_sub(self.now_secs)
-                        > MAX_TTL_SECS.saturating_add(MAX_CLOCK_SKEW_SECS)
+                        > MAX_TTL_SECS.saturating_add(MAX_CLOCK_SKEW)
                 {
                     out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                         inbound_id,
@@ -2168,8 +2168,8 @@ impl DhtStateMachine {
 
     #[tracing::instrument(name = "dht.state.alloc_internal_op", level = "trace", skip(self))]
     fn allocate_internal_id(&mut self) -> OpId {
-        let op_id = self.next_internal_op_id;
-        self.next_internal_op_id = self.next_internal_op_id.saturating_add(1);
+        let op_id = self.internal_op_id;
+        self.internal_op_id = self.internal_op_id.saturating_add(1);
         op_id
     }
 }
@@ -2245,7 +2245,7 @@ fn stored_value_bounded(key: &DhtKeyId, entry: &StoredValue, now_secs: u64) -> b
     entry.value.len() <= MAX_VALUE_SIZE
         && entry.revision > 0
         && entry.expires_at.saturating_sub(now_secs)
-            <= MAX_TTL_SECS.saturating_add(MAX_CLOCK_SKEW_SECS)
+            <= MAX_TTL_SECS.saturating_add(MAX_CLOCK_SKEW)
         && retention_deadline(entry.expires_at, now_secs) > now_secs
         && verify_stored_value(key, entry)
 }
@@ -2330,7 +2330,7 @@ fn storage_error_response(error: &DhtIoError) -> DhtResponse {
 }
 
 fn get_stats(op: &GetOp, completed_reason: GetCompletedReason) -> DhtGetStats {
-    let queried_peers = limited_sorted_peers(&op.frontier.queried, LOOKUP_LOG_PEER_LIMIT);
+    let queried_peers = limited_sorted_peers(&op.frontier.queried, LOG_PEER_LIMIT);
     let queried_peer_count = op.frontier.queried.len();
 
     DhtGetStats {
@@ -2339,7 +2339,7 @@ fn get_stats(op: &GetOp, completed_reason: GetCompletedReason) -> DhtGetStats {
         remote_value_count: op.remote_values.len(),
         queried_peer_count,
         queried_peers,
-        queried_peers_truncated: queried_peer_count > LOOKUP_LOG_PEER_LIMIT,
+        queried_peers_truncated: queried_peer_count > LOG_PEER_LIMIT,
         peer_error_count: op.peer_error_count,
         peer_errors: op.peer_errors.clone(),
         peer_errors_truncated: op.peer_error_count > op.peer_errors.len(),
@@ -2355,7 +2355,7 @@ fn limited_sorted_peers(peers: &HashSet<NodeId>, limit: usize) -> Vec<NodeId> {
 
 fn record_peer_error(op: &mut GetOp, peer: NodeId, error: impl Into<String>) {
     op.peer_error_count = op.peer_error_count.saturating_add(1);
-    if op.peer_errors.len() >= LOOKUP_LOG_ERROR_LIMIT {
+    if op.peer_errors.len() >= LOG_ERROR_LIMIT {
         return;
     }
 
@@ -3019,7 +3019,7 @@ mod tests {
     #[test]
     fn old_floor_rejected() {
         let local_secret = make_secret(86);
-        let now_secs = MAX_TTL_SECS + MAX_CLOCK_SKEW_SECS + 1_000;
+        let now_secs = MAX_TTL_SECS + MAX_CLOCK_SKEW + 1_000;
         let mut state = DhtStateMachine::new(local_secret.public(), local_secret, now_secs);
         let key = DhtKeyId::from_data(b"old-remote-floor");
         let peer = make_node(87);
@@ -3030,7 +3030,7 @@ mod tests {
             key,
             make_realm(1),
             b"expired",
-            now_secs - MAX_TTL_SECS - MAX_CLOCK_SKEW_SECS,
+            now_secs - MAX_TTL_SECS - MAX_CLOCK_SKEW,
             2,
         );
         let effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
@@ -3293,7 +3293,7 @@ mod tests {
             trace_context: None,
         }));
 
-        let entries = (0..super::super::constants::MAX_ENTRIES_PER_KEY)
+        let entries = (0..super::super::constants::ENTRIES_PER_KEY)
             .map(|seed| make_entry(seed as u8, key, make_realm(seed as u8), b"local", 2_000))
             .collect();
         let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {

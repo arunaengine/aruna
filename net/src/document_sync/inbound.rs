@@ -46,11 +46,11 @@ impl DocumentSyncService {
         let mut byte_reservation =
             InboundByteReservation::new(self.inbound_budget.clone(), node_to_peer(&peer));
         let (messages, touched_topics) = timeout(
-            DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT,
+            INBOUND_STREAM_TIMEOUT,
             read_sync_messages(&mut recv, &mut byte_reservation),
         )
         .await
-        .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT))??;
+        .map_err(|_| NetError::Timeout(INBOUND_STREAM_TIMEOUT))??;
         let read_elapsed = stream_started.elapsed();
         let message_count = messages.len();
         let handle_started = Instant::now();

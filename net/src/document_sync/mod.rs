@@ -31,22 +31,22 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
-    ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-    DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
-    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    METADATA_GRAPH_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
-    PERSISTENT_ID_MAPPING_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
-    SYNC_QUARANTINE_USAGE_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    DOCUMENT_STATE_KEYSPACE, APPLIED_OPS_KEYSPACE,
+    SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, OWNER_INDEX_KEYSPACE,
+    CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
+    GRAPH_LIFECYCLE_KEYSPACE, WATCH_INTEREST_KEYSPACE,
+    ID_MAPPING_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
+    QUARANTINE_USAGE_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, GraphPruneRecord, MetadataDeleteRecord, MetadataEventRecord,
     MetadataLifecycleRecord,
 };
 use aruna_core::reducer::{
-    AdminApplyStatus, AdminDocumentState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
-    GROUP_REALM_ID_PATH, MAX_LIVE_REVOCATIONS_PER_ORIGIN, REALM_CONFIG_COMPUTE_PATH,
-    REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
-    REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_POLICIES_PATH, REALM_CONFIG_QUOTA_PATH,
+    AdminApplyStatus, AdminDocumentState, DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
+    REALM_ID_PATH, REVOCATIONS_PER_ORIGIN, CONFIG_COMPUTE_PATH,
+    CONFIG_DESCRIPTION_PATH, CONFIG_DISCOVERY_PATH,
+    METADATA_REPLICATION_PATH, CONFIG_POLICIES_PATH, CONFIG_QUOTA_PATH,
     RevocationIndex, USER_NAME_PATH, config_node_path, decode_reducer_state, group_role_path,
     group_user_path, overlay_placement, parse_config_node, parse_config_oidc,
     parse_group_assignment, parse_group_role, parse_realm_assignment, realm_role_path,
@@ -68,15 +68,15 @@ use aruna_core::structs::placement::placement_record::{
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument, owner_group_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::execution::notification_watch::{
-    NOTIFICATION_WATCH_INTEREST_BYTES_CAP, NOTIFICATION_WATCH_INTEREST_ENTRY_CAP,
-    NOTIFICATION_WATCH_MAX_PREFIX_LEN, WatchEventMask, WatchInterestDigest, WatchSubscription,
+    INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP,
+    MAX_PREFIX_LEN, WatchEventMask, WatchInterestDigest, WatchSubscription,
     interest_dirty_key, interest_node_id, interest_realm_id,
 };
 use aruna_core::structs::storage::node_info::{NodeInfoDocument, reserved_label};
 use aruna_core::structs::storage::usage::{NodeUsageSnapshot, usage_node_id};
 use aruna_core::structs::{
     PersistentIdKind, PersistentIdMapping, PersistentIdProvider, PersistentIdStatus,
-    SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence,
+    QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence,
     SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries,
     persistent_id_change, persistent_id_key, persistent_id_target, quarantine_usage_entry,
 };
@@ -116,33 +116,33 @@ mod topics;
 use self::reconcile::*;
 use self::storage::*;
 
-const DOCUMENT_SYNC_PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+const PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 // Matches irokle's 1024-topic wire batches; the worst-case data stream sends
 // three messages per topic, staying under the peer's 4096-message stream cap.
-pub const DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT: usize = 1_024;
-const DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT: usize = 8;
-const DOCUMENT_SYNC_FANOUT_DOMAIN: &[u8] = b"aruna-document-sync-fanout-v1";
-const DOCUMENT_SYNC_FANOUT_KEYSPACE: &str = "document-sync-fanout";
-const DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
-const DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
+pub const BATCH_TOPIC_LIMIT: usize = 1_024;
+const OUTBOUND_PEER_LIMIT: usize = 8;
+const SYNC_FANOUT_DOMAIN: &[u8] = b"aruna-document-sync-fanout-v1";
+const SYNC_FANOUT_KEYSPACE: &str = "document-sync-fanout";
+const SYNC_MESSAGE_LIMIT: usize = 4_096;
+const SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 // A frame is meaningful progress; a byte trickle cannot retain a permit forever.
-const DOCUMENT_SYNC_INBOUND_FRAME_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const INBOUND_FRAME_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const INBOUND_STREAM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 // Admission budgets: worst-case inbound cost is bounded before any stream is
 // drained, per pushing peer and for the node as a whole.
-const DOCUMENT_SYNC_INBOUND_PEER_STREAMS: usize = 8;
-const DOCUMENT_SYNC_INBOUND_GLOBAL_STREAMS: usize = 64;
+const INBOUND_PEER_STREAMS: usize = 8;
+const INBOUND_GLOBAL_STREAMS: usize = 64;
 // Aggregate buffered-byte ceilings, well below 64 independent 256 MiB streams,
 // so concurrent streams cannot pin more memory than the node can absorb.
-const DOCUMENT_SYNC_INBOUND_PEER_BYTES: usize = 512 * 1024 * 1024;
-const DOCUMENT_SYNC_INBOUND_GLOBAL_BYTES: usize = 2 * 1024 * 1024 * 1024;
-const DOCUMENT_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
-const DOCUMENT_SYNC_REPLAY_BATCH_LIMIT: usize = 1_024;
+const INBOUND_PEER_BYTES: usize = 512 * 1024 * 1024;
+const INBOUND_GLOBAL_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
+const REPLAY_BATCH_LIMIT: usize = 1_024;
 const MAX_DEFERRED_TOPICS: usize = 1_024;
-const MAX_DEFERRED_TOPICS_PER_DEPENDENCY: usize = 256;
+const TOPICS_PER_DEPENDENCY: usize = 256;
 /// Bounds concurrent co-holder genesis probes so a large holder set cannot open
 /// an unbounded number of simultaneous sync streams.
-const SHARD_GENESIS_PROBE_CONCURRENCY: usize = 8;
+const SHARD_PROBE_CONCURRENCY: usize = 8;
 
 #[derive(Debug)]
 struct PendingCreateApply {
@@ -258,7 +258,7 @@ impl ShardPublisherPolicy {
 #[derive(Clone, Debug, Default)]
 pub struct ShardGenesisProbe {
     /// Probed topics at least one reached co-holder already has a genesis for.
-    pub known_by_co_holder: BTreeSet<::irokle::TopicId>,
+    pub known_co_holder: BTreeSet<::irokle::TopicId>,
     /// Probed topics a reached co-holder neither advertised nor positively
     /// confirmed unknown: it holds the topic but the prober may not open it yet,
     /// so a fresh genesis would fork. Possibly-existing ⇒ creation withheld.
@@ -287,8 +287,8 @@ impl InboundSyncBudget {
     fn acquire(self: &Arc<Self>, peer: PeerId) -> Option<InboundSyncPermit> {
         let mut state = self.state.lock();
         let held = state.per_peer.get(&peer).copied().unwrap_or(0);
-        if state.global >= DOCUMENT_SYNC_INBOUND_GLOBAL_STREAMS
-            || held >= DOCUMENT_SYNC_INBOUND_PEER_STREAMS
+        if state.global >= INBOUND_GLOBAL_STREAMS
+            || held >= INBOUND_PEER_STREAMS
         {
             return None;
         }
@@ -305,8 +305,8 @@ impl InboundSyncBudget {
     fn reserve_bytes(&self, peer: PeerId, bytes: usize) -> bool {
         let mut state = self.state.lock();
         let held = state.per_peer_bytes.get(&peer).copied().unwrap_or(0);
-        if state.global_bytes.saturating_add(bytes) > DOCUMENT_SYNC_INBOUND_GLOBAL_BYTES
-            || held.saturating_add(bytes) > DOCUMENT_SYNC_INBOUND_PEER_BYTES
+        if state.global_bytes.saturating_add(bytes) > INBOUND_GLOBAL_BYTES
+            || held.saturating_add(bytes) > INBOUND_PEER_BYTES
         {
             return false;
         }
@@ -468,7 +468,7 @@ impl DocumentSyncService {
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let fanout_cursors = db
             .keyspace(
-                DOCUMENT_SYNC_FANOUT_KEYSPACE,
+                SYNC_FANOUT_KEYSPACE,
                 fjall::KeyspaceCreateOptions::default,
             )
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -591,11 +591,11 @@ fn select_sync_peers(
             .then_with(|| left_peer.as_bytes().cmp(right_peer.as_bytes()))
     });
     let candidate_count = ranked.len();
-    let selected = DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT.min(candidate_count);
+    let selected = OUTBOUND_PEER_LIMIT.min(candidate_count);
     let start = if candidate_count == 0 {
         0
     } else {
-        ((round as u128 * DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT as u128) % candidate_count as u128)
+        ((round as u128 * OUTBOUND_PEER_LIMIT as u128) % candidate_count as u128)
             as usize
     };
     let peers = (0..selected)
@@ -609,8 +609,8 @@ fn select_sync_peers(
 }
 
 fn peer_score(subject: &[u8], peer: PeerId) -> [u8; 32] {
-    let mut input = Vec::with_capacity(DOCUMENT_SYNC_FANOUT_DOMAIN.len() + subject.len() + 32);
-    input.extend_from_slice(DOCUMENT_SYNC_FANOUT_DOMAIN);
+    let mut input = Vec::with_capacity(SYNC_FANOUT_DOMAIN.len() + subject.len() + 32);
+    input.extend_from_slice(SYNC_FANOUT_DOMAIN);
     input.extend_from_slice(subject);
     input.extend_from_slice(peer.as_bytes());
     *DhtKeyId::from_data(&input).as_bytes()

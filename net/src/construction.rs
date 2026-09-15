@@ -36,7 +36,7 @@ use crate::error::{NetError, Result};
 use crate::eviction::spawn_eviction_maintenance;
 use crate::streams::{self, InboundAdmission, StreamsService};
 use crate::tasks::{
-    BackgroundTasks, MAX_INBOUND_APP_STREAM_HANDLERS, spawn_accept_loop, spawn_dht_forwarder,
+    BackgroundTasks, MAX_STREAM_HANDLERS, spawn_accept_loop, spawn_dht_forwarder,
     spawn_effect_dispatch, spawn_stream_dispatch,
 };
 use crate::{
@@ -74,7 +74,7 @@ impl NetHandle {
                 notification_wakes: handle_state.notification_wakes,
                 dashboard_epoch: handle_state.dashboard_epoch,
                 dashboard_changes: handle_state.dashboard_changes,
-                dht_signed_authorized_nodes: peers.dht_signed_authorized_nodes,
+                signed_authorized_nodes: peers.signed_authorized_nodes,
                 dht: services.dht,
                 document_sync: services.document_sync,
                 streams: services.streams,
@@ -125,11 +125,11 @@ impl NetworkEndpoint {
         let configured_relay_urls = relay_method.relay_urls();
 
         let mut transport_config = QuicTransportConfig::builder();
-        if let Some(max_uni) = config.max_concurrent_uni_streams {
+        if let Some(max_uni) = config.max_uni_streams {
             transport_config =
                 transport_config.max_concurrent_uni_streams(VarInt::from_u64(max_uni)?);
         }
-        if let Some(max_bidi) = config.max_concurrent_bidi_streams {
+        if let Some(max_bidi) = config.max_bidi_streams {
             transport_config =
                 transport_config.max_concurrent_bidi_streams(VarInt::from_u64(max_bidi)?);
         }
@@ -233,7 +233,7 @@ impl NetworkEndpoint {
 struct PeerAdmissionState {
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
     inbound_admission: InboundAdmission,
-    dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
+    signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     peer_connectivity: Arc<Mutex<PeerManagerState>>,
     network_diagnostics: Arc<Mutex<NetworkDiagnosticsState>>,
     peer_connectivity_tx: mpsc::Sender<PeerEvent>,
@@ -261,7 +261,7 @@ impl PeerAdmissionState {
         if persisted_realm_peers.is_some() {
             inbound_admission.mark_materialized();
         }
-        let dht_signed_authorized_nodes = Arc::new(RwLock::new(realm_peer_nodes.clone()));
+        let signed_authorized_nodes = Arc::new(RwLock::new(realm_peer_nodes.clone()));
         let peer_connectivity = Arc::new(Mutex::new(PeerManagerState::new(
             &realm_peer_nodes,
             "realm_config",
@@ -283,7 +283,7 @@ impl PeerAdmissionState {
             Self {
                 realm_peers,
                 inbound_admission,
-                dht_signed_authorized_nodes,
+                signed_authorized_nodes,
                 peer_connectivity,
                 network_diagnostics,
                 peer_connectivity_tx,
@@ -355,7 +355,7 @@ impl NetworkServices {
         }
 
         let document_sync_path = config
-            .document_sync_storage_path
+            .sync_storage_path
             .clone()
             .unwrap_or_else(|| {
                 std::env::temp_dir().join(format!("aruna-document-sync-{}", ulid::Ulid::generate()))
@@ -462,7 +462,7 @@ impl BackgroundRuntime {
         tasks.push(spawn_dht_forwarder(dht_rx, dht_inbound_tx));
 
         let inbound_stream_handlers =
-            Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_APP_STREAM_HANDLERS));
+            Arc::new(tokio::sync::Semaphore::new(MAX_STREAM_HANDLERS));
         tasks.push(spawn_stream_dispatch(
             stream_rx,
             services.dht.clone(),
@@ -498,7 +498,7 @@ impl BackgroundRuntime {
             services.connection_pool.clone(),
             runtime.discovery_method.clone(),
             config.realm_id,
-            peers.dht_signed_authorized_nodes.clone(),
+            peers.signed_authorized_nodes.clone(),
             peers.peer_connectivity.clone(),
             peers.network_diagnostics.clone(),
             peers
