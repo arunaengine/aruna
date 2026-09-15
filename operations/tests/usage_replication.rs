@@ -9,16 +9,19 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
-use aruna_core::structs::{
-    Actor, BucketInfo, NODE_USAGE_DIRTY_GLOBAL_KEY, NodeUsageSnapshot, RealmConfigDocument,
-    RealmId, RealmNodeKind, UsageCounters, global_group_key, usage_global_key, usage_group_key,
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::usage::{
+    NODE_USAGE_DIRTY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, global_group_key,
+    usage_global_key, usage_group_key,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::usage_stats::{
     RealmUsageScope, load_realm_usage, publish_usage_snapshots,
 };
-use aruna_operations::s3::create_bucket::CreateBucketOperation;
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,

@@ -11,12 +11,19 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
     NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, NOTIFICATION_WATCH_PER_USER_CAP, NotificationClass,
-    NotificationKind, NotificationRecord, PlacementRef, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, RealmNodeKind, WatchAuthorizationBinding, WatchEvent,
-    WatchEventDetail, WatchEventKind, WatchEventMask, WatchInterestDigest, WatchSubscription,
-    interest_node_key, watch_notification_id, watch_resource_path,
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::execution::notification_watch::{
+    NOTIFICATION_WATCH_PER_USER_CAP, WatchAuthorizationBinding, WatchEvent, WatchEventDetail,
+    WatchEventKind, WatchEventMask, WatchInterestDigest, WatchSubscription, interest_node_key,
+    watch_notification_id, watch_resource_path,
+};
+use aruna_core::structs::execution::notification::{
+    NotificationClass, NotificationKind, NotificationRecord,
+};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{DocumentEffect, NodeId, UserId};
@@ -862,7 +869,7 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
     let shutdown = aruna_core::shutdown::Shutdown::new();
     initialize_net_holder(
         context.clone(),
-        aruna_core::structs::RoCrateLimits::default(),
+        aruna_core::structs::execution::job::RoCrateLimits::default(),
         jobs_runtime.clone(),
         &shutdown,
     );

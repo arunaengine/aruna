@@ -12,37 +12,46 @@ use aruna_core::keyspaces::{
     USAGE_STATS_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
-    AuthContext, Backend, BackendConfig, BlobHeadKey, BucketInfo, CurrentVersionPointer,
-    GroupQuotaOverride, MultipartChecksumType, NODE_SUBJECT_KEY, NodeSubjectRecord,
-    NodeUsageSnapshot, PlacementSubject, PolicyRefMode, QuotaConfig, RealmId, RoutingSnapshot,
-    UsageCounters, global_shard_keys, usage_group_key, usage_snapshot_key,
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::blob::{
+    Backend, BackendConfig, BlobHeadKey, BucketInfo, CurrentVersionPointer,
 };
+use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, RealmId};
+use aruna_core::structs::storage::multipart::MultipartChecksumType;
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::storage::usage::{
+    NodeUsageSnapshot, UsageCounters, global_shard_keys, usage_group_key, usage_snapshot_key,
+};
+use aruna_core::structs::placement::placement_policy::PlacementSubject;
+use aruna_core::structs::placement::policy_attachment::PolicyRefMode;
+use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::records::HeadAliasContext;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::usage_stats::RebuildStatsOperation;
-use aruna_operations::s3::abort_upload::{AbortUploadInput, AbortUploadOperation};
-use aruna_operations::s3::complete_upload::{
+use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
+use aruna_operations::s3::multipart::complete::{
     CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
     CompleteUploadResult,
 };
-use aruna_operations::s3::copy_object::{
+use aruna_operations::s3::object::copy::{
     CopyObjectInput, CopyReferences, CopyResultData, CopySourceConditions,
 };
-use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::create_upload::{CreateMultipartInput, CreateMultipartOperation};
-use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
-use aruna_operations::s3::delete_object::{
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
+use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
+use aruna_operations::s3::object::delete::{
     DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
 use aruna_operations::s3::policy::successor::{
     MintSuccessorOperation, SuccessorOutcome, SuccessorPlan,
 };
-use aruna_operations::s3::put_object::{
+use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_operations::s3::upload_part::{UploadPartInput, UploadPartOperation, UploadPartResult};
+use aruna_operations::s3::multipart::part_upload::{
+    UploadPartInput, UploadPartOperation, UploadPartResult,
+};
 use aruna_storage::storage;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -902,7 +911,7 @@ async fn copy_object(
     dest_key: &str,
     group_id: Ulid,
 ) -> CopyResultData {
-    aruna_operations::s3::copy_object::copy_object(
+    aruna_operations::s3::object::copy::copy_object(
         &h.driver,
         CopyObjectInput {
             source_bucket: bucket.to_string(),
