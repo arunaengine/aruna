@@ -5,8 +5,8 @@ use crate::NodeId;
 use crate::UserId;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncConflict, DocumentSyncRevision,
-    DocumentSyncTarget, ShardManifestEntry,
+    DocumentChange, DocumentChangeKind, DocumentSyncConflict, DocumentSyncRevision, DocumentTarget,
+    ShardManifestEntry,
 };
 use crate::errors::ConversionError;
 use crate::keyspaces::{
@@ -26,12 +26,11 @@ use crate::keyspaces::{
     USER_SUBJECT_INDEX_KEYSPACE,
 };
 use crate::metadata::{
-    MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
-    MetadataGraphPruneJobRecord, MetadataIriReferenceIndexRecord,
-    MetadataMaterializationDeadLetterRecord, MetadataMaterializationJobRecord,
-    MetadataMaterializationStatusRecord, MetadataProfileValidationStatus, MetadataRawOriginBudget,
+    DeadLetterRecord, GraphLifecycleRecord, GraphPruneRecord, IriIndexRecord,
+    MaterializationStatusRecord, MetadataEventRecord, MetadataLifecycleRecord,
+    MetadataMaterializationRecord, ProfileValidationStatus, RawOriginBudget,
 };
-use crate::reducer::{AdminDocumentConflict, AdminDocumentReducerState};
+use crate::reducer::{AdminConflict, AdminDocumentState};
 use crate::structs::{
     MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PLACEMENT_EPOCH_PAD,
     PlacementRef, RealmId, User, WatchSubscription, notification_inbox_key,
@@ -206,15 +205,15 @@ pub fn pending_projection_target(key: &[u8]) -> Option<(Ulid, Ulid)> {
     Some((Ulid::from_bytes(document_id), Ulid::from_bytes(event_id)))
 }
 
-pub fn sync_revision_key(target: &DocumentSyncTarget) -> Key {
+pub fn sync_revision_key(target: &DocumentTarget) -> Key {
     sync_sidecar_key(target)
 }
 
-pub fn sync_conflict_key(target: &DocumentSyncTarget) -> Key {
+pub fn sync_conflict_key(target: &DocumentTarget) -> Key {
     sync_sidecar_key(target)
 }
 
-fn sync_sidecar_key(target: &DocumentSyncTarget) -> Key {
+fn sync_sidecar_key(target: &DocumentTarget) -> Key {
     let storage_key = target.storage_key();
     let keyspace = target.storage_keyspace().as_bytes();
     let mut bytes = Vec::with_capacity(keyspace.len() + 1 + storage_key.as_ref().len());
@@ -258,7 +257,7 @@ pub fn dead_letter_key(document_id: Ulid, event_id: Ulid) -> Key {
     document_job_key(document_id, event_id)
 }
 
-pub fn materialization_job_key(record: &MetadataMaterializationJobRecord) -> Key {
+pub fn materialization_job_key(record: &MetadataMaterializationRecord) -> Key {
     let mut bytes = Vec::with_capacity(40);
     bytes.extend_from_slice(&record.due_at_ms.to_be_bytes());
     bytes.extend_from_slice(&record.document_id.to_bytes());
@@ -313,7 +312,7 @@ fn admin_target_bytes(target: &AdminDocumentTarget) -> Vec<u8> {
     }
 }
 
-pub fn graph_prune_key(record: &MetadataGraphPruneJobRecord) -> Key {
+pub fn graph_prune_key(record: &GraphPruneRecord) -> Key {
     let mut bytes = Vec::with_capacity(40);
     bytes.extend_from_slice(&record.due_at_ms.to_be_bytes());
     bytes.extend_from_slice(blake3::hash(record.graph_iri.as_bytes()).as_bytes());
@@ -321,7 +320,7 @@ pub fn graph_prune_key(record: &MetadataGraphPruneJobRecord) -> Key {
 }
 
 pub fn create_event_entry(
-    event: &MetadataCreateEventRecord,
+    event: &MetadataEventRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_EVENT_LOG_KEYSPACE.to_string(),
@@ -331,7 +330,7 @@ pub fn create_event_entry(
 }
 
 pub fn raw_budget_entry(
-    budget: &MetadataRawOriginBudget,
+    budget: &RawOriginBudget,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_RAW_BUDGET_KEYSPACE.to_string(),
@@ -341,7 +340,7 @@ pub fn raw_budget_entry(
 }
 
 pub fn profile_validation_entry(
-    status: &MetadataProfileValidationStatus,
+    status: &ProfileValidationStatus,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_PROFILE_VALIDATION_STATUS_KEYSPACE.to_string(),
@@ -351,7 +350,7 @@ pub fn profile_validation_entry(
 }
 
 pub fn create_acceptance_entry(
-    event: &MetadataCreateEventRecord,
+    event: &MetadataEventRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
@@ -360,7 +359,7 @@ pub fn create_acceptance_entry(
     ))
 }
 
-pub fn pending_projection_entry(event: &MetadataCreateEventRecord) -> (KeySpace, Key, Value) {
+pub fn pending_projection_entry(event: &MetadataEventRecord) -> (KeySpace, Key, Value) {
     (
         METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
         pending_projection_key(event.record.document_id, event.event_id),
@@ -376,7 +375,7 @@ pub fn delete_projection_entry(document_id: Ulid, event_id: Ulid) -> (KeySpace, 
 }
 
 pub fn create_projection_entries(
-    event: &MetadataCreateEventRecord,
+    event: &MetadataEventRecord,
 ) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
     Ok(vec![
         create_event_entry(event)?,
@@ -385,7 +384,7 @@ pub fn create_projection_entries(
 }
 
 pub fn graph_lifecycle_entry(
-    record: &MetadataGraphLifecycleRecord,
+    record: &GraphLifecycleRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
@@ -395,7 +394,7 @@ pub fn graph_lifecycle_entry(
 }
 
 pub fn document_lifecycle_entry(
-    record: &MetadataDocumentLifecycleRecord,
+    record: &MetadataLifecycleRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
@@ -405,8 +404,8 @@ pub fn document_lifecycle_entry(
 }
 
 pub fn sync_revision_entry(
-    target: &DocumentSyncTarget,
-    change: &DocumentSyncChange,
+    target: &DocumentTarget,
+    change: &DocumentChange,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
@@ -418,7 +417,7 @@ pub fn sync_revision_entry(
 /// Manifest-row key: `strategy(16) ‖ pad(8) ‖ shard(4, be) ‖ per-target sidecar key`. The 28-byte shard
 /// prefix isolates one shard's rows on a scan; the sidecar tail (keyspace-discriminated, see
 /// [`sync_revision_key`]) keeps two targets sharing a storage key from colliding.
-pub fn shard_manifest_key(placement: &PlacementRef, target: &DocumentSyncTarget) -> Key {
+pub fn shard_manifest_key(placement: &PlacementRef, target: &DocumentTarget) -> Key {
     let tail = sync_sidecar_key(target);
     let mut bytes = Vec::with_capacity(28 + tail.as_ref().len());
     bytes.extend_from_slice(&shard_manifest_prefix(placement));
@@ -451,8 +450,8 @@ pub fn shard_manifest_prefix(placement: &PlacementRef) -> Vec<u8> {
 /// at `change.current` (a delete leaves a tombstone). `Ok(None)` for shared
 /// realm-scoped targets or a NIL placement (no shard governs the change yet).
 pub fn shard_manifest_entry(
-    target: &DocumentSyncTarget,
-    change: &DocumentSyncChange,
+    target: &DocumentTarget,
+    change: &DocumentChange,
 ) -> Result<Option<(KeySpace, Key, Value)>, ConversionError> {
     if !target.uses_shard_topic() || change.placement == PlacementRef::NIL {
         return Ok(None);
@@ -471,11 +470,11 @@ pub fn shard_manifest_entry(
 /// Manifest row for a metadata document lifecycle record, built from the same
 /// revision change its sidecar carries so the manifest and the sidecar agree.
 pub fn lifecycle_manifest_entry(
-    record: &MetadataDocumentLifecycleRecord,
+    record: &MetadataLifecycleRecord,
     delete_actor: NodeId,
     placement: PlacementRef,
 ) -> Result<Option<(KeySpace, Key, Value)>, ConversionError> {
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+    let target = DocumentTarget::MetadataDocumentLifecycle {
         document_id: record.document_id(),
     };
     let change = lifecycle_revision_change(record, delete_actor, placement);
@@ -483,7 +482,7 @@ pub fn lifecycle_manifest_entry(
 }
 
 pub fn sync_conflict_entry(
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     conflict: &DocumentSyncConflict,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
@@ -494,12 +493,12 @@ pub fn sync_conflict_entry(
 }
 
 pub fn lifecycle_revision_change(
-    record: &MetadataDocumentLifecycleRecord,
+    record: &MetadataLifecycleRecord,
     delete_actor: NodeId,
     placement: PlacementRef,
-) -> DocumentSyncChange {
+) -> DocumentChange {
     match record {
-        MetadataDocumentLifecycleRecord::Upsert { event } => DocumentSyncChange {
+        MetadataLifecycleRecord::Upsert { event } => DocumentChange {
             base: None,
             current: DocumentSyncRevision {
                 generation: event.record.updated_at_ms,
@@ -507,10 +506,10 @@ pub fn lifecycle_revision_change(
                 actor: event.node_id,
                 updated_at_ms: event.occurred_at_ms,
             },
-            kind: DocumentSyncChangeKind::Upsert,
+            kind: DocumentChangeKind::Upsert,
             placement,
         },
-        MetadataDocumentLifecycleRecord::Delete { event } => DocumentSyncChange {
+        MetadataLifecycleRecord::Delete { event } => DocumentChange {
             base: None,
             current: DocumentSyncRevision {
                 generation: event.tombstone.updated_at_ms,
@@ -518,7 +517,7 @@ pub fn lifecycle_revision_change(
                 actor: delete_actor,
                 updated_at_ms: event.tombstone.updated_at_ms,
             },
-            kind: DocumentSyncChangeKind::Delete,
+            kind: DocumentChangeKind::Delete,
             placement,
         },
     }
@@ -528,12 +527,12 @@ pub fn lifecycle_revision_change(
 /// lifecycle records do not own an event id, so the sync event id is supplied
 /// by the outbox publisher and becomes the deterministic tie-breaker.
 pub fn graph_revision_change(
-    record: &MetadataGraphLifecycleRecord,
+    record: &GraphLifecycleRecord,
     event_id: Ulid,
     actor: NodeId,
     placement: PlacementRef,
-) -> DocumentSyncChange {
-    DocumentSyncChange {
+) -> DocumentChange {
+    DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: record.updated_at_ms,
@@ -541,17 +540,17 @@ pub fn graph_revision_change(
             actor,
             updated_at_ms: record.updated_at_ms,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement,
     }
 }
 
 pub fn lifecycle_revision_entry(
-    record: &MetadataDocumentLifecycleRecord,
+    record: &MetadataLifecycleRecord,
     delete_actor: NodeId,
     placement: PlacementRef,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+    let target = DocumentTarget::MetadataDocumentLifecycle {
         document_id: record.document_id(),
     };
     let change = lifecycle_revision_change(record, delete_actor, placement);
@@ -559,7 +558,7 @@ pub fn lifecycle_revision_entry(
 }
 
 pub fn materialization_status_entry(
-    record: &MetadataMaterializationStatusRecord,
+    record: &MaterializationStatusRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
@@ -569,7 +568,7 @@ pub fn materialization_status_entry(
 }
 
 pub fn iri_reference_entry(
-    record: &MetadataIriReferenceIndexRecord,
+    record: &IriIndexRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
@@ -587,7 +586,7 @@ pub fn iri_reference_entry(
 /// row is authoritative. Both rows MUST be written and deleted in one batch/txn
 /// so the index never references a document job that does not exist.
 pub fn materialization_job_entry(
-    record: &MetadataMaterializationJobRecord,
+    record: &MetadataMaterializationRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
@@ -599,7 +598,7 @@ pub fn materialization_job_entry(
 /// Authoritative sidecar row for the materialization queue, paired with the due
 /// index row above; the two MUST be written and deleted together.
 pub fn document_job_entry(
-    record: &MetadataMaterializationJobRecord,
+    record: &MetadataMaterializationRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
@@ -611,7 +610,7 @@ pub fn document_job_entry(
 /// Parked job kept for later requeue; the drain rearm loop retries these so a
 /// node converges without an operator or a restart.
 pub fn dead_letter_entry(
-    record: &MetadataMaterializationDeadLetterRecord,
+    record: &DeadLetterRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE.to_string(),
@@ -638,7 +637,7 @@ pub fn materialization_prune_key(document_id: Ulid) -> Key {
 }
 
 pub fn graph_prune_entry(
-    record: &MetadataGraphPruneJobRecord,
+    record: &GraphPruneRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
@@ -727,7 +726,7 @@ pub fn watch_delete_entry(owner: UserId, watch_id: Ulid) -> (KeySpace, Key) {
 }
 
 pub fn reducer_state_entry(
-    state: &AdminDocumentReducerState,
+    state: &AdminDocumentState,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
@@ -738,7 +737,7 @@ pub fn reducer_state_entry(
 
 pub fn conflict_write_entry(
     target: &AdminDocumentTarget,
-    conflict: &AdminDocumentConflict,
+    conflict: &AdminConflict,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
@@ -748,7 +747,7 @@ pub fn conflict_write_entry(
 }
 
 pub fn conflict_write_entries(
-    state: &AdminDocumentReducerState,
+    state: &AdminDocumentState,
 ) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
     state
         .conflicts
@@ -765,8 +764,8 @@ pub fn conflict_delete_entry(target: &AdminDocumentTarget, path: &str) -> (KeySp
 }
 
 pub fn stale_conflict_deletes(
-    previous: Option<&AdminDocumentReducerState>,
-    current: Option<&AdminDocumentReducerState>,
+    previous: Option<&AdminDocumentState>,
+    current: Option<&AdminDocumentState>,
 ) -> Vec<(KeySpace, Key)> {
     let Some(previous) = previous else {
         return Vec::new();
@@ -858,8 +857,8 @@ mod tests {
     use crate::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
     use crate::document::ShardManifestEntry;
     use crate::document::{
-        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncConflict, DocumentSyncRevision,
-        DocumentSyncTarget,
+        DocumentChange, DocumentChangeKind, DocumentSyncConflict, DocumentSyncRevision,
+        DocumentTarget,
     };
     use crate::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
@@ -868,10 +867,9 @@ mod tests {
         METADATA_IRI_REFERENCE_INDEX_KEYSPACE, METADATA_UPDATED_INDEX_KEYSPACE,
         SHARD_MANIFEST_KEYSPACE,
     };
-    use crate::metadata::{MetadataGraphLifecycleRecord, MetadataIriReferenceIndexRecord};
+    use crate::metadata::{GraphLifecycleRecord, IriIndexRecord};
     use crate::reducer::{
-        AdminDocumentAttributeVersion, AdminDocumentConflict, AdminDocumentConflictValue,
-        AdminDocumentReducerState,
+        AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
     };
     use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use crate::{NodeId, UserId};
@@ -897,7 +895,7 @@ mod tests {
     #[test]
     fn metadata_iri_iris() {
         let document_id = Ulid::from_bytes([7; 16]);
-        let record = MetadataIriReferenceIndexRecord {
+        let record = IriIndexRecord {
             document_id,
             document_cursor: Ulid::from_bytes([8; 16]),
             predicate_iri: "http://schema.org/conformsTo".to_string(),
@@ -907,8 +905,7 @@ mod tests {
 
         let (keyspace, key, value) = iri_reference_entry(&record).unwrap();
         let prefix = iri_reference_prefix(&record.predicate_iri, &record.object_iri);
-        let decoded: MetadataIriReferenceIndexRecord =
-            postcard::from_bytes(value.as_ref()).unwrap();
+        let decoded: IriIndexRecord = postcard::from_bytes(value.as_ref()).unwrap();
 
         assert_eq!(keyspace, METADATA_IRI_REFERENCE_INDEX_KEYSPACE);
         assert_eq!(prefix.as_ref().len(), 64);
@@ -964,15 +961,15 @@ mod tests {
         }
     }
 
-    fn conflict(path: &str, first_seed: u8, second_seed: u8) -> AdminDocumentConflict {
-        AdminDocumentConflict {
+    fn conflict(path: &str, first_seed: u8, second_seed: u8) -> AdminConflict {
+        AdminConflict {
             path: path.to_string(),
             values: vec![
-                AdminDocumentConflictValue {
+                AdminConflictValue {
                     value: Some(format!("value-{first_seed}")),
                     dot: dot(first_seed),
                 },
-                AdminDocumentConflictValue {
+                AdminConflictValue {
                     value: Some(format!("value-{second_seed}")),
                     dot: dot(second_seed),
                 },
@@ -984,13 +981,13 @@ mod tests {
     fn admin_document_roundtrips() {
         let target = user_target(8);
         let attr_dot = dot(1);
-        let state = AdminDocumentReducerState {
+        let state = AdminDocumentState {
             target: target.clone(),
             clock: AdminDocumentClock::default().with_observed(attr_dot.origin_node_id, 1),
             applied_event_ids: BTreeSet::from([attr_dot.event_id]),
             user_attributes: BTreeMap::from([(
                 "department".to_string(),
-                AdminDocumentAttributeVersion {
+                AdminAttributeVersion {
                     value: Some("biology".to_string()),
                     dot: attr_dot,
                 },
@@ -1007,7 +1004,7 @@ mod tests {
         };
 
         let (keyspace, key, value) = reducer_state_entry(&state).unwrap();
-        let decoded: AdminDocumentReducerState = postcard::from_bytes(value.as_ref()).unwrap();
+        let decoded: AdminDocumentState = postcard::from_bytes(value.as_ref()).unwrap();
 
         assert_eq!(keyspace, ADMIN_DOCUMENT_STATE_KEYSPACE);
         assert_eq!(key, reducer_state_key(&target));
@@ -1019,7 +1016,7 @@ mod tests {
         let target = realm_config_target(8);
         let attr_dot = dot(1);
         let path = format!("realm_config.nodes.{}", node(4));
-        let state = AdminDocumentReducerState {
+        let state = AdminDocumentState {
             target: target.clone(),
             clock: AdminDocumentClock::default().with_observed(attr_dot.origin_node_id, 1),
             applied_event_ids: BTreeSet::from([attr_dot.event_id]),
@@ -1028,7 +1025,7 @@ mod tests {
             user_name: None,
             user_subject_ids: BTreeMap::from([(
                 path,
-                AdminDocumentAttributeVersion {
+                AdminAttributeVersion {
                     value: Some("server".to_string()),
                     dot: attr_dot,
                 },
@@ -1039,7 +1036,7 @@ mod tests {
         };
 
         let (keyspace, key, value) = reducer_state_entry(&state).unwrap();
-        let decoded: AdminDocumentReducerState = postcard::from_bytes(value.as_ref()).unwrap();
+        let decoded: AdminDocumentState = postcard::from_bytes(value.as_ref()).unwrap();
 
         assert_eq!(keyspace, ADMIN_DOCUMENT_STATE_KEYSPACE);
         assert_eq!(key, reducer_state_key(&target));
@@ -1048,19 +1045,19 @@ mod tests {
 
     #[test]
     fn document_sync_roundtrips() {
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        let target = DocumentTarget::MetadataDocumentLifecycle {
             document_id: Ulid::from_bytes([7; 16]),
         };
         let base = revision(1, 1);
-        let change = DocumentSyncChange {
+        let change = DocumentChange {
             base: Some(base),
             current: revision(2, 2),
-            kind: DocumentSyncChangeKind::Upsert,
+            kind: DocumentChangeKind::Upsert,
             placement: PlacementRef::NIL,
         };
 
         let (keyspace, key, value) = sync_revision_entry(&target, &change).unwrap();
-        let decoded: DocumentSyncChange = postcard::from_bytes(value.as_ref()).unwrap();
+        let decoded: DocumentChange = postcard::from_bytes(value.as_ref()).unwrap();
 
         assert_eq!(keyspace, DOCUMENT_SYNC_REVISION_KEYSPACE);
         assert_eq!(key, sync_revision_key(&target));
@@ -1070,10 +1067,10 @@ mod tests {
     #[test]
     fn graph_revision_order() {
         let graph_iri = "urn:graph:revision".to_string();
-        let target = DocumentSyncTarget::MetadataGraphLifecycle {
+        let target = DocumentTarget::MetadataGraphLifecycle {
             graph_iri: graph_iri.clone(),
         };
-        let record = MetadataGraphLifecycleRecord::deleted(
+        let record = GraphLifecycleRecord::deleted(
             graph_iri,
             realm_id(2),
             Ulid::from_bytes([3; 16]),
@@ -1086,7 +1083,7 @@ mod tests {
 
         assert!(older.current < newer.current);
         let (keyspace, key, value) = sync_revision_entry(&target, &newer).unwrap();
-        let decoded: DocumentSyncChange = postcard::from_bytes(value.as_ref()).unwrap();
+        let decoded: DocumentChange = postcard::from_bytes(value.as_ref()).unwrap();
         assert_eq!(keyspace, DOCUMENT_SYNC_REVISION_KEYSPACE);
         assert_eq!(key, sync_revision_key(&target));
         assert_eq!(decoded, newer);
@@ -1107,14 +1104,14 @@ mod tests {
 
     #[test]
     fn shard_manifest_revision() {
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        let target = DocumentTarget::MetadataDocumentLifecycle {
             document_id: Ulid::from_bytes([7; 16]),
         };
         let placement = shard_placement(3);
-        let change = DocumentSyncChange {
+        let change = DocumentChange {
             base: None,
             current: revision(2, 5),
-            kind: DocumentSyncChangeKind::Upsert,
+            kind: DocumentChangeKind::Upsert,
             placement,
         };
 
@@ -1128,20 +1125,20 @@ mod tests {
 
     #[test]
     fn shard_delete_key() {
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        let target = DocumentTarget::MetadataDocumentLifecycle {
             document_id: Ulid::from_bytes([7; 16]),
         };
         let placement = shard_placement(3);
-        let upsert = DocumentSyncChange {
+        let upsert = DocumentChange {
             base: None,
             current: revision(2, 5),
-            kind: DocumentSyncChangeKind::Upsert,
+            kind: DocumentChangeKind::Upsert,
             placement,
         };
-        let delete = DocumentSyncChange {
+        let delete = DocumentChange {
             base: Some(upsert.current),
             current: revision(3, 6),
-            kind: DocumentSyncChangeKind::Delete,
+            kind: DocumentChangeKind::Delete,
             placement,
         };
 
@@ -1158,23 +1155,23 @@ mod tests {
 
     #[test]
     fn shard_manifest_placements() {
-        let shared = DocumentSyncTarget::RealmConfig {
+        let shared = DocumentTarget::RealmConfig {
             realm_id: realm_id(2),
         };
-        let change = DocumentSyncChange {
+        let change = DocumentChange {
             base: None,
             current: revision(1, 1),
-            kind: DocumentSyncChangeKind::Upsert,
+            kind: DocumentChangeKind::Upsert,
             placement: shard_placement(3),
         };
         // Shared realm-scoped targets never ride a shard, so they get no row.
         assert!(shard_manifest_entry(&shared, &change).unwrap().is_none());
 
         // A shard-classed target with a NIL placement has no governing shard yet.
-        let shard_target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        let shard_target = DocumentTarget::MetadataDocumentLifecycle {
             document_id: Ulid::from_bytes([7; 16]),
         };
-        let nil_change = DocumentSyncChange {
+        let nil_change = DocumentChange {
             placement: PlacementRef::NIL,
             ..change
         };
@@ -1187,10 +1184,10 @@ mod tests {
 
     #[test]
     fn shard_manifest_targets() {
-        let a = DocumentSyncTarget::MetadataDocumentLifecycle {
+        let a = DocumentTarget::MetadataDocumentLifecycle {
             document_id: Ulid::from_bytes([7; 16]),
         };
-        let b = DocumentSyncTarget::MetadataDocumentLifecycle {
+        let b = DocumentTarget::MetadataDocumentLifecycle {
             document_id: Ulid::from_bytes([8; 16]),
         };
         let shard3 = shard_placement(3);
@@ -1223,19 +1220,19 @@ mod tests {
 
     #[test]
     fn document_conflict_roundtrips() {
-        let target = DocumentSyncTarget::User {
+        let target = DocumentTarget::User {
             user_id: user_id(8),
         };
-        let local_change = DocumentSyncChange {
+        let local_change = DocumentChange {
             base: None,
             current: revision(1, 1),
-            kind: DocumentSyncChangeKind::Upsert,
+            kind: DocumentChangeKind::Upsert,
             placement: PlacementRef::NIL,
         };
-        let incoming_change = DocumentSyncChange {
+        let incoming_change = DocumentChange {
             base: None,
             current: revision(2, 2),
-            kind: DocumentSyncChangeKind::Upsert,
+            kind: DocumentChangeKind::Upsert,
             placement: PlacementRef::NIL,
         };
         let conflict = DocumentSyncConflict {
@@ -1257,8 +1254,8 @@ mod tests {
     #[test]
     fn document_sync_keyspace() {
         let group_id = Ulid::from_bytes([4; 16]);
-        let group = DocumentSyncTarget::Group { group_id };
-        let auth = DocumentSyncTarget::GroupAuthorization { group_id };
+        let group = DocumentTarget::Group { group_id };
+        let auth = DocumentTarget::GroupAuthorization { group_id };
 
         assert_ne!(sync_revision_key(&group), sync_revision_key(&auth));
     }
@@ -1267,7 +1264,7 @@ mod tests {
     fn admin_document_prefix() {
         let target = user_target(8);
         let other_target = user_target(9);
-        let state = AdminDocumentReducerState {
+        let state = AdminDocumentState {
             target: target.clone(),
             clock: AdminDocumentClock::default(),
             applied_event_ids: BTreeSet::new(),
@@ -1295,7 +1292,7 @@ mod tests {
 
         assert_eq!(entries.len(), 2);
         for (keyspace, key, value) in entries {
-            let decoded: AdminDocumentConflict = postcard::from_bytes(value.as_ref()).unwrap();
+            let decoded: AdminConflict = postcard::from_bytes(value.as_ref()).unwrap();
 
             assert_eq!(keyspace, ADMIN_DOCUMENT_CONFLICT_KEYSPACE);
             assert!(key.as_ref().starts_with(prefix.as_ref()));
@@ -1329,7 +1326,7 @@ mod tests {
     #[test]
     fn stale_admin_paths() {
         let target = user_target(8);
-        let previous = AdminDocumentReducerState {
+        let previous = AdminDocumentState {
             target: target.clone(),
             clock: AdminDocumentClock::default(),
             applied_event_ids: BTreeSet::new(),
@@ -1350,7 +1347,7 @@ mod tests {
             revocation_floor: 0,
             revocation_next_expiry: None,
         };
-        let current = AdminDocumentReducerState {
+        let current = AdminDocumentState {
             conflicts: BTreeMap::from([(
                 "user.attributes.title".to_string(),
                 conflict("user.attributes.title", 3, 4),

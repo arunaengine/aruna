@@ -1,6 +1,6 @@
 use crate::admin_documents::{
-    AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition,
-    AdminDocumentTarget,
+    AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+    AdminRoleDefinition,
 };
 use crate::reducer::*;
 use crate::structs::{
@@ -32,8 +32,8 @@ pub(crate) fn role_id(seed: u8) -> RoleId {
     Ulid::from_bytes([seed; 16])
 }
 
-pub(crate) fn role_definition(role_id: RoleId, name: &str) -> AdminDocumentRoleDefinition {
-    AdminDocumentRoleDefinition {
+pub(crate) fn role_definition(role_id: RoleId, name: &str) -> AdminRoleDefinition {
+    AdminRoleDefinition {
         role_id,
         name: name.to_string(),
         permissions: BTreeMap::from([
@@ -70,24 +70,24 @@ pub(crate) fn actor(origin_node_id: NodeId) -> Actor {
     }
 }
 
-pub(crate) fn user_state() -> AdminDocumentReducerState {
-    AdminDocumentReducerState::new(AdminDocumentTarget::User { user_id: user_id() })
+pub(crate) fn user_state() -> AdminDocumentState {
+    AdminDocumentState::new(AdminDocumentTarget::User { user_id: user_id() })
 }
 
-pub(crate) fn group_state() -> AdminDocumentReducerState {
-    AdminDocumentReducerState::new(AdminDocumentTarget::Group {
+pub(crate) fn group_state() -> AdminDocumentState {
+    AdminDocumentState::new(AdminDocumentTarget::Group {
         group_id: group_id(),
     })
 }
 
-pub(crate) fn realm_state() -> AdminDocumentReducerState {
-    AdminDocumentReducerState::new(AdminDocumentTarget::Realm {
+pub(crate) fn realm_state() -> AdminDocumentState {
+    AdminDocumentState::new(AdminDocumentTarget::Realm {
         realm_id: realm_id(),
     })
 }
 
-pub(crate) fn realm_config_state() -> AdminDocumentReducerState {
-    AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig {
+pub(crate) fn realm_config_state() -> AdminDocumentState {
+    AdminDocumentState::new(AdminDocumentTarget::RealmConfig {
         realm_id: realm_id(),
     })
 }
@@ -287,7 +287,7 @@ pub(crate) fn add_group_role(
 pub(crate) fn create_group_role(
     event_seed: u8,
     origin_seed: u8,
-    role: AdminDocumentRoleDefinition,
+    role: AdminRoleDefinition,
 ) -> AdminDocumentEvent {
     group_event(
         event_seed,
@@ -359,7 +359,7 @@ pub(crate) fn add_realm_role(
 pub(crate) fn create_realm_role(
     event_seed: u8,
     origin_seed: u8,
-    role: AdminDocumentRoleDefinition,
+    role: AdminRoleDefinition,
 ) -> AdminDocumentEvent {
     realm_event(
         event_seed,

@@ -32,9 +32,7 @@ use std::time::Duration;
 
 use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
-use aruna_core::document::{
-    DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
-};
+use aruna_core::document::{DocumentEvictedDocument, DocumentReconcileResult, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetError as CoreNetError, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
@@ -67,8 +65,8 @@ pub use streams::StreamsService;
 
 use connection_pool::ConnectionPool;
 use connectivity::{
-    PeerConnectivityEvent, PeerConnectivityManagerState, net_warnings, peer_connection_states,
-    peer_connectivity_status, send_connectivity_event,
+    PeerEvent, PeerManagerState, net_warnings, peer_connection_states, peer_connectivity_status,
+    send_connectivity_event,
 };
 use discovery::{
     authorize_signed_node, install_signed_endpoint, local_endpoint_addr, replace_authorized_nodes,
@@ -94,7 +92,7 @@ pub trait InboundEventHandler: Send + Sync {
     /// Re-emits documents recovered from a genesis tie-break eviction: the loser's
     /// payloads replayed onto the winning genesis via durable outbox records.
     /// Returns whether every replacement committed; otherwise the journal stays.
-    async fn handle_evicted_documents(&self, _documents: Vec<DocumentSyncEvictedDocument>) -> bool {
+    async fn handle_evicted_documents(&self, _documents: Vec<DocumentEvictedDocument>) -> bool {
         false
     }
 }
@@ -126,9 +124,9 @@ struct NetInner {
     document_sync: Arc<DocumentSyncService>,
     streams: Arc<StreamsService>,
     connection_pool: ConnectionPool,
-    peer_connectivity: Arc<Mutex<PeerConnectivityManagerState>>,
+    peer_connectivity: Arc<Mutex<PeerManagerState>>,
     network_diagnostics: Arc<Mutex<NetworkDiagnosticsState>>,
-    peer_connectivity_tx: mpsc::Sender<PeerConnectivityEvent>,
+    peer_connectivity_tx: mpsc::Sender<PeerEvent>,
     inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
     inbound_handler_registered: Arc<Notify>,
     inbound_tasks: TaskTracker,
@@ -313,7 +311,7 @@ impl NetHandle {
         &self,
         topics: Vec<::irokle::TopicId>,
         peers: Vec<NodeId>,
-    ) -> aruna_core::document::DocumentSyncNetEvent {
+    ) -> aruna_core::document::DocumentNetEvent {
         self.inner
             .document_sync
             .sync_documents_event(topics, peers)
@@ -334,7 +332,7 @@ impl NetHandle {
     pub async fn reconcile_sync_topics(
         &self,
         topic_ids: Vec<::irokle::TopicId>,
-    ) -> Result<DocumentSyncReconcileResult> {
+    ) -> Result<DocumentReconcileResult> {
         let applied = self
             .inner
             .document_sync
@@ -343,7 +341,7 @@ impl NetHandle {
         if applied
             .targets
             .iter()
-            .any(|target| matches!(target, DocumentSyncTarget::RealmConfig { .. }))
+            .any(|target| matches!(target, DocumentTarget::RealmConfig { .. }))
         {
             self.reload_realm_peers().await?;
         }
@@ -382,7 +380,7 @@ impl NetHandle {
         }
         send_connectivity_event(
             &self.inner.peer_connectivity_tx,
-            PeerConnectivityEvent::ManagePeer {
+            PeerEvent::ManagePeer {
                 node_id: endpoint_addr.id,
                 source: "endpoint_addr".to_string(),
                 immediate: true,
@@ -459,7 +457,7 @@ impl NetHandle {
     }
 
     pub async fn reload_realm_peers(&self) -> Result<Option<Vec<NodeId>>> {
-        let target = DocumentSyncTarget::RealmConfig {
+        let target = DocumentTarget::RealmConfig {
             realm_id: self.inner.realm_id,
         };
         let Some(bytes) = self
@@ -586,7 +584,7 @@ impl NetHandle {
         );
         send_connectivity_event(
             &self.inner.peer_connectivity_tx,
-            PeerConnectivityEvent::ManagePeer {
+            PeerEvent::ManagePeer {
                 node_id,
                 source: "realm_config".to_string(),
                 immediate,
@@ -647,7 +645,7 @@ impl NetHandle {
                 if node_id != self.inner.node_id {
                     send_connectivity_event(
                         &self.inner.peer_connectivity_tx,
-                        PeerConnectivityEvent::ConnectionFailure {
+                        PeerEvent::ConnectionFailure {
                             node_id,
                             source: "stream_open".to_string(),
                             error: "stream open timed out".to_string(),
@@ -688,7 +686,7 @@ impl NetHandle {
             }
             send_connectivity_event(
                 &self.inner.peer_connectivity_tx,
-                PeerConnectivityEvent::ManagePeer {
+                PeerEvent::ManagePeer {
                     node_id,
                     source: "stream_target".to_string(),
                     immediate: false,
@@ -701,7 +699,7 @@ impl NetHandle {
                 if node_id != self.inner.node_id {
                     send_connectivity_event(
                         &self.inner.peer_connectivity_tx,
-                        PeerConnectivityEvent::ConnectionSuccess {
+                        PeerEvent::ConnectionSuccess {
                             node_id,
                             source: "stream_open".to_string(),
                         },
@@ -738,7 +736,7 @@ impl NetHandle {
                                 Ok(stream) => {
                                     send_connectivity_event(
                                         &self.inner.peer_connectivity_tx,
-                                        PeerConnectivityEvent::ConnectionSuccess {
+                                        PeerEvent::ConnectionSuccess {
                                             node_id,
                                             source: "stream_open_dht_signed".to_string(),
                                         },
@@ -764,7 +762,7 @@ impl NetHandle {
                 if node_id != self.inner.node_id {
                     send_connectivity_event(
                         &self.inner.peer_connectivity_tx,
-                        PeerConnectivityEvent::ConnectionFailure {
+                        PeerEvent::ConnectionFailure {
                             node_id,
                             source: "stream_open".to_string(),
                             error: err.to_string(),

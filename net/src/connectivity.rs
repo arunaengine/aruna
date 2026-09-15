@@ -1,11 +1,6 @@
-//! Peer connectivity management: retry/backoff decisions over the peer set,
-//! the run loop that waits and probes, and the diagnostic projection of
-//! managed peers.
-//!
-//! `PeerConnectivityManagerState` holds the pure scheduling decisions
-//! (due peers, next wait, success/failure transitions); the `run_*` functions
-//! own the waits and network I/O. Handle-side peer registration lives on
-//! `NetHandle`; this module never touches admission.
+//! Peer connectivity management: retry/backoff decisions over the peer set, the
+//! run loop that waits and probes, and the diagnostic projection of managed
+//! peers. Registration lives on `NetHandle`; this module never touches admission.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,7 +31,7 @@ const PEER_SUCCESS_REFRESH_DELAY: Duration = Duration::from_secs(300);
 const PEER_MANAGER_IDLE_DELAY: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
-pub(crate) struct PeerConnectivityManagerState {
+pub(crate) struct PeerManagerState {
     peers: Vec<ManagedPeer>,
 }
 
@@ -50,7 +45,7 @@ struct ManagedPeer {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PeerConnectivityState {
+pub(crate) struct PeerState {
     node_id: NodeId,
     consecutive_failures: u64,
     last_error: Option<String>,
@@ -58,7 +53,7 @@ pub(crate) struct PeerConnectivityState {
 }
 
 #[derive(Debug)]
-pub(crate) enum PeerConnectivityEvent {
+pub(crate) enum PeerEvent {
     ManagePeer {
         node_id: NodeId,
         source: String,
@@ -75,7 +70,7 @@ pub(crate) enum PeerConnectivityEvent {
     },
 }
 
-impl PeerConnectivityManagerState {
+impl PeerManagerState {
     pub(crate) fn new(nodes: &[NodeId], source: &str) -> Self {
         let now = Instant::now();
         let mut peers = nodes
@@ -156,10 +151,10 @@ impl PeerConnectivityManagerState {
             .unwrap_or_else(|| "managed_peer".to_string())
     }
 
-    fn status(&self, now: Instant) -> Vec<PeerConnectivityState> {
+    fn status(&self, now: Instant) -> Vec<PeerState> {
         self.peers
             .iter()
-            .map(|peer| PeerConnectivityState {
+            .map(|peer| PeerState {
                 node_id: peer.node_id,
                 consecutive_failures: peer.consecutive_failures,
                 last_error: peer.last_error.clone(),
@@ -219,10 +214,7 @@ fn peer_jitter_seed(node_id: NodeId, attempt: u64) -> u64 {
     u64::from_le_bytes(bytes) ^ attempt.rotate_left(17)
 }
 
-pub(crate) fn send_connectivity_event(
-    tx: &mpsc::Sender<PeerConnectivityEvent>,
-    event: PeerConnectivityEvent,
-) {
+pub(crate) fn send_connectivity_event(tx: &mpsc::Sender<PeerEvent>, event: PeerEvent) {
     if let Err(err) = tx.try_send(event) {
         match err {
             mpsc::error::TrySendError::Full(_) => debug!("peer connectivity event queue full"),
@@ -232,8 +224,8 @@ pub(crate) fn send_connectivity_event(
 }
 
 pub(crate) async fn peer_connectivity_status(
-    state: &Arc<Mutex<PeerConnectivityManagerState>>,
-) -> Vec<PeerConnectivityState> {
+    state: &Arc<Mutex<PeerManagerState>>,
+) -> Vec<PeerState> {
     state.lock().await.status(Instant::now())
 }
 
@@ -245,9 +237,9 @@ pub(crate) async fn run_connectivity_manager(
     discovery_method: DiscoveryMethod,
     realm_id: RealmId,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
-    state: Arc<Mutex<PeerConnectivityManagerState>>,
+    state: Arc<Mutex<PeerManagerState>>,
     diagnostics: Arc<Mutex<NetworkDiagnosticsState>>,
-    mut event_rx: mpsc::Receiver<PeerConnectivityEvent>,
+    mut event_rx: mpsc::Receiver<PeerEvent>,
     shutdown: CancellationToken,
 ) {
     loop {
@@ -296,32 +288,29 @@ pub(crate) async fn run_connectivity_manager(
 }
 
 async fn drain_connectivity_events(
-    state: &Arc<Mutex<PeerConnectivityManagerState>>,
-    event_rx: &mut mpsc::Receiver<PeerConnectivityEvent>,
+    state: &Arc<Mutex<PeerManagerState>>,
+    event_rx: &mut mpsc::Receiver<PeerEvent>,
 ) {
     while let Ok(event) = event_rx.try_recv() {
         apply_connectivity_event(state, event).await;
     }
 }
 
-async fn apply_connectivity_event(
-    state: &Arc<Mutex<PeerConnectivityManagerState>>,
-    event: PeerConnectivityEvent,
-) {
+async fn apply_connectivity_event(state: &Arc<Mutex<PeerManagerState>>, event: PeerEvent) {
     let now = Instant::now();
     let mut guard = state.lock().await;
     match event {
-        PeerConnectivityEvent::ManagePeer {
+        PeerEvent::ManagePeer {
             node_id,
             source,
             immediate,
         } => {
             guard.manage_peer(node_id, &source, now, immediate);
         }
-        PeerConnectivityEvent::ConnectionSuccess { node_id, source } => {
+        PeerEvent::ConnectionSuccess { node_id, source } => {
             guard.record_success(node_id, &source, now);
         }
-        PeerConnectivityEvent::ConnectionFailure {
+        PeerEvent::ConnectionFailure {
             node_id,
             source,
             error,
@@ -339,7 +328,7 @@ async fn run_connectivity_attempt(
     discovery_method: &DiscoveryMethod,
     realm_id: RealmId,
     dht_signed_authorized_nodes: &[NodeId],
-    state: &Arc<Mutex<PeerConnectivityManagerState>>,
+    state: &Arc<Mutex<PeerManagerState>>,
     diagnostics: &Arc<Mutex<NetworkDiagnosticsState>>,
     peer: NodeId,
 ) {
@@ -414,7 +403,7 @@ async fn run_connectivity_attempt(
 pub(crate) async fn peer_connection_states(
     endpoint: &Endpoint,
     monitor: &ConnectionMonitorState,
-    peer_connectivity: &[PeerConnectivityState],
+    peer_connectivity: &[PeerState],
     peer_nodes: &[NodeId],
     local_id: NodeId,
 ) -> Vec<PeerConnectionState> {

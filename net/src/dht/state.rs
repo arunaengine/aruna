@@ -15,10 +15,10 @@ use super::constants::{
 };
 use super::kbucket::{InsertResult, K, PeerInfo, RoutingTable};
 use super::protocol::{
-    CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtGetCompletedReason, DhtGetStats, DhtInput, DhtIo,
-    DhtIoError, DhtIoRequest, DhtOutput, DhtOutputValue, DhtPeerError, DhtPutStats,
-    INTERNAL_OP_START, InboundId, OpId, RpcPhase, StorageStage, dht_cmd_kind, dht_input_kind,
-    dht_io_kind, io_inbound_id, io_op_id,
+    CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtGetStats, DhtInput, DhtIo, DhtIoError, DhtIoRequest,
+    DhtOutput, DhtOutputValue, DhtPeerError, DhtPutStats, GetCompletedReason, INTERNAL_OP_START,
+    InboundId, OpId, RpcPhase, StorageStage, dht_cmd_kind, dht_input_kind, dht_io_kind,
+    io_inbound_id, io_op_id,
 };
 use super::rpc::{
     DhtRequest, DhtResponse, ErrorCode, StoredValue, request_kind, response_kind,
@@ -877,7 +877,7 @@ impl DhtStateMachine {
                         if first_usable {
                             op.frontier.responsive.insert(peer);
                             self.insert_peer(peer, out);
-                            complete_get(op_id, op, DhtGetCompletedReason::FirstUsable, out);
+                            complete_get(op_id, op, GetCompletedReason::FirstUsable, out);
                             return;
                         }
                     } else if insert_get_floor(&mut op, &entry) {
@@ -1211,7 +1211,7 @@ impl DhtStateMachine {
                         let first_usable = first_usable_match(&op, value.publisher, value.realm_id);
                         insert_get_value(&mut op, value);
                         if first_usable {
-                            complete_get(op_id, op, DhtGetCompletedReason::FirstUsable, out);
+                            complete_get(op_id, op, GetCompletedReason::FirstUsable, out);
                             return;
                         }
                     } else {
@@ -1835,11 +1835,11 @@ impl DhtStateMachine {
         }
 
         let completed_reason = if op.values.is_empty() {
-            DhtGetCompletedReason::LookupExhausted
+            GetCompletedReason::LookupExhausted
         } else if !op.remote_values.is_empty() {
-            DhtGetCompletedReason::RemoteValue
+            GetCompletedReason::RemoteValue
         } else {
-            DhtGetCompletedReason::LocalValue
+            GetCompletedReason::LocalValue
         };
         complete_get(op_id, op, completed_reason, out);
     }
@@ -2190,7 +2190,7 @@ fn first_usable_match(op: &GetOp, publisher: NodeId, realm_id: RealmId) -> bool 
 fn complete_get(
     op_id: OpId,
     mut op: GetOp,
-    completed_reason: DhtGetCompletedReason,
+    completed_reason: GetCompletedReason,
     out: &mut SmallVec<[DhtEffect; 4]>,
 ) {
     let stats = get_stats(&op, completed_reason);
@@ -2329,7 +2329,7 @@ fn storage_error_response(error: &DhtIoError) -> DhtResponse {
     }
 }
 
-fn get_stats(op: &GetOp, completed_reason: DhtGetCompletedReason) -> DhtGetStats {
+fn get_stats(op: &GetOp, completed_reason: GetCompletedReason) -> DhtGetStats {
     let queried_peers = limited_sorted_peers(&op.frontier.queried, LOOKUP_LOG_PEER_LIMIT);
     let queried_peer_count = op.frontier.queried.len();
 
@@ -2632,7 +2632,7 @@ mod tests {
                 ..
             }) if values.len() == 1
                 && values[0].node_id == publisher
-                && stats.completed_reason == DhtGetCompletedReason::FirstUsable
+                && stats.completed_reason == GetCompletedReason::FirstUsable
         )));
         assert!(!state.contains_op(201));
     }
@@ -2755,7 +2755,7 @@ mod tests {
                 result: DhtOutputValue::GetValues { values, stats },
                 ..
             }) if values.len() == 2
-                && stats.completed_reason == DhtGetCompletedReason::RemoteValue
+                && stats.completed_reason == GetCompletedReason::RemoteValue
         )));
     }
 
@@ -3126,7 +3126,7 @@ mod tests {
                 result: DhtOutputValue::GetValues { values, stats },
                 ..
             })] if values.is_empty()
-                && stats.completed_reason == DhtGetCompletedReason::LookupExhausted
+                && stats.completed_reason == GetCompletedReason::LookupExhausted
                 && stats.local_value_count == 0
                 && stats.remote_value_count == 0
         ));
@@ -3179,7 +3179,7 @@ mod tests {
                 result: DhtOutputValue::GetValues { values, stats },
             })] if values.len() == 1
                 && values[0].value == b"remote".to_vec()
-                && stats.completed_reason == DhtGetCompletedReason::RemoteValue
+                && stats.completed_reason == GetCompletedReason::RemoteValue
                 && stats.remote_value_count == 1
         ));
     }
@@ -4469,7 +4469,7 @@ mod tests {
                     op_id: 15,
                     result: DhtOutputValue::GetValues { values, stats }
                 }) if values.iter().any(|entry| entry.value == b"cached".to_vec())
-                    && stats.completed_reason == DhtGetCompletedReason::LocalValue
+                    && stats.completed_reason == GetCompletedReason::LocalValue
                     && stats.local_value_count == 1
                     && stats.remote_value_count == 0
                     && stats.queried_peer_count == 1
@@ -4696,7 +4696,7 @@ mod tests {
                     result: DhtOutputValue::GetValues { values, stats }
                 }) if values.iter().any(|entry| entry.value == b"first".to_vec())
                     && values.iter().any(|entry| entry.value == b"second".to_vec())
-                    && stats.completed_reason == DhtGetCompletedReason::RemoteValue
+                    && stats.completed_reason == GetCompletedReason::RemoteValue
                     && stats.local_value_count == 0
                     && stats.remote_value_count == 2
                     && stats.queried_peer_count == lookup_peers.len()
@@ -4793,7 +4793,7 @@ mod tests {
                 .iter()
                 .any(|entry| entry.value == b"after-error".to_vec())
         );
-        assert_eq!(stats.completed_reason, DhtGetCompletedReason::RemoteValue);
+        assert_eq!(stats.completed_reason, GetCompletedReason::RemoteValue);
         assert_eq!(stats.local_value_count, 0);
         assert_eq!(stats.remote_value_count, 1);
         assert_eq!(stats.queried_peer_count, lookup_peers.len());

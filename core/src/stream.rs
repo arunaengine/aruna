@@ -67,7 +67,7 @@ impl<T> BackendStream<Result<T, StreamError>> {
         Fut: Future<Output = Result<(), StreamError>> + Send + 'static,
         T: 'static,
     {
-        BackendStream(Box::pin(AsyncStreamCompletionCallback {
+        BackendStream(Box::pin(AsyncCompletionCallback {
             inner: self,
             callback: Some(Box::new(move || Box::pin(callback()))),
             pending: Mutex::new(None),
@@ -109,7 +109,7 @@ impl<T> Stream for StreamCompletionCallback<T> {
     }
 }
 
-struct AsyncStreamCompletionCallback<T> {
+struct AsyncCompletionCallback<T> {
     inner: BackendStream<Result<T, StreamError>>,
     callback: Option<CompletionCallback>,
     pending: Mutex<Option<CompletionFuture>>,
@@ -117,9 +117,9 @@ struct AsyncStreamCompletionCallback<T> {
     completed: bool,
 }
 
-impl<T> Unpin for AsyncStreamCompletionCallback<T> {}
+impl<T> Unpin for AsyncCompletionCallback<T> {}
 
-impl<T> Stream for AsyncStreamCompletionCallback<T> {
+impl<T> Stream for AsyncCompletionCallback<T> {
     type Item = Result<T, StreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

@@ -2,7 +2,9 @@
 //! Crockford ULID whose entropy splits into a 20-bit placement handle, a 12-bit
 //! placement bucket and a 48-bit nonce. Raw bit knowledge stays in [`layout`].
 
+#[path = "structured_id_generator.rs"]
 mod generator;
+#[path = "structured_id_layout.rs"]
 mod layout;
 
 pub use generator::{
@@ -49,7 +51,7 @@ pub enum ParseError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("bucket {bucket} is not less than bucket_count {bucket_count}")]
-pub struct BucketNotInRange {
+pub struct BucketRangeError {
     pub bucket: u16,
     pub bucket_count: u16,
 }
@@ -106,11 +108,11 @@ impl BucketId {
 
     /// Fail-closed `bucket < bucket_count` check (REQ-META-ID-FORMAT-001): an id
     /// whose bucket reaches the strategy's `bucket_count` is invalid.
-    pub const fn in_strategy_range(self, bucket_count: u16) -> Result<(), BucketNotInRange> {
+    pub const fn in_strategy_range(self, bucket_count: u16) -> Result<(), BucketRangeError> {
         if bucket_count <= layout::MAX_BUCKET_COUNT && self.0 < bucket_count {
             Ok(())
         } else {
-            Err(BucketNotInRange {
+            Err(BucketRangeError {
                 bucket: self.0,
                 bucket_count,
             })
@@ -213,7 +215,7 @@ pub trait StructuredId: Sized + Copy + private::Private {
     }
 
     /// Fail-closed `bucket < bucket_count` check for this id.
-    fn validate_bucket(&self, bucket_count: u16) -> Result<(), BucketNotInRange> {
+    fn validate_bucket(&self, bucket_count: u16) -> Result<(), BucketRangeError> {
         self.bucket().in_strategy_range(bucket_count)
     }
 }
@@ -397,7 +399,7 @@ mod tests {
         assert!(BucketId::new(63).unwrap().in_strategy_range(64).is_ok());
         assert_eq!(
             BucketId::new(64).unwrap().in_strategy_range(64),
-            Err(BucketNotInRange {
+            Err(BucketRangeError {
                 bucket: 64,
                 bucket_count: 64,
             })
