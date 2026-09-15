@@ -2,7 +2,7 @@ use std::path::{Component, Path as FsPath};
 use std::sync::{Arc, Mutex};
 
 use aruna_core::StructuredId;
-use aruna_core::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
+use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     Actor, AuthContext, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
@@ -11,15 +11,14 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::jobs::import::{
-    CreateRoCrateUploadConfig, CreateRoCrateUploadError, CreateRoCrateUploadOperation,
-    load_rocrate_upload,
+    CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation, load_rocrate_upload,
 };
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
 use aruna_operations::metadata::create_document::mint_job_document;
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::staging::head_source::{
-    HeadStagingSourceError, HeadStagingSourceInput, HeadStagingSourceOperation,
+    HeadSourceError, HeadSourceInput, HeadSourceOperation,
 };
 use axum::body::Body;
 use axum::extract::State;
@@ -37,9 +36,9 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::jobs::{job_urls, map_submit_error};
 use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::execution::jobs::{job_urls, map_submit_error};
 use crate::server_state::ServerState;
 
 const ZIP_MEDIA_TYPE: &str = "application/zip";
@@ -49,10 +48,10 @@ const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 #[derive(OpenApi)]
 #[openapi()]
-pub struct RoCrateImportApiDoc;
+pub struct RoCrateImportDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(RoCrateImportApiDoc::openapi())
+    OpenApiRouter::with_openapi(RoCrateImportDoc::openapi())
         .routes(routes!(upload_rocrate))
         .routes(routes!(submit_import))
 }
@@ -209,7 +208,7 @@ pub async fn upload_rocrate(
         })??;
     let upload_id = Ulid::generate();
     let record = drive_until(
-        CreateRoCrateUploadOperation::new(CreateRoCrateUploadConfig {
+        CreateRoCrateOperation::new(CreateRoCrateConfig {
             upload_id,
             owner: auth.user_id,
             media_type,
@@ -562,7 +561,7 @@ async fn fast_source_check(
             )
             .await?;
             let result = drive(
-                HeadStagingSourceOperation::new(HeadStagingSourceInput {
+                HeadSourceOperation::new(HeadSourceInput {
                     group_id: *group_id,
                     connector_id: *connector_id,
                     source_path: path.clone(),
@@ -628,13 +627,13 @@ async fn load_bucket(
     bucket: &str,
 ) -> ServerResult<aruna_core::structs::BucketInfo> {
     match drive(
-        GetBucketInfoOperation::new(bucket.to_string()),
+        GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
     )
     .await
     {
         Ok(info) => Ok(info),
-        Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
         Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
 }
@@ -674,12 +673,12 @@ fn upload_body_stream(
     }))
 }
 
-fn map_upload_error(error: CreateRoCrateUploadError) -> ServerError {
+fn map_upload_error(error: CreateRoCrateError) -> ServerError {
     match error {
-        CreateRoCrateUploadError::Blob(BlobError::SizeLimitExceeded { limit }) => {
+        CreateRoCrateError::Blob(BlobError::SizeLimitExceeded { limit }) => {
             ServerError::PayloadTooLarge(format!("upload exceeds limit {limit}"))
         }
-        CreateRoCrateUploadError::Blob(BlobError::HandleMissing) => {
+        CreateRoCrateError::Blob(BlobError::HandleMissing) => {
             ServerError::ServiceUnavailableReason("blob storage is unavailable".to_string())
         }
         other => ServerError::InternalError(other.to_string()),
@@ -728,15 +727,15 @@ fn map_head_error(error: HeadObjectError) -> ServerError {
     }
 }
 
-fn map_source_error(error: HeadStagingSourceError) -> ServerError {
+fn map_source_error(error: HeadSourceError) -> ServerError {
     match error {
-        HeadStagingSourceError::Resolve(SourceConnectorResolutionError::NotFound)
-        | HeadStagingSourceError::Staging(StagingSourceError::NotFound) => ServerError::NotFound,
-        HeadStagingSourceError::Resolve(
-            SourceConnectorResolutionError::InvalidSourcePath
-            | SourceConnectorResolutionError::UnsupportedConnectorKind(_),
+        HeadSourceError::Resolve(SourceResolutionError::NotFound)
+        | HeadSourceError::Staging(StagingSourceError::NotFound) => ServerError::NotFound,
+        HeadSourceError::Resolve(
+            SourceResolutionError::InvalidSourcePath
+            | SourceResolutionError::UnsupportedConnectorKind(_),
         ) => ServerError::BadRequest,
-        HeadStagingSourceError::Staging(_) => ServerError::BadGateway,
+        HeadSourceError::Staging(_) => ServerError::BadGateway,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -766,4 +765,5 @@ async fn owner_node_url(state: &ServerState) -> ServerResult<String> {
 }
 
 #[cfg(test)]
+#[path = "rocrate_import_tests.rs"]
 mod tests;

@@ -1,12 +1,10 @@
-use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission_with, require_unrestricted_auth,
-};
+use crate::auth::{ValidatedBearer, ensure_permission_with, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::jobs::{decode_cursor, encode_cursor};
+use crate::routes::execution::jobs::{decode_cursor, encode_cursor};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::metrics::WatchAuthorizationMetricReason;
+use aruna_core::metrics::WatchMetricReason;
 use aruna_core::structs::{
     AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NotificationClass, NotificationKind,
     NotificationRecord, Permission, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
@@ -25,7 +23,7 @@ use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
 use aruna_operations::notifications::watch::authorization::{
     WatchAuthorization, evaluate_watch_creation, watch_permission_path,
 };
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -64,8 +62,8 @@ const NOTIFICATION_STREAM_LOCAL_RECHECK: Duration = Duration::from_secs(60);
 #[openapi(
     tags((name = "system/notifications", description = "User notification inbox")),
     components(schemas(
-        NotificationStreamStateResponse,
-        UnreadCountApiResponse
+        NotificationStreamResponse,
+        UnreadCountResponse
     ))
 )]
 pub struct NotificationsApiDoc;
@@ -132,20 +130,23 @@ pub struct NotificationListResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct UnreadCountApiResponse {
+#[schema(as = UnreadCountApiResponse)]
+pub struct UnreadCountResponse {
     pub count: u32,
     pub capped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct NotificationStreamStateResponse {
+#[schema(as = NotificationStreamStateResponse)]
+pub struct NotificationStreamResponse {
     pub epoch: String,
     pub revision: u64,
-    pub unread: UnreadCountApiResponse,
+    pub unread: UnreadCountResponse,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MarkReadApiRequest {
+#[schema(as = MarkReadApiRequest)]
+pub struct MarkReadRequest {
     #[serde(default)]
     pub ids: Vec<String>,
     #[serde(default)]
@@ -153,7 +154,8 @@ pub struct MarkReadApiRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MarkReadApiResponse {
+#[schema(as = MarkReadApiResponse)]
+pub struct MarkReadResponse {
     pub marked: u32,
 }
 
@@ -231,7 +233,7 @@ fn watch_authorized(subscription: &WatchSubscription) -> bool {
     !subscription.path_prefix.is_empty()
 }
 
-fn record_watch_denial(state: &ServerState, reason: WatchAuthorizationMetricReason) {
+fn record_watch_denial(state: &ServerState, reason: WatchMetricReason) {
     dispatch::record_watch_denial(state.get_ctx().as_ref(), reason);
     warn!(
         parent: None,
@@ -378,7 +380,7 @@ async fn authorize_watch(
     let Some(permission_path) =
         watch_permission_path(state.get_realm_id(), path_prefix, event_mask)
     else {
-        record_watch_denial(state, WatchAuthorizationMetricReason::InvalidResource);
+        record_watch_denial(state, WatchMetricReason::InvalidResource);
         return Err(ServerError::BadRequest);
     };
     if let Err(error) = ensure_permission_with(
@@ -395,8 +397,8 @@ async fn authorize_watch(
         record_watch_denial(
             state,
             match error {
-                ServerError::Forbidden => WatchAuthorizationMetricReason::PermissionDenied,
-                _ => WatchAuthorizationMetricReason::AuthorizationUnavailable,
+                ServerError::Forbidden => WatchMetricReason::PermissionDenied,
+                _ => WatchMetricReason::AuthorizationUnavailable,
             },
         );
         return Err(error);
@@ -416,17 +418,11 @@ async fn authorize_watch(
             Err(ServerError::Forbidden)
         }
         Ok(WatchAuthorization::Unavailable(_)) => {
-            record_watch_denial(
-                state,
-                WatchAuthorizationMetricReason::AuthorizationUnavailable,
-            );
+            record_watch_denial(state, WatchMetricReason::AuthorizationUnavailable);
             Err(ServerError::Forbidden)
         }
         Err(error) => {
-            record_watch_denial(
-                state,
-                WatchAuthorizationMetricReason::AuthorizationUnavailable,
-            );
+            record_watch_denial(state, WatchMetricReason::AuthorizationUnavailable);
             Err(ServerError::InternalError(error))
         }
     }
@@ -452,19 +448,14 @@ async fn canonicalize_watch_path(
     if node_id != state.get_node_id() {
         return Ok(path_prefix);
     }
-    match drive(
-        GetBucketInfoOperation::new(bucket.clone()),
-        &state.get_ctx(),
-    )
-    .await
-    {
+    match drive(GetBucketOperation::new(bucket.clone()), &state.get_ctx()).await {
         Ok(info) => Ok(watch_resource_path(
             info.group_id,
             node_id,
             &bucket,
             &key_prefix,
         )),
-        Err(GetBucketInfoError::NotFound) => Ok(path_prefix),
+        Err(GetBucketError::NotFound) => Ok(path_prefix),
         Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
 }
@@ -591,7 +582,7 @@ path-restricted token is refused.
         (
             status = 200,
             description = "Unread badge value for the caller",
-            body = UnreadCountApiResponse,
+            body = UnreadCountResponse,
             example = json!({
                 "count": 7,
                 "capped": false
@@ -607,17 +598,14 @@ path-restricted token is refused.
 pub async fn unread_count(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-) -> ServerResult<(StatusCode, Json<UnreadCountApiResponse>)> {
+) -> ServerResult<(StatusCode, Json<UnreadCountResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
 
     let (count, capped) = unread_for_user(&state.get_ctx(), state.get_node_id(), auth.user_id)
         .await
         .map_err(|error| map_dispatch_error(error, "unread"))?;
 
-    Ok((
-        StatusCode::OK,
-        Json(UnreadCountApiResponse { count, capped }),
-    ))
+    Ok((StatusCode::OK, Json(UnreadCountResponse { count, capped })))
 }
 
 /// Transport for the live unread-count stream. The local arm reacts to the
@@ -807,18 +795,18 @@ struct NotificationStateStream<S> {
     epoch: String,
     revisions: watch::Receiver<u64>,
     cadence: tokio::time::Interval,
-    current_unread: Option<UnreadCountApiResponse>,
+    current_unread: Option<UnreadCountResponse>,
     last_revision: Option<u64>,
     unread_open: bool,
     revisions_open: bool,
 }
 
 impl<S> NotificationStateStream<S> {
-    fn state(&mut self) -> Option<NotificationStreamStateResponse> {
+    fn state(&mut self) -> Option<NotificationStreamResponse> {
         let unread = self.current_unread.clone()?;
         let revision = *self.revisions.borrow_and_update();
         self.last_revision = Some(revision);
-        Some(NotificationStreamStateResponse {
+        Some(NotificationStreamResponse {
             epoch: self.epoch.clone(),
             revision,
             unread,
@@ -837,7 +825,7 @@ fn notification_state_stream<S>(
     epoch: String,
     revisions: watch::Receiver<u64>,
     cadence: Duration,
-) -> impl Stream<Item = NotificationStreamStateResponse> + Send
+) -> impl Stream<Item = NotificationStreamResponse> + Send
 where
     S: Stream<Item = (u64, bool)> + Send,
 {
@@ -857,7 +845,7 @@ where
         loop {
             if state.current_unread.is_none() {
                 let (count, capped) = state.unread.next().await?;
-                state.current_unread = Some(UnreadCountApiResponse {
+                state.current_unread = Some(UnreadCountResponse {
                     count: count as u32,
                     capped,
                 });
@@ -880,7 +868,7 @@ where
             match step {
                 NotificationStateStep::Unread(Some((count, capped))) => {
                     // Sources emit only wakes or changes, so repeated totals still trigger refetch.
-                    state.current_unread = Some(UnreadCountApiResponse {
+                    state.current_unread = Some(UnreadCountResponse {
                         count: count as u32,
                         capped,
                     });
@@ -907,7 +895,7 @@ where
     })
 }
 
-fn state_event(state: NotificationStreamStateResponse) -> Event {
+fn state_event(state: NotificationStreamResponse) -> Event {
     let data = serde_json::to_string(&state).unwrap_or_else(|_| {
         format!(
             "{{\"epoch\":\"{}\",\"revision\":{},\"unread\":{{\"count\":{},\"capped\":{}}}}}",
@@ -948,7 +936,7 @@ path-restricted token is refused.
   state, and any state missed while disconnected is recovered by refetching the inbox, never
   replayed on the stream."#,
     responses(
-        (status = 200, description = "Server-sent state stream, media type `text/event-stream`; it ends on client disconnect or node shutdown", body = NotificationStreamStateResponse, content_type = "text/event-stream"),
+        (status = 200, description = "Server-sent state stream, media type `text/event-stream`; it ends on client disconnect or node shutdown", body = NotificationStreamResponse, content_type = "text/event-stream"),
         (status = 401, description = "Missing, malformed or expired bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 503, description = "No inbox holder is available, this node has no realm network handle, or the dashboard change feed is not running; the caller may retry", body = ErrorResponse)
@@ -1020,7 +1008,7 @@ path-restricted token is refused.
 **Limits**
 - At most 512 ids, and duplicates are collapsed."#,
     request_body(
-        content = MarkReadApiRequest,
+        content = MarkReadRequest,
         description = "Notifications to mark read, by id, by age, or both; at most 512 ids, duplicates are collapsed",
         example = json!({
             "ids": ["01JABCDEF0123456789ABCDEFG"],
@@ -1031,7 +1019,7 @@ path-restricted token is refused.
         (
             status = 200,
             description = "Number of notifications flipped from unread to read by this call",
-            body = MarkReadApiResponse,
+            body = MarkReadResponse,
             example = json!({
                 "marked": 3
             })
@@ -1047,8 +1035,8 @@ path-restricted token is refused.
 pub async fn mark_read(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Json(request): Json<MarkReadApiRequest>,
-) -> ServerResult<(StatusCode, Json<MarkReadApiResponse>)> {
+    Json(request): Json<MarkReadRequest>,
+) -> ServerResult<(StatusCode, Json<MarkReadResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
     if request.ids.len() > MARK_READ_MAX_IDS {
         return Err(ServerError::BadRequest);
@@ -1069,7 +1057,7 @@ pub async fn mark_read(
     .await
     .map_err(|error| map_dispatch_error(error, "mark_read"))?;
 
-    Ok((StatusCode::OK, Json(MarkReadApiResponse { marked })))
+    Ok((StatusCode::OK, Json(MarkReadResponse { marked })))
 }
 
 #[utoipa::path(
@@ -1200,7 +1188,7 @@ permission path, evaluated against the caller's current grants at creation time.
 pub async fn create_watch(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(_bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(_bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateWatchRequest>,
 ) -> ServerResult<(StatusCode, Json<WatchResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
@@ -1209,13 +1197,13 @@ pub async fn create_watch(
         || request.path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN
         || request.events.is_empty()
     {
-        record_watch_denial(&state, WatchAuthorizationMetricReason::InvalidResource);
+        record_watch_denial(&state, WatchMetricReason::InvalidResource);
         return Err(ServerError::BadRequest);
     }
     let mut event_mask = WatchEventMask::empty();
     for name in &request.events {
         let Some(kind) = WatchEventKind::from_name(name) else {
-            record_watch_denial(&state, WatchAuthorizationMetricReason::InvalidResource);
+            record_watch_denial(&state, WatchMetricReason::InvalidResource);
             return Err(ServerError::BadRequest);
         };
         event_mask.insert(kind);
@@ -1295,4 +1283,5 @@ pub async fn delete_watch(
 }
 
 #[cfg(test)]
+#[path = "notifications_tests.rs"]
 mod tests;

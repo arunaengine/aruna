@@ -20,7 +20,7 @@ use aruna_operations::driver::DriverContext;
 use aruna_operations::harvest::oai_pmh::mapping::jsonld_to_dc;
 use aruna_operations::harvest::oai_pmh::request::format_from;
 use aruna_operations::metadata::api::{
-    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataRoCrateExportView,
+    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
 use aruna_operations::metadata::forward::export_rocrate_routed;
 use aruna_operations::metadata::get_document::load_document_record;
@@ -673,10 +673,10 @@ async fn read_jsonld(
     realm_id: RealmId,
     document_id: Ulid,
 ) -> Result<String, OaiFault> {
-    let request = ExportMetadataRoCrateRequest {
+    let request = ExportMetadataRequest {
         document_id,
         auth: None,
-        view: MetadataRoCrateExportView::Full,
+        view: RoCrateExportView::Full,
         limit: None,
         offset: None,
         after: None,
@@ -690,7 +690,7 @@ async fn read_jsonld(
     )
     .await
     {
-        Ok(ExportMetadataRoCrateResult::Full { jsonld, .. }) => Ok(jsonld),
+        Ok(ExportMetadataResult::Full { jsonld, .. }) => Ok(jsonld),
         Ok(_) => Err(OaiFault::Internal),
         Err(_) => Err(OaiFault::Unavailable),
     }
@@ -819,4 +819,5 @@ fn decode_token(token: &str) -> Option<TokenPayload> {
 }
 
 #[cfg(test)]
+#[path = "oai_tests.rs"]
 mod tests;
