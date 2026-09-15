@@ -29,7 +29,7 @@ enum RefreshState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum RefreshBlobHoldersError {
+pub enum RefreshHoldersError {
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error(transparent)]
@@ -47,7 +47,7 @@ pub enum RefreshBlobHoldersError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct RefreshBlobHoldersOperation {
+pub struct RefreshHoldersOperation {
     realm_id: RealmId,
     limits: RoCrateLimits,
     state: RefreshState,
@@ -55,10 +55,10 @@ pub struct RefreshBlobHoldersOperation {
     next_start: Option<Key>,
     last_published: Option<DhtKeyId>,
     refreshed: usize,
-    output: Option<Result<usize, RefreshBlobHoldersError>>,
+    output: Option<Result<usize, RefreshHoldersError>>,
 }
 
-impl RefreshBlobHoldersOperation {
+impl RefreshHoldersOperation {
     pub fn new(realm_id: RealmId, limits: RoCrateLimits) -> Self {
         Self {
             realm_id,
@@ -101,7 +101,7 @@ impl RefreshBlobHoldersOperation {
         smallvec![]
     }
 
-    fn fail(&mut self, error: RefreshBlobHoldersError) -> Effects {
+    fn fail(&mut self, error: RefreshHoldersError) -> Effects {
         self.state = RefreshState::Error;
         self.output = Some(Err(error));
         smallvec![]
@@ -109,7 +109,7 @@ impl RefreshBlobHoldersOperation {
 
     fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
         let state = format!("{:?}", self.state);
-        self.fail(RefreshBlobHoldersError::UnexpectedEvent {
+        self.fail(RefreshHoldersError::UnexpectedEvent {
             state,
             expected,
             got: format!("{event:?}"),
@@ -117,9 +117,9 @@ impl RefreshBlobHoldersOperation {
     }
 }
 
-impl Operation for RefreshBlobHoldersOperation {
+impl Operation for RefreshHoldersOperation {
     type Output = usize;
-    type Error = RefreshBlobHoldersError;
+    type Error = RefreshHoldersError;
 
     fn start(&mut self) -> Effects {
         self.state = RefreshState::Schedule;
@@ -165,7 +165,7 @@ impl Operation for RefreshBlobHoldersOperation {
                     ..
                 }) => self.read_page(None),
                 Event::Task(TaskEvent::Error { message, .. }) => {
-                    self.fail(RefreshBlobHoldersError::Schedule(message))
+                    self.fail(RefreshHoldersError::Schedule(message))
                 }
                 other => self.unexpected("blob holder timer result", other),
             },
@@ -180,8 +180,7 @@ impl Operation for RefreshBlobHoldersOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(RefreshBlobHoldersError::NotFinished))
+        self.output.unwrap_or(Err(RefreshHoldersError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -198,7 +197,7 @@ enum GetState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum GetBlobHoldersError {
+pub enum GetHoldersError {
     #[error(transparent)]
     Dht(#[from] DhtError),
     #[error("blob holder lookup did not complete")]
@@ -212,15 +211,15 @@ pub enum GetBlobHoldersError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct GetBlobHoldersOperation {
+pub struct GetHoldersOperation {
     key: DhtKeyId,
     realm_id: RealmId,
     self_node_id: NodeId,
     state: GetState,
-    output: Option<Result<Vec<NodeId>, GetBlobHoldersError>>,
+    output: Option<Result<Vec<NodeId>, GetHoldersError>>,
 }
 
-impl GetBlobHoldersOperation {
+impl GetHoldersOperation {
     pub fn new(blake3: [u8; 32], realm_id: RealmId, self_node_id: NodeId) -> Self {
         Self {
             key: DhtKeyId::from_bytes(blake3),
@@ -231,7 +230,7 @@ impl GetBlobHoldersOperation {
         }
     }
 
-    fn fail(&mut self, error: GetBlobHoldersError) -> Effects {
+    fn fail(&mut self, error: GetHoldersError) -> Effects {
         self.state = GetState::Error;
         self.output = Some(Err(error));
         smallvec![]
@@ -239,7 +238,7 @@ impl GetBlobHoldersOperation {
 
     fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
         let state = format!("{:?}", self.state);
-        self.fail(GetBlobHoldersError::UnexpectedEvent {
+        self.fail(GetHoldersError::UnexpectedEvent {
             state,
             expected,
             got: format!("{event:?}"),
@@ -260,9 +259,9 @@ impl GetBlobHoldersOperation {
     }
 }
 
-impl Operation for GetBlobHoldersOperation {
+impl Operation for GetHoldersOperation {
     type Output = Vec<NodeId>;
-    type Error = GetBlobHoldersError;
+    type Error = GetHoldersError;
 
     fn start(&mut self) -> Effects {
         self.state = GetState::Read;
@@ -297,14 +296,14 @@ impl Operation for GetBlobHoldersOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(GetBlobHoldersError::Aborted))
+        self.output.unwrap_or(Err(GetHoldersError::Aborted))
     }
 
     /// A deadline must not look like an empty holder set: the caller reports the
     /// gap instead of claiming it enumerated every copy.
     fn abort(&mut self) -> Effects {
         self.state = GetState::Error;
-        self.output.get_or_insert(Err(GetBlobHoldersError::Aborted));
+        self.output.get_or_insert(Err(GetHoldersError::Aborted));
         smallvec![]
     }
 }
@@ -368,7 +367,7 @@ mod pure_tests {
             holder_refresh_ms: 30_000,
             ..RoCrateLimits::default()
         };
-        let mut operation = RefreshBlobHoldersOperation::new(realm_id, limits);
+        let mut operation = RefreshHoldersOperation::new(realm_id, limits);
 
         let schedule = operation.start();
         assert_eq!(
@@ -439,7 +438,7 @@ mod pure_tests {
         let self_node = node(9);
         let mut expected = vec![node(3), node(1), node(2)];
         expected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-        let mut operation = GetBlobHoldersOperation::new([4; 32], realm_id, self_node);
+        let mut operation = GetHoldersOperation::new([4; 32], realm_id, self_node);
         operation.start();
         operation.step(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
             key: DhtKeyId::from_bytes([4; 32]),
@@ -459,7 +458,7 @@ mod pure_tests {
         let realm_id = RealmId::from_bytes([1; 32]);
         let self_node = node(9);
         let other = node(2);
-        let mut operation = GetBlobHoldersOperation::new([4; 32], realm_id, self_node);
+        let mut operation = GetHoldersOperation::new([4; 32], realm_id, self_node);
         operation.start();
         operation.step(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
             key: DhtKeyId::from_bytes([4; 32]),
@@ -478,7 +477,7 @@ mod pure_tests {
     #[test]
     fn terminal_rejects_event() {
         let realm_id = RealmId::from_bytes([1; 32]);
-        let mut refresh = RefreshBlobHoldersOperation::new(realm_id, RoCrateLimits::default());
+        let mut refresh = RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
 
         let effects = refresh.step(Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
             key: DhtKeyId::from_bytes([1; 32]),
@@ -489,10 +488,10 @@ mod pure_tests {
         assert!(effects.is_empty());
         assert!(matches!(
             refresh.finalize(),
-            Err(RefreshBlobHoldersError::UnexpectedEvent { .. })
+            Err(RefreshHoldersError::UnexpectedEvent { .. })
         ));
 
-        let mut get = GetBlobHoldersOperation::new([4; 32], realm_id, node(9));
+        let mut get = GetHoldersOperation::new([4; 32], realm_id, node(9));
 
         let effects = get.step(Event::Net(NetEvent::Dht(DhtEvent::Error {
             error: DhtError::Other("offline".to_string()),
@@ -501,7 +500,7 @@ mod pure_tests {
         assert!(effects.is_empty());
         assert!(matches!(
             get.finalize(),
-            Err(GetBlobHoldersError::UnexpectedEvent { .. })
+            Err(GetHoldersError::UnexpectedEvent { .. })
         ));
     }
 }

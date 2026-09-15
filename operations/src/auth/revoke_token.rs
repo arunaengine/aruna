@@ -3,7 +3,7 @@ use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::{
     revocation_live, revocation_retained, valid_revocation_expiry, valid_token_hash,
 };
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -13,8 +13,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState, MAX_LIVE_REVOCATIONS_PER_ORIGIN,
-    RevocationIndex,
+    AdminDocumentError, AdminDocumentState, MAX_LIVE_REVOCATIONS_PER_ORIGIN, RevocationIndex,
 };
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -77,7 +76,7 @@ enum RevokeTokenState {
     ReadCurrent,
     ReadOutboxCapacity {
         document: RealmConfigDocument,
-        reducer_state: AdminDocumentReducerState,
+        reducer_state: AdminDocumentState,
         revocation_index: RevocationIndex,
         apply_event: bool,
         write_canonical: bool,
@@ -86,7 +85,7 @@ enum RevokeTokenState {
     },
     ReadOutboxRecords {
         document: RealmConfigDocument,
-        reducer_state: AdminDocumentReducerState,
+        reducer_state: AdminDocumentState,
         revocation_index: RevocationIndex,
         apply_event: bool,
         write_canonical: bool,
@@ -97,7 +96,7 @@ enum RevokeTokenState {
     },
     DeletePendingOutbox {
         document: RealmConfigDocument,
-        reducer_state: AdminDocumentReducerState,
+        reducer_state: AdminDocumentState,
         revocation_index: RevocationIndex,
         apply_event: bool,
         write_canonical: bool,
@@ -131,7 +130,7 @@ pub enum RevokeTokenError {
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
-    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
+    AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
     RealmConfigNotFound,
     #[error("revoked bearer token hash is malformed")]
@@ -162,8 +161,8 @@ impl RevokeTokenOperation {
         }
     }
 
-    fn document_ref(&self) -> DocumentSyncTarget {
-        DocumentSyncTarget::RealmConfig {
+    fn document_ref(&self) -> DocumentTarget {
+        DocumentTarget::RealmConfig {
             realm_id: self.config.actor.realm_id,
         }
     }
@@ -222,12 +221,12 @@ impl RevokeTokenOperation {
             .as_ref()
             .is_some_and(|state| state.target != target)
         {
-            return Err(AdminDocumentReducerError::TargetMismatch.into());
+            return Err(AdminDocumentError::TargetMismatch.into());
         }
 
         let reducer_state = previous_reducer_state
             .clone()
-            .unwrap_or_else(|| AdminDocumentReducerState::new(target));
+            .unwrap_or_else(|| AdminDocumentState::new(target));
         let effective_now = reducer_state.revocation_floor.max(self.config.now);
         let revocation_index = reducer_state.revocation_index(effective_now);
         let materialized = revocation_index.materialized();
@@ -255,7 +254,7 @@ impl RevokeTokenOperation {
     fn emit_capacity_read(
         &mut self,
         document: RealmConfigDocument,
-        reducer_state: AdminDocumentReducerState,
+        reducer_state: AdminDocumentState,
         revocation_index: RevocationIndex,
         apply_event: bool,
         write_canonical: bool,
@@ -281,14 +280,11 @@ impl RevokeTokenOperation {
         })])
     }
 
-    fn pending_revocation(
-        &self,
-        record: &DocumentSyncOutboxRecord,
-    ) -> Option<(String, u64, UserId)> {
+    fn pending_revocation(&self, record: &DocumentOutboxRecord) -> Option<(String, u64, UserId)> {
         if record.node_id != self.config.actor.node_id || record.target != self.document_ref() {
             return None;
         }
-        let DocumentSyncOutboxEvent::AdminOperation { event, .. } = &record.event else {
+        let DocumentOutboxEvent::AdminOperation { event, .. } = &record.event else {
             return None;
         };
         if event.origin_node_id != self.config.actor.node_id
@@ -332,7 +328,7 @@ impl RevokeTokenOperation {
                 ));
                 continue;
             };
-            let Ok(record) = postcard::from_bytes::<DocumentSyncOutboxRecord>(&value) else {
+            let Ok(record) = postcard::from_bytes::<DocumentOutboxRecord>(&value) else {
                 pending_deletes.extend([
                     (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
                     (
@@ -375,7 +371,7 @@ impl RevokeTokenOperation {
     fn finish_capacity(
         &mut self,
         document: RealmConfigDocument,
-        reducer_state: AdminDocumentReducerState,
+        reducer_state: AdminDocumentState,
         revocation_index: RevocationIndex,
         apply_event: bool,
         write_canonical: bool,
@@ -469,7 +465,7 @@ impl RevokeTokenOperation {
     fn emit_after_capacity(
         &mut self,
         document: RealmConfigDocument,
-        reducer_state: AdminDocumentReducerState,
+        reducer_state: AdminDocumentState,
         revocation_index: RevocationIndex,
         apply_event: bool,
         write_canonical: bool,
@@ -484,7 +480,7 @@ impl RevokeTokenOperation {
     fn emit_write(
         &mut self,
         mut document: RealmConfigDocument,
-        mut reducer_state: AdminDocumentReducerState,
+        mut reducer_state: AdminDocumentState,
         mut revocation_index: RevocationIndex,
         apply_event: bool,
     ) -> Result<Effects, RevokeTokenError> {
@@ -525,7 +521,7 @@ impl RevokeTokenOperation {
                 self.config.actor.node_id,
                 document_target,
                 Vec::new(),
-                DocumentSyncOutboxEvent::admin(admin_event),
+                DocumentOutboxEvent::admin(admin_event),
                 placement,
                 false,
             );
@@ -871,19 +867,19 @@ impl Operation for RevokeTokenOperation {
 #[cfg(test)]
 mod tests {
     use super::{
-        ADMIN_DOCUMENT_STATE_KEYSPACE, AdminDocumentReducerState, AdminDocumentTarget, Event,
+        ADMIN_DOCUMENT_STATE_KEYSPACE, AdminDocumentState, AdminDocumentTarget, Event,
         MAX_LIVE_REVOCATIONS_PER_ORIGIN, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError,
         RevokeTokenOperation, StorageEffect, StorageEvent, reducer_state_key,
     };
     use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::realm::get_config::GetRealmConfigOperation;
+    use crate::realm::get_config::GetConfigOperation;
     use crate::sync::document_outbox::admin_outbox_prefix;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentOperation;
     use aruna_core::auth::MAX_BEARER_TOKEN_LIFETIME_SECS;
     use aruna_core::auth::bearer_token_hash;
-    use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord};
+    use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
     use aruna_core::keyspaces::{
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE,
     };
@@ -956,19 +952,15 @@ mod tests {
         }
     }
 
-    fn seed_state(actor: &Actor, count: usize) -> AdminDocumentReducerState {
+    fn seed_state(actor: &Actor, count: usize) -> AdminDocumentState {
         seed_state_for(actor, actor.user_id, count)
     }
 
-    fn seed_state_for(
-        actor: &Actor,
-        token_owner: UserId,
-        count: usize,
-    ) -> AdminDocumentReducerState {
+    fn seed_state_for(actor: &Actor, token_owner: UserId, count: usize) -> AdminDocumentState {
         let target = AdminDocumentTarget::RealmConfig {
             realm_id: actor.realm_id,
         };
-        let mut state = AdminDocumentReducerState::new(target);
+        let mut state = AdminDocumentState::new(target);
         for index in 0..count {
             state
                 .apply_operation(
@@ -984,7 +976,7 @@ mod tests {
         state
     }
 
-    async fn write_state(context: &DriverContext, state: &AdminDocumentReducerState) {
+    async fn write_state(context: &DriverContext, state: &AdminDocumentState) {
         let (key_space, key, value) = reducer_state_entry(state).unwrap();
         match context
             .storage_handle
@@ -1048,10 +1040,7 @@ mod tests {
         }
     }
 
-    async fn token_records(
-        context: &DriverContext,
-        actor: &Actor,
-    ) -> Vec<DocumentSyncOutboxRecord> {
+    async fn token_records(context: &DriverContext, actor: &Actor) -> Vec<DocumentOutboxRecord> {
         iter_values(
             context,
             DOCUMENT_SYNC_OUTBOX_KEYSPACE,
@@ -1060,10 +1049,10 @@ mod tests {
         .await
         .into_iter()
         .filter_map(|(_, value)| postcard::from_bytes(&value).ok())
-        .filter(|record: &DocumentSyncOutboxRecord| {
+        .filter(|record: &DocumentOutboxRecord| {
             matches!(
                 &record.event,
-                DocumentSyncOutboxEvent::AdminOperation { event, .. }
+                DocumentOutboxEvent::AdminOperation { event, .. }
                     if matches!(
                         &event.op,
                         AdminDocumentOperation::RealmConfigTokenRevoked { .. }
@@ -1095,7 +1084,7 @@ mod tests {
         .unwrap();
         assert!(document.token_revoked(&token_hash, 1_000));
 
-        let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+        let read = drive(GetConfigOperation::new(actor.realm_id), &context)
             .await
             .unwrap();
         assert!(read.token_revoked(&token_hash, 1_000));
@@ -1139,7 +1128,7 @@ mod tests {
         .await
         .unwrap();
 
-        let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+        let read = drive(GetConfigOperation::new(actor.realm_id), &context)
             .await
             .unwrap();
         assert_eq!(read.revoked_tokens.len(), 2);
@@ -1393,7 +1382,7 @@ mod tests {
         assert_eq!(index_values(&context, &actor).await.len(), 1);
         assert_eq!(token_records(&context, &actor).await.len(), 1);
 
-        let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+        let read = drive(GetConfigOperation::new(actor.realm_id), &context)
             .await
             .unwrap();
         assert_eq!(read.revoked_tokens.len(), 1);
@@ -1457,10 +1446,7 @@ mod tests {
         );
     }
 
-    async fn reducer_state(
-        context: &DriverContext,
-        realm_id: RealmId,
-    ) -> AdminDocumentReducerState {
+    async fn reducer_state(context: &DriverContext, realm_id: RealmId) -> AdminDocumentState {
         let target = AdminDocumentTarget::RealmConfig { realm_id };
         match context
             .storage_handle

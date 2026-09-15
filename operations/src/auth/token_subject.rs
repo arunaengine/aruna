@@ -11,16 +11,16 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 #[derive(Debug, PartialEq)]
-pub struct EnsureCanonicalUserTokenSubjectOperation {
+pub struct SubjectCheckOperation {
     user_id: UserId,
     subject_ids: Vec<String>,
     subject_index: usize,
-    state: EnsureCanonicalUserTokenSubjectState,
-    output: Option<Result<(), EnsureCanonicalUserTokenSubjectError>>,
+    state: SubjectCheckState,
+    output: Option<Result<(), SubjectCheckError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum EnsureCanonicalUserTokenSubjectState {
+enum SubjectCheckState {
     Init,
     ReadUser,
     ReadSubjectIndex,
@@ -29,7 +29,7 @@ enum EnsureCanonicalUserTokenSubjectState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum EnsureCanonicalUserTokenSubjectError {
+pub enum SubjectCheckError {
     #[error("Unauthorized")]
     Unauthorized,
     #[error("Forbidden")]
@@ -48,31 +48,31 @@ pub enum EnsureCanonicalUserTokenSubjectError {
     NotFinished,
 }
 
-impl EnsureCanonicalUserTokenSubjectOperation {
+impl SubjectCheckOperation {
     pub fn new(user_id: UserId) -> Self {
         Self {
             user_id,
             subject_ids: Vec::new(),
             subject_index: 0,
-            state: EnsureCanonicalUserTokenSubjectState::Init,
+            state: SubjectCheckState::Init,
             output: None,
         }
     }
 
-    fn fail(&mut self, error: EnsureCanonicalUserTokenSubjectError) -> Effects {
-        self.state = EnsureCanonicalUserTokenSubjectState::Error;
+    fn fail(&mut self, error: SubjectCheckError) -> Effects {
+        self.state = SubjectCheckState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
     fn finish(&mut self) -> Effects {
-        self.state = EnsureCanonicalUserTokenSubjectState::Finish;
+        self.state = SubjectCheckState::Finish;
         self.output = Some(Ok(()));
         smallvec![]
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: Event) -> Effects {
-        self.fail(EnsureCanonicalUserTokenSubjectError::UnexpectedEvent {
+        self.fail(SubjectCheckError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
             got: format!("{got:?}"),
@@ -87,11 +87,11 @@ impl EnsureCanonicalUserTokenSubjectOperation {
         })
     }
 
-    fn read_subject_effect(&self) -> Result<Effect, EnsureCanonicalUserTokenSubjectError> {
+    fn read_subject_effect(&self) -> Result<Effect, SubjectCheckError> {
         let subject_id = self
             .subject_ids
             .get(self.subject_index)
-            .ok_or(EnsureCanonicalUserTokenSubjectError::Forbidden)?;
+            .ok_or(SubjectCheckError::Forbidden)?;
         Ok(Effect::Storage(StorageEffect::Read {
             key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
             key: ByteView::from(subject_id.as_bytes().to_vec()),
@@ -107,23 +107,25 @@ impl EnsureCanonicalUserTokenSubjectOperation {
             };
         };
         let Some(bytes) = value else {
-            return self.fail(EnsureCanonicalUserTokenSubjectError::Unauthorized);
+            return self.fail(SubjectCheckError::Unauthorized);
         };
         let user = match User::from_bytes(&bytes) {
             Ok(user) => user,
             Err(error) => return self.fail(error.into()),
         };
         if user.user_id != self.user_id {
-            return self.fail(EnsureCanonicalUserTokenSubjectError::Unauthorized);
+            return self.fail(SubjectCheckError::Unauthorized);
         }
 
         self.subject_ids = user.subject_ids;
         self.subject_index = 0;
+        // Nothing is claimed, so no index entry can resolve this record to a
+        // different canonical owner; the record's own id already matched.
         if self.subject_ids.is_empty() {
             return self.finish();
         }
 
-        self.state = EnsureCanonicalUserTokenSubjectState::ReadSubjectIndex;
+        self.state = SubjectCheckState::ReadSubjectIndex;
         match self.read_subject_effect() {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(error),
@@ -138,14 +140,17 @@ impl EnsureCanonicalUserTokenSubjectOperation {
             };
         };
         let Some(bytes) = value else {
-            return self.fail(EnsureCanonicalUserTokenSubjectError::Forbidden);
+            return self.fail(SubjectCheckError::Forbidden);
         };
         let indexed_user_id = match UserId::from_storage_key(&bytes) {
             Ok(user_id) => user_id,
             Err(error) => return self.fail(error.into()),
         };
+        // The index resolves this subject to another user in the realm, so this
+        // record is a merged alias or stale: issuing a token here would restore
+        // a non-canonical identity for a subject that already has an owner.
         if indexed_user_id != self.user_id {
-            return self.fail(EnsureCanonicalUserTokenSubjectError::Forbidden);
+            return self.fail(SubjectCheckError::Forbidden);
         }
 
         self.subject_index += 1;
@@ -160,38 +165,34 @@ impl EnsureCanonicalUserTokenSubjectOperation {
     }
 }
 
-impl Operation for EnsureCanonicalUserTokenSubjectOperation {
+impl Operation for SubjectCheckOperation {
     type Output = ();
-    type Error = EnsureCanonicalUserTokenSubjectError;
+    type Error = SubjectCheckError;
 
     fn start(&mut self) -> Effects {
-        self.state = EnsureCanonicalUserTokenSubjectState::ReadUser;
+        self.state = SubjectCheckState::ReadUser;
         smallvec![self.read_user_effect()]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            EnsureCanonicalUserTokenSubjectState::ReadUser => self.handle_user_read(event),
-            EnsureCanonicalUserTokenSubjectState::ReadSubjectIndex => {
-                self.handle_subject_read(event)
+            SubjectCheckState::ReadUser => self.handle_user_read(event),
+            SubjectCheckState::ReadSubjectIndex => self.handle_subject_read(event),
+            SubjectCheckState::Init | SubjectCheckState::Finish | SubjectCheckState::Error => {
+                smallvec![]
             }
-            EnsureCanonicalUserTokenSubjectState::Init
-            | EnsureCanonicalUserTokenSubjectState::Finish
-            | EnsureCanonicalUserTokenSubjectState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            EnsureCanonicalUserTokenSubjectState::Finish
-                | EnsureCanonicalUserTokenSubjectState::Error
+            SubjectCheckState::Finish | SubjectCheckState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .ok_or(EnsureCanonicalUserTokenSubjectError::NotFinished)?
+        self.output.ok_or(SubjectCheckError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {

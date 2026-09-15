@@ -11,8 +11,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, COMPLETION_DEADLINE_MS,
-    GroupStorageBackend, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    MultipartUploadStatus, RealmId, RoCrateLimits, WriteOwner,
+    GroupStorage, MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus, RealmId,
+    RoCrateLimits, WriteOwner,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
@@ -22,7 +22,7 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::{backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
-use crate::s3::abort_upload::{AbortMultipartUploadInput, AbortMultipartUploadOperation};
+use crate::s3::abort_upload::{AbortUploadInput, AbortUploadOperation};
 
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
@@ -249,7 +249,7 @@ pub async fn sweep_stale_uploads(
     for record in stale {
         let upload_id = record.upload_id;
         match drive(
-            AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
+            AbortUploadOperation::new(AbortUploadInput {
                 bucket: record.bucket,
                 key: record.key,
                 upload_id,
@@ -292,7 +292,7 @@ async fn is_removed_backend(context: &DriverContext, backend: &BackendRef) -> bo
             txn_id: None,
         })
         .await;
-    matches!(parse_read(event, GroupStorageBackend::from_bytes), Ok(None))
+    matches!(parse_read(event, GroupStorage::from_bytes), Ok(None))
 }
 
 async fn delete_cleanup_rows(
@@ -425,7 +425,7 @@ async fn owns_write(
             part_number,
         } => (
             S3_MULTIPART_UPLOAD_PART_KEYSPACE,
-            MultipartUploadPartKey::new(*upload_id, *part_number)
+            MultipartPartKey::new(*upload_id, *part_number)
                 .to_bytes()
                 .ok()?
                 .into(),
@@ -448,7 +448,7 @@ async fn owns_write(
     };
     let owned = match owner {
         WriteOwner::Blob { .. } => BackendLocation::from_bytes(&value).ok()?,
-        WriteOwner::UploadPart { .. } => MultipartUploadPart::from_bytes(&value).ok()?.location,
+        WriteOwner::UploadPart { .. } => MultipartPart::from_bytes(&value).ok()?.location,
     };
     Some(owned.same_object(location))
 }

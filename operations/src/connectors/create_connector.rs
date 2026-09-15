@@ -15,7 +15,7 @@ use crate::connectors::repository::{connector_secret_key, source_connector_key};
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateSourceConnectorInput {
+pub struct SourceConnectorInput {
     pub group_id: GroupId,
     pub created_by: UserId,
     pub name: String,
@@ -25,13 +25,13 @@ pub struct CreateSourceConnectorInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateSourceConnectorResult {
+pub struct SourceConnectorResult {
     pub connector: SourceConnector,
     pub has_secret_config: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CreateSourceConnectorState {
+pub enum SourceConnectorState {
     Init,
     WriteRecords,
     Finish,
@@ -39,7 +39,7 @@ pub enum CreateSourceConnectorState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum CreateSourceConnectorError {
+pub enum SourceConnectorError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -50,34 +50,34 @@ pub enum CreateSourceConnectorError {
     CreateSourceConnectorFailed,
     #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
     InvalidStateEvent {
-        state: CreateSourceConnectorState,
+        state: SourceConnectorState,
         expected: &'static str,
         received: Event,
     },
 }
 
 #[derive(Debug, PartialEq)]
-pub struct CreateSourceConnectorOperation {
-    input: CreateSourceConnectorInput,
-    state: CreateSourceConnectorState,
+pub struct SourceConnectorOperation {
+    input: SourceConnectorInput,
+    state: SourceConnectorState,
     connector: Option<SourceConnector>,
     secret: Option<SourceConnectorSecret>,
-    output: Option<Result<CreateSourceConnectorResult, CreateSourceConnectorError>>,
+    output: Option<Result<SourceConnectorResult, SourceConnectorError>>,
 }
 
-impl CreateSourceConnectorOperation {
-    pub fn new(input: CreateSourceConnectorInput) -> Self {
+impl SourceConnectorOperation {
+    pub fn new(input: SourceConnectorInput) -> Self {
         Self {
             input,
-            state: CreateSourceConnectorState::Init,
+            state: SourceConnectorState::Init,
             connector: None,
             secret: None,
             output: None,
         }
     }
 
-    fn emit_error(&mut self, error: CreateSourceConnectorError) -> Effects {
-        self.state = CreateSourceConnectorState::Error;
+    fn emit_error(&mut self, error: SourceConnectorError) -> Effects {
+        self.state = SourceConnectorState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
@@ -130,7 +130,7 @@ impl CreateSourceConnectorOperation {
 
         self.connector = Some(connector);
         self.secret = secret;
-        self.state = CreateSourceConnectorState::WriteRecords;
+        self.state = SourceConnectorState::WriteRecords;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: None,
@@ -139,7 +139,7 @@ impl CreateSourceConnectorOperation {
 
     fn handle_records_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.emit_error(CreateSourceConnectorError::InvalidStateEvent {
+            return self.emit_error(SourceConnectorError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchWriteResult)",
                 received: event,
@@ -147,11 +147,11 @@ impl CreateSourceConnectorOperation {
         };
 
         let Some(connector) = self.connector.clone() else {
-            return self.emit_error(CreateSourceConnectorError::CreateSourceConnectorFailed);
+            return self.emit_error(SourceConnectorError::CreateSourceConnectorFailed);
         };
 
-        self.state = CreateSourceConnectorState::Finish;
-        self.output = Some(Ok(CreateSourceConnectorResult {
+        self.state = SourceConnectorState::Finish;
+        self.output = Some(Ok(SourceConnectorResult {
             connector,
             has_secret_config: self.secret.is_some(),
         }));
@@ -159,9 +159,9 @@ impl CreateSourceConnectorOperation {
     }
 }
 
-impl Operation for CreateSourceConnectorOperation {
-    type Output = CreateSourceConnectorResult;
-    type Error = CreateSourceConnectorError;
+impl Operation for SourceConnectorOperation {
+    type Output = SourceConnectorResult;
+    type Error = SourceConnectorError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -169,30 +169,30 @@ impl Operation for CreateSourceConnectorOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            CreateSourceConnectorState::Init => self.handle_init(),
-            CreateSourceConnectorState::WriteRecords => self.handle_records_written(event),
-            CreateSourceConnectorState::Finish => smallvec![],
-            CreateSourceConnectorState::Error => self.abort(),
+            SourceConnectorState::Init => self.handle_init(),
+            SourceConnectorState::WriteRecords => self.handle_records_written(event),
+            SourceConnectorState::Finish => smallvec![],
+            SourceConnectorState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            CreateSourceConnectorState::Finish | CreateSourceConnectorState::Error
+            SourceConnectorState::Finish | SourceConnectorState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == CreateSourceConnectorState::Error {
+        if self.state == SourceConnectorState::Error {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(CreateSourceConnectorError::CreateSourceConnectorFailed);
+            return Err(SourceConnectorError::CreateSourceConnectorFailed);
         }
 
         self.output
-            .ok_or(CreateSourceConnectorError::CreateSourceConnectorFailed)?
+            .ok_or(SourceConnectorError::CreateSourceConnectorFailed)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -223,7 +223,7 @@ mod tests {
         };
 
         let result = drive(
-            CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
+            SourceConnectorOperation::new(SourceConnectorInput {
                 group_id: ulid::Ulid::generate(),
                 created_by: Default::default(),
                 name: "refdata".to_string(),
