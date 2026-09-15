@@ -1,14 +1,14 @@
 use std::time::Duration;
 
 use super::*;
-use aruna_core::structs::{BackendRef, COMPLETION_LEASE_MS, MultipartUploadChecksumHint};
+use aruna_core::structs::{BackendRef, COMPLETION_LEASE_MS, MultipartChecksumHint};
 use aruna_core::task::{TaskEffect, TaskKey};
 
 pub(super) const TEST_NOW_MS: u64 = 1_700_000_000_000;
 
-fn finalize_input() -> CompleteMultipartUploadInput {
+fn finalize_input() -> CompleteUploadInput {
     let realm_id = RealmId::from_bytes([3u8; 32]);
-    CompleteMultipartUploadInput {
+    CompleteUploadInput {
         bucket: "bucket".to_string(),
         key: "object".to_string(),
         upload_id: Ulid::from_parts(1, 1),
@@ -42,7 +42,7 @@ fn obligation_keeps_restrictions() {
         pattern: "/realm/g/group/data/node/bucket/scoped/**".to_string(),
         permission: aruna_core::structs::Permission::WRITE,
     }];
-    let mut operation = CompleteMultipartUploadOperation::new(finalize_input())
+    let mut operation = CompleteUploadOperation::new(finalize_input())
         .with_restrictions(Some(restrictions.clone()));
     operation.version_id = Some(Ulid::from_parts(3, 3));
 
@@ -51,13 +51,12 @@ fn obligation_keeps_restrictions() {
     let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
         panic!("expected one obligation write, got {effects:?}")
     };
-    let record =
-        crate::replication::queue::LiveReplicationObligationRecord::from_bytes(value.as_ref())
-            .expect("obligation decodes");
+    let record = crate::replication::queue::LiveObligationRecord::from_bytes(value.as_ref())
+        .expect("obligation decodes");
     assert_eq!(record.auth_context.path_restrictions, Some(restrictions));
 }
 
-fn open_upload_record(input: &CompleteMultipartUploadInput) -> MultipartUpload {
+fn open_upload_record(input: &CompleteUploadInput) -> MultipartUpload {
     MultipartUpload {
         backend: BackendRef::node_default(),
         storage_class: None,
@@ -76,8 +75,8 @@ fn open_upload_record(input: &CompleteMultipartUploadInput) -> MultipartUpload {
     }
 }
 
-fn part_record(part_number: u16, blob_size: u64) -> MultipartUploadPart {
-    MultipartUploadPart {
+fn part_record(part_number: u16, blob_size: u64) -> MultipartPart {
+    MultipartPart {
         part_number,
         location: BackendLocation {
             backend: BackendRef::node_default(),
@@ -108,7 +107,7 @@ fn rejects_foreign_part() {
         etag: None,
         expected_checksums: Vec::new(),
     }];
-    let mut operation = CompleteMultipartUploadOperation::new(input);
+    let mut operation = CompleteUploadOperation::new(input);
     let record = open_upload_record(&operation.input);
     let upload_id = record.upload_id;
     operation.upload_record = Some(record);
@@ -117,21 +116,18 @@ fn rejects_foreign_part() {
 
     let result = operation.extract_requested_parts(part_values(upload_id, vec![part]));
 
-    assert!(matches!(
-        result,
-        Err(CompleteMultipartUploadError::BackendMismatch)
-    ));
+    assert!(matches!(result, Err(CompleteUploadError::BackendMismatch)));
 }
 
 fn part_values(
     upload_id: Ulid,
-    parts: Vec<MultipartUploadPart>,
+    parts: Vec<MultipartPart>,
 ) -> Vec<(aruna_core::types::Key, aruna_core::types::Value)> {
     parts
         .into_iter()
         .map(|part| {
             (
-                MultipartUploadPartKey::new(upload_id, part.part_number)
+                MultipartPartKey::new(upload_id, part.part_number)
                     .to_bytes()
                     .unwrap()
                     .into(),
@@ -146,24 +142,21 @@ fn refuses_disabled_backend() {
     // Compose already ran on the pinned backend, so the finalize fence has
     // to abort the transaction and roll the composed object back.
     let backend_id = Ulid::from_bytes([5u8; 16]);
-    let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+    let mut op = CompleteUploadOperation::new(finalize_input());
     op.upload_record = Some(open_upload_record(&op.input));
     op.composed_location = Some(composed_location(backend_id));
-    op.state = CompleteMultipartUploadState::StartFinalizeTransaction;
+    op.state = CompleteUploadState::StartFinalizeTransaction;
     let txn_id = TxnId::generate();
 
     let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-    assert_eq!(
-        op.state,
-        CompleteMultipartUploadState::CheckPurgeFenceForFinalize
-    );
+    assert_eq!(op.state, CompleteUploadState::CheckPurgeFenceForFinalize);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { .. })]
     ));
 
     let effects = op.step(fence_clear());
-    assert_eq!(op.state, CompleteMultipartUploadState::ReadBucketDefault);
+    assert_eq!(op.state, CompleteUploadState::ReadBucketDefault);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::BatchRead { .. })]
@@ -175,7 +168,7 @@ fn refuses_disabled_backend() {
             (b"subject".to_vec().into(), None),
         ],
     }));
-    assert_eq!(op.state, CompleteMultipartUploadState::FenceBackend);
+    assert_eq!(op.state, CompleteUploadState::FenceBackend);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { .. })]
@@ -202,9 +195,9 @@ fn refuses_disabled_backend() {
 
 #[test]
 fn fence_rejects_stray() {
-    let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+    let mut op = CompleteUploadOperation::new(finalize_input());
     op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
-    op.state = CompleteMultipartUploadState::FenceBackend;
+    op.state = CompleteUploadState::FenceBackend;
 
     op.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: Vec::new(),
@@ -212,7 +205,7 @@ fn fence_rejects_stray() {
 
     assert!(matches!(
         op.cleanup.take_error(),
-        Some(CompleteMultipartUploadError::BackendFenceError(
+        Some(CompleteUploadError::BackendFenceError(
             BackendFenceError::Read(_)
         ))
     ));
@@ -222,9 +215,9 @@ fn fence_rejects_stray() {
 fn rollback_queues_cleanup() {
     // A backend that refuses the rollback delete would otherwise leave a
     // composed object no location or cleanup row can find.
-    let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+    let mut op = CompleteUploadOperation::new(finalize_input());
     op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
-    op.state = CompleteMultipartUploadState::FenceBackend;
+    op.state = CompleteUploadState::FenceBackend;
 
     let effects = op.step(Event::Storage(StorageEvent::ReadResult {
         key: b"x".to_vec().into(),
@@ -257,14 +250,14 @@ fn rollback_queues_cleanup() {
 fn commit_keeps_composed() {
     // A possibly-landed finalize commit owns the composed object, so it
     // goes to reconciliation instead of being deleted here.
-    let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+    let mut op = CompleteUploadOperation::new(finalize_input());
     let mut location = composed_location(Ulid::from_bytes([5u8; 16]));
     location.hashes.insert(
         aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
         vec![7u8; 32],
     );
     op.composed_location = Some(location.clone());
-    op.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
+    op.state = CompleteUploadState::CommitFinalizeTransaction;
 
     let effects = op.step(Event::Storage(StorageEvent::Error {
         error: StorageError::CommitFailed,
@@ -296,11 +289,11 @@ fn commit_keeps_composed() {
         key: b"k".to_vec().into(),
     }));
     assert!(effects.is_empty());
-    assert_eq!(op.state, CompleteMultipartUploadState::Error);
+    assert_eq!(op.state, CompleteUploadState::Error);
     assert!(op.is_complete());
     assert!(matches!(
         op.finalize(),
-        Err(CompleteMultipartUploadError::StorageError(
+        Err(CompleteUploadError::StorageError(
             StorageError::CommitFailed
         ))
     ));
@@ -308,19 +301,18 @@ fn commit_keeps_composed() {
 
 #[test]
 fn release_on_failure() {
-    let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+    let mut op = CompleteUploadOperation::new(finalize_input());
     let mut location = composed_location(Ulid::from_bytes([5u8; 16]));
     location.hashes.insert(
         aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
         vec![7u8; 32],
     );
     let id = location.ulid;
-    op.cleanup
-        .set_error(CompleteMultipartUploadError::StorageError(
-            StorageError::CommitFailed,
-        ));
+    op.cleanup.set_error(CompleteUploadError::StorageError(
+        StorageError::CommitFailed,
+    ));
     op.cleanup.set_release(id);
-    op.state = CompleteMultipartUploadState::QueueCleanupRow;
+    op.state = CompleteUploadState::QueueCleanupRow;
     assert!(
         op.cleanup
             .queue(BlobCleanupWork::ReconcileWrite {
@@ -364,7 +356,7 @@ fn release_on_failure() {
 fn exhausted_releases_hold() {
     // Giving up on the cleanup row still releases the reservation before the
     // pending error is reported.
-    let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+    let mut op = CompleteUploadOperation::new(finalize_input());
     let mut location = composed_location(Ulid::from_bytes([5u8; 16]));
     location.hashes.insert(
         aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
@@ -372,11 +364,9 @@ fn exhausted_releases_hold() {
     );
     let id = location.ulid;
     op.cleanup
-        .set_error(CompleteMultipartUploadError::StorageError(
-            StorageError::Timeout,
-        ));
+        .set_error(CompleteUploadError::StorageError(StorageError::Timeout));
     op.cleanup.set_release(id);
-    op.state = CompleteMultipartUploadState::QueueCleanupRow;
+    op.state = CompleteUploadState::QueueCleanupRow;
     assert!(
         op.cleanup
             .queue(BlobCleanupWork::ReconcileWrite {
@@ -414,21 +404,19 @@ fn exhausted_releases_hold() {
     assert!(op.is_complete());
     assert!(matches!(
         op.finalize(),
-        Err(CompleteMultipartUploadError::StorageError(
-            StorageError::Timeout
-        ))
+        Err(CompleteUploadError::StorageError(StorageError::Timeout))
     ));
 }
 
 #[test]
 fn cleanup_keeps_location() {
     let input = finalize_input();
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     let location = composed_location(Ulid::from_bytes([5u8; 16]));
     let release_id = location.ulid;
     let record = open_upload_record(&op.input);
     op.upload_record = Some(record.clone());
-    op.state = CompleteMultipartUploadState::ComposeBlob;
+    op.state = CompleteUploadState::ComposeBlob;
 
     let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteCleanup {
         location: location.clone(),
@@ -494,18 +482,18 @@ fn cleanup_keeps_location() {
     );
     assert_eq!(
         op.finalize(),
-        Err(CompleteMultipartUploadError::CompleteMultipartUploadFailed)
+        Err(CompleteUploadError::CompleteMultipartUploadFailed)
     );
 }
 
 #[test]
 fn cleanup_reset_error() {
     let input = finalize_input();
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     let location = composed_location(Ulid::from_bytes([5u8; 16]));
     let release_id = location.ulid;
     op.upload_record = Some(open_upload_record(&op.input));
-    op.state = CompleteMultipartUploadState::ComposeBlob;
+    op.state = CompleteUploadState::ComposeBlob;
 
     let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteCleanup {
         location: location.clone(),
@@ -549,9 +537,9 @@ fn cleanup_reset_error() {
 #[test]
 fn conflict_deletes_composed() {
     // A refused finalize proves no version names the composed object.
-    let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+    let mut op = CompleteUploadOperation::new(finalize_input());
     op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
-    op.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
+    op.state = CompleteUploadState::CommitFinalizeTransaction;
 
     let effects = op.step(Event::Storage(StorageEvent::Error {
         error: StorageError::TransactionConflict,
@@ -567,9 +555,9 @@ fn conflict_deletes_composed() {
 fn abort_deletes_composed() {
     // The reset transaction never commits, so nothing else can reach the
     // composed object once this operation ends.
-    let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+    let mut op = CompleteUploadOperation::new(finalize_input());
     op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
-    op.state = CompleteMultipartUploadState::CommitResetTransaction;
+    op.state = CompleteUploadState::CommitResetTransaction;
 
     let effects = op.step(Event::Storage(StorageEvent::Error {
         error: StorageError::TransactionConflict,
@@ -584,13 +572,13 @@ fn abort_deletes_composed() {
 
 #[test]
 fn unknown_reset_reconciles() {
-    let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+    let mut op = CompleteUploadOperation::new(finalize_input());
     let location = composed_location(Ulid::from_bytes([5u8; 16]));
     op.composed_location = Some(location.clone());
     op.txn_id = Some(TxnId::from_bytes([3u8; 16]));
     op.cleanup
-        .set_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
-    op.state = CompleteMultipartUploadState::CommitResetTransaction;
+        .set_error(CompleteUploadError::CompleteMultipartUploadFailed);
+    op.state = CompleteUploadState::CommitResetTransaction;
 
     let effects = op.step(Event::Storage(StorageEvent::Error {
         error: StorageError::CommitFailed,
@@ -611,17 +599,17 @@ fn unknown_reset_reconciles() {
             if observed == location
     ));
     assert_eq!(op.txn_id, None);
-    assert_eq!(op.state, CompleteMultipartUploadState::QueueCleanupRow);
+    assert_eq!(op.state, CompleteUploadState::QueueCleanupRow);
 }
 
 #[test]
 fn abort_keeps_blob() {
-    let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+    let mut op = CompleteUploadOperation::new(finalize_input());
     let location = composed_location(Ulid::from_bytes([5u8; 16]));
     op.composed_location = Some(location.clone());
     op.cleanup
-        .set_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
-    op.state = CompleteMultipartUploadState::AbortFinalizeTransaction;
+        .set_error(CompleteUploadError::CompleteMultipartUploadFailed);
+    op.state = CompleteUploadState::AbortFinalizeTransaction;
 
     let effects = op.step(Event::Storage(StorageEvent::Error {
         error: StorageError::TransactionConflict,
@@ -646,11 +634,11 @@ fn abort_keeps_blob() {
 
 #[test]
 fn cleanup_close_stops() {
-    let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+    let mut op = CompleteUploadOperation::new(finalize_input());
     let location = composed_location(Ulid::from_bytes([5u8; 16]));
     op.cleanup
-        .set_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
-    op.state = CompleteMultipartUploadState::QueueCleanupRow;
+        .set_error(CompleteUploadError::CompleteMultipartUploadFailed);
+    op.state = CompleteUploadState::QueueCleanupRow;
     assert!(
         op.cleanup
             .queue(BlobCleanupWork::ReconcileReservation { location })
@@ -663,15 +651,15 @@ fn cleanup_close_stops() {
         }))
         .is_empty()
     );
-    assert_eq!(op.state, CompleteMultipartUploadState::Error);
+    assert_eq!(op.state, CompleteUploadState::Error);
     assert!(op.abort().is_empty());
 }
 
 #[test]
 fn abort_queues_cleanup() {
-    let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+    let mut op = CompleteUploadOperation::new(finalize_input());
     op.delete_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
-    op.state = CompleteMultipartUploadState::ComposeBlob;
+    op.state = CompleteUploadState::ComposeBlob;
 
     let effects = op.abort();
 
@@ -680,11 +668,11 @@ fn abort_queues_cleanup() {
         [Effect::Storage(StorageEffect::Write { key_space, .. })]
             if key_space == BLOB_CLEANUP_KEYSPACE
     ));
-    assert_eq!(op.state, CompleteMultipartUploadState::QueueCleanupRow);
+    assert_eq!(op.state, CompleteUploadState::QueueCleanupRow);
     assert!(op.delete_location.is_none());
     assert!(matches!(
         op.finalize(),
-        Err(CompleteMultipartUploadError::NotFinished)
+        Err(CompleteUploadError::NotFinished)
     ));
 }
 
@@ -696,7 +684,7 @@ fn composed_location(backend_id: Ulid) -> BackendLocation {
 }
 
 fn disabled_record(backend_id: Ulid) -> Vec<u8> {
-    aruna_core::structs::GroupStorageBackend {
+    aruna_core::structs::GroupStorage {
         backend_id,
         group_id: Ulid::from_bytes([7u8; 16]),
         name: "tenant".to_string(),
@@ -718,19 +706,16 @@ fn marks_completion_lease() {
     let input = finalize_input();
     let mut record = open_upload_record(&input);
     record.status = MultipartUploadStatus::Open;
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     op.txn_id = Some(TxnId::generate());
-    op.state = CompleteMultipartUploadState::ReadUploadForMark;
+    op.state = CompleteUploadState::ReadUploadForMark;
 
     let effects = op.mark_upload_read(Event::Storage(StorageEvent::ReadResult {
         key: Vec::new().into(),
         value: Some(record.to_bytes().unwrap().into()),
     }));
 
-    assert_eq!(
-        op.state,
-        CompleteMultipartUploadState::WriteUploadCompleting
-    );
+    assert_eq!(op.state, CompleteUploadState::WriteUploadCompleting);
     let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
         panic!("expected the marking write")
     };
@@ -746,9 +731,9 @@ fn takes_stale_lease() {
     let input = finalize_input();
     let mut record = open_upload_record(&input);
     record.completing_since_ms = Some(TEST_NOW_MS - COMPLETION_LEASE_MS);
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     op.txn_id = Some(TxnId::generate());
-    op.state = CompleteMultipartUploadState::ReadUploadForMark;
+    op.state = CompleteUploadState::ReadUploadForMark;
 
     let effects = op.mark_upload_read(Event::Storage(StorageEvent::ReadResult {
         key: Vec::new().into(),
@@ -768,10 +753,10 @@ fn refuses_live_lease() {
     let input = finalize_input();
     let mut record = open_upload_record(&input);
     record.completing_since_ms = Some(TEST_NOW_MS - 1);
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     let txn_id = TxnId::generate();
     op.txn_id = Some(txn_id);
-    op.state = CompleteMultipartUploadState::ReadUploadForMark;
+    op.state = CompleteUploadState::ReadUploadForMark;
 
     let effects = op.mark_upload_read(Event::Storage(StorageEvent::ReadResult {
         key: Vec::new().into(),
@@ -785,7 +770,7 @@ fn refuses_live_lease() {
     ));
     assert_eq!(
         op.cleanup.take_error(),
-        Some(CompleteMultipartUploadError::CompletionInProgress)
+        Some(CompleteUploadError::CompletionInProgress)
     );
 }
 
@@ -794,17 +779,14 @@ fn refuses_live_lease() {
 fn abort_reopens_record() {
     let input = finalize_input();
     let record = open_upload_record(&input);
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     op.upload_record = Some(record);
-    op.state = CompleteMultipartUploadState::ComposeBlob;
+    op.state = CompleteUploadState::ComposeBlob;
 
     assert!(op.abort_after_commit());
     let effects = op.abort();
 
-    assert_eq!(
-        op.state,
-        CompleteMultipartUploadState::ResetUploadTransaction
-    );
+    assert_eq!(op.state, CompleteUploadState::ResetUploadTransaction);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::StartTransaction {
@@ -819,16 +801,16 @@ fn reset_skips_foreign() {
     let input = finalize_input();
     let mut record = open_upload_record(&input);
     record.completing_since_ms = Some(TEST_NOW_MS + 1);
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     op.txn_id = Some(TxnId::generate());
-    op.state = CompleteMultipartUploadState::ReadUploadForReset;
+    op.state = CompleteUploadState::ReadUploadForReset;
 
     let effects = op.reset_upload_read(Event::Storage(StorageEvent::ReadResult {
         key: Vec::new().into(),
         value: Some(record.to_bytes().unwrap().into()),
     }));
 
-    assert_eq!(op.state, CompleteMultipartUploadState::CleanupFailedCompose);
+    assert_eq!(op.state, CompleteUploadState::CleanupFailedCompose);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::AbortTransaction { .. })]
@@ -842,14 +824,14 @@ fn contract_failure_aborts() {
     input.checksum_type_explicit = true;
     let mut record = open_upload_record(&input);
     record.status = MultipartUploadStatus::Open;
-    record.checksum_hint = Some(MultipartUploadChecksumHint {
+    record.checksum_hint = Some(MultipartChecksumHint {
         algorithm: Some(ChecksumAlgorithm::Sha256),
         checksum_type: MultipartChecksumType::Composite,
     });
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     let txn_id = TxnId::generate();
     op.txn_id = Some(txn_id);
-    op.state = CompleteMultipartUploadState::ReadUploadForMark;
+    op.state = CompleteUploadState::ReadUploadForMark;
 
     let effects = op.mark_upload_read(Event::Storage(StorageEvent::ReadResult {
         key: Vec::new().into(),
@@ -878,7 +860,7 @@ fn composite_parts_only() {
     }];
     input.object_size = Some(1);
     let mut upload = open_upload_record(&input);
-    upload.checksum_hint = Some(MultipartUploadChecksumHint {
+    upload.checksum_hint = Some(MultipartChecksumHint {
         algorithm: Some(ChecksumAlgorithm::Sha256),
         checksum_type: MultipartChecksumType::Composite,
     });
@@ -887,7 +869,7 @@ fn composite_parts_only() {
         .hashes
         .insert(ChecksumAlgorithm::Sha256.hash_key().to_string(), digest);
     let values = part_values(input.upload_id, vec![part]);
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
 
     assert_eq!(op.validate_checksum_contract(&upload), Ok(()));
     assert_eq!(op.input.checksum_type, MultipartChecksumType::Composite);
@@ -905,17 +887,17 @@ fn requires_part_checksum() {
     }];
     input.object_size = Some(1);
     let mut upload = open_upload_record(&input);
-    upload.checksum_hint = Some(MultipartUploadChecksumHint {
+    upload.checksum_hint = Some(MultipartChecksumHint {
         algorithm: Some(ChecksumAlgorithm::Sha256),
         checksum_type: MultipartChecksumType::Composite,
     });
     let values = part_values(input.upload_id, vec![part_record(1, 1)]);
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     op.upload_record = Some(upload);
 
     assert_eq!(
         op.extract_requested_parts(values),
-        Err(CompleteMultipartUploadError::ChecksumContractMismatch)
+        Err(CompleteUploadError::ChecksumContractMismatch)
     );
 }
 
@@ -939,11 +921,11 @@ fn undersized_middle_rejected() {
         input.upload_id,
         vec![part_record(1, 5 * 1024 * 1024 - 1), part_record(2, 1)],
     );
-    let op = CompleteMultipartUploadOperation::new(input);
+    let op = CompleteUploadOperation::new(input);
 
     assert_eq!(
         op.extract_requested_parts(values),
-        Err(CompleteMultipartUploadError::EntityTooSmall)
+        Err(CompleteUploadError::EntityTooSmall)
     );
 }
 
@@ -967,7 +949,7 @@ fn undersized_final_allowed() {
         input.upload_id,
         vec![part_record(1, 5 * 1024 * 1024), part_record(2, 1)],
     );
-    let op = CompleteMultipartUploadOperation::new(input);
+    let op = CompleteUploadOperation::new(input);
 
     assert!(op.extract_requested_parts(values).is_ok());
 }
@@ -975,7 +957,7 @@ fn undersized_final_allowed() {
 #[test]
 fn omitted_parts_deleted() {
     let input = finalize_input();
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     op.upload_parts = vec![part_record(1, 10), part_record(2, 20)];
     op.resolved_parts = vec![op.upload_parts[0].clone()];
 
@@ -985,7 +967,7 @@ fn omitted_parts_deleted() {
         panic!("expected batch delete effect");
     };
     assert_eq!(deletes.len(), 3);
-    let omitted_key = MultipartUploadPartKey::new(op.input.upload_id, 2)
+    let omitted_key = MultipartPartKey::new(op.input.upload_id, 2)
         .to_bytes()
         .unwrap();
     assert!(deletes.iter().any(|(_, key)| key.as_ref() == omitted_key));
@@ -995,7 +977,7 @@ fn omitted_parts_deleted() {
 fn cleanup_covers_omitted() {
     // Deferred delete records must cover requested AND omitted parts.
     let input = finalize_input();
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     let requested = part_record(1, 10);
     let omitted = part_record(2, 20);
     let mut final_location = BackendLocation {
@@ -1078,7 +1060,7 @@ fn cleanup_covers_omitted() {
 fn finish_after_commit() {
     // The response must be ready at finalize commit; housekeeping is deferred.
     let input = finalize_input();
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     let location = BackendLocation {
         backend: BackendRef::node_default(),
         storage_class: None,
@@ -1098,7 +1080,7 @@ fn finish_after_commit() {
     op.final_location = Some(location.clone());
     op.composed_location = Some(location.clone());
     op.version_id = Some(Ulid::from_parts(13, 13));
-    op.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
+    op.state = CompleteUploadState::CommitFinalizeTransaction;
     op.txn_id = Some(TxnId::generate());
 
     let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
@@ -1111,7 +1093,7 @@ fn finish_after_commit() {
             id: location.ulid
         })]
     );
-    assert_eq!(op.state, CompleteMultipartUploadState::ReleaseReservation);
+    assert_eq!(op.state, CompleteUploadState::ReleaseReservation);
     let effects = op.step(Event::Blob(BlobEvent::ReservationReleased {
         id: location.ulid,
     }));
@@ -1139,13 +1121,13 @@ fn finish_after_commit() {
 fn quota_aborts_finalize() {
     let input = finalize_input();
     let record = open_upload_record(&input);
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     let finalize_txn = TxnId::generate();
     op.txn_id = Some(finalize_txn);
     op.upload_record = Some(record);
-    op.state = CompleteMultipartUploadState::EnforceQuota;
+    op.state = CompleteUploadState::EnforceQuota;
 
-    let effects = op.schedule_error(CompleteMultipartUploadError::QuotaExceeded {
+    let effects = op.schedule_error(CompleteUploadError::QuotaExceeded {
         limit: 30,
         usage: 35,
     });
@@ -1155,10 +1137,7 @@ fn quota_aborts_finalize() {
         effects[0],
         Effect::Storage(StorageEffect::AbortTransaction { txn_id }) if txn_id == finalize_txn
     ));
-    assert_eq!(
-        op.state,
-        CompleteMultipartUploadState::AbortFinalizeTransaction
-    );
+    assert_eq!(op.state, CompleteUploadState::AbortFinalizeTransaction);
     // Cleared so the reset StartTransaction can never overwrite (orphan) it.
     assert_eq!(op.txn_id, None);
 
@@ -1171,13 +1150,10 @@ fn quota_aborts_finalize() {
         effects[0],
         Effect::Storage(StorageEffect::StartTransaction { read: false })
     ));
-    assert_eq!(
-        op.state,
-        CompleteMultipartUploadState::ResetUploadTransaction
-    );
+    assert_eq!(op.state, CompleteUploadState::ResetUploadTransaction);
     assert_eq!(
         op.cleanup.take_error(),
-        Some(CompleteMultipartUploadError::QuotaExceeded {
+        Some(CompleteUploadError::QuotaExceeded {
             limit: 30,
             usage: 35
         })
@@ -1189,12 +1165,12 @@ fn quota_aborts_finalize() {
 #[test]
 fn abort_preserves_error() {
     let input = finalize_input();
-    let mut op = CompleteMultipartUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
     let finalize_txn = TxnId::generate();
     op.txn_id = Some(finalize_txn);
-    op.state = CompleteMultipartUploadState::EnforceQuota;
+    op.state = CompleteUploadState::EnforceQuota;
 
-    let effects = op.schedule_error(CompleteMultipartUploadError::QuotaExceeded {
+    let effects = op.schedule_error(CompleteUploadError::QuotaExceeded {
         limit: 30,
         usage: 35,
     });
@@ -1212,7 +1188,7 @@ fn abort_preserves_error() {
     assert!(op.is_complete());
     assert_eq!(
         op.finalize(),
-        Err(CompleteMultipartUploadError::QuotaExceeded {
+        Err(CompleteUploadError::QuotaExceeded {
             limit: 30,
             usage: 35
         })
@@ -1222,10 +1198,10 @@ fn abort_preserves_error() {
 #[test]
 fn unknown_mark_resets() {
     let input = finalize_input();
-    let mut operation = CompleteMultipartUploadOperation::new(input);
+    let mut operation = CompleteUploadOperation::new(input);
     operation.upload_record = Some(open_upload_record(&operation.input));
     operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
-    operation.state = CompleteMultipartUploadState::CommitMarkTransaction;
+    operation.state = CompleteUploadState::CommitMarkTransaction;
 
     let effects = operation.step(Event::Storage(StorageEvent::Error {
         error: StorageError::CommitFailed,
@@ -1237,14 +1213,11 @@ fn unknown_mark_resets() {
             read: false
         })]
     );
-    assert_eq!(
-        operation.state,
-        CompleteMultipartUploadState::ResetUploadTransaction
-    );
+    assert_eq!(operation.state, CompleteUploadState::ResetUploadTransaction);
     assert_eq!(operation.txn_id, None);
     assert_eq!(
         operation.cleanup.take_error(),
-        Some(CompleteMultipartUploadError::StorageError(
+        Some(CompleteUploadError::StorageError(
             StorageError::CommitFailed
         ))
     );
@@ -1253,9 +1226,9 @@ fn unknown_mark_resets() {
 #[test]
 fn conflict_mark_aborts() {
     let input = finalize_input();
-    let mut operation = CompleteMultipartUploadOperation::new(input);
+    let mut operation = CompleteUploadOperation::new(input);
     operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
-    operation.state = CompleteMultipartUploadState::CommitMarkTransaction;
+    operation.state = CompleteUploadState::CommitMarkTransaction;
     let txn_id = operation.txn_id.unwrap();
 
     let effects = operation.step(Event::Storage(StorageEvent::Error {
@@ -1266,16 +1239,16 @@ fn conflict_mark_aborts() {
         effects.as_slice(),
         [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
     );
-    assert_eq!(operation.state, CompleteMultipartUploadState::Error);
+    assert_eq!(operation.state, CompleteUploadState::Error);
     assert_eq!(operation.txn_id, None);
 }
 
 #[test]
 fn committed_mark_continues() {
     let input = finalize_input();
-    let mut operation = CompleteMultipartUploadOperation::new(input);
+    let mut operation = CompleteUploadOperation::new(input);
     operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
-    operation.state = CompleteMultipartUploadState::CommitMarkTransaction;
+    operation.state = CompleteUploadState::CommitMarkTransaction;
 
     let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
         txn_id: TxnId::from_bytes([3u8; 16]),
@@ -1286,9 +1259,6 @@ fn committed_mark_continues() {
         [Effect::Storage(StorageEffect::Iter { key_space, .. })]
             if key_space == S3_MULTIPART_UPLOAD_PART_KEYSPACE
     ));
-    assert_eq!(
-        operation.state,
-        CompleteMultipartUploadState::ReadUploadParts
-    );
+    assert_eq!(operation.state, CompleteUploadState::ReadUploadParts);
     assert_eq!(operation.txn_id, None);
 }
