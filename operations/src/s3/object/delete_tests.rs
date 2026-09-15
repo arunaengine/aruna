@@ -10,11 +10,16 @@ use aruna_core::keyspaces::{
     USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::{
-    Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashIndex,
-    PortableSourceDescriptor, RealmId, RoutingSnapshot, SourceConnectorKind, SourceMetadata,
-    StagingStrategy, VersionKey, VersionSourceBinding,
+use aruna_core::structs::storage::blob::{
+    Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashIndex, VersionKey,
 };
+use aruna_core::structs::execution::staging::{
+    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::routing::RoutingSnapshot;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
 use futures_util::StreamExt;
@@ -37,7 +42,7 @@ fn obligation_keeps_restrictions() {
     // credential must stay scoped on it.
     let restrictions = vec![PathRestriction {
         pattern: "/realm/g/group/data/node/bucket/scoped/**".to_string(),
-        permission: aruna_core::structs::Permission::WRITE,
+        permission: aruna_core::structs::identity::auth::Permission::WRITE,
     }];
     let mut operation = DeleteObjectOperation::new(DeleteObjectInput {
         bucket: "bucket".to_string(),
@@ -75,7 +80,7 @@ fn audit_op(version_id: Option<Ulid>) -> DeleteObjectOperation {
     operation
 }
 
-fn audit_record(effects: &[Effect]) -> aruna_core::structs::BlobAuditRecord {
+fn audit_record(effects: &[Effect]) -> aruna_core::structs::storage::delete_audit::BlobAuditRecord {
     let [
         Effect::Storage(StorageEffect::Write {
             key_space, value, ..
@@ -85,7 +90,7 @@ fn audit_record(effects: &[Effect]) -> aruna_core::structs::BlobAuditRecord {
         panic!("expected one audit write, got {effects:?}")
     };
     assert_eq!(key_space, BLOB_DELETE_AUDIT_KEYSPACE);
-    aruna_core::structs::BlobAuditRecord::from_bytes(value.as_ref()).expect("audit record decodes")
+    aruna_core::structs::storage::delete_audit::BlobAuditRecord::from_bytes(value.as_ref()).expect("audit record decodes")
 }
 
 #[test]
@@ -97,7 +102,7 @@ fn audits_delete_marker() {
     let record = audit_record(&operation.write_delete_audit());
     assert_eq!(
         record.kind,
-        aruna_core::structs::BlobAuditKind::DeleteMarker
+        aruna_core::structs::storage::delete_audit::BlobAuditKind::DeleteMarker
     );
     assert_eq!(record.version_id, Some(marker));
     assert_eq!(record.bucket, "bucket");
@@ -112,7 +117,7 @@ fn audits_version_delete() {
     let record = audit_record(&operation.write_delete_audit());
     assert_eq!(
         record.kind,
-        aruna_core::structs::BlobAuditKind::DeleteVersion
+        aruna_core::structs::storage::delete_audit::BlobAuditKind::DeleteVersion
     );
     assert_eq!(record.version_id, Some(version_id));
 }
@@ -261,7 +266,7 @@ fn drifted_counter_commits() {
     let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
         panic!("expected the counter read, got {effects:?}")
     };
-    let stored = aruna_core::structs::UsageCounters {
+    let stored = aruna_core::structs::storage::usage::UsageCounters {
         objects: 1,
         logical_bytes: 1_096_145,
         ..Default::default()
@@ -284,11 +289,11 @@ fn drifted_counter_commits() {
         panic!("expected the clamped counter write, got {effects:?}")
     };
     assert_ne!(op.state, DeleteObjectState::Error);
-    let counters: Vec<aruna_core::structs::UsageCounters> = writes
+    let counters: Vec<aruna_core::structs::storage::usage::UsageCounters> = writes
         .iter()
         .filter(|(key_space, ..)| key_space == USAGE_STATS_KEYSPACE)
         .map(|(_, _, value)| {
-            aruna_core::structs::UsageCounters::from_bytes(value.as_ref()).unwrap()
+            aruna_core::structs::storage::usage::UsageCounters::from_bytes(value.as_ref()).unwrap()
         })
         .collect();
     assert_eq!(counters.len(), reads.len());
@@ -328,7 +333,7 @@ fn candidate_op(location: Option<BlobLocationKey>) -> DeleteObjectOperation {
 #[test]
 fn queues_deleted_copy() {
     // The candidate rides the delete transaction, keyed backend first.
-    let key = BlobLocationKey::new([4u8; 32], aruna_core::structs::BackendRef::node_default());
+    let key = BlobLocationKey::new([4u8; 32], aruna_core::structs::storage::blob::BackendRef::node_default());
     let mut op = candidate_op(Some(key.clone()));
 
     let effects = op.write_reclaim_candidate();

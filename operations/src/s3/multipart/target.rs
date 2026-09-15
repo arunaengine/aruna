@@ -1,4 +1,4 @@
-use aruna_core::structs::{MultipartUpload, MultipartUploadStatus};
+use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,7 +45,7 @@ pub(crate) fn validate_upload(
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::BackendRef;
+    use aruna_core::structs::storage::blob::BackendRef;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -84,7 +84,7 @@ mod pure_tests {
 
     #[test]
     fn takeover_uses_clock() {
-        let now_ms = aruna_core::structs::COMPLETION_LEASE_MS + 10;
+        let now_ms = aruna_core::structs::storage::multipart::COMPLETION_LEASE_MS + 10;
         let record = upload(MultipartUploadStatus::Completing, Some(10));
 
         assert_eq!(

@@ -16,11 +16,16 @@ use aruna_core::keyspaces::{
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobAuditKind, BlobAuditRecord, BlobHeadKey, BlobLocationKey,
-    BlobVersion, BlobVersionState, CurrentVersionPointer, MultipartObjectKey, PathRestriction,
-    RealmId, ReclaimCandidate, ReclaimCandidateKey, UsageDelta, VersionKey, delete_audit_key,
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobAuditRecord, delete_audit_key};
+use aruna_core::structs::storage::multipart::MultipartObjectKey;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
+use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
 use std::collections::{HashMap, VecDeque};

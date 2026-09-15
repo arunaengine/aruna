@@ -15,10 +15,12 @@ use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{
-    AuthContext, BackendLocation, PathRestriction, RealmId, SourceMetadata, StagingStrategy,
-    VersionSourceBinding, resolve_backend,
-};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
+use aruna_core::structs::storage::blob::BackendLocation;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
+use aruna_core::structs::storage::routing::resolve_backend;
 use aruna_core::types::GroupId;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -373,10 +375,12 @@ pub(crate) mod test {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{
-        Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer,
-        PortableSourceDescriptor, SourceConnectorKind, SourceMetadata, VersionKey,
+    use aruna_core::structs::storage::blob::{
+        Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::execution::staging::PortableSourceDescriptor;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use axum::{Router, routing::get};
@@ -477,7 +481,7 @@ pub(crate) mod test {
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling: None,
-            routing: aruna_core::structs::RoutingSnapshot::single(group_id),
+            routing: aruna_core::structs::storage::routing::RoutingSnapshot::single(group_id),
         }
     }
 
@@ -549,11 +553,11 @@ pub(crate) mod test {
     }
 
     /// A rule that admits exactly this node, so a governed write is allowed.
-    fn admits(node_id: NodeId, seed: u8) -> aruna_core::structs::VerifiedPolicy {
-        let policy = aruna_core::structs::PlacementPolicy::new(
+    fn admits(node_id: NodeId, seed: u8) -> aruna_core::structs::placement::placement_policy::VerifiedPolicy {
+        let policy = aruna_core::structs::placement::placement_policy::PlacementPolicy::new(
             Ulid::from_bytes([seed; 16]),
             "residency".to_string(),
-            vec![aruna_core::structs::PlacementSelector {
+            vec![aruna_core::structs::placement::placement_policy::PlacementSelector {
                 node_id: Some(node_id),
                 location: None,
                 labels: Vec::new(),
@@ -561,7 +565,7 @@ pub(crate) mod test {
             }],
         )
         .expect("policy is valid");
-        aruna_core::structs::VerifiedPolicy::verify(policy).expect("policy verifies")
+        aruna_core::structs::placement::placement_policy::VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
     pub(crate) async fn seed_bucket(
@@ -569,9 +573,9 @@ pub(crate) mod test {
         bucket: &str,
         group_id: GroupId,
         user_id: UserId,
-        policies: Vec<aruna_core::structs::PlacementPolicyRef>,
+        policies: Vec<aruna_core::structs::placement::placement_policy::PlacementPolicyRef>,
     ) {
-        let info = aruna_core::structs::BucketInfo {
+        let info = aruna_core::structs::storage::blob::BucketInfo {
             group_id,
             created_at: std::time::UNIX_EPOCH,
             created_by: user_id,

@@ -7,10 +7,10 @@ use aruna_core::keyspaces::{
     SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    BlobHeadKey, BucketInfo, MultipartUpload, SyncRelationship, UsageDelta, VersionKey,
-    sync_relationship_key, sync_relationship_prefix,
-};
+use aruna_core::structs::storage::blob::{BlobHeadKey, BucketInfo, VersionKey};
+use aruna_core::structs::storage::multipart::MultipartUpload;
+use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
+use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use smallvec::smallvec;
@@ -473,10 +473,10 @@ mod test {
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SYNC_MIRROR_REPAIR_KEYSPACE,
         SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
     };
-    use aruna_core::structs::{
-        ArunaArn, BlobVersion, CurrentVersionPointer, RealmId, SyncMode, SyncState,
-        SyncStatusSnapshot, sync_relationship_key,
-    };
+    use aruna_core::structs::storage::replication::ArunaArn;
+    use aruna_core::structs::storage::blob::{BlobVersion, CurrentVersionPointer};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot, sync_relationship_key};
     use aruna_storage::storage;
     use std::time::SystemTime;
     use tempfile::tempdir;

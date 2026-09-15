@@ -3,7 +3,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::BucketInfo;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::types::{Effects, GroupId, Key};
 use base64::Engine;
 use smallvec::smallvec;

@@ -6,7 +6,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{MultipartUpload, MultipartUploadStatus};
+use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -365,7 +365,8 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::structs::{BackendRef, RealmId};
+    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::storage;
     use std::time::{Duration, SystemTime};
     use tempfile::tempdir;

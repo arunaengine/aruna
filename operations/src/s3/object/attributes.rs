@@ -13,11 +13,15 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType, MultipartObjectKey,
-    MultipartObjectPart, MultipartObjectSummary, PlacementPolicyRef, SourceMetadata, VersionKey,
+    CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
+use aruna_core::structs::storage::multipart::{
+    MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
+};
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -297,7 +301,7 @@ impl GetAttributesOperation {
         &mut self,
         version_id: Ulid,
         blob_hash: [u8; 32],
-        backend: aruna_core::structs::BackendRef,
+        backend: aruna_core::structs::storage::blob::BackendRef,
     ) -> Effects {
         let check = match begin_copy_check(
             &self.input.bucket,
@@ -520,7 +524,8 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5, HASH_SHA256};
-    use aruna_core::structs::{BackendRef, RealmId};
+    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::SystemTime;

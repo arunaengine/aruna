@@ -3,7 +3,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::BucketInfo;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -128,7 +128,8 @@ mod state_machine_tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{BucketInfo, RealmId};
+    use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::identity::realm::RealmId;
     use ulid::Ulid;
 
     fn fixed_bucket_info() -> BucketInfo {

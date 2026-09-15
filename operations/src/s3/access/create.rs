@@ -9,7 +9,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
-use aruna_core::structs::{PathRestriction, UserAccess};
+use aruna_core::structs::identity::auth::PathRestriction;
+use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::{Effects, GroupId};
 use rand::distr::Alphanumeric;
 use rand::{RngExt, rng};
@@ -707,7 +708,7 @@ mod pure_tests {
     fn rejects_oversized_restrictions() {
         // Over the cap the operation fails with no storage write emitted.
         use aruna_core::permission_path::MAX_TOKEN_RESTRICTIONS;
-        use aruna_core::structs::Permission;
+        use aruna_core::structs::identity::auth::Permission;
         let restrictions = (0..=MAX_TOKEN_RESTRICTIONS)
             .map(|index| PathRestriction {
                 pattern: format!("/r/{index}/**"),

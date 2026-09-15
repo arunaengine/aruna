@@ -29,17 +29,27 @@ use aruna_core::keyspaces::{
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, SYNC_REFERENCE_STATE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{
-    ArunaArn, AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs, ManagedCopyKey,
-    MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary, Permission,
-    PlacementPolicyRef, PortableSourceDescriptor, ReferenceHandling, ReplicationFailure,
-    ReplicationItemError, ReplicationItemKind, ReplicationNegotiationResult,
-    ReplicationSuboperationResult, ResolvedSourceAccess, RoutingError, SourceConnectorKind,
-    SourceMetadata, StagingStrategy, SyncMode, SyncRelationship, VersionKey, VersionSourceBinding,
-    object_permission_path, sync_state_key,
+use aruna_core::structs::storage::replication::{
+    ArunaArn, ReplicationFailure, ReplicationItemError, ReplicationItemKind,
+    ReplicationNegotiationResult, ReplicationSuboperationResult,
 };
-use aruna_core::structs::{NodeRouting, StorageRoutingRule, resolve_backend};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
+    CurrentVersionPointer, ManagedCopyKey, VersionKey, object_permission_path,
+};
+use aruna_core::structs::storage::routing::{GroupRoutingInputs, RoutingError};
+use aruna_core::structs::storage::multipart::{
+    MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
+};
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::execution::staging::{
+    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+};
+use aruna_core::structs::{ReferenceHandling, SyncMode, SyncRelationship, sync_state_key};
+use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::storage::routing::{NodeRouting, StorageRoutingRule, resolve_backend};
 use aruna_core::types::{Effects, GroupId, Key};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
@@ -1371,7 +1381,7 @@ impl ReplicateObjectOperation {
                 result: Ok(access),
             }) => {
                 let (source_kind, source_path, source_version) = match &access {
-                    aruna_core::structs::ResolvedSourceAccess::OpenDal {
+                    aruna_core::structs::execution::source_access::ResolvedSourceAccess::OpenDal {
                         kind,
                         path,
                         version,
@@ -2678,15 +2688,28 @@ mod tests {
     };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{
-        Actor, AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo,
-        CurrentVersionPointer, Group, GroupAuthorizationDocument, GroupRoutingInputs,
-        MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
-        PathRestriction, Permission, PortableSourceDescriptor, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmId, ReferenceHandling, ReplicationItemError, ReplicationItemKind,
-        ReplicationNegotiationResult, ReplicationSuboperationResult, ResolvedSourceAccess,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
+    use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
+    use aruna_core::structs::storage::blob::{
+        BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::storage::routing::GroupRoutingInputs;
+    use aruna_core::structs::storage::multipart::{
+        MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
+    };
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    };
+    use aruna_core::structs::ReferenceHandling;
+    use aruna_core::structs::storage::replication::{
+        ReplicationItemError, ReplicationItemKind, ReplicationNegotiationResult,
+        ReplicationSuboperationResult,
+    };
+    use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::types::Effects;
     use aruna_storage::FjallStorage;
     use bytes::Bytes;
@@ -3724,7 +3747,7 @@ mod tests {
         let manifest = op.manifest.expect("manifest built");
         assert_eq!(
             manifest.kind,
-            aruna_core::structs::ReplicationItemKind::Materialized
+            aruna_core::structs::storage::replication::ReplicationItemKind::Materialized
         );
         assert_eq!(manifest.source, Some(source));
         assert_eq!(manifest.metadata, metadata);
@@ -3836,7 +3859,7 @@ mod tests {
         let manifest = op.manifest.expect("manifest built");
         assert_eq!(
             manifest.kind,
-            aruna_core::structs::ReplicationItemKind::DeleteMarker
+            aruna_core::structs::storage::replication::ReplicationItemKind::DeleteMarker
         );
         assert_eq!(manifest.source, None);
     }

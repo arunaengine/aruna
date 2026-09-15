@@ -4,7 +4,8 @@ use crate::s3::object::delete::{
 };
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
-use aruna_core::structs::{PathRestriction, RealmId};
+use aruna_core::structs::identity::auth::PathRestriction;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
 use ulid::Ulid;
 
@@ -69,7 +70,9 @@ mod test {
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{Backend, BackendConfig, RealmId, RoutingSnapshot};
+    use aruna_core::structs::storage::blob::{Backend, BackendConfig};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use std::collections::HashMap;

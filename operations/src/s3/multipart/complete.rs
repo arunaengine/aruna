@@ -30,13 +30,19 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
-use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CopyOrigin, CurrentVersionPointer, MultipartChecksumType, MultipartObjectKey,
-    MultipartObjectPart, MultipartObjectSummary, MultipartPart, MultipartPartKey, MultipartUpload,
-    MultipartUploadStatus, PathRestriction, PlacementPolicyError, PlacementPolicyRef, RealmId,
-    ResolvedBackend, RoCrateLimits, UsageDelta, VersionKey, WriteOwner,
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
+    CopyOrigin, CurrentVersionPointer, ResolvedBackend, VersionKey, WriteOwner,
 };
+use aruna_core::structs::storage::multipart::{
+    MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
+    MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
+};
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -1923,9 +1929,10 @@ mod decision_tests {
     use super::pure_tests::TEST_NOW_MS;
     use super::*;
     use crate::placement::policy::PolicyCacheEntry;
-    use aruna_core::structs::{
-        BackendRef, MultipartChecksumHint, PlacementPolicy, PlacementSelector, PlacementSubject,
-        VerifiedPolicy,
+    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::multipart::MultipartChecksumHint;
+    use aruna_core::structs::placement::placement_policy::{
+        PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
     use aruna_core::types::Value;
     use std::collections::BTreeMap;

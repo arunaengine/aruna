@@ -5,7 +5,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::UserAccess;
+use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -239,7 +239,7 @@ mod pure_tests {
     use super::*;
     use crate::s3::access::index::{MAX_ACTIVE_CREDENTIALS, encode_index, owner_key};
     use aruna_core::credential_encryption::EncryptedS3Secret;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
     use std::time::{Duration, SystemTime};
     use ulid::Ulid;
 

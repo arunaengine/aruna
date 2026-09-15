@@ -4,7 +4,10 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BucketInfo, RoutingError, StorageRoutingRule, validate_tenant_rules};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::routing::{
+    RoutingError, StorageRoutingRule, validate_tenant_rules,
+};
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -351,8 +354,9 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{
-        BackendRef, BucketInfo, GroupRoutingInputs, RoutingError, RoutingTarget, StorageRoutingRule,
+    use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
+    use aruna_core::structs::storage::routing::{
+        GroupRoutingInputs, RoutingError, RoutingTarget, StorageRoutingRule,
     };
     use aruna_core::types::{Effects, TxnId};
     use std::collections::BTreeSet;

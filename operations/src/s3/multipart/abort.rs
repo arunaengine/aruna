@@ -7,8 +7,9 @@ use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    BlobCleanupWork, MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
+use aruna_core::structs::storage::blob::BlobCleanupWork;
+use aruna_core::structs::storage::multipart::{
+    MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
 };
 use aruna_core::types::{Effects, TxnId, Value};
 use smallvec::smallvec;
@@ -486,7 +487,7 @@ impl Operation for AbortUploadOperation {
 mod pure_tests {
     use super::*;
     use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
-    use aruna_core::structs::{BackendLocation, BackendRef};
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 
     use std::collections::HashMap;
     use std::time::SystemTime;

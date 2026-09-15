@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use super::*;
-use aruna_core::structs::{BackendRef, COMPLETION_LEASE_MS, MultipartChecksumHint};
+use aruna_core::structs::storage::blob::BackendRef;
+use aruna_core::structs::storage::multipart::{COMPLETION_LEASE_MS, MultipartChecksumHint};
 use aruna_core::task::{TaskEffect, TaskKey};
 
 pub(super) const TEST_NOW_MS: u64 = 1_700_000_000_000;
@@ -40,7 +41,7 @@ fn obligation_keeps_restrictions() {
     // credential must stay scoped on it.
     let restrictions = vec![PathRestriction {
         pattern: "/realm/g/group/data/node/bucket/scoped/**".to_string(),
-        permission: aruna_core::structs::Permission::WRITE,
+        permission: aruna_core::structs::identity::auth::Permission::WRITE,
     }];
     let mut operation = CompleteUploadOperation::new(finalize_input())
         .with_restrictions(Some(restrictions.clone()));
@@ -684,17 +685,17 @@ fn composed_location(backend_id: Ulid) -> BackendLocation {
 }
 
 fn disabled_record(backend_id: Ulid) -> Vec<u8> {
-    aruna_core::structs::GroupStorage {
+    aruna_core::structs::storage::group_backend::GroupStorage {
         backend_id,
         group_id: Ulid::from_bytes([7u8; 16]),
         name: "tenant".to_string(),
-        kind: aruna_core::structs::GroupBackendKind::S3,
+        kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
         public_config: HashMap::new(),
         created_at: SystemTime::UNIX_EPOCH,
         updated_at: SystemTime::UNIX_EPOCH,
         created_by: Default::default(),
         disabled: true,
-        cleanup: aruna_core::structs::CleanupStrategy::Retain,
+        cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
     }
     .to_bytes()
     .unwrap()

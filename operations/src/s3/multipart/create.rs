@@ -9,10 +9,12 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    BucketInfo, MultipartChecksumHint, MultipartUpload, MultipartUploadStatus, PlacementPolicyRef,
-    ResolvedBackend, RoutingError, RoutingSnapshot, resolve_backend,
+use aruna_core::structs::storage::blob::{BucketInfo, ResolvedBackend};
+use aruna_core::structs::storage::multipart::{
+    MultipartChecksumHint, MultipartUpload, MultipartUploadStatus,
 };
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -390,10 +392,13 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{
-        BackendCatalog, BackendRef, GroupBackendKind, GroupRoutingInputs, GroupStorage,
-        MultipartUpload, RoutingError, RoutingSnapshot, RoutingTarget, StorageRoutingRule,
+    use aruna_core::structs::storage::routing::{
+        BackendCatalog, GroupRoutingInputs, RoutingError, RoutingSnapshot, RoutingTarget,
+        StorageRoutingRule,
     };
+    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
+    use aruna_core::structs::storage::multipart::MultipartUpload;
     use aruna_core::types::TxnId;
     use std::collections::BTreeSet;
     use ulid::Ulid;
@@ -532,7 +537,7 @@ mod pure_tests {
             updated_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
             disabled: true,
-            cleanup: aruna_core::structs::CleanupStrategy::Retain,
+            cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         }
     }
 

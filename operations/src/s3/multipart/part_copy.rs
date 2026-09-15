@@ -10,10 +10,11 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{
-    AuthContext, BackendLocation, MultipartUpload, MultipartUploadStatus, PlacementPolicyError,
-    PlacementPolicyRef, RealmId,
-};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::blob::BackendLocation;
+use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use std::time::SystemTime;
@@ -321,10 +322,12 @@ mod test {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE};
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{
-        Backend, BackendConfig, BackendRef, MultipartPart, MultipartPartKey, MultipartUpload,
-        MultipartUploadStatus, RealmId, RoutingSnapshot,
+    use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
+    use aruna_core::structs::storage::multipart::{
+        MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
     };
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use std::collections::HashMap;
@@ -546,11 +549,11 @@ mod test {
         let node_id = context.net_handle.as_ref().unwrap().node_id();
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let upload_id = Ulid::generate();
-        let rule = aruna_core::structs::VerifiedPolicy::verify(
-            aruna_core::structs::PlacementPolicy::new(
+        let rule = aruna_core::structs::placement::placement_policy::VerifiedPolicy::verify(
+            aruna_core::structs::placement::placement_policy::PlacementPolicy::new(
                 Ulid::from_bytes([4u8; 16]),
                 "residency".to_string(),
-                vec![aruna_core::structs::PlacementSelector {
+                vec![aruna_core::structs::placement::placement_policy::PlacementSelector {
                     node_id: Some(node_id),
                     location: None,
                     labels: Vec::new(),
@@ -631,11 +634,11 @@ mod test {
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let upload_id = Ulid::generate();
         let elsewhere = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
-        let rule = aruna_core::structs::VerifiedPolicy::verify(
-            aruna_core::structs::PlacementPolicy::new(
+        let rule = aruna_core::structs::placement::placement_policy::VerifiedPolicy::verify(
+            aruna_core::structs::placement::placement_policy::PlacementPolicy::new(
                 Ulid::from_bytes([7u8; 16]),
                 "residency".to_string(),
-                vec![aruna_core::structs::PlacementSelector {
+                vec![aruna_core::structs::placement::placement_policy::PlacementSelector {
                     node_id: Some(elsewhere),
                     location: None,
                     labels: Vec::new(),
@@ -724,9 +727,9 @@ mod test {
         context: &DriverContext,
         group_id: GroupId,
         user_id: UserId,
-        policies: Vec<aruna_core::structs::PlacementPolicyRef>,
+        policies: Vec<aruna_core::structs::placement::placement_policy::PlacementPolicyRef>,
     ) {
-        let bucket = aruna_core::structs::BucketInfo {
+        let bucket = aruna_core::structs::storage::blob::BucketInfo {
             group_id,
             created_at: SystemTime::UNIX_EPOCH,
             created_by: user_id,

@@ -3,7 +3,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BucketCorsConfiguration, BucketInfo};
+use aruna_core::structs::storage::blob::{BucketCorsConfiguration, BucketInfo};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -506,7 +506,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-    use aruna_core::structs::{BucketCorsConfiguration, BucketCorsRule, BucketInfo};
+    use aruna_core::structs::storage::blob::{BucketCorsConfiguration, BucketCorsRule, BucketInfo};
     use aruna_storage::storage;
     use std::time::SystemTime;
     use tempfile::tempdir;

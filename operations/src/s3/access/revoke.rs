@@ -4,7 +4,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::UserAccess;
+use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use std::time::SystemTime;
@@ -255,7 +255,8 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::s3::access::index::{decode_index, encode_index, owner_key};
     use aruna_core::UserId;
-    use aruna_core::structs::{RealmId, UserAccess};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::UserAccess;
     use aruna_storage::storage;
     use std::time::Duration;
     use tempfile::tempdir;

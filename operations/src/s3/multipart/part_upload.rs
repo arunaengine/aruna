@@ -13,10 +13,11 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
-use aruna_core::structs::{
-    BackendLocation, BlobCleanupWork, MultipartPart, MultipartPartKey, MultipartUpload,
-    NODE_SUBJECT_KEY, NodeSubjectRecord, ResolvedBackend, WriteOwner,
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BlobCleanupWork, ResolvedBackend, WriteOwner,
 };
+use aruna_core::structs::storage::multipart::{MultipartPart, MultipartPartKey, MultipartUpload};
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::types::{Effects, Key, TxnId};
 use bytes::Bytes;
 use smallvec::smallvec;
@@ -784,8 +785,8 @@ mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
-    use aruna_core::structs::MultipartUploadStatus;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::storage::multipart::MultipartUploadStatus;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::storage;
     use tempfile::tempdir;
 
@@ -822,7 +823,7 @@ mod test {
         op.state = UploadPartState::ReadUpload;
         let record = MultipartUpload {
             upload_id,
-            backend: aruna_core::structs::BackendRef::Node("cold".to_string()),
+            backend: aruna_core::structs::storage::blob::BackendRef::Node("cold".to_string()),
             storage_class: Some("cold".to_string()),
             bucket: "mybucket".to_string(),
             key: "object.txt".to_string(),
@@ -1400,7 +1401,7 @@ mod test {
 
     fn part_location(backend_id: Ulid) -> BackendLocation {
         BackendLocation {
-            backend: aruna_core::structs::BackendRef::Group(backend_id),
+            backend: aruna_core::structs::storage::blob::BackendRef::Group(backend_id),
             storage_class: None,
             root: "root".to_string(),
             storage_bucket: "storage".to_string(),
@@ -1418,17 +1419,17 @@ mod test {
     }
 
     fn disabled_record(backend_id: Ulid) -> Vec<u8> {
-        aruna_core::structs::GroupStorage {
+        aruna_core::structs::storage::group_backend::GroupStorage {
             backend_id,
             group_id: Ulid::from_bytes([7u8; 16]),
             name: "tenant".to_string(),
-            kind: aruna_core::structs::GroupBackendKind::S3,
+            kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
             public_config: std::collections::HashMap::new(),
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: Default::default(),
             disabled: true,
-            cleanup: aruna_core::structs::CleanupStrategy::Retain,
+            cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         }
         .to_bytes()
         .unwrap()

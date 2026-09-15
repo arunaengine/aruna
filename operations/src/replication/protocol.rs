@@ -1,14 +1,22 @@
-use crate::s3::get_object::MAX_AUTO_ADVANCES;
+use crate::s3::object::get::MAX_AUTO_ADVANCES;
 use aruna_blob::hash::Hasher;
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
-use aruna_core::structs::{
-    ArunaArn, AuthContext, BackendLocation, CopyOrigin, MAX_POLICY_REF_INPUT,
-    MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary, PlacementPolicyRef,
-    PlacementSubject, RealmId, ReplicationItemKind, ReplicationNegotiationResult, SourceMetadata,
-    VersionSourceBinding, VersionedObjectArn,
+use aruna_core::structs::storage::replication::{
+    ArunaArn, ReplicationItemKind, ReplicationNegotiationResult, VersionedObjectArn,
 };
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::blob::{BackendLocation, CopyOrigin};
+use aruna_core::structs::placement::placement_policy::{
+    MAX_POLICY_REF_INPUT, PlacementPolicyRef, PlacementSubject,
+};
+use aruna_core::structs::storage::multipart::{
+    MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
+};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::staging::VersionSourceBinding;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use ulid::Ulid;
@@ -219,7 +227,7 @@ pub enum BaoReadTarget {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BaoReadRequest {
     pub auth_context: AuthContext,
-    pub realm_id: aruna_core::structs::RealmId,
+    pub realm_id: aruna_core::structs::identity::realm::RealmId,
     pub target: BaoReadTarget,
     pub expected_blake3: Option<[u8; 32]>,
     pub metadata_only: bool,
@@ -236,7 +244,7 @@ impl BaoReadRequest {
     pub fn validate(&self) -> Result<(), ConversionError> {
         if self.known_refs.len() > MAX_POLICY_REF_INPUT {
             return Err(ConversionError::PlacementPolicyError(
-                aruna_core::structs::PlacementPolicyError::RefCount,
+                aruna_core::structs::placement::placement_policy::PlacementPolicyError::RefCount,
             ));
         }
         if PlacementPolicyRef::canonical_set(&self.known_refs)? != self.known_refs {
@@ -375,10 +383,10 @@ fn check_location(
     location: &BackendLocation,
 ) -> Result<(), ConversionError> {
     match &location.backend {
-        aruna_core::structs::BackendRef::Node(name) => {
+        aruna_core::structs::storage::blob::BackendRef::Node(name) => {
             check_text(budget, name, MAX_REPLICATION_VALUE_BYTES)?;
         }
-        aruna_core::structs::BackendRef::Group(_) => {}
+        aruna_core::structs::storage::blob::BackendRef::Group(_) => {}
     }
     if let Some(storage_class) = &location.storage_class {
         check_text(budget, storage_class, MAX_REPLICATION_VALUE_BYTES)?;
@@ -595,7 +603,7 @@ impl VersionReplicationMessage {
             Self::PlacementPolicyDenied { policy_ids } => {
                 if policy_ids.len() > MAX_POLICY_REF_INPUT {
                     return Err(ConversionError::PlacementPolicyError(
-                        aruna_core::structs::PlacementPolicyError::RefCount,
+                        aruna_core::structs::placement::placement_policy::PlacementPolicyError::RefCount,
                     ));
                 }
                 None
@@ -643,12 +651,19 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::errors::ConversionError;
     use aruna_core::structs::checksum::HASH_SHA256;
-    use aruna_core::structs::{
-        ArunaArn, AuthContext, BackendLocation, BackendRef, MultipartChecksumType,
-        MultipartObjectPart, MultipartObjectSummary, PlacementPolicyRef, PortableSourceDescriptor,
-        RealmId, ReplicationItemKind, SourceConnectorKind, SourceMetadata, StagingStrategy,
-        VersionSourceBinding,
+    use aruna_core::structs::storage::replication::{ArunaArn, ReplicationItemKind};
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::storage::multipart::{
+        MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
     };
+    use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
     use std::collections::{BTreeMap, HashMap};
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -802,7 +817,7 @@ mod pure_tests {
             )
             .unwrap(),
         );
-        manifest.reference_metadata = Some(aruna_core::structs::SourceMetadata {
+        manifest.reference_metadata = Some(aruna_core::structs::execution::source_access::SourceMetadata {
             content_length: 42,
             content_type: Some("text/plain".to_string()),
             etag: Some("etag-1".to_string()),

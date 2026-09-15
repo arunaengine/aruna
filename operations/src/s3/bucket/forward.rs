@@ -7,8 +7,8 @@ use crate::s3::bucket::create::CreateBucketError;
 use crate::s3::bucket::create::CreateBucketOperation;
 use crate::s3::bucket::get::GetBucketOperation;
 use aruna_core::NodeId;
-use aruna_core::structs::BucketInfo;
-use aruna_core::structs::Permission;
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::types::GroupId;
 use std::sync::Arc;
@@ -68,7 +68,7 @@ pub(super) async fn create_remote_bucket(
     crate::metadata::device_pull::authorize_pull(
         context,
         &auth,
-        aruna_core::structs::bucket_permission_path(
+        aruna_core::structs::storage::blob::bucket_permission_path(
             realm_id,
             group_id,
             net_handle.node_id(),

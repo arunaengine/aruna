@@ -11,10 +11,15 @@ use aruna_core::keyspaces::{
     SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::storage::replication::{ArunaArn, ReplicationFailure};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, RealmId, ReferenceHandling, ReplicationFailure, SyncMode,
-    SyncRelationship, SyncState, WatchEvent, WatchEventDetail, WatchEventKind,
-    sync_relationship_key, sync_relationship_prefix, watch_resource_path,
+    ReferenceHandling, SyncMode, SyncRelationship, SyncState, sync_relationship_key,
+    sync_relationship_prefix,
+};
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -36,7 +41,7 @@ use super::version_replication::{
 };
 use crate::driver::{DriverContext, drive, gate_context, now_ms, quota_marked_routing};
 use crate::notifications::watch::emit::emit_watch_event;
-use crate::s3::get_bucket::GetBucketOperation;
+use crate::s3::bucket::get::GetBucketOperation;
 use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 
@@ -2623,12 +2628,16 @@ mod tests {
         AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-    use aruna_core::structs::{
-        Actor, ArunaArn, BackendRef, BlobVersion, BucketInfo, Group, GroupAuthorizationDocument,
-        PathRestriction, Permission, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-        ReferenceHandling, ReplicationItemError, SyncStatusSnapshot, VersionKey,
-        object_permission_path, sync_relationship_key,
+    use aruna_core::structs::identity::auth::{Actor, PathRestriction, Permission};
+    use aruna_core::structs::storage::replication::{ArunaArn, ReplicationItemError};
+    use aruna_core::structs::storage::blob::{
+        BackendRef, BlobVersion, BucketInfo, VersionKey, object_permission_path,
     };
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    };
+    use aruna_core::structs::{ReferenceHandling, SyncStatusSnapshot, sync_relationship_key};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use std::time::SystemTime;

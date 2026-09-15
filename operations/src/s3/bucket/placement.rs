@@ -8,10 +8,10 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, PlacementPolicyError, PlacementPolicyRef,
-    group_admin_path, policy_admin_path,
-};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
+use aruna_core::structs::placement::policy_document::{group_admin_path, policy_admin_path};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -414,10 +414,12 @@ mod pure_tests {
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::id::NodeId;
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{
-        AuthContext, BucketInfo, PlacementPolicy, PlacementPolicyRef, PlacementSelector, RealmId,
-        VerifiedPolicy,
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::placement::placement_policy::{
+        PlacementPolicy, PlacementPolicyRef, PlacementSelector, VerifiedPolicy,
     };
+    use aruna_core::structs::identity::realm::RealmId;
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
 
