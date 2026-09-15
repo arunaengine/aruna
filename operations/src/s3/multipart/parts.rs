@@ -1,7 +1,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE};
+use aruna_core::keyspaces::{UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::multipart::{
     MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
@@ -64,7 +64,7 @@ pub struct ListPartsResult {
     pub upload: MultipartUpload,
     pub parts: Vec<MultipartPart>,
     pub is_truncated: bool,
-    pub next_part_number_marker: Option<u16>,
+    pub next_part_marker: Option<u16>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -114,7 +114,7 @@ impl ListPartsOperation {
         self.txn_id = Some(txn_id);
         self.state = ListPartsState::ReadUpload;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
             txn_id: Some(txn_id),
         })]
@@ -157,7 +157,7 @@ impl ListPartsOperation {
         };
         self.state = ListPartsState::ReadParts;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
+            key_space: UPLOAD_PART_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
             start: None,
             limit: PART_SCAN_LIMIT,
@@ -193,7 +193,7 @@ impl ListPartsOperation {
         parts.truncate(self.input.max_parts);
         // With max_parts=0 the truncation empties `parts`, so fall back to the
         // marker preceding the first unreturned part (the request marker, or 0).
-        let next_part_number_marker = is_truncated.then(|| {
+        let next_part_marker = is_truncated.then(|| {
             parts
                 .last()
                 .map(|part| part.part_number)
@@ -212,7 +212,7 @@ impl ListPartsOperation {
             upload,
             parts,
             is_truncated,
-            next_part_number_marker,
+            next_part_marker,
         }));
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -340,7 +340,7 @@ mod test {
     async fn seed_upload(storage_handle: &storage::StorageHandle, record: &MultipartUpload) {
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+                key_space: UPLOAD_KEYSPACE.to_string(),
                 key: record.upload_id.to_bytes().to_vec().into(),
                 value: record.to_bytes().unwrap().into(),
                 txn_id: None,
@@ -356,7 +356,7 @@ mod test {
         };
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
+                key_space: UPLOAD_PART_KEYSPACE.to_string(),
                 key: MultipartPartKey::new(upload_id, part_number)
                     .to_bytes()
                     .unwrap()
@@ -402,7 +402,7 @@ mod test {
         let numbers: Vec<u16> = result.parts.iter().map(|part| part.part_number).collect();
         assert_eq!(numbers, vec![1, 100, 127, 128, 130, 255, 256, 300]);
         assert!(!result.is_truncated);
-        assert_eq!(result.next_part_number_marker, None);
+        assert_eq!(result.next_part_marker, None);
     }
 
     #[tokio::test]
@@ -440,10 +440,10 @@ mod test {
 
             collected.extend(result.parts.iter().map(|part| part.part_number));
             if result.is_truncated {
-                assert!(result.next_part_number_marker.is_some());
-                marker = result.next_part_number_marker;
+                assert!(result.next_part_marker.is_some());
+                marker = result.next_part_marker;
             } else {
-                assert_eq!(result.next_part_number_marker, None);
+                assert_eq!(result.next_part_marker, None);
                 break;
             }
         }
@@ -483,7 +483,7 @@ mod test {
         .unwrap();
         assert!(result.parts.is_empty());
         assert!(result.is_truncated);
-        assert_eq!(result.next_part_number_marker, Some(0));
+        assert_eq!(result.next_part_marker, Some(0));
 
         // With a marker the resume marker is preserved.
         let result = drive(
@@ -499,7 +499,7 @@ mod test {
         .await
         .unwrap();
         assert!(result.is_truncated);
-        assert_eq!(result.next_part_number_marker, Some(2));
+        assert_eq!(result.next_part_marker, Some(2));
     }
 
     #[tokio::test]

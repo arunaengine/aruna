@@ -7,7 +7,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE};
+use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{BucketInfo, ResolvedBackend};
 use aruna_core::structs::storage::multipart::{
@@ -59,7 +59,7 @@ pub enum CreateMultipartError {
     #[error(transparent)]
     PurgeFence(#[from] PurgeFenceError),
     #[error("CreateMultipartUpload failed")]
-    CreateMultipartUploadFailed,
+    CreateUploadFailed,
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -156,7 +156,7 @@ impl CreateMultipartOperation {
 
     fn handle_gate_bucket(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(CreateMultipartError::CreateMultipartUploadFailed);
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
         let bucket = match value
             .as_ref()
@@ -192,7 +192,7 @@ impl CreateMultipartOperation {
 
     fn handle_policy_gate(&mut self, event: Event) -> Effects {
         let Some(gate) = self.gate.as_mut() else {
-            return self.emit_error(CreateMultipartError::CreateMultipartUploadFailed);
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
         let effects = gate.step(event);
         match gate.is_complete() {
@@ -203,7 +203,7 @@ impl CreateMultipartOperation {
 
     fn finish_gate(&mut self) -> Effects {
         let Some(gate) = self.gate.take() else {
-            return self.emit_error(CreateMultipartError::CreateMultipartUploadFailed);
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
         let outcome = match gate.finalize() {
             Ok(outcome) => outcome,
@@ -247,7 +247,7 @@ impl CreateMultipartOperation {
             return self.emit_error(error.into());
         }
         let Some(resolved) = self.resolved.as_ref() else {
-            return self.emit_error(CreateMultipartError::CreateMultipartUploadFailed);
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
         match fence_backend(&resolved.backend, self.txn_id) {
             Some(effect) => {
@@ -267,7 +267,7 @@ impl CreateMultipartOperation {
 
     fn write_upload(&mut self) -> Effects {
         let Some((txn_id, resolved)) = self.txn_id.zip(self.resolved.take()) else {
-            return self.emit_error(CreateMultipartError::CreateMultipartUploadFailed);
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
         let record = MultipartUpload {
             backend: resolved.backend,
@@ -293,7 +293,7 @@ impl CreateMultipartOperation {
         self.record = Some(record.clone());
         self.state = CreateMultipartState::WriteUpload;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: record.upload_id.to_bytes().to_vec().into(),
             value: value.into(),
             txn_id: Some(txn_id),
@@ -326,7 +326,7 @@ impl CreateMultipartOperation {
         };
 
         let Some(record) = self.record.clone() else {
-            return self.emit_error(CreateMultipartError::CreateMultipartUploadFailed);
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
         self.txn_id = None;
         self.state = CreateMultipartState::Finish;

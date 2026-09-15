@@ -3,7 +3,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE};
+use aruna_core::keyspaces::{USER_ACCESS_KEYSPACE, ACCESS_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::Effects;
@@ -41,7 +41,7 @@ pub enum ListUserError {
     #[error("credential owner index is inconsistent")]
     IndexInconsistent,
     #[error("ListUserAccess failed")]
-    ListUserAccessFailed,
+    ListAccessFailed,
 }
 
 #[derive(Debug, PartialEq)]
@@ -91,7 +91,7 @@ impl ListUserOperation {
         self.txn_id = Some(txn_id);
         self.state = ListUserState::ReadOwnerIndex;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_ACCESS_OWNER_KEYSPACE.to_string(),
+            key_space: ACCESS_OWNER_KEYSPACE.to_string(),
             key: owner_key(self.input.user_identity),
             txn_id: Some(txn_id),
         })]
@@ -220,7 +220,7 @@ impl Operation for ListUserOperation {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(ListUserError::ListUserAccessFailed);
+            return Err(ListUserError::ListAccessFailed);
         }
         self.output.unwrap_or_else(|| Ok(Vec::new()))
     }

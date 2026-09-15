@@ -2,7 +2,7 @@ use super::index::{decode_index, encode_index, owner_key};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE};
+use aruna_core::keyspaces::{USER_ACCESS_KEYSPACE, ACCESS_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::Effects;
@@ -36,7 +36,7 @@ pub enum RevokeUserError {
     #[error("Invalid operation state")]
     InvalidOperationState,
     #[error("RevokeUserAccess failed")]
-    RevokeUserAccessFailed,
+    RevokeAccessFailed,
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -109,7 +109,7 @@ impl RevokeUserOperation {
             return self.emit_error(RevokeUserError::NotFound);
         };
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_ACCESS_OWNER_KEYSPACE.to_string(),
+            key_space: ACCESS_OWNER_KEYSPACE.to_string(),
             key: owner_key(access.user_identity),
             txn_id: Some(txn_id),
         })]
@@ -152,7 +152,7 @@ impl RevokeUserOperation {
         self.state = RevokeUserState::WriteUserAccess;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes: vec![(
-                USER_ACCESS_OWNER_KEYSPACE.to_string(),
+                ACCESS_OWNER_KEYSPACE.to_string(),
                 owner_key(access.user_identity),
                 index_value,
             )],
@@ -413,7 +413,7 @@ mod tests {
         let index = encode_index(&std::collections::BTreeSet::from([access_key.clone()])).unwrap();
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: USER_ACCESS_OWNER_KEYSPACE.to_string(),
+                key_space: ACCESS_OWNER_KEYSPACE.to_string(),
                 key: owner_key(user_access.user_identity),
                 value: index,
                 txn_id: None,
@@ -437,7 +437,7 @@ mod tests {
         assert!(value.is_none());
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: USER_ACCESS_OWNER_KEYSPACE.to_string(),
+                key_space: ACCESS_OWNER_KEYSPACE.to_string(),
                 key: owner_key(user_access.user_identity),
                 txn_id: None,
             })

@@ -54,7 +54,7 @@ pub struct ListBucketsOperation {
     input: ListBucketsInput,
     state: ListBucketsState,
     matches: Vec<(String, BucketInfo)>,
-    next_storage_start_after: Option<Key>,
+    storage_start_after: Option<Key>,
     scanned_rows: usize,
     output: Option<Result<ListBucketsResult, ListBucketsError>>,
 }
@@ -70,7 +70,7 @@ impl ListBucketsOperation {
             input,
             state: ListBucketsState::Init,
             matches: Vec::new(),
-            next_storage_start_after: None,
+            storage_start_after: None,
             scanned_rows: 0,
             output: None,
         }
@@ -92,7 +92,7 @@ impl ListBucketsOperation {
 
     fn emit_scan(&mut self) -> Effects {
         self.state = ListBucketsState::ReadBuckets;
-        let start = if let Some(key) = &self.next_storage_start_after {
+        let start = if let Some(key) = &self.storage_start_after {
             Some(IterStart::After(key.clone()))
         } else if let Some(token) = self.input.continuation_token.as_deref() {
             match decode_cursor(token) {
@@ -168,9 +168,9 @@ impl ListBucketsOperation {
         // The group page is not yet full: follow the storage cursor into the next
         // raw page so group buckets past the first page stay reachable.
         if let Some(next) = next_start_after {
-            self.next_storage_start_after = Some(next);
+            self.storage_start_after = Some(next);
             if self.scanned_rows == Self::MAX_SCAN_ROWS {
-                let cursor = self.next_storage_start_after.clone();
+                let cursor = self.storage_start_after.clone();
                 return self.finish_cursor(cursor.as_ref());
             }
             return self.emit_scan();

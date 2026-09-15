@@ -4,7 +4,7 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
+use aruna_core::keyspaces::UPLOAD_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use aruna_core::types::{Effects, Key};
@@ -41,7 +41,7 @@ pub enum ListUploadsError {
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("ListMultipartUploads failed")]
-    ListMultipartUploadsFailed,
+    ListUploadsFailed,
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -62,7 +62,7 @@ pub struct ListUploadsResult {
     pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_key_marker: Option<String>,
-    pub next_upload_id_marker: Option<Ulid>,
+    pub next_upload_marker: Option<Ulid>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -141,7 +141,7 @@ impl ListUploadsOperation {
                 common_prefixes: Vec::new(),
                 is_truncated: false,
                 next_key_marker: None,
-                next_upload_id_marker: None,
+                next_upload_marker: None,
             }));
             return smallvec![];
         }
@@ -174,7 +174,7 @@ impl ListUploadsOperation {
         }
         self.state = ListUploadsState::ReadUploads;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             prefix: None,
             start: self.scan_cursor.take().map(IterStart::After),
             limit: self.scan_round_limit.min(remaining),
@@ -279,7 +279,7 @@ impl ListUploadsOperation {
             self.input.delimiter.as_deref(),
             |upload| upload.key.as_str(),
         );
-        let (next_key_marker, next_upload_id_marker) =
+        let (next_key_marker, next_upload_marker) =
             match page.last_index.filter(|_| page.truncated) {
                 Some(index) => (
                     Some(uploads[index].key.clone()),
@@ -294,7 +294,7 @@ impl ListUploadsOperation {
             common_prefixes: page.prefixes,
             is_truncated: page.truncated,
             next_key_marker,
-            next_upload_id_marker,
+            next_upload_marker,
         }));
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -413,7 +413,7 @@ mod test {
     async fn seed_upload(storage_handle: &storage::StorageHandle, record: &MultipartUpload) {
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+                key_space: UPLOAD_KEYSPACE.to_string(),
                 key: record.upload_id.to_bytes().to_vec().into(),
                 value: record.to_bytes().unwrap().into(),
                 txn_id: None,
@@ -585,7 +585,7 @@ mod test {
         assert!(result.uploads.is_empty());
         assert!(!result.is_truncated);
         assert_eq!(result.next_key_marker, None);
-        assert_eq!(result.next_upload_id_marker, None);
+        assert_eq!(result.next_upload_marker, None);
     }
 
     #[tokio::test]
@@ -723,7 +723,7 @@ mod test {
             collected.extend(result.uploads.iter().map(|upload| upload.key.clone()));
             if result.is_truncated {
                 key_marker = result.next_key_marker.clone();
-                upload_id_marker = result.next_upload_id_marker;
+                upload_id_marker = result.next_upload_marker;
                 assert!(key_marker.is_some());
             } else {
                 break;
@@ -787,7 +787,7 @@ mod test {
                 prefix: None,
                 delimiter: None,
                 key_marker: first.next_key_marker.clone(),
-                upload_id_marker: first.next_upload_id_marker,
+                upload_id_marker: first.next_upload_marker,
                 max_uploads: 2,
             }),
             &driver_ctx,

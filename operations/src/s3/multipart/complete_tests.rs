@@ -150,7 +150,7 @@ fn refuses_disabled_backend() {
     let txn_id = TxnId::generate();
 
     let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-    assert_eq!(op.state, CompleteUploadState::CheckPurgeFenceForFinalize);
+    assert_eq!(op.state, CompleteUploadState::CheckPurgeFinalize);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { .. })]
@@ -483,7 +483,7 @@ fn cleanup_keeps_location() {
     );
     assert_eq!(
         op.finalize(),
-        Err(CompleteUploadError::CompleteMultipartUploadFailed)
+        Err(CompleteUploadError::CompleteUploadFailed)
     );
 }
 
@@ -578,7 +578,7 @@ fn unknown_reset_reconciles() {
     op.composed_location = Some(location.clone());
     op.txn_id = Some(TxnId::from_bytes([3u8; 16]));
     op.cleanup
-        .set_error(CompleteUploadError::CompleteMultipartUploadFailed);
+        .set_error(CompleteUploadError::CompleteUploadFailed);
     op.state = CompleteUploadState::CommitResetTransaction;
 
     let effects = op.step(Event::Storage(StorageEvent::Error {
@@ -609,7 +609,7 @@ fn abort_keeps_blob() {
     let location = composed_location(Ulid::from_bytes([5u8; 16]));
     op.composed_location = Some(location.clone());
     op.cleanup
-        .set_error(CompleteUploadError::CompleteMultipartUploadFailed);
+        .set_error(CompleteUploadError::CompleteUploadFailed);
     op.state = CompleteUploadState::AbortFinalizeTransaction;
 
     let effects = op.step(Event::Storage(StorageEvent::Error {
@@ -638,7 +638,7 @@ fn cleanup_close_stops() {
     let mut op = CompleteUploadOperation::new(finalize_input());
     let location = composed_location(Ulid::from_bytes([5u8; 16]));
     op.cleanup
-        .set_error(CompleteUploadError::CompleteMultipartUploadFailed);
+        .set_error(CompleteUploadError::CompleteUploadFailed);
     op.state = CompleteUploadState::QueueCleanupRow;
     assert!(
         op.cleanup
@@ -709,7 +709,7 @@ fn marks_completion_lease() {
     record.status = MultipartUploadStatus::Open;
     let mut op = CompleteUploadOperation::new(input);
     op.txn_id = Some(TxnId::generate());
-    op.state = CompleteUploadState::ReadUploadForMark;
+    op.state = CompleteUploadState::ReadUploadMark;
 
     let effects = op.mark_upload_read(Event::Storage(StorageEvent::ReadResult {
         key: Vec::new().into(),
@@ -734,7 +734,7 @@ fn takes_stale_lease() {
     record.completing_since_ms = Some(TEST_NOW_MS - COMPLETION_LEASE_MS);
     let mut op = CompleteUploadOperation::new(input);
     op.txn_id = Some(TxnId::generate());
-    op.state = CompleteUploadState::ReadUploadForMark;
+    op.state = CompleteUploadState::ReadUploadMark;
 
     let effects = op.mark_upload_read(Event::Storage(StorageEvent::ReadResult {
         key: Vec::new().into(),
@@ -757,7 +757,7 @@ fn refuses_live_lease() {
     let mut op = CompleteUploadOperation::new(input);
     let txn_id = TxnId::generate();
     op.txn_id = Some(txn_id);
-    op.state = CompleteUploadState::ReadUploadForMark;
+    op.state = CompleteUploadState::ReadUploadMark;
 
     let effects = op.mark_upload_read(Event::Storage(StorageEvent::ReadResult {
         key: Vec::new().into(),
@@ -804,7 +804,7 @@ fn reset_skips_foreign() {
     record.completing_since_ms = Some(TEST_NOW_MS + 1);
     let mut op = CompleteUploadOperation::new(input);
     op.txn_id = Some(TxnId::generate());
-    op.state = CompleteUploadState::ReadUploadForReset;
+    op.state = CompleteUploadState::ReadUploadReset;
 
     let effects = op.reset_upload_read(Event::Storage(StorageEvent::ReadResult {
         key: Vec::new().into(),
@@ -832,7 +832,7 @@ fn contract_failure_aborts() {
     let mut op = CompleteUploadOperation::new(input);
     let txn_id = TxnId::generate();
     op.txn_id = Some(txn_id);
-    op.state = CompleteUploadState::ReadUploadForMark;
+    op.state = CompleteUploadState::ReadUploadMark;
 
     let effects = op.mark_upload_read(Event::Storage(StorageEvent::ReadResult {
         key: Vec::new().into(),
@@ -1107,7 +1107,7 @@ fn finish_after_commit() {
                 ..
             }),
             Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::DrainBlobCleanupQueue,
+                key: TaskKey::DrainCleanupQueue,
                 ..
             }),
         ]
@@ -1258,7 +1258,7 @@ fn committed_mark_continues() {
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Iter { key_space, .. })]
-            if key_space == S3_MULTIPART_UPLOAD_PART_KEYSPACE
+            if key_space == UPLOAD_PART_KEYSPACE
     ));
     assert_eq!(operation.state, CompleteUploadState::ReadUploadParts);
     assert_eq!(operation.txn_id, None);

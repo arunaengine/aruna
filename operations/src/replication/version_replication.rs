@@ -6,7 +6,7 @@ use crate::blob::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
 use crate::blob::records::blob_location_read;
-use crate::connectors::resolver::ARUNA_NATIVE_RELATIONSHIP_ID;
+use crate::connectors::resolver::NATIVE_RELATIONSHIP_ID;
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::{RecordReadError, parse_read};
@@ -26,7 +26,7 @@ use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, Sub
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, SYNC_REFERENCE_STATE_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, SYNC_REFERENCE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::storage::replication::{
@@ -155,7 +155,7 @@ impl SourceAuthorization {
 
 fn permission_error(error: AuthorizationError) -> SourceAuthorizationError {
     match error {
-        AuthorizationError::AuthDocNotFound
+        AuthorizationError::DocNotFound
         | AuthorizationError::GroupNotFound
         | AuthorizationError::InvalidGroupId
         | AuthorizationError::InvalidRealmId => SourceAuthorizationError::Denied,
@@ -620,7 +620,7 @@ pub enum ReplicateObjectError {
     #[error("Missing blob hash")]
     MissingBlobHash,
     #[error("Multipart metadata incomplete: expected {expected} parts, found {actual}")]
-    MultipartPartCountMismatch { expected: usize, actual: usize },
+    PartCountMismatch { expected: usize, actual: usize },
     #[error("operation did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
@@ -1084,7 +1084,7 @@ pub struct ReplicateObjectOperation {
     replication_version: Option<ReplicationVersion>,
     multipart_summary: Option<MultipartObjectSummary>,
     multipart_parts: Vec<MultipartObjectPart>,
-    multipart_parts_next_start_after: Option<Key>,
+    parts_next_start: Option<Key>,
     stream_id: Option<Ulid>,
     manifest: Option<VersionReplicationManifest>,
     blob_replication_id: Option<Ulid>,
@@ -1129,7 +1129,7 @@ impl ReplicateObjectOperation {
             replication_version: None,
             multipart_summary: None,
             multipart_parts: Vec::new(),
-            multipart_parts_next_start_after: None,
+            parts_next_start: None,
             stream_id: None,
             manifest: None,
             blob_replication_id: None,
@@ -1255,7 +1255,7 @@ impl ReplicateObjectOperation {
         };
 
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            key_space: OBJECT_METADATA_KEYSPACE.to_string(),
             key: key.into(),
             txn_id: None,
         })]
@@ -1269,10 +1269,10 @@ impl ReplicateObjectOperation {
         };
 
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            key_space: OBJECT_METADATA_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
             start: self
-                .multipart_parts_next_start_after
+                .parts_next_start
                 .clone()
                 .map(IterStart::After),
             limit: ITER_PAGE_SIZE,
@@ -1287,7 +1287,7 @@ impl ReplicateObjectOperation {
 
         let actual = self.multipart_parts.len();
         if actual != summary.part_count {
-            return Err(ReplicateObjectError::MultipartPartCountMismatch {
+            return Err(ReplicateObjectError::PartCountMismatch {
                 expected: summary.part_count,
                 actual,
             });
@@ -1377,7 +1377,7 @@ impl ReplicateObjectOperation {
 
     fn accept_reference_access(&mut self, event: Event) -> Effects {
         match event {
-            Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+            Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                 result: Ok(access),
             }) => {
                 let (source_kind, source_path, source_version) = match &access {
@@ -1405,7 +1405,7 @@ impl ReplicateObjectOperation {
                 self.state = ReplicateObjectState::HeadReferenceSource;
                 smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
             }
-            Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+            Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                 result: Err(_),
             }) => {
                 debug!(
@@ -1458,7 +1458,7 @@ impl ReplicateObjectOperation {
                 };
                 self.state = ReplicateObjectState::ReadReferenceState;
                 smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: SYNC_REFERENCE_STATE_KEYSPACE.to_string(),
+                    key_space: SYNC_REFERENCE_KEYSPACE.to_string(),
                     key: key.into(),
                     txn_id: None,
                 })]
@@ -1978,7 +1978,7 @@ impl ReplicateObjectOperation {
             descriptor: PortableSourceDescriptor {
                 kind: SourceConnectorKind::ArunaNative,
                 public_config: std::collections::HashMap::from([(
-                    ARUNA_NATIVE_RELATIONSHIP_ID.to_string(),
+                    NATIVE_RELATIONSHIP_ID.to_string(),
                     sync.relationship_id.to_string(),
                 )]),
                 source_path: format!("{}/{}", self.request.bucket, self.request.key),
@@ -2063,7 +2063,7 @@ impl ReplicateObjectOperation {
         };
         self.state = ReplicateObjectState::WriteReferenceState;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: SYNC_REFERENCE_STATE_KEYSPACE.to_string(),
+            key_space: SYNC_REFERENCE_KEYSPACE.to_string(),
             key: key.into(),
             value: value.into(),
             txn_id: None,
@@ -2336,7 +2336,7 @@ impl ReplicateObjectOperation {
             .and_then(|value| MultipartObjectSummary::from_bytes(value.as_ref()).ok());
         if self.multipart_summary.is_some() {
             self.multipart_parts.clear();
-            self.multipart_parts_next_start_after = None;
+            self.parts_next_start = None;
             self.read_multipart_parts()
         } else {
             self.read_current_lookup()
@@ -2365,10 +2365,10 @@ impl ReplicateObjectOperation {
         }
 
         if let Some(cursor) = next_start_after {
-            self.multipart_parts_next_start_after = Some(cursor);
+            self.parts_next_start = Some(cursor);
             self.read_multipart_parts()
         } else {
-            self.multipart_parts_next_start_after = None;
+            self.parts_next_start = None;
             self.multipart_parts
                 .sort_unstable_by_key(|part| part.part_number);
             if let Err(err) = self.validate_multipart_parts() {
@@ -2506,7 +2506,7 @@ impl ReplicateObjectOperation {
                 );
                 self.await_apply_complete()
             }
-            ReplicationNegotiationResult::NeedBlobAndVersion => {
+            ReplicationNegotiationResult::NeedBlobVersion => {
                 let Some(blob) = self
                     .manifest
                     .as_ref()
@@ -3533,7 +3533,7 @@ mod tests {
         assert_eq!(op.state, ReplicateObjectState::Error);
         assert_eq!(
             op.result,
-            Err(ReplicateObjectError::MultipartPartCountMismatch {
+            Err(ReplicateObjectError::PartCountMismatch {
                 expected: 2,
                 actual: 1,
             })
@@ -3969,7 +3969,7 @@ mod tests {
             version: None,
         };
         op.step(Event::SubOperation(
-            SubOperationEvent::VersionSourceAccessResolved { result: Ok(access) },
+            SubOperationEvent::VersionAccessResolved { result: Ok(access) },
         ));
         let mut stale = reference_cached_metadata();
         stale.etag = Some("etag-2".to_string());
@@ -4003,7 +4003,7 @@ mod tests {
             version: None,
         };
         op.step(Event::SubOperation(
-            SubOperationEvent::VersionSourceAccessResolved { result: Ok(access) },
+            SubOperationEvent::VersionAccessResolved { result: Ok(access) },
         ));
         let metadata = reference_cached_metadata();
         op.step(Event::StagingSource(StagingSourceEvent::HeadResult {
@@ -4057,7 +4057,7 @@ mod tests {
             value: Some(reference_blob_version().to_bytes().unwrap().into()),
         }));
         op.step(Event::SubOperation(
-            SubOperationEvent::VersionSourceAccessResolved {
+            SubOperationEvent::VersionAccessResolved {
                 result: Ok(ResolvedSourceAccess::OpenDal {
                     kind: SourceConnectorKind::Http,
                     config: HashMap::new(),
@@ -4101,7 +4101,7 @@ mod tests {
             version: None,
         };
         let effects = op.step(Event::SubOperation(
-            SubOperationEvent::VersionSourceAccessResolved {
+            SubOperationEvent::VersionAccessResolved {
                 result: Ok(access.clone()),
             },
         ));
@@ -4161,7 +4161,7 @@ mod tests {
             value: Some(reference_blob_version().to_bytes().unwrap().into()),
         }));
         op.step(Event::SubOperation(
-            SubOperationEvent::VersionSourceAccessResolved {
+            SubOperationEvent::VersionAccessResolved {
                 result: Ok(ResolvedSourceAccess::OpenDal {
                     kind: SourceConnectorKind::Http,
                     config: HashMap::from([(
@@ -4216,7 +4216,7 @@ mod tests {
             version: None,
         };
         op.step(Event::SubOperation(
-            SubOperationEvent::VersionSourceAccessResolved { result: Ok(access) },
+            SubOperationEvent::VersionAccessResolved { result: Ok(access) },
         ));
         load_routing(&mut op);
         op.step(Event::StagingSource(StagingSourceEvent::ReadResult {
@@ -4242,7 +4242,7 @@ mod tests {
         }));
 
         let negotiation = VersionReplicationMessage::VersionNegotiationResponse(
-            ReplicationNegotiationResult::NeedBlobAndVersion,
+            ReplicationNegotiationResult::NeedBlobVersion,
         )
         .to_bytes()
         .unwrap();

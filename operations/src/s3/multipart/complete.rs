@@ -25,8 +25,8 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, UPLOAD_KEYSPACE,
+    UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
@@ -55,8 +55,8 @@ use ulid::Ulid;
 pub enum CompleteUploadState {
     Init,
     StartMarkTransaction,
-    CheckPurgeFenceForMark,
-    ReadUploadForMark,
+    CheckPurgeMark,
+    ReadUploadMark,
     WriteUploadCompleting,
     CommitMarkTransaction,
     ReadUploadParts,
@@ -64,7 +64,7 @@ pub enum CompleteUploadState {
     PolicyGate,
     ComposeBlob,
     StartFinalizeTransaction,
-    CheckPurgeFenceForFinalize,
+    CheckPurgeFinalize,
     ReadBucketDefault,
     FenceBackend,
     CheckHashLookup,
@@ -72,19 +72,19 @@ pub enum CompleteUploadState {
     ReadObjectLookup,
     ReadLivenessVersion,
     WriteBlobHead,
-    WriteHashPathIndex,
-    WriteBlobVersionRecord,
+    WritePathIndex,
+    WriteVersionRecord,
     RegisterManagedCopy,
     WriteObjectMetadata,
     DeleteUploadRecords,
     WriteCleanupRecords,
-    WriteLiveReplicationObligation,
+    WriteReplicationObligation,
     EnforceQuota,
     UpdateUsage,
     CommitFinalizeTransaction,
     AbortFinalizeTransaction,
     ResetUploadTransaction,
-    ReadUploadForReset,
+    ReadUploadReset,
     WriteUploadReset,
     CommitResetTransaction,
     CleanupFailedCompose,
@@ -151,7 +151,7 @@ pub enum CompleteUploadError {
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("CompleteMultipartUpload failed")]
-    CompleteMultipartUploadFailed,
+    CompleteUploadFailed,
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -427,7 +427,7 @@ impl CompleteUploadOperation {
             self.output = Some(Err(self
                 .cleanup
                 .take_error()
-                .unwrap_or(CompleteUploadError::CompleteMultipartUploadFailed)));
+                .unwrap_or(CompleteUploadError::CompleteUploadFailed)));
         }
         smallvec![]
     }
@@ -508,7 +508,7 @@ impl CompleteUploadOperation {
     fn emit_pending_error(&mut self) -> Effects {
         let error = match (self.cleanup.take_error(), self.output.take()) {
             (Some(error), _) | (None, Some(Err(error))) => error,
-            _ => CompleteUploadError::CompleteMultipartUploadFailed,
+            _ => CompleteUploadError::CompleteUploadFailed,
         };
         self.emit_error(error)
     }
@@ -547,7 +547,7 @@ impl CompleteUploadOperation {
 
     fn alias_context(&self) -> Result<HeadAliasContext, CompleteUploadError> {
         let Some(upload_record) = self.upload_record.as_ref() else {
-            return Err(CompleteUploadError::CompleteMultipartUploadFailed);
+            return Err(CompleteUploadError::CompleteUploadFailed);
         };
 
         Ok(HeadAliasContext::new(
@@ -571,7 +571,7 @@ impl CompleteUploadOperation {
             return self.emit_error(CompleteUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
-        self.state = CompleteUploadState::CheckPurgeFenceForMark;
+        self.state = CompleteUploadState::CheckPurgeMark;
         smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
     }
 
@@ -579,9 +579,9 @@ impl CompleteUploadOperation {
         if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
             return self.emit_error(error.into());
         }
-        self.state = CompleteUploadState::ReadUploadForMark;
+        self.state = CompleteUploadState::ReadUploadMark;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
             txn_id: self.txn_id,
         })]
@@ -627,7 +627,7 @@ impl CompleteUploadOperation {
         self.upload_record = Some(record);
         self.state = CompleteUploadState::WriteUploadCompleting;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
             value: bytes.into(),
             txn_id: self.txn_id,
@@ -656,7 +656,7 @@ impl CompleteUploadOperation {
                     Err(err) => return self.schedule_error(err.into()),
                 };
                 smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
+                    key_space: UPLOAD_PART_KEYSPACE.to_string(),
                     prefix: Some(prefix.into()),
                     start: None,
                     limit: 10_000,
@@ -860,7 +860,7 @@ impl CompleteUploadOperation {
             Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
                 self.cleanup.set_release(location.ulid);
                 self.delete_location = Some(location);
-                return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+                return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
             }
             _ => return self.schedule_error(CompleteUploadError::InvalidOperationState),
         };
@@ -896,7 +896,7 @@ impl CompleteUploadOperation {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
-        self.state = CompleteUploadState::CheckPurgeFenceForFinalize;
+        self.state = CompleteUploadState::CheckPurgeFinalize;
         smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
     }
 
@@ -932,7 +932,7 @@ impl CompleteUploadOperation {
         self.bucket_policies = observed.policies;
 
         let Some(location) = self.composed_location.clone() else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         // The compose already ran on the pinned backend, so the finalize must
         // prove it is still enabled or roll the composed object back.
@@ -954,7 +954,7 @@ impl CompleteUploadOperation {
 
     fn check_hash_lookup(&mut self) -> Effects {
         let Some(location) = self.composed_location.clone() else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let Some(blake3_hash) = location.get_blake3() else {
             return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
@@ -974,7 +974,7 @@ impl CompleteUploadOperation {
         };
 
         let Some(composed_location) = self.composed_location.clone() else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
 
         self.final_location = match value {
@@ -995,7 +995,7 @@ impl CompleteUploadOperation {
 
     fn write_blob_location(&mut self) -> Effects {
         let Some(location) = self.final_location.clone() else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let Some(blake3_hash) = location.get_blake3() else {
             return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
@@ -1109,7 +1109,7 @@ impl CompleteUploadOperation {
 
     fn write_path_index(&mut self) -> Effects {
         let Some(location) = self.final_location.clone() else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let Some(blake3_hash) = location.get_blake3() else {
             return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
@@ -1129,7 +1129,7 @@ impl CompleteUploadOperation {
             match self.version_id {
                 Some(version_id) => version_id,
                 None => {
-                    return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+                    return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
                 }
             },
             self.txn_id,
@@ -1138,7 +1138,7 @@ impl CompleteUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
 
-        self.state = CompleteUploadState::WriteHashPathIndex;
+        self.state = CompleteUploadState::WritePathIndex;
         smallvec![effect]
     }
 
@@ -1148,10 +1148,10 @@ impl CompleteUploadOperation {
         };
 
         let Some(location) = self.final_location.clone() else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let Some(version_id) = self.version_id else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let Some(blake3_hash) = location.get_blake3() else {
             return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
@@ -1161,7 +1161,7 @@ impl CompleteUploadOperation {
             .get_or_insert_with(SystemTime::now)
             .to_owned();
         let Some(upload_record) = self.upload_record.as_ref() else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let version = BlobVersion::materialized(
             match blake3_hash.try_into() {
@@ -1191,7 +1191,7 @@ impl CompleteUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
 
-        self.state = CompleteUploadState::WriteBlobVersionRecord;
+        self.state = CompleteUploadState::WriteVersionRecord;
         smallvec![effect]
     }
 
@@ -1208,7 +1208,7 @@ impl CompleteUploadOperation {
     fn register_managed_copy(&mut self) -> Effects {
         let (Some(version_id), Some(location)) = (self.version_id, self.final_location.clone())
         else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let effect = match register_effect(
             CopyRegistration {
@@ -1235,7 +1235,7 @@ impl CompleteUploadOperation {
         };
 
         let Some(version_id) = self.version_id else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let mut writes = Vec::with_capacity(self.resolved_parts.len() + 1);
 
@@ -1253,7 +1253,7 @@ impl CompleteUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
         writes.push((
-            S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            OBJECT_METADATA_KEYSPACE.to_string(),
             summary_key.into(),
             summary_value.into(),
         ));
@@ -1273,7 +1273,7 @@ impl CompleteUploadOperation {
                 Err(err) => return self.schedule_error(err.into()),
             };
             writes.push((
-                S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+                OBJECT_METADATA_KEYSPACE.to_string(),
                 key.into(),
                 value.into(),
             ));
@@ -1391,7 +1391,7 @@ impl CompleteUploadOperation {
 
     fn write_obligation(&mut self) -> Effects {
         let Some(version_id) = self.version_id else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let effect = match build_live_obligation(
             self.input.node_id,
@@ -1410,7 +1410,7 @@ impl CompleteUploadOperation {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
         };
-        self.state = CompleteUploadState::WriteLiveReplicationObligation;
+        self.state = CompleteUploadState::WriteReplicationObligation;
         smallvec![effect]
     }
 
@@ -1422,14 +1422,14 @@ impl CompleteUploadOperation {
             return self.schedule_error(CompleteUploadError::NoTransactionFound);
         };
         let Some(group_id) = self.upload_record.as_ref().map(|record| record.group_id) else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let Some(size) = self
             .final_location
             .as_ref()
             .map(|location| i128::from(location.blob_size))
         else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
 
         let group_delta = UsageDelta {
@@ -1442,7 +1442,7 @@ impl CompleteUploadOperation {
             .as_ref()
             .and_then(|location| StoredDelta::for_location(location, self.new_blob));
         let Some(stored) = stored else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         self.usage_update = Some(UsageCounterUpdate::with_stored(
             group_id,
@@ -1480,7 +1480,7 @@ impl CompleteUploadOperation {
         self.state = CompleteUploadState::UpdateUsage;
         match self.usage_update.as_mut() {
             Some(update) => update.start(txn_id),
-            None => self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed),
+            None => self.schedule_error(CompleteUploadError::CompleteUploadFailed),
         }
     }
 
@@ -1489,7 +1489,7 @@ impl CompleteUploadOperation {
             return self.schedule_error(CompleteUploadError::NoTransactionFound);
         };
         let Some(gate) = self.quota_gate.as_mut() else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         match gate.step(event, txn_id) {
             Ok(Some(effects)) => effects,
@@ -1513,7 +1513,7 @@ impl CompleteUploadOperation {
             return self.schedule_error(CompleteUploadError::NoTransactionFound);
         };
         let Some(update) = self.usage_update.as_mut() else {
-            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         match update.step(event, txn_id) {
             Ok(Some(effects)) => effects,
@@ -1560,10 +1560,10 @@ impl CompleteUploadOperation {
         self.reset_done = true;
         let release_id = self.composed_location.take().map(|location| location.ulid);
         let Some(location) = self.final_location.clone() else {
-            return self.emit_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.emit_error(CompleteUploadError::CompleteUploadFailed);
         };
         let Some(version_id) = self.version_id else {
-            return self.emit_error(CompleteUploadError::CompleteMultipartUploadFailed);
+            return self.emit_error(CompleteUploadError::CompleteUploadFailed);
         };
         let response_hashes = match self.input.checksum_type {
             MultipartChecksumType::FullObject => location.hashes.clone(),
@@ -1594,9 +1594,9 @@ impl CompleteUploadOperation {
             }
         };
         self.txn_id = Some(txn_id);
-        self.state = CompleteUploadState::ReadUploadForReset;
+        self.state = CompleteUploadState::ReadUploadReset;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
             txn_id: Some(txn_id),
         })]
@@ -1629,7 +1629,7 @@ impl CompleteUploadOperation {
             };
             self.state = CompleteUploadState::WriteUploadReset;
             return smallvec![Effect::Storage(StorageEffect::Write {
-                key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+                key_space: UPLOAD_KEYSPACE.to_string(),
                 key: self.input.upload_id.to_bytes().to_vec().into(),
                 value: bytes.into(),
                 txn_id: self.txn_id,
@@ -1729,8 +1729,8 @@ impl Operation for CompleteUploadOperation {
         match self.state {
             CompleteUploadState::Init => self.handle_init(),
             CompleteUploadState::StartMarkTransaction => self.mark_started(event),
-            CompleteUploadState::CheckPurgeFenceForMark => self.mark_fence_checked(event),
-            CompleteUploadState::ReadUploadForMark => self.mark_upload_read(event),
+            CompleteUploadState::CheckPurgeMark => self.mark_fence_checked(event),
+            CompleteUploadState::ReadUploadMark => self.mark_upload_read(event),
             CompleteUploadState::WriteUploadCompleting => self.handle_upload_marked(event),
             CompleteUploadState::CommitMarkTransaction => self.handle_mark_committed(event),
             CompleteUploadState::ReadUploadParts => self.upload_parts_read(event),
@@ -1738,7 +1738,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::PolicyGate => self.handle_policy_gate(event),
             CompleteUploadState::ComposeBlob => self.handle_blob_composed(event),
             CompleteUploadState::StartFinalizeTransaction => self.finalize_started(event),
-            CompleteUploadState::CheckPurgeFenceForFinalize => self.finalize_fence_checked(event),
+            CompleteUploadState::CheckPurgeFinalize => self.finalize_fence_checked(event),
             CompleteUploadState::ReadBucketDefault => self.handle_default_read(event),
             CompleteUploadState::FenceBackend => self.handle_backend_fenced(event),
             CompleteUploadState::CheckHashLookup => self.hash_checked(event),
@@ -1746,19 +1746,19 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::ReadObjectLookup => self.object_lookup_read(event),
             CompleteUploadState::ReadLivenessVersion => self.liveness_read(event),
             CompleteUploadState::WriteBlobHead => self.head_written(event),
-            CompleteUploadState::WriteHashPathIndex => self.path_index_written(event),
-            CompleteUploadState::WriteBlobVersionRecord => self.version_written(event),
+            CompleteUploadState::WritePathIndex => self.path_index_written(event),
+            CompleteUploadState::WriteVersionRecord => self.version_written(event),
             CompleteUploadState::RegisterManagedCopy => self.handle_copy_registered(event),
             CompleteUploadState::WriteObjectMetadata => self.metadata_written(event),
             CompleteUploadState::DeleteUploadRecords => self.records_deleted(event),
             CompleteUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
-            CompleteUploadState::WriteLiveReplicationObligation => self.obligation_written(event),
+            CompleteUploadState::WriteReplicationObligation => self.obligation_written(event),
             CompleteUploadState::EnforceQuota => self.handle_enforce_quota(event),
             CompleteUploadState::UpdateUsage => self.handle_usage_update(event),
             CompleteUploadState::CommitFinalizeTransaction => self.handle_finalize_committed(event),
             CompleteUploadState::AbortFinalizeTransaction => self.abort_finalize(event),
             CompleteUploadState::ResetUploadTransaction => self.reset_started(event),
-            CompleteUploadState::ReadUploadForReset => self.reset_upload_read(event),
+            CompleteUploadState::ReadUploadReset => self.reset_upload_read(event),
             CompleteUploadState::WriteUploadReset => self.upload_reset(event),
             CompleteUploadState::CommitResetTransaction => self.handle_reset_committed(event),
             CompleteUploadState::CleanupFailedCompose => self.compose_cleanup(event),
@@ -1835,7 +1835,7 @@ impl Operation for CompleteUploadOperation {
         }
         self.state = CompleteUploadState::Error;
         if !matches!(self.output.as_ref(), Some(Err(_))) {
-            self.output = Some(Err(CompleteUploadError::CompleteMultipartUploadFailed));
+            self.output = Some(Err(CompleteUploadError::CompleteUploadFailed));
         }
         smallvec![]
     }

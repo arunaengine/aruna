@@ -36,7 +36,7 @@ pub enum GetAccessError {
     #[error("No user access found")]
     NotFound,
     #[error("GetUserAccess failed")]
-    GetUserAccessFailed,
+    GetAccessFailed,
     #[error("operation did not finish")]
     NotFinished,
 }

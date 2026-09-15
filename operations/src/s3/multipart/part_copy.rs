@@ -8,7 +8,7 @@ use crate::s3::object::get::{
 use crate::s3::purge_fence::ensure_write_allowed;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
+use aruna_core::keyspaces::UPLOAD_KEYSPACE;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendLocation;
@@ -231,7 +231,7 @@ async fn merge_upload_policies(
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: upload_id.to_bytes().to_vec().into(),
             txn_id: Some(txn_id),
         })
@@ -253,7 +253,7 @@ async fn merge_upload_policies(
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: upload_id.to_bytes().to_vec().into(),
             value: value.into(),
             txn_id: Some(txn_id),
@@ -277,7 +277,7 @@ async fn validate_destination_upload(
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: input.upload_id.to_bytes().to_vec().into(),
             txn_id: None,
         })
@@ -320,7 +320,7 @@ mod test {
     use aruna_blob::hash::Hasher;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE};
+    use aruna_core::keyspaces::{UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
     use aruna_core::structs::storage::multipart::{
@@ -458,7 +458,7 @@ mod test {
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+                key_space: UPLOAD_KEYSPACE.to_string(),
                 key: upload_id.to_bytes().to_vec().into(),
                 value: record.to_bytes().unwrap().into(),
                 txn_id: None,
@@ -522,7 +522,7 @@ mod test {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
+                key_space: UPLOAD_PART_KEYSPACE.to_string(),
                 key: MultipartPartKey::new(upload_id, 1)
                     .to_bytes()
                     .unwrap()
@@ -610,7 +610,7 @@ mod test {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+                key_space: UPLOAD_KEYSPACE.to_string(),
                 key: upload_id.to_bytes().to_vec().into(),
                 txn_id: None,
             })
@@ -709,7 +709,7 @@ mod test {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
+                key_space: UPLOAD_PART_KEYSPACE.to_string(),
                 key: MultipartPartKey::new(upload_id, 1)
                     .to_bytes()
                     .unwrap()

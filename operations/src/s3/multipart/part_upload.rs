@@ -8,7 +8,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    NODE_SUBJECT_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    NODE_SUBJECT_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -33,7 +33,7 @@ const CONFLICT_RETRIES: u8 = 4;
 #[derive(Debug, Eq, PartialEq)]
 pub enum UploadPartState {
     Init,
-    CheckPurgeFenceBeforeWrite,
+    CheckPurgeWrite,
     ReadUpload,
     WritePart,
     CleanupFailedWrite,
@@ -162,7 +162,7 @@ impl UploadPartOperation {
     /// Reject an already-fenced destination before accepting the part body.
     /// The commit transaction rechecks the same row after the bytes move.
     fn handle_init(&mut self) -> Effects {
-        self.state = UploadPartState::CheckPurgeFenceBeforeWrite;
+        self.state = UploadPartState::CheckPurgeWrite;
         smallvec![write_fence_read(&self.input.bucket, None)]
     }
 
@@ -176,7 +176,7 @@ impl UploadPartOperation {
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
                 (
-                    S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+                    UPLOAD_KEYSPACE.to_string(),
                     self.input.upload_id.to_bytes().to_vec().into(),
                 ),
                 (
@@ -450,7 +450,7 @@ impl UploadPartOperation {
     fn reread_upload(&mut self) -> Effects {
         self.state = UploadPartState::ReReadUpload;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
             txn_id: self.txn_id,
         })]
@@ -484,7 +484,7 @@ impl UploadPartOperation {
                 Err(err) => return self.cleanup_failed_write(err.into()),
             };
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
+            key_space: UPLOAD_PART_KEYSPACE.to_string(),
             key: key.into(),
             txn_id: self.txn_id,
         })]
@@ -523,7 +523,7 @@ impl UploadPartOperation {
 
         self.state = UploadPartState::WritePartRecord;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
+            key_space: UPLOAD_PART_KEYSPACE.to_string(),
             key: key.into(),
             value: value.into(),
             txn_id: self.txn_id,
@@ -699,7 +699,7 @@ impl Operation for UploadPartOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             UploadPartState::Init => self.handle_init(),
-            UploadPartState::CheckPurgeFenceBeforeWrite => self.check_write_fence(event),
+            UploadPartState::CheckPurgeWrite => self.check_write_fence(event),
             UploadPartState::ReadUpload => self.handle_upload_read(event),
             UploadPartState::WritePart => self.handle_write_finished(event),
             UploadPartState::CleanupFailedWrite => self.write_cleanup_failed(event),

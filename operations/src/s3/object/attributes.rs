@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 #[cfg(test)]
 use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{
@@ -67,7 +67,7 @@ pub enum GetAttributesError {
     #[error(transparent)]
     ManagedCopyError(#[from] ManagedCopyError),
     #[error("GetObjectAttributes failed")]
-    GetObjectAttributesFailed,
+    GetAttributesFailed,
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -144,7 +144,7 @@ impl GetAttributesOperation {
                 expected,
                 received,
             },
-            LookupError::Missing => GetAttributesError::GetObjectAttributesFailed,
+            LookupError::Missing => GetAttributesError::GetAttributesFailed,
         }
     }
 
@@ -248,7 +248,7 @@ impl GetAttributesOperation {
         };
 
         let Some(version_id) = self.resolved_version_id.or(self.input.version_id) else {
-            return self.emit_error(GetAttributesError::GetObjectAttributesFailed);
+            return self.emit_error(GetAttributesError::GetAttributesFailed);
         };
 
         self.read_version(version_id, version, self.input.version_id.is_some())
@@ -395,7 +395,7 @@ impl GetAttributesOperation {
         };
         self.state = GetAttributesState::ReadMultipartParts;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            key_space: OBJECT_METADATA_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
             start: None,
             limit: PART_SCAN_LIMIT,
@@ -631,7 +631,7 @@ mod tests {
     ) {
         write(
             storage_handle,
-            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+            OBJECT_METADATA_KEYSPACE,
             MultipartObjectKey::summary(version_id).to_bytes().unwrap(),
             MultipartObjectSummary {
                 checksum_type,
@@ -648,7 +648,7 @@ mod tests {
             hashes.insert(HASH_SHA256.to_string(), vec![*part_number as u8; 32]);
             write(
                 storage_handle,
-                S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+                OBJECT_METADATA_KEYSPACE,
                 MultipartObjectKey::part(version_id, *part_number)
                     .to_bytes()
                     .unwrap(),

@@ -6,7 +6,7 @@ use aruna_core::credential_encryption::{
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{USER_ACCESS_KEYSPACE, USER_ACCESS_OWNER_KEYSPACE};
+use aruna_core::keyspaces::{USER_ACCESS_KEYSPACE, ACCESS_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
 use aruna_core::structs::identity::auth::PathRestriction;
@@ -66,7 +66,7 @@ pub enum CreateUserError {
     #[error("User access creation not finished")]
     NotFinished,
     #[error("User access creation failed")]
-    CreateUserAccessFailed,
+    CreateAccessFailed,
 }
 
 #[derive(Debug, PartialEq)]
@@ -163,7 +163,7 @@ impl CreateUserOperation {
         self.txn_id = Some(txn_id);
         self.state = CreateUserState::ReadOwnerIndex;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_ACCESS_OWNER_KEYSPACE.to_string(),
+            key_space: ACCESS_OWNER_KEYSPACE.to_string(),
             key: owner_key(self.config.user_identity),
             txn_id: Some(txn_id),
         })]
@@ -182,10 +182,10 @@ impl CreateUserOperation {
             Err(error) => return self.handle_error(error.into()),
         };
         let Some(txn_id) = self.txn_id else {
-            return self.handle_error(CreateUserError::CreateUserAccessFailed);
+            return self.handle_error(CreateUserError::CreateAccessFailed);
         };
         let Some(new_access) = self.access.as_ref() else {
-            return self.handle_error(CreateUserError::CreateUserAccessFailed);
+            return self.handle_error(CreateUserError::CreateAccessFailed);
         };
         let replace = index.contains(&new_access.access_key);
         let mut reads: Vec<_> = index
@@ -228,7 +228,7 @@ impl CreateUserOperation {
         }
 
         let Some(new_access) = self.access.as_ref() else {
-            return self.handle_error(CreateUserError::CreateUserAccessFailed);
+            return self.handle_error(CreateUserError::CreateAccessFailed);
         };
         let now = SystemTime::now();
         let mut active = std::collections::BTreeSet::new();
@@ -269,7 +269,7 @@ impl CreateUserOperation {
         active.insert(new_access.access_key.clone());
         if !stale.is_empty() {
             let Some(txn_id) = self.txn_id else {
-                return self.handle_error(CreateUserError::CreateUserAccessFailed);
+                return self.handle_error(CreateUserError::CreateAccessFailed);
             };
             self.state = CreateUserState::DeleteStale { index: active };
             return smallvec![Effect::Storage(StorageEffect::BatchDelete {
@@ -305,10 +305,10 @@ impl CreateUserOperation {
 
     fn write_credentials(&mut self, index: std::collections::BTreeSet<String>) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.handle_error(CreateUserError::CreateUserAccessFailed);
+            return self.handle_error(CreateUserError::CreateAccessFailed);
         };
         let Some(access) = self.access.as_ref() else {
-            return self.handle_error(CreateUserError::CreateUserAccessFailed);
+            return self.handle_error(CreateUserError::CreateAccessFailed);
         };
         let bytes = match access.to_bytes() {
             Ok(bytes) => bytes,
@@ -327,7 +327,7 @@ impl CreateUserOperation {
                     bytes.into(),
                 ),
                 (
-                    USER_ACCESS_OWNER_KEYSPACE.to_string(),
+                    ACCESS_OWNER_KEYSPACE.to_string(),
                     owner_key(self.config.user_identity),
                     index_value,
                 ),
@@ -346,14 +346,14 @@ impl CreateUserOperation {
         };
 
         let Some(access) = self.access.clone() else {
-            return self.handle_error(CreateUserError::CreateUserAccessFailed);
+            return self.handle_error(CreateUserError::CreateAccessFailed);
         };
         let Some(secret) = self.pending_secret.take() else {
-            return self.handle_error(CreateUserError::CreateUserAccessFailed);
+            return self.handle_error(CreateUserError::CreateAccessFailed);
         };
         self.output = Ok((access.access_key.clone(), secret, access));
         let Some(txn_id) = self.txn_id else {
-            return self.handle_error(CreateUserError::CreateUserAccessFailed);
+            return self.handle_error(CreateUserError::CreateAccessFailed);
         };
         self.state = CreateUserState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
@@ -493,7 +493,7 @@ mod pure_tests {
         else {
             panic!("Expected owner index read");
         };
-        assert_eq!(key_space, aruna_core::keyspaces::USER_ACCESS_OWNER_KEYSPACE);
+        assert_eq!(key_space, aruna_core::keyspaces::ACCESS_OWNER_KEYSPACE);
         assert_eq!(*read_txn, txn_id);
 
         let Some(access) = op.access.as_ref() else {

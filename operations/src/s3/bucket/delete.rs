@@ -3,8 +3,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+    RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{BlobHeadKey, BucketInfo, VersionKey};
@@ -196,7 +196,7 @@ impl DeleteBucketOperation {
 
         self.state = DeleteBucketState::CheckMultipartUploads;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: u64::MAX as usize,
@@ -233,9 +233,9 @@ impl DeleteBucketOperation {
         };
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: if incoming {
-                SYNC_RELATIONSHIP_IN_KEYSPACE.to_string()
+                RELATIONSHIP_IN_KEYSPACE.to_string()
             } else {
-                SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string()
+                RELATIONSHIP_OUT_KEYSPACE.to_string()
             },
             prefix: Some(sync_relationship_prefix(&self.bucket).into()),
             start: start.map(aruna_core::effects::IterStart::After),
@@ -258,9 +258,9 @@ impl DeleteBucketOperation {
         };
         let incoming = self.state == DeleteBucketState::ScanInRelationships;
         let key_space = if incoming {
-            SYNC_RELATIONSHIP_IN_KEYSPACE
+            RELATIONSHIP_IN_KEYSPACE
         } else {
-            SYNC_RELATIONSHIP_OUT_KEYSPACE
+            RELATIONSHIP_OUT_KEYSPACE
         };
         for (key, value) in values {
             let relationship = match SyncRelationship::from_bytes(&value) {
@@ -401,7 +401,7 @@ impl DeleteBucketOperation {
         let mut effects = smallvec![schedule_snapshot_publish()];
         if !self.relationships.is_empty() {
             effects.push(Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::DrainSyncMirrorRepair,
+                key: TaskKey::DrainMirrorRepair,
                 after: std::time::Duration::ZERO,
             }));
         }
@@ -470,8 +470,8 @@ mod test {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SYNC_MIRROR_REPAIR_KEYSPACE,
-        SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MIRROR_REPAIR_KEYSPACE,
+        RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE,
     };
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::storage::blob::{BlobVersion, CurrentVersionPointer};
@@ -647,12 +647,12 @@ mod test {
         ];
         let keys = [
             (
-                SYNC_RELATIONSHIP_OUT_KEYSPACE,
+                RELATIONSHIP_OUT_KEYSPACE,
                 sync_relationship_key(&bucket, relationships[0].id),
                 relationships[0].to_bytes().unwrap(),
             ),
             (
-                SYNC_RELATIONSHIP_IN_KEYSPACE,
+                RELATIONSHIP_IN_KEYSPACE,
                 sync_relationship_key(&bucket, relationships[1].id),
                 relationships[1].to_bytes().unwrap(),
             ),
@@ -688,7 +688,7 @@ mod test {
         for relationship in relationships {
             let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
                 .send_storage_effect(StorageEffect::Read {
-                    key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+                    key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
                     key: relationship.id.to_bytes().to_vec().into(),
                     txn_id: None,
                 })

@@ -4,7 +4,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BlobCleanupWork;
@@ -20,7 +20,7 @@ use ulid::Ulid;
 pub enum AbortUploadState {
     Init,
     StartMarkTransaction,
-    ReadUploadForMark,
+    ReadUploadMark,
     WriteUploadAborting,
     CommitMarkTransaction,
     ReadUploadParts,
@@ -30,7 +30,7 @@ pub enum AbortUploadState {
     CommitDeleteTransaction,
     CleanupPartBlobs,
     ResetUploadTransaction,
-    ReadUploadForReset,
+    ReadUploadReset,
     WriteUploadReset,
     CommitResetTransaction,
     Finish,
@@ -56,7 +56,7 @@ pub enum AbortUploadError {
     #[error("The upload is being completed, retry shortly.")]
     CompletionInProgress,
     #[error("AbortMultipartUpload failed")]
-    AbortMultipartUploadFailed,
+    AbortUploadFailed,
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -137,7 +137,7 @@ impl AbortUploadOperation {
 
     fn emit_pending_error(&mut self) -> Effects {
         let Some(error) = self.cleanup.take_error() else {
-            return self.emit_error(AbortUploadError::AbortMultipartUploadFailed);
+            return self.emit_error(AbortUploadError::AbortUploadFailed);
         };
         self.emit_error(error)
     }
@@ -154,9 +154,9 @@ impl AbortUploadOperation {
             return self.emit_error(AbortUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
-        self.state = AbortUploadState::ReadUploadForMark;
+        self.state = AbortUploadState::ReadUploadMark;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
             txn_id: Some(txn_id),
         })]
@@ -196,7 +196,7 @@ impl AbortUploadOperation {
         };
         self.state = AbortUploadState::WriteUploadAborting;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
             value: value.into(),
             txn_id: self.txn_id,
@@ -226,7 +226,7 @@ impl AbortUploadOperation {
                 };
                 self.state = AbortUploadState::ReadUploadParts;
                 smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
+                    key_space: UPLOAD_PART_KEYSPACE.to_string(),
                     prefix: Some(prefix.into()),
                     start: None,
                     limit: 10_000,
@@ -362,9 +362,9 @@ impl AbortUploadOperation {
             return self.emit_error(AbortUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
-        self.state = AbortUploadState::ReadUploadForReset;
+        self.state = AbortUploadState::ReadUploadReset;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
             txn_id: Some(txn_id),
         })]
@@ -392,7 +392,7 @@ impl AbortUploadOperation {
         };
         self.state = AbortUploadState::WriteUploadReset;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
             value,
             txn_id: self.txn_id,
@@ -431,7 +431,7 @@ impl Operation for AbortUploadOperation {
         match self.state {
             AbortUploadState::Init => self.handle_init(),
             AbortUploadState::StartMarkTransaction => self.mark_started(event),
-            AbortUploadState::ReadUploadForMark => self.mark_upload_read(event),
+            AbortUploadState::ReadUploadMark => self.mark_upload_read(event),
             AbortUploadState::WriteUploadAborting => self.handle_upload_marked(event),
             AbortUploadState::CommitMarkTransaction => self.handle_mark_committed(event),
             AbortUploadState::ReadUploadParts => self.upload_parts_read(event),
@@ -441,7 +441,7 @@ impl Operation for AbortUploadOperation {
             AbortUploadState::CommitDeleteTransaction => self.handle_delete_committed(event),
             AbortUploadState::CleanupPartBlobs => self.blob_cleaned(event),
             AbortUploadState::ResetUploadTransaction => self.reset_started(event),
-            AbortUploadState::ReadUploadForReset => self.reset_upload_read(event),
+            AbortUploadState::ReadUploadReset => self.reset_upload_read(event),
             AbortUploadState::WriteUploadReset => self.upload_reset(event),
             AbortUploadState::CommitResetTransaction => self.handle_reset_committed(event),
             AbortUploadState::Finish => smallvec![],
@@ -575,7 +575,7 @@ mod pure_tests {
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Iter { key_space, .. })]
-                if key_space == S3_MULTIPART_UPLOAD_PART_KEYSPACE
+                if key_space == UPLOAD_PART_KEYSPACE
         ));
         assert_eq!(operation.state, AbortUploadState::ReadUploadParts);
         assert_eq!(operation.txn_id, None);
@@ -649,13 +649,13 @@ mod pure_tests {
         assert_eq!(deletes.len(), 2);
         let upload_key = operation.input.upload_id.to_bytes().to_vec();
         assert!(deletes.iter().any(|(key_space, key)| {
-            key_space == S3_MULTIPART_UPLOAD_KEYSPACE && key.as_ref() == upload_key.as_slice()
+            key_space == UPLOAD_KEYSPACE && key.as_ref() == upload_key.as_slice()
         }));
         let part_key = MultipartPartKey::new(operation.input.upload_id, 1)
             .to_bytes()
             .unwrap();
         assert!(deletes.iter().any(|(key_space, key)| {
-            key_space == S3_MULTIPART_UPLOAD_PART_KEYSPACE && key.as_ref() == part_key.as_slice()
+            key_space == UPLOAD_PART_KEYSPACE && key.as_ref() == part_key.as_slice()
         }));
         assert_eq!(operation.state, AbortUploadState::DeleteUploadRecords);
     }
