@@ -2,7 +2,7 @@ use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::get_document::load_document_record;
-use crate::metadata::protocol::MetadataAuthToken;
+use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::PersistentIdOutcome;
@@ -13,7 +13,7 @@ use crate::placement::resolve_shard_holders;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::JobId;
-use aruna_core::structs::MintPersistentIdSpec;
+use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::PersistentIdFailure;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::RealmConfigDocument;
@@ -73,7 +73,7 @@ pub async fn mint_pid_routed(
     document_id: Ulid,
     minted_by: UserId,
     minted_at_ms: u64,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<(PersistentIdMapping, bool), MetadataApiError> {
     if context.net_handle.is_none() {
         return crate::metadata::persistent_id::mint_persistent_id(
@@ -125,7 +125,7 @@ pub async fn submit_pid_routed(
     minted_by: UserId,
     local_node_id: NodeId,
     retention_ms: u64,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<(JobId, bool), MetadataApiError> {
     let realm_id = minted_by.realm_id;
     if let Some(job_id) = read_pid_routed(context, realm_id, document_id)
@@ -169,7 +169,7 @@ pub(super) async fn submit_pid_local(
 ) -> Result<(JobId, bool), MetadataApiError> {
     crate::jobs::service::submit_mint_local(
         context.as_ref(),
-        MintPersistentIdSpec {
+        MintPersistentSpec {
             document_id,
             minted_by,
         },
@@ -189,7 +189,7 @@ pub async fn withdraw_pid_routed(
     withdrawn_by: UserId,
     reason: String,
     withdrawn_at_ms: u64,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<PersistentIdMapping, MetadataApiError> {
     if context.net_handle.is_none() {
         return crate::metadata::persistent_id::admin_withdraw_pid(
@@ -278,7 +278,7 @@ pub async fn fail_pid_routed(
     realm_id: RealmId,
     document_id: Ulid,
     failure: PersistentIdFailure,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
 ) -> Result<PersistentIdMapping, MetadataApiError> {
     if context.net_handle.is_none() {
         return crate::metadata::persistent_id::fail_persistent_id(
@@ -401,7 +401,7 @@ pub(super) async fn forward_pid(
     authority: NodeId,
     document_id: Ulid,
     request: PersistentIdRequest,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<PersistentIdOutcome, MetadataApiError> {
     let config_digest = config
         .digest()
@@ -485,7 +485,7 @@ pub(crate) async fn apply_forwarded_pid(
 
     // Transitions carry the caller's authority: forwarding is a routing hop, so
     // the holder re-runs the WRITE check the origin's handler ran.
-    let internal = matches!(&auth_token, Some(MetadataAuthToken::Internal(_)));
+    let internal = matches!(&auth_token, Some(AuthToken::Internal(_)));
     let auth = match authorize_forwarded_pid(context, peer, realm_id, auth_token).await {
         Ok(auth) => auth,
         Err(error) => return forward_auth_error(error),
