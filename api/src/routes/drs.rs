@@ -7,16 +7,14 @@ use crate::rate_limit::LocalKey;
 use crate::server_state::ServerState;
 use aruna_core::structs::{
     ArunaArn, ArunaArnType, AuthContext, BackendLocation, Permission, SourceMetadata,
-    VersionedObjectArn, W3idDataIdentifier, object_permission_path,
+    VersionedObjectArn, W3idIdentifier, object_permission_path,
 };
-use aruna_operations::blob::permission_paths::ResolveBlobPermissionPathsOperation;
+use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::driver::{drive, drive_until};
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
-use aruna_operations::replication::locations::{
-    LocationSummaryError, RemoteLocationSummaryOperation,
-};
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use aruna_operations::replication::protocol::LocationSummaryRequest;
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::body::Body;
@@ -53,15 +51,15 @@ const BULK_PROBE_CONCURRENCY: usize = 8;
     tags((name = "drs", description = "GA4GH DRS content access")),
     components(
         schemas(
-            DrsServiceInfoResponse,
+            DrsServiceResponse,
             DrsAuthorizationsResponse,
             DrsObjectResponse,
             DrsChecksum,
             DrsAccessMethod,
             DrsAccessUrl,
-            DrsBulkObjectsRequestBody,
-            DrsBulkObjectsResponse,
-            DrsBulkObjectItem,
+            DrsBulkBody,
+            DrsBulk,
+            DrsBulkItem,
             DrsErrorPayload
         )
     )
@@ -81,7 +79,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct DrsServiceInfoResponse {
+#[schema(as = DrsServiceInfoResponse)]
+pub struct DrsServiceResponse {
     id: String,
     name: String,
     r#type: DrsServiceType,
@@ -162,17 +161,20 @@ pub struct DrsAccessMethod {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct DrsBulkObjectsRequestBody {
+#[schema(as = DrsBulkObjectsRequestBody)]
+pub struct DrsBulkBody {
     object_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct DrsBulkObjectsResponse {
-    objects: Vec<DrsBulkObjectItem>,
+#[schema(as = DrsBulkObjectsResponse)]
+pub struct DrsBulk {
+    objects: Vec<DrsBulkItem>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct DrsBulkObjectItem {
+#[schema(as = DrsBulkObjectItem)]
+pub struct DrsBulkItem {
     object_id: String,
     result: Value,
 }
@@ -240,7 +242,7 @@ enum ResolveOutcome {
     responses((
         status = 200,
         description = "GA4GH service-info document for this node",
-        body = DrsServiceInfoResponse,
+        body = DrsServiceResponse,
         example = json!({
             "id": "org.aruna.9xC3nQ2vRk5tYbW0aZ7pLmJ4hS6dF8gT1uV3wX5yZ2c",
             "name": "Aruna Realm 9xC3nQ2vRk5tYbW0aZ7pLmJ4hS6dF8gT1uV3wX5yZ2c",
@@ -262,11 +264,11 @@ pub async fn get_service_info(
     State(state): State<Arc<ServerState>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
-) -> (StatusCode, Json<DrsServiceInfoResponse>) {
+) -> (StatusCode, Json<DrsServiceResponse>) {
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     (
         StatusCode::OK,
-        Json(DrsServiceInfoResponse {
+        Json(DrsServiceResponse {
             id: format!("org.aruna.{}", state.get_realm_id()),
             name: format!("Aruna Realm {}", state.get_realm_id()),
             r#type: DrsServiceType {
@@ -459,7 +461,7 @@ anonymous caller resolves only publicly readable objects.
 - An unreadable object is 403 for a token-bearing caller and 404 for an anonymous one.
 - An object that could not be serialized is 500."#,
     request_body(
-        content = DrsBulkObjectsRequestBody,
+        content = DrsBulkBody,
         description = "The DRS identifiers to resolve, in any of the forms the single-object lookup accepts",
         example = json!({
             "object_ids": [
@@ -469,7 +471,7 @@ anonymous caller resolves only publicly readable objects.
         })
     ),
     responses(
-        (status = 200, description = "One entry per requested identifier, in request order, each holding either the resolved object or a per-identifier error", body = DrsBulkObjectsResponse, example = json!({
+        (status = 200, description = "One entry per requested identifier, in request order, each holding either the resolved object or a per-identifier error", body = DrsBulk, example = json!({
             "objects": [
                 {
                     "object_id": "https://w3id.org/aruna/data/000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
@@ -519,7 +521,7 @@ pub async fn post_objects(
     Extension(auth): Extension<Option<AuthContext>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
-    Json(body): Json<DrsBulkObjectsRequestBody>,
+    Json(body): Json<DrsBulkBody>,
 ) -> Response {
     if body.object_ids.len() > MAX_BULK_OBJECT_IDS {
         return DrsError::bad_request(format!(
@@ -540,7 +542,7 @@ pub async fn post_objects(
     let node = state.as_ref();
     let auth = &auth;
     let base_url = &base_url;
-    let objects: Vec<DrsBulkObjectItem> = futures_util::stream::iter(body.object_ids)
+    let objects: Vec<DrsBulkItem> = futures_util::stream::iter(body.object_ids)
         .map(|object_id| async move {
             let result = match resolve_object(node, auth, &object_id, deadline).await {
                 Ok(ResolveOutcome::Found(resolved)) => serde_json::to_value(build_object_response(
@@ -562,12 +564,12 @@ pub async fn post_objects(
                     json!({ "status_code": error.status.as_u16(), "msg": error.message })
                 }
             };
-            DrsBulkObjectItem { object_id, result }
+            DrsBulkItem { object_id, result }
         })
         .buffered(BULK_PROBE_CONCURRENCY)
         .collect()
         .await;
-    drs_json_response(StatusCode::OK, DrsBulkObjectsResponse { objects })
+    drs_json_response(StatusCode::OK, DrsBulk { objects })
 }
 
 /// Maps a source read failure onto its DRS status: an observation the source no
@@ -828,7 +830,7 @@ async fn resolve_routed(
     deadline: Instant,
 ) -> Result<ResolveOutcome, DrsError> {
     let context = state.get_ctx();
-    let config = match drive(GetRealmConfigOperation::new(arn.realm_id), &context).await {
+    let config = match drive(GetConfigOperation::new(arn.realm_id), &context).await {
         Ok(config) => config,
         Err(_) => return Ok(ResolveOutcome::Unavailable),
     };
@@ -837,7 +839,7 @@ async fn resolve_routed(
         return Ok(ResolveOutcome::Unavailable);
     }
     let summary = drive_until(
-        RemoteLocationSummaryOperation::new(
+        RemoteLocationOperation::new(
             arn.node_id,
             LocationSummaryRequest {
                 realm_id: arn.realm_id,
@@ -893,13 +895,13 @@ async fn resolve_versioned(
     }
 
     let bucket_info = match drive(
-        GetBucketInfoOperation::new(arn.bucket.clone()),
+        GetBucketOperation::new(arn.bucket.clone()),
         &state.get_ctx(),
     )
     .await
     {
         Ok(info) => info,
-        Err(GetBucketInfoError::NotFound) => return Ok(ResolveOutcome::NotFound),
+        Err(GetBucketError::NotFound) => return Ok(ResolveOutcome::NotFound),
         Err(error) => {
             return Err(DrsError::internal(error.to_string()));
         }
@@ -967,12 +969,9 @@ async fn resolve_content_hash(
         return Ok(ResolveOutcome::NotFound);
     }
 
-    let mappings = drive(
-        ResolveBlobPermissionPathsOperation::new(*hash),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| DrsError::internal(error.to_string()))?;
+    let mappings = drive(ResolvePathsOperation::new(*hash), &state.get_ctx())
+        .await
+        .map_err(|error| DrsError::internal(error.to_string()))?;
     debug!(?mappings);
 
     let mut any_mapping_on_this_node = false;
@@ -1061,11 +1060,11 @@ async fn can_read_path(
 
 fn parse_object_id(object_id: &str) -> Result<RequestedObjectId, DrsError> {
     if object_id.starts_with(W3ID_DATA_PREFIX) {
-        return match W3idDataIdentifier::parse(object_id)
+        return match W3idIdentifier::parse(object_id)
             .map_err(|error| DrsError::bad_request(error.to_string()))?
         {
-            W3idDataIdentifier::ContentHash(hash) => Ok(RequestedObjectId::CanonicalW3id(hash)),
-            W3idDataIdentifier::VersionedObject(arn) => Ok(RequestedObjectId::VersionedObject(arn)),
+            W3idIdentifier::ContentHash(hash) => Ok(RequestedObjectId::CanonicalW3id(hash)),
+            W3idIdentifier::VersionedObject(arn) => Ok(RequestedObjectId::VersionedObject(arn)),
         };
     }
 
@@ -1170,4 +1169,5 @@ impl IntoResponse for DrsError {
 }
 
 #[cfg(test)]
+#[path = "drs_tests.rs"]
 mod tests;

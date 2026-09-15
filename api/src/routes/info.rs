@@ -7,7 +7,7 @@ use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{
     Actor, AuthContext, GroupQuotaOverride, Permission, PlacementScope, QuotaConfig,
-    UserGroupCapOverride, policy_admin_path,
+    UserCapOverride, policy_admin_path,
 };
 use aruna_core::structs::{BackendRef, USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
@@ -18,22 +18,19 @@ use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
 use aruna_operations::node::status::load_status;
-use aruna_operations::node::usage_stats::{LoadUsageCountersOperation, RealmUsageScope};
+use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, provision_metadata_binding,
 };
 use aruna_operations::placement::transition::transition_health;
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::get_nodes::{
-    GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
+    GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
 use aruna_operations::realm::mutate_placement::{
-    MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
-    drive_placement_mutation,
+    MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
 };
-use aruna_operations::realm::set_quota::{
-    SetRealmQuotaConfig, SetRealmQuotaError, SetRealmQuotaOperation,
-};
+use aruna_operations::realm::set_quota::{SetQuotaConfig, SetQuotaError, SetQuotaOperation};
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
@@ -278,8 +275,8 @@ pub struct InterfaceStatus {
 pub struct RealmInfoResponse {
     pub realm_id: String,
     pub description: String,
-    pub metadata_replication: RealmMetadataReplicationResponse,
-    pub oidc_providers: Vec<RealmOidcProviderResponse>,
+    pub metadata_replication: RealmReplicationResponse,
+    pub oidc_providers: Vec<RealmProviderResponse>,
     /// Count-only realm overview, available to anonymous and authenticated
     /// callers. The optional wrapper permits an older or otherwise unable node
     /// to omit the whole extension without changing the rest of the response.
@@ -296,7 +293,7 @@ pub struct RealmInfoResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discovery: Option<Value>,
     /// Realm nodes. Realm-authenticated callers only, else empty.
-    pub nodes: Vec<RealmNodeInfoResponse>,
+    pub nodes: Vec<NodeInfoResponse>,
     /// Realm quota policy. Realm-authenticated callers only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<RealmQuotaConfig>,
@@ -324,23 +321,25 @@ pub struct RealmQuotaConfig {
     pub default_group_quota_bytes: Option<u64>,
     pub grace_factor_percent: u32,
     pub warn_threshold_percent: u32,
-    pub group_overrides: Vec<RealmGroupQuotaOverride>,
+    pub group_overrides: Vec<RealmQuotaOverride>,
     pub max_groups_per_user: Option<u32>,
-    pub user_group_cap_overrides: Vec<RealmUserGroupCapOverride>,
+    pub user_group_cap_overrides: Vec<GroupCapOverride>,
     pub max_devices_per_user: Option<u32>,
     pub device_requests_per_minute: Option<u32>,
     pub device_concurrent_pulls: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmGroupQuotaOverride {
+#[schema(as = RealmGroupQuotaOverride)]
+pub struct RealmQuotaOverride {
     pub group_id: String,
     pub quota_bytes: Option<u64>,
     pub grace_factor_percent: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmUserGroupCapOverride {
+#[schema(as = RealmUserGroupCapOverride)]
+pub struct GroupCapOverride {
     pub user_id: String,
     pub max_groups: Option<u32>,
 }
@@ -354,7 +353,7 @@ impl From<QuotaConfig> for RealmQuotaConfig {
             group_overrides: quota
                 .group_overrides
                 .into_iter()
-                .map(|over| RealmGroupQuotaOverride {
+                .map(|over| RealmQuotaOverride {
                     group_id: over.group_id.to_string(),
                     quota_bytes: over.quota_bytes,
                     grace_factor_percent: over.grace_factor_percent,
@@ -364,7 +363,7 @@ impl From<QuotaConfig> for RealmQuotaConfig {
             user_group_cap_overrides: quota
                 .user_group_cap_overrides
                 .into_iter()
-                .map(|over| RealmUserGroupCapOverride {
+                .map(|over| GroupCapOverride {
                     user_id: over.user_id.to_string(),
                     max_groups: over.max_groups,
                 })
@@ -398,7 +397,7 @@ impl RealmQuotaConfig {
             .user_group_cap_overrides
             .into_iter()
             .map(|over| {
-                Ok(UserGroupCapOverride {
+                Ok(UserCapOverride {
                     user_id: UserId::from_string(&over.user_id).map_err(|_| {
                         ServerError::BadRequestReason(format!(
                             "invalid user id in user_group_cap_overrides: {}",
@@ -424,19 +423,21 @@ impl RealmQuotaConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmPlacementConfigResponse {
+#[schema(as = RealmPlacementConfigResponse)]
+pub struct RealmPlacementResponse {
     pub strategies: Vec<RealmPlacementStrategy>,
     pub default_strategy_id: Option<String>,
     pub job_family_strategy_id: String,
-    pub bindings: Vec<RealmPlacementBinding>,
+    pub bindings: Vec<RealmBinding>,
     pub overrides: Vec<RealmPlacementOverride>,
-    pub transitions: RealmTransitionHealthResponse,
+    pub transitions: RealmHealthResponse,
 }
 
 /// Health of the realm's in-flight placement transitions. Counts only: nothing
 /// here changes where a request routes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmTransitionHealthResponse {
+#[schema(as = RealmTransitionHealthResponse)]
+pub struct RealmHealthResponse {
     pub active: usize,
     pub incomplete_buckets: usize,
     pub stalled_buckets: usize,
@@ -450,48 +451,47 @@ pub struct RealmPlacementStrategy {
     pub name: String,
     pub replica_count: Option<u32>,
     pub distinct_locations: bool,
-    pub affinity: Vec<RealmPlacementAffinityRule>,
+    pub affinity: Vec<RealmAffinityRule>,
     pub shard_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmPlacementAffinityRule {
+#[schema(as = RealmPlacementAffinityRule)]
+pub struct RealmAffinityRule {
     pub key: String,
     pub value: String,
-    pub effect: RealmPlacementAffinityEffect,
+    pub effect: RealmAffinityEffect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RealmPlacementAffinityEffect {
+#[schema(as = RealmPlacementAffinityEffect)]
+pub enum RealmAffinityEffect {
     Filter,
     Multiply { permille: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmPlacementBinding {
-    pub scope: RealmPlacementBindingScope,
+#[schema(as = RealmPlacementBinding)]
+pub struct RealmBinding {
+    pub scope: RealmBindingScope,
     pub strategy_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RealmPlacementBindingScope {
+#[schema(as = RealmPlacementBindingScope)]
+pub enum RealmBindingScope {
     Realm,
-    Group {
-        group_id: String,
-    },
-    Class {
-        document_class: RealmPlacementDocumentClass,
-    },
-    MetadataPathPrefix {
-        prefix: String,
-    },
+    Group { group_id: String },
+    Class { document_class: RealmPlacementClass },
+    MetadataPathPrefix { prefix: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum RealmPlacementDocumentClass {
+#[schema(as = RealmPlacementDocumentClass)]
+pub enum RealmPlacementClass {
     Admin,
     Group,
     User,
@@ -511,7 +511,8 @@ pub struct RealmPlacementOverride {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "mutation", rename_all = "snake_case", deny_unknown_fields)]
-pub enum RealmPlacementMutationRequest {
+#[schema(as = RealmPlacementMutationRequest)]
+pub enum RealmPlacementRequest {
     UpsertStrategy {
         strategy: RealmPlacementStrategy,
     },
@@ -522,10 +523,10 @@ pub enum RealmPlacementMutationRequest {
         strategy_id: String,
     },
     SetBinding {
-        binding: RealmPlacementBinding,
+        binding: RealmBinding,
     },
     RemoveBinding {
-        scope: RealmPlacementBindingScope,
+        scope: RealmBindingScope,
     },
     SetOverride {
         placement_override: RealmPlacementOverride,
@@ -542,14 +543,15 @@ pub enum RealmPlacementMutationRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         location: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        labels: Option<Vec<RealmPlacementNodeLabel>>,
+        labels: Option<Vec<RealmPlacementLabel>>,
     },
 }
 
 /// One node placement label. Absent from a request means unchanged; a present
 /// list replaces the whole set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmPlacementNodeLabel {
+#[schema(as = RealmPlacementNodeLabel)]
+pub struct RealmPlacementLabel {
     pub key: String,
     pub value: String,
 }
@@ -562,11 +564,11 @@ enum RealmPlacementAction {
     },
 }
 
-impl RealmPlacementConfigResponse {
+impl RealmPlacementResponse {
     fn from_document(document: &RealmConfigDocument) -> Self {
         let health = transition_health(document, unix_timestamp_millis());
         Self {
-            transitions: RealmTransitionHealthResponse {
+            transitions: RealmHealthResponse {
                 active: health.active,
                 incomplete_buckets: health.incomplete_buckets,
                 stalled_buckets: health.stalled_buckets,
@@ -582,7 +584,7 @@ impl RealmPlacementConfigResponse {
             bindings: document
                 .strategy_bindings
                 .iter()
-                .map(RealmPlacementBinding::from)
+                .map(RealmBinding::from)
                 .collect(),
             overrides: document
                 .placement_overrides
@@ -603,15 +605,13 @@ impl From<&aruna_core::structs::PlacementStrategy> for RealmPlacementStrategy {
             affinity: strategy
                 .affinity
                 .iter()
-                .map(|rule| RealmPlacementAffinityRule {
+                .map(|rule| RealmAffinityRule {
                     key: rule.matcher.key.clone(),
                     value: rule.matcher.value.clone(),
                     effect: match rule.effect {
-                        aruna_core::structs::AffinityEffect::Filter => {
-                            RealmPlacementAffinityEffect::Filter
-                        }
+                        aruna_core::structs::AffinityEffect::Filter => RealmAffinityEffect::Filter,
                         aruna_core::structs::AffinityEffect::Multiply { permille } => {
-                            RealmPlacementAffinityEffect::Multiply { permille }
+                            RealmAffinityEffect::Multiply { permille }
                         }
                     },
                 })
@@ -637,10 +637,8 @@ impl RealmPlacementStrategy {
                         value: rule.value,
                     },
                     effect: match rule.effect {
-                        RealmPlacementAffinityEffect::Filter => {
-                            aruna_core::structs::AffinityEffect::Filter
-                        }
-                        RealmPlacementAffinityEffect::Multiply { permille } => {
+                        RealmAffinityEffect::Filter => aruna_core::structs::AffinityEffect::Filter,
+                        RealmAffinityEffect::Multiply { permille } => {
                             aruna_core::structs::AffinityEffect::Multiply { permille }
                         }
                     },
@@ -651,16 +649,16 @@ impl RealmPlacementStrategy {
     }
 }
 
-impl From<&aruna_core::structs::StrategyBinding> for RealmPlacementBinding {
+impl From<&aruna_core::structs::StrategyBinding> for RealmBinding {
     fn from(binding: &aruna_core::structs::StrategyBinding) -> Self {
         Self {
-            scope: RealmPlacementBindingScope::from(&binding.scope),
+            scope: RealmBindingScope::from(&binding.scope),
             strategy_id: binding.strategy_id.to_string(),
         }
     }
 }
 
-impl RealmPlacementBinding {
+impl RealmBinding {
     fn into_core(self) -> ServerResult<aruna_core::structs::StrategyBinding> {
         Ok(aruna_core::structs::StrategyBinding {
             scope: self.scope.into_core()?,
@@ -669,7 +667,7 @@ impl RealmPlacementBinding {
     }
 }
 
-impl From<&aruna_core::structs::BindingScope> for RealmPlacementBindingScope {
+impl From<&aruna_core::structs::BindingScope> for RealmBindingScope {
     fn from(scope: &aruna_core::structs::BindingScope) -> Self {
         match scope {
             aruna_core::structs::BindingScope::Realm => Self::Realm,
@@ -677,7 +675,7 @@ impl From<&aruna_core::structs::BindingScope> for RealmPlacementBindingScope {
                 group_id: group_id.to_string(),
             },
             aruna_core::structs::BindingScope::Class(document_class) => Self::Class {
-                document_class: RealmPlacementDocumentClass::from(*document_class),
+                document_class: RealmPlacementClass::from(*document_class),
             },
             aruna_core::structs::BindingScope::MetadataPathPrefix(prefix) => {
                 Self::MetadataPathPrefix {
@@ -688,7 +686,7 @@ impl From<&aruna_core::structs::BindingScope> for RealmPlacementBindingScope {
     }
 }
 
-impl RealmPlacementBindingScope {
+impl RealmBindingScope {
     fn into_core(self) -> ServerResult<aruna_core::structs::BindingScope> {
         Ok(match self {
             Self::Realm => aruna_core::structs::BindingScope::Realm,
@@ -705,7 +703,7 @@ impl RealmPlacementBindingScope {
     }
 }
 
-impl From<aruna_core::structs::DocumentClass> for RealmPlacementDocumentClass {
+impl From<aruna_core::structs::DocumentClass> for RealmPlacementClass {
     fn from(document_class: aruna_core::structs::DocumentClass) -> Self {
         match document_class {
             aruna_core::structs::DocumentClass::Admin => Self::Admin,
@@ -719,16 +717,16 @@ impl From<aruna_core::structs::DocumentClass> for RealmPlacementDocumentClass {
     }
 }
 
-impl From<RealmPlacementDocumentClass> for aruna_core::structs::DocumentClass {
-    fn from(document_class: RealmPlacementDocumentClass) -> Self {
+impl From<RealmPlacementClass> for aruna_core::structs::DocumentClass {
+    fn from(document_class: RealmPlacementClass) -> Self {
         match document_class {
-            RealmPlacementDocumentClass::Admin => Self::Admin,
-            RealmPlacementDocumentClass::Group => Self::Group,
-            RealmPlacementDocumentClass::User => Self::User,
-            RealmPlacementDocumentClass::Metadata => Self::Metadata,
-            RealmPlacementDocumentClass::MetadataRegistry => Self::MetadataRegistry,
-            RealmPlacementDocumentClass::JobControl => Self::JobControl,
-            RealmPlacementDocumentClass::PlacementPolicy => Self::PlacementPolicy,
+            RealmPlacementClass::Admin => Self::Admin,
+            RealmPlacementClass::Group => Self::Group,
+            RealmPlacementClass::User => Self::User,
+            RealmPlacementClass::Metadata => Self::Metadata,
+            RealmPlacementClass::MetadataRegistry => Self::MetadataRegistry,
+            RealmPlacementClass::JobControl => Self::JobControl,
+            RealmPlacementClass::PlacementPolicy => Self::PlacementPolicy,
         }
     }
 }
@@ -758,7 +756,7 @@ impl RealmPlacementOverride {
     }
 }
 
-impl RealmPlacementMutationRequest {
+impl RealmPlacementRequest {
     fn into_core(self) -> ServerResult<RealmPlacementAction> {
         let mutation = match self {
             Self::UpsertStrategy { strategy } => {
@@ -840,12 +838,14 @@ fn parse_node_ids(values: Vec<String>, field: &str) -> ServerResult<Vec<aruna_co
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmMetadataReplicationResponse {
+#[schema(as = RealmMetadataReplicationResponse)]
+pub struct RealmReplicationResponse {
     pub default_replication_factor: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmOidcProviderResponse {
+#[schema(as = RealmOidcProviderResponse)]
+pub struct RealmProviderResponse {
     pub id: String,
     pub issuer: String,
     pub audience: String,
@@ -853,27 +853,29 @@ pub struct RealmOidcProviderResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmNodeInfoResponse {
+#[schema(as = RealmNodeInfoResponse)]
+pub struct NodeInfoResponse {
     pub node_id: String,
-    pub kind: RealmNodeKindInfo,
+    pub kind: NodeKindInfo,
     /// Owner of a `user` node; null for infrastructure nodes.
     pub owner: Option<String>,
     pub configured: bool,
     pub present: bool,
-    pub connection_status: RealmNodeConnectionStatus,
+    pub connection_status: RealmConnectionStatus,
     /// When a `user` node last reached this node, in unix milliseconds. This
     /// node's own observation; absent for other kinds and for a device it has
     /// not seen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen_ms: Option<u64>,
     /// Placement map entry (location/weight/status) when the node is mapped.
-    pub placement: Option<RealmNodePlacementResponse>,
+    pub placement: Option<NodePlacementResponse>,
     /// Latest published node info document (capabilities/labels/urls/utilization) if received.
-    pub info: Option<RealmNodeInfoDocumentResponse>,
+    pub info: Option<NodeDocumentResponse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmNodePlacementResponse {
+#[schema(as = RealmNodePlacementResponse)]
+pub struct NodePlacementResponse {
     pub location: String,
     pub weight: u32,
     pub full: bool,
@@ -881,11 +883,12 @@ pub struct RealmNodePlacementResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmNodeInfoDocumentResponse {
+#[schema(as = RealmNodeInfoDocumentResponse)]
+pub struct NodeDocumentResponse {
     pub executors: Vec<ExecutorCapabilityResponse>,
     pub labels: std::collections::BTreeMap<String, String>,
-    pub urls: RealmNodeUrlsResponse,
-    pub utilization: RealmNodeUtilizationResponse,
+    pub urls: RealmUrlsResponse,
+    pub utilization: RealmUtilizationResponse,
     pub updated_at_ms: u64,
 }
 
@@ -897,7 +900,8 @@ pub struct ExecutorCapabilityResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmNodeUrlsResponse {
+#[schema(as = RealmNodeUrlsResponse)]
+pub struct RealmUrlsResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -905,7 +909,8 @@ pub struct RealmNodeUrlsResponse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RealmNodeUtilizationResponse {
+#[schema(as = RealmNodeUtilizationResponse)]
+pub struct RealmUtilizationResponse {
     pub storage_bytes_used: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub documents_held: Option<u64>,
@@ -916,7 +921,8 @@ pub struct RealmNodeUtilizationResponse {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum RealmNodeKindInfo {
+#[schema(as = RealmNodeKindInfo)]
+pub enum NodeKindInfo {
     Management,
     Server,
     User,
@@ -924,7 +930,8 @@ pub enum RealmNodeKindInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum RealmNodeConnectionStatus {
+#[schema(as = RealmNodeConnectionStatus)]
+pub enum RealmConnectionStatus {
     Connected,
     Configured,
     /// A device that reached this node recently. Not a connection: it is what
@@ -934,7 +941,7 @@ pub enum RealmNodeConnectionStatus {
     Unknown,
 }
 
-impl From<&RealmNodeKind> for RealmNodeKindInfo {
+impl From<&RealmNodeKind> for NodeKindInfo {
     fn from(value: &RealmNodeKind) -> Self {
         match value {
             RealmNodeKind::Management => Self::Management,
@@ -1102,12 +1109,12 @@ pub(crate) async fn run_realm_info(
     auth: Option<AuthContext>,
 ) -> ServerResult<RealmInfoResponse> {
     let config = drive(
-        GetRealmConfigOperation::new(state.get_realm_id()),
+        GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::realm::get_config::GetRealmConfigError::DocumentNotFound => {
+        aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
         other => ServerError::InternalError(other.to_string()),
@@ -1123,7 +1130,7 @@ pub(crate) async fn run_realm_info(
         }
     }
 
-    let metadata_replication = RealmMetadataReplicationResponse {
+    let metadata_replication = RealmReplicationResponse {
         default_replication_factor: config.effective_replication_factor(),
     };
     let live_datasets = match count_realm_documents(&state.get_ctx(), config.realm_id).await {
@@ -1188,7 +1195,7 @@ pub(crate) async fn run_realm_info(
         oidc_providers: config
             .oidc_providers
             .into_iter()
-            .map(|provider| RealmOidcProviderResponse {
+            .map(|provider| RealmProviderResponse {
                 id: provider.id,
                 issuer: provider.issuer,
                 audience: provider.audience,
@@ -1272,10 +1279,8 @@ pub(crate) async fn load_node_documents(
     }
 }
 
-fn map_node_document(
-    document: &aruna_core::structs::NodeInfoDocument,
-) -> RealmNodeInfoDocumentResponse {
-    RealmNodeInfoDocumentResponse {
+fn map_node_document(document: &aruna_core::structs::NodeInfoDocument) -> NodeDocumentResponse {
+    NodeDocumentResponse {
         executors: document
             .executors
             .iter()
@@ -1286,11 +1291,11 @@ fn map_node_document(
             })
             .collect(),
         labels: document.labels.clone(),
-        urls: RealmNodeUrlsResponse {
+        urls: RealmUrlsResponse {
             api: document.urls.api.clone(),
             s3: document.urls.s3.clone(),
         },
-        utilization: RealmNodeUtilizationResponse {
+        utilization: RealmUtilizationResponse {
             storage_bytes_used: document.utilization.storage_bytes_used,
             documents_held: document.utilization.documents_held,
             load_permille: document.utilization.load_permille,
@@ -1379,7 +1384,7 @@ management node serves the call and every other node relays it to one.
         (
             status = 200,
             description = "The realm's record placement strategies as this management node has them",
-            body = RealmPlacementConfigResponse,
+            body = RealmPlacementResponse,
             example = json!({
                 "strategies": [
                     {
@@ -1423,22 +1428,22 @@ management node serves the call and every other node relays it to one.
 pub async fn get_realm_placement(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-) -> ServerResult<(StatusCode, Json<RealmPlacementConfigResponse>)> {
+) -> ServerResult<(StatusCode, Json<RealmPlacementResponse>)> {
     require_realm_admin(&state, auth).await?;
     let document = drive(
-        GetRealmConfigOperation::new(state.get_realm_id()),
+        GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::realm::get_config::GetRealmConfigError::DocumentNotFound => {
+        aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
         other => ServerError::InternalError(other.to_string()),
     })?;
     Ok((
         StatusCode::OK,
-        Json(RealmPlacementConfigResponse::from_document(&document)),
+        Json(RealmPlacementResponse::from_document(&document)),
     ))
 }
 
@@ -1477,7 +1482,7 @@ management node serves the call and every other node relays it to one.
   key (`aruna-engine.org/kind`, `.../location`, `.../node`, `.../storage-class/*`), and any edit
   while that node is draining."#,
     request_body(
-        content = RealmPlacementMutationRequest,
+        content = RealmPlacementRequest,
         description = "Exactly one placement change, discriminated by `mutation`. Ids are ULIDs, node ids are hex-encoded, an override `subject` is a hex-encoded key prefix",
         examples(
             ("Define a strategy" = (
@@ -1527,7 +1532,7 @@ management node serves the call and every other node relays it to one.
         (
             status = 200,
             description = "The complete strategy set after the change was applied",
-            body = RealmPlacementConfigResponse,
+            body = RealmPlacementResponse,
             example = json!({
                 "strategies": [
                     {
@@ -1567,8 +1572,8 @@ management node serves the call and every other node relays it to one.
 pub async fn mutate_realm_placement(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    request: Result<Json<RealmPlacementMutationRequest>, JsonRejection>,
-) -> ServerResult<(StatusCode, Json<RealmPlacementConfigResponse>)> {
+    request: Result<Json<RealmPlacementRequest>, JsonRejection>,
+) -> ServerResult<(StatusCode, Json<RealmPlacementResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
@@ -1590,7 +1595,7 @@ pub async fn mutate_realm_placement(
             )
             .await?;
             drive_placement_mutation(
-                MutateRealmPlacementConfig { actor, mutation },
+                MutatePlacementConfig { actor, mutation },
                 Some(auth),
                 &context,
             )
@@ -1609,10 +1614,10 @@ pub async fn mutate_realm_placement(
             provision_metadata_binding(context.as_ref(), actor.clone(), scope, strategy_id)
                 .await
                 .map_err(map_handle_error)?;
-            drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+            drive(GetConfigOperation::new(actor.realm_id), &context)
                 .await
                 .map_err(|error| match error {
-                    aruna_operations::realm::get_config::GetRealmConfigError::DocumentNotFound => {
+                    aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
                         ServerError::NotFound
                     }
                     other => ServerError::InternalError(other.to_string()),
@@ -1621,7 +1626,7 @@ pub async fn mutate_realm_placement(
     };
     Ok((
         StatusCode::OK,
-        Json(RealmPlacementConfigResponse::from_document(&document)),
+        Json(RealmPlacementResponse::from_document(&document)),
     ))
 }
 
@@ -1635,7 +1640,7 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
         }
         HandleAllocationError::Append(error) => map_placement_error(error),
         HandleAllocationError::ReadConfig(
-            aruna_operations::realm::get_config::GetRealmConfigError::DocumentNotFound,
+            aruna_operations::realm::get_config::GetConfigError::DocumentNotFound,
         ) => ServerError::NotFound,
         HandleAllocationError::Storage(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent placement provisioning conflict; retry".to_string())
@@ -1649,30 +1654,30 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
     }
 }
 
-fn map_placement_error(error: MutateRealmPlacementError) -> ServerError {
+fn map_placement_error(error: MutatePlacementError) -> ServerError {
     match error {
-        MutateRealmPlacementError::RealmConfigNotFound => ServerError::NotFound,
-        MutateRealmPlacementError::InvalidInput(reason) => ServerError::BadRequestReason(reason),
-        error @ (MutateRealmPlacementError::AdminDocumentReducerError(_)
-        | MutateRealmPlacementError::EmptyShardHolders { .. }
-        | MutateRealmPlacementError::UnknownTransition { .. }
-        | MutateRealmPlacementError::ForceWithoutProof { .. }) => {
+        MutatePlacementError::RealmConfigNotFound => ServerError::NotFound,
+        MutatePlacementError::InvalidInput(reason) => ServerError::BadRequestReason(reason),
+        error @ (MutatePlacementError::AdminDocumentError(_)
+        | MutatePlacementError::EmptyShardHolders { .. }
+        | MutatePlacementError::UnknownTransition { .. }
+        | MutatePlacementError::ForceWithoutProof { .. }) => {
             ServerError::BadRequestReason(error.to_string())
         }
-        MutateRealmPlacementError::Unauthorized { .. } => ServerError::Forbidden,
-        MutateRealmPlacementError::StrategyReferenced { strategy_id } => ServerError::Conflict(
-            format!("placement strategy {strategy_id} is currently referenced"),
-        ),
-        MutateRealmPlacementError::JobFamilyImmutable { strategy_id } => ServerError::Conflict(
-            format!("placement strategy {strategy_id} is the immutable job-family strategy"),
-        ),
-        error @ MutateRealmPlacementError::TransitionInFlight { .. } => {
+        MutatePlacementError::Unauthorized { .. } => ServerError::Forbidden,
+        MutatePlacementError::StrategyReferenced { strategy_id } => ServerError::Conflict(format!(
+            "placement strategy {strategy_id} is currently referenced"
+        )),
+        MutatePlacementError::JobFamilyImmutable { strategy_id } => ServerError::Conflict(format!(
+            "placement strategy {strategy_id} is the immutable job-family strategy"
+        )),
+        error @ MutatePlacementError::TransitionInFlight { .. } => {
             ServerError::Conflict(error.to_string())
         }
-        MutateRealmPlacementError::StorageError(StorageError::TransactionConflict) => {
+        MutatePlacementError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm placement update conflict; retry".to_string())
         }
-        MutateRealmPlacementError::StorageError(StorageError::CleanupCapacity) => {
+        MutatePlacementError::StorageError(StorageError::CleanupCapacity) => {
             ServerError::ServiceUnavailableReason(
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
@@ -1787,7 +1792,7 @@ pub async fn set_realm_quota(
         realm_id: state.get_realm_id(),
     };
     let stored = drive(
-        SetRealmQuotaOperation::new(SetRealmQuotaConfig {
+        SetQuotaOperation::new(SetQuotaConfig {
             actor,
             auth_context: auth,
             quota,
@@ -1799,17 +1804,15 @@ pub async fn set_realm_quota(
     Ok((StatusCode::OK, Json(RealmQuotaConfig::from(stored.quota))))
 }
 
-fn map_quota_error(error: SetRealmQuotaError) -> ServerError {
+fn map_quota_error(error: SetQuotaError) -> ServerError {
     match error {
-        SetRealmQuotaError::RealmConfigNotFound => ServerError::NotFound,
-        SetRealmQuotaError::Unauthorized | SetRealmQuotaError::NotManagementNode => {
-            ServerError::Forbidden
-        }
-        SetRealmQuotaError::InvalidQuota { reason } => ServerError::BadRequestReason(reason),
-        SetRealmQuotaError::StorageError(StorageError::TransactionConflict) => {
+        SetQuotaError::RealmConfigNotFound => ServerError::NotFound,
+        SetQuotaError::Unauthorized | SetQuotaError::NotManagementNode => ServerError::Forbidden,
+        SetQuotaError::InvalidQuota { reason } => ServerError::BadRequestReason(reason),
+        SetQuotaError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm quota update conflict; retry".to_string())
         }
-        SetRealmQuotaError::StorageError(StorageError::CleanupCapacity) => {
+        SetQuotaError::StorageError(StorageError::CleanupCapacity) => {
             ServerError::ServiceUnavailableReason(
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
@@ -1965,7 +1968,7 @@ impl UsageResponse {
 }
 
 pub async fn load_usage_counters(state: &ServerState, key: Vec<u8>) -> ServerResult<UsageCounters> {
-    drive(LoadUsageCountersOperation::new(key), &state.get_ctx())
+    drive(LoadCountersOperation::new(key), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))
 }
@@ -2061,7 +2064,7 @@ fn map_realm_nodes(
     node_info_docs: BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument>,
     contacts: &PeerContacts,
     now_ms: u64,
-) -> Vec<RealmNodeInfoResponse> {
+) -> Vec<NodeInfoResponse> {
     let current_node = state.get_node_id();
     config
         .nodes
@@ -2069,15 +2072,15 @@ fn map_realm_nodes(
         .map(|node| {
             let parsed = node.node_id.parse::<aruna_core::NodeId>().ok();
             let is_current = node.node_id == current_node.to_string();
-            let kind = RealmNodeKindInfo::from(&node.kind);
+            let kind = NodeKindInfo::from(&node.kind);
             // A device publishes no realm presence, so presence carries no
             // statement about it, not even on the device's own node.
-            let is_device = matches!(kind, RealmNodeKindInfo::User);
+            let is_device = matches!(kind, NodeKindInfo::User);
             let present = !is_device
                 && (is_current || parsed.is_some_and(|node_id| present_nodes.contains(&node_id)));
             let placement = parsed
                 .and_then(|node_id| config.placement_entry(node_id))
-                .map(|entry| RealmNodePlacementResponse {
+                .map(|entry| NodePlacementResponse {
                     location: entry.effective_location().to_string(),
                     weight: entry.weight,
                     full: entry.full,
@@ -2095,17 +2098,17 @@ fn map_realm_nodes(
             let seen_recently = is_device
                 && (is_current
                     || parsed.is_some_and(|node_id| contacts.seen_recently(&node_id, now_ms)));
-            RealmNodeInfoResponse {
+            NodeInfoResponse {
                 node_id: node.node_id.clone(),
                 kind,
                 owner: node.kind.owner().map(|owner| owner.to_string()),
                 configured: true,
                 present,
                 connection_status: match (is_device, seen_recently, present) {
-                    (true, true, _) => RealmNodeConnectionStatus::Seen,
-                    (true, false, _) => RealmNodeConnectionStatus::Unknown,
-                    (false, _, true) => RealmNodeConnectionStatus::Connected,
-                    (false, _, false) => RealmNodeConnectionStatus::Configured,
+                    (true, true, _) => RealmConnectionStatus::Seen,
+                    (true, false, _) => RealmConnectionStatus::Unknown,
+                    (false, _, true) => RealmConnectionStatus::Connected,
+                    (false, _, false) => RealmConnectionStatus::Configured,
                 },
                 last_seen_ms,
                 placement,
@@ -2135,7 +2138,7 @@ async fn load_realm_presence(state: &ServerState) -> HashSet<aruna_core::NodeId>
     let discovery = tokio::time::timeout(
         REALM_DISCOVERY_TIMEOUT,
         drive(
-            GetRealmNodesOperation::new(state.get_realm_id()),
+            GetNodesOperation::new(state.get_realm_id()),
             &state.get_ctx(),
         ),
     )
@@ -2538,4 +2541,5 @@ fn format_transport_addr(addr: &iroh::TransportAddr) -> String {
 }
 
 #[cfg(test)]
+#[path = "info_tests.rs"]
 mod tests;

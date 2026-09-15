@@ -1,6 +1,4 @@
-use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission, parse_group_id, require_realm_auth,
-};
+use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
 use crate::server_state::ServerState;
@@ -170,7 +168,7 @@ forwards the read under the caller's own token and every peer re-checks that sam
 pub async fn list_audit(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<(StatusCode, Json<AuditPageResponse>)> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(AUDIT_DEADLINE_SECS);
