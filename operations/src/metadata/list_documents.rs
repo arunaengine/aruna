@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE;
-use aruna_core::metadata::MetadataGraphLifecycleRecord;
+use aruna_core::metadata::GraphLifecycleRecord;
 use aruna_core::operation::Operation;
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::{Effects, GroupId, Key};
@@ -15,16 +15,16 @@ use crate::metadata::repository::{
 };
 
 #[derive(Debug, PartialEq)]
-pub struct ListMetadataDocumentsOperation {
+pub struct ListDocumentsOperation {
     group_id: GroupId,
     documents: Vec<MetadataRegistryRecord>,
     deleted_graph_iris: HashSet<String>,
-    state: ListMetadataDocumentsState,
-    output: Option<Result<Vec<MetadataRegistryRecord>, ListMetadataDocumentsError>>,
+    state: ListDocumentsState,
+    output: Option<Result<Vec<MetadataRegistryRecord>, ListDocumentsError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum ListMetadataDocumentsState {
+enum ListDocumentsState {
     Init,
     ListDeleted,
     ListDocuments,
@@ -33,7 +33,7 @@ enum ListMetadataDocumentsState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ListMetadataDocumentsError {
+pub enum ListDocumentsError {
     #[error(transparent)]
     StorageError(#[from] aruna_core::errors::StorageError),
     #[error(transparent)]
@@ -46,26 +46,26 @@ pub enum ListMetadataDocumentsError {
     },
 }
 
-impl ListMetadataDocumentsOperation {
+impl ListDocumentsOperation {
     pub fn new(group_id: GroupId) -> Self {
         Self {
             group_id,
             documents: Vec::new(),
             deleted_graph_iris: HashSet::new(),
-            state: ListMetadataDocumentsState::Init,
+            state: ListDocumentsState::Init,
             output: None,
         }
     }
 
-    fn fail(&mut self, error: ListMetadataDocumentsError) -> Effects {
-        self.state = ListMetadataDocumentsState::Error;
+    fn fail(&mut self, error: ListDocumentsError) -> Effects {
+        self.state = ListDocumentsState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
-        self.fail(ListMetadataDocumentsError::UnexpectedEvent {
+        self.fail(ListDocumentsError::UnexpectedEvent {
             state,
             expected,
             got,
@@ -87,24 +87,24 @@ impl ListMetadataDocumentsOperation {
     }
 }
 
-impl Operation for ListMetadataDocumentsOperation {
+impl Operation for ListDocumentsOperation {
     type Output = Vec<MetadataRegistryRecord>;
-    type Error = ListMetadataDocumentsError;
+    type Error = ListDocumentsError;
 
     fn start(&mut self) -> Effects {
-        self.state = ListMetadataDocumentsState::ListDeleted;
+        self.state = ListDocumentsState::ListDeleted;
         smallvec![Self::lifecycle_iter_effect(None)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            ListMetadataDocumentsState::ListDeleted => match event {
+            ListDocumentsState::ListDeleted => match event {
                 Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
                 }) => {
                     for (_, value) in values {
-                        match postcard::from_bytes::<MetadataGraphLifecycleRecord>(&value) {
+                        match postcard::from_bytes::<GraphLifecycleRecord>(&value) {
                             Ok(lifecycle) => {
                                 if lifecycle.is_deleted() {
                                     self.deleted_graph_iris.insert(lifecycle.graph_iri);
@@ -119,14 +119,14 @@ impl Operation for ListMetadataDocumentsOperation {
                     if next_start_after.is_some() {
                         return smallvec![Self::lifecycle_iter_effect(next_start_after)];
                     }
-                    self.state = ListMetadataDocumentsState::ListDocuments;
+                    self.state = ListDocumentsState::ListDocuments;
                     smallvec![self.iter_effect(None)]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self
                     .unexpected_event("metadata graph lifecycle iter result", format!("{other:?}")),
             },
-            ListMetadataDocumentsState::ListDocuments => match parse_registry_iter(event) {
+            ListDocumentsState::ListDocuments => match parse_registry_iter(event) {
                 Ok((page, next_start_after)) => {
                     self.documents.extend(
                         page.into_iter()
@@ -135,23 +135,23 @@ impl Operation for ListMetadataDocumentsOperation {
                     if next_start_after.is_some() {
                         return smallvec![self.iter_effect(next_start_after)];
                     }
-                    self.state = ListMetadataDocumentsState::Finish;
+                    self.state = ListDocumentsState::Finish;
                     self.output = Some(Ok(std::mem::take(&mut self.documents)));
                     smallvec![]
                 }
                 Err(StorageReadError::Storage(error)) => self.fail(error.into()),
                 Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
             },
-            ListMetadataDocumentsState::Finish
-            | ListMetadataDocumentsState::Error
-            | ListMetadataDocumentsState::Init => smallvec![],
+            ListDocumentsState::Finish | ListDocumentsState::Error | ListDocumentsState::Init => {
+                smallvec![]
+            }
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            ListMetadataDocumentsState::Finish | ListMetadataDocumentsState::Error
+            ListDocumentsState::Finish | ListDocumentsState::Error
         )
     }
 
@@ -170,7 +170,7 @@ mod tests {
 
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::METADATA_INDEX_KEYSPACE;
-    use aruna_core::metadata::MetadataGraphLifecycleRecord;
+    use aruna_core::metadata::GraphLifecycleRecord;
     use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use aruna_storage::FjallStorage;
     use byteview::ByteView;
@@ -229,7 +229,7 @@ mod tests {
             compute_handle: None,
         };
 
-        let result = drive(ListMetadataDocumentsOperation::new(group_id), &context)
+        let result = drive(ListDocumentsOperation::new(group_id), &context)
             .await
             .unwrap();
         assert_eq!(
@@ -261,7 +261,7 @@ mod tests {
             ));
         }
 
-        let lifecycle = MetadataGraphLifecycleRecord::deleted(
+        let lifecycle = GraphLifecycleRecord::deleted(
             deleted.graph_iri.clone(),
             realm_id,
             group_id,
@@ -287,7 +287,7 @@ mod tests {
             compute_handle: None,
         };
 
-        let result = drive(ListMetadataDocumentsOperation::new(group_id), &context)
+        let result = drive(ListDocumentsOperation::new(group_id), &context)
             .await
             .unwrap();
         assert_eq!(result, vec![active]);
@@ -299,7 +299,7 @@ mod tests {
         let group_id = Ulid::generate();
         let active = metadata_record(realm_id, group_id, Ulid::generate(), "docs/active");
         let deleted = metadata_record(realm_id, group_id, Ulid::generate(), "docs/deleted");
-        let lifecycle = MetadataGraphLifecycleRecord::deleted(
+        let lifecycle = GraphLifecycleRecord::deleted(
             deleted.graph_iri.clone(),
             realm_id,
             group_id,
@@ -307,7 +307,7 @@ mod tests {
             1,
         );
 
-        let mut operation = ListMetadataDocumentsOperation::new(group_id);
+        let mut operation = ListDocumentsOperation::new(group_id);
         let effects = operation.start();
         assert!(matches!(
             effects.as_slice(),

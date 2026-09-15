@@ -150,7 +150,7 @@ pub(super) async fn query_local_graphs(
     })?
     .ok();
     let cancellation = CancellationToken::new();
-    let _cancel_on_drop = MetadataQueryCancellationGuard(cancellation.clone());
+    let _cancel_on_drop = MetadataCancellationGuard(cancellation.clone());
     let blocking_cancellation = cancellation.clone();
     let mut blocking = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -201,9 +201,9 @@ pub(super) async fn query_local_graphs(
     result
 }
 
-struct MetadataQueryCancellationGuard(CancellationToken);
+struct MetadataCancellationGuard(CancellationToken);
 
-impl Drop for MetadataQueryCancellationGuard {
+impl Drop for MetadataCancellationGuard {
     fn drop(&mut self) {
         self.0.cancel();
     }

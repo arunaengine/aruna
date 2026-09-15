@@ -2,7 +2,7 @@ use super::super::transport::with_sync_timeout;
 use super::auth::{auth_storage, node_id_seed, realm_fixture};
 use super::*;
 use crate::metadata::handle::transport::read_budget;
-use crate::s3::get_bucket::GetBucketInfoOperation;
+use crate::s3::get_bucket::GetBucketOperation;
 use craqle::CraqleFjallPersistMode;
 #[test]
 fn workspace_delete_allowed() {
@@ -77,7 +77,7 @@ async fn sync_creates_bucket() {
     create_sync_bucket(&context, "foobar", group_id, &relationship)
         .await
         .unwrap();
-    let bucket = drive(GetBucketInfoOperation::new("foobar".to_string()), &context)
+    let bucket = drive(GetBucketOperation::new("foobar".to_string()), &context)
         .await
         .unwrap();
 
