@@ -17,21 +17,21 @@ const REALM_PRESENCE_TTL: Duration = Duration::from_secs(60);
 pub(crate) const REALM_PRESENCE_REFRESH_AFTER: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct AnnounceRealmPresenceConfig {
+pub struct AnnouncePresenceConfig {
     pub realm_id: RealmId,
     pub node_id: NodeId,
     pub schedule_refresh: bool,
 }
 
 #[derive(Debug, PartialEq)]
-pub struct AnnounceRealmPresenceOperation {
-    config: AnnounceRealmPresenceConfig,
-    state: AnnounceRealmPresenceState,
-    output: Option<Result<(), AnnounceRealmPresenceError>>,
+pub struct AnnouncePresenceOperation {
+    config: AnnouncePresenceConfig,
+    state: AnnouncePresenceState,
+    output: Option<Result<(), AnnouncePresenceError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum AnnounceRealmPresenceState {
+enum AnnouncePresenceState {
     Init,
     PutPresence,
     ScheduleRefresh,
@@ -40,7 +40,7 @@ enum AnnounceRealmPresenceState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum AnnounceRealmPresenceError {
+pub enum AnnouncePresenceError {
     #[error("failed to announce realm presence: {0}")]
     PutFailed(DhtError),
     #[error("failed to schedule realm presence refresh: {0}")]
@@ -53,11 +53,11 @@ pub enum AnnounceRealmPresenceError {
     },
 }
 
-impl AnnounceRealmPresenceOperation {
-    pub fn new(config: AnnounceRealmPresenceConfig) -> Self {
+impl AnnouncePresenceOperation {
+    pub fn new(config: AnnouncePresenceConfig) -> Self {
         Self {
             config,
-            state: AnnounceRealmPresenceState::Init,
+            state: AnnouncePresenceState::Init,
             output: None,
         }
     }
@@ -74,20 +74,20 @@ impl AnnounceRealmPresenceOperation {
     }
 
     fn finish_success(&mut self) -> Effects {
-        self.state = AnnounceRealmPresenceState::Finish;
+        self.state = AnnouncePresenceState::Finish;
         self.output = Some(Ok(()));
         smallvec![]
     }
 
-    fn fail(&mut self, error: AnnounceRealmPresenceError) -> Effects {
-        self.state = AnnounceRealmPresenceState::Error;
+    fn fail(&mut self, error: AnnouncePresenceError) -> Effects {
+        self.state = AnnouncePresenceState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
-        self.fail(AnnounceRealmPresenceError::UnexpectedEvent {
+        self.fail(AnnouncePresenceError::UnexpectedEvent {
             state,
             expected,
             got,
@@ -95,12 +95,12 @@ impl AnnounceRealmPresenceOperation {
     }
 }
 
-impl Operation for AnnounceRealmPresenceOperation {
+impl Operation for AnnouncePresenceOperation {
     type Output = ();
-    type Error = AnnounceRealmPresenceError;
+    type Error = AnnouncePresenceError;
 
     fn start(&mut self) -> Effects {
-        self.state = AnnounceRealmPresenceState::PutPresence;
+        self.state = AnnouncePresenceState::PutPresence;
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Put {
             key: self.presence_key(),
             realm_id: self.config.realm_id,
@@ -111,10 +111,10 @@ impl Operation for AnnounceRealmPresenceOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            AnnounceRealmPresenceState::PutPresence => match event {
+            AnnouncePresenceState::PutPresence => match event {
                 Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. })) => {
                     if self.config.schedule_refresh {
-                        self.state = AnnounceRealmPresenceState::ScheduleRefresh;
+                        self.state = AnnouncePresenceState::ScheduleRefresh;
                         smallvec![Effect::Task(TaskEffect::ResetTimer {
                             key: self.task_key(),
                             after: REALM_PRESENCE_REFRESH_AFTER,
@@ -124,27 +124,27 @@ impl Operation for AnnounceRealmPresenceOperation {
                     }
                 }
                 Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => {
-                    self.fail(AnnounceRealmPresenceError::PutFailed(error))
+                    self.fail(AnnouncePresenceError::PutFailed(error))
                 }
                 other => self.unexpected_event("dht put result", format!("{other:?}")),
             },
-            AnnounceRealmPresenceState::ScheduleRefresh => match event {
+            AnnouncePresenceState::ScheduleRefresh => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_success(),
                 Event::Task(TaskEvent::Error { message, .. }) => {
-                    self.fail(AnnounceRealmPresenceError::ScheduleFailed(message))
+                    self.fail(AnnouncePresenceError::ScheduleFailed(message))
                 }
                 other => self.unexpected_event("task scheduling result", format!("{other:?}")),
             },
-            AnnounceRealmPresenceState::Finish
-            | AnnounceRealmPresenceState::Error
-            | AnnounceRealmPresenceState::Init => smallvec![],
+            AnnouncePresenceState::Finish
+            | AnnouncePresenceState::Error
+            | AnnouncePresenceState::Init => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            AnnounceRealmPresenceState::Finish | AnnounceRealmPresenceState::Error
+            AnnouncePresenceState::Finish | AnnouncePresenceState::Error
         )
     }
 
@@ -165,7 +165,7 @@ mod pure_tests {
     fn presence_ttl_sufficient() {
         let realm_id = RealmId([1u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
-        let mut op = AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+        let mut op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
             realm_id,
             node_id,
             schedule_refresh: true,
@@ -184,7 +184,7 @@ mod pure_tests {
     fn dht_error_fails() {
         let realm_id = RealmId([1u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
-        let mut op = AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+        let mut op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
             realm_id,
             node_id,
             schedule_refresh: true,
@@ -199,7 +199,7 @@ mod pure_tests {
         assert!(effects.is_empty());
         assert!(matches!(
             op.finalize(),
-            Err(AnnounceRealmPresenceError::PutFailed(DhtError::Other(message))) if message == "boom"
+            Err(AnnouncePresenceError::PutFailed(DhtError::Other(message))) if message == "boom"
         ));
     }
 }
