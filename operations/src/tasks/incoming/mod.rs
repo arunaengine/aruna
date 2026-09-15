@@ -119,9 +119,7 @@ use crate::tasks::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_task_timers,
 };
 
-#[path = "incoming_outbox.rs"]
 mod outbox;
-#[path = "incoming_restore.rs"]
 mod restore;
 
 pub use outbox::drive_sync_drain;
@@ -860,5 +858,4 @@ impl InboundTaskHandler for OperationsTaskHandler {
 }
 
 #[cfg(test)]
-#[path = "incoming_tests.rs"]
 mod tests;

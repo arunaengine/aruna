@@ -1,10 +1,6 @@
-#[path = "shard_client.rs"]
 pub mod client;
-#[path = "shard_incoming.rs"]
 pub mod incoming;
-#[path = "shard_protocol.rs"]
 pub mod protocol;
-#[path = "shard_verify.rs"]
 pub mod verify;
 
 use aruna_core::document::{ShardManifest, ShardManifestEntry, shard_topic_id};

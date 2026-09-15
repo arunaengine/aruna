@@ -23,7 +23,7 @@ use crate::blob::records::HeadAliasContext;
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
 use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
-use crate::s3::policy_successor::{
+use crate::s3::policy::successor::{
     MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
 
@@ -328,7 +328,7 @@ mod pure_tests {
 
     use crate::blob::records::HeadAliasContext;
     use crate::placement::policy::cache::PolicyCacheEntry;
-    use crate::s3::policy_successor::SuccessorError;
+    use crate::s3::policy::successor::SuccessorError;
     use crate::tests::policy::signed_document;
 
     fn realm_id() -> RealmId {

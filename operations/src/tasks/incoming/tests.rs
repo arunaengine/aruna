@@ -21,11 +21,11 @@ use ulid::Ulid;
 
 use crate::notifications::outbox::new_outbox_record;
 
-#[path = "incoming_tests_harness.rs"]
+#[path = "tests_harness.rs"]
 mod harness;
-#[path = "incoming_tests_notification.rs"]
+#[path = "tests_notification.rs"]
 mod notification;
-#[path = "incoming_tests_outbox.rs"]
+#[path = "tests_outbox.rs"]
 mod outbox;
-#[path = "incoming_tests_restore.rs"]
+#[path = "tests_restore.rs"]
 mod restore;

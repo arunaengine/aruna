@@ -36,7 +36,7 @@ use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{
     DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
-use aruna_operations::s3::policy_successor::{
+use aruna_operations::s3::policy::successor::{
     MintSuccessorOperation, SuccessorOutcome, SuccessorPlan,
 };
 use aruna_operations::s3::put_object::{

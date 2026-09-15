@@ -35,14 +35,14 @@ use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object_placement::{
     ObjectPlacementError, ObjectPlacementInput, ObjectPlacementOperation,
 };
-use aruna_operations::s3::policy_bulk::{BulkConfig, BulkError, PolicyBulkOperation};
-use aruna_operations::s3::policy_coverage::{
+use aruna_operations::s3::policy::bulk::{BulkConfig, BulkError, PolicyBulkOperation};
+use aruna_operations::s3::policy::coverage::{
     CoverageError, CoverageInput, CoverageScope, PolicyCoverageOperation,
 };
-use aruna_operations::s3::policy_mutation::{
+use aruna_operations::s3::policy::mutation::{
     PolicyMutationConfig, PolicyMutationError, PolicyMutationOperation,
 };
-use aruna_operations::s3::policy_successor::{SuccessorError, SuccessorOutcome};
+use aruna_operations::s3::policy::successor::{SuccessorError, SuccessorOutcome};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
@@ -1520,9 +1520,9 @@ pub async fn get_placement_coverage(
 
 fn coverage_response(
     bucket: String,
-    report: aruna_operations::s3::policy_coverage::CoverageReport,
+    report: aruna_operations::s3::policy::coverage::CoverageReport,
 ) -> CoverageResponse {
-    use aruna_operations::s3::policy_coverage::{AttachmentGap, CopyState, CoverageLimit};
+    use aruna_operations::s3::policy::coverage::{AttachmentGap, CopyState, CoverageLimit};
     CoverageResponse {
         bucket,
         scope: match report.scope {

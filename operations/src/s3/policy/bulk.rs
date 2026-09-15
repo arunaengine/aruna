@@ -6,7 +6,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::blob::records::HeadAliasContext;
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
-use crate::s3::policy_successor::{
+use crate::s3::policy::successor::{
     CapturedDefault, MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
 use aruna_core::effects::{Effect, IterStart, StorageEffect};

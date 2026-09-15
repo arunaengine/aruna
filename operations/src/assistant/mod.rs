@@ -9,14 +9,10 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-#[path = "assistant_heads.rs"]
 mod heads;
-#[path = "assistant_provider.rs"]
 pub mod provider;
 #[cfg(test)]
-#[path = "assistant_tests.rs"]
 mod tests;
-#[path = "assistant_turns.rs"]
 mod turns;
 
 pub use heads::{DeleteChatOperation, ListChatOperation, WriteChatOperation};
