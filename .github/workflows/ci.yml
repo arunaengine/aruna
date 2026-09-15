@@ -264,17 +264,17 @@ jobs:
       - name: Check the compute feature selections
         run: |
           set -euo pipefail
-          cargo check -p aruna-compute --no-default-features --locked
+          cargo check -p aruna-compute --all-targets --no-default-features --locked
           for features in docker apptainer kubernetes; do
-            cargo check -p aruna-compute --no-default-features --features "$features" --locked
+            cargo check -p aruna-compute --all-targets --no-default-features --features "$features" --locked
           done
 
       - name: Check the node feature selections
         run: |
           set -euo pipefail
-          cargo check -p aruna --no-default-features --locked
+          cargo check -p aruna --all-targets --no-default-features --locked
           for features in docker apptainer kubernetes; do
-            cargo check -p aruna --no-default-features --features "$features" --locked
+            cargo check -p aruna --all-targets --no-default-features --features "$features" --locked
           done
 
   fmt:
