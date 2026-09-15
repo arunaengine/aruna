@@ -8,14 +8,14 @@ use ulid::Ulid;
 use crate::connectors::repository::{StorageReadError, parse_secret_read, read_secret_effect};
 
 #[derive(Debug, PartialEq)]
-pub struct ConnectorHasSecretConfigOperation {
+pub struct HasConfigOperation {
     connector_id: Ulid,
-    state: ConnectorHasSecretConfigState,
-    output: Option<Result<bool, ConnectorHasSecretConfigError>>,
+    state: HasConfigState,
+    output: Option<Result<bool, HasConfigError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum ConnectorHasSecretConfigState {
+enum HasConfigState {
     Init,
     ReadSecret,
     Finish,
@@ -23,24 +23,24 @@ enum ConnectorHasSecretConfigState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ConnectorHasSecretConfigError {
+pub enum HasConfigError {
     #[error(transparent)]
     StorageRead(#[from] StorageReadError),
     #[error("connector secret config check did not finish")]
     NotFinished,
 }
 
-impl ConnectorHasSecretConfigOperation {
+impl HasConfigOperation {
     pub fn new(connector_id: Ulid) -> Self {
         Self {
             connector_id,
-            state: ConnectorHasSecretConfigState::Init,
+            state: HasConfigState::Init,
             output: None,
         }
     }
 
-    fn fail(&mut self, error: ConnectorHasSecretConfigError) -> Effects {
-        self.state = ConnectorHasSecretConfigState::Error;
+    fn fail(&mut self, error: HasConfigError) -> Effects {
+        self.state = HasConfigState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
@@ -48,7 +48,7 @@ impl ConnectorHasSecretConfigOperation {
     fn handle_secret_read(&mut self, event: Event) -> Effects {
         match parse_secret_read(event) {
             Ok(secret) => {
-                self.state = ConnectorHasSecretConfigState::Finish;
+                self.state = HasConfigState::Finish;
                 self.output = Some(Ok(secret.is_some()));
                 smallvec![]
             }
@@ -57,34 +57,28 @@ impl ConnectorHasSecretConfigOperation {
     }
 }
 
-impl Operation for ConnectorHasSecretConfigOperation {
+impl Operation for HasConfigOperation {
     type Output = bool;
-    type Error = ConnectorHasSecretConfigError;
+    type Error = HasConfigError;
 
     fn start(&mut self) -> Effects {
-        self.state = ConnectorHasSecretConfigState::ReadSecret;
+        self.state = HasConfigState::ReadSecret;
         smallvec![read_secret_effect(self.connector_id, None)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            ConnectorHasSecretConfigState::ReadSecret => self.handle_secret_read(event),
-            ConnectorHasSecretConfigState::Init
-            | ConnectorHasSecretConfigState::Finish
-            | ConnectorHasSecretConfigState::Error => smallvec![],
+            HasConfigState::ReadSecret => self.handle_secret_read(event),
+            HasConfigState::Init | HasConfigState::Finish | HasConfigState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ConnectorHasSecretConfigState::Finish | ConnectorHasSecretConfigState::Error
-        )
+        matches!(self.state, HasConfigState::Finish | HasConfigState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .ok_or(ConnectorHasSecretConfigError::NotFinished)?
+        self.output.ok_or(HasConfigError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {

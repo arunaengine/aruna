@@ -5,7 +5,7 @@ use aruna_core::structs::{OFFERED_DIRECTORY_BUCKET, SourceConnectorKind};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceConnectorValidationRules {
+pub struct SourceConnectorRules {
     pub required_public_keys: &'static [&'static str],
     pub allowed_public_keys: &'static [&'static str],
     pub allowed_secret_keys: &'static [&'static str],
@@ -153,34 +153,34 @@ pub fn validate_connector_input(
     Ok(())
 }
 
-pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorValidationRules {
+pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorRules {
     match kind {
-        SourceConnectorKind::Http => SourceConnectorValidationRules {
+        SourceConnectorKind::Http => SourceConnectorRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
             allowed_secret_keys: &["username", "password", "token"],
         },
-        SourceConnectorKind::S3 => SourceConnectorValidationRules {
+        SourceConnectorKind::S3 => SourceConnectorRules {
             required_public_keys: &["bucket", "endpoint"],
             allowed_public_keys: &["bucket", "endpoint", "region", "root", S3_SKIP_SIGNATURE],
             allowed_secret_keys: &["access_key_id", "secret_access_key"],
         },
-        SourceConnectorKind::Webdav => SourceConnectorValidationRules {
+        SourceConnectorKind::Webdav => SourceConnectorRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
             allowed_secret_keys: &["username", "password", "token"],
         },
-        SourceConnectorKind::Ftp => SourceConnectorValidationRules {
+        SourceConnectorKind::Ftp => SourceConnectorRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
             allowed_secret_keys: &["user", "password"],
         },
-        SourceConnectorKind::ArunaNative => SourceConnectorValidationRules {
+        SourceConnectorKind::ArunaNative => SourceConnectorRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "realm_id", "default_node_id"],
             allowed_secret_keys: &["bearer_token", "access_key", "secret_key"],
         },
-        SourceConnectorKind::LocalDirectory => SourceConnectorValidationRules {
+        SourceConnectorKind::LocalDirectory => SourceConnectorRules {
             required_public_keys: &[OFFERED_DIRECTORY_BUCKET],
             allowed_public_keys: &[OFFERED_DIRECTORY_BUCKET],
             allowed_secret_keys: &[],

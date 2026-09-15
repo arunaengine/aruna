@@ -20,7 +20,7 @@ use crate::connectors::repository::{
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReplaceSourceConnectorInput {
+pub struct ReplaceSourceInput {
     pub group_id: GroupId,
     pub connector_id: Ulid,
     pub name: String,
@@ -30,13 +30,13 @@ pub struct ReplaceSourceConnectorInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReplaceSourceConnectorResult {
+pub struct ReplaceSourceResult {
     pub connector: SourceConnector,
     pub has_secret_config: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReplaceSourceConnectorState {
+pub enum ReplaceSourceState {
     Init,
     ReadCurrent,
     ReadSecret,
@@ -51,7 +51,7 @@ pub enum ReplaceSourceConnectorState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ReplaceSourceConnectorError {
+pub enum ReplaceSourceError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -66,13 +66,13 @@ pub enum ReplaceSourceConnectorError {
     ReplaceSourceConnectorFailed,
     #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
     InvalidStateEvent {
-        state: ReplaceSourceConnectorState,
+        state: ReplaceSourceState,
         expected: &'static str,
         received: Event,
     },
 }
 
-impl From<StorageReadError> for ReplaceSourceConnectorError {
+impl From<StorageReadError> for ReplaceSourceError {
     fn from(value: StorageReadError) -> Self {
         match value {
             StorageReadError::Storage(error) => Self::StorageError(error),
@@ -82,20 +82,20 @@ impl From<StorageReadError> for ReplaceSourceConnectorError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ReplaceSourceConnectorOperation {
-    input: ReplaceSourceConnectorInput,
-    state: ReplaceSourceConnectorState,
+pub struct ReplaceSourceOperation {
+    input: ReplaceSourceInput,
+    state: ReplaceSourceState,
     replacement: Option<SourceConnector>,
     replacement_secret: Option<SourceConnectorSecret>,
     txn_id: Option<TxnId>,
-    output: Option<Result<ReplaceSourceConnectorResult, ReplaceSourceConnectorError>>,
+    output: Option<Result<ReplaceSourceResult, ReplaceSourceError>>,
 }
 
-impl ReplaceSourceConnectorOperation {
-    pub fn new(input: ReplaceSourceConnectorInput) -> Self {
+impl ReplaceSourceOperation {
+    pub fn new(input: ReplaceSourceInput) -> Self {
         Self {
             input,
-            state: ReplaceSourceConnectorState::Init,
+            state: ReplaceSourceState::Init,
             replacement: None,
             replacement_secret: None,
             txn_id: None,
@@ -113,7 +113,7 @@ impl ReplaceSourceConnectorOperation {
             return self.emit_error(error.into());
         }
 
-        self.state = ReplaceSourceConnectorState::ReadCurrent;
+        self.state = ReplaceSourceState::ReadCurrent;
         smallvec![read_connector_effect(
             self.input.group_id,
             self.input.connector_id,
@@ -125,10 +125,10 @@ impl ReplaceSourceConnectorOperation {
         match parse_connector_read(event) {
             Ok(Some(existing)) => {
                 self.prepare_replacement(existing);
-                self.state = ReplaceSourceConnectorState::ReadSecret;
+                self.state = ReplaceSourceState::ReadSecret;
                 smallvec![read_secret_effect(self.input.connector_id, None)]
             }
-            Ok(None) => self.emit_error(ReplaceSourceConnectorError::NotFound),
+            Ok(None) => self.emit_error(ReplaceSourceError::NotFound),
             Err(error) => self.emit_error(error.into()),
         }
     }
@@ -159,7 +159,7 @@ impl ReplaceSourceConnectorOperation {
         };
 
         if secret_config_changed(current_secret.as_ref(), self.replacement_secret.as_ref()) {
-            self.state = ReplaceSourceConnectorState::StartTransaction;
+            self.state = ReplaceSourceState::StartTransaction;
             return smallvec![Effect::Storage(StorageEffect::StartTransaction {
                 read: false
             })];
@@ -175,7 +175,7 @@ impl ReplaceSourceConnectorOperation {
                 self.scan_reference_versions(None)
             }
             Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
-            received => self.emit_error(ReplaceSourceConnectorError::InvalidStateEvent {
+            received => self.emit_error(ReplaceSourceError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
                 received,
@@ -183,23 +183,23 @@ impl ReplaceSourceConnectorOperation {
         }
     }
 
-    fn emit_error(&mut self, error: ReplaceSourceConnectorError) -> Effects {
-        self.state = ReplaceSourceConnectorState::Error;
+    fn emit_error(&mut self, error: ReplaceSourceError) -> Effects {
+        self.state = ReplaceSourceState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
-    fn abort_with_error(&mut self, error: ReplaceSourceConnectorError) -> Effects {
+    fn abort_with_error(&mut self, error: ReplaceSourceError) -> Effects {
         let Some(txn_id) = self.txn_id.take() else {
             return self.emit_error(error);
         };
 
-        self.state = ReplaceSourceConnectorState::AbortTransaction;
+        self.state = ReplaceSourceState::AbortTransaction;
         self.output = Some(Err(error));
         smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
     }
 
-    fn fail_or_abort(&mut self, error: ReplaceSourceConnectorError) -> Effects {
+    fn fail_or_abort(&mut self, error: ReplaceSourceError) -> Effects {
         if self.txn_id.is_some() {
             self.abort_with_error(error)
         } else {
@@ -212,14 +212,14 @@ impl ReplaceSourceConnectorOperation {
             return self.emit_error(StorageError::TransactionNotFound.into());
         };
 
-        self.state = ReplaceSourceConnectorState::ScanReferenceVersions;
+        self.state = ReplaceSourceState::ScanReferenceVersions;
         smallvec![reference_scan_effect(start_after, Some(txn_id),)]
     }
 
     fn handle_scan_page(&mut self, event: Event) -> Effects {
         match parse_scan_page(event, self.input.connector_id) {
             Ok(ScanStep::Referenced) => {
-                self.abort_with_error(ReplaceSourceConnectorError::ReferencedByObjectVersion)
+                self.abort_with_error(ReplaceSourceError::ReferencedByObjectVersion)
             }
             Ok(ScanStep::NextPage(start_after)) => self.scan_reference_versions(Some(start_after)),
             Ok(ScanStep::Complete) => self.write_records(),
@@ -237,7 +237,7 @@ impl ReplaceSourceConnectorOperation {
                 self.txn_id = None;
                 self.emit_error(error.into())
             }
-            received => self.fail_or_abort(ReplaceSourceConnectorError::InvalidStateEvent {
+            received => self.fail_or_abort(ReplaceSourceError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                 received,
@@ -249,10 +249,10 @@ impl ReplaceSourceConnectorOperation {
         match event {
             Event::Storage(StorageEvent::TransactionAborted { .. })
             | Event::Storage(StorageEvent::Error { .. }) => {
-                self.state = ReplaceSourceConnectorState::Error;
+                self.state = ReplaceSourceState::Error;
                 smallvec![]
             }
-            received => self.emit_error(ReplaceSourceConnectorError::InvalidStateEvent {
+            received => self.emit_error(ReplaceSourceError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionAborted)",
                 received,
@@ -262,10 +262,10 @@ impl ReplaceSourceConnectorOperation {
 
     fn write_records(&mut self) -> Effects {
         let Some(replacement) = self.replacement.clone() else {
-            return self.fail_or_abort(ReplaceSourceConnectorError::ReplaceSourceConnectorFailed);
+            return self.fail_or_abort(ReplaceSourceError::ReplaceSourceConnectorFailed);
         };
 
-        self.state = ReplaceSourceConnectorState::WriteRecords;
+        self.state = ReplaceSourceState::WriteRecords;
 
         if let Some(secret) = self.replacement_secret.as_ref() {
             let connector_bytes = match replacement.to_bytes() {
@@ -311,14 +311,14 @@ impl ReplaceSourceConnectorOperation {
                 self.commit_or_finish()
             }
             (None, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.state = ReplaceSourceConnectorState::DeleteSecret;
+                self.state = ReplaceSourceState::DeleteSecret;
                 smallvec![delete_secret_effect(self.input.connector_id, self.txn_id,)]
             }
             (_, Event::Storage(StorageEvent::Error { error })) if self.txn_id.is_some() => {
                 self.abort_with_error(error.into())
             }
             (_, Event::Storage(StorageEvent::Error { error })) => self.emit_error(error.into()),
-            (_, received) => self.fail_or_abort(ReplaceSourceConnectorError::InvalidStateEvent {
+            (_, received) => self.fail_or_abort(ReplaceSourceError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchWriteResult | WriteResult)",
                 received,
@@ -334,7 +334,7 @@ impl ReplaceSourceConnectorOperation {
             }
             Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
             received => {
-                return self.fail_or_abort(ReplaceSourceConnectorError::InvalidStateEvent {
+                return self.fail_or_abort(ReplaceSourceError::InvalidStateEvent {
                     state: self.state.clone(),
                     expected: "Event::Storage(StorageEvent::DeleteResult)",
                     received,
@@ -347,7 +347,7 @@ impl ReplaceSourceConnectorOperation {
 
     fn commit_or_finish(&mut self) -> Effects {
         if let Some(txn_id) = self.txn_id {
-            self.state = ReplaceSourceConnectorState::CommitTransaction;
+            self.state = ReplaceSourceState::CommitTransaction;
             return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
         }
 
@@ -356,11 +356,11 @@ impl ReplaceSourceConnectorOperation {
 
     fn finish(&mut self) -> Effects {
         let Some(connector) = self.replacement.clone() else {
-            return self.emit_error(ReplaceSourceConnectorError::ReplaceSourceConnectorFailed);
+            return self.emit_error(ReplaceSourceError::ReplaceSourceConnectorFailed);
         };
 
-        self.state = ReplaceSourceConnectorState::Finish;
-        self.output = Some(Ok(ReplaceSourceConnectorResult {
+        self.state = ReplaceSourceState::Finish;
+        self.output = Some(Ok(ReplaceSourceResult {
             connector,
             has_secret_config: self.replacement_secret.is_some(),
         }));
@@ -375,9 +375,9 @@ fn secret_config_changed(
     current.map(|secret| &secret.secret_config) != replacement.map(|secret| &secret.secret_config)
 }
 
-impl Operation for ReplaceSourceConnectorOperation {
-    type Output = ReplaceSourceConnectorResult;
-    type Error = ReplaceSourceConnectorError;
+impl Operation for ReplaceSourceOperation {
+    type Output = ReplaceSourceResult;
+    type Error = ReplaceSourceError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -385,44 +385,42 @@ impl Operation for ReplaceSourceConnectorOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            ReplaceSourceConnectorState::Init => self.handle_init(),
-            ReplaceSourceConnectorState::ReadCurrent => self.handle_current_read(event),
-            ReplaceSourceConnectorState::ReadSecret => self.handle_secret_read(event),
-            ReplaceSourceConnectorState::StartTransaction => self.handle_transaction_started(event),
-            ReplaceSourceConnectorState::ScanReferenceVersions => self.handle_scan_page(event),
-            ReplaceSourceConnectorState::WriteRecords => self.handle_records_written(event),
-            ReplaceSourceConnectorState::DeleteSecret => self.handle_secret_deleted(event),
-            ReplaceSourceConnectorState::CommitTransaction => {
-                self.handle_transaction_committed(event)
-            }
-            ReplaceSourceConnectorState::AbortTransaction => self.handle_transaction_aborted(event),
-            ReplaceSourceConnectorState::Finish => smallvec![],
-            ReplaceSourceConnectorState::Error => self.abort(),
+            ReplaceSourceState::Init => self.handle_init(),
+            ReplaceSourceState::ReadCurrent => self.handle_current_read(event),
+            ReplaceSourceState::ReadSecret => self.handle_secret_read(event),
+            ReplaceSourceState::StartTransaction => self.handle_transaction_started(event),
+            ReplaceSourceState::ScanReferenceVersions => self.handle_scan_page(event),
+            ReplaceSourceState::WriteRecords => self.handle_records_written(event),
+            ReplaceSourceState::DeleteSecret => self.handle_secret_deleted(event),
+            ReplaceSourceState::CommitTransaction => self.handle_transaction_committed(event),
+            ReplaceSourceState::AbortTransaction => self.handle_transaction_aborted(event),
+            ReplaceSourceState::Finish => smallvec![],
+            ReplaceSourceState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            ReplaceSourceConnectorState::Finish | ReplaceSourceConnectorState::Error
+            ReplaceSourceState::Finish | ReplaceSourceState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ReplaceSourceConnectorState::Error {
+        if self.state == ReplaceSourceState::Error {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(ReplaceSourceConnectorError::ReplaceSourceConnectorFailed);
+            return Err(ReplaceSourceError::ReplaceSourceConnectorFailed);
         }
 
         self.output
-            .ok_or(ReplaceSourceConnectorError::ReplaceSourceConnectorFailed)?
+            .ok_or(ReplaceSourceError::ReplaceSourceConnectorFailed)?
     }
 
     fn abort(&mut self) -> Effects {
         if let Some(txn_id) = self.txn_id.take() {
-            self.state = ReplaceSourceConnectorState::AbortTransaction;
+            self.state = ReplaceSourceState::AbortTransaction;
             return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
         }
         smallvec![]
@@ -432,12 +430,8 @@ impl Operation for ReplaceSourceConnectorOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::create_connector::{
-        CreateSourceConnectorInput, CreateSourceConnectorOperation,
-    };
-    use crate::connectors::resolver::{
-        ResolveVersionSourceBindingInput, ResolveVersionSourceBindingOperation,
-    };
+    use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
+    use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
     use crate::driver::{DriverContext, drive};
     use crate::staging::descriptor::build_source_binding;
     use aruna_core::effects::IterStart;
@@ -475,7 +469,7 @@ mod tests {
 
     async fn create_connector(context: &DriverContext) -> SourceConnector {
         drive(
-            CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
+            SourceConnectorOperation::new(SourceConnectorInput {
                 group_id: ulid::Ulid::generate(),
                 created_by: Default::default(),
                 name: "dav-source".to_string(),
@@ -582,7 +576,7 @@ mod tests {
         let group_id = Ulid::from_bytes([1u8; 16]);
         let connector_id = Ulid::from_bytes([2u8; 16]);
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
             group_id,
             connector_id,
             name: "new".to_string(),
@@ -590,7 +584,7 @@ mod tests {
             public_config: HashMap::new(),
             secret_config: HashMap::new(),
         });
-        operation.state = ReplaceSourceConnectorState::ReadSecret;
+        operation.state = ReplaceSourceState::ReadSecret;
         operation.replacement = Some(replacement_connector(group_id, connector_id));
         operation.replacement_secret = Some(connector_secret(connector_id, "bob"));
 
@@ -641,7 +635,7 @@ mod tests {
     fn reference_aborts_replace() {
         let connector_id = Ulid::from_bytes([2u8; 16]);
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id,
             name: "new".to_string(),
@@ -649,7 +643,7 @@ mod tests {
             public_config: HashMap::new(),
             secret_config: HashMap::new(),
         });
-        operation.state = ReplaceSourceConnectorState::ScanReferenceVersions;
+        operation.state = ReplaceSourceState::ScanReferenceVersions;
         operation.txn_id = Some(txn_id);
         operation.replacement = Some(replacement_connector(Ulid::generate(), connector_id));
         operation.replacement_secret = Some(connector_secret(connector_id, "bob"));
@@ -673,7 +667,7 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert_eq!(
             operation.finalize(),
-            Err(ReplaceSourceConnectorError::ReferencedByObjectVersion)
+            Err(ReplaceSourceError::ReferencedByObjectVersion)
         );
     }
 
@@ -683,7 +677,7 @@ mod tests {
         let connector_id = Ulid::from_bytes([2u8; 16]);
         let txn_id = Ulid::from_bytes([3u8; 16]);
         let next_key: Key = vec![9u8].into();
-        let mut operation = ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
             group_id,
             connector_id,
             name: "new".to_string(),
@@ -691,7 +685,7 @@ mod tests {
             public_config: HashMap::new(),
             secret_config: HashMap::new(),
         });
-        operation.state = ReplaceSourceConnectorState::ScanReferenceVersions;
+        operation.state = ReplaceSourceState::ScanReferenceVersions;
         operation.txn_id = Some(txn_id);
         operation.replacement = Some(replacement_connector(group_id, connector_id));
 
@@ -724,7 +718,7 @@ mod tests {
         let connector_id = Ulid::from_bytes([2u8; 16]);
         let txn_id = Ulid::from_bytes([3u8; 16]);
         let next_key: Key = vec![9u8].into();
-        let mut operation = ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id,
             name: "new".to_string(),
@@ -732,7 +726,7 @@ mod tests {
             public_config: HashMap::new(),
             secret_config: HashMap::new(),
         });
-        operation.state = ReplaceSourceConnectorState::ScanReferenceVersions;
+        operation.state = ReplaceSourceState::ScanReferenceVersions;
         operation.txn_id = Some(txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::IterResult {
@@ -766,14 +760,14 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert_eq!(
             operation.finalize(),
-            Err(ReplaceSourceConnectorError::ReferencedByObjectVersion)
+            Err(ReplaceSourceError::ReferencedByObjectVersion)
         );
     }
 
     #[test]
     fn scan_failure_aborts() {
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id: Ulid::from_bytes([2u8; 16]),
             name: "new".to_string(),
@@ -781,7 +775,7 @@ mod tests {
             public_config: HashMap::new(),
             secret_config: HashMap::new(),
         });
-        operation.state = ReplaceSourceConnectorState::ScanReferenceVersions;
+        operation.state = ReplaceSourceState::ScanReferenceVersions;
         operation.txn_id = Some(txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
@@ -796,16 +790,16 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert_eq!(
             operation.finalize(),
-            Err(ReplaceSourceConnectorError::StorageError(
-                StorageError::ReadError("unexpected event".to_string())
-            ))
+            Err(ReplaceSourceError::StorageError(StorageError::ReadError(
+                "unexpected event".to_string()
+            )))
         );
     }
 
     #[test]
     fn commit_failure_reports() {
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id: Ulid::from_bytes([2u8; 16]),
             name: "new".to_string(),
@@ -813,7 +807,7 @@ mod tests {
             public_config: HashMap::new(),
             secret_config: HashMap::new(),
         });
-        operation.state = ReplaceSourceConnectorState::CommitTransaction;
+        operation.state = ReplaceSourceState::CommitTransaction;
         operation.txn_id = Some(txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {
@@ -823,16 +817,16 @@ mod tests {
         assert!(operation.txn_id.is_none());
         assert_eq!(
             operation.finalize(),
-            Err(ReplaceSourceConnectorError::StorageError(
-                StorageError::ReadError("commit failed".to_string())
-            ))
+            Err(ReplaceSourceError::StorageError(StorageError::ReadError(
+                "commit failed".to_string()
+            )))
         );
     }
 
     #[test]
     fn invalid_commit_aborts() {
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id: Ulid::from_bytes([2u8; 16]),
             name: "new".to_string(),
@@ -840,7 +834,7 @@ mod tests {
             public_config: HashMap::new(),
             secret_config: HashMap::new(),
         });
-        operation.state = ReplaceSourceConnectorState::CommitTransaction;
+        operation.state = ReplaceSourceState::CommitTransaction;
         operation.txn_id = Some(txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
@@ -855,7 +849,7 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert!(matches!(
             operation.finalize(),
-            Err(ReplaceSourceConnectorError::InvalidStateEvent {
+            Err(ReplaceSourceError::InvalidStateEvent {
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                 ..
             })
@@ -865,7 +859,7 @@ mod tests {
     #[test]
     fn abort_emits_transaction() {
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id: Ulid::from_bytes([2u8; 16]),
             name: "new".to_string(),
@@ -898,7 +892,7 @@ mod tests {
         };
 
         let created = drive(
-            CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
+            SourceConnectorOperation::new(SourceConnectorInput {
                 group_id: ulid::Ulid::generate(),
                 created_by: Default::default(),
                 name: "old".to_string(),
@@ -915,7 +909,7 @@ mod tests {
         .unwrap();
 
         let replaced = drive(
-            ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+            ReplaceSourceOperation::new(ReplaceSourceInput {
                 group_id: created.connector.group_id,
                 connector_id: created.connector.connector_id,
                 name: "new".to_string(),
@@ -950,7 +944,7 @@ mod tests {
         write_reference_version(&context, source).await;
 
         let result = drive(
-            ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+            ReplaceSourceOperation::new(ReplaceSourceInput {
                 group_id: connector.group_id,
                 connector_id: connector.connector_id,
                 name: "new".to_string(),
@@ -965,10 +959,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            result,
-            Err(ReplaceSourceConnectorError::ReferencedByObjectVersion)
-        );
+        assert_eq!(result, Err(ReplaceSourceError::ReferencedByObjectVersion));
     }
 
     #[tokio::test]
@@ -986,7 +977,7 @@ mod tests {
         write_reference_version(&context, source.clone()).await;
 
         let replaced = drive(
-            ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+            ReplaceSourceOperation::new(ReplaceSourceInput {
                 group_id: connector.group_id,
                 connector_id: connector.connector_id,
                 name: "new".to_string(),
@@ -1011,7 +1002,7 @@ mod tests {
         assert_eq!(replaced.connector.name, "new");
 
         let access = drive(
-            ResolveVersionSourceBindingOperation::new(ResolveVersionSourceBindingInput { source }),
+            ResolveBindingOperation::new(ResolveBindingInput { source }),
             &context,
         )
         .await
