@@ -36,7 +36,7 @@ use super::version_replication::{
 };
 use crate::driver::{DriverContext, drive, gate_context, now_ms, quota_marked_routing};
 use crate::notifications::watch::emit::emit_watch_event;
-use crate::s3::get_bucket::GetBucketInfoOperation;
+use crate::s3::get_bucket::GetBucketOperation;
 use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 
@@ -52,7 +52,7 @@ pub const BLOB_REPLICATION_POLL_AFTER: Duration = Duration::from_secs(5);
 pub const BLOB_REPLICATION_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlobReplicationJobRecord {
+pub struct BlobJobRecord {
     pub input: ReplicateScopeInput,
     pub source_delete_marker: Option<bool>,
     pub due_at_ms: u64,
@@ -67,13 +67,13 @@ pub struct BlobReplicationJobRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueueBlobReplicationResult {
+pub struct QueueBlobResult {
     pub queued: usize,
     pub scheduled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlobReplicationDrainResult {
+pub struct BlobDrainResult {
     pub processed: usize,
     pub succeeded: usize,
     pub failed: usize,
@@ -82,7 +82,7 @@ pub struct BlobReplicationDrainResult {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum BlobReplicationQueueError {
+pub enum BlobQueueError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -94,7 +94,7 @@ pub enum BlobReplicationQueueError {
 }
 
 #[derive(Serialize)]
-struct BlobReplicationJobIdentity<'a> {
+struct BlobJobIdentity<'a> {
     mode: ReplicationMode,
     bucket: &'a str,
     target: &'a ReplicateScopeTarget,
@@ -112,7 +112,7 @@ pub struct LiveReplicationContinuation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LiveReplicationObligationRecord {
+pub struct LiveObligationRecord {
     pub local_node_id: NodeId,
     pub auth_context: AuthContext,
     pub bucket: String,
@@ -126,14 +126,14 @@ pub struct LiveReplicationObligationRecord {
 }
 
 #[derive(Serialize)]
-struct LiveReplicationObligationIdentity<'a> {
+struct LiveObligationIdentity<'a> {
     bucket: &'a str,
     key: &'a str,
     version_id: Ulid,
 }
 
-struct BlobReplicationJobScan {
-    jobs: Vec<(Vec<u8>, BlobReplicationJobRecord)>,
+struct BlobJobScan {
+    jobs: Vec<(Vec<u8>, BlobJobRecord)>,
     has_more_due: bool,
     next_due_at_ms: Option<u64>,
     next_cursor: ReplicationScanCursor,
@@ -157,19 +157,19 @@ struct ReplicationScanCursor {
     next_due_at_ms: Option<u64>,
 }
 
-enum BlobReplicationJobOutcome {
+enum BlobJobOutcome {
     Succeeded,
     TerminalFailure,
 }
 
 #[derive(Default)]
-struct LiveReplicationRepairResult {
+struct LiveRepairResult {
     processed: usize,
     queued: usize,
     has_more: bool,
 }
 
-impl BlobReplicationJobRecord {
+impl BlobJobRecord {
     pub fn new(
         input: ReplicateScopeInput,
         source_delete_marker: Option<bool>,
@@ -242,7 +242,7 @@ impl BlobReplicationJobRecord {
     }
 }
 
-impl LiveReplicationObligationRecord {
+impl LiveObligationRecord {
     pub fn new(
         local_node_id: NodeId,
         auth_context: AuthContext,
@@ -293,8 +293,8 @@ impl LiveReplicationObligationRecord {
     }
 }
 
-pub fn blob_job_key(record: &BlobReplicationJobRecord) -> Result<Key, ConversionError> {
-    let identity = BlobReplicationJobIdentity {
+pub fn blob_job_key(record: &BlobJobRecord) -> Result<Key, ConversionError> {
+    let identity = BlobJobIdentity {
         mode: record.input.mode,
         bucket: &record.input.bucket,
         target: &record.input.target,
@@ -309,9 +309,7 @@ pub fn blob_job_key(record: &BlobReplicationJobRecord) -> Result<Key, Conversion
     Ok(ByteView::from(key))
 }
 
-fn blob_job_entry(
-    record: &BlobReplicationJobRecord,
-) -> Result<(String, Key, ByteView), ConversionError> {
+fn blob_job_entry(record: &BlobJobRecord) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((
         BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
         blob_job_key(record)?,
@@ -319,17 +317,12 @@ fn blob_job_entry(
     ))
 }
 
-fn blob_job_preferred(
-    candidate: &BlobReplicationJobRecord,
-    current: &BlobReplicationJobRecord,
-) -> bool {
+fn blob_job_preferred(candidate: &BlobJobRecord, current: &BlobJobRecord) -> bool {
     (candidate.attempts, candidate.due_at_ms) > (current.attempts, current.due_at_ms)
 }
 
-pub fn live_obligation_key(
-    record: &LiveReplicationObligationRecord,
-) -> Result<Key, ConversionError> {
-    let identity = LiveReplicationObligationIdentity {
+pub fn live_obligation_key(record: &LiveObligationRecord) -> Result<Key, ConversionError> {
+    let identity = LiveObligationIdentity {
         bucket: &record.bucket,
         key: &record.key,
         version_id: record.version_id,
@@ -340,7 +333,7 @@ pub fn live_obligation_key(
 }
 
 pub(crate) fn live_obligation_entry(
-    record: &LiveReplicationObligationRecord,
+    record: &LiveObligationRecord,
 ) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((
         BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
@@ -350,7 +343,7 @@ pub(crate) fn live_obligation_entry(
 }
 
 pub(crate) fn live_obligation_effect(
-    record: LiveReplicationObligationRecord,
+    record: LiveObligationRecord,
     txn_id: Option<Ulid>,
 ) -> Result<Effect, ConversionError> {
     let (key_space, key, value) = live_obligation_entry(&record)?;
@@ -371,7 +364,7 @@ pub fn build_live_obligation(
     delete_marker: bool,
     txn_id: Option<Ulid>,
 ) -> Result<Effect, ConversionError> {
-    let record = LiveReplicationObligationRecord::new(
+    let record = LiveObligationRecord::new(
         local_node_id,
         auth_context,
         bucket,
@@ -390,7 +383,7 @@ pub fn schedule_blob_drain() -> Effect {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum QueueBlobReplicationState {
+enum QueueBlobState {
     Init,
     ReadExisting,
     WriteJob,
@@ -400,21 +393,17 @@ enum QueueBlobReplicationState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct QueueBlobReplicationOperation {
-    job: BlobReplicationJobRecord,
-    state: QueueBlobReplicationState,
-    output: Option<Result<QueueBlobReplicationResult, BlobReplicationQueueError>>,
+pub struct QueueBlobOperation {
+    job: BlobJobRecord,
+    state: QueueBlobState,
+    output: Option<Result<QueueBlobResult, BlobQueueError>>,
 }
 
-impl QueueBlobReplicationOperation {
+impl QueueBlobOperation {
     pub fn new(input: ReplicateScopeInput, source_delete_marker: Option<bool>) -> Self {
         Self {
-            job: BlobReplicationJobRecord::new(
-                input,
-                source_delete_marker,
-                unix_timestamp_millis(),
-            ),
-            state: QueueBlobReplicationState::Init,
+            job: BlobJobRecord::new(input, source_delete_marker, unix_timestamp_millis()),
+            state: QueueBlobState::Init,
             output: None,
         }
     }
@@ -425,19 +414,19 @@ impl QueueBlobReplicationOperation {
         relationship_id: Ulid,
     ) -> Self {
         Self {
-            job: BlobReplicationJobRecord::new_relationship(
+            job: BlobJobRecord::new_relationship(
                 input,
                 source_delete_marker,
                 relationship_id,
                 unix_timestamp_millis(),
             ),
-            state: QueueBlobReplicationState::Init,
+            state: QueueBlobState::Init,
             output: None,
         }
     }
 
-    fn fail(&mut self, error: BlobReplicationQueueError) -> Effects {
-        self.state = QueueBlobReplicationState::Error;
+    fn fail(&mut self, error: BlobQueueError) -> Effects {
+        self.state = QueueBlobState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
@@ -447,7 +436,7 @@ impl QueueBlobReplicationOperation {
             Ok(key) => key,
             Err(error) => return self.fail(error.into()),
         };
-        self.state = QueueBlobReplicationState::ReadExisting;
+        self.state = QueueBlobState::ReadExisting;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
             key,
@@ -460,7 +449,7 @@ impl QueueBlobReplicationOperation {
             Ok(entry) => entry,
             Err(error) => return self.fail(error.into()),
         };
-        self.state = QueueBlobReplicationState::WriteJob;
+        self.state = QueueBlobState::WriteJob;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space,
             key,
@@ -470,13 +459,13 @@ impl QueueBlobReplicationOperation {
     }
 
     fn schedule_drain(&mut self) -> Effects {
-        self.state = QueueBlobReplicationState::ScheduleDrain;
+        self.state = QueueBlobState::ScheduleDrain;
         smallvec![schedule_blob_drain()]
     }
 
     fn finish(&mut self, scheduled: bool) -> Effects {
-        self.state = QueueBlobReplicationState::Finish;
-        self.output = Some(Ok(QueueBlobReplicationResult {
+        self.state = QueueBlobState::Finish;
+        self.output = Some(Ok(QueueBlobResult {
             queued: 1,
             scheduled,
         }));
@@ -484,9 +473,9 @@ impl QueueBlobReplicationOperation {
     }
 }
 
-impl Operation for QueueBlobReplicationOperation {
-    type Output = QueueBlobReplicationResult;
-    type Error = BlobReplicationQueueError;
+impl Operation for QueueBlobOperation {
+    type Output = QueueBlobResult;
+    type Error = BlobQueueError;
 
     fn start(&mut self) -> Effects {
         self.read_existing()
@@ -494,11 +483,11 @@ impl Operation for QueueBlobReplicationOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            QueueBlobReplicationState::Init => self.read_existing(),
-            QueueBlobReplicationState::ReadExisting => match event {
+            QueueBlobState::Init => self.read_existing(),
+            QueueBlobState::ReadExisting => match event {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
-                }) => match BlobReplicationJobRecord::from_bytes(&value) {
+                }) => match BlobJobRecord::from_bytes(&value) {
                     Ok(existing) if blob_job_preferred(&existing, &self.job) => {
                         self.schedule_drain()
                     }
@@ -506,18 +495,14 @@ impl Operation for QueueBlobReplicationOperation {
                 },
                 Event::Storage(StorageEvent::ReadResult { value: None, .. }) => self.write_job(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                ))),
+                other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
             },
-            QueueBlobReplicationState::WriteJob => match event {
+            QueueBlobState::WriteJob => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => self.schedule_drain(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                ))),
+                other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
             },
-            QueueBlobReplicationState::ScheduleDrain => match event {
+            QueueBlobState::ScheduleDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(true),
                 Event::Task(TaskEvent::Error { .. }) => self.finish(false),
                 other => {
@@ -525,23 +510,20 @@ impl Operation for QueueBlobReplicationOperation {
                     self.finish(false)
                 }
             },
-            QueueBlobReplicationState::Finish => smallvec![],
-            QueueBlobReplicationState::Error => smallvec![],
+            QueueBlobState::Finish => smallvec![],
+            QueueBlobState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            QueueBlobReplicationState::Finish | QueueBlobReplicationState::Error
-        )
+        matches!(self.state, QueueBlobState::Finish | QueueBlobState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         match self.output {
             Some(Ok(result)) => Ok(result),
             Some(Err(error)) => Err(error),
-            None => Err(BlobReplicationQueueError::UnexpectedEvent(
+            None => Err(BlobQueueError::UnexpectedEvent(
                 "queue operation finished without output".to_string(),
             )),
         }
@@ -553,7 +535,7 @@ impl Operation for QueueBlobReplicationOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueueLiveVersionReplicationInput {
+pub struct LiveVersionInput {
     pub local_node_id: NodeId,
     pub auth_context: AuthContext,
     pub bucket: String,
@@ -563,7 +545,7 @@ pub struct QueueLiveVersionReplicationInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum QueueLiveVersionReplicationState {
+enum LiveVersionState {
     Init,
     StartObligation,
     ReadObligation,
@@ -576,23 +558,23 @@ enum QueueLiveVersionReplicationState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct QueueLiveVersionReplicationOperation {
-    input: QueueLiveVersionReplicationInput,
+pub struct LiveVersionOperation {
+    input: LiveVersionInput,
     reference_advance: Option<ReferenceAdvance>,
-    state: QueueLiveVersionReplicationState,
+    state: LiveVersionState,
     seed_key: Option<Key>,
     seed_value: Option<ByteView>,
     txn_id: Option<Ulid>,
-    abort_error: Option<BlobReplicationQueueError>,
-    output: Option<Result<QueueBlobReplicationResult, BlobReplicationQueueError>>,
+    abort_error: Option<BlobQueueError>,
+    output: Option<Result<QueueBlobResult, BlobQueueError>>,
 }
 
-impl QueueLiveVersionReplicationOperation {
-    pub fn new(input: QueueLiveVersionReplicationInput) -> Self {
+impl LiveVersionOperation {
+    pub fn new(input: LiveVersionInput) -> Self {
         Self {
             input,
             reference_advance: None,
-            state: QueueLiveVersionReplicationState::Init,
+            state: LiveVersionState::Init,
             seed_key: None,
             seed_value: None,
             txn_id: None,
@@ -606,14 +588,14 @@ impl QueueLiveVersionReplicationOperation {
         self
     }
 
-    fn fail(&mut self, error: BlobReplicationQueueError) -> Effects {
-        self.state = QueueLiveVersionReplicationState::Error;
+    fn fail(&mut self, error: BlobQueueError) -> Effects {
+        self.state = LiveVersionState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
-    fn seed_record(&self) -> LiveReplicationObligationRecord {
-        let mut record = LiveReplicationObligationRecord::new(
+    fn seed_record(&self) -> LiveObligationRecord {
+        let mut record = LiveObligationRecord::new(
             self.input.local_node_id,
             self.input.auth_context.clone(),
             self.input.bucket.clone(),
@@ -636,20 +618,20 @@ impl QueueLiveVersionReplicationOperation {
         };
         self.seed_key = Some(key);
         self.seed_value = Some(value);
-        self.state = QueueLiveVersionReplicationState::StartObligation;
+        self.state = LiveVersionState::StartObligation;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
         })]
     }
 
-    fn abort_obligation(&mut self, error: Option<BlobReplicationQueueError>) -> Effects {
+    fn abort_obligation(&mut self, error: Option<BlobQueueError>) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
+            return self.fail(BlobQueueError::UnexpectedEvent(
                 "obligation transaction is not active".to_string(),
             ));
         };
         self.abort_error = error;
-        self.state = QueueLiveVersionReplicationState::AbortObligation;
+        self.state = LiveVersionState::AbortObligation;
         smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
     }
 
@@ -657,11 +639,11 @@ impl QueueLiveVersionReplicationOperation {
         let (Some(key), Some(value), Some(txn_id)) =
             (self.seed_key.clone(), self.seed_value.clone(), self.txn_id)
         else {
-            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
+            return self.fail(BlobQueueError::UnexpectedEvent(
                 "obligation write is not prepared".to_string(),
             ));
         };
-        self.state = QueueLiveVersionReplicationState::WriteObligation;
+        self.state = LiveVersionState::WriteObligation;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
             key,
@@ -672,16 +654,16 @@ impl QueueLiveVersionReplicationOperation {
 
     fn read_obligation(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
+            return self.fail(BlobQueueError::UnexpectedEvent(
                 "obligation transaction is not active".to_string(),
             ));
         };
         let Some(key) = self.seed_key.clone() else {
-            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
+            return self.fail(BlobQueueError::UnexpectedEvent(
                 "obligation key is not prepared".to_string(),
             ));
         };
-        self.state = QueueLiveVersionReplicationState::ReadObligation;
+        self.state = LiveVersionState::ReadObligation;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
             key,
@@ -691,29 +673,29 @@ impl QueueLiveVersionReplicationOperation {
 
     fn commit_obligation(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
+            return self.fail(BlobQueueError::UnexpectedEvent(
                 "obligation transaction is not active".to_string(),
             ));
         };
-        self.state = QueueLiveVersionReplicationState::CommitObligation;
+        self.state = LiveVersionState::CommitObligation;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn schedule_drain(&mut self) -> Effects {
-        self.state = QueueLiveVersionReplicationState::ScheduleDrain;
+        self.state = LiveVersionState::ScheduleDrain;
         smallvec![schedule_blob_drain()]
     }
 
     fn finish(&mut self, queued: usize, scheduled: bool) -> Effects {
-        self.state = QueueLiveVersionReplicationState::Finish;
-        self.output = Some(Ok(QueueBlobReplicationResult { queued, scheduled }));
+        self.state = LiveVersionState::Finish;
+        self.output = Some(Ok(QueueBlobResult { queued, scheduled }));
         smallvec![]
     }
 }
 
-impl Operation for QueueLiveVersionReplicationOperation {
-    type Output = QueueBlobReplicationResult;
-    type Error = BlobReplicationQueueError;
+impl Operation for LiveVersionOperation {
+    type Output = QueueBlobResult;
+    type Error = BlobQueueError;
 
     fn start(&mut self) -> Effects {
         self.start_obligation()
@@ -721,54 +703,48 @@ impl Operation for QueueLiveVersionReplicationOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            QueueLiveVersionReplicationState::Init => self.start_obligation(),
-            QueueLiveVersionReplicationState::StartObligation => match event {
+            LiveVersionState::Init => self.start_obligation(),
+            LiveVersionState::StartObligation => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.txn_id = Some(txn_id);
                     self.read_obligation()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                ))),
+                other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
             },
-            QueueLiveVersionReplicationState::ReadObligation => match event {
+            LiveVersionState::ReadObligation => match event {
                 Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
                     self.write_obligation()
                 }
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
-                }) => match LiveReplicationObligationRecord::from_bytes(&value) {
+                }) => match LiveObligationRecord::from_bytes(&value) {
                     Ok(_) => self.abort_obligation(None),
                     Err(_) => self.write_obligation(),
                 },
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.abort_obligation(Some(error.into()))
                 }
-                other => self.abort_obligation(Some(BlobReplicationQueueError::UnexpectedEvent(
-                    format!("{other:?}"),
-                ))),
+                other => self
+                    .abort_obligation(Some(BlobQueueError::UnexpectedEvent(format!("{other:?}")))),
             },
-            QueueLiveVersionReplicationState::WriteObligation => match event {
+            LiveVersionState::WriteObligation => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => self.commit_obligation(),
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.abort_obligation(Some(error.into()))
                 }
-                other => self.abort_obligation(Some(BlobReplicationQueueError::UnexpectedEvent(
-                    format!("{other:?}"),
-                ))),
+                other => self
+                    .abort_obligation(Some(BlobQueueError::UnexpectedEvent(format!("{other:?}")))),
             },
-            QueueLiveVersionReplicationState::CommitObligation => match event {
+            LiveVersionState::CommitObligation => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.schedule_drain(),
                 Event::Storage(StorageEvent::Error {
                     error: StorageError::TransactionConflict,
                 }) => self.schedule_drain(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                ))),
+                other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
             },
-            QueueLiveVersionReplicationState::AbortObligation => match event {
+            LiveVersionState::AbortObligation => match event {
                 Event::Storage(StorageEvent::TransactionAborted { .. }) => {
                     match self.abort_error.take() {
                         Some(error) => self.fail(error),
@@ -776,11 +752,9 @@ impl Operation for QueueLiveVersionReplicationOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                ))),
+                other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
             },
-            QueueLiveVersionReplicationState::ScheduleDrain => match event {
+            LiveVersionState::ScheduleDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(0, true),
                 Event::Task(TaskEvent::Error { .. }) => self.finish(0, false),
                 other => {
@@ -788,15 +762,15 @@ impl Operation for QueueLiveVersionReplicationOperation {
                     self.finish(0, false)
                 }
             },
-            QueueLiveVersionReplicationState::Finish => smallvec![],
-            QueueLiveVersionReplicationState::Error => smallvec![],
+            LiveVersionState::Finish => smallvec![],
+            LiveVersionState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            QueueLiveVersionReplicationState::Finish | QueueLiveVersionReplicationState::Error
+            LiveVersionState::Finish | LiveVersionState::Error
         )
     }
 
@@ -804,7 +778,7 @@ impl Operation for QueueLiveVersionReplicationOperation {
         match self.output {
             Some(Ok(result)) => Ok(result),
             Some(Err(error)) => Err(error),
-            None => Err(BlobReplicationQueueError::UnexpectedEvent(
+            None => Err(BlobQueueError::UnexpectedEvent(
                 "live replication queue operation finished without output".to_string(),
             )),
         }
@@ -829,7 +803,7 @@ pub async fn complete_put(
 ) {
     let actor = auth.user_id;
     match drive(
-        QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+        LiveVersionOperation::new(LiveVersionInput {
             local_node_id: node_id,
             auth_context: auth,
             bucket: bucket.clone(),
@@ -891,7 +865,7 @@ fn relationship_job(
     relationship: SyncRelationship,
     inbound_origin: Option<&SyncOrigin>,
     upstream_sources: &[ArunaArn],
-) -> Option<BlobReplicationJobRecord> {
+) -> Option<BlobJobRecord> {
     let RelationshipJobTarget {
         bucket,
         key,
@@ -936,7 +910,7 @@ fn relationship_job(
         next_sources.push(relationship.source.clone());
     }
     Some(
-        BlobReplicationJobRecord::new_relationship(
+        BlobJobRecord::new_relationship(
             ReplicateScopeInput {
                 bucket: bucket.to_string(),
                 target: ReplicateScopeTarget::Version {
@@ -1001,7 +975,7 @@ pub async fn restore_blob_timer(storage: &StorageHandle, task_handle: &TaskHandl
     }
 }
 
-pub async fn blob_jobs_exist(storage: &StorageHandle) -> Result<bool, BlobReplicationQueueError> {
+pub async fn blob_jobs_exist(storage: &StorageHandle) -> Result<bool, BlobQueueError> {
     if live_obligations_exist(storage).await? {
         return Ok(true);
     }
@@ -1018,9 +992,7 @@ pub async fn blob_jobs_exist(storage: &StorageHandle) -> Result<bool, BlobReplic
     {
         Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
@@ -1029,7 +1001,7 @@ pub async fn blob_jobs_exist(storage: &StorageHandle) -> Result<bool, BlobReplic
 pub async fn relationship_job_stats(
     context: &DriverContext,
     relationship_id: Ulid,
-) -> Result<(usize, Option<u64>), BlobReplicationQueueError> {
+) -> Result<(usize, Option<u64>), BlobQueueError> {
     let mut start = None;
     let mut pending = 0usize;
     let mut oldest = None::<u64>;
@@ -1050,7 +1022,7 @@ pub async fn relationship_job_stats(
                 next_start_after,
             }) => {
                 for (_, value) in values {
-                    let record = BlobReplicationJobRecord::from_bytes(value.as_ref())?;
+                    let record = BlobJobRecord::from_bytes(value.as_ref())?;
                     if record.relationship_id == Some(relationship_id) {
                         pending = pending.saturating_add(1);
                         oldest = Some(oldest.map_or(record.enqueued_at_ms, |current: u64| {
@@ -1065,17 +1037,13 @@ pub async fn relationship_job_stats(
             }
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
             }
         }
     }
 }
 
-pub async fn next_blob_timer(
-    storage: &StorageHandle,
-) -> Result<Option<Duration>, BlobReplicationQueueError> {
+pub async fn next_blob_timer(storage: &StorageHandle) -> Result<Option<Duration>, BlobQueueError> {
     if live_obligations_exist(storage).await? {
         return Ok(Some(Duration::ZERO));
     }
@@ -1096,9 +1064,7 @@ pub async fn next_blob_timer(
         .map(|due_at_ms| due_after(now_ms, due_at_ms)))
 }
 
-async fn live_obligations_exist(
-    storage: &StorageHandle,
-) -> Result<bool, BlobReplicationQueueError> {
+async fn live_obligations_exist(storage: &StorageHandle) -> Result<bool, BlobQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
@@ -1111,15 +1077,13 @@ async fn live_obligations_exist(
     {
         Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 pub async fn process_blob_batch(
     context: &DriverContext,
-) -> Result<BlobReplicationDrainResult, BlobReplicationQueueError> {
+) -> Result<BlobDrainResult, BlobQueueError> {
     let batch_started = Instant::now();
     let repair = process_live_obligations(context).await?;
     let now_ms = unix_timestamp_millis();
@@ -1145,11 +1109,11 @@ pub async fn process_blob_batch(
                 .cloned()
         });
         match process_blob_job(context, &job, relationship, &mut relationships).await {
-            Ok(BlobReplicationJobOutcome::Succeeded) => {
+            Ok(BlobJobOutcome::Succeeded) => {
                 delete_blob_job(&context.storage_handle, job_key).await?;
                 succeeded = succeeded.saturating_add(1);
             }
-            Ok(BlobReplicationJobOutcome::TerminalFailure) => {
+            Ok(BlobJobOutcome::TerminalFailure) => {
                 delete_blob_job(&context.storage_handle, job_key).await?;
                 failed = failed.saturating_add(1);
             }
@@ -1180,7 +1144,7 @@ pub async fn process_blob_batch(
         );
     }
 
-    Ok(BlobReplicationDrainResult {
+    Ok(BlobDrainResult {
         processed: job_count,
         succeeded,
         failed,
@@ -1199,7 +1163,7 @@ async fn load_source_authorization(
     source_node_id: NodeId,
     bucket: &str,
 ) -> Result<SourceAuthorization, (SourceAuthorizationError, Option<GroupId>)> {
-    let bucket_info = match drive(GetBucketInfoOperation::new(bucket.to_string()), context).await {
+    let bucket_info = match drive(GetBucketOperation::new(bucket.to_string()), context).await {
         Ok(bucket_info) => bucket_info,
         Err(error) => {
             return Err((
@@ -1316,10 +1280,7 @@ async fn emit_sync_watch(
     .await;
 }
 
-fn job_source_auth<'a>(
-    job: &'a BlobReplicationJobRecord,
-    creator: &'a AuthContext,
-) -> &'a AuthContext {
+fn job_source_auth<'a>(job: &'a BlobJobRecord, creator: &'a AuthContext) -> &'a AuthContext {
     if job.reference_advance.is_some()
         && job
             .origin
@@ -1333,38 +1294,38 @@ fn job_source_auth<'a>(
 }
 
 fn relationship_bucket<'a>(
-    job: &BlobReplicationJobRecord,
+    job: &BlobJobRecord,
     relationship: &'a SyncRelationship,
     relationship_id: Ulid,
-) -> Result<&'a str, BlobReplicationJobOutcome> {
+) -> Result<&'a str, BlobJobOutcome> {
     if relationship.state != SyncState::Enabled {
         info!(
             %relationship_id,
             state = ?relationship.state,
             "Skipping replication job for disabled sync relationship"
         );
-        return Err(BlobReplicationJobOutcome::Succeeded);
+        return Err(BlobJobOutcome::Succeeded);
     }
     if job.reference_advance.is_some()
         && relationship.mode != SyncMode::Reference
         && relationship.reference_handling != ReferenceHandling::Preserve
     {
-        return Err(BlobReplicationJobOutcome::TerminalFailure);
+        return Err(BlobJobOutcome::TerminalFailure);
     }
     relationship
         .source
         .bucket()
-        .ok_or(BlobReplicationJobOutcome::TerminalFailure)
+        .ok_or(BlobJobOutcome::TerminalFailure)
 }
 
 async fn process_blob_job(
     context: &DriverContext,
-    job: &BlobReplicationJobRecord,
+    job: &BlobJobRecord,
     stored_relationship: Option<SyncRelationship>,
     relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
-) -> Result<BlobReplicationJobOutcome, String> {
+) -> Result<BlobJobOutcome, String> {
     if job.reference_advance.is_some() && job.relationship_id.is_none() {
-        return Ok(BlobReplicationJobOutcome::TerminalFailure);
+        return Ok(BlobJobOutcome::TerminalFailure);
     }
     let routing = match quota_marked_routing(context).await {
         Ok(routing) => routing,
@@ -1372,7 +1333,7 @@ async fn process_blob_job(
         // backoff ceiling; the drain repair re-enqueues once it is repaired.
         Err(error) if error.storage().is_none() => {
             error!(error = %error, "Dropping blob replication job with undecodable routing inputs");
-            return Ok(BlobReplicationJobOutcome::TerminalFailure);
+            return Ok(BlobJobOutcome::TerminalFailure);
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -1393,7 +1354,7 @@ async fn process_blob_job(
                 relationship_id = %relationship_id,
                 "Skipping replication job for missing sync relationship"
             );
-            return Ok(BlobReplicationJobOutcome::Succeeded);
+            return Ok(BlobJobOutcome::Succeeded);
         };
         let bucket = match relationship_bucket(job, &relationship, relationship_id) {
             Ok(bucket) => bucket,
@@ -1420,7 +1381,7 @@ async fn process_blob_job(
             }
             Err((SourceAuthorizationError::Denied, group_id)) => {
                 if job.reference_advance.is_some() {
-                    return Ok(BlobReplicationJobOutcome::TerminalFailure);
+                    return Ok(BlobJobOutcome::TerminalFailure);
                 }
                 let mut relationship = relationship;
                 relationship.state = SyncState::Failed {
@@ -1433,7 +1394,7 @@ async fn process_blob_job(
                     emit_sync_watch(context, &relationship, group_id, 0, Some("access_denied"))
                         .await;
                 }
-                return Ok(BlobReplicationJobOutcome::TerminalFailure);
+                return Ok(BlobJobOutcome::TerminalFailure);
             }
             Err((SourceAuthorizationError::Unavailable(error), group_id)) => {
                 let mut relationship = relationship;
@@ -1469,7 +1430,7 @@ async fn process_blob_job(
                 bucket = %job.input.bucket,
                 "Dropping replication job without durable source writer"
             );
-            return Ok(BlobReplicationJobOutcome::TerminalFailure);
+            return Ok(BlobJobOutcome::TerminalFailure);
         };
         let Some(source_node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
             return Err("source node identity unavailable".to_string());
@@ -1484,7 +1445,7 @@ async fn process_blob_job(
         {
             Ok(authorization) => authorization,
             Err((SourceAuthorizationError::Denied, _)) => {
-                return Ok(BlobReplicationJobOutcome::TerminalFailure);
+                return Ok(BlobJobOutcome::TerminalFailure);
             }
             Err((SourceAuthorizationError::Unavailable(error), _)) => return Err(error),
         };
@@ -1507,12 +1468,12 @@ async fn process_blob_job(
 
 async fn finish_blob_job(
     context: &DriverContext,
-    job: &BlobReplicationJobRecord,
+    job: &BlobJobRecord,
     operation: ReplicateScopeOperation,
     mut relationship: Option<SyncRelationship>,
     watch_group_id: Option<GroupId>,
     relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
-) -> Result<BlobReplicationJobOutcome, String> {
+) -> Result<BlobJobOutcome, String> {
     let failure: Option<ReplicationFailure>;
     let error = match drive(operation, context).await {
         Ok(result) if result.failed == 0 => {
@@ -1524,17 +1485,17 @@ async fn finish_blob_job(
                     emit_sync_watch(context, relationship, group_id, result.replicated, None).await;
                 }
             }
-            return Ok(BlobReplicationJobOutcome::Succeeded);
+            return Ok(BlobJobOutcome::Succeeded);
         }
         Ok(result) => {
             failure = result.failure;
             if failure.is_some_and(ReplicationFailure::is_writer_denied) {
-                return Ok(BlobReplicationJobOutcome::TerminalFailure);
+                return Ok(BlobJobOutcome::TerminalFailure);
             }
             if job.reference_advance.is_some()
                 && failure.is_some_and(ReplicationFailure::is_access_denied)
             {
-                return Ok(BlobReplicationJobOutcome::TerminalFailure);
+                return Ok(BlobJobOutcome::TerminalFailure);
             }
             if result.replicated > 0
                 && let Some(relationship) = relationship.as_mut()
@@ -1564,7 +1525,7 @@ async fn finish_blob_job(
                     emit_sync_watch(context, relationship, group_id, 0, Some("access_denied"))
                         .await;
                 }
-                return Ok(BlobReplicationJobOutcome::TerminalFailure);
+                return Ok(BlobJobOutcome::TerminalFailure);
             }
             error
         }
@@ -1574,7 +1535,7 @@ async fn finish_blob_job(
         }
     };
     if failure.is_some_and(ReplicationFailure::is_denied) {
-        return Ok(BlobReplicationJobOutcome::TerminalFailure);
+        return Ok(BlobJobOutcome::TerminalFailure);
     }
     if let Some(relationship) = relationship.as_mut() {
         mark_failure(relationship, &error);
@@ -1589,7 +1550,7 @@ async fn finish_blob_job(
 
 fn cache_relationship(
     relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
-    job: &BlobReplicationJobRecord,
+    job: &BlobJobRecord,
     relationship: &SyncRelationship,
     stored: bool,
 ) {
@@ -1606,8 +1567,8 @@ fn cache_relationship(
 
 async fn read_job_relationships(
     storage: &StorageHandle,
-    jobs: &[(Vec<u8>, BlobReplicationJobRecord)],
-) -> Result<HashMap<(String, Ulid), SyncRelationship>, BlobReplicationQueueError> {
+    jobs: &[(Vec<u8>, BlobJobRecord)],
+) -> Result<HashMap<(String, Ulid), SyncRelationship>, BlobQueueError> {
     let mut requested = HashSet::new();
     let mut keys = Vec::new();
     for (_, job) in jobs {
@@ -1642,13 +1603,11 @@ async fn read_job_relationships(
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
         }
     };
     if values.len() != keys.len() {
-        return Err(BlobReplicationQueueError::UnexpectedEvent(
+        return Err(BlobQueueError::UnexpectedEvent(
             "blob replication relationship read count mismatch".to_string(),
         ));
     }
@@ -1673,7 +1632,7 @@ async fn read_job_relationships(
 
 async fn process_live_obligations(
     context: &DriverContext,
-) -> Result<LiveReplicationRepairResult, BlobReplicationQueueError> {
+) -> Result<LiveRepairResult, BlobQueueError> {
     let (obligations, has_more) = read_live_obligations(&context.storage_handle).await?;
     let mut starts = HashMap::<String, Option<Vec<u8>>>::new();
     for (_, obligation) in &obligations {
@@ -1718,7 +1677,7 @@ async fn process_live_obligations(
         relationship_work = relationship_work.saturating_add(page.values.len());
         relationship_cache.insert(bucket, page);
     }
-    let mut result = LiveReplicationRepairResult {
+    let mut result = LiveRepairResult {
         has_more,
         ..Default::default()
     };
@@ -1767,7 +1726,7 @@ async fn process_live_obligations(
 
 async fn read_live_obligations(
     storage: &StorageHandle,
-) -> Result<(Vec<(Vec<u8>, LiveReplicationObligationRecord)>, bool), BlobReplicationQueueError> {
+) -> Result<(Vec<(Vec<u8>, LiveObligationRecord)>, bool), BlobQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
@@ -1784,7 +1743,7 @@ async fn read_live_obligations(
         }) => {
             let mut obligations = Vec::with_capacity(values.len());
             for (key, value) in values {
-                match LiveReplicationObligationRecord::from_bytes(&value) {
+                match LiveObligationRecord::from_bytes(&value) {
                     Ok(record) => obligations.push((key.to_vec(), record)),
                     Err(error) => {
                         let key = key.to_vec();
@@ -1796,9 +1755,7 @@ async fn read_live_obligations(
             Ok((obligations, next_start_after.is_some()))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
@@ -1821,8 +1778,8 @@ fn continuation_newer(
 
 async fn write_live_obligation(
     storage: &StorageHandle,
-    record: &LiveReplicationObligationRecord,
-) -> Result<(), BlobReplicationQueueError> {
+    record: &LiveObligationRecord,
+) -> Result<(), BlobQueueError> {
     let (key_space, key, value) = live_obligation_entry(record)?;
     let txn_id = match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
@@ -1831,9 +1788,7 @@ async fn write_live_obligation(
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
         }
     };
     let (current, valid) = match storage
@@ -1847,7 +1802,7 @@ async fn write_live_obligation(
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => (None, true),
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
-        }) => match LiveReplicationObligationRecord::from_bytes(&value) {
+        }) => match LiveObligationRecord::from_bytes(&value) {
             Ok(record) => (Some(record), true),
             Err(_) => (None, false),
         },
@@ -1857,9 +1812,7 @@ async fn write_live_obligation(
         }
         other => {
             abort_cursor(storage, txn_id).await;
-            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
         }
     };
     let should_write = !valid
@@ -1891,9 +1844,7 @@ async fn write_live_obligation(
         }
         other => {
             abort_cursor(storage, txn_id).await;
-            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
         }
     }
     match storage
@@ -1902,9 +1853,7 @@ async fn write_live_obligation(
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
@@ -1913,7 +1862,7 @@ async fn read_relationships_limit(
     bucket: &str,
     start: Option<Vec<u8>>,
     limit: usize,
-) -> Result<RelationshipPage, BlobReplicationQueueError> {
+) -> Result<RelationshipPage, BlobQueueError> {
     let mut start_after = start.clone();
     let mut relationships = Vec::with_capacity(limit.min(REPLICATION_SCAN_PAGE_SIZE));
     if limit == 0 {
@@ -1940,9 +1889,7 @@ async fn read_relationships_limit(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
             }
         };
         for (key, value) in values {
@@ -1970,9 +1917,9 @@ async fn read_relationships_limit(
 
 async fn write_live_jobs(
     storage: &StorageHandle,
-    obligation: &LiveReplicationObligationRecord,
+    obligation: &LiveObligationRecord,
     relationships: Option<&RelationshipPage>,
-) -> Result<LiveRepairWrite, BlobReplicationQueueError> {
+) -> Result<LiveRepairWrite, BlobQueueError> {
     if obligation
         .origin
         .as_ref()
@@ -2086,9 +2033,9 @@ async fn write_live_jobs(
 
 async fn persist_live_jobs(
     storage: &StorageHandle,
-    jobs: Vec<BlobReplicationJobRecord>,
+    jobs: Vec<BlobJobRecord>,
     continuation: Option<LiveReplicationContinuation>,
-) -> Result<LiveRepairWrite, BlobReplicationQueueError> {
+) -> Result<LiveRepairWrite, BlobQueueError> {
     if jobs.is_empty() {
         return Ok(LiveRepairWrite {
             queued: 0,
@@ -2116,13 +2063,11 @@ async fn persist_live_jobs(
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
         }
     };
     if values.len() != jobs.len() {
-        return Err(BlobReplicationQueueError::UnexpectedEvent(
+        return Err(BlobQueueError::UnexpectedEvent(
             "blob replication existing job read count mismatch".to_string(),
         ));
     }
@@ -2130,7 +2075,7 @@ async fn persist_live_jobs(
     let mut writes = Vec::with_capacity(jobs.len());
     for (job, (_, value)) in jobs.iter().zip(values) {
         match value {
-            Some(value) => match BlobReplicationJobRecord::from_bytes(&value) {
+            Some(value) => match BlobJobRecord::from_bytes(&value) {
                 Ok(existing) if blob_job_preferred(&existing, job) => {}
                 Ok(_) | Err(_) => writes.push(blob_job_entry(job)?),
             },
@@ -2157,9 +2102,7 @@ async fn persist_live_jobs(
             progressed: true,
         }),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
@@ -2167,7 +2110,7 @@ async fn read_inbound_source(
     storage: &StorageHandle,
     bucket: &str,
     origin: &SyncOrigin,
-) -> Result<Option<ArunaArn>, BlobReplicationQueueError> {
+) -> Result<Option<ArunaArn>, BlobQueueError> {
     let key = sync_relationship_key(bucket, origin.relationship_id);
     match storage
         .send_storage_effect(StorageEffect::Read {
@@ -2194,9 +2137,7 @@ async fn read_inbound_source(
             Ok(Some(relationship.source))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
@@ -2204,7 +2145,7 @@ async fn delete_live_obligation(
     storage: &StorageHandle,
     key: Vec<u8>,
     expected: Option<&LiveReplicationContinuation>,
-) -> Result<(), BlobReplicationQueueError> {
+) -> Result<(), BlobQueueError> {
     let txn_id = match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
@@ -2212,9 +2153,7 @@ async fn delete_live_obligation(
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
         }
     };
     let current = match storage
@@ -2232,14 +2171,12 @@ async fn delete_live_obligation(
         }
         other => {
             abort_cursor(storage, txn_id).await;
-            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
         }
     };
     let should_delete = match current {
         None => false,
-        Some(value) => match LiveReplicationObligationRecord::from_bytes(&value) {
+        Some(value) => match LiveObligationRecord::from_bytes(&value) {
             Ok(record) => record.continuation.as_ref() == expected,
             Err(_) => expected.is_none(),
         },
@@ -2263,9 +2200,7 @@ async fn delete_live_obligation(
         }
         other => {
             abort_cursor(storage, txn_id).await;
-            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
         }
     }
     match storage
@@ -2274,15 +2209,13 @@ async fn delete_live_obligation(
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 async fn read_replication_cursor(
     storage: &StorageHandle,
-) -> Result<ReplicationScanCursor, BlobReplicationQueueError> {
+) -> Result<ReplicationScanCursor, BlobQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: NODE_STATE_KEYSPACE.to_string(),
@@ -2298,9 +2231,7 @@ async fn read_replication_cursor(
             value: Some(value), ..
         }) => Ok(postcard::from_bytes(value.as_ref()).unwrap_or_default()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
@@ -2344,7 +2275,7 @@ async fn abort_cursor(storage: &StorageHandle, txn_id: Ulid) {
 async fn advance_replication_cursor(
     storage: &StorageHandle,
     candidate: ReplicationScanCursor,
-) -> Result<(), BlobReplicationQueueError> {
+) -> Result<(), BlobQueueError> {
     let txn_id = match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
@@ -2352,9 +2283,7 @@ async fn advance_replication_cursor(
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
         }
     };
     let (current, valid) = match storage
@@ -2380,9 +2309,7 @@ async fn advance_replication_cursor(
         }
         other => {
             abort_cursor(storage, txn_id).await;
-            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
         }
     };
     let merged = cursor_merge(candidate, current.clone());
@@ -2393,9 +2320,7 @@ async fn advance_replication_cursor(
         {
             Event::Storage(StorageEvent::TransactionAborted { .. }) => Ok(()),
             Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                "{other:?}"
-            ))),
+            other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
         }
     } else {
         let value = postcard::to_allocvec(&merged).map_err(ConversionError::from)?;
@@ -2415,9 +2340,7 @@ async fn advance_replication_cursor(
             }
             other => {
                 abort_cursor(storage, txn_id).await;
-                return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
             }
         }
         match storage
@@ -2426,9 +2349,7 @@ async fn advance_replication_cursor(
         {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
             Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                "{other:?}"
-            ))),
+            other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
         }
     }
 }
@@ -2437,7 +2358,7 @@ async fn scan_due_jobs(
     storage: &StorageHandle,
     now_ms: u64,
     limit: usize,
-) -> Result<BlobReplicationJobScan, BlobReplicationQueueError> {
+) -> Result<BlobJobScan, BlobQueueError> {
     let cursor = read_replication_cursor(storage).await?;
     let start_after = cursor.after.clone();
     let mut jobs = Vec::new();
@@ -2459,9 +2380,7 @@ async fn scan_due_jobs(
         }) => (values, next_start_after),
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
         }
     };
     let mut last_key;
@@ -2470,7 +2389,7 @@ async fn scan_due_jobs(
     for (key, value) in values {
         let mut key = key.to_vec();
         last_key = Some(key.clone());
-        let mut job = match BlobReplicationJobRecord::from_bytes(&value) {
+        let mut job = match BlobJobRecord::from_bytes(&value) {
             Ok(job) => job,
             Err(error) => {
                 warn!(error = %error, key = ?key, "Deleting malformed blob replication job");
@@ -2503,7 +2422,7 @@ async fn scan_due_jobs(
             continue;
         }
         if merge_due_job(&mut jobs, key, job, limit) {
-            return Ok(BlobReplicationJobScan {
+            return Ok(BlobJobScan {
                 next_cursor: ReplicationScanCursor {
                     generation: cursor.generation,
                     after: last_key,
@@ -2517,7 +2436,7 @@ async fn scan_due_jobs(
     }
 
     if let Some(next) = next_start_after {
-        return Ok(BlobReplicationJobScan {
+        return Ok(BlobJobScan {
             next_cursor: ReplicationScanCursor {
                 generation: cursor.generation,
                 after: Some(next.to_vec()),
@@ -2529,7 +2448,7 @@ async fn scan_due_jobs(
         });
     }
 
-    Ok(BlobReplicationJobScan {
+    Ok(BlobJobScan {
         next_cursor: ReplicationScanCursor {
             generation: if page_empty && cursor.after.is_none() {
                 cursor.generation
@@ -2548,7 +2467,7 @@ async fn scan_due_jobs(
 async fn read_blob_job(
     storage: &StorageHandle,
     key: &[u8],
-) -> Result<Option<BlobReplicationJobRecord>, BlobReplicationQueueError> {
+) -> Result<Option<BlobJobRecord>, BlobQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
@@ -2559,19 +2478,17 @@ async fn read_blob_job(
     {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
-        }) => Ok(Some(BlobReplicationJobRecord::from_bytes(&value)?)),
+        }) => Ok(Some(BlobJobRecord::from_bytes(&value)?)),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 async fn write_blob_job(
     storage: &StorageHandle,
-    job: &BlobReplicationJobRecord,
-) -> Result<(), BlobReplicationQueueError> {
+    job: &BlobJobRecord,
+) -> Result<(), BlobQueueError> {
     let (key_space, key, value) = blob_job_entry(job)?;
     match storage
         .send_storage_effect(StorageEffect::Write {
@@ -2584,16 +2501,11 @@ async fn write_blob_job(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
-async fn delete_blob_job(
-    storage: &StorageHandle,
-    key: Vec<u8>,
-) -> Result<(), BlobReplicationQueueError> {
+async fn delete_blob_job(storage: &StorageHandle, key: Vec<u8>) -> Result<(), BlobQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Delete {
             key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
@@ -2604,21 +2516,19 @@ async fn delete_blob_job(
     {
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 async fn reschedule_blob_job(
     storage: &StorageHandle,
     key: Vec<u8>,
-    job: &BlobReplicationJobRecord,
+    job: &BlobJobRecord,
     error: String,
-) -> Result<u64, BlobReplicationQueueError> {
+) -> Result<u64, BlobQueueError> {
     let attempts = job.attempts.saturating_add(1);
     let due_at_ms = unix_timestamp_millis().saturating_add(retry_delay_ms(attempts));
-    let next_job = BlobReplicationJobRecord {
+    let next_job = BlobJobRecord {
         input: job.input.clone(),
         source_delete_marker: job.source_delete_marker,
         due_at_ms,
@@ -2642,16 +2552,14 @@ async fn reschedule_blob_job(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(due_at_ms),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 fn merge_due_job(
-    jobs: &mut Vec<(Vec<u8>, BlobReplicationJobRecord)>,
+    jobs: &mut Vec<(Vec<u8>, BlobJobRecord)>,
     key: Vec<u8>,
-    job: BlobReplicationJobRecord,
+    job: BlobJobRecord,
     limit: usize,
 ) -> bool {
     if let Some((_, existing)) = jobs
@@ -2672,7 +2580,7 @@ fn merge_due_job(
 async fn read_relationships(
     storage: &StorageHandle,
     bucket: &str,
-) -> Result<Vec<SyncRelationship>, BlobReplicationQueueError> {
+) -> Result<Vec<SyncRelationship>, BlobQueueError> {
     let mut start_after = None;
     let mut relationships = Vec::new();
     loop {
@@ -2692,9 +2600,7 @@ async fn read_relationships(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
             }
         };
         for (key, value) in values {
@@ -2769,7 +2675,7 @@ mod tests {
         }
     }
 
-    async fn read_jobs(storage: &StorageHandle) -> Vec<(Vec<u8>, BlobReplicationJobRecord)> {
+    async fn read_jobs(storage: &StorageHandle) -> Vec<(Vec<u8>, BlobJobRecord)> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
@@ -2785,8 +2691,7 @@ mod tests {
                 .map(|(key, value)| {
                     (
                         key.to_vec(),
-                        BlobReplicationJobRecord::from_bytes(&value)
-                            .expect("replication job decodes"),
+                        BlobJobRecord::from_bytes(&value).expect("replication job decodes"),
                     )
                 })
                 .collect(),
@@ -3070,7 +2975,7 @@ mod tests {
         }
     }
 
-    async fn read_obligations(storage: &StorageHandle) -> Vec<LiveReplicationObligationRecord> {
+    async fn read_obligations(storage: &StorageHandle) -> Vec<LiveObligationRecord> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
@@ -3084,7 +2989,7 @@ mod tests {
             Event::Storage(StorageEvent::IterResult { values, .. }) => values
                 .into_iter()
                 .map(|(_, value)| {
-                    LiveReplicationObligationRecord::from_bytes(&value).expect("obligation decodes")
+                    LiveObligationRecord::from_bytes(&value).expect("obligation decodes")
                 })
                 .collect(),
             other => panic!("unexpected storage event: {other:?}"),
@@ -3119,12 +3024,9 @@ mod tests {
             compute_handle: None,
         };
 
-        let result = drive(
-            QueueBlobReplicationOperation::new(on_demand_input(), None),
-            &context,
-        )
-        .await
-        .expect("queue operation succeeds after durable write");
+        let result = drive(QueueBlobOperation::new(on_demand_input(), None), &context)
+            .await
+            .expect("queue operation succeeds after durable write");
 
         assert_eq!(result.queued, 1);
         assert!(!result.scheduled);
@@ -3147,25 +3049,19 @@ mod tests {
             compute_handle: None,
         };
 
-        drive(
-            QueueBlobReplicationOperation::new(on_demand_input(), None),
-            &context,
-        )
-        .await
-        .expect("first queue succeeds");
-        drive(
-            QueueBlobReplicationOperation::new(on_demand_input(), None),
-            &context,
-        )
-        .await
-        .expect("second queue succeeds");
+        drive(QueueBlobOperation::new(on_demand_input(), None), &context)
+            .await
+            .expect("first queue succeeds");
+        drive(QueueBlobOperation::new(on_demand_input(), None), &context)
+            .await
+            .expect("second queue succeeds");
 
         assert_eq!(read_jobs(&storage).await.len(), 1);
     }
 
     #[test]
     fn queue_rejects_event() {
-        let mut operation = QueueBlobReplicationOperation::new(on_demand_input(), None);
+        let mut operation = QueueBlobOperation::new(on_demand_input(), None);
         operation.start();
 
         let effects = operation.step(Event::Search());
@@ -3174,7 +3070,7 @@ mod tests {
         assert!(operation.is_complete());
         assert!(matches!(
             operation.finalize(),
-            Err(BlobReplicationQueueError::UnexpectedEvent(_))
+            Err(BlobQueueError::UnexpectedEvent(_))
         ));
     }
 
@@ -3197,11 +3093,7 @@ mod tests {
             ArunaArn::s3_object_prefix(realm(), node(2), "target-bucket", "mapped/").unwrap();
         write_relationship(&storage, &relationship).await;
         drive(
-            QueueBlobReplicationOperation::new_relationship(
-                on_demand_input(),
-                None,
-                relationship_id,
-            ),
+            QueueBlobOperation::new_relationship(on_demand_input(), None, relationship_id),
             &context,
         )
         .await
@@ -3235,13 +3127,9 @@ mod tests {
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
         let advance = reference_advance();
-        let mut job = BlobReplicationJobRecord::new_relationship(
-            on_demand_input(),
-            None,
-            Ulid::from_parts(78, 1),
-            42,
-        )
-        .with_reference_advance(advance);
+        let mut job =
+            BlobJobRecord::new_relationship(on_demand_input(), None, Ulid::from_parts(78, 1), 42)
+                .with_reference_advance(advance);
         job.writer_auth_context = None;
         let key = blob_job_key(&job).unwrap().to_vec();
 
@@ -3269,11 +3157,7 @@ mod tests {
             compute_handle: None,
         };
         drive(
-            QueueBlobReplicationOperation::new_relationship(
-                on_demand_input(),
-                None,
-                Ulid::from(78u128),
-            ),
+            QueueBlobOperation::new_relationship(on_demand_input(), None, Ulid::from(78u128)),
             &context,
         )
         .await
@@ -3310,11 +3194,7 @@ mod tests {
             compute_handle: None,
         };
         drive(
-            QueueBlobReplicationOperation::new_relationship(
-                on_demand_input(),
-                None,
-                relationship.id,
-            ),
+            QueueBlobOperation::new_relationship(on_demand_input(), None, relationship.id),
             &context,
         )
         .await
@@ -3373,7 +3253,7 @@ mod tests {
             compute_handle: None,
         };
         drive(
-            QueueBlobReplicationOperation::new_relationship(
+            QueueBlobOperation::new_relationship(
                 ReplicateScopeInput {
                     target: ReplicateScopeTarget::Bucket,
                     auth_context: queued_by,
@@ -3520,7 +3400,7 @@ mod tests {
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
         let due_at_ms = unix_timestamp_millis().saturating_add(60_000);
-        let future_job = BlobReplicationJobRecord {
+        let future_job = BlobJobRecord {
             input: on_demand_input(),
             source_delete_marker: None,
             due_at_ms,
@@ -3555,12 +3435,9 @@ mod tests {
             compute_handle: None,
         };
 
-        drive(
-            QueueBlobReplicationOperation::new(on_demand_input(), None),
-            &context,
-        )
-        .await
-        .expect("duplicate queue succeeds");
+        drive(QueueBlobOperation::new(on_demand_input(), None), &context)
+            .await
+            .expect("duplicate queue succeeds");
 
         let jobs = read_jobs(&storage).await;
         assert_eq!(
@@ -3571,29 +3448,17 @@ mod tests {
 
     #[test]
     fn job_requires_writer() {
-        let mut record = BlobReplicationJobRecord::new(on_demand_input(), None, 42);
+        let mut record = BlobJobRecord::new(on_demand_input(), None, 42);
         record.writer_auth_context = None;
         let bytes = record.to_bytes().unwrap();
-        assert!(BlobReplicationJobRecord::from_bytes(&bytes).is_err());
+        assert!(BlobJobRecord::from_bytes(&bytes).is_err());
         record.reference_advance = Some(reference_advance());
         let bytes = record.to_bytes().unwrap();
-        assert_eq!(
-            BlobReplicationJobRecord::from_bytes(&bytes).unwrap(),
-            record
-        );
+        assert_eq!(BlobJobRecord::from_bytes(&bytes).unwrap(), record);
 
-        let first = BlobReplicationJobRecord::new_relationship(
-            on_demand_input(),
-            None,
-            Ulid::from(1u128),
-            42,
-        );
-        let second = BlobReplicationJobRecord::new_relationship(
-            on_demand_input(),
-            None,
-            Ulid::from(2u128),
-            42,
-        );
+        let first = BlobJobRecord::new_relationship(on_demand_input(), None, Ulid::from(1u128), 42);
+        let second =
+            BlobJobRecord::new_relationship(on_demand_input(), None, Ulid::from(2u128), 42);
         assert_ne!(
             blob_job_key(&first).unwrap(),
             blob_job_key(&second).unwrap()
@@ -3624,13 +3489,12 @@ mod tests {
         }]);
         let reader = input.auth_context.clone();
         let creator = auth_context();
-        let mut job =
-            BlobReplicationJobRecord::new_relationship(input, None, Ulid::from_parts(3, 3), 42)
-                .with_origin(Some(SyncOrigin {
-                    relationship_id: Ulid::from_parts(3, 3),
-                    hop_count: 0,
-                }))
-                .with_reference_advance(reference_advance());
+        let mut job = BlobJobRecord::new_relationship(input, None, Ulid::from_parts(3, 3), 42)
+            .with_origin(Some(SyncOrigin {
+                relationship_id: Ulid::from_parts(3, 3),
+                hop_count: 0,
+            }))
+            .with_reference_advance(reference_advance());
         job.writer_auth_context = None;
 
         assert_eq!(job_source_auth(&job, &creator), &reader);
@@ -3644,31 +3508,28 @@ mod tests {
     #[test]
     fn job_rejects_malformed() {
         // Greenfield: pre-advance record bytes decode strictly or not at all.
-        let record = BlobReplicationJobRecord::new(on_demand_input(), None, 42);
+        let record = BlobJobRecord::new(on_demand_input(), None, 42);
         let encoded = record.to_bytes().unwrap();
-        assert_eq!(
-            BlobReplicationJobRecord::from_bytes(&encoded).unwrap(),
-            record
-        );
+        assert_eq!(BlobJobRecord::from_bytes(&encoded).unwrap(), record);
 
         let mut trailing = encoded.clone();
         trailing.push(0xff);
-        assert!(BlobReplicationJobRecord::from_bytes(&trailing).is_err());
+        assert!(BlobJobRecord::from_bytes(&trailing).is_err());
         let mut short = encoded;
         short.pop().unwrap();
-        assert!(BlobReplicationJobRecord::from_bytes(&short).is_err());
+        assert!(BlobJobRecord::from_bytes(&short).is_err());
         let mut truncated = record
             .with_reference_advance(reference_advance())
             .to_bytes()
             .unwrap();
         truncated.pop().unwrap();
-        assert!(BlobReplicationJobRecord::from_bytes(&truncated).is_err());
+        assert!(BlobJobRecord::from_bytes(&truncated).is_err());
     }
 
     #[test]
     fn obligation_rejects_malformed() {
         // Greenfield: pre-advance record bytes decode strictly or not at all.
-        let record = LiveReplicationObligationRecord::new(
+        let record = LiveObligationRecord::new(
             node(1),
             auth_context(),
             "bucket".to_string(),
@@ -3677,23 +3538,20 @@ mod tests {
             false,
         );
         let encoded = record.to_bytes().unwrap();
-        assert_eq!(
-            LiveReplicationObligationRecord::from_bytes(&encoded).unwrap(),
-            record
-        );
+        assert_eq!(LiveObligationRecord::from_bytes(&encoded).unwrap(), record);
 
         let mut trailing = encoded.clone();
         trailing.push(0xff);
-        assert!(LiveReplicationObligationRecord::from_bytes(&trailing).is_err());
+        assert!(LiveObligationRecord::from_bytes(&trailing).is_err());
         let mut short = encoded;
         short.pop().unwrap();
-        assert!(LiveReplicationObligationRecord::from_bytes(&short).is_err());
+        assert!(LiveObligationRecord::from_bytes(&short).is_err());
         let mut truncated = record
             .with_reference_advance(reference_advance())
             .to_bytes()
             .unwrap();
         truncated.pop().unwrap();
-        assert!(LiveReplicationObligationRecord::from_bytes(&truncated).is_err());
+        assert!(LiveObligationRecord::from_bytes(&truncated).is_err());
     }
 
     #[test]
@@ -3862,7 +3720,7 @@ mod tests {
         let forward = relationship(13, 3, None, true);
         write_relationship(&storage, &reverse).await;
         write_relationship(&storage, &forward).await;
-        let obligation = LiveReplicationObligationRecord::new(
+        let obligation = LiveObligationRecord::new(
             node(1),
             auth_context(),
             "bucket".to_string(),
@@ -3928,7 +3786,7 @@ mod tests {
         };
 
         let result = drive(
-            QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+            LiveVersionOperation::new(LiveVersionInput {
                 local_node_id: node(1),
                 auth_context: auth_context(),
                 bucket: "bucket".to_string(),
@@ -3980,7 +3838,7 @@ mod tests {
         };
 
         let result = drive(
-            QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+            LiveVersionOperation::new(LiveVersionInput {
                 local_node_id: node(1),
                 auth_context: auth_context(),
                 bucket: "bucket".to_string(),
@@ -4031,7 +3889,7 @@ mod tests {
         let advance = reference_advance();
 
         drive(
-            QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+            LiveVersionOperation::new(LiveVersionInput {
                 local_node_id: node(1),
                 auth_context: reader.clone(),
                 bucket: "bucket".to_string(),
@@ -4081,7 +3939,7 @@ mod tests {
         )
         .expect("future job builds")
         .with_writer_auth(auth_context());
-        let future_job = BlobReplicationJobRecord {
+        let future_job = BlobJobRecord {
             due_at_ms: unix_timestamp_millis().saturating_add(60_000),
             attempts: 1,
             last_error: Some("transient".to_string()),
@@ -4110,7 +3968,7 @@ mod tests {
         };
 
         let result = drive(
-            QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+            LiveVersionOperation::new(LiveVersionInput {
                 local_node_id: node(1),
                 auth_context: auth_context(),
                 bucket: "bucket".to_string(),
@@ -4204,7 +4062,7 @@ mod tests {
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
         let due_at_ms = unix_timestamp_millis().saturating_add(60_000);
-        let record = BlobReplicationJobRecord::new(on_demand_input(), None, due_at_ms);
+        let record = BlobJobRecord::new(on_demand_input(), None, due_at_ms);
         let (key_space, key, value) = blob_job_entry(&record).unwrap();
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -4241,7 +4099,7 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        let job = BlobReplicationJobRecord::new(on_demand_input(), None, unix_timestamp_millis());
+        let job = BlobJobRecord::new(on_demand_input(), None, unix_timestamp_millis());
         write_blob_job(&storage, &job).await.expect("job writes");
 
         let before = storage.snapshot_metrics().requests_total;
@@ -4262,12 +4120,12 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        let first = BlobReplicationJobRecord::new(on_demand_input(), None, unix_timestamp_millis());
+        let first = BlobJobRecord::new(on_demand_input(), None, unix_timestamp_millis());
         let mut second_input = on_demand_input();
         second_input.target = ReplicateScopeTarget::Object {
             key: "other".to_string(),
         };
-        let second = BlobReplicationJobRecord::new(second_input, None, unix_timestamp_millis());
+        let second = BlobJobRecord::new(second_input, None, unix_timestamp_millis());
         write_blob_job(&storage, &first)
             .await
             .expect("first job writes");
@@ -4325,7 +4183,7 @@ mod tests {
         .await;
         write_blob_job(
             &storage,
-            &BlobReplicationJobRecord::new(on_demand_input(), None, unix_timestamp_millis()),
+            &BlobJobRecord::new(on_demand_input(), None, unix_timestamp_millis()),
         )
         .await
         .expect("job writes");
@@ -4345,8 +4203,8 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        let job = BlobReplicationJobRecord::new(on_demand_input(), None, unix_timestamp_millis());
-        let preferred = BlobReplicationJobRecord {
+        let job = BlobJobRecord::new(on_demand_input(), None, unix_timestamp_millis());
+        let preferred = BlobJobRecord {
             attempts: 1,
             last_error: Some("retry".to_string()),
             ..job.clone()
@@ -4381,7 +4239,7 @@ mod tests {
         let jobs = vec![
             (
                 Vec::new(),
-                BlobReplicationJobRecord::new_relationship(
+                BlobJobRecord::new_relationship(
                     on_demand_input(),
                     None,
                     relationship.id,
@@ -4390,7 +4248,7 @@ mod tests {
             ),
             (
                 Vec::new(),
-                BlobReplicationJobRecord::new_relationship(
+                BlobJobRecord::new_relationship(
                     on_demand_input(),
                     None,
                     relationship.id,
@@ -4455,12 +4313,9 @@ mod tests {
             compute_handle: None,
         };
         write_corrupt_job(&storage, "000-corrupt-blob-job").await;
-        drive(
-            QueueBlobReplicationOperation::new(on_demand_input(), None),
-            &context,
-        )
-        .await
-        .expect("queue succeeds");
+        drive(QueueBlobOperation::new(on_demand_input(), None), &context)
+            .await
+            .expect("queue succeeds");
 
         let result = process_blob_batch(&context)
             .await
@@ -4546,7 +4401,7 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        let record = LiveReplicationObligationRecord::new(
+        let record = LiveObligationRecord::new(
             node(1),
             auth_context(),
             "bucket".to_string(),
@@ -4574,7 +4429,7 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        let mut record = LiveReplicationObligationRecord::new(
+        let mut record = LiveObligationRecord::new(
             node(1),
             auth_context(),
             "bucket".to_string(),
@@ -4612,7 +4467,7 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        let mut record = LiveReplicationObligationRecord::new(
+        let mut record = LiveObligationRecord::new(
             node(1),
             auth_context(),
             "bucket".to_string(),
@@ -4675,12 +4530,9 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
-        drive(
-            QueueBlobReplicationOperation::new(on_demand_input(), None),
-            &context,
-        )
-        .await
-        .expect("queue succeeds");
+        drive(QueueBlobOperation::new(on_demand_input(), None), &context)
+            .await
+            .expect("queue succeeds");
 
         let result = process_blob_batch(&context)
             .await
@@ -4724,12 +4576,9 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
-        drive(
-            QueueBlobReplicationOperation::new(on_demand_input(), None),
-            &context,
-        )
-        .await
-        .expect("queue succeeds");
+        drive(QueueBlobOperation::new(on_demand_input(), None), &context)
+            .await
+            .expect("queue succeeds");
 
         let result = process_blob_batch(&context)
             .await
@@ -4771,7 +4620,7 @@ mod tests {
             compute_handle: None,
         };
         drive(
-            QueueBlobReplicationOperation::new(
+            QueueBlobOperation::new(
                 ReplicateScopeInput {
                     target: ReplicateScopeTarget::Bucket,
                     ..on_demand_input()
