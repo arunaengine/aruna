@@ -53,7 +53,7 @@ pub(crate) fn describe_event(event: &Event) -> String {
             SubOperationEvent::SourceConnectorResolved { .. } => {
                 "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)".to_string()
             }
-            SubOperationEvent::VersionSourceAccessResolved { .. } => {
+            SubOperationEvent::VersionAccessResolved { .. } => {
                 "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)".to_string()
             }
             SubOperationEvent::ReplicationItemResult { .. } => {

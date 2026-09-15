@@ -5,7 +5,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{SYNC_MIRROR_REPAIR_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE};
+use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
@@ -35,7 +35,7 @@ use crate::tasks::queue_backoff::retry_delay_ms;
 const REPAIR_PAGE_SIZE: usize = 128;
 const REPAIR_BATCH_SIZE: usize = 64;
 pub(crate) const RECONCILE_GRACE: Duration = Duration::from_secs(30);
-pub const MIRROR_REPAIR_RETRY_AFTER: Duration = Duration::from_secs(1);
+pub const REPAIR_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SyncMirrorIntent {
@@ -112,7 +112,7 @@ pub enum SyncMirrorError {
 struct RepairScan {
     records: Vec<(Vec<u8>, SyncMirrorRecord)>,
     has_more_due: bool,
-    next_due_at_ms: Option<u64>,
+    next_due_ms: Option<u64>,
 }
 
 pub fn mirror_delete_entry(
@@ -181,12 +181,12 @@ pub async fn store_sync_status(
             .send_storage_effect(StorageEffect::BatchWrite {
                 writes: vec![
                     (
-                        SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                        RELATIONSHIP_OUT_KEYSPACE.to_string(),
                         ByteView::from(relationship_key),
                         ByteView::from(relationship.to_bytes()?),
                     ),
                     (
-                        SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+                        MIRROR_REPAIR_KEYSPACE.to_string(),
                         ByteView::from(repair_key),
                         ByteView::from(repair.to_bytes()?),
                     ),
@@ -255,7 +255,7 @@ pub async fn kick_mirror_repair(context: &DriverContext) {
     };
     let event = task_handle
         .send_effect(Effect::Task(TaskEffect::ShortenTimer {
-            key: TaskKey::DrainSyncMirrorRepair,
+            key: TaskKey::DrainMirrorRepair,
             after: Duration::ZERO,
         }))
         .await;
@@ -418,7 +418,7 @@ pub async fn process_mirror_repairs(
         next_due_after: if scan.has_more_due {
             None
         } else {
-            scan.next_due_at_ms
+            scan.next_due_ms
                 .map(|due_at| Duration::from_millis(due_at.saturating_sub(now_ms)))
         },
     })
@@ -430,7 +430,7 @@ pub async fn restore_mirror_timer(storage: &StorageHandle, task_handle: &TaskHan
         Ok(Some(after)) => {
             let event = task_handle
                 .send_effect(Effect::Task(TaskEffect::ResetTimer {
-                    key: TaskKey::DrainSyncMirrorRepair,
+                    key: TaskKey::DrainMirrorRepair,
                     after,
                 }))
                 .await;
@@ -446,7 +446,7 @@ fn repair_entry(record: SyncMirrorRecord) -> Result<(KeySpace, Key, Value), Conv
     let key = record.relationship.id.to_bytes().to_vec();
     let value = record.to_bytes()?;
     Ok((
-        SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+        MIRROR_REPAIR_KEYSPACE.to_string(),
         ByteView::from(key),
         ByteView::from(value),
     ))
@@ -590,12 +590,12 @@ async fn scan_repair_records(
     now_ms: u64,
 ) -> Result<RepairScan, SyncMirrorError> {
     let mut records = Vec::new();
-    let mut next_due_at_ms: Option<u64> = None;
+    let mut next_due_ms: Option<u64> = None;
     let mut start_after = None;
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+                key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
                 limit: REPAIR_PAGE_SIZE,
@@ -623,8 +623,8 @@ async fn scan_repair_records(
             if record.due_at_ms <= now_ms {
                 records.push((key.to_vec(), record));
             } else {
-                next_due_at_ms = Some(
-                    next_due_at_ms
+                next_due_ms = Some(
+                    next_due_ms
                         .map_or(record.due_at_ms, |current| current.min(record.due_at_ms)),
                 );
             }
@@ -642,7 +642,7 @@ async fn scan_repair_records(
     Ok(RepairScan {
         records,
         has_more_due,
-        next_due_at_ms,
+        next_due_ms,
     })
 }
 
@@ -653,7 +653,7 @@ async fn next_repair_after(storage: &StorageHandle) -> Result<Option<Duration>, 
         return Ok(Some(Duration::ZERO));
     }
     Ok(scan
-        .next_due_at_ms
+        .next_due_ms
         .map(|due_at| Duration::from_millis(due_at.saturating_sub(now_ms))))
 }
 
@@ -682,7 +682,7 @@ async fn reschedule_repair_record(
         }
         match storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+                key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
                 key: ByteView::from(key),
                 value: ByteView::from(next.to_bytes()?),
                 txn_id: Some(txn_id),
@@ -718,7 +718,7 @@ async fn store_repair_record(
         }
         match storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+                key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
                 key: ByteView::from(key),
                 value: ByteView::from(record.to_bytes()?),
                 txn_id: Some(txn_id),
@@ -757,7 +757,7 @@ async fn clear_repair_intent(
         }
         match storage
             .send_storage_effect(StorageEffect::Delete {
-                key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+                key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
                 key: ByteView::from(key),
                 txn_id: Some(txn_id),
             })
@@ -793,7 +793,7 @@ async fn clear_scanned_record(
         }
         match storage
             .send_storage_effect(StorageEffect::Delete {
-                key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+                key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
                 key: ByteView::from(key),
                 txn_id: Some(txn_id),
             })
@@ -820,7 +820,7 @@ async fn read_repair_record(
 ) -> Result<Option<SyncMirrorRecord>, SyncMirrorError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+            key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
             key: ByteView::from(key.to_vec()),
             txn_id,
         })
@@ -844,7 +844,7 @@ async fn read_out_relationship(
 ) -> Result<Option<SyncRelationship>, SyncMirrorError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+            key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
             key: ByteView::from(key.to_vec()),
             txn_id,
         })
@@ -910,7 +910,7 @@ async fn delete_repair_record(
 ) -> Result<(), SyncMirrorError> {
     match storage
         .send_storage_effect(StorageEffect::Delete {
-            key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+            key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
             key: ByteView::from(key),
             txn_id: None,
         })
@@ -1111,7 +1111,7 @@ mod tests {
             value: Some(value), ..
         }) = storage
             .send_storage_effect(StorageEffect::Read {
-                key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+                key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
                 key: relationship.id.to_bytes().to_vec().into(),
                 txn_id: None,
             })
@@ -1394,7 +1394,7 @@ mod tests {
             value: Some(value), ..
         }) = storage
             .send_storage_effect(StorageEffect::Read {
-                key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+                key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
                 key: relationship.id.to_bytes().to_vec().into(),
                 txn_id: None,
             })

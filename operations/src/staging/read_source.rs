@@ -51,7 +51,7 @@ pub enum ReadSourceError {
         got: String,
     },
     #[error("Read staging source failed")]
-    ReadStagingSourceFailed,
+    ReadSourceFailed,
 }
 
 #[derive(Debug, PartialEq)]
@@ -122,7 +122,7 @@ impl ReadSourceOperation {
         match event {
             Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
                 let Some(connector) = self.connector.clone() else {
-                    return self.emit_error(ReadSourceError::ReadStagingSourceFailed);
+                    return self.emit_error(ReadSourceError::ReadSourceFailed);
                 };
 
                 self.state = ReadSourceState::Finish;
@@ -171,11 +171,11 @@ impl Operation for ReadSourceOperation {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(ReadSourceError::ReadStagingSourceFailed);
+            return Err(ReadSourceError::ReadSourceFailed);
         }
 
         self.output
-            .ok_or(ReadSourceError::ReadStagingSourceFailed)?
+            .ok_or(ReadSourceError::ReadSourceFailed)?
     }
 
     fn abort(&mut self) -> Effects {

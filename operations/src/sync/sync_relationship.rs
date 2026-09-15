@@ -1,7 +1,7 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE};
+use aruna_core::keyspaces::{RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     SyncRelationship, SyncState, sync_relationship_key, sync_relationship_prefix,
@@ -25,8 +25,8 @@ pub enum SyncRelationshipDirection {
 impl SyncRelationshipDirection {
     fn keyspace(self) -> &'static str {
         match self {
-            Self::Outgoing => SYNC_RELATIONSHIP_OUT_KEYSPACE,
-            Self::Incoming => SYNC_RELATIONSHIP_IN_KEYSPACE,
+            Self::Outgoing => RELATIONSHIP_OUT_KEYSPACE,
+            Self::Incoming => RELATIONSHIP_IN_KEYSPACE,
         }
     }
 
@@ -148,7 +148,7 @@ async fn create_relationship_once(
     loop {
         match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
                 prefix: Some(prefix.clone()),
                 start: start.map(IterStart::After),
                 limit: RELATIONSHIP_PAGE_SIZE,
@@ -188,7 +188,7 @@ async fn create_relationship_once(
 
     match storage
         .send_storage_effect(StorageEffect::Write {
-            key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+            key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
             key: key.clone(),
             value: value.clone(),
             txn_id: Some(txn_id),

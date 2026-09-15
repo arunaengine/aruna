@@ -50,11 +50,11 @@ use crate::blob::reclaim::{
     RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, process_reclaim_batch, restore_reclaim_sweep,
 };
 use crate::device::drain::{
-    DrainOutcome, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_RETRY_AFTER, restore_publish_timer,
+    DrainOutcome, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER, restore_publish_timer,
 };
 use crate::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
-    UPLOAD_DEFER_RETRY_AFTER, restore_sync_timers,
+    UPLOAD_DEFER_AFTER, restore_sync_timers,
 };
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::remove::remove_drained_backends;
@@ -65,18 +65,18 @@ use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, drain_witness_deadlin
 use crate::jobs::prune::{prune_job_batch, restore_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
 use crate::jobs::store::release_job;
-use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_AFTER};
+use crate::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
-    METADATA_MATERIALIZATION_NEXT_BATCH_AFTER, METADATA_MATERIALIZATION_POLL_AFTER,
-    METADATA_MATERIALIZATION_RETRY_AFTER, MetadataDrainResult, materialization_jobs_exist,
+    NEXT_BATCH_AFTER, MATERIALIZATION_POLL_AFTER,
+    MATERIALIZATION_RETRY_AFTER, MetadataDrainResult, materialization_jobs_exist,
     process_materialization_batch, requeue_dead_letters, restore_materialization_timer,
 };
 use crate::metadata::projector::{
-    METADATA_PROJECTION_RETRY_AFTER, drain_projection_queue, project_create_events,
+    PROJECTION_RETRY_AFTER, drain_projection_queue, project_create_events,
     project_logged_events, replay_event_log, restore_projection_timer,
 };
 use crate::metadata::prune_queue::{
-    METADATA_GRAPH_PRUNE_POLL_AFTER, METADATA_GRAPH_PRUNE_RETRY_AFTER, process_graph_tombstones,
+    GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, process_graph_tombstones,
     prune_jobs_exist,
 };
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
@@ -84,35 +84,35 @@ use crate::node::usage_stats::{refresh_usage_targets, restore_usage_timer};
 use crate::notifications::client::deliver_remote;
 use crate::notifications::inbox::upsert_with_report;
 use crate::notifications::outbox::{
-    NOTIFICATION_DELIVERY_RETRY_AFTER, NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
-    NOTIFICATION_OUTBOX_RETENTION_MS, delete_outbox_records, read_outbox_batch, restore_idle_timer,
+    DELIVERY_RETRY_AFTER, OUTBOX_BATCH_SIZE,
+    OUTBOX_RETENTION_MS, delete_outbox_records, read_outbox_batch, restore_idle_timer,
     restore_outbox_timer,
 };
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::prune::{
-    NOTIFICATION_PRUNE_POLL_AFTER, NOTIFICATION_PRUNE_RETRY_AFTER, process_prune_batch,
+    NOTIFICATION_POLL_AFTER, NOTIFICATION_RETRY_AFTER, process_prune_batch,
 };
 use crate::notifications::watch::interest::{
-    WATCH_INTEREST_PUBLISH_DEBOUNCE, rebuild_interest_table, refresh_target_interest,
+    WATCH_PUBLISH_DEBOUNCE, rebuild_interest_table, refresh_target_interest,
 };
 use crate::placement::policy::observe_placement;
 use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};
 use crate::realm::announce_presence::{
-    AnnouncePresenceConfig, AnnouncePresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
+    AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
 };
 use crate::replication::queue::{
-    BLOB_REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer,
+    REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer,
 };
-use crate::s3::object::metadata::REFERENCE_METADATA_REFRESH_RETRY_AFTER;
+use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::sync::document_outbox::{
-    OUTBOX_DRAIN_BATCH_SIZE, read_outbox_records, read_outbox_tails, restore_outbox_timers,
+    OUTBOX_DRAIN_SIZE, read_outbox_records, read_outbox_tails, restore_outbox_timers,
 };
 use crate::sync::mirror_repair::{
-    MIRROR_REPAIR_RETRY_AFTER, process_mirror_repairs, restore_mirror_timer,
+    REPAIR_RETRY_AFTER, process_mirror_repairs, restore_mirror_timer,
 };
 use crate::sync::shard_placement::{
-    DOCUMENT_SYNC_DEFER_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_MAX,
-    SYNC_PLACEMENT_RETRY_AFTER,
+    DEFER_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX,
+    PLACEMENT_RETRY_AFTER,
 };
 use crate::tasks::queue_backoff::{retry_after_ms, retry_delay_ms};
 use crate::tasks::task_persistence::{
@@ -135,13 +135,13 @@ const DRAIN_SUBBATCH_RECORDS: usize = 512;
 /// Pages one drain invocation may examine, so a large or blocked queue cannot
 /// monopolise a task invocation.
 const OUTBOX_INVOCATION_PAGES: usize = 2;
-const OUTBOX_INVOCATION_RECORDS: usize = OUTBOX_INVOCATION_PAGES * OUTBOX_DRAIN_BATCH_SIZE;
+const OUTBOX_INVOCATION_RECORDS: usize = OUTBOX_INVOCATION_PAGES * OUTBOX_DRAIN_SIZE;
 /// Consecutive continuations before a rotation yields through the timer, so an
 /// append-heavy or wholly blocked queue cannot keep the task continuously hot.
 const OUTBOX_CONTINUATION_STREAK: u32 = 8;
 const _: () = assert!(OUTBOX_INVOCATION_PAGES > 0 && OUTBOX_CONTINUATION_STREAK > 0);
 const OUTBOX_CONTINUATION_AFTER: Duration = Duration::from_millis(50);
-const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
+const QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 
 /// How long a device keeps its copy of the realm documents before asking for
 /// them again. A revocation reaches it within this window at the latest.
@@ -151,7 +151,7 @@ const REALM_DOCUMENTS_AFTER: Duration = Duration::from_secs(60);
 /// is what it shares that time with, so it is bounded once, not per node.
 const REALM_DOCUMENTS_BUDGET: Duration = Duration::from_secs(20);
 /// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
-const DEAD_LETTER_SWEEP_TICKS: usize = 12;
+const DEAD_LETTER_TICKS: usize = 12;
 /// How long a record may wait for its shard topic's genesis before the drain
 /// stops treating the wait as normal and says so at error level.
 const OUTBOX_STUCK_AFTER: Duration = Duration::from_secs(300);
@@ -562,8 +562,8 @@ impl OperationsTaskHandler {
     fn placement_retry_after(&self, key: &TaskKey) -> Duration {
         self.retry_ladder(
             key,
-            SHARD_TOPIC_PULL_RETRY_AFTER,
-            SHARD_TOPIC_PULL_RETRY_MAX,
+            PULL_RETRY_AFTER,
+            PULL_RETRY_MAX,
         )
     }
 
@@ -727,7 +727,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
                     error!(error = ?err, "Failed to process realm presence timer event");
                     self.reschedule_timer(
                         TaskKey::RealmPresence { realm_id, node_id },
-                        REALM_PRESENCE_REFRESH_AFTER,
+                        PRESENCE_REFRESH_AFTER,
                     )
                     .await;
                 }
@@ -751,11 +751,11 @@ impl InboundTaskHandler for OperationsTaskHandler {
                     }
                     PlacementReconcileStatus::RetryScheduled => {}
                     PlacementReconcileStatus::StorageFailure => {
-                        self.reschedule_timer(key, SYNC_PLACEMENT_RETRY_AFTER).await;
+                        self.reschedule_timer(key, PLACEMENT_RETRY_AFTER).await;
                     }
                 }
             }
-            TaskKey::DrainDocumentSyncOutbox => {
+            TaskKey::DrainSyncOutbox => {
                 self.drain_sync_outbox().await;
             }
             TaskKey::PublishUsageSnapshots => {
@@ -764,19 +764,19 @@ impl InboundTaskHandler for OperationsTaskHandler {
             TaskKey::PublishNodeInfo => {
                 self.publish_node_info().await;
             }
-            TaskKey::DrainMetadataProjectionQueue => {
+            TaskKey::DrainProjectionQueue => {
                 self.drain_projection_queue().await;
             }
-            TaskKey::DrainMetadataMaterializationQueue => {
+            TaskKey::DrainMaterializationQueue => {
                 self.drain_materialization_queue().await;
             }
-            TaskKey::DrainMetadataGraphPruneQueue => {
+            TaskKey::DrainPruneQueue => {
                 self.drain_graph_queue().await;
             }
-            TaskKey::DrainBlobReplicationQueue => {
+            TaskKey::DrainReplicationQueue => {
                 self.drain_replication_queue().await;
             }
-            TaskKey::DrainReferenceMetadataRefreshQueue => {
+            TaskKey::DrainRefreshQueue => {
                 self.drain_refresh_queue().await;
             }
             TaskKey::DrainNotificationOutbox => {
@@ -794,25 +794,25 @@ impl InboundTaskHandler for OperationsTaskHandler {
             TaskKey::PruneJobs => {
                 self.prune_jobs().await;
             }
-            TaskKey::DrainSyncMirrorRepair => {
+            TaskKey::DrainMirrorRepair => {
                 self.drain_mirror_repair().await;
             }
             TaskKey::SweepHiddenBlobs => {
                 self.sweep_hidden_blobs().await;
             }
-            TaskKey::DrainBlobCleanupQueue => {
+            TaskKey::DrainCleanupQueue => {
                 self.drain_blob_cleanup().await;
             }
-            TaskKey::DrainBlobReclaimQueue => {
+            TaskKey::DrainReclaimQueue => {
                 self.drain_blob_reclaim().await;
             }
             TaskKey::RefreshBlobHolders => {
                 self.refresh_blob_holders().await;
             }
-            TaskKey::DrainJobFamilyOutbox => {
+            TaskKey::DrainFamilyOutbox => {
                 self.drain_family_outbox().await;
             }
-            TaskKey::DrainJobWitnessQueue => {
+            TaskKey::DrainWitnessQueue => {
                 self.drain_witness_queue().await;
             }
             TaskKey::SettleJobTerminals => {
@@ -831,20 +831,20 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 self.fetch_realm_documents().await;
                 self.refresh_device_replicas().await;
             }
-            TaskKey::DrainSyncUploadOutbox => {
+            TaskKey::DrainUploadOutbox => {
                 let after = match crate::device::sync::drain_sync_outbox(&self.context).await {
-                    DrainOutcome::Deferred => Some(UPLOAD_DEFER_RETRY_AFTER),
+                    DrainOutcome::Deferred => Some(UPLOAD_DEFER_AFTER),
                     DrainOutcome::Recheck => Some(UPLOAD_CONTINUE_AFTER),
                     DrainOutcome::Idle => None,
                 };
                 if let Some(after) = after {
-                    self.reschedule_timer(TaskKey::DrainSyncUploadOutbox, after)
+                    self.reschedule_timer(TaskKey::DrainUploadOutbox, after)
                         .await;
                 }
             }
             TaskKey::DrainDeviceIntake => {
                 let after = match crate::device::drain::drain_publish_queue(&self.context).await {
-                    DrainOutcome::Deferred => Some(PUBLISH_DEFER_RETRY_AFTER),
+                    DrainOutcome::Deferred => Some(PUBLISH_DEFER_AFTER),
                     DrainOutcome::Recheck => Some(PUBLISH_CONTINUE_AFTER),
                     DrainOutcome::Idle => None,
                 };

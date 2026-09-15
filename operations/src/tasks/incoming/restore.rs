@@ -20,7 +20,7 @@ async fn durable_rearm_loop(
     loop {
         tokio::select! {
             _ = cancelled.cancelled() => return,
-            _ = tokio::time::sleep(DURABLE_QUEUE_REARM_AFTER) => {}
+            _ = tokio::time::sleep(QUEUE_REARM_AFTER) => {}
         }
         let Some(context) = context.upgrade() else {
             return;
@@ -41,13 +41,13 @@ async fn durable_rearm_loop(
         restore_idle_timer(
             &context.storage_handle,
             &task_handle,
-            NOTIFICATION_DELIVERY_RETRY_AFTER,
+            DELIVERY_RETRY_AFTER,
         )
         .await;
         restore_projection_timer(&context.storage_handle, &task_handle).await;
         // Dead letters retry on a minute-scale backoff, so sweeping every rearm
         // tick would scan the keyspace far more often than it can yield work.
-        if ticks.is_multiple_of(DEAD_LETTER_SWEEP_TICKS) {
+        if ticks.is_multiple_of(DEAD_LETTER_TICKS) {
             sweep_dead_letters(&context.storage_handle).await;
         }
         restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
@@ -65,9 +65,9 @@ async fn durable_rearm_loop(
 // it backs off instead of rescanning the same head at batch pace.
 pub(super) fn drain_delay(result: &MetadataDrainResult) -> Duration {
     if result.processed == 0 {
-        METADATA_MATERIALIZATION_RETRY_AFTER
+        MATERIALIZATION_RETRY_AFTER
     } else {
-        METADATA_MATERIALIZATION_NEXT_BATCH_AFTER
+        NEXT_BATCH_AFTER
     }
 }
 
@@ -255,7 +255,7 @@ impl TaskQueues {
             restore_hidden_sweep(&context.storage_handle, &task_handle).await;
             restore_reclaim_sweep(&context.storage_handle, &task_handle).await;
             handler
-                .reschedule_timer(TaskKey::DrainBlobCleanupQueue, Duration::ZERO)
+                .reschedule_timer(TaskKey::DrainCleanupQueue, Duration::ZERO)
                 .await;
         }
         if refresh_holders {
@@ -287,7 +287,7 @@ impl OperationsTaskHandler {
                 warn!(task_id = ?TaskKey::PublishUsageSnapshots, error = %error, "Failed to publish usage snapshots");
                 self.reschedule_timer(
                     TaskKey::PublishUsageSnapshots,
-                    crate::node::usage_stats::USAGE_SNAPSHOT_PUBLISH_DEBOUNCE,
+                    crate::node::usage_stats::SNAPSHOT_PUBLISH_DEBOUNCE,
                 )
                 .await;
             }
@@ -311,7 +311,7 @@ impl OperationsTaskHandler {
         // outcome so a transient failure never stops the heartbeat.
         self.reschedule_timer(
             TaskKey::PublishNodeInfo,
-            crate::node::node_info::NODE_INFO_PUBLISH_INTERVAL,
+            crate::node::node_info::INFO_PUBLISH_INTERVAL,
         )
         .await;
     }
@@ -339,7 +339,7 @@ impl OperationsTaskHandler {
                 warn!(task_id = ?TaskKey::PublishWatchInterest, error = %error, "Failed to publish watch interest");
                 self.reschedule_timer(
                     TaskKey::PublishWatchInterest,
-                    WATCH_INTEREST_PUBLISH_DEBOUNCE,
+                    WATCH_PUBLISH_DEBOUNCE,
                 )
                 .await;
             }
@@ -363,17 +363,17 @@ impl OperationsTaskHandler {
         match process_materialization_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(
-                    TaskKey::DrainMetadataMaterializationQueue,
+                    TaskKey::DrainMaterializationQueue,
                     drain_delay(&result),
                 )
                 .await;
             }
             Ok(result) if result.next_due_after.is_some() => {
                 self.reschedule_timer(
-                    TaskKey::DrainMetadataMaterializationQueue,
+                    TaskKey::DrainMaterializationQueue,
                     result
                         .next_due_after
-                        .unwrap_or(METADATA_MATERIALIZATION_POLL_AFTER),
+                        .unwrap_or(MATERIALIZATION_POLL_AFTER),
                 )
                 .await;
             }
@@ -381,25 +381,25 @@ impl OperationsTaskHandler {
                 Ok(false) => {}
                 Ok(true) => {
                     self.reschedule_timer(
-                        TaskKey::DrainMetadataMaterializationQueue,
-                        METADATA_MATERIALIZATION_POLL_AFTER,
+                        TaskKey::DrainMaterializationQueue,
+                        MATERIALIZATION_POLL_AFTER,
                     )
                     .await;
                 }
                 Err(error) => {
-                    warn!(task_id = ?TaskKey::DrainMetadataMaterializationQueue, error = ?error, "Failed to probe metadata materialization jobs");
+                    warn!(task_id = ?TaskKey::DrainMaterializationQueue, error = ?error, "Failed to probe metadata materialization jobs");
                     self.reschedule_timer(
-                        TaskKey::DrainMetadataMaterializationQueue,
-                        METADATA_MATERIALIZATION_RETRY_AFTER,
+                        TaskKey::DrainMaterializationQueue,
+                        MATERIALIZATION_RETRY_AFTER,
                     )
                     .await;
                 }
             },
             Err(error) => {
-                warn!(task_id = ?TaskKey::DrainMetadataMaterializationQueue, error = ?error, "Failed to drain metadata materialization queue");
+                warn!(task_id = ?TaskKey::DrainMaterializationQueue, error = ?error, "Failed to drain metadata materialization queue");
                 self.reschedule_timer(
-                    TaskKey::DrainMetadataMaterializationQueue,
-                    METADATA_MATERIALIZATION_RETRY_AFTER,
+                    TaskKey::DrainMaterializationQueue,
+                    MATERIALIZATION_RETRY_AFTER,
                 )
                 .await;
             }
@@ -411,17 +411,17 @@ impl OperationsTaskHandler {
         match crate::metadata::prune_queue::process_prune_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(
-                    TaskKey::DrainMetadataGraphPruneQueue,
+                    TaskKey::DrainPruneQueue,
                     std::time::Duration::ZERO,
                 )
                 .await;
             }
             Ok(result) if result.next_due_after.is_some() => {
                 self.reschedule_timer(
-                    TaskKey::DrainMetadataGraphPruneQueue,
+                    TaskKey::DrainPruneQueue,
                     result
                         .next_due_after
-                        .unwrap_or(METADATA_GRAPH_PRUNE_POLL_AFTER),
+                        .unwrap_or(GRAPH_POLL_AFTER),
                 )
                 .await;
             }
@@ -429,25 +429,25 @@ impl OperationsTaskHandler {
                 Ok(false) => {}
                 Ok(true) => {
                     self.reschedule_timer(
-                        TaskKey::DrainMetadataGraphPruneQueue,
-                        METADATA_GRAPH_PRUNE_POLL_AFTER,
+                        TaskKey::DrainPruneQueue,
+                        GRAPH_POLL_AFTER,
                     )
                     .await;
                 }
                 Err(error) => {
-                    warn!(task_id = ?TaskKey::DrainMetadataGraphPruneQueue, error = ?error, "Failed to probe metadata graph prune jobs");
+                    warn!(task_id = ?TaskKey::DrainPruneQueue, error = ?error, "Failed to probe metadata graph prune jobs");
                     self.reschedule_timer(
-                        TaskKey::DrainMetadataGraphPruneQueue,
-                        METADATA_GRAPH_PRUNE_RETRY_AFTER,
+                        TaskKey::DrainPruneQueue,
+                        GRAPH_RETRY_AFTER,
                     )
                     .await;
                 }
             },
             Err(error) => {
-                warn!(task_id = ?TaskKey::DrainMetadataGraphPruneQueue, error = ?error, "Failed to drain metadata graph prune queue");
+                warn!(task_id = ?TaskKey::DrainPruneQueue, error = ?error, "Failed to drain metadata graph prune queue");
                 self.reschedule_timer(
-                    TaskKey::DrainMetadataGraphPruneQueue,
-                    METADATA_GRAPH_PRUNE_RETRY_AFTER,
+                    TaskKey::DrainPruneQueue,
+                    GRAPH_RETRY_AFTER,
                 )
                 .await;
             }
@@ -460,27 +460,27 @@ impl OperationsTaskHandler {
         match drain_projection_queue(&self.context).await {
             Ok(result) if result.has_more => {
                 self.reschedule_timer(
-                    TaskKey::DrainMetadataProjectionQueue,
+                    TaskKey::DrainProjectionQueue,
                     std::time::Duration::ZERO,
                 )
                 .await;
             }
             Ok(result) if result.markers_examined == 0 => {
                 if let Err(error) = replay_event_log(&self.context).await {
-                    warn!(task_id = ?TaskKey::DrainMetadataProjectionQueue, error = ?error, "Failed to replay metadata event log fallback");
+                    warn!(task_id = ?TaskKey::DrainProjectionQueue, error = ?error, "Failed to replay metadata event log fallback");
                     self.reschedule_timer(
-                        TaskKey::DrainMetadataProjectionQueue,
-                        METADATA_PROJECTION_RETRY_AFTER,
+                        TaskKey::DrainProjectionQueue,
+                        PROJECTION_RETRY_AFTER,
                     )
                     .await;
                 }
             }
             Ok(_) => {}
             Err(error) => {
-                warn!(task_id = ?TaskKey::DrainMetadataProjectionQueue, error = ?error, "Failed to drain metadata projection queue");
+                warn!(task_id = ?TaskKey::DrainProjectionQueue, error = ?error, "Failed to drain metadata projection queue");
                 self.reschedule_timer(
-                    TaskKey::DrainMetadataProjectionQueue,
-                    METADATA_PROJECTION_RETRY_AFTER,
+                    TaskKey::DrainProjectionQueue,
+                    PROJECTION_RETRY_AFTER,
                 )
                 .await;
             }
@@ -490,20 +490,20 @@ impl OperationsTaskHandler {
     pub(super) async fn drain_replication_queue(&self) {
         match process_blob_batch(&self.context).await {
             Ok(result) if result.has_more_due => {
-                self.reschedule_timer(TaskKey::DrainBlobReplicationQueue, Duration::ZERO)
+                self.reschedule_timer(TaskKey::DrainReplicationQueue, Duration::ZERO)
                     .await;
             }
             Ok(result) => {
                 if let Some(after) = result.next_due_after {
-                    self.reschedule_timer(TaskKey::DrainBlobReplicationQueue, after)
+                    self.reschedule_timer(TaskKey::DrainReplicationQueue, after)
                         .await;
                 }
             }
             Err(error) => {
-                warn!(task_id = ?TaskKey::DrainBlobReplicationQueue, error = ?error, "Failed to drain blob replication queue");
+                warn!(task_id = ?TaskKey::DrainReplicationQueue, error = ?error, "Failed to drain blob replication queue");
                 self.reschedule_timer(
-                    TaskKey::DrainBlobReplicationQueue,
-                    BLOB_REPLICATION_RETRY_AFTER,
+                    TaskKey::DrainReplicationQueue,
+                    REPLICATION_RETRY_AFTER,
                 )
                 .await;
             }
@@ -512,24 +512,24 @@ impl OperationsTaskHandler {
 
     pub(super) async fn drain_mirror_repair(&self) {
         let Some(net_handle) = self.context.net_handle.as_ref() else {
-            self.reschedule_timer(TaskKey::DrainSyncMirrorRepair, MIRROR_REPAIR_RETRY_AFTER)
+            self.reschedule_timer(TaskKey::DrainMirrorRepair, REPAIR_RETRY_AFTER)
                 .await;
             return;
         };
         match process_mirror_repairs(&self.context, net_handle.node_id()).await {
             Ok(result) if result.has_more_due => {
-                self.reschedule_timer(TaskKey::DrainSyncMirrorRepair, Duration::ZERO)
+                self.reschedule_timer(TaskKey::DrainMirrorRepair, Duration::ZERO)
                     .await;
             }
             Ok(result) => {
                 if let Some(after) = result.next_due_after {
-                    self.reschedule_timer(TaskKey::DrainSyncMirrorRepair, after)
+                    self.reschedule_timer(TaskKey::DrainMirrorRepair, after)
                         .await;
                 }
             }
             Err(error) => {
-                warn!(task_id = ?TaskKey::DrainSyncMirrorRepair, %error, "Failed to drain sync mirror repair queue");
-                self.reschedule_timer(TaskKey::DrainSyncMirrorRepair, MIRROR_REPAIR_RETRY_AFTER)
+                warn!(task_id = ?TaskKey::DrainMirrorRepair, %error, "Failed to drain sync mirror repair queue");
+                self.reschedule_timer(TaskKey::DrainMirrorRepair, REPAIR_RETRY_AFTER)
                     .await;
             }
         }
@@ -538,20 +538,20 @@ impl OperationsTaskHandler {
     pub(super) async fn drain_refresh_queue(&self) {
         match crate::s3::object::metadata::process_batch(&self.context).await {
             Ok(result) if result.has_more_due => {
-                self.reschedule_timer(TaskKey::DrainReferenceMetadataRefreshQueue, Duration::ZERO)
+                self.reschedule_timer(TaskKey::DrainRefreshQueue, Duration::ZERO)
                     .await;
             }
             Ok(result) => {
                 if let Some(after) = result.next_due_after {
-                    self.reschedule_timer(TaskKey::DrainReferenceMetadataRefreshQueue, after)
+                    self.reschedule_timer(TaskKey::DrainRefreshQueue, after)
                         .await;
                 }
             }
             Err(error) => {
-                warn!(task_id = ?TaskKey::DrainReferenceMetadataRefreshQueue, error = ?error, "Failed to drain reference metadata refresh queue");
+                warn!(task_id = ?TaskKey::DrainRefreshQueue, error = ?error, "Failed to drain reference metadata refresh queue");
                 self.reschedule_timer(
-                    TaskKey::DrainReferenceMetadataRefreshQueue,
-                    REFERENCE_METADATA_REFRESH_RETRY_AFTER,
+                    TaskKey::DrainRefreshQueue,
+                    REFRESH_RETRY_AFTER,
                 )
                 .await;
             }
@@ -564,7 +564,7 @@ impl OperationsTaskHandler {
     pub(super) async fn drain_witness_queue(&self) {
         let now_ms = unix_timestamp_millis();
         if drain_witness_deadlines(self.context.as_ref(), now_ms).await {
-            self.reschedule_timer(TaskKey::DrainJobWitnessQueue, WITNESS_RETRY_AFTER)
+            self.reschedule_timer(TaskKey::DrainWitnessQueue, WITNESS_RETRY_AFTER)
                 .await;
         }
     }
@@ -594,7 +594,7 @@ impl OperationsTaskHandler {
     /// The pass is bounded, so a large backlog re-arms instead of blocking.
     pub(super) async fn drain_family_outbox(&self) {
         if drain_family_outbox(self.context.as_ref()).await {
-            self.reschedule_timer(TaskKey::DrainJobFamilyOutbox, OUTBOX_RETRY_AFTER)
+            self.reschedule_timer(TaskKey::DrainFamilyOutbox, OUTBOX_RETRY_AFTER)
                 .await;
         }
     }
@@ -606,11 +606,11 @@ impl OperationsTaskHandler {
             Ok(outcome) if outcome.has_more => Duration::ZERO,
             Ok(outcome) => outcome
                 .next_due_after
-                .unwrap_or(NOTIFICATION_PRUNE_POLL_AFTER)
-                .min(NOTIFICATION_PRUNE_POLL_AFTER),
+                .unwrap_or(NOTIFICATION_POLL_AFTER)
+                .min(NOTIFICATION_POLL_AFTER),
             Err(error) => {
                 warn!(task_id = ?TaskKey::PruneNotifications, error = %error, "Failed to prune notifications");
-                NOTIFICATION_PRUNE_RETRY_AFTER
+                NOTIFICATION_RETRY_AFTER
             }
         };
         self.reschedule_timer(TaskKey::PruneNotifications, after)
@@ -658,7 +658,7 @@ impl OperationsTaskHandler {
 
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             warn!(task_id = ?retry_key, "Cannot drain notification outbox without net handle");
-            self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+            self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER)
                 .await;
             return;
         };
@@ -668,14 +668,14 @@ impl OperationsTaskHandler {
             Ok(owner) => owner,
             Err(error) => {
                 warn!(task_id = ?retry_key, error = %error, "Failed to start notification outbox snapshot");
-                self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+                self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER)
                     .await;
                 return;
             }
         };
         let Some(snapshot_txn_id) = snapshot_owner.id() else {
             warn!(task_id = ?retry_key, "Notification outbox snapshot owner missing transaction");
-            self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+            self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER)
                 .await;
             return;
         };
@@ -693,7 +693,7 @@ impl OperationsTaskHandler {
             let batch = match read_outbox_batch(
                 &self.context.storage_handle,
                 start_after.clone(),
-                NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
+                OUTBOX_BATCH_SIZE,
                 Some(snapshot_txn_id),
             )
             .await
@@ -725,7 +725,7 @@ impl OperationsTaskHandler {
             for (record_key, outbox_record) in batch.records {
                 let age_ms =
                     unix_timestamp_millis().saturating_sub(outbox_record.outbox_id.timestamp_ms());
-                if age_ms > NOTIFICATION_OUTBOX_RETENTION_MS {
+                if age_ms > OUTBOX_RETENTION_MS {
                     warn!(task_id = ?retry_key, outbox_id = %outbox_record.outbox_id, age_ms, "Dropping expired notification outbox record");
                     if let Err(error) =
                         delete_outbox_records(&self.context.storage_handle, vec![record_key]).await
@@ -852,7 +852,7 @@ impl OperationsTaskHandler {
         }
 
         if retry_needed {
-            self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+            self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER)
                 .await;
         } else {
             match read_outbox_batch(&self.context.storage_handle, None, 1, None).await {
@@ -862,7 +862,7 @@ impl OperationsTaskHandler {
                 Ok(_) => {}
                 Err(error) => {
                     warn!(task_id = ?retry_key, error = %error, "Failed to check for notification outbox records appended during drain");
-                    self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+                    self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER)
                         .await;
                 }
             }
@@ -877,7 +877,7 @@ impl OperationsTaskHandler {
         }
         let Some(owner_node_id) = self.context.net_handle.as_ref().map(|net| net.node_id()) else {
             warn!(task_id = ?TaskKey::DrainJobQueue, "Cannot drain job queue without net handle");
-            self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+            self.reschedule_timer(TaskKey::DrainJobQueue, DRAIN_RETRY_AFTER)
                 .await;
             return;
         };
@@ -907,7 +907,7 @@ impl OperationsTaskHandler {
             Ok(result) => result,
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainJobQueue, error = %error, "Failed to drain job queue");
-                self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+                self.reschedule_timer(TaskKey::DrainJobQueue, DRAIN_RETRY_AFTER)
                     .await;
                 return;
             }
@@ -942,7 +942,7 @@ impl OperationsTaskHandler {
         // A per-job error stopped the batch after handing off what was claimed; back off
         // and re-drive the remainder rather than hot-looping on the failure.
         if result.retry_after_error {
-            self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+            self.reschedule_timer(TaskKey::DrainJobQueue, DRAIN_RETRY_AFTER)
                 .await;
             return;
         }
@@ -951,7 +951,7 @@ impl OperationsTaskHandler {
         // a ZERO hot-loop.
         match result.next_due_after {
             Some(after) if after.is_zero() && result.deferred_saturated => {
-                self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+                self.reschedule_timer(TaskKey::DrainJobQueue, DRAIN_RETRY_AFTER)
                     .await;
             }
             Some(after) => {
@@ -966,11 +966,11 @@ impl OperationsTaskHandler {
             Ok(outcome) if outcome.has_more => Duration::ZERO,
             Ok(outcome) => outcome
                 .next_due_after
-                .unwrap_or(JOB_PRUNE_POLL_AFTER)
-                .min(JOB_PRUNE_POLL_AFTER),
+                .unwrap_or(PRUNE_POLL_AFTER)
+                .min(PRUNE_POLL_AFTER),
             Err(error) => {
                 warn!(task_id = ?TaskKey::PruneJobs, error = %error, "Failed to prune jobs");
-                JOB_PRUNE_RETRY_AFTER
+                PRUNE_RETRY_AFTER
             }
         };
         self.reschedule_timer(TaskKey::PruneJobs, after).await;
@@ -981,21 +981,21 @@ impl OperationsTaskHandler {
             Ok(outcome) if outcome.failed > 0 => BLOB_CLEANUP_RETRY,
             Ok(_) => BLOB_CLEANUP_AFTER,
             Err(error) => {
-                warn!(task_id = ?TaskKey::DrainBlobCleanupQueue, error = %error, "Failed to drain blob cleanup");
+                warn!(task_id = ?TaskKey::DrainCleanupQueue, error = %error, "Failed to drain blob cleanup");
                 BLOB_CLEANUP_RETRY
             }
         };
         // The parts a reclaimed upload frees become cleanup rows, so the sweep
         // rides the same timer that drains them.
         if let Err(error) = sweep_stale_uploads(&self.context, unix_timestamp_millis()).await {
-            warn!(task_id = ?TaskKey::DrainBlobCleanupQueue, error = %error, "Failed to sweep stale multipart uploads");
+            warn!(task_id = ?TaskKey::DrainCleanupQueue, error = %error, "Failed to sweep stale multipart uploads");
         }
-        self.reschedule_timer(TaskKey::DrainBlobCleanupQueue, after)
+        self.reschedule_timer(TaskKey::DrainCleanupQueue, after)
             .await;
     }
 
     pub(super) async fn drain_blob_reclaim(&self) {
-        let key = TaskKey::DrainBlobReclaimQueue;
+        let key = TaskKey::DrainReclaimQueue;
         // A failed candidate earns the fast retry, then doubles up to the normal interval, so a permanently
         // failing one cannot hold a one-minute rescan of the whole queue forever.
         let (after, drained) =

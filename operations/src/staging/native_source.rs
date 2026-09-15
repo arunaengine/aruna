@@ -25,7 +25,7 @@ use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::connectors::resolver::{ARUNA_NATIVE_ORIGIN_NODE_ID, ARUNA_NATIVE_RELATIONSHIP_ID};
+use crate::connectors::resolver::{ORIGIN_NODE_ID, NATIVE_RELATIONSHIP_ID};
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{
@@ -40,7 +40,7 @@ use crate::sync::sync_relationship::{
 };
 
 const NATIVE_IO_TIMEOUT: Duration = Duration::from_secs(30);
-const NATIVE_MAX_HEADER_SIZE: usize = 64 * 1024;
+const MAX_HEADER_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct NativeReferenceRequest {
@@ -160,11 +160,11 @@ fn native_request(
         ));
     };
     let origin_node_id = config
-        .get(ARUNA_NATIVE_ORIGIN_NODE_ID)
+        .get(ORIGIN_NODE_ID)
         .and_then(|value| NodeId::from_str(value).ok())
         .ok_or_else(|| StagingSourceError::ReadError("missing origin node".to_string()))?;
     let relationship_id = config
-        .get(ARUNA_NATIVE_RELATIONSHIP_ID)
+        .get(NATIVE_RELATIONSHIP_ID)
         .and_then(|value| Ulid::from_string(value).ok())
         .ok_or_else(|| StagingSourceError::ReadError("missing relationship id".to_string()))?;
     let version_id = Ulid::from_string(version)
@@ -559,7 +559,7 @@ async fn mark_access_denied(context: &DriverContext, mut relationship: SyncRelat
 
 async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<(), String> {
     let bytes = postcard::to_allocvec(value).map_err(|error| error.to_string())?;
-    if bytes.len() > NATIVE_MAX_HEADER_SIZE {
+    if bytes.len() > MAX_HEADER_SIZE {
         return Err("native reference header is too large".to_string());
     }
     send.write_all(&(bytes.len() as u32).to_be_bytes())
@@ -576,7 +576,7 @@ async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, Str
         .await
         .map_err(|error| error.to_string())?;
     let length = u32::from_be_bytes(length) as usize;
-    if length > NATIVE_MAX_HEADER_SIZE {
+    if length > MAX_HEADER_SIZE {
         return Err("native reference header is too large".to_string());
     }
     let mut bytes = vec![0u8; length];

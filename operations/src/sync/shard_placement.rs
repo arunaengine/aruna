@@ -12,23 +12,23 @@ use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::Key;
 use byteview::ByteView;
 
-pub const DOCUMENT_SYNC_RETRY_AFTER: Duration = Duration::from_secs(30);
-pub const SYNC_PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
+pub const SYNC_RETRY_AFTER: Duration = Duration::from_secs(30);
+pub const PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Retry interval for outbox records deferred on a missing shard-topic
 /// genesis. Short: the genesis is usually one gossip push away (the rank-0
 /// holder creates it eagerly on config apply).
-pub const DOCUMENT_SYNC_DEFER_RETRY_AFTER: Duration = Duration::from_secs(1);
+pub const DEFER_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// Retry interval for a held shard topic the local node could not pull yet (no
 /// genesis or co-holder served it). The base matches `QUEUE_RETRY_BASE_MS` because
 /// admission is a gossip round away; the pull is join-only, so it cannot fork.
-pub const SHARD_TOPIC_PULL_RETRY_AFTER: Duration = Duration::from_millis(250);
+pub const PULL_RETRY_AFTER: Duration = Duration::from_millis(250);
 
 /// Cap for the join-only shard-pull retry ladder. Admission is a gossip round away,
 /// so retries stay on a short cadence rather than cliffing to the 30s genesis-create
 /// interval. The pull cannot fork, so a 2s cap is cheap even for a stuck topic.
-pub const SHARD_TOPIC_PULL_RETRY_MAX: Duration = Duration::from_secs(2);
+pub const PULL_RETRY_MAX: Duration = Duration::from_secs(2);
 
 pub fn placement_prefix(realm_id: RealmId) -> Key {
     ByteView::from(realm_id.as_bytes().to_vec())
@@ -92,7 +92,7 @@ pub fn delete_placement_effect(realm_id: RealmId, placement: &PlacementRef) -> E
 }
 
 pub fn schedule_retry_effect(realm_id: RealmId, local_node_id: NodeId) -> Effect {
-    schedule_retry_after(realm_id, local_node_id, SYNC_PLACEMENT_RETRY_AFTER)
+    schedule_retry_after(realm_id, local_node_id, PLACEMENT_RETRY_AFTER)
 }
 
 pub fn schedule_revalidation(realm_id: RealmId, local_node_id: NodeId) -> Effect {

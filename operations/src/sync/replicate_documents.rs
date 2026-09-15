@@ -67,7 +67,7 @@ pub enum ReplicateDocumentsError {
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error("realm config document not found")]
-    RealmConfigNotFound,
+    ConfigMissing,
     #[error("document sync failed: {0}")]
     DocumentSync(String),
     #[error("placement persistence failed: {0}")]

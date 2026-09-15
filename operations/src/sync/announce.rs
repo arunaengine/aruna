@@ -29,7 +29,7 @@ use ulid::Ulid;
 use crate::document_repository;
 use crate::sync::document_outbox::{new_outbox_record, schedule_drain_effect, write_outbox_effect};
 
-const USER_SYNC_PAGE_SIZE: usize = 256;
+const USER_PAGE_SIZE: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 enum PendingDocumentSync {
@@ -395,7 +395,7 @@ impl AnnounceTopicOperation {
                     key_space: USER_KEYSPACE.to_string(),
                     prefix: Some(UserId::storage_prefix(realm_id)),
                     start: start_after.map(IterStart::After),
-                    limit: USER_SYNC_PAGE_SIZE,
+                    limit: USER_PAGE_SIZE,
                     txn_id: None,
                 })]
             }
@@ -523,7 +523,7 @@ mod pure_tests {
 
     use aruna_core::document::DocumentOutboxRecord;
     use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::metadata::GraphLifecycleRecord;
     use aruna_core::types::GroupId;
     use ulid::Ulid;
@@ -550,7 +550,7 @@ mod pure_tests {
         else {
             panic!("expected one outbox write, got {effects:?}");
         };
-        assert_eq!(key_space, DOCUMENT_SYNC_OUTBOX_KEYSPACE);
+        assert_eq!(key_space, SYNC_OUTBOX_KEYSPACE);
         assert_eq!(txn_id, &None);
         postcard::from_bytes(value.as_ref()).expect("outbox record decodes")
     }

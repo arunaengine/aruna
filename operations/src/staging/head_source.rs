@@ -47,7 +47,7 @@ pub enum HeadSourceError {
         got: String,
     },
     #[error("Head staging source failed")]
-    HeadStagingSourceFailed,
+    HeadSourceFailed,
 }
 
 #[derive(Debug, PartialEq)]
@@ -120,7 +120,7 @@ impl HeadSourceOperation {
         match event {
             Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
                 let Some(connector) = self.connector.clone() else {
-                    return self.emit_error(HeadSourceError::HeadStagingSourceFailed);
+                    return self.emit_error(HeadSourceError::HeadSourceFailed);
                 };
 
                 self.state = HeadSourceState::Finish;
@@ -169,11 +169,11 @@ impl Operation for HeadSourceOperation {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(HeadSourceError::HeadStagingSourceFailed);
+            return Err(HeadSourceError::HeadSourceFailed);
         }
 
         self.output
-            .ok_or(HeadSourceError::HeadStagingSourceFailed)?
+            .ok_or(HeadSourceError::HeadSourceFailed)?
     }
 
     fn abort(&mut self) -> Effects {

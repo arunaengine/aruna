@@ -76,7 +76,7 @@ async fn notification_drain_unresolvable() {
         panic!("expected timer scheduled");
     };
     assert!(
-        after <= NOTIFICATION_DELIVERY_RETRY_AFTER,
+        after <= DELIVERY_RETRY_AFTER,
         "an unresolvable holder must re-arm the retry timer"
     );
 }

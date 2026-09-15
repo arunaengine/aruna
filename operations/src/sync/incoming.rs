@@ -14,7 +14,7 @@ use crate::driver::{
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
-    METADATA_PROJECTION_RETRY_AFTER, project_create_events, project_logged_events,
+    PROJECTION_RETRY_AFTER, project_create_events, project_logged_events,
     schedule_projection_drain,
 };
 use crate::metadata::prune_queue::process_graph_tombstones;
@@ -60,8 +60,8 @@ use tokio::time::{sleep, timeout};
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use ulid::Ulid;
 
-const METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
-const METADATA_DOCUMENT_SYNC_MAINTENANCE_JITTER_SECS: u64 = 15;
+const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const MAINTENANCE_JITTER_SECS: u64 = 15;
 const INBOUND_BAO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -1098,7 +1098,7 @@ async fn reemit_evicted_documents(
     documents: Vec<DocumentEvictedDocument>,
 ) -> bool {
     let Some(net_handle) = context.net_handle.as_ref() else {
-        warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, "Cannot re-emit evicted documents without net handle");
+        warn!(task_id = ?TaskKey::DrainSyncOutbox, "Cannot re-emit evicted documents without net handle");
         return false;
     };
     let node_id = net_handle.node_id();
@@ -1117,7 +1117,7 @@ async fn reemit_evicted_documents(
         let effect = match write_outbox_effect(&record) {
             Ok(effect) => effect,
             Err(error) => {
-                warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, error = %error, "Failed to encode re-emitted eviction outbox record");
+                warn!(task_id = ?TaskKey::DrainSyncOutbox, error = %error, "Failed to encode re-emitted eviction outbox record");
                 complete = false;
                 continue;
             }
@@ -1125,11 +1125,11 @@ async fn reemit_evicted_documents(
         match context.storage_handle.send_effect(effect).await {
             Event::Storage(StorageEvent::WriteResult { .. }) => written += 1,
             Event::Storage(StorageEvent::Error { error }) => {
-                warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, error = %error, "Failed to write re-emitted eviction outbox record");
+                warn!(task_id = ?TaskKey::DrainSyncOutbox, error = %error, "Failed to write re-emitted eviction outbox record");
                 complete = false;
             }
             other => {
-                warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, event = ?other, "Unexpected event writing re-emitted eviction outbox record");
+                warn!(task_id = ?TaskKey::DrainSyncOutbox, event = ?other, "Unexpected event writing re-emitted eviction outbox record");
                 complete = false;
             }
         }
@@ -1138,13 +1138,13 @@ async fn reemit_evicted_documents(
         return complete;
     }
     let Some(task_handle) = context.task_handle.as_ref() else {
-        warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, "Cannot schedule outbox drain for re-emitted evictions without task handle");
+        warn!(task_id = ?TaskKey::DrainSyncOutbox, "Cannot schedule outbox drain for re-emitted evictions without task handle");
         return complete;
     };
     if let Event::Task(TaskEvent::Error { message, .. }) =
         task_handle.send_effect(schedule_drain_effect()).await
     {
-        warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, message = %message, "Failed to schedule outbox drain after re-emitting evictions");
+        warn!(task_id = ?TaskKey::DrainSyncOutbox, message = %message, "Failed to schedule outbox drain after re-emitting evictions");
     }
     info!(
         count = written,
@@ -1190,8 +1190,8 @@ async fn project_inbound_events(context: &DriverContext, reconciled: DocumentRec
 }
 
 async fn schedule_projection_retry(context: &DriverContext) {
-    if let Err(error) = schedule_projection_drain(context, METADATA_PROJECTION_RETRY_AFTER).await {
-        warn!(task_id = ?TaskKey::DrainMetadataProjectionQueue, error = ?error, "Failed to schedule metadata projection retry");
+    if let Err(error) = schedule_projection_drain(context, PROJECTION_RETRY_AFTER).await {
+        warn!(task_id = ?TaskKey::DrainProjectionQueue, error = ?error, "Failed to schedule metadata projection retry");
     }
 }
 
@@ -1204,7 +1204,7 @@ fn schedule_sync_maintenance(
     let jitter = Duration::from_secs(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|now| now.subsec_nanos() as u64 % METADATA_DOCUMENT_SYNC_MAINTENANCE_JITTER_SECS)
+            .map(|now| now.subsec_nanos() as u64 % MAINTENANCE_JITTER_SECS)
             .unwrap_or(0),
     );
     // This loop writes the metadata store, so it has to stop before the
@@ -1215,7 +1215,7 @@ fn schedule_sync_maintenance(
         loop {
             tokio::select! {
                 _ = cancelled.cancelled() => return,
-                _ = sleep(METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL + jitter) => {}
+                _ = sleep(SYNC_MAINTENANCE_INTERVAL + jitter) => {}
             }
             let Some(coalescer) = coalescer.upgrade() else {
                 return;
@@ -1562,7 +1562,7 @@ mod tests {
                     bind_addr: "127.0.0.1:0".parse().unwrap(),
                     discovery_method: DiscoveryMethod::None,
                     relay_method: RelayMethod::None,
-                    document_sync_storage_path: Some(dir.path().join("document-sync")),
+                    sync_storage_path: Some(dir.path().join("document-sync")),
                     ..NetConfig::default()
                 },
                 storage.clone(),
@@ -1634,10 +1634,10 @@ mod tests {
         )
         .await;
 
-        let timer = read_task_timer(&storage, &TaskKey::DrainMetadataProjectionQueue)
+        let timer = read_task_timer(&storage, &TaskKey::DrainProjectionQueue)
             .await
             .expect("projection retry timer persisted");
-        assert_eq!(timer.key, TaskKey::DrainMetadataProjectionQueue);
+        assert_eq!(timer.key, TaskKey::DrainProjectionQueue);
     }
 
     async fn read_task_timer(

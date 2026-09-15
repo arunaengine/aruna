@@ -5,9 +5,9 @@
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{SYNC_QUARANTINE_KEYSPACE, SYNC_QUARANTINE_USAGE_KEYSPACE};
+use aruna_core::keyspaces::{SYNC_QUARANTINE_KEYSPACE, QUARANTINE_USAGE_KEYSPACE};
 use aruna_core::structs::{
-    SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage, quarantine_row_entry,
+    QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage, quarantine_row_entry,
     quarantine_usage_entry,
 };
 use aruna_core::types::{Key, TxnId, Value};
@@ -97,8 +97,8 @@ async fn read_usage_row(
 ) -> Result<SyncQuarantineUsage, QuarantineAdminError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: SYNC_QUARANTINE_USAGE_KEYSPACE.to_string(),
-            key: ByteView::from(SYNC_QUARANTINE_USAGE_KEY),
+            key_space: QUARANTINE_USAGE_KEYSPACE.to_string(),
+            key: ByteView::from(QUARANTINE_USAGE_KEY),
             txn_id,
         })
         .await

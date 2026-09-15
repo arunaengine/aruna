@@ -306,7 +306,7 @@ impl OperationsTaskHandler {
         rotation: &OutboxRotation,
         invocation: &mut DrainInvocation,
     ) -> DrainPage {
-        let page_limit = OUTBOX_DRAIN_BATCH_SIZE.min(
+        let page_limit = OUTBOX_DRAIN_SIZE.min(
             self.outbox_limits
                 .records
                 .saturating_sub(invocation.records),
@@ -353,7 +353,7 @@ impl OperationsTaskHandler {
 
 impl OperationsTaskHandler {
     async fn run_drain(&self) {
-        let retry_key = TaskKey::DrainDocumentSyncOutbox;
+        let retry_key = TaskKey::DrainSyncOutbox;
         let drain_started = Instant::now();
 
         let Some(net_handle) = self.context.net_handle.as_ref() else {
@@ -457,7 +457,7 @@ impl OperationsTaskHandler {
             if closed.deleted > 0 {
                 self.reset_backoff(&retry_key);
             }
-            self.reschedule_timer(retry_key, DOCUMENT_SYNC_DEFER_RETRY_AFTER)
+            self.reschedule_timer(retry_key, DEFER_RETRY_AFTER)
                 .await;
         } else {
             self.reset_backoff(&retry_key);
@@ -995,7 +995,7 @@ impl OperationsTaskHandler {
             } else {
                 rotation.continuations = 0;
                 self.store_rotation(rotation);
-                self.reschedule_timer(retry_key, DOCUMENT_SYNC_DEFER_RETRY_AFTER)
+                self.reschedule_timer(retry_key, DEFER_RETRY_AFTER)
                     .await;
             }
         } else {

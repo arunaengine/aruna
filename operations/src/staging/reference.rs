@@ -15,7 +15,7 @@ use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
-    SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE,
+    SOURCE_INDEX_KEYSPACE, SOURCE_SECRET_KEYSPACE,
 };
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
@@ -460,7 +460,7 @@ async fn guard_connector_unchanged(
     let current_connector = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+            key_space: SOURCE_INDEX_KEYSPACE.to_string(),
             key: source_connector_key(resolved_connector.group_id, resolved_connector.connector_id),
             txn_id: Some(txn_id),
         })
@@ -481,7 +481,7 @@ async fn guard_connector_unchanged(
     let current_secret = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
+            key_space: SOURCE_SECRET_KEYSPACE.to_string(),
             key: connector_secret_key(resolved_connector.connector_id),
             txn_id: Some(txn_id),
         })
@@ -551,8 +551,8 @@ mod tests {
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-        S3_PURGE_FENCE_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE,
+        PURGE_FENCE_KEYSPACE, SOURCE_INDEX_KEYSPACE, SOURCE_SECRET_KEYSPACE,
         USAGE_STATS_KEYSPACE,
     };
     use aruna_core::stream::BackendStream;
@@ -616,7 +616,7 @@ mod tests {
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+                key_space: SOURCE_INDEX_KEYSPACE.to_string(),
                 key: source_connector_key(connector.group_id, connector.connector_id),
                 value: connector.to_bytes().unwrap().into(),
                 txn_id: None,
@@ -632,7 +632,7 @@ mod tests {
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
+                key_space: SOURCE_SECRET_KEYSPACE.to_string(),
                 key: connector_secret_key(secret.connector_id),
                 value: secret.to_bytes().unwrap().into(),
                 txn_id: None,
@@ -648,7 +648,7 @@ mod tests {
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Delete {
-                key_space: SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+                key_space: SOURCE_INDEX_KEYSPACE.to_string(),
                 key: source_connector_key(connector.group_id, connector.connector_id),
                 txn_id: None,
             })
@@ -663,7 +663,7 @@ mod tests {
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Delete {
-                key_space: SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
+                key_space: SOURCE_SECRET_KEYSPACE.to_string(),
                 key: connector_secret_key(connector_id),
                 txn_id: None,
             })
@@ -949,7 +949,7 @@ mod tests {
 
         let historical_hash_path = read_value(
             context,
-            HASH_PATHS_INDEX_KEYSPACE,
+            PATHS_INDEX_KEYSPACE,
             HashIndex::new(
                 initial_hash,
                 initial.version_id,
@@ -1027,7 +1027,7 @@ mod tests {
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_PURGE_FENCE_KEYSPACE.to_string(),
+                key_space: PURGE_FENCE_KEYSPACE.to_string(),
                 key: b"bucket-a".to_vec().into(),
                 value: fence.to_bytes().unwrap().into(),
                 txn_id: None,

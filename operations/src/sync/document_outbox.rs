@@ -6,7 +6,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTa
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    DOCUMENT_SYNC_OUTBOX_KEYSPACE, TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE,
+    SYNC_OUTBOX_KEYSPACE, OUTBOX_INDEX_KEYSPACE,
 };
 use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -19,8 +19,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 // Size one drain for several full topic batches; every grouped peer receives every topic.
-pub const OUTBOX_DRAIN_BATCH_SIZE: usize =
-    4 * aruna_net::document_sync::DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT;
+pub const OUTBOX_DRAIN_SIZE: usize =
+    4 * aruna_net::document_sync::BATCH_TOPIC_LIMIT;
 const ADMIN_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/admin-operation/";
 const DELETE_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/delete/";
 const UPSERT_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/upsert/";
@@ -61,7 +61,7 @@ pub fn outbox_key(record: &DocumentOutboxRecord) -> Key {
 
 pub fn revocation_index_entry(record: &DocumentOutboxRecord) -> (String, Key, Value) {
     (
-        TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+        OUTBOX_INDEX_KEYSPACE.to_string(),
         outbox_key(record),
         Value::from(vec![1u8]),
     )
@@ -73,7 +73,7 @@ fn revocation_index_key(record: &DocumentOutboxRecord) -> Option<Key> {
     };
     matches!(
         &event.op,
-        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+        AdminDocumentOperation::ConfigTokenRevoked { .. }
     )
     .then(|| outbox_key(record))
 }
@@ -169,7 +169,7 @@ pub fn outbox_write_entry(
     let value = ByteView::from(postcard::to_allocvec(record)?);
     #[cfg(debug_assertions)]
     record_ledger(record, key.as_ref(), value.as_ref());
-    Ok((DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), key, value))
+    Ok((SYNC_OUTBOX_KEYSPACE.to_string(), key, value))
 }
 
 pub fn write_transaction_effect(
@@ -187,7 +187,7 @@ pub fn write_transaction_effect(
 
 pub fn schedule_drain_effect() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainDocumentSyncOutbox,
+        key: TaskKey::DrainSyncOutbox,
         after: Duration::ZERO,
     })
 }
@@ -198,7 +198,7 @@ pub async fn read_outbox_record(
 ) -> Result<Option<DocumentOutboxRecord>, String> {
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+            key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
             key: ByteView::from(key.to_vec()),
             txn_id: None,
         })
@@ -230,7 +230,7 @@ pub async fn read_outbox_records(
     let read_limit = limit.saturating_add(1);
     match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+            key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
             prefix: Some(ByteView::from(prefix.to_vec())),
             start: start_after.map(|key| IterStart::After(ByteView::from(key))),
             limit: read_limit,
@@ -269,7 +269,7 @@ pub async fn read_outbox_tails(storage: &StorageHandle) -> Result<Vec<(Vec<u8>, 
     for prefix in outbox_stream_prefixes() {
         match storage
             .send_storage_effect(StorageEffect::Last {
-                key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
                 prefix: Some(prefix.to_vec().into()),
                 txn_id: None,
             })
@@ -299,7 +299,7 @@ pub async fn delete_outbox_records(
         let index_key = if key.starts_with(ADMIN_OUTBOX_PREFIX) {
             let value = match storage
                 .send_storage_effect(StorageEffect::Read {
-                    key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                    key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
                     key: ByteView::from(key.clone()),
                     txn_id: None,
                 })
@@ -340,10 +340,10 @@ pub async fn delete_outbox_records(
         };
 
         let key = ByteView::from(key);
-        deletes.push((DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), key));
+        deletes.push((SYNC_OUTBOX_KEYSPACE.to_string(), key));
         if let Some(index_key) = index_key {
             deletes.push((
-                TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                OUTBOX_INDEX_KEYSPACE.to_string(),
                 index_key,
             ));
         }
@@ -364,7 +364,7 @@ pub async fn delete_outbox_records(
 async fn read_index_value(storage: &StorageHandle, key: &[u8]) -> Result<Option<Value>, String> {
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+            key_space: OUTBOX_INDEX_KEYSPACE.to_string(),
             key: ByteView::from(key.to_vec()),
             txn_id: None,
         })
@@ -379,7 +379,7 @@ async fn read_index_value(storage: &StorageHandle, key: &[u8]) -> Result<Option<
 pub async fn restore_outbox_timers(storage: &StorageHandle, task_handle: &TaskHandle) {
     let event = storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+            key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: 1,
@@ -401,7 +401,7 @@ pub async fn restore_outbox_timers(storage: &StorageHandle, task_handle: &TaskHa
 
     if has_records {
         let event = task_handle
-            .schedule_idle_timer(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
+            .schedule_idle_timer(TaskKey::DrainSyncOutbox, Duration::ZERO)
             .await;
         if let TaskEvent::Error { message, .. } = event {
             warn!(message = %message, "Failed to restore document sync outbox timer");
@@ -467,7 +467,7 @@ mod tests {
                 user_id,
                 realm_id,
             },
-            op: AdminDocumentOperation::RealmConfigTokenRevoked {
+            op: AdminDocumentOperation::ConfigTokenRevoked {
                 token_hash: aruna_core::auth::bearer_token_hash(&format!("token-{origin_seq}")),
                 expires_at: 100,
                 token_owner: user_id,
@@ -506,7 +506,7 @@ mod tests {
     async fn write_raw_record(storage: &StorageHandle, key: Vec<u8>, value: Vec<u8>) {
         match storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
                 key: ByteView::from(key),
                 value: ByteView::from(value),
                 txn_id: None,
@@ -521,7 +521,7 @@ mod tests {
     async fn write_index(storage: &StorageHandle, key: Vec<u8>) {
         match storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                key_space: OUTBOX_INDEX_KEYSPACE.to_string(),
                 key: ByteView::from(key),
                 value: Value::from(vec![1u8]),
                 txn_id: None,
@@ -541,7 +541,7 @@ mod tests {
         let corrupt_key = b"000-corrupt-outbox".to_vec();
         write_raw_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
 
-        let batch = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_BATCH_SIZE)
+        let batch = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_SIZE)
             .await
             .expect("outbox read succeeds");
 
@@ -796,7 +796,7 @@ mod tests {
         );
         let (keyspace, key, value) = revocation_index_entry(&record);
 
-        assert_eq!(keyspace, TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE);
+        assert_eq!(keyspace, OUTBOX_INDEX_KEYSPACE);
         assert_eq!(key, outbox_key(&record));
         assert_eq!(value, Value::from(vec![1u8]));
     }
@@ -836,7 +836,7 @@ mod tests {
         );
         match storage
             .send_storage_effect(StorageEffect::Read {
-                key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                key_space: OUTBOX_INDEX_KEYSPACE.to_string(),
                 key: index_key,
                 txn_id: None,
             })
@@ -896,7 +896,7 @@ mod tests {
         for key in [metadata_key, admin_key] {
             match storage
                 .send_storage_effect(StorageEffect::Read {
-                    key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                    key_space: OUTBOX_INDEX_KEYSPACE.to_string(),
                     key: ByteView::from(key),
                     txn_id: None,
                 })
@@ -931,7 +931,7 @@ mod tests {
             .expect("outbox delete succeeds");
         match storage
             .send_storage_effect(StorageEffect::Read {
-                key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                key_space: OUTBOX_INDEX_KEYSPACE.to_string(),
                 key: ByteView::from(record_key),
                 txn_id: None,
             })

@@ -15,10 +15,10 @@ fn blocked_batch_waits() {
         processed: 4,
         ..blocked
     };
-    assert_eq!(drain_delay(&blocked), METADATA_MATERIALIZATION_RETRY_AFTER);
+    assert_eq!(drain_delay(&blocked), MATERIALIZATION_RETRY_AFTER);
     assert_eq!(
         drain_delay(&progressing),
-        METADATA_MATERIALIZATION_NEXT_BATCH_AFTER
+        NEXT_BATCH_AFTER
     );
 }
 
@@ -40,7 +40,7 @@ fn reclaim_retry_climbs() {
         }),
         JobsRuntime::new(),
     );
-    let key = TaskKey::DrainBlobReclaimQueue;
+    let key = TaskKey::DrainReclaimQueue;
     let ladder = |handler: &OperationsTaskHandler| {
         handler.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER)
     };
