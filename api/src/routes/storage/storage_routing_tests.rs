@@ -1,9 +1,9 @@
 use super::*;
 use crate::openapi::ApiDoc;
-use crate::tests::fixtures::storage_routing::setup_state;
+use crate::tests::storage_routing::setup_state;
 
-fn class_rule(class: &str) -> StorageRoutingRuleRequest {
-    StorageRoutingRuleRequest {
+fn class_rule(class: &str) -> RoutingRuleRequest {
+    RoutingRuleRequest {
         key_prefix: "archive/".to_string(),
         exact: false,
         target: RoutingTargetRequest {
@@ -52,7 +52,7 @@ async fn rejects_operator_backend() {
         Extension(Some(test.auth.clone())),
         Path(test.bucket.clone()),
         Json(BucketRoutingRequest {
-            rules: vec![StorageRoutingRuleRequest {
+            rules: vec![RoutingRuleRequest {
                 key_prefix: String::new(),
                 exact: false,
                 target: RoutingTargetRequest {
@@ -160,7 +160,7 @@ async fn rejects_foreign_backend() {
         Extension(Some(test.auth.clone())),
         Path(test.bucket.clone()),
         Json(BucketRoutingRequest {
-            rules: vec![StorageRoutingRuleRequest {
+            rules: vec![RoutingRuleRequest {
                 key_prefix: String::new(),
                 exact: false,
                 target: RoutingTargetRequest {
