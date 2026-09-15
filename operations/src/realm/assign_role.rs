@@ -2,13 +2,13 @@ use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -28,7 +28,7 @@ use crate::sync::replicate_documents::replicate_documents_effect;
 use aruna_core::types::Effects;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AddUserToRealmRolesInput {
+pub struct AssignRolesInput {
     pub actor: Actor,
     pub realm_id: RealmId,
     pub user_id: UserId,
@@ -36,15 +36,15 @@ pub struct AddUserToRealmRolesInput {
 }
 
 #[derive(PartialEq)]
-pub struct AddUserToRealmRolesOperation {
-    input: AddUserToRealmRolesInput,
-    state: AddUserToRealmRolesState,
-    output: Option<Result<RealmAuthorizationDocument, AddUserToRealmRolesError>>,
+pub struct AssignRolesOperation {
+    input: AssignRolesInput,
+    state: AssignRolesState,
+    output: Option<Result<RealmAuthorizationDocument, AssignRolesError>>,
 }
 
-impl std::fmt::Debug for AddUserToRealmRolesOperation {
+impl std::fmt::Debug for AssignRolesOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AddUserToRealmRolesOperation")
+        f.debug_struct("AssignRolesOperation")
             .field("input", &self.input)
             .field("state", &self.state)
             .field("output", &self.output)
@@ -53,7 +53,7 @@ impl std::fmt::Debug for AddUserToRealmRolesOperation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum AddUserToRealmRolesState {
+pub enum AssignRolesState {
     Init,
     Auth,
     StartTransaction,
@@ -87,13 +87,13 @@ pub enum AddUserToRealmRolesState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum AddUserToRealmRolesError {
+pub enum AssignRolesError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
-    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
+    AdminDocumentError(#[from] AdminDocumentError),
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
     #[error("No transaction found")]
@@ -112,17 +112,17 @@ pub enum AddUserToRealmRolesError {
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: AddUserToRealmRolesState,
+        state: AssignRolesState,
         expected: &'static str,
         got: String,
     },
 }
 
-impl AddUserToRealmRolesOperation {
-    pub fn new(input: AddUserToRealmRolesInput) -> Self {
-        AddUserToRealmRolesOperation {
+impl AssignRolesOperation {
+    pub fn new(input: AssignRolesInput) -> Self {
+        AssignRolesOperation {
             input,
-            state: AddUserToRealmRolesState::Init,
+            state: AssignRolesState::Init,
             output: None,
         }
     }
@@ -131,7 +131,7 @@ impl AddUserToRealmRolesOperation {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
-                AddUserToRealmRolesState::StartTransaction,
+                AssignRolesState::StartTransaction,
                 "Event::Storage(StorageEvent::TransactionStarted)",
                 got,
             );
@@ -155,7 +155,7 @@ impl AddUserToRealmRolesOperation {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
             return self.unexpected_event(
-                AddUserToRealmRolesState::Auth,
+                AssignRolesState::Auth,
                 "Event::SubOperation(SubOperationEvent::AuthorizationResult)",
                 got,
             );
@@ -170,19 +170,19 @@ impl AddUserToRealmRolesOperation {
     fn emit_start_transaction(
         &mut self,
         auth_result: Result<bool, AuthorizationError>,
-    ) -> Result<Effects, AddUserToRealmRolesError> {
+    ) -> Result<Effects, AssignRolesError> {
         if auth_result? {
-            self.state = AddUserToRealmRolesState::StartTransaction;
+            self.state = AssignRolesState::StartTransaction;
             Ok(smallvec![Effect::Storage(
                 StorageEffect::StartTransaction { read: false }
             )])
         } else {
-            Err(AddUserToRealmRolesError::Unauthorized)
+            Err(AssignRolesError::Unauthorized)
         }
     }
 
-    fn emit_auth_read(&mut self, txn_id: TxnId) -> Result<Effects, AddUserToRealmRolesError> {
-        self.state = AddUserToRealmRolesState::ReadAuthDocAndAdminState { txn_id };
+    fn emit_auth_read(&mut self, txn_id: TxnId) -> Result<Effects, AssignRolesError> {
+        self.state = AssignRolesState::ReadAuthDocAndAdminState { txn_id };
         let target = AdminDocumentTarget::Realm {
             realm_id: self.input.realm_id,
         };
@@ -227,14 +227,14 @@ impl AddUserToRealmRolesOperation {
         txn_id: TxnId,
         auth_doc: Option<ByteView>,
         reducer_state_value: Option<ByteView>,
-    ) -> Result<Effects, AddUserToRealmRolesError> {
+    ) -> Result<Effects, AssignRolesError> {
         let mut auth_doc = RealmAuthorizationDocument::from_bytes(
-            &auth_doc.ok_or_else(|| AddUserToRealmRolesError::AuthDocNotFound)?,
+            &auth_doc.ok_or_else(|| AssignRolesError::AuthDocNotFound)?,
         )?;
         let role_ids = sorted_role_ids(&self.input.role_ids);
         for role_id in &role_ids {
             if !auth_doc.roles.contains_key(role_id) {
-                return Err(AddUserToRealmRolesError::RoleNotFound);
+                return Err(AssignRolesError::RoleNotFound);
             }
         }
 
@@ -252,12 +252,12 @@ impl AddUserToRealmRolesOperation {
             .as_ref()
             .is_some_and(|state| state.target != target)
         {
-            return Err(AdminDocumentReducerError::TargetMismatch.into());
+            return Err(AdminDocumentError::TargetMismatch.into());
         }
 
         let mut reducer_state = previous_reducer_state
             .clone()
-            .unwrap_or_else(|| AdminDocumentReducerState::new(target));
+            .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_events = apply_reducer_updates(&mut reducer_state, &self.input, &role_ids)?;
 
         let materialized_assignments = reducer_state.materialized_realm_assignments();
@@ -265,7 +265,7 @@ impl AddUserToRealmRolesOperation {
             let role = auth_doc
                 .roles
                 .get_mut(&role_id)
-                .ok_or_else(|| AddUserToRealmRolesError::RoleNotFound)?;
+                .ok_or_else(|| AssignRolesError::RoleNotFound)?;
             if materialized_assignments
                 .get(&role_id)
                 .is_some_and(|users| users.contains(&self.input.user_id))
@@ -284,7 +284,7 @@ impl AddUserToRealmRolesOperation {
             (AUTH_KEYSPACE.to_string(), key, value),
             reducer_state_entry(&reducer_state)?,
         ];
-        let document_target = DocumentSyncTarget::RealmAuthorization {
+        let document_target = DocumentTarget::RealmAuthorization {
             realm_id: self.input.realm_id,
         };
         for event in &admin_events {
@@ -293,7 +293,7 @@ impl AddUserToRealmRolesOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::admin(event.clone()),
+                DocumentOutboxEvent::admin(event.clone()),
                 // No realm config in reach here; the stage-2 topic flip resolves
                 // the real ref for this target.
                 aruna_core::structs::PlacementRef::NIL,
@@ -303,7 +303,7 @@ impl AddUserToRealmRolesOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = AddUserToRealmRolesState::WriteAuthDocAndAdminState {
+        self.state = AssignRolesState::WriteAuthDocAndAdminState {
             txn_id,
             auth_doc,
             admin_outbox_written: !admin_events.is_empty(),
@@ -334,7 +334,7 @@ impl AddUserToRealmRolesOperation {
         };
 
         if !stale_conflict_deletes.is_empty() {
-            self.state = AddUserToRealmRolesState::DeleteStaleAdminConflicts {
+            self.state = AssignRolesState::DeleteStaleAdminConflicts {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
@@ -373,7 +373,7 @@ impl AddUserToRealmRolesOperation {
         auth_doc: RealmAuthorizationDocument,
         admin_outbox_written: bool,
     ) -> Effects {
-        self.state = AddUserToRealmRolesState::CommitTransaction {
+        self.state = AssignRolesState::CommitTransaction {
             txn_id,
             auth_doc,
             admin_outbox_written,
@@ -396,7 +396,7 @@ impl AddUserToRealmRolesOperation {
             );
         };
         if admin_outbox_written {
-            self.state = AddUserToRealmRolesState::ScheduleAdminDocumentOutboxDrain { auth_doc };
+            self.state = AssignRolesState::ScheduleAdminDocumentOutboxDrain { auth_doc };
             return smallvec![schedule_drain_effect()];
         }
 
@@ -411,7 +411,7 @@ impl AddUserToRealmRolesOperation {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. })
             | Event::Task(TaskEvent::Error { .. }) => {
-                self.state = AddUserToRealmRolesState::Finish;
+                self.state = AssignRolesState::Finish;
                 self.output = Some(Ok(auth_doc));
                 smallvec![]
             }
@@ -424,10 +424,10 @@ impl AddUserToRealmRolesOperation {
     }
 
     fn emit_auth_announce(&mut self, auth_doc: RealmAuthorizationDocument) -> Effects {
-        self.state = AddUserToRealmRolesState::AnnounceAuthDoc {
+        self.state = AssignRolesState::AnnounceAuthDoc {
             auth_doc: auth_doc.clone(),
         };
-        let document = DocumentSyncTarget::RealmAuthorization {
+        let document = DocumentTarget::RealmAuthorization {
             realm_id: auth_doc.realm_id,
         };
         smallvec![replicate_documents_effect(
@@ -451,38 +451,34 @@ impl AddUserToRealmRolesOperation {
             );
         };
         if let Err(error) = result {
-            return self.fail(AddUserToRealmRolesError::TopicAnnouncement(error));
+            return self.fail(AssignRolesError::TopicAnnouncement(error));
         }
-        self.state = AddUserToRealmRolesState::Finish;
+        self.state = AssignRolesState::Finish;
         self.output = Some(Ok(auth_doc));
         smallvec![]
     }
 
-    fn fail(&mut self, err: AddUserToRealmRolesError) -> Effects {
-        self.state = AddUserToRealmRolesState::Error;
+    fn fail(&mut self, err: AssignRolesError) -> Effects {
+        self.state = AssignRolesState::Error;
         self.output = Some(Err(err));
         self.abort()
     }
 
-    fn fail_with_cleanup(
-        &mut self,
-        err: AddUserToRealmRolesError,
-        cleanup_effects: Effects,
-    ) -> Effects {
-        self.state = AddUserToRealmRolesState::Error;
+    fn fail_with_cleanup(&mut self, err: AssignRolesError, cleanup_effects: Effects) -> Effects {
+        self.state = AssignRolesState::Error;
         self.output = Some(Err(err));
         cleanup_effects
     }
 
     fn unexpected_event(
         &mut self,
-        state: AddUserToRealmRolesState,
+        state: AssignRolesState,
         expected: &'static str,
         got: String,
     ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
-            AddUserToRealmRolesError::UnexpectedEvent {
+            AssignRolesError::UnexpectedEvent {
                 state,
                 expected,
                 got,
@@ -500,17 +496,17 @@ impl AddUserToRealmRolesOperation {
     }
 }
 
-impl Operation for AddUserToRealmRolesOperation {
+impl Operation for AssignRolesOperation {
     type Output = RealmAuthorizationDocument;
 
-    type Error = AddUserToRealmRolesError;
+    type Error = AssignRolesError;
 
     fn start(&mut self) -> Effects {
         if self.input.user_id.is_nil() {
-            return self.fail(AddUserToRealmRolesError::InvalidUserId);
+            return self.fail(AssignRolesError::InvalidUserId);
         }
 
-        self.state = AddUserToRealmRolesState::Auth;
+        self.state = AssignRolesState::Auth;
 
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
@@ -534,12 +530,12 @@ impl Operation for AddUserToRealmRolesOperation {
         };
 
         match self.state.clone() {
-            AddUserToRealmRolesState::Auth => self.handle_authorization(event),
-            AddUserToRealmRolesState::StartTransaction => self.handle_start_transaction(event),
-            AddUserToRealmRolesState::ReadAuthDocAndAdminState { txn_id } => {
+            AssignRolesState::Auth => self.handle_authorization(event),
+            AssignRolesState::StartTransaction => self.handle_start_transaction(event),
+            AssignRolesState::ReadAuthDocAndAdminState { txn_id } => {
                 self.handle_auth_read(event, txn_id)
             }
-            AddUserToRealmRolesState::WriteAuthDocAndAdminState {
+            AssignRolesState::WriteAuthDocAndAdminState {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
@@ -551,25 +547,23 @@ impl Operation for AddUserToRealmRolesOperation {
                 admin_outbox_written,
                 stale_conflict_deletes,
             ),
-            AddUserToRealmRolesState::DeleteStaleAdminConflicts {
+            AssignRolesState::DeleteStaleAdminConflicts {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
             } => self.delete_stale_conflicts(event, txn_id, auth_doc, admin_outbox_written),
-            AddUserToRealmRolesState::CommitTransaction {
+            AssignRolesState::CommitTransaction {
                 auth_doc,
                 admin_outbox_written,
                 ..
             } => self.handle_commit_transaction(event, auth_doc, admin_outbox_written),
-            AddUserToRealmRolesState::ScheduleAdminDocumentOutboxDrain { auth_doc } => {
+            AssignRolesState::ScheduleAdminDocumentOutboxDrain { auth_doc } => {
                 self.schedule_outbox_drain(event, auth_doc)
             }
-            AddUserToRealmRolesState::AnnounceAuthDoc { auth_doc } => {
+            AssignRolesState::AnnounceAuthDoc { auth_doc } => {
                 self.handle_auth_announce(event, auth_doc)
             }
-            AddUserToRealmRolesState::Init
-            | AddUserToRealmRolesState::Finish
-            | AddUserToRealmRolesState::Error => {
+            AssignRolesState::Init | AssignRolesState::Finish | AssignRolesState::Error => {
                 smallvec![]
             }
         }
@@ -578,21 +572,20 @@ impl Operation for AddUserToRealmRolesOperation {
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            AddUserToRealmRolesState::Finish | AddUserToRealmRolesState::Error
+            AssignRolesState::Finish | AssignRolesState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .ok_or_else(|| AddUserToRealmRolesError::NotFinished)?
+        self.output.ok_or_else(|| AssignRolesError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            AddUserToRealmRolesState::ReadAuthDocAndAdminState { txn_id }
-            | AddUserToRealmRolesState::WriteAuthDocAndAdminState { txn_id, .. }
-            | AddUserToRealmRolesState::DeleteStaleAdminConflicts { txn_id, .. }
-            | AddUserToRealmRolesState::CommitTransaction { txn_id, .. } => {
+            AssignRolesState::ReadAuthDocAndAdminState { txn_id }
+            | AssignRolesState::WriteAuthDocAndAdminState { txn_id, .. }
+            | AssignRolesState::DeleteStaleAdminConflicts { txn_id, .. }
+            | AssignRolesState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
 
@@ -608,10 +601,10 @@ fn sorted_role_ids(role_ids: &HashSet<RoleId>) -> Vec<RoleId> {
 }
 
 fn apply_reducer_updates(
-    state: &mut AdminDocumentReducerState,
-    input: &AddUserToRealmRolesInput,
+    state: &mut AdminDocumentState,
+    input: &AssignRolesInput,
     role_ids: &[RoleId],
-) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
+) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut admin_events = Vec::new();
     for role_id in role_ids {
         if should_seed_role(state, *role_id) {
@@ -634,7 +627,7 @@ fn apply_reducer_updates(
     Ok(admin_events)
 }
 
-fn should_seed_role(state: &AdminDocumentReducerState, role_id: RoleId) -> bool {
+fn should_seed_role(state: &AdminDocumentState, role_id: RoleId) -> bool {
     !state.materialized_realm_roles().contains(&role_id)
         && !state
             .conflicts
@@ -646,18 +639,14 @@ pub mod test {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     use crate::driver::{DriverContext, drive};
-    use crate::realm::assign_role::{
-        AddUserToRealmRolesError, AddUserToRealmRolesInput, AddUserToRealmRolesOperation,
-    };
-    use crate::realm::claim_admin::{ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation};
+    use crate::realm::assign_role::{AssignRolesError, AssignRolesInput, AssignRolesOperation};
+    use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentDot, AdminDocumentOperation, AdminDocumentTarget,
     };
-    use aruna_core::document::{
-        DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
-    };
+    use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
@@ -666,8 +655,7 @@ pub mod test {
     };
     use aruna_core::operation::Operation;
     use aruna_core::reducer::{
-        AdminDocumentAttributeVersion, AdminDocumentConflict, AdminDocumentConflictValue,
-        AdminDocumentReducerState,
+        AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
     };
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
     use aruna_core::structs::{Actor, Permission, RealmAuthorizationDocument, RealmId, Role};
@@ -700,15 +688,15 @@ pub mod test {
         user_id: UserId,
         add_seed: u8,
         remove_seed: u8,
-    ) -> AdminDocumentConflict {
-        AdminDocumentConflict {
+    ) -> AdminConflict {
+        AdminConflict {
             path: assignment_path(role_id, user_id),
             values: vec![
-                AdminDocumentConflictValue {
+                AdminConflictValue {
                     value: Some(user_id.to_string()),
                     dot: dot(add_seed),
                 },
-                AdminDocumentConflictValue {
+                AdminConflictValue {
                     value: None,
                     dot: dot(remove_seed),
                 },
@@ -721,14 +709,14 @@ pub mod test {
         role_id: RoleId,
         assigned_user_id: UserId,
         remaining_conflict_user_id: UserId,
-    ) -> AdminDocumentReducerState {
+    ) -> AdminDocumentState {
         let role_dot = dot(3);
         let mut clock = AdminDocumentClock::default();
         for dot in [role_dot, dot(11), dot(12), dot(13), dot(14)] {
             clock.advance(dot.origin_node_id, dot.origin_seq);
         }
 
-        AdminDocumentReducerState {
+        AdminDocumentState {
             target: AdminDocumentTarget::Realm { realm_id },
             clock,
             applied_event_ids: BTreeSet::new(),
@@ -746,7 +734,7 @@ pub mod test {
             user_name: None,
             user_subject_ids: BTreeMap::from([(
                 format!("realm.roles.{role_id}"),
-                AdminDocumentAttributeVersion {
+                AdminAttributeVersion {
                     value: Some(role_id.to_string()),
                     dot: role_dot,
                 },
@@ -767,7 +755,7 @@ pub mod test {
             user_id: owner_id,
             realm_id,
         };
-        let mut operation = AddUserToRealmRolesOperation::new(AddUserToRealmRolesInput {
+        let mut operation = AssignRolesOperation::new(AssignRolesInput {
             actor,
             realm_id,
             user_id: UserId::nil(realm_id),
@@ -775,10 +763,7 @@ pub mod test {
         });
 
         assert!(operation.start().is_empty());
-        assert_eq!(
-            operation.finalize(),
-            Err(AddUserToRealmRolesError::InvalidUserId)
-        );
+        assert_eq!(operation.finalize(), Err(AssignRolesError::InvalidUserId));
     }
 
     #[test]
@@ -805,14 +790,14 @@ pub mod test {
             )]),
             operation_restrictions: HashMap::new(),
         };
-        let input = AddUserToRealmRolesInput {
+        let input = AssignRolesInput {
             actor: actor.clone(),
             realm_id,
             user_id: assigned_user_id,
             role_ids: HashSet::from([role_id]),
         };
         let target = AdminDocumentTarget::Realm { realm_id };
-        let mut operation = AddUserToRealmRolesOperation::new(input);
+        let mut operation = AssignRolesOperation::new(input);
 
         let effects = operation
             .emit_auth_write(
@@ -821,7 +806,7 @@ pub mod test {
                 None,
             )
             .unwrap();
-        let outbox_records: Vec<DocumentSyncOutboxRecord> = match effects.first().unwrap() {
+        let outbox_records: Vec<DocumentOutboxRecord> = match effects.first().unwrap() {
             Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => writes
                 .iter()
                 .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
@@ -830,13 +815,15 @@ pub mod test {
             other => panic!("unexpected write effect: {other:?}"),
         };
         assert_eq!(outbox_records.len(), 2);
-        assert!(outbox_records.iter().all(|record| {
-            record.target == (DocumentSyncTarget::RealmAuthorization { realm_id })
-        }));
+        assert!(
+            outbox_records.iter().all(|record| {
+                record.target == (DocumentTarget::RealmAuthorization { realm_id })
+            })
+        );
         let events: Vec<_> = outbox_records
             .iter()
             .map(|record| match &record.event {
-                DocumentSyncOutboxEvent::AdminOperation { event, .. } => event.as_ref(),
+                DocumentOutboxEvent::AdminOperation { event, .. } => event.as_ref(),
                 other => panic!("unexpected outbox event: {other:?}"),
             })
             .collect();
@@ -902,14 +889,14 @@ pub mod test {
             assigned_user_id,
             remaining_conflict_user_id,
         );
-        let input = AddUserToRealmRolesInput {
+        let input = AssignRolesInput {
             actor: actor.clone(),
             realm_id,
             user_id: assigned_user_id,
             role_ids: HashSet::from([role_id, second_role_id]),
         };
         let target = AdminDocumentTarget::Realm { realm_id };
-        let mut operation = AddUserToRealmRolesOperation::new(input);
+        let mut operation = AssignRolesOperation::new(input);
 
         operation.start();
         operation.step(Event::SubOperation(
@@ -941,7 +928,7 @@ pub mod test {
                     .iter()
                     .find(|(keyspace, _, _)| keyspace == ADMIN_DOCUMENT_STATE_KEYSPACE)
                     .expect("reducer state write is included");
-                let outbox_records: Vec<DocumentSyncOutboxRecord> = writes
+                let outbox_records: Vec<DocumentOutboxRecord> = writes
                     .iter()
                     .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
                     .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
@@ -951,7 +938,7 @@ pub mod test {
                     .filter(|(keyspace, _, _)| keyspace == ADMIN_DOCUMENT_CONFLICT_KEYSPACE)
                     .collect();
                 assert_eq!(conflict_writes.len(), 1);
-                let conflict: AdminDocumentConflict =
+                let conflict: AdminConflict =
                     postcard::from_bytes(conflict_writes[0].2.as_ref()).unwrap();
                 assert_eq!(
                     conflict.path,
@@ -960,10 +947,8 @@ pub mod test {
 
                 (
                     RealmAuthorizationDocument::from_bytes(auth_write.2.as_ref()).unwrap(),
-                    postcard::from_bytes::<AdminDocumentReducerState>(
-                        reducer_state_write.2.as_ref(),
-                    )
-                    .unwrap(),
+                    postcard::from_bytes::<AdminDocumentState>(reducer_state_write.2.as_ref())
+                        .unwrap(),
                     outbox_records,
                 )
             }
@@ -971,10 +956,10 @@ pub mod test {
         };
         assert_eq!(outbox_records.len(), 3);
         assert!(outbox_records.iter().any(|record| {
-            record.target == (DocumentSyncTarget::RealmAuthorization { realm_id })
+            record.target == (DocumentTarget::RealmAuthorization { realm_id })
                 && matches!(
                     &record.event,
-                    DocumentSyncOutboxEvent::AdminOperation { event, .. }
+                    DocumentOutboxEvent::AdminOperation { event, .. }
                         if event.target == target
                             && matches!(
                                 &event.op,
@@ -985,10 +970,10 @@ pub mod test {
         }));
         for expected_role_id in [role_id, second_role_id] {
             assert!(outbox_records.iter().any(|record| {
-                record.target == (DocumentSyncTarget::RealmAuthorization { realm_id })
+                record.target == (DocumentTarget::RealmAuthorization { realm_id })
                     && matches!(
                         &record.event,
-                        DocumentSyncOutboxEvent::AdminOperation { event, .. }
+                        DocumentOutboxEvent::AdminOperation { event, .. }
                             if event.target == target
                                 && matches!(
                                     &event.op,
@@ -1115,7 +1100,7 @@ pub mod test {
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let (_realm, realm_auth_doc) = drive(realm_operation, &context).await.unwrap();
         drive(
-            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+            ClaimInitialOperation::new(ClaimInitialInput {
                 actor: realm_config.actor.clone(),
             }),
             &context,
@@ -1135,7 +1120,7 @@ pub mod test {
             })
             .collect();
 
-        let add_user_input = AddUserToRealmRolesInput {
+        let add_user_input = AssignRolesInput {
             actor: Actor {
                 node_id,
                 user_id,
@@ -1146,7 +1131,7 @@ pub mod test {
             role_ids: admin_role,
         };
 
-        let add_user_operation = AddUserToRealmRolesOperation::new(add_user_input.clone());
+        let add_user_operation = AssignRolesOperation::new(add_user_input.clone());
         let auth_doc = drive(add_user_operation, &context).await.unwrap();
 
         assert!(

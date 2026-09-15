@@ -1,13 +1,13 @@
 use aruna_core::admin_documents::{
-    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
 };
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::reducer_state_entry;
 use aruna_core::structs::{
     Actor, BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE,
@@ -188,16 +188,16 @@ impl CreateRealmOperation {
             .ok_or(CreateRealmError::RealmAdminRoleNotFound)?;
 
         let realm_target = AdminDocumentTarget::Realm { realm_id };
-        let mut realm_state = AdminDocumentReducerState::new(realm_target);
+        let mut realm_state = AdminDocumentState::new(realm_target);
         let realm_role_event = realm_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::RealmRoleCreated {
-                role: AdminDocumentRoleDefinition::from(realm_admin_role),
+                role: AdminRoleDefinition::from(realm_admin_role),
             },
         )?;
 
         let config_target = AdminDocumentTarget::RealmConfig { realm_id };
-        let mut config_state = AdminDocumentReducerState::new(config_target);
+        let mut config_state = AdminDocumentState::new(config_target);
         let config_node_event = config_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::RealmConfigNodeEnsured {
@@ -266,8 +266,8 @@ impl CreateRealmOperation {
             }
         }
 
-        let realm_auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
-        let realm_config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let realm_auth_target = DocumentTarget::RealmAuthorization { realm_id };
+        let realm_config_target = DocumentTarget::RealmConfig { realm_id };
         let realm_auth_placement =
             target_placement_ref(config_doc, &realm_auth_target, Default::default());
         let realm_config_placement =
@@ -277,7 +277,7 @@ impl CreateRealmOperation {
             self.config.actor.node_id,
             realm_auth_target,
             Vec::new(),
-            DocumentSyncOutboxEvent::admin(realm_role_event),
+            DocumentOutboxEvent::admin(realm_role_event),
             realm_auth_placement,
             true,
         );
@@ -292,7 +292,7 @@ impl CreateRealmOperation {
                 self.config.actor.node_id,
                 realm_config_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::admin(event),
+                DocumentOutboxEvent::admin(event),
                 realm_config_placement,
                 true,
             );
@@ -454,7 +454,7 @@ pub enum CreateRealmError {
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
-    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
+    AdminDocumentError(#[from] AdminDocumentError),
     #[error("authorization document not found")]
     AuthDocNotFound,
     #[error("realm config document not found")]
@@ -537,10 +537,10 @@ fn seed_placement_defaults(config: &mut RealmConfigDocument) {
 /// strategies, seeded placement bindings, default/job-family strategies and class
 /// bindings. Every bootstrap path applies them, so rebuilds materialize identically.
 pub(crate) fn seed_placement_events(
-    state: &mut AdminDocumentReducerState,
+    state: &mut AdminDocumentState,
     actor: &Actor,
     document: &RealmConfigDocument,
-) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
+) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut events = Vec::new();
     for strategy in &document.strategies {
         events.push(state.apply_operation(
@@ -588,18 +588,16 @@ mod test {
 
     use aruna_core::UserId;
     use aruna_core::admin_documents::{
-        AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+        AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
-    use aruna_core::document::{
-        DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
-    };
+    use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::reducer::AdminDocumentReducerState;
+    use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::{
         Actor, BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
         OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
@@ -737,7 +735,7 @@ mod test {
 
         let states = write_values(writes, ADMIN_DOCUMENT_STATE_KEYSPACE)
             .into_iter()
-            .map(|value| postcard::from_bytes::<AdminDocumentReducerState>(value.as_ref()).unwrap())
+            .map(|value| postcard::from_bytes::<AdminDocumentState>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
         let realm_target = AdminDocumentTarget::Realm { realm_id };
         let config_target = AdminDocumentTarget::RealmConfig { realm_id };
@@ -808,30 +806,30 @@ mod test {
 
         let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
             .into_iter()
-            .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
+            .map(|value| postcard::from_bytes::<DocumentOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(outbox_records.len(), 25);
         assert!(outbox_records.iter().any(|record| {
-            record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
+            record.target == DocumentTarget::RealmAuthorization { realm_id }
                 && matches!(
                     &record.event,
-                    DocumentSyncOutboxEvent::AdminOperation { event, .. }
+                    DocumentOutboxEvent::AdminOperation { event, .. }
                         if event.target == realm_target
                             && matches!(
                                 &event.op,
                                 AdminDocumentOperation::RealmRoleCreated { role }
-                                    if role == &AdminDocumentRoleDefinition::from(&realm_admin_role)
+                                    if role == &AdminRoleDefinition::from(&realm_admin_role)
                             )
                 )
         }));
         let config_events = outbox_records
             .iter()
             .filter_map(|record| {
-                if record.target != (DocumentSyncTarget::RealmConfig { realm_id }) {
+                if record.target != (DocumentTarget::RealmConfig { realm_id }) {
                     return None;
                 }
 
-                let DocumentSyncOutboxEvent::AdminOperation { event, .. } = &record.event else {
+                let DocumentOutboxEvent::AdminOperation { event, .. } = &record.event else {
                     return None;
                 };
 
@@ -1027,7 +1025,7 @@ mod test {
         .unwrap();
         let config_state = write_values(writes, ADMIN_DOCUMENT_STATE_KEYSPACE)
             .into_iter()
-            .map(|value| postcard::from_bytes::<AdminDocumentReducerState>(value.as_ref()).unwrap())
+            .map(|value| postcard::from_bytes::<AdminDocumentState>(value.as_ref()).unwrap())
             .find(|state| state.target == (AdminDocumentTarget::RealmConfig { realm_id }))
             .expect("the config reducer state is seeded");
 
