@@ -43,7 +43,7 @@ async fn filters_document_delete() {
         event: aruna_core::metadata::MetadataDeleteRecord {
             event_id: Ulid::generate(),
             tombstone,
-            deleted_after_event_id: deleted.last_event_id,
+            deleted_after_id: deleted.last_event_id,
         },
     };
     write_entry(
@@ -65,7 +65,7 @@ async fn rejects_bad_lifecycle() {
     write_entry(
         &test,
         (
-            METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            GRAPH_LIFECYCLE_KEYSPACE.to_string(),
             graph_lifecycle_key(&record.graph_iri),
             ByteView::from(vec![1u8]),
         ),
@@ -97,7 +97,7 @@ async fn foreign_lifecycle_rejected() {
     write_entry(
         &test,
         (
-            METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            GRAPH_LIFECYCLE_KEYSPACE.to_string(),
             graph_lifecycle_key(&graph_record.graph_iri),
             ByteView::from(postcard::to_allocvec(&tombstone).expect("tombstone encodes")),
         ),
@@ -107,13 +107,13 @@ async fn foreign_lifecycle_rejected() {
         event: aruna_core::metadata::MetadataDeleteRecord {
             event_id: Ulid::generate(),
             tombstone,
-            deleted_after_event_id: stranger.last_event_id,
+            deleted_after_id: stranger.last_event_id,
         },
     };
     write_entry(
         &test,
         (
-            METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+            DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
             document_lifecycle_key(document_record.document_id),
             ByteView::from(postcard::to_allocvec(&lifecycle).expect("lifecycle encodes")),
         ),
@@ -190,7 +190,7 @@ async fn pending_scan_capped() {
 async fn estimate_beyond_page() {
     let test = metadata_test();
     let group_id = Ulid::generate();
-    let seeded = METADATA_ESTIMATE_MIN_LIMIT + 2;
+    let seeded = ESTIMATE_MIN_LIMIT + 2;
     for _ in 0..seeded {
         seed_registry_cache(&test, &public_record(group_id, Ulid::generate())).await;
     }
@@ -199,21 +199,21 @@ async fn estimate_beyond_page() {
         &test.context,
         TEST_REALM_ID,
         ListVisibleRequest {
-            limit: Some(METADATA_ESTIMATE_MIN_LIMIT),
+            limit: Some(ESTIMATE_MIN_LIMIT),
             ..summary_request(group_id, false)
         },
     )
     .await
     .expect("listing succeeds");
-    assert_eq!(page.documents.len(), METADATA_ESTIMATE_MIN_LIMIT);
-    assert_eq!(page.total_returned, METADATA_ESTIMATE_MIN_LIMIT);
+    assert_eq!(page.documents.len(), ESTIMATE_MIN_LIMIT);
+    assert_eq!(page.total_returned, ESTIMATE_MIN_LIMIT);
     assert_eq!(page.total_estimate, Some(seeded));
 
     let tail = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
         ListVisibleRequest {
-            limit: Some(METADATA_ESTIMATE_MIN_LIMIT),
+            limit: Some(ESTIMATE_MIN_LIMIT),
             offset: Some(seeded - 1),
             ..summary_request(group_id, false)
         },
@@ -238,7 +238,7 @@ async fn lookup_omits_estimate() {
         &test.context,
         TEST_REALM_ID,
         ListVisibleRequest {
-            limit: Some(METADATA_ESTIMATE_MIN_LIMIT - 1),
+            limit: Some(ESTIMATE_MIN_LIMIT - 1),
             ..summary_request(group_id, false)
         },
     )
@@ -251,7 +251,7 @@ async fn lookup_omits_estimate() {
         &test.context,
         TEST_REALM_ID,
         ListVisibleRequest {
-            limit: Some(METADATA_ESTIMATE_MIN_LIMIT),
+            limit: Some(ESTIMATE_MIN_LIMIT),
             ..summary_request(group_id, false)
         },
     )
@@ -338,31 +338,31 @@ async fn cross_shard_unknown() {
 fn anonymous_limit_clamped() {
     assert_eq!(
         effective_list_limit(None, true),
-        DEFAULT_LIST_METADATA_LIMIT
+        LIST_METADATA_LIMIT
     );
     assert_eq!(
-        effective_list_limit(Some(MAX_LIST_METADATA_LIMIT), true),
-        ANONYMOUS_LIST_METADATA_LIMIT
+        effective_list_limit(Some(MAX_METADATA_LIMIT), true),
+        ANONYMOUS_METADATA_LIMIT
     );
     assert_eq!(
-        effective_list_limit(Some(MAX_LIST_METADATA_LIMIT), false),
-        MAX_LIST_METADATA_LIMIT
+        effective_list_limit(Some(MAX_METADATA_LIMIT), false),
+        MAX_METADATA_LIMIT
     );
     assert_eq!(
         effective_list_limit(Some(usize::MAX), false),
-        MAX_LIST_METADATA_LIMIT
+        MAX_METADATA_LIMIT
     );
     assert_eq!(effective_list_limit(Some(0), true), 1);
 }
 
 #[test]
 fn policy_scope_limit() {
-    let within = (0..METADATA_REGISTRY_CANDIDATE_LIMIT)
+    let within = (0..REGISTRY_CANDIDATE_LIMIT)
         .map(|_| Ulid::generate())
         .collect();
     assert!(check_policy_limit(within).is_ok());
 
-    let over = (0..=METADATA_REGISTRY_CANDIDATE_LIMIT)
+    let over = (0..=REGISTRY_CANDIDATE_LIMIT)
         .map(|_| Ulid::generate())
         .collect();
     assert!(matches!(
@@ -419,7 +419,7 @@ fn peers_are_bounded() {
         local,
     )
     .expect("peer selection succeeds");
-    assert_eq!(first.len(), METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+    assert_eq!(first.len(), QUERY_MAX_NODES);
     assert_eq!(first, second);
 }
 
@@ -436,7 +436,7 @@ fn fanout_nodes_bounded() {
     let second = select_fanout_nodes(&reversed, local, b"metadata-query");
 
     assert_eq!(first, second);
-    assert_eq!(first.len(), METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+    assert_eq!(first.len(), QUERY_MAX_NODES);
     assert!(first.contains(&local));
     assert_eq!(first.iter().collect::<HashSet<_>>().len(), first.len());
 }
@@ -736,7 +736,7 @@ async fn estimate_counts_exact() {
         &test.context,
         TEST_REALM_ID,
         ListVisibleRequest {
-            limit: Some(METADATA_ESTIMATE_MIN_LIMIT - 1),
+            limit: Some(ESTIMATE_MIN_LIMIT - 1),
             auth: Some(auth_for(member)),
             ..summary_request(group_id, false)
         },

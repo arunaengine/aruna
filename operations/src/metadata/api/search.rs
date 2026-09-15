@@ -1,7 +1,7 @@
 use super::{
     ApiQueryMode, AuthContext, BlobHeadKey, BucketSearchHit, CursorEnvelopeError, Deserialize,
-    DriverContext, GroupId, HashMap, HashSet, METADATA_DISTRIBUTED_QUERY_DEADLINE,
-    METADATA_DISTRIBUTED_QUERY_MAX_NODES, MetadataApiError, MetadataFanoutOperation,
+    DriverContext, GroupId, HashMap, HashSet, DISTRIBUTED_QUERY_DEADLINE,
+    QUERY_MAX_NODES, MetadataApiError, MetadataFanoutOperation,
     MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataReadError,
     MetadataSearchHit, NodeId, ObjectInventoryHit, ObjectKeyMatch, RealmId, RealmNodeDiscovery,
     SearchCursor, SearchCursorError, SearchNodePage, SearchObjectsInput, Serialize, SignedCursor,
@@ -12,16 +12,16 @@ use super::{
 
 use super::distributed::run_search_distributed;
 use crate::metadata::search_cursor::{
-    METADATA_SEARCH_DEFAULT_PAGE_SIZE, METADATA_SEARCH_MAX_PAGE_SIZE,
+    SEARCH_PAGE_SIZE, SEARCH_MAX_PAGE,
 };
 
-const OBJECT_SEARCH_CURSOR_VERSION: u8 = 1;
+const OBJECT_CURSOR_VERSION: u8 = 1;
 
-const OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT: &[u8] = b"aruna.object.search.cursor.v1";
+const CURSOR_SIGNATURE_CONTEXT: &[u8] = b"aruna.object.search.cursor.v1";
 
-const OBJECT_SEARCH_CURSOR_MAX_BYTES: usize = 64 * 1024;
+const CURSOR_MAX_BYTES: usize = 64 * 1024;
 
-const OBJECT_SEARCH_CURSOR_MAX_KEY_BYTES: usize = 2 * 1024;
+const SEARCH_MAX_BYTES: usize = 2 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct MetadataSearchRequest {
@@ -144,17 +144,17 @@ impl SignedCursor<ObjectCursorPayload> {
         fingerprint: [u8; 32],
         authorized_signers: &[NodeId],
     ) -> Result<Self, MetadataApiError> {
-        if raw.len() > OBJECT_SEARCH_CURSOR_MAX_BYTES {
+        if raw.len() > CURSOR_MAX_BYTES {
             return Err(MetadataApiError::InvalidCursor(
                 "invalid object search cursor".to_string(),
             ));
         }
         let cursor = Self::decode_verified(
             raw,
-            OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT,
+            CURSOR_SIGNATURE_CONTEXT,
             authorized_signers,
             |cursor| {
-                if cursor.version != OBJECT_SEARCH_CURSOR_VERSION
+                if cursor.version != OBJECT_CURSOR_VERSION
                     || cursor.fingerprint != fingerprint
                 {
                     Err(CursorEnvelopeError::QueryMismatch)
@@ -171,8 +171,8 @@ impl SignedCursor<ObjectCursorPayload> {
                 "object search cursor does not match query".to_string(),
             ),
         })?;
-        if cursor.payload.partitions.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
-            || cursor.payload.failed_partitions.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
+        if cursor.payload.partitions.len() > QUERY_MAX_NODES
+            || cursor.payload.failed_partitions.len() > QUERY_MAX_NODES
         {
             return Err(MetadataApiError::InvalidCursor(
                 "invalid object search cursor".to_string(),
@@ -185,7 +185,7 @@ impl SignedCursor<ObjectCursorPayload> {
             })?;
             if !nodes.insert(partition.node_id)
                 || partition.start_after.as_ref().is_some_and(|key| {
-                    key.len() > OBJECT_SEARCH_CURSOR_MAX_KEY_BYTES
+                    key.len() > SEARCH_MAX_BYTES
                         || BlobHeadKey::from_bytes(key).is_err()
                 })
             {
@@ -271,8 +271,8 @@ impl SignedCursor<ObjectCursorPayload> {
             .map(|node_id| *node_id.as_bytes())
             .collect();
         Self::build_signed(
-            OBJECT_SEARCH_CURSOR_VERSION,
-            OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT,
+            OBJECT_CURSOR_VERSION,
+            CURSOR_SIGNATURE_CONTEXT,
             fingerprint,
             ObjectCursorPayload {
                 as_of,
@@ -314,7 +314,7 @@ pub async fn search_objects(
     local_node_id: NodeId,
     request: SearchQueryRequest,
 ) -> Result<ObjectExecution, MetadataApiError> {
-    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let deadline = tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE;
     let plan = plan_object_search(realm_id, request)?;
     let partitions =
         resolve_object_partitions(context, realm_id, local_node_id, &plan, deadline).await?;
@@ -343,7 +343,7 @@ pub(super) fn plan_object_search(
     }
     let limit = request
         .limit
-        .clamp(1, crate::s3::object::search::OBJECT_SEARCH_MAX_LIMIT);
+        .clamp(1, crate::s3::object::search::SEARCH_MAX_LIMIT);
     let fingerprint = object_search_fingerprint(
         realm_id,
         &request.query,
@@ -427,7 +427,7 @@ pub(super) async fn resolve_object_partitions(
                 if nodes.is_empty() {
                     return Err(MetadataApiError::ServiceUnavailable);
                 }
-                let omitted_partitions = if nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+                let omitted_partitions = if nodes.len() > QUERY_MAX_NODES {
                     let selected = select_fanout_nodes(&nodes, local_node_id, &plan.fingerprint);
                     let omitted = nodes.len().saturating_sub(selected.len());
                     nodes = selected;
@@ -699,7 +699,7 @@ pub async fn search_metadata(
     local_node_id: NodeId,
     mut request: MetadataSearchRequest,
 ) -> Result<MetadataSearchExecution, MetadataApiError> {
-    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let deadline = tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE;
     if request.query.trim().is_empty() && request.conforms_to.is_none() {
         return Err(MetadataApiError::BadRequest);
     }
@@ -717,8 +717,8 @@ pub async fn search_metadata(
     }
     let page_size = request
         .limit
-        .unwrap_or(METADATA_SEARCH_DEFAULT_PAGE_SIZE)
-        .clamp(1, METADATA_SEARCH_MAX_PAGE_SIZE);
+        .unwrap_or(SEARCH_PAGE_SIZE)
+        .clamp(1, SEARCH_MAX_PAGE);
 
     let fingerprint = query_fingerprint(
         &request.query,

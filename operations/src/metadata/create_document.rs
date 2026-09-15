@@ -6,9 +6,9 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
+use aruna_core::keyspaces::CREATE_ACCEPTANCE_KEYSPACE;
 use aruna_core::metadata::{
-    METADATA_RAW_BYTES_LIMIT, MetadataCrateRequest, MetadataEffect, MetadataError, MetadataEvent,
+    RAW_BYTES_LIMIT, MetadataCrateRequest, MetadataEffect, MetadataError, MetadataEvent,
     MetadataEventPayload, MetadataEventRecord, MetadataGraphPolicy, MetadataRequestDurability,
     ProfileValidationStatus, raw_quotas,
 };
@@ -19,7 +19,7 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::placement::binding_directory::BindingError;
 use aruna_core::structs::execution::job::{
-    DEFAULT_JOB_RETENTION_MS, JobPayload, JobRecord, WorkspaceMode, pid_dedup_key,
+    RETENTION_MS, JobPayload, JobRecord, WorkspaceMode, pid_dedup_key,
 };
 use aruna_core::structs::placement::placement_record::{
     DocumentClass, PlacementRef, PlacementScope, PlacementStrategy, shard_for_subject,
@@ -135,7 +135,7 @@ pub enum CreateDocumentError {
     /// The receiving node holds no bucket of the governing strategy, so it can
     /// never publish this document. The caller forwards the create to a holder.
     #[error("create-receiving node holds no bucket of the governing strategy")]
-    OriginHoldsNoBucket,
+    HoldsNoBucket,
     /// The id's placement handle resolves to no binding, or no strategy/binding
     /// governs the create target. Fails closed rather than guessing a placement.
     #[error("placement_binding_unavailable: {0}")]
@@ -267,7 +267,7 @@ impl CreateDocumentOperation {
         let mut holders = resolve_shard_holders(config, placement);
         sort_node_ids(&mut holders);
         if !holders.contains(&self.config.actor.node_id) {
-            return Err(CreateDocumentError::OriginHoldsNoBucket);
+            return Err(CreateDocumentError::HoldsNoBucket);
         }
         Ok(holders)
     }
@@ -290,7 +290,7 @@ impl CreateDocumentOperation {
             self.config.document_id,
         )?;
         if !holds_placement(config, &placement, self.config.actor.node_id) {
-            return Err(CreateDocumentError::OriginHoldsNoBucket);
+            return Err(CreateDocumentError::HoldsNoBucket);
         }
         Ok(placement)
     }
@@ -422,7 +422,7 @@ impl CreateDocumentOperation {
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
                 (
-                    METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+                    CREATE_ACCEPTANCE_KEYSPACE.to_string(),
                     create_acceptance_key(self.config.document_id),
                 ),
                 (
@@ -507,7 +507,7 @@ impl CreateDocumentOperation {
             return self.append_create_event(&realm_config, placement, holders);
         };
         if route.peers.first().copied() != Some(self.config.actor.node_id) {
-            return self.fail(CreateDocumentError::OriginHoldsNoBucket);
+            return self.fail(CreateDocumentError::HoldsNoBucket);
         }
         if route.generation == 0 {
             return self.append_create_event(&realm_config, placement, holders);
@@ -549,7 +549,7 @@ impl CreateDocumentOperation {
             Ok(size) => size,
             Err(_) => return self.fail(CreateDocumentError::RawLimit),
         };
-        if encoded_bytes > METADATA_RAW_BYTES_LIMIT {
+        if encoded_bytes > RAW_BYTES_LIMIT {
             return self.fail(CreateDocumentError::RawLimit);
         }
         let Some(raw_budget) = raw_quotas(
@@ -614,7 +614,7 @@ impl CreateDocumentOperation {
                 Some(dedup_key),
             );
             job.workspace_mode = WorkspaceMode::None;
-            job.retention_ms = DEFAULT_JOB_RETENTION_MS;
+            job.retention_ms = RETENTION_MS;
             writes.extend(crate::jobs::store::job_insert_entries(&job)?);
 
             let route = mapping_route_for(
@@ -883,7 +883,7 @@ fn resolve_create_placement(
         }
     } else {
         choose_origin_bucket(config, strategy, actor.node_id, &subject)
-            .ok_or(CreateDocumentError::OriginHoldsNoBucket)?
+            .ok_or(CreateDocumentError::HoldsNoBucket)?
     };
     Ok((handle, placement))
 }
@@ -1145,10 +1145,10 @@ mod tests {
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
-        METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-        METADATA_EVENT_LOG_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
-        METADATA_RAW_BUDGET_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
+        CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE,
+        EVENT_LOG_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
+        RAW_BUDGET_KEYSPACE, ID_MAPPING_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::metadata::{
         MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload, MetadataEventRecord,
@@ -1285,7 +1285,7 @@ mod tests {
             panic!("expected create fence read");
         };
         assert_eq!(reads.len(), 2);
-        assert_eq!(reads[0].0, METADATA_CREATE_ACCEPTANCE_KEYSPACE);
+        assert_eq!(reads[0].0, CREATE_ACCEPTANCE_KEYSPACE);
         assert_eq!(reads[1].0, REALM_CONFIG_KEYSPACE);
     }
 
@@ -1348,17 +1348,17 @@ mod tests {
         assert!(
             writes
                 .iter()
-                .any(|(key_space, _, _)| key_space == METADATA_EVENT_LOG_KEYSPACE)
+                .any(|(key_space, _, _)| key_space == EVENT_LOG_KEYSPACE)
         );
         assert!(
             writes
                 .iter()
-                .any(|(key_space, _, _)| key_space == METADATA_PENDING_PROJECTION_KEYSPACE)
+                .any(|(key_space, _, _)| key_space == PENDING_PROJECTION_KEYSPACE)
         );
         assert!(
             writes
                 .iter()
-                .any(|(key_space, _, _)| key_space == METADATA_CREATE_ACCEPTANCE_KEYSPACE)
+                .any(|(key_space, _, _)| key_space == CREATE_ACCEPTANCE_KEYSPACE)
         );
         assert_eq!(
             writes
@@ -1371,7 +1371,7 @@ mod tests {
 
         let mut winner: MetadataEventRecord = writes
             .iter()
-            .find(|(key_space, _, _)| key_space == METADATA_CREATE_ACCEPTANCE_KEYSPACE)
+            .find(|(key_space, _, _)| key_space == CREATE_ACCEPTANCE_KEYSPACE)
             .and_then(|(_, _, value)| postcard::from_bytes(value.as_ref()).ok())
             .expect("create acceptance decodes");
         winner.event_id = Ulid::from_bytes([33; 16]);
@@ -1522,7 +1522,7 @@ mod tests {
         else {
             panic!("expected metadata document index read");
         };
-        assert_eq!(key_space, METADATA_DOCUMENT_INDEX_KEYSPACE);
+        assert_eq!(key_space, DOCUMENT_INDEX_KEYSPACE);
         assert_eq!(txn_id, &None);
     }
 
@@ -1533,9 +1533,9 @@ mod tests {
         assert!(txn_id.is_some());
         for required in [
             JOB_KEYSPACE,
-            JOB_SCHEDULE_INDEX_KEYSPACE,
-            JOB_DEDUP_INDEX_KEYSPACE,
-            PERSISTENT_ID_MAPPING_KEYSPACE,
+            SCHEDULE_INDEX_KEYSPACE,
+            DEDUP_INDEX_KEYSPACE,
+            ID_MAPPING_KEYSPACE,
         ] {
             assert!(
                 writes.iter().any(|(key_space, _, _)| key_space == required),
@@ -1544,7 +1544,7 @@ mod tests {
         }
         let (_, key, value) = writes
             .iter()
-            .find(|(key_space, _, _)| key_space == METADATA_EVENT_LOG_KEYSPACE)
+            .find(|(key_space, _, _)| key_space == EVENT_LOG_KEYSPACE)
             .expect("event log write exists");
         assert!(
             key.as_ref()
@@ -1576,7 +1576,7 @@ mod tests {
             .expect("atomic PID job decodes");
         let mapping = writes
             .iter()
-            .find(|(key_space, _, _)| key_space == PERSISTENT_ID_MAPPING_KEYSPACE)
+            .find(|(key_space, _, _)| key_space == ID_MAPPING_KEYSPACE)
             .and_then(|(_, _, value)| PersistentIdMapping::from_bytes(value).ok())
             .expect("atomic PID intent decodes");
         assert!(matches!(
@@ -1589,7 +1589,7 @@ mod tests {
         let (_, acceptance_key, acceptance_value) = writes
             .iter()
             .find(|(key_space, key, _)| {
-                key_space == METADATA_CREATE_ACCEPTANCE_KEYSPACE
+                key_space == CREATE_ACCEPTANCE_KEYSPACE
                     && key == &create_acceptance_key(document_id)
             })
             .expect("create acceptance write exists");
@@ -1600,7 +1600,7 @@ mod tests {
 
         let (_, marker_key, marker_value) = writes
             .iter()
-            .find(|(key_space, _, _)| key_space == METADATA_PENDING_PROJECTION_KEYSPACE)
+            .find(|(key_space, _, _)| key_space == PENDING_PROJECTION_KEYSPACE)
             .expect("pending projection marker write exists");
         assert_eq!(
             marker_key,
@@ -1611,11 +1611,11 @@ mod tests {
         assert!(
             writes
                 .iter()
-                .any(|(key_space, _, _)| key_space == METADATA_RAW_BUDGET_KEYSPACE)
+                .any(|(key_space, _, _)| key_space == RAW_BUDGET_KEYSPACE)
         );
         let (_, _, budget_value) = writes
             .iter()
-            .find(|(key_space, _, _)| key_space == METADATA_RAW_BUDGET_KEYSPACE)
+            .find(|(key_space, _, _)| key_space == RAW_BUDGET_KEYSPACE)
             .expect("raw origin budget write exists");
         let budget: RawOriginBudget =
             postcard::from_bytes(budget_value).expect("raw origin budget decodes");
@@ -1695,7 +1695,7 @@ mod tests {
         };
         let mappings = writes
             .iter()
-            .filter(|(key_space, _, _)| key_space == PERSISTENT_ID_MAPPING_KEYSPACE)
+            .filter(|(key_space, _, _)| key_space == ID_MAPPING_KEYSPACE)
             .map(|(_, _, value)| PersistentIdMapping::from_bytes(value).unwrap())
             .collect::<Vec<_>>();
 
@@ -1814,7 +1814,7 @@ mod tests {
         }));
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: vec![(METADATA_EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
+            entries: vec![(EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
         }));
         commit_create(&mut operation, effects.as_slice());
         assert!(operation.is_complete());
@@ -1845,7 +1845,7 @@ mod tests {
         let effects = apply_create_pid(&mut operation, &actor, document_id, &realm_config);
         let create_event_key = assert_create_event(effects.as_slice(), document_id, &actor);
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: vec![(METADATA_EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
+            entries: vec![(EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
         }));
 
         commit_create(&mut operation, effects.as_slice());

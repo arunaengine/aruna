@@ -25,9 +25,9 @@ async fn preflight_fanout_reports() {
         freshness: MetadataNodeFreshness {
             node_id,
             index_state: MetadataIndexState::Current,
-            oldest_status_updated_at_ms: None,
+            oldest_status_updated: None,
         },
-        path_style_endpoint_available: true,
+        path_style_available: true,
         saturated: false,
     };
     let local_call: MetadataNodeCall<ReferenceNodeExecution> = metadata_node_call(
@@ -98,7 +98,7 @@ fn preflight_cursor_pagination() {
         queried_iris: vec![content_w3id.clone()],
         targeted_versions: Vec::new(),
         removed_locations: Vec::new(),
-        remove_all_resolvable_locations: false,
+        remove_resolvable_locations: false,
     }];
     let fingerprint = preflight_fingerprint(&targets, Some(ApiQueryMode::Local));
     let hits = (0..3)
@@ -126,7 +126,7 @@ fn preflight_cursor_pagination() {
             }],
             watermark,
             1,
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+            MAX_PAGINATION_DEPTH,
         );
         returned.push(page.hits[0].document_id.clone());
         watermark = page.next.map(|next| {
@@ -167,7 +167,7 @@ fn preflight_request(
         bearer_token: None,
         target: ReferenceTarget::ContentW3ids {
             content_w3ids,
-            remove_all_resolvable_locations: false,
+            remove_resolvable_locations: false,
         },
         s3_endpoint: None,
         limit,
@@ -193,7 +193,7 @@ fn preflight_plan_limits() {
     let (plan, target_value) =
         plan_preflight_request(realm_id, preflight_request(realm_id, target(), None))
             .expect("default plan");
-    assert_eq!(plan.page_size, METADATA_REFERENCES_DEFAULT_LIMIT);
+    assert_eq!(plan.page_size, REFERENCES_LIMIT);
     assert!(matches!(target_value, ReferenceTarget::ContentW3ids { .. }));
     let (plan, _) =
         plan_preflight_request(realm_id, preflight_request(realm_id, target(), Some(0)))
@@ -204,7 +204,7 @@ fn preflight_plan_limits() {
         preflight_request(realm_id, target(), Some(usize::MAX)),
     )
     .expect("large limit clamps");
-    assert_eq!(plan.page_size, METADATA_REFERENCES_MAX_LIMIT);
+    assert_eq!(plan.page_size, REFERENCES_MAX_LIMIT);
 }
 
 #[tokio::test]
@@ -248,7 +248,7 @@ async fn preflight_stage_failures() {
     .expect("content w3ids resolve without storage");
     plan.cursor = Some("not-a-cursor".to_string());
     plan.mode = Some(ApiQueryMode::Local);
-    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let deadline = tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE;
     assert!(matches!(
         verify_preflight_cursor(
             &test.context,
@@ -293,9 +293,9 @@ async fn preflight_stage_failures() {
         freshness: MetadataNodeFreshness {
             node_id: local_node_id,
             index_state: MetadataIndexState::Current,
-            oldest_status_updated_at_ms: None,
+            oldest_status_updated: None,
         },
-        path_style_endpoint_available: true,
+        path_style_available: true,
         saturated: false,
     };
     let denied = assemble_preflight_execution(

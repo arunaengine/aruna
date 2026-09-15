@@ -290,7 +290,7 @@ async fn capped_fanout_incomplete() {
         task_handle: None,
         compute_handle: None,
     };
-    let nodes = (0..=METADATA_DISTRIBUTED_QUERY_MAX_NODES)
+    let nodes = (0..=QUERY_MAX_NODES)
         .map(|index| iroh::SecretKey::from_bytes(&[60 + index as u8; 32]).public())
         .collect::<Vec<_>>();
     let local = nodes[0];
@@ -357,7 +357,7 @@ fn search_plan_limits() {
     .expect("large limit clamps");
     assert_eq!(
         plan.limit,
-        crate::s3::object::search::OBJECT_SEARCH_MAX_LIMIT
+        crate::s3::object::search::SEARCH_MAX_LIMIT
     );
 }
 

@@ -2,17 +2,17 @@
 //! Their shapes ship with the binary, so a revision is a constant rather than a
 //! registry event id, and no registry row backs them.
 
-use aruna_core::metadata::PROCESS_RUN_CRATE_PROFILE_IRI;
+use aruna_core::metadata::CRATE_PROFILE_IRI;
 
 /// Revision reported for every built-in Profile: the shapes change only when
 /// the node binary does, so there is nothing per-realm to pin.
 pub(crate) const BUILTIN_REVISION: &str = "builtin";
 
-const PROCESS_RUN_CRATE_SHAPES: &str = include_str!("process_run.ttl");
+const RUN_CRATE_SHAPES: &str = include_str!("process_run.ttl");
 
 /// The embedded SHACL Turtle for `iri`, when the node ships shapes for it.
 pub(crate) fn builtin_shapes(iri: &str) -> Option<&'static str> {
-    (iri == PROCESS_RUN_CRATE_PROFILE_IRI).then_some(PROCESS_RUN_CRATE_SHAPES)
+    (iri == CRATE_PROFILE_IRI).then_some(RUN_CRATE_SHAPES)
 }
 
 #[cfg(test)]
@@ -22,7 +22,7 @@ mod pure_tests {
 
     #[test]
     fn shapes_parse() {
-        let shapes = builtin_shapes(PROCESS_RUN_CRATE_PROFILE_IRI).expect("embedded shapes");
+        let shapes = builtin_shapes(CRATE_PROFILE_IRI).expect("embedded shapes");
         let triples = TurtleParser::new()
             .for_slice(shapes.as_bytes())
             .collect::<Result<Vec<_>, _>>()

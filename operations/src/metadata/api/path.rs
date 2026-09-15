@@ -1,7 +1,7 @@
 use super::{
     AuthContext, AuthFailure, AuthToken, DriverContext, GroupId, GroupPermissionRules, HashSet,
-    METADATA_DISTRIBUTED_QUERY_DEADLINE, METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT,
-    METADATA_DISTRIBUTED_QUERY_MAX_NODES, METADATA_REGISTRY_CANDIDATE_LIMIT, MetaResourceId,
+    DISTRIBUTED_QUERY_DEADLINE, QUERY_FANOUT_LIMIT,
+    QUERY_MAX_NODES, REGISTRY_CANDIDATE_LIMIT, MetaResourceId,
     MetadataApiError, MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner,
     MetadataReadError, MetadataRegistryRecord, MetadataTransportMessage, NodeId, PathClaimRecord,
     PlacementRef, ROLE_NODE, ReadDecision, RealmConfigDocument, RealmId, Ulid, holds_placement,
@@ -30,7 +30,7 @@ pub(super) fn select_path_holders(
         return Err(MetadataApiError::ServiceUnavailable);
     }
     let subject = meta_bucket_subject(realm_id, group_id, normalized);
-    let mut ranked = Vec::with_capacity(METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+    let mut ranked = Vec::with_capacity(QUERY_MAX_NODES);
     let mut local_score = None;
     let scan_shards = if replica_count.is_none() {
         1
@@ -44,7 +44,7 @@ pub(super) fn select_path_holders(
         }
         let placement = PlacementRef { strategy_id, shard };
         let holders =
-            resolve_holders_limit(config, &placement, METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+            resolve_holders_limit(config, &placement, QUERY_MAX_NODES);
         if holders.is_empty() {
             return Err(MetadataApiError::ServiceUnavailable);
         }
@@ -57,7 +57,7 @@ pub(super) fn select_path_holders(
             if ranked.iter().any(|(candidate, _)| *candidate == *holder) {
                 continue;
             }
-            if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+            if ranked.len() < QUERY_MAX_NODES {
                 ranked.push((*holder, score));
                 continue;
             }
@@ -79,7 +79,7 @@ pub(super) fn select_path_holders(
         shard_holders.push(holders);
     }
     if let Some(score) = local_score {
-        if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+        if ranked.len() < QUERY_MAX_NODES {
             ranked.push((local_node, score));
         } else if !ranked.iter().any(|(node, _)| *node == local_node)
             && let Some((worst_index, _)) =
@@ -148,7 +148,7 @@ pub(super) fn select_forward_peers(
 ) -> Result<Vec<NodeId>, MetadataApiError> {
     let mut subject = meta_bucket_subject(realm_id, group_id, normalized);
     subject.extend_from_slice(local_node.as_bytes());
-    let mut ranked = Vec::with_capacity(METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+    let mut ranked = Vec::with_capacity(QUERY_MAX_NODES);
     for node in config
         .nodes
         .iter()
@@ -161,7 +161,7 @@ pub(super) fn select_forward_peers(
             continue;
         }
         let score = neg_log2_q48(selector_hash(ROLE_NODE, &subject, peer.as_bytes()));
-        if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+        if ranked.len() < QUERY_MAX_NODES {
             ranked.push((peer, score));
             continue;
         }
@@ -234,7 +234,7 @@ pub(super) async fn forward_path_resolution(
             (response, peer)
         }
     }))
-    .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT);
+    .buffer_unordered(QUERY_FANOUT_LIMIT);
     futures_util::pin_mut!(requests);
     let mut auth_error = None;
     let mut divergent = false;
@@ -566,10 +566,10 @@ pub(super) fn select_fanout_nodes(
             .copied()
             .filter(|node_id| *node_id != local_node_id),
         subject,
-        METADATA_DISTRIBUTED_QUERY_MAX_NODES,
+        QUERY_MAX_NODES,
         |_| {},
     );
-    if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+    if ranked.len() < QUERY_MAX_NODES {
         ranked.push(local_node_id);
     } else if !ranked.is_empty() {
         ranked.pop();
@@ -666,7 +666,7 @@ pub async fn lookup_metadata_path(
     request: MetadataLookupRequest,
     auth_token: Option<AuthToken>,
 ) -> Result<MetadataLookupResult, MetadataApiError> {
-    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let deadline = tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE;
     let normalized = MetadataRegistryRecord::normalize_document_path(&request.document_path);
     if normalized.is_empty() {
         return Err(MetadataApiError::BadRequest);
@@ -756,7 +756,7 @@ pub async fn lookup_metadata_path(
             (holder, shards, result)
         }
     }))
-    .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT)
+    .buffer_unordered(QUERY_FANOUT_LIMIT)
     .collect::<Vec<_>>();
     let responses = tokio::time::timeout_at(deadline, requests)
         .await
@@ -770,7 +770,7 @@ pub async fn lookup_metadata_path(
         match response {
             Ok(returned) => {
                 candidate_count = candidate_count.saturating_add(returned.len());
-                if candidate_count > METADATA_REGISTRY_CANDIDATE_LIMIT {
+                if candidate_count > REGISTRY_CANDIDATE_LIMIT {
                     return Err(MetadataApiError::ServiceUnavailable);
                 }
                 only_auth = false;

@@ -1,9 +1,9 @@
 use super::{
     AuthContext, AuthToken, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
     DriverContext, Event, GraphLifecycleRecord, GroupId, HashMap, ListGroupOperation,
-    METADATA_DISTRIBUTED_QUERY_DEADLINE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_REFERENCES_DEFAULT_LIMIT,
-    METADATA_REFERENCES_MAX_LIMIT, METADATA_REGISTRY_CANDIDATE_LIMIT, MetadataApiError,
+    DISTRIBUTED_QUERY_DEADLINE, DOCUMENT_LIFECYCLE_KEYSPACE,
+    GRAPH_LIFECYCLE_KEYSPACE, REFERENCES_LIMIT,
+    REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT, MetadataApiError,
     MetadataFanoutScope, MetadataFanoutStats, MetadataLifecycleRecord, MetadataQueryResults,
     MetadataReadError, MetadataRegistryRecord, NodeId, Permission, RealmId, StorageEffect,
     StorageEvent, StorageHandle, StorageReadError, TxnId, Ulid, check_policy_limit,
@@ -140,7 +140,7 @@ pub async fn query_metadata(
     local_node_id: NodeId,
     request: MetadataQueryRequest,
 ) -> Result<MetadataQueryExecution, MetadataApiError> {
-    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let deadline = tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE;
     ensure_query_form(&request.query)?;
     let subject = query_fingerprint(
         &request.query,
@@ -188,8 +188,8 @@ pub async fn references_metadata(
     }
     let limit = request
         .limit
-        .unwrap_or(METADATA_REFERENCES_DEFAULT_LIMIT)
-        .clamp(1, METADATA_REFERENCES_MAX_LIMIT);
+        .unwrap_or(REFERENCES_LIMIT)
+        .clamp(1, REFERENCES_MAX_LIMIT);
 
     let handle = context
         .metadata_handle
@@ -277,7 +277,7 @@ pub(crate) async fn filter_live_records(
     storage: &StorageHandle,
     records: &[MetadataRegistryRecord],
 ) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
-    if records.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+    if records.len() > REGISTRY_CANDIDATE_LIMIT {
         return Err(MetadataApiError::ServiceUnavailable);
     }
     if records.is_empty() {
@@ -287,11 +287,11 @@ pub(crate) async fn filter_live_records(
     let mut reads = Vec::with_capacity(records.len().saturating_mul(2));
     for record in records {
         reads.push((
-            METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            GRAPH_LIFECYCLE_KEYSPACE.to_string(),
             graph_lifecycle_key(&record.graph_iri),
         ));
         reads.push((
-            METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+            DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
             document_lifecycle_key(record.document_id),
         ));
     }
@@ -402,7 +402,7 @@ pub(super) async fn load_claim_records(
     let group_ids = check_policy_limit(match group_id {
         Some(group_id) => vec![group_id],
         None => drive(
-            ListGroupOperation::with_pagination(METADATA_REGISTRY_CANDIDATE_LIMIT + 1, 0),
+            ListGroupOperation::with_pagination(REGISTRY_CANDIDATE_LIMIT + 1, 0),
             context,
         )
         .await
@@ -412,10 +412,10 @@ pub(super) async fn load_claim_records(
         .collect(),
     })?;
     let mut pending =
-        load_pending_records(context, group_id, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
+        load_pending_records(context, group_id, REGISTRY_CANDIDATE_LIMIT).await?;
     let mut records = Vec::new();
     for group_id in group_ids {
-        let remaining = METADATA_REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());
+        let remaining = REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());
         let mut group_records = load_group_records(context, group_id, remaining).await?;
         if let Some(pending_records) = pending.remove(&group_id) {
             merge_pending_records(&mut group_records, pending_records);
@@ -427,7 +427,7 @@ pub(super) async fn load_claim_records(
         records.extend(group_records);
     }
     for pending_records in pending.into_values() {
-        if records.len().saturating_add(pending_records.len()) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+        if records.len().saturating_add(pending_records.len()) > REGISTRY_CANDIDATE_LIMIT {
             return Err(MetadataApiError::ServiceUnavailable);
         }
         records.extend(pending_records);
@@ -443,7 +443,7 @@ pub(super) async fn is_deleted(
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
             key: graph_lifecycle_key(graph_iri),
             txn_id: None,
         })
@@ -531,7 +531,7 @@ async fn graph_deleted_txn(
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
             key: graph_lifecycle_key(&record.graph_iri),
             txn_id: Some(txn_id),
         })
@@ -556,7 +556,7 @@ async fn document_deleted_txn(
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+            key_space: DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
             key: document_lifecycle_key(record.document_id),
             txn_id: Some(txn_id),
         })
@@ -728,7 +728,7 @@ pub(super) async fn ensure_permission(
             AuthorizationError::InvalidRealmId
             | AuthorizationError::InvalidGroupId
             | AuthorizationError::GroupNotFound
-            | AuthorizationError::AuthDocNotFound => MetadataApiError::Forbidden,
+            | AuthorizationError::DocNotFound => MetadataApiError::Forbidden,
             _ => MetadataApiError::Internal(err.to_string()),
         })?;
     if !allowed {

@@ -7,9 +7,9 @@ use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-    METADATA_PENDING_PROJECTION_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
+    EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
+    PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataError, MetadataEventRecord, MetadataLifecycleRecord,
@@ -52,8 +52,8 @@ use self::fanout::{
 };
 #[cfg(test)]
 use self::list::{
-    ANONYMOUS_LIST_METADATA_LIMIT, DEFAULT_LIST_METADATA_LIMIT, MAX_LIST_METADATA_LIMIT,
-    METADATA_ESTIMATE_MIN_LIMIT, effective_list_limit,
+    ANONYMOUS_METADATA_LIMIT, LIST_METADATA_LIMIT, MAX_METADATA_LIMIT,
+    ESTIMATE_MIN_LIMIT, effective_list_limit,
 };
 use self::list::{
     check_policy_limit, load_group_records, load_pending_records, merge_pending_records,
@@ -73,15 +73,15 @@ pub use self::read::{query_metadata, query_metadata_document, references_metadat
 use super::AuthToken;
 use super::forward::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::handle::{
-    METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS,
-    METADATA_REGISTRY_CANDIDATE_LIMIT,
+    QUERY_MAX_BYTES, MAX_RESULT_BYTES, QUERY_MAX_ROWS,
+    REGISTRY_CANDIDATE_LIMIT,
 };
 use super::protocol::{
     MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner, MetadataReadError,
     MetadataTransportMessage,
 };
 use super::search_cursor::{
-    CursorEnvelopeError, METADATA_SEARCH_MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor,
+    CursorEnvelopeError, MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor,
     SearchCursorError, SearchPageCursor, SearchWatermark, SignedCursor, merge_search_hits,
     paginate, query_fingerprint, resume_fetch_limit,
 };
@@ -93,7 +93,7 @@ use crate::driver::{DriverContext, drive};
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::get_document::{load_document_record, record_materialized_read};
 use crate::metadata::repository::{
-    LIST_METADATA_PAGE_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
+    LIST_METADATA_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
     parse_registry_read, read_document_registry,
 };
 use crate::placement::selector::{
@@ -155,15 +155,15 @@ pub use self::search::{
 #[cfg(test)]
 use self::search::{ObjectCursor, ObjectPartitionState};
 
-const METADATA_REFERENCES_DEFAULT_LIMIT: usize = 25;
+const REFERENCES_LIMIT: usize = 25;
 
-const METADATA_REFERENCES_MAX_LIMIT: usize = 100;
+const REFERENCES_MAX_LIMIT: usize = 100;
 
-const METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT: usize = 8;
+const QUERY_FANOUT_LIMIT: usize = 8;
 
-const METADATA_DISTRIBUTED_QUERY_MAX_NODES: usize = 32;
+const QUERY_MAX_NODES: usize = 32;
 
-const METADATA_DISTRIBUTED_QUERY_DEADLINE: Duration = Duration::from_secs(12);
+const DISTRIBUTED_QUERY_DEADLINE: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Error)]
 pub enum MetadataApiError {

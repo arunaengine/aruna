@@ -33,11 +33,11 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive_until};
 use crate::placement::selector::select_top_peers;
 
-pub const MAX_AUDIT_PAGE_SIZE: usize = MAX_AUDIT_RECORDS;
-pub const DEFAULT_AUDIT_PAGE_SIZE: usize = 50;
+pub const AUDIT_PAGE_LIMIT: usize = MAX_AUDIT_RECORDS;
+pub const AUDIT_PAGE_SIZE: usize = 50;
 const AUDIT_CURSOR_VERSION: u8 = 1;
-const MAX_AUDIT_CURSOR_BYTES: usize = 256;
-const MAX_AUDIT_CURSOR_CHARS: usize = 384;
+const AUDIT_CURSOR_BYTES: usize = 256;
+const AUDIT_CURSOR_CHARS: usize = 384;
 const AUDIT_INBOUND_LIMIT: usize = 16;
 const AUDIT_OUTBOUND_LIMIT: usize = 16;
 pub const AUDIT_DEADLINE_SECS: u64 = 30;
@@ -113,13 +113,13 @@ fn decode_cursor(
     group_id: GroupId,
     document_id: Option<Ulid>,
 ) -> Result<Vec<u8>, ListAuditError> {
-    if cursor.len() > MAX_AUDIT_CURSOR_CHARS {
+    if cursor.len() > AUDIT_CURSOR_CHARS {
         return Err(ListAuditError::InvalidCursor);
     }
     let bytes = URL_SAFE_NO_PAD
         .decode(cursor)
         .map_err(|_| ListAuditError::InvalidCursor)?;
-    if bytes.len() > MAX_AUDIT_CURSOR_BYTES {
+    if bytes.len() > AUDIT_CURSOR_BYTES {
         return Err(ListAuditError::InvalidCursor);
     }
     let (cursor, rest) = postcard::take_from_bytes::<AuditCursor>(&bytes)
@@ -207,7 +207,7 @@ impl LocalPageOperation {
         start_after: Option<Vec<u8>>,
         limit: usize,
     ) -> Self {
-        let limit = limit.clamp(1, MAX_AUDIT_PAGE_SIZE);
+        let limit = limit.clamp(1, AUDIT_PAGE_LIMIT);
         Self {
             realm_id,
             group_id,
@@ -395,7 +395,7 @@ impl ListAuditOperation {
     where
         I: IntoIterator<Item = NodeId>,
     {
-        let limit = limit.clamp(1, MAX_AUDIT_PAGE_SIZE);
+        let limit = limit.clamp(1, AUDIT_PAGE_LIMIT);
         let scope = audit_scope(
             realm_id,
             local_node,
@@ -663,8 +663,8 @@ pub async fn list_audit(
         .map_err(|_| ListAuditError::Unavailable)?;
     let limit = request
         .limit
-        .unwrap_or(DEFAULT_AUDIT_PAGE_SIZE)
-        .clamp(1, MAX_AUDIT_PAGE_SIZE);
+        .unwrap_or(AUDIT_PAGE_SIZE)
+        .clamp(1, AUDIT_PAGE_LIMIT);
 
     // Membership and its digest are eventual candidates; each peer revalidates them.
     let mut partial = false;
@@ -824,7 +824,7 @@ async fn local_audit_result(
         request.group_id,
         request.document_id,
         request.start_after,
-        request.limit.clamp(1, MAX_AUDIT_PAGE_SIZE),
+        request.limit.clamp(1, AUDIT_PAGE_LIMIT),
     );
     drive_until(operation, context.as_ref(), deadline)
         .await
@@ -890,7 +890,7 @@ mod tests {
         AUDIT_DEADLINE_SECS, AUDIT_INBOUND_ADMISSION, AUDIT_INBOUND_LIMIT,
         AUDIT_OUTBOUND_ADMISSION, AUDIT_OUTBOUND_LIMIT, AuditPageEntry, AuditPageResponse, Effect,
         Event, ListAuditError, ListAuditOperation, ListAuditRequest, LocalPageOperation,
-        MAX_AUDIT_CURSOR_CHARS, MAX_AUDIT_PAGE_SIZE, MAX_AUDIT_PEERS, MetadataReadError, NetEffect,
+        AUDIT_CURSOR_CHARS, AUDIT_PAGE_LIMIT, MAX_AUDIT_PEERS, MetadataReadError, NetEffect,
         NetEvent, Operation, StorageEvent, audit_member, audit_scope, authorize_admin,
         decode_cursor, drive_until, encode_cursor, list_audit, select_peers,
     };
@@ -1199,7 +1199,7 @@ mod tests {
         let Effect::Storage(StorageEffect::Iter { limit, .. }) = &effects[0] else {
             panic!("local page must use storage iteration");
         };
-        assert_eq!(*limit, MAX_AUDIT_PAGE_SIZE);
+        assert_eq!(*limit, AUDIT_PAGE_LIMIT);
     }
 
     #[test]
@@ -1531,7 +1531,7 @@ mod tests {
         assert!(decode_cursor("!!not-base64!!", realm_id, config_digest, group, None).is_err());
         assert!(
             decode_cursor(
-                &"a".repeat(MAX_AUDIT_CURSOR_CHARS + 1),
+                &"a".repeat(AUDIT_CURSOR_CHARS + 1),
                 realm_id,
                 config_digest,
                 group,

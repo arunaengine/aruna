@@ -3,9 +3,9 @@ use super::{
     BLOB_VERSIONS_KEYSPACE, BTreeMap, BTreeSet, BlobHeadKey, BlobVersion, BlobVersionState,
     ConversionError, CurrentVersionPointer, Deserialize, DriverContext, Event, GetBucketError,
     GetBucketOperation, GetConfigOperation, GetNodesOperation, HashMap, HashSet, IterStart, Key,
-    METADATA_DISTRIBUTED_QUERY_DEADLINE, METADATA_REFERENCES_DEFAULT_LIMIT,
-    METADATA_REFERENCES_MAX_LIMIT, METADATA_REGISTRY_CANDIDATE_LIMIT,
-    METADATA_SEARCH_MAX_PAGINATION_DEPTH, MetadataApiError, MetadataFanoutOperation,
+    DISTRIBUTED_QUERY_DEADLINE, REFERENCES_LIMIT,
+    REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT,
+    MAX_PAGINATION_DEPTH, MetadataApiError, MetadataFanoutOperation,
     MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataReferenceEntry,
     MetadataReferencesRequest, MetadataRegistryRecord, MetadataSearchHit, NodeId, NodeSearchResult,
     Permission, REALM_DISCOVERY_TIMEOUT, RealmConfigDocument, RealmId, RealmNodeDiscovery,
@@ -30,10 +30,10 @@ pub(super) async fn resolve_preflight_targets(
     match target {
         ReferenceTarget::ContentW3ids {
             content_w3ids,
-            remove_all_resolvable_locations,
+            remove_resolvable_locations,
         } => {
             if content_w3ids.is_empty()
-                || content_w3ids.len() > METADATA_PREFLIGHT_MAX_TARGET_VERSIONS
+                || content_w3ids.len() > MAX_TARGET_VERSIONS
             {
                 return Err(MetadataApiError::BadRequest);
             }
@@ -53,7 +53,7 @@ pub(super) async fn resolve_preflight_targets(
                         queried_iris: vec![content_w3id],
                         targeted_versions: Vec::new(),
                         removed_locations: Vec::new(),
-                        remove_all_resolvable_locations,
+                        remove_resolvable_locations,
                     });
             }
             Ok(ResolvedPreflightTargets {
@@ -156,7 +156,7 @@ pub(super) async fn resolve_preflight_targets(
                         content_hash,
                         targeted_versions: Vec::new(),
                         removed_locations: Vec::new(),
-                        remove_all_resolvable_locations: false,
+                        remove_resolvable_locations: false,
                     }
                 });
                 add_location_iris(
@@ -207,7 +207,7 @@ pub(super) async fn resolve_preflight_versions(
     }
     .map_err(|_| MetadataApiError::BadRequest)?;
     let heads = scan_preflight_rows(context, BLOB_HEAD_KEYSPACE, prefix_key.into()).await?;
-    if heads.len() > METADATA_PREFLIGHT_MAX_TARGET_VERSIONS {
+    if heads.len() > MAX_TARGET_VERSIONS {
         return Err(MetadataApiError::BadRequest);
     }
     let mut versions = Vec::with_capacity(heads.len());
@@ -252,7 +252,7 @@ pub(super) async fn resolve_all_preflight(
         if key_prefix.is_some_and(|prefix| !version_key.key.starts_with(prefix)) {
             continue;
         }
-        if versions.len() >= METADATA_PREFLIGHT_MAX_TARGET_VERSIONS {
+        if versions.len() >= MAX_TARGET_VERSIONS {
             return Err(MetadataApiError::BadRequest);
         }
         let version = BlobVersion::from_bytes(value.as_ref())
@@ -276,7 +276,7 @@ pub(super) async fn scan_preflight_rows(
                 key_space: key_space.to_string(),
                 prefix: Some(prefix.clone()),
                 start: start_after.take().map(IterStart::After),
-                limit: METADATA_PREFLIGHT_SCAN_PAGE_SIZE,
+                limit: PREFLIGHT_PAGE_SIZE,
                 txn_id: None,
             })
             .await;
@@ -285,7 +285,7 @@ pub(super) async fn scan_preflight_rows(
                 values,
                 next_start_after,
             }) => {
-                if rows.len().saturating_add(values.len()) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+                if rows.len().saturating_add(values.len()) > REGISTRY_CANDIDATE_LIMIT {
                     return Err(MetadataApiError::BadRequest);
                 }
                 rows.extend(values);
@@ -343,9 +343,9 @@ pub(crate) async fn references_preflight_local(
     mut request: ReferenceNodeRequest,
     s3_endpoint: Option<String>,
 ) -> Result<ReferenceNodeExecution, MetadataApiError> {
-    if request.targets.len() > METADATA_PREFLIGHT_MAX_TARGET_VERSIONS
+    if request.targets.len() > MAX_TARGET_VERSIONS
         || request.limit == 0
-        || request.limit > METADATA_SEARCH_MAX_PAGINATION_DEPTH
+        || request.limit > MAX_PAGINATION_DEPTH
     {
         return Err(MetadataApiError::BadRequest);
     }
@@ -366,7 +366,7 @@ pub(crate) async fn references_preflight_local(
         crate::metadata::iri_index::iri_index_freshness(&context.storage_handle, registry.as_ref())
             .await
             .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let pending_for_realm = load_pending_records(context, None, METADATA_REGISTRY_CANDIDATE_LIMIT)
+    let pending_for_realm = load_pending_records(context, None, REGISTRY_CANDIDATE_LIMIT)
         .await?
         .into_values()
         .flatten()
@@ -405,7 +405,7 @@ pub(crate) async fn references_preflight_local(
                 key: alias.key.clone(),
                 version_id: alias.version_id,
             };
-            let removed = target.remove_all_resolvable_locations
+            let removed = target.remove_resolvable_locations
                 || target.removed_locations.contains(&location);
             remaining |= !removed;
             add_location_iris(
@@ -492,14 +492,14 @@ pub(crate) async fn references_preflight_local(
         .targets
         .into_iter()
         .map(|target| {
-            let (resolvable_location_found, resolvable_location_after_operation) = target_locations
+            let (resolvable_location_found, location_after_operation) = target_locations
                 .remove(&target.content_w3id)
                 .unwrap_or((false, false));
             ReferenceNodeTarget {
                 hidden_references_exist: hidden.contains(&target.content_w3id),
                 content_w3id: target.content_w3id,
                 resolvable_location_found,
-                resolvable_location_after_operation,
+                location_after_operation,
             }
         })
         .collect();
@@ -509,9 +509,9 @@ pub(crate) async fn references_preflight_local(
         freshness: MetadataNodeFreshness {
             node_id: local_node_id,
             index_state,
-            oldest_status_updated_at_ms: freshness.oldest_status_updated_at_ms,
+            oldest_status_updated: freshness.oldest_status_updated,
         },
-        path_style_endpoint_available: s3_endpoint.is_some() || !aliases_seen,
+        path_style_available: s3_endpoint.is_some() || !aliases_seen,
         saturated,
     })
 }
@@ -649,15 +649,15 @@ pub(crate) async fn discover_realm_nodes(
     RealmNodeDiscovery { nodes, failed }
 }
 
-const METADATA_PREFLIGHT_MAX_TARGET_VERSIONS: usize = 128;
+const MAX_TARGET_VERSIONS: usize = 128;
 
-const METADATA_PREFLIGHT_SCAN_PAGE_SIZE: usize = 128;
+const PREFLIGHT_PAGE_SIZE: usize = 128;
 
 #[derive(Debug, Clone)]
 pub enum ReferenceTarget {
     ContentW3ids {
         content_w3ids: Vec<String>,
-        remove_all_resolvable_locations: bool,
+        remove_resolvable_locations: bool,
     },
     BucketPrefix {
         bucket: String,
@@ -701,7 +701,8 @@ pub struct MetadataResolvedTarget {
     pub queried_iris: Vec<String>,
     pub targeted_versions: Vec<MetadataPreflightLocation>,
     pub removed_locations: Vec<MetadataPreflightLocation>,
-    pub remove_all_resolvable_locations: bool,
+    #[serde(rename = "remove_all_resolvable_locations")]
+    pub remove_resolvable_locations: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -729,7 +730,8 @@ pub enum MetadataIndexState {
 pub struct MetadataNodeFreshness {
     pub node_id: NodeId,
     pub index_state: MetadataIndexState,
-    pub oldest_status_updated_at_ms: Option<u64>,
+    #[serde(rename = "oldest_status_updated_at_ms")]
+    pub oldest_status_updated: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -737,7 +739,8 @@ pub struct ReferenceNodeTarget {
     pub content_w3id: String,
     pub hidden_references_exist: bool,
     pub resolvable_location_found: bool,
-    pub resolvable_location_after_operation: bool,
+    #[serde(rename = "resolvable_location_after_operation")]
+    pub location_after_operation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -745,7 +748,8 @@ pub struct ReferenceNodeExecution {
     pub visible_references: Vec<MetadataVisibleReference>,
     pub targets: Vec<ReferenceNodeTarget>,
     pub freshness: MetadataNodeFreshness,
-    pub path_style_endpoint_available: bool,
+    #[serde(rename = "path_style_endpoint_available")]
+    pub path_style_available: bool,
     pub saturated: bool,
 }
 
@@ -755,7 +759,7 @@ pub struct ReferenceTargetExecution {
     pub targeted_versions: Vec<MetadataPreflightLocation>,
     pub visible_references: Vec<MetadataVisibleReference>,
     pub hidden_references_exist: bool,
-    pub would_remove_last_resolvable_aruna_location: bool,
+    pub would_remove_location: bool,
     pub location_impact_complete: bool,
 }
 
@@ -772,7 +776,7 @@ pub struct ReferenceCoverage {
     pub excluded_forms: Vec<MetadataExcludedForm>,
     pub node_freshness: Vec<MetadataNodeFreshness>,
     pub target_resolution_complete: bool,
-    pub path_style_endpoint_coverage_complete: bool,
+    pub path_style_complete: bool,
     pub realm_coverage_complete: bool,
 }
 
@@ -818,7 +822,7 @@ pub async fn references_preflight(
     local_node_id: NodeId,
     request: ReferenceRequest,
 ) -> Result<ReferenceExecution, MetadataApiError> {
-    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let deadline = tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE;
     let (plan, target) = plan_preflight_request(realm_id, request)?;
     let resolved = resolve_preflight_targets(
         context,
@@ -864,8 +868,8 @@ pub(super) fn plan_preflight_request(
         return Err(MetadataApiError::Forbidden);
     }
     let page_size = limit
-        .unwrap_or(METADATA_REFERENCES_DEFAULT_LIMIT)
-        .clamp(1, METADATA_REFERENCES_MAX_LIMIT);
+        .unwrap_or(REFERENCES_LIMIT)
+        .clamp(1, REFERENCES_MAX_LIMIT);
     Ok((
         PreflightPlan {
             auth,
@@ -1001,7 +1005,7 @@ pub(super) async fn run_preflight_fanout(
                 &resume,
                 node_id,
                 page_size,
-                METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+                MAX_PAGINATION_DEPTH,
             );
             references_preflight_local(
                 &context,
@@ -1028,7 +1032,7 @@ pub(super) async fn run_preflight_fanout(
                 &resume,
                 node_id,
                 page_size,
-                METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+                MAX_PAGINATION_DEPTH,
             );
             handle
                 .request_remote_preflight(
@@ -1068,17 +1072,17 @@ pub(super) fn assemble_preflight_execution(
     let mut node_freshness = Vec::new();
     let mut hidden = BTreeSet::new();
     let mut locations = BTreeMap::<String, (bool, bool)>::new();
-    let mut path_style_endpoint_coverage_complete = true;
+    let mut path_style_complete = true;
     for (node_id, part) in node_parts {
         node_freshness.push(part.freshness.clone());
-        path_style_endpoint_coverage_complete &= part.path_style_endpoint_available;
+        path_style_complete &= part.path_style_available;
         for target in part.targets {
             if target.hidden_references_exist {
                 hidden.insert(target.content_w3id.clone());
             }
             let entry = locations.entry(target.content_w3id).or_default();
             entry.0 |= target.resolvable_location_found;
-            entry.1 |= target.resolvable_location_after_operation;
+            entry.1 |= target.location_after_operation;
         }
         let hits = part
             .visible_references
@@ -1106,7 +1110,7 @@ pub(super) fn assemble_preflight_execution(
         node_results,
         cursor.watermark,
         plan.page_size,
-        METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+        MAX_PAGINATION_DEPTH,
     );
     let mut visible_by_target = BTreeMap::<String, Vec<MetadataVisibleReference>>::new();
     for hit in page.hits {
@@ -1125,7 +1129,7 @@ pub(super) fn assemble_preflight_execution(
     let complete = fanout_stats.nodes_failed == 0
         && resolved.complete
         && index_current
-        && path_style_endpoint_coverage_complete
+        && path_style_complete
         && !page.truncated;
     if !plan.allow_partial && !complete {
         return Err(MetadataApiError::ServiceUnavailable);
@@ -1138,13 +1142,13 @@ pub(super) fn assemble_preflight_execution(
                 .remove(&target.content_w3id)
                 .unwrap_or((false, false));
             let removes_location =
-                target.remove_all_resolvable_locations || !target.removed_locations.is_empty();
+                target.remove_resolvable_locations || !target.removed_locations.is_empty();
             ReferenceTargetExecution {
                 visible_references: visible_by_target
                     .remove(&target.content_w3id)
                     .unwrap_or_default(),
                 hidden_references_exist: hidden.contains(&target.content_w3id),
-                would_remove_last_resolvable_aruna_location: complete
+                would_remove_location: complete
                     && removes_location
                     && found
                     && !remaining,
@@ -1208,7 +1212,7 @@ pub(super) fn assemble_preflight_execution(
             ],
             node_freshness,
             target_resolution_complete: resolved.complete,
-            path_style_endpoint_coverage_complete,
+            path_style_complete,
             realm_coverage_complete: distributed && complete,
         },
     })

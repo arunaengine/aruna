@@ -116,11 +116,11 @@ fn query_validation_accepts() {
 
 #[test]
 fn query_validation_enforces() {
-    assert!(ensure_query_form(&" ".repeat(METADATA_QUERY_MAX_BYTES + 1)).is_err());
+    assert!(ensure_query_form(&" ".repeat(QUERY_MAX_BYTES + 1)).is_err());
     assert!(
         ensure_query_form(&format!(
             "SELECT ?s WHERE {{ ?s ?p ?o }} LIMIT {}",
-            METADATA_QUERY_MAX_ROWS + 1
+            QUERY_MAX_ROWS + 1
         ))
         .is_err()
     );

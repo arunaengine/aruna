@@ -239,7 +239,7 @@ async fn shard_counts_match() {
     .expect("holder selection succeeds");
 
     assert_eq!(replica_counts.len(), 8);
-    assert!(selections.len() <= METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+    assert!(selections.len() <= QUERY_MAX_NODES);
     for (shard, expected) in replica_counts.iter().copied().enumerate() {
         let dispatched = selections
             .iter()
