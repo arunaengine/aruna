@@ -13,7 +13,7 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ResolveUserSubjectConflictsInput {
+pub struct ResolveConflictsInput {
     pub txn_id: TxnId,
     pub actor: Actor,
     pub document_user_id: UserId,
@@ -22,9 +22,9 @@ pub struct ResolveUserSubjectConflictsInput {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ResolveUserSubjectConflictsOperation {
-    input: ResolveUserSubjectConflictsInput,
-    state: ResolveUserSubjectConflictsState,
+pub struct ResolveConflictsOperation {
+    input: ResolveConflictsInput,
+    state: ResolveConflictsState,
     current_user: Option<User>,
     previous_user: Option<User>,
     subject_queue: VecDeque<String>,
@@ -33,11 +33,11 @@ pub struct ResolveUserSubjectConflictsOperation {
     conflict_users: Vec<StoredUser>,
     pending_deletes: Vec<(String, ByteView)>,
     pending_writes: Vec<(String, ByteView, ByteView)>,
-    output: Option<Result<(), ResolveUserSubjectConflictsError>>,
+    output: Option<Result<(), ResolveConflictsError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum ResolveUserSubjectConflictsState {
+enum ResolveConflictsState {
     Init,
     ReadSubjectIndex { subject: String },
     ReadConflictingUser { user_id: UserId },
@@ -63,7 +63,7 @@ struct ConflictResolutionPlan {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ResolveUserSubjectConflictsError {
+pub enum ResolveConflictsError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -80,11 +80,11 @@ pub enum ResolveUserSubjectConflictsError {
     },
 }
 
-impl ResolveUserSubjectConflictsOperation {
-    pub fn new(input: ResolveUserSubjectConflictsInput) -> Self {
+impl ResolveConflictsOperation {
+    pub fn new(input: ResolveConflictsInput) -> Self {
         Self {
             input,
-            state: ResolveUserSubjectConflictsState::Init,
+            state: ResolveConflictsState::Init,
             current_user: None,
             previous_user: None,
             subject_queue: VecDeque::new(),
@@ -97,8 +97,8 @@ impl ResolveUserSubjectConflictsOperation {
         }
     }
 
-    fn fail(&mut self, error: ResolveUserSubjectConflictsError) -> Effects {
-        self.state = ResolveUserSubjectConflictsState::Error;
+    fn fail(&mut self, error: ResolveConflictsError) -> Effects {
+        self.state = ResolveConflictsState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
@@ -111,17 +111,17 @@ impl ResolveUserSubjectConflictsOperation {
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
-        self.fail(ResolveUserSubjectConflictsError::UnexpectedEvent {
+        self.fail(ResolveConflictsError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
             got,
         })
     }
 
-    fn init(&mut self) -> Result<Effects, ResolveUserSubjectConflictsError> {
+    fn init(&mut self) -> Result<Effects, ResolveConflictsError> {
         let current_user = User::from_bytes(&self.input.current_bytes)?;
         if current_user.user_id != self.input.document_user_id {
-            return Err(ResolveUserSubjectConflictsError::UserIdMismatch);
+            return Err(ResolveConflictsError::UserIdMismatch);
         }
         let previous_user = match self.input.previous_bytes.as_deref() {
             Some(bytes) if !bytes.is_empty() => Some(User::from_bytes(bytes)?),
@@ -139,9 +139,9 @@ impl ResolveUserSubjectConflictsOperation {
         self.advance_resolution()
     }
 
-    fn advance_resolution(&mut self) -> Result<Effects, ResolveUserSubjectConflictsError> {
+    fn advance_resolution(&mut self) -> Result<Effects, ResolveConflictsError> {
         if let Some(subject) = self.subject_queue.pop_front() {
-            self.state = ResolveUserSubjectConflictsState::ReadSubjectIndex {
+            self.state = ResolveConflictsState::ReadSubjectIndex {
                 subject: subject.clone(),
             };
             return Ok(smallvec![Effect::Storage(StorageEffect::Read {
@@ -152,7 +152,7 @@ impl ResolveUserSubjectConflictsOperation {
         }
 
         if let Some(user_id) = self.conflict_user_queue.pop_front() {
-            self.state = ResolveUserSubjectConflictsState::ReadConflictingUser { user_id };
+            self.state = ResolveConflictsState::ReadConflictingUser { user_id };
             return Ok(smallvec![Effect::Storage(StorageEffect::Read {
                 key_space: USER_KEYSPACE.to_string(),
                 key: ByteView::from(user_id.to_bytes()),
@@ -175,7 +175,7 @@ impl ResolveUserSubjectConflictsOperation {
                 Err(error) => return self.fail(error.into()),
             };
             let Some(current_user) = self.current_user.as_ref() else {
-                return self.fail(ResolveUserSubjectConflictsError::NotFinished);
+                return self.fail(ResolveConflictsError::NotFinished);
             };
             if indexed_user_id != current_user.user_id
                 && indexed_user_id.realm_id == current_user.user_id.realm_id
@@ -215,11 +215,11 @@ impl ResolveUserSubjectConflictsOperation {
         }
     }
 
-    fn write_canonical(&mut self) -> Result<Effects, ResolveUserSubjectConflictsError> {
+    fn write_canonical(&mut self) -> Result<Effects, ResolveConflictsError> {
         let plan = self.build_resolution()?;
         self.pending_deletes = plan.deletes;
         self.pending_writes = plan.writes;
-        self.state = ResolveUserSubjectConflictsState::WriteCanonicalUser;
+        self.state = ResolveConflictsState::WriteCanonicalUser;
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
             key_space: USER_KEYSPACE.to_string(),
             key: ByteView::from(plan.canonical_user.user_id.to_bytes()),
@@ -228,11 +228,11 @@ impl ResolveUserSubjectConflictsOperation {
         })])
     }
 
-    fn build_resolution(&self) -> Result<ConflictResolutionPlan, ResolveUserSubjectConflictsError> {
+    fn build_resolution(&self) -> Result<ConflictResolutionPlan, ResolveConflictsError> {
         let current_user = self
             .current_user
             .as_ref()
-            .ok_or(ResolveUserSubjectConflictsError::NotFinished)?;
+            .ok_or(ResolveConflictsError::NotFinished)?;
         let mut candidates = Vec::with_capacity(self.conflict_users.len() + 1);
         candidates.push(StoredUser {
             user: current_user.clone(),
@@ -243,7 +243,7 @@ impl ResolveUserSubjectConflictsOperation {
         let canonical = candidates
             .iter()
             .min_by_key(|candidate| candidate.user.user_id)
-            .ok_or(ResolveUserSubjectConflictsError::NotFinished)?;
+            .ok_or(ResolveConflictsError::NotFinished)?;
         let canonical_id = canonical.user.user_id;
         let mut canonical_user = canonical.user.clone();
         let mut subject_ids = BTreeSet::new();
@@ -272,7 +272,7 @@ impl ResolveUserSubjectConflictsOperation {
         let canonical_base = candidates
             .iter()
             .find(|candidate| candidate.user.user_id == canonical_id)
-            .ok_or(ResolveUserSubjectConflictsError::NotFinished)?;
+            .ok_or(ResolveConflictsError::NotFinished)?;
         let canonical_bytes =
             canonical_user.reconcile_bytes(Some(&canonical_base.bytes), &self.input.actor)?;
 
@@ -308,7 +308,7 @@ impl ResolveUserSubjectConflictsOperation {
 
     fn sync_subjects(&mut self) -> Effects {
         if !self.pending_deletes.is_empty() {
-            self.state = ResolveUserSubjectConflictsState::DeleteStaleEntries;
+            self.state = ResolveConflictsState::DeleteStaleEntries;
             return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                 deletes: std::mem::take(&mut self.pending_deletes),
                 txn_id: Some(self.input.txn_id),
@@ -327,12 +327,12 @@ impl ResolveUserSubjectConflictsOperation {
 
     fn write_subjects(&mut self) -> Effects {
         if self.pending_writes.is_empty() {
-            self.state = ResolveUserSubjectConflictsState::Finish;
+            self.state = ResolveConflictsState::Finish;
             self.output = Some(Ok(()));
             return smallvec![];
         }
 
-        self.state = ResolveUserSubjectConflictsState::WriteSubjectIndexes;
+        self.state = ResolveConflictsState::WriteSubjectIndexes;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes: std::mem::take(&mut self.pending_writes),
             txn_id: Some(self.input.txn_id),
@@ -344,15 +344,15 @@ impl ResolveUserSubjectConflictsOperation {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchWriteResult)", got);
         };
-        self.state = ResolveUserSubjectConflictsState::Finish;
+        self.state = ResolveConflictsState::Finish;
         self.output = Some(Ok(()));
         smallvec![]
     }
 }
 
-impl Operation for ResolveUserSubjectConflictsOperation {
+impl Operation for ResolveConflictsOperation {
     type Output = ();
-    type Error = ResolveUserSubjectConflictsError;
+    type Error = ResolveConflictsError;
 
     fn start(&mut self) -> Effects {
         match self.init() {
@@ -368,33 +368,29 @@ impl Operation for ResolveUserSubjectConflictsOperation {
         };
 
         match self.state.clone() {
-            ResolveUserSubjectConflictsState::ReadSubjectIndex { .. } => self.accept_subject(event),
-            ResolveUserSubjectConflictsState::ReadConflictingUser { user_id } => {
+            ResolveConflictsState::ReadSubjectIndex { .. } => self.accept_subject(event),
+            ResolveConflictsState::ReadConflictingUser { user_id } => {
                 self.accept_conflict(event, user_id)
             }
-            ResolveUserSubjectConflictsState::WriteCanonicalUser => {
-                self.accept_canonical_write(event)
-            }
-            ResolveUserSubjectConflictsState::DeleteStaleEntries => self.accept_stale_delete(event),
-            ResolveUserSubjectConflictsState::WriteSubjectIndexes => {
-                self.accept_subject_write(event)
-            }
-            ResolveUserSubjectConflictsState::Init
-            | ResolveUserSubjectConflictsState::Finish
-            | ResolveUserSubjectConflictsState::Error => smallvec![],
+            ResolveConflictsState::WriteCanonicalUser => self.accept_canonical_write(event),
+            ResolveConflictsState::DeleteStaleEntries => self.accept_stale_delete(event),
+            ResolveConflictsState::WriteSubjectIndexes => self.accept_subject_write(event),
+            ResolveConflictsState::Init
+            | ResolveConflictsState::Finish
+            | ResolveConflictsState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            ResolveUserSubjectConflictsState::Finish | ResolveUserSubjectConflictsState::Error
+            ResolveConflictsState::Finish | ResolveConflictsState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         self.output
-            .unwrap_or(Err(ResolveUserSubjectConflictsError::NotFinished))
+            .unwrap_or(Err(ResolveConflictsError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -432,7 +428,7 @@ pub fn rewrite_subjects(
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{ResolveUserSubjectConflictsInput, ResolveUserSubjectConflictsOperation};
+    use super::{ResolveConflictsInput, ResolveConflictsOperation};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
@@ -473,14 +469,13 @@ mod pure_tests {
         let subject = oidc_subject_key("https://issuer.example", "subject-1").unwrap();
         let current_bytes = user_bytes(user_id, vec![subject.clone()], HashSet::new());
         let txn_id = Ulid::from_parts(1, 1);
-        let mut operation =
-            ResolveUserSubjectConflictsOperation::new(ResolveUserSubjectConflictsInput {
-                txn_id,
-                actor: actor(realm_id),
-                document_user_id: user_id,
-                previous_bytes: None,
-                current_bytes,
-            });
+        let mut operation = ResolveConflictsOperation::new(ResolveConflictsInput {
+            txn_id,
+            actor: actor(realm_id),
+            document_user_id: user_id,
+            previous_bytes: None,
+            current_bytes,
+        });
 
         let effects = operation.start();
         assert!(matches!(
@@ -531,14 +526,13 @@ mod pure_tests {
         let winner_bytes = user_bytes(winner_id, vec![subject.clone()], HashSet::new());
         let loser_bytes = user_bytes(loser_id, vec![subject.clone()], HashSet::new());
         let txn_id = Ulid::from_parts(2, 2);
-        let mut operation =
-            ResolveUserSubjectConflictsOperation::new(ResolveUserSubjectConflictsInput {
-                txn_id,
-                actor: actor(realm_id),
-                document_user_id: loser_id,
-                previous_bytes: None,
-                current_bytes: loser_bytes,
-            });
+        let mut operation = ResolveConflictsOperation::new(ResolveConflictsInput {
+            txn_id,
+            actor: actor(realm_id),
+            document_user_id: loser_id,
+            previous_bytes: None,
+            current_bytes: loser_bytes,
+        });
 
         operation.start();
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {

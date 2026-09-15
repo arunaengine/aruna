@@ -3,15 +3,14 @@ use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
-    DocumentSyncTarget,
+    DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
     sync_revision_entry, sync_revision_key,
@@ -23,8 +22,7 @@ use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId};
 use aruna_core::user_validation::{
-    UserAttributeValidationError, validate_attribute_count, validate_attribute_key,
-    validate_attribute_value,
+    UserAttributeError, validate_attribute_count, validate_attribute_key, validate_attribute_value,
 };
 use aruna_core::{ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
@@ -125,7 +123,7 @@ pub enum UpdateUserError {
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
-    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
+    AdminDocumentError(#[from] AdminDocumentError),
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
     #[error("the user's bucket cut over to a new holder set; retry the update")]
@@ -140,12 +138,12 @@ pub enum UpdateUserError {
     NotFinished,
 }
 
-impl From<UserAttributeValidationError> for UpdateUserError {
-    fn from(error: UserAttributeValidationError) -> Self {
+impl From<UserAttributeError> for UpdateUserError {
+    fn from(error: UserAttributeError) -> Self {
         match error {
-            UserAttributeValidationError::InvalidKey(key) => Self::InvalidAttributeKey(key),
-            UserAttributeValidationError::InvalidValue(key) => Self::InvalidAttributeValue(key),
-            UserAttributeValidationError::TooManyAttributes => Self::TooManyAttributes,
+            UserAttributeError::InvalidKey(key) => Self::InvalidAttributeKey(key),
+            UserAttributeError::InvalidValue(key) => Self::InvalidAttributeValue(key),
+            UserAttributeError::TooManyAttributes => Self::TooManyAttributes,
         }
     }
 }
@@ -250,7 +248,7 @@ impl UpdateUserOperation {
         let admin_target = AdminDocumentTarget::User {
             user_id: target_user_id,
         };
-        let document_target = DocumentSyncTarget::User {
+        let document_target = DocumentTarget::User {
             user_id: target_user_id,
         };
         self.state = UpdateUserState::ReadUserAdminStateAndDocumentRevision { txn_id };
@@ -336,20 +334,20 @@ impl UpdateUserOperation {
             .as_ref()
             .is_some_and(|state| state.target != admin_target)
         {
-            return Err(AdminDocumentReducerError::TargetMismatch.into());
+            return Err(AdminDocumentError::TargetMismatch.into());
         }
         let mut reducer_state = previous_reducer_state
             .clone()
-            .unwrap_or_else(|| AdminDocumentReducerState::new(admin_target));
+            .unwrap_or_else(|| AdminDocumentState::new(admin_target));
         let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
         let previous_document_revision = revision_value
             .as_ref()
             .map(|value| {
-                postcard::from_bytes::<DocumentSyncChange>(value.as_ref())
+                postcard::from_bytes::<DocumentChange>(value.as_ref())
                     .map_err(ConversionError::from)
             })
             .transpose()?;
-        let document_target = DocumentSyncTarget::User {
+        let document_target = DocumentTarget::User {
             user_id: user.user_id,
         };
         let realm_config = realm_config_value
@@ -389,7 +387,7 @@ impl UpdateUserOperation {
                 self.input.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::admin(event.clone()),
+                DocumentOutboxEvent::admin(event.clone()),
                 placement,
                 false,
             )
@@ -539,7 +537,7 @@ impl UpdateUserOperation {
     fn emit_announce_user(&mut self, user: User) -> Effects {
         let user_id = user.user_id;
         self.state = UpdateUserState::AnnounceUser { user };
-        let document = DocumentSyncTarget::User { user_id };
+        let document = DocumentTarget::User { user_id };
         smallvec![replicate_documents_effect(
             self.input.actor.realm_id,
             self.input.actor.node_id,
@@ -651,15 +649,15 @@ impl Operation for UpdateUserOperation {
 }
 
 fn local_sync_change(
-    previous_change: Option<&DocumentSyncChange>,
+    previous_change: Option<&DocumentChange>,
     actor: &Actor,
     placement: PlacementRef,
-) -> DocumentSyncChange {
+) -> DocumentChange {
     let updated_at_ms = current_timestamp_ms();
     let minimum_generation = previous_change
         .map(|change| change.current.generation.saturating_add(1))
         .unwrap_or_default();
-    DocumentSyncChange {
+    DocumentChange {
         base: previous_change.map(|change| change.current),
         current: DocumentSyncRevision {
             generation: updated_at_ms.max(minimum_generation),
@@ -667,15 +665,15 @@ fn local_sync_change(
             actor: actor.node_id,
             updated_at_ms,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement,
     }
 }
 
 fn apply_reducer_updates(
-    state: &mut AdminDocumentReducerState,
+    state: &mut AdminDocumentState,
     input: &UpdateUserInput,
-) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
+) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut events = Vec::new();
     for operation in admin_document_operations(input) {
         events.push(state.apply_operation(&input.actor, operation)?);
@@ -749,16 +747,14 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
     use aruna_core::document::{
-        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
-        DocumentSyncOutboxRecord, DocumentSyncRevision, DocumentSyncTarget,
+        DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
+        DocumentSyncRevision, DocumentTarget,
     };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::operation::Operation;
-    use aruna_core::reducer::{
-        AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
-    };
+    use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key, sync_revision_key};
     use aruna_core::structs::{Actor, AuthContext, PlacementRef, RealmId, User};
     use aruna_core::task::{TaskEvent, TaskKey};
@@ -837,15 +833,15 @@ mod pure_tests {
         }
     }
 
-    fn conflict(path: &str, first_seed: u8, second_seed: u8) -> AdminDocumentConflict {
-        AdminDocumentConflict {
+    fn conflict(path: &str, first_seed: u8, second_seed: u8) -> AdminConflict {
+        AdminConflict {
             path: path.to_string(),
             values: vec![
-                AdminDocumentConflictValue {
+                AdminConflictValue {
                     value: Some(format!("value-{first_seed}")),
                     dot: dot(first_seed),
                 },
-                AdminDocumentConflictValue {
+                AdminConflictValue {
                     value: Some(format!("value-{second_seed}")),
                     dot: dot(second_seed),
                 },
@@ -853,7 +849,7 @@ mod pure_tests {
         }
     }
 
-    fn conflict_state(user_id: UserId) -> AdminDocumentReducerState {
+    fn conflict_state(user_id: UserId) -> AdminDocumentState {
         let name_first = dot(11);
         let name_second = dot(12);
         let title_first = dot(13);
@@ -863,7 +859,7 @@ mod pure_tests {
             clock.advance(dot.origin_node_id, dot.origin_seq);
         }
 
-        AdminDocumentReducerState {
+        AdminDocumentState {
             target: AdminDocumentTarget::User { user_id },
             clock,
             applied_event_ids: BTreeSet::from([
@@ -905,7 +901,7 @@ mod pure_tests {
         let txn_id = TxnId::generate();
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let target = AdminDocumentTarget::User { user_id };
-        let document = DocumentSyncTarget::User { user_id };
+        let document = DocumentTarget::User { user_id };
         match effects.first().unwrap() {
             Effect::Storage(StorageEffect::BatchRead { reads, txn_id: id }) => {
                 assert_eq!(*id, Some(txn_id));
@@ -948,7 +944,7 @@ mod pure_tests {
                         .iter()
                         .all(|(keyspace, _, _)| keyspace != ADMIN_DOCUMENT_CONFLICT_KEYSPACE)
                 );
-                let outbox_records: Vec<DocumentSyncOutboxRecord> = writes
+                let outbox_records: Vec<DocumentOutboxRecord> = writes
                     .iter()
                     .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
                     .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
@@ -961,17 +957,15 @@ mod pure_tests {
                 );
                 assert!(outbox_records.iter().any(|record| matches!(
                     &record.event,
-                    DocumentSyncOutboxEvent::AdminOperation { event, .. } if matches!(
+                    DocumentOutboxEvent::AdminOperation { event, .. } if matches!(
                         &event.op,
                         aruna_core::admin_documents::AdminDocumentOperation::UserNameSet { .. }
                     )
                 )));
                 (
                     User::from_bytes(user_write.2.as_ref()).unwrap(),
-                    postcard::from_bytes::<AdminDocumentReducerState>(
-                        reducer_state_write.2.as_ref(),
-                    )
-                    .unwrap(),
+                    postcard::from_bytes::<AdminDocumentState>(reducer_state_write.2.as_ref())
+                        .unwrap(),
                 )
             }
             other => panic!("unexpected update effect: {other:?}"),
@@ -1028,11 +1022,11 @@ mod pure_tests {
         let expected_actor = request.actor.clone();
         let mut operation = UpdateUserOperation::new(request);
         let admin_target = AdminDocumentTarget::User { user_id };
-        let document_target = DocumentSyncTarget::User { user_id };
-        let previous_revision = DocumentSyncChange {
+        let document_target = DocumentTarget::User { user_id };
+        let previous_revision = DocumentChange {
             base: None,
             current: document_revision(21, 42),
-            kind: DocumentSyncChangeKind::Upsert,
+            kind: DocumentChangeKind::Upsert,
             placement: PlacementRef::NIL,
         };
 
@@ -1072,7 +1066,7 @@ mod pure_tests {
         let updated = User::from_bytes(user_write.2.as_ref()).unwrap();
         assert_eq!(updated.name, "Alice Updated");
 
-        let (revision_key, revision): (_, DocumentSyncChange) = writes
+        let (revision_key, revision): (_, DocumentChange) = writes
             .iter()
             .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_REVISION_KEYSPACE)
             .map(|(_, key, value)| {
@@ -1087,7 +1081,7 @@ mod pure_tests {
         assert_eq!(revision.current.actor, expected_actor.node_id);
         assert!(revision.current.generation > previous_revision.current.generation);
         assert!(revision.current.updated_at_ms > 0);
-        assert_eq!(revision.kind, DocumentSyncChangeKind::Upsert);
+        assert_eq!(revision.kind, DocumentChangeKind::Upsert);
     }
 
     #[test]
@@ -1097,7 +1091,7 @@ mod pure_tests {
         let original = stored_user(user_id);
         let previous_state = conflict_state(user_id);
         let target = AdminDocumentTarget::User { user_id };
-        let document = DocumentSyncTarget::User { user_id };
+        let document = DocumentTarget::User { user_id };
         let mut operation = UpdateUserOperation::new(input(realm_id, user_id, user_id));
 
         operation.start();
@@ -1135,16 +1129,14 @@ mod pure_tests {
                     .filter(|(keyspace, _, _)| keyspace == ADMIN_DOCUMENT_CONFLICT_KEYSPACE)
                     .collect();
                 assert_eq!(conflict_writes.len(), 1);
-                let conflict: AdminDocumentConflict =
+                let conflict: AdminConflict =
                     postcard::from_bytes(conflict_writes[0].2.as_ref()).unwrap();
                 assert_eq!(conflict.path, "user.attributes.title");
 
                 (
                     User::from_bytes(user_write.2.as_ref()).unwrap(),
-                    postcard::from_bytes::<AdminDocumentReducerState>(
-                        reducer_state_write.2.as_ref(),
-                    )
-                    .unwrap(),
+                    postcard::from_bytes::<AdminDocumentState>(reducer_state_write.2.as_ref())
+                        .unwrap(),
                 )
             }
             other => panic!("unexpected update effect: {other:?}"),
@@ -1271,7 +1263,7 @@ mod pure_tests {
         let caller = actor(realm_id, user_id);
         let config = activated_config(realm_id, &caller);
         let admin_target = AdminDocumentTarget::User { user_id };
-        let document_target = DocumentSyncTarget::User { user_id };
+        let document_target = DocumentTarget::User { user_id };
         operation.start();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(Event::Storage(StorageEvent::BatchReadResult {
