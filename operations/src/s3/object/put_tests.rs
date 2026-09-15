@@ -1,5 +1,5 @@
 use crate::driver::{DriverContext, drive};
-use crate::s3::put_object::{
+use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectState,
 };
 
@@ -19,7 +19,7 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CurrentVersionPointer, HashPathIndexKey, RealmId, UsageDelta, VersionKey,
+    BucketInfo, CurrentVersionPointer, HashIndex, RealmId, UsageDelta, VersionKey,
 };
 use aruna_core::structs::{BackendCatalog, NodeRoutingRule, RoutingSnapshot, RoutingTarget};
 use aruna_net::dht::storage::decode_entries;
@@ -337,7 +337,7 @@ fn quota_error_cleans() {
     assert!(op.is_complete());
     assert!(matches!(
         op.finalize(),
-        Err(crate::s3::put_object::PutObjectError::QuotaGateError(_))
+        Err(crate::s3::object::put::PutObjectError::QuotaGateError(_))
     ));
 }
 
@@ -382,7 +382,7 @@ fn usage_error_cleans() {
     assert!(op.is_complete());
     assert!(matches!(
         op.finalize(),
-        Err(crate::s3::put_object::PutObjectError::UsageUpdateError(_))
+        Err(crate::s3::object::put::PutObjectError::UsageUpdateError(_))
     ));
 }
 
@@ -479,7 +479,7 @@ fn conflict_exhausts_retries() {
     assert!(op.is_complete());
     assert!(matches!(
         op.finalize(),
-        Err(crate::s3::put_object::PutObjectError::StorageError(
+        Err(crate::s3::object::put::PutObjectError::StorageError(
             StorageError::TransactionConflict
         ))
     ));
@@ -972,7 +972,7 @@ pub async fn test_put_object() {
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
-            key: HashPathIndexKey::new(
+            key: HashIndex::new(
                 result.location.get_blake3().unwrap().try_into().unwrap(),
                 result.version_id,
                 realm_id,
@@ -1211,7 +1211,7 @@ pub async fn deduplicates_blob() {
         let hash_path_value = read_value(
             &context,
             HASH_PATHS_INDEX_KEYSPACE,
-            HashPathIndexKey::new(
+            HashIndex::new(
                 blob_hash,
                 expected_version_id,
                 realm_id,
@@ -1413,8 +1413,8 @@ async fn delete_keeps_copy() {
     let cold = put_routed(&context, group_id, realm_id, "archive/cold.txt", data).await;
 
     let deleted = drive(
-        crate::s3::delete_object::DeleteObjectOperation::new(
-            crate::s3::delete_object::DeleteObjectInput {
+        crate::s3::object::delete::DeleteObjectOperation::new(
+            crate::s3::object::delete::DeleteObjectInput {
                 bucket: "mybucket".to_string(),
                 key: "hot.txt".to_string(),
                 version_id: Some(hot.version_id),
@@ -1629,7 +1629,7 @@ pub async fn overwrite_retains_index() {
     let historical_hash_path = read_value(
         &context,
         HASH_PATHS_INDEX_KEYSPACE,
-        HashPathIndexKey::new(
+        HashIndex::new(
             first_hash,
             first.version_id,
             realm_id,
@@ -1648,7 +1648,7 @@ pub async fn overwrite_retains_index() {
     let new_hash_path = read_value(
         &context,
         HASH_PATHS_INDEX_KEYSPACE,
-        HashPathIndexKey::new(
+        HashIndex::new(
             second_hash,
             second.version_id,
             realm_id,
@@ -1765,7 +1765,7 @@ async fn mismatch_cleans_blob() {
 
     assert!(matches!(
         err,
-        crate::s3::put_object::PutObjectError::ChecksumMismatch("SHA256")
+        crate::s3::object::put::PutObjectError::ChecksumMismatch("SHA256")
     ));
     assert_eq!(count_files(Path::new(&blob_root)), 0);
 }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::tests::fixtures::s3::{test_context, test_storage};
+use crate::tests::s3::{test_context, test_storage};
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -100,7 +100,7 @@ async fn deleted_versions_skipped() {
     ));
 
     let result = drive(
-        ListObjectsV2Operation::new(ListObjectsV2Input {
+        ListBucketOperation::new(ListBucketInput {
             bucket: "bucket".to_string(),
             group_id,
             continuation_token: None,
@@ -141,7 +141,7 @@ async fn prefix_filtered() {
 
     loop {
         let result = drive(
-            ListObjectsV2Operation::new(ListObjectsV2Input {
+            ListBucketOperation::new(ListBucketInput {
                 bucket: "bucket".to_string(),
                 group_id,
                 continuation_token,
@@ -197,7 +197,7 @@ async fn prefix_miss_continues() {
     .await;
 
     let result = drive(
-        ListObjectsV2Operation::new(ListObjectsV2Input {
+        ListBucketOperation::new(ListBucketInput {
             bucket: "bucket".to_string(),
             group_id,
             continuation_token: None,
@@ -268,7 +268,7 @@ async fn zero_limit_honored() {
         .await;
 
     let result = drive(
-        ListObjectsV2Operation::new(ListObjectsV2Input {
+        ListBucketOperation::new(ListBucketInput {
             bucket: "bucket".to_string(),
             group_id,
             continuation_token: None,
@@ -307,7 +307,7 @@ async fn pagination_resumes() {
 
     loop {
         let result = drive(
-            ListObjectsV2Operation::new(ListObjectsV2Input {
+            ListBucketOperation::new(ListBucketInput {
                 bucket: "bucket".to_string(),
                 group_id,
                 continuation_token,
@@ -348,7 +348,7 @@ async fn empty_bucket_lists() {
     let group_id = Ulid::generate();
 
     let result = drive(
-        ListObjectsV2Operation::new(ListObjectsV2Input {
+        ListBucketOperation::new(ListBucketInput {
             bucket: "empty-bucket".to_string(),
             group_id,
             continuation_token: None,
@@ -435,7 +435,7 @@ async fn reference_object_lists() {
         .await;
 
     let result = drive(
-        ListObjectsV2Operation::new(ListObjectsV2Input {
+        ListBucketOperation::new(ListBucketInput {
             bucket: "bucket".to_string(),
             group_id,
             continuation_token: None,
@@ -577,7 +577,7 @@ async fn list_keys(
     start_after: Option<&str>,
 ) -> Vec<String> {
     let result = drive(
-        ListObjectsV2Operation::new(ListObjectsV2Input {
+        ListBucketOperation::new(ListBucketInput {
             bucket: bucket.to_string(),
             group_id: Ulid::generate(),
             continuation_token: None,
@@ -680,10 +680,10 @@ async fn list_page(
     bucket: &str,
     delimiter: Option<&str>,
     max_keys: usize,
-    continuation_token: Option<ListObjectsV2ContinuationToken>,
-) -> ListObjectsV2Result {
+    continuation_token: Option<ListContinuationToken>,
+) -> ListBucketResult {
     drive(
-        ListObjectsV2Operation::new(ListObjectsV2Input {
+        ListBucketOperation::new(ListBucketInput {
             bucket: bucket.to_string(),
             group_id: Ulid::generate(),
             continuation_token,
@@ -832,7 +832,7 @@ async fn hydration_preserves_order() {
     }
 
     let result = drive(
-        ListObjectsV2Operation::new(ListObjectsV2Input {
+        ListBucketOperation::new(ListBucketInput {
             bucket: "bucket".to_string(),
             group_id: Ulid::generate(),
             continuation_token: None,
@@ -859,10 +859,10 @@ async fn hydration_preserves_order() {
 
 fn delimiter_input(
     max_keys: usize,
-    continuation_token: Option<ListObjectsV2ContinuationToken>,
+    continuation_token: Option<ListContinuationToken>,
     delimiter: Option<&str>,
-) -> ListObjectsV2Input {
-    ListObjectsV2Input {
+) -> ListBucketInput {
+    ListBucketInput {
         bucket: "bucket".to_string(),
         group_id: Ulid::generate(),
         continuation_token,
@@ -873,7 +873,7 @@ fn delimiter_input(
     }
 }
 
-fn step_transaction_started(operation: &mut ListObjectsV2Operation) -> Effects {
+fn step_transaction_started(operation: &mut ListBucketOperation) -> Effects {
     let effects = operation.start();
     assert!(matches!(
         effects[0],
@@ -886,7 +886,7 @@ fn step_transaction_started(operation: &mut ListObjectsV2Operation) -> Effects {
 
 #[test]
 fn group_round_advances() {
-    let mut operation = ListObjectsV2Operation::new(delimiter_input(1, None, Some("/")));
+    let mut operation = ListBucketOperation::new(delimiter_input(1, None, Some("/")));
 
     let effects = step_transaction_started(&mut operation);
     let Effect::Storage(StorageEffect::Iter {
@@ -948,13 +948,13 @@ fn group_round_advances() {
 
 #[test]
 fn group_resume_advances() {
-    let token = ListObjectsV2ContinuationToken {
+    let token = ListContinuationToken {
         last_key: BlobHeadKey::new("bucket", "dir/5").to_bytes().unwrap(),
         last_common_prefix: Some("dir/".to_string()),
     };
 
     let mut operation =
-        ListObjectsV2Operation::new(delimiter_input(10, Some(token.clone()), Some("/")));
+        ListBucketOperation::new(delimiter_input(10, Some(token.clone()), Some("/")));
     let effects = step_transaction_started(&mut operation);
     let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
         panic!("expected resumed scan round: {:?}", effects[0]);
@@ -963,7 +963,7 @@ fn group_resume_advances() {
 
     // Without the delimiter the group no longer applies: resume behind
     // the exclusive cursor instead of seeking.
-    let mut operation = ListObjectsV2Operation::new(delimiter_input(10, Some(token.clone()), None));
+    let mut operation = ListBucketOperation::new(delimiter_input(10, Some(token.clone()), None));
     let effects = step_transaction_started(&mut operation);
     let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
         panic!("expected resumed scan round: {:?}", effects[0]);
