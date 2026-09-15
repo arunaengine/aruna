@@ -7,19 +7,19 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    REPLICATION_OBLIGATION_KEYSPACE, REPLICATION_JOB_KEYSPACE, NODE_STATE_KEYSPACE,
-    RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE,
+    NODE_STATE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE,
+    REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::storage::replication::{ArunaArn, ReplicationFailure};
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
+};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::replication::{ArunaArn, ReplicationFailure};
 use aruna_core::structs::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, sync_relationship_key,
     sync_relationship_prefix,
-};
-use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -2052,12 +2052,7 @@ async fn persist_live_jobs(
 
     let reads = jobs
         .iter()
-        .map(|job| {
-            Ok((
-                REPLICATION_JOB_KEYSPACE.to_string(),
-                blob_job_key(job)?,
-            ))
-        })
+        .map(|job| Ok((REPLICATION_JOB_KEYSPACE.to_string(), blob_job_key(job)?)))
         .collect::<Result<Vec<_>, ConversionError>>()?;
     let values = match storage
         .send_storage_effect(StorageEffect::BatchRead {
@@ -2630,14 +2625,14 @@ mod tests {
     };
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::identity::auth::{Actor, PathRestriction, Permission};
-    use aruna_core::structs::storage::replication::{ArunaArn, ReplicationItemError};
-    use aruna_core::structs::storage::blob::{
-        BackendRef, BlobVersion, BucketInfo, VersionKey, object_permission_path,
-    };
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
+    use aruna_core::structs::storage::blob::{
+        BackendRef, BlobVersion, BucketInfo, VersionKey, object_permission_path,
+    };
+    use aruna_core::structs::storage::replication::{ArunaArn, ReplicationItemError};
     use aruna_core::structs::{ReferenceHandling, SyncStatusSnapshot, sync_relationship_key};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -4045,14 +4040,10 @@ mod tests {
             other => panic!("unexpected relationship batch write event: {other:?}"),
         }
 
-        let first = read_relationships_limit(
-            &storage,
-            "bucket",
-            None,
-            REPLICATION_RELATIONSHIP_LIMIT,
-        )
-        .await
-        .unwrap();
+        let first =
+            read_relationships_limit(&storage, "bucket", None, REPLICATION_RELATIONSHIP_LIMIT)
+                .await
+                .unwrap();
         assert_eq!(first.values.len(), REPLICATION_RELATIONSHIP_LIMIT);
         let second = read_relationships_limit(
             &storage,

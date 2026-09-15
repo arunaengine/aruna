@@ -6,20 +6,20 @@ use aruna_blob::blob::BlobHandler;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE,
-    NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NODE_STATS_KEYSPACE, PATHS_INDEX_KEYSPACE,
+    USAGE_STATS_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::storage::blob::{
-    Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashIndex, VersionKey,
-};
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::{
     PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
 };
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{
+    Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashIndex, VersionKey,
+};
 use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
 use futures_util::StreamExt;
@@ -90,7 +90,8 @@ fn audit_record(effects: &[Effect]) -> aruna_core::structs::storage::delete_audi
         panic!("expected one audit write, got {effects:?}")
     };
     assert_eq!(key_space, DELETE_AUDIT_KEYSPACE);
-    aruna_core::structs::storage::delete_audit::BlobAuditRecord::from_bytes(value.as_ref()).expect("audit record decodes")
+    aruna_core::structs::storage::delete_audit::BlobAuditRecord::from_bytes(value.as_ref())
+        .expect("audit record decodes")
 }
 
 #[test]
@@ -333,7 +334,10 @@ fn candidate_op(location: Option<BlobLocationKey>) -> DeleteObjectOperation {
 #[test]
 fn queues_deleted_copy() {
     // The candidate rides the delete transaction, keyed backend first.
-    let key = BlobLocationKey::new([4u8; 32], aruna_core::structs::storage::blob::BackendRef::node_default());
+    let key = BlobLocationKey::new(
+        [4u8; 32],
+        aruna_core::structs::storage::blob::BackendRef::node_default(),
+    );
     let mut op = candidate_op(Some(key.clone()));
 
     let effects = op.write_reclaim_candidate();

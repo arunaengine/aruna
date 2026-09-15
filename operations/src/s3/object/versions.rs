@@ -7,13 +7,13 @@ use aruna_core::keyspaces::{
     NODE_SUBJECT_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
-use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
-use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use std::collections::VecDeque;
@@ -628,8 +628,7 @@ impl ListVersionsOperation {
                         Some(_) => match locations.next() {
                             Some((_, value)) => value,
                             None => {
-                                return self
-                                    .emit_error(ListVersionsError::ListVersionsFailed);
+                                return self.emit_error(ListVersionsError::ListVersionsFailed);
                             }
                         },
                         None => None,
@@ -788,12 +787,12 @@ mod test {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::checksum::HASH_MD5;
-    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::{
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::storage::blob::BackendRef;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::{Duration, UNIX_EPOCH};
@@ -1359,11 +1358,11 @@ mod test {
 mod pure_tests {
     use super::served_copy;
     use crate::blob::managed_copy::register_entry;
+    use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
+    use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, ManagedCopyKey, VersionKey,
     };
-    use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
-    use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
     use std::collections::{BTreeMap, HashMap};
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;

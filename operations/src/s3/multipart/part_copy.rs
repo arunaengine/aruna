@@ -11,10 +11,10 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
-use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use std::time::SystemTime;
@@ -322,11 +322,11 @@ mod test {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
     use aruna_core::stream::BackendStream;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
     use aruna_core::structs::storage::multipart::{
         MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
     };
-    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -553,12 +553,14 @@ mod test {
             aruna_core::structs::placement::placement_policy::PlacementPolicy::new(
                 Ulid::from_bytes([4u8; 16]),
                 "residency".to_string(),
-                vec![aruna_core::structs::placement::placement_policy::PlacementSelector {
-                    node_id: Some(node_id),
-                    location: None,
-                    labels: Vec::new(),
-                    executor_kind: None,
-                }],
+                vec![
+                    aruna_core::structs::placement::placement_policy::PlacementSelector {
+                        node_id: Some(node_id),
+                        location: None,
+                        labels: Vec::new(),
+                        executor_kind: None,
+                    },
+                ],
             )
             .expect("policy is valid"),
         )
@@ -638,12 +640,14 @@ mod test {
             aruna_core::structs::placement::placement_policy::PlacementPolicy::new(
                 Ulid::from_bytes([7u8; 16]),
                 "residency".to_string(),
-                vec![aruna_core::structs::placement::placement_policy::PlacementSelector {
-                    node_id: Some(elsewhere),
-                    location: None,
-                    labels: Vec::new(),
-                    executor_kind: None,
-                }],
+                vec![
+                    aruna_core::structs::placement::placement_policy::PlacementSelector {
+                        node_id: Some(elsewhere),
+                        location: None,
+                        labels: Vec::new(),
+                        executor_kind: None,
+                    },
+                ],
             )
             .expect("policy is valid"),
         )

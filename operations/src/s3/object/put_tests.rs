@@ -12,20 +12,20 @@ use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
-    PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE, PURGE_FENCE_KEYSPACE,
+    PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BucketInfo, CurrentVersionPointer, HashIndex, VersionKey,
 };
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::structs::storage::routing::{
     BackendCatalog, NodeRoutingRule, RoutingSnapshot, RoutingTarget,
 };
+use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
@@ -129,9 +129,9 @@ fn guard_allows_edit() {
         placement_policy_generation: 0,
     };
     let edited = BucketInfo {
-        cors_configuration: Some(aruna_core::structs::storage::blob::BucketCorsConfiguration {
-            rules: Vec::new(),
-        }),
+        cors_configuration: Some(
+            aruna_core::structs::storage::blob::BucketCorsConfiguration { rules: Vec::new() },
+        ),
         ..expected.clone()
     };
     let mut op = PutObjectOperation::new(config).with_bucket_guard(expected);

@@ -279,14 +279,14 @@ impl ListUploadsOperation {
             self.input.delimiter.as_deref(),
             |upload| upload.key.as_str(),
         );
-        let (next_key_marker, next_upload_marker) =
-            match page.last_index.filter(|_| page.truncated) {
-                Some(index) => (
-                    Some(uploads[index].key.clone()),
-                    Some(uploads[index].upload_id),
-                ),
-                None => (None, None),
-            };
+        let (next_key_marker, next_upload_marker) = match page.last_index.filter(|_| page.truncated)
+        {
+            Some(index) => (
+                Some(uploads[index].key.clone()),
+                Some(uploads[index].upload_id),
+            ),
+            None => (None, None),
+        };
 
         self.state = ListUploadsState::CommitTransaction;
         self.output = Some(Ok(ListUploadsResult {
@@ -365,8 +365,8 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::BackendRef;
     use aruna_storage::storage;
     use std::time::{Duration, SystemTime};
     use tempfile::tempdir;

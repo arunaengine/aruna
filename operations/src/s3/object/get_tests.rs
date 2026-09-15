@@ -5,8 +5,8 @@ use crate::replication::protocol::{BaoReadRefusal, ReferenceAdvance};
 use crate::replication::queue::LiveObligationRecord;
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, HolderFailures,
-    MAX_AUTO_ADVANCES, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest,
-    RoutedRead, get_object_routed, routed_info,
+    MAX_AUTO_ADVANCES, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest, RoutedRead,
+    get_object_routed, routed_info,
 };
 use aruna_blob::blob::BlobHandler;
 use aruna_blob::hash::Hasher;
@@ -16,24 +16,24 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::events::SubOperationEvent;
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    REPLICATION_OBLIGATION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{HASH_MD5, HASH_SHA256};
+use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::staging::{
+    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+};
+use aruna_core::structs::identity::auth::{PathRestriction, Permission};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartObjectSummary};
-use aruna_core::structs::identity::auth::{PathRestriction, Permission};
-use aruna_core::structs::execution::staging::{
-    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
-};
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
-use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::storage::usage::{UsageDelta, usage_group_key};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
@@ -1233,7 +1233,9 @@ async fn drift_creates_successor() {
     else {
         panic!("missing usage counters");
     };
-    let counters = aruna_core::structs::storage::usage::UsageCounters::from_bytes(value.unwrap().as_ref()).unwrap();
+    let counters =
+        aruna_core::structs::storage::usage::UsageCounters::from_bytes(value.unwrap().as_ref())
+            .unwrap();
     assert_eq!(counters.referenced_bytes, 15);
 
     // The successor's obligation is committed with it, so replication and

@@ -7,11 +7,11 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
+use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
@@ -435,6 +435,7 @@ impl Operation for SearchBucketsOperation {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
@@ -444,7 +445,6 @@ mod tests {
     use aruna_core::structs::identity::auth::{Actor, Role};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
-    use aruna_core::UserId;
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_storage::storage;
     use tempfile::tempdir;

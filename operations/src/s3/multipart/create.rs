@@ -9,11 +9,11 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{BucketInfo, ResolvedBackend};
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumHint, MultipartUpload, MultipartUploadStatus,
 };
-use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
@@ -392,13 +392,13 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
+    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
+    use aruna_core::structs::storage::multipart::MultipartUpload;
     use aruna_core::structs::storage::routing::{
         BackendCatalog, GroupRoutingInputs, RoutingError, RoutingSnapshot, RoutingTarget,
         StorageRoutingRule,
     };
-    use aruna_core::structs::storage::blob::BackendRef;
-    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
-    use aruna_core::structs::storage::multipart::MultipartUpload;
     use aruna_core::types::TxnId;
     use std::collections::BTreeSet;
     use ulid::Ulid;

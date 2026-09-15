@@ -15,17 +15,17 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{
-    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
-};
-use aruna_core::structs::placement::policy_attachment::{
-    BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, PolicyBlockedReason, PolicyBulkRun,
-    PolicyIntent, PolicyIntentKey, PolicyIntentOutcome, PolicyRefMode, PolicyStatus,
-};
 use aruna_core::structs::placement::placement_policy::{
     PlacementPolicyRef, PlacementSubject, PolicyResolution,
 };
+use aruna_core::structs::placement::policy_attachment::{
+    BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, PolicyBlockedReason, PolicyBulkRun, PolicyIntent,
+    PolicyIntentKey, PolicyIntentOutcome, PolicyRefMode, PolicyStatus,
+};
 use aruna_core::structs::placement::policy_document::{group_admin_path, policy_admin_path};
+use aruna_core::structs::storage::blob::{
+    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
+};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
@@ -979,24 +979,24 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
-        POLICY_CACHE_KEYSPACE, S3_BUCKET_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, POLICY_CACHE_KEYSPACE,
+        S3_BUCKET_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
-    use aruna_core::structs::storage::blob::{
-        Backend, BackendConfig, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
-        CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, VersionKey,
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::placement_policy::{
+        PlacementPolicy, PlacementPolicyRef, PlacementSelector, VerifiedPolicy,
     };
     use aruna_core::structs::placement::policy_attachment::{
         BULK_INTENT_KEYSPACE, PolicyBlockedReason, PolicyIntent, PolicyIntentKey,
         PolicyIntentOutcome, PolicyStatus,
     };
-    use aruna_core::structs::placement::placement_policy::{
-        PlacementPolicy, PlacementPolicyRef, PlacementSelector, VerifiedPolicy,
+    use aruna_core::structs::storage::blob::{
+        Backend, BackendConfig, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
+        CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, VersionKey,
     };
-    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::types::{GroupId, Key, Value};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};

@@ -15,11 +15,11 @@ use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
-use aruna_core::structs::storage::blob::BackendLocation;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::routing::resolve_backend;
 use aruna_core::types::GroupId;
 use futures_util::StreamExt;
@@ -375,12 +375,12 @@ pub(crate) mod test {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
     use aruna_core::stream::BackendStream;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::staging::PortableSourceDescriptor;
     use aruna_core::structs::storage::blob::{
         Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
     };
-    use aruna_core::structs::execution::staging::PortableSourceDescriptor;
-    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-    use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use axum::{Router, routing::get};
@@ -553,19 +553,25 @@ pub(crate) mod test {
     }
 
     /// A rule that admits exactly this node, so a governed write is allowed.
-    fn admits(node_id: NodeId, seed: u8) -> aruna_core::structs::placement::placement_policy::VerifiedPolicy {
+    fn admits(
+        node_id: NodeId,
+        seed: u8,
+    ) -> aruna_core::structs::placement::placement_policy::VerifiedPolicy {
         let policy = aruna_core::structs::placement::placement_policy::PlacementPolicy::new(
             Ulid::from_bytes([seed; 16]),
             "residency".to_string(),
-            vec![aruna_core::structs::placement::placement_policy::PlacementSelector {
-                node_id: Some(node_id),
-                location: None,
-                labels: Vec::new(),
-                executor_kind: None,
-            }],
+            vec![
+                aruna_core::structs::placement::placement_policy::PlacementSelector {
+                    node_id: Some(node_id),
+                    location: None,
+                    labels: Vec::new(),
+                    executor_kind: None,
+                },
+            ],
         )
         .expect("policy is valid");
-        aruna_core::structs::placement::placement_policy::VerifiedPolicy::verify(policy).expect("policy verifies")
+        aruna_core::structs::placement::placement_policy::VerifiedPolicy::verify(policy)
+            .expect("policy verifies")
     }
 
     pub(crate) async fn seed_bucket(

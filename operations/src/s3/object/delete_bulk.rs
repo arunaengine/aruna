@@ -70,8 +70,8 @@ mod test {
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::storage::blob::{Backend, BackendConfig};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::{Backend, BackendConfig};
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;

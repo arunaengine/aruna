@@ -7,10 +7,10 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
 };
-use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -175,8 +175,8 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, CurrentVersionPointer};
     use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+    use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, CurrentVersionPointer};
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -207,7 +207,9 @@ mod pure_tests {
             [7u8; 32],
             BackendRef::node_default(),
             SystemTime::UNIX_EPOCH,
-            UserId::nil(aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32])),
+            UserId::nil(aruna_core::structs::identity::realm::RealmId::from_bytes(
+                [1u8; 32],
+            )),
             None,
         )
         .with_policies(vec![policy_ref])

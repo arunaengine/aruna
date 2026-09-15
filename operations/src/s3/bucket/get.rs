@@ -128,8 +128,8 @@ mod state_machine_tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::operation::Operation;
-    use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::BucketInfo;
     use ulid::Ulid;
 
     fn fixed_bucket_info() -> BucketInfo {
