@@ -1,7 +1,7 @@
 use crate::NodeId;
 use crate::UserId;
 use crate::errors::ConversionError;
-use crate::structs::realm::RealmId;
+use crate::structs::identity::realm::RealmId;
 use crate::types::RoleId;
 use core::fmt;
 use ed25519_dalek::SigningKey;

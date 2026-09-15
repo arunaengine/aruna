@@ -2,7 +2,7 @@ use crate::NodeId;
 use crate::UserId;
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained};
 use crate::errors::ConversionError;
-use crate::reducer::{AdminDocumentReducerState, RevocationIndex};
+use crate::reducer::{AdminDocumentState, RevocationIndex};
 use crate::structs::{
     Actor, BandPool, BindingDirectory, BindingError, BindingScope, CandidateMapNode,
     CandidatePlacementMap, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT,
@@ -177,7 +177,7 @@ pub struct RealmConfigDocument {
     pub placement_handle_ranges: Vec<HandleRange>,
     /// Append-only coordinator band pools forming a causal delegation tree.
     /// Each coordinator grants node bands only from pools it owns; precedence
-    /// is by lineage (see [`crate::structs::placement::coordinator_spans`]).
+    /// is by lineage (see [`crate::structs::placement::placement_record::coordinator_spans`]).
     pub band_pools: Vec<BandPool>,
     /// Immutable snapshots of the placement view. `placement_map` stays the
     /// edit surface; only a published map can become a holder-set input.
@@ -220,7 +220,7 @@ pub struct QuotaConfig {
     pub warn_threshold_percent: u32,
     pub group_overrides: Vec<GroupQuotaOverride>,
     pub max_groups_per_user: Option<u32>,
-    pub user_group_cap_overrides: Vec<UserGroupCapOverride>,
+    pub user_group_cap_overrides: Vec<UserCapOverride>,
     pub max_devices_per_user: Option<u32>,
     /// Inbound requests one user device may send a realm node per minute.
     /// `None` leaves devices uncapped.
@@ -238,7 +238,7 @@ pub struct GroupQuotaOverride {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub struct UserGroupCapOverride {
+pub struct UserCapOverride {
     pub user_id: UserId,
     pub max_groups: Option<u32>,
 }
@@ -626,7 +626,7 @@ impl RealmConfigDocument {
     /// Unions the locally accepted revocations with the reducer's materialized
     /// set and drops entries whose token has expired. Ownership stays in the
     /// reducer path; the deny overlay only needs one hash and expiry per token.
-    pub fn merge_revocations(&mut self, reducer_state: &AdminDocumentReducerState, now: u64) {
+    pub fn merge_revocations(&mut self, reducer_state: &AdminDocumentState, now: u64) {
         self.revocation_floor = self.revocation_floor.max(reducer_state.revocation_floor);
         let index = reducer_state.revocation_index(now);
         self.merge_revocation_index(&index, now);
@@ -1025,8 +1025,8 @@ pub fn default_discovery_config() -> RealmDiscoveryConfig {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct MetadataReplicationConfig {
     pub default_replication_factor: u32,
-    pub group_overrides: Vec<MetadataGroupReplicationOverride>,
-    pub path_overrides: Vec<MetadataPathReplicationOverride>,
+    pub group_overrides: Vec<MetadataReplicationOverride>,
+    pub path_overrides: Vec<MetadataPathOverride>,
 }
 
 impl MetadataReplicationConfig {
@@ -1064,13 +1064,13 @@ impl MetadataReplicationConfig {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub struct MetadataGroupReplicationOverride {
+pub struct MetadataReplicationOverride {
     pub group_id: GroupId,
     pub replication_factor: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub struct MetadataPathReplicationOverride {
+pub struct MetadataPathOverride {
     pub group_id: GroupId,
     pub path_prefix: String,
     pub replication_factor: u32,
@@ -1086,12 +1086,12 @@ mod test {
     use crate::UserId;
     use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use crate::auth::REVOCATION_GRACE_SECS;
-    use crate::reducer::AdminDocumentReducerState;
+    use crate::reducer::AdminDocumentState;
     use crate::request_policy::{PolicyKind, RequestPolicy};
     use crate::structs::{
         Actor, BindingScope, CandidatePlacementMap, DocumentClass, DynamicDiscoveryMethod,
-        KIND_LABEL_KEY, MetadataGroupReplicationOverride, MetadataPathReplicationOverride,
-        NODE_LABEL_KEY, OidcProviderConfig, PlacementOverride, PlacementRef, PlacementStrategy,
+        KIND_LABEL_KEY, MetadataPathOverride, MetadataReplicationOverride, NODE_LABEL_KEY,
+        OidcProviderConfig, PlacementOverride, PlacementRef, PlacementStrategy,
         RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
         RealmNodeKind, StrategyBinding, SubmissionId, TokenRevocation, default_discovery_config,
         shard_for_subject,
@@ -1126,11 +1126,11 @@ mod test {
             realm_id: RealmId([4u8; 32]),
             metadata_replication: super::MetadataReplicationConfig {
                 default_replication_factor: 3,
-                group_overrides: vec![MetadataGroupReplicationOverride {
+                group_overrides: vec![MetadataReplicationOverride {
                     group_id,
                     replication_factor: 5,
                 }],
-                path_overrides: vec![MetadataPathReplicationOverride {
+                path_overrides: vec![MetadataPathOverride {
                     group_id,
                     path_prefix: "/datasets/demo".to_string(),
                     replication_factor: 7,
@@ -1322,9 +1322,10 @@ mod test {
         assert!(config.token_revoked(&token_hash, 1_000));
         assert!(!config.token_revoked(&token_hash, 1_001));
 
-        let reducer_state = AdminDocumentReducerState::new(
-            crate::admin_documents::AdminDocumentTarget::RealmConfig { realm_id },
-        );
+        let reducer_state =
+            AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
+                realm_id,
+            });
         // Retained for one grace window so a skewed peer still sees it, then pruned.
         config.merge_revocations(&reducer_state, 1_001);
         assert_eq!(config.revoked_tokens.len(), 1);
@@ -1344,7 +1345,7 @@ mod test {
         };
         let target = AdminDocumentTarget::RealmConfig { realm_id };
         let token_hash = crate::auth::bearer_token_hash("rollback-token");
-        let mut reducer = AdminDocumentReducerState::new(target);
+        let mut reducer = AdminDocumentState::new(target);
         reducer
             .apply_operation(
                 &actor,
@@ -1398,8 +1399,7 @@ mod test {
             user_id: owner_b,
             realm_id,
         };
-        let mut reducer =
-            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        let mut reducer = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
         let token_hash = crate::auth::bearer_token_hash("owner-overlay");
         reducer
             .apply_operation(
@@ -1666,17 +1666,17 @@ mod test {
             realm_id: RealmId([5u8; 32]),
             metadata_replication: super::MetadataReplicationConfig {
                 default_replication_factor: 3,
-                group_overrides: vec![MetadataGroupReplicationOverride {
+                group_overrides: vec![MetadataReplicationOverride {
                     group_id,
                     replication_factor: 5,
                 }],
                 path_overrides: vec![
-                    MetadataPathReplicationOverride {
+                    MetadataPathOverride {
                         group_id,
                         path_prefix: "/datasets".to_string(),
                         replication_factor: 6,
                     },
-                    MetadataPathReplicationOverride {
+                    MetadataPathOverride {
                         group_id,
                         path_prefix: "/datasets/important".to_string(),
                         replication_factor: 7,
