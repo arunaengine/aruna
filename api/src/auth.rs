@@ -28,9 +28,9 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use ulid::Ulid;
 
-const OIDC_HTTP_TIMEOUT_SECS: u64 = 5;
-const OIDC_HTTP_CONNECT_TIMEOUT_SECS: u64 = 2;
-const OIDC_PROVIDER_METADATA_CACHE_TTL_SECS: u64 = 300;
+const HTTP_TIMEOUT_SECS: u64 = 5;
+const CONNECT_TIMEOUT_SECS: u64 = 2;
+const CACHE_TTL_SECS: u64 = 300;
 
 #[derive(Debug)]
 pub struct OidcValidator {
@@ -103,8 +103,8 @@ impl OidcValidator {
     pub fn new() -> Result<Self, AuthorizationError> {
         Ok(Self {
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(OIDC_HTTP_TIMEOUT_SECS))
-                .connect_timeout(Duration::from_secs(OIDC_HTTP_CONNECT_TIMEOUT_SECS))
+                .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+                .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
                 .build()?,
             provider_metadata_cache: RwLock::new(HashMap::new()),
         })
@@ -175,7 +175,7 @@ impl OidcValidator {
         refresh: bool,
     ) -> Result<CachedProviderMetadata, OidcError> {
         if !refresh {
-            let ttl = Duration::from_secs(OIDC_PROVIDER_METADATA_CACHE_TTL_SECS);
+            let ttl = Duration::from_secs(CACHE_TTL_SECS);
             if let Some(metadata) = self
                 .provider_metadata_cache
                 .read()
@@ -214,7 +214,7 @@ impl OidcValidator {
             }
         }
 
-        Err(OidcError::SigningKeyNotFound)
+        Err(OidcError::SigningNotFound)
     }
 
     pub async fn validate(
@@ -639,7 +639,7 @@ pub(crate) fn blob_permission_path(
 #[cfg(test)]
 mod test {
     use crate::auth::{
-        OIDC_PROVIDER_METADATA_CACHE_TTL_SECS, OidcValidator, blob_permission_path,
+        CACHE_TTL_SECS, OidcValidator, blob_permission_path,
         extract_auth_context, extract_auth_parts, handle_token, map_authorize_error,
     };
     use crate::error::{ServerError, TokenError};
@@ -1222,7 +1222,7 @@ mod test {
         validator.validate(&provider, &token).await.unwrap();
         let expired_at = Instant::now()
             .checked_sub(Duration::from_secs(
-                OIDC_PROVIDER_METADATA_CACHE_TTL_SECS + 1,
+                CACHE_TTL_SECS + 1,
             ))
             .unwrap();
         validator

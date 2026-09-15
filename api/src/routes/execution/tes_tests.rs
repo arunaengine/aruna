@@ -947,13 +947,13 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
         group_id: payload.group_id,
         created_by,
         created_at_ms: 10,
-        retention_ms: aruna_core::structs::execution::job::DEFAULT_JOB_RETENTION_MS,
+        retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
         payload,
         request_digest: [7u8; 32],
         spec_digest: [8u8; 32],
         resources,
         retry: JobRetryPolicy {
-            max_launches_per_witness: 3,
+            launches_per_witness: 3,
         },
         admission: JobAdmissionRecord {
             submission_id,
@@ -1082,15 +1082,15 @@ fn derives_family_tags() {
         "http://x",
     );
     assert_eq!(
-        unplaced.tags.get(JOB_ID_TAG_KEY).map(String::as_str),
+        unplaced.tags.get(ID_TAG_KEY).map(String::as_str),
         Some(report.job.job_id.to_string().as_str())
     );
     assert_eq!(
-        unplaced.tags.get(LOGICAL_STATE_TAG_KEY).map(String::as_str),
+        unplaced.tags.get(STATE_TAG_KEY).map(String::as_str),
         Some("succeeded")
     );
-    assert!(!unplaced.tags.contains_key(EXECUTOR_KIND_TAG_KEY));
-    assert!(!unplaced.tags.contains_key(TRANSFER_BYTES_TAG_KEY));
+    assert!(!unplaced.tags.contains_key(KIND_TAG_KEY));
+    assert!(!unplaced.tags.contains_key(TRANSFER_TAG_KEY));
 
     report.plan = Some(PlanEstimate {
         target: Some(ExecutionTargetId {
@@ -1112,11 +1112,11 @@ fn derives_family_tags() {
     for view in [TesView::Basic, TesView::Full] {
         let task = project_task(&record, &details, view, "http://x");
         assert_eq!(
-            task.tags.get(EXECUTOR_KIND_TAG_KEY).map(String::as_str),
+            task.tags.get(KIND_TAG_KEY).map(String::as_str),
             Some("docker")
         );
         assert_eq!(
-            task.tags.get(TRANSFER_BYTES_TAG_KEY).map(String::as_str),
+            task.tags.get(TRANSFER_TAG_KEY).map(String::as_str),
             Some("4096")
         );
     }
@@ -1264,7 +1264,7 @@ fn rejects_derived_tag() {
     let group = Ulid::from_bytes([5u8; 16]);
     let mut task = sample_task(group);
     task.tags
-        .insert(EXECUTOR_KIND_TAG_KEY.to_string(), "docker".to_string());
+        .insert(KIND_TAG_KEY.to_string(), "docker".to_string());
 
     let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -1577,7 +1577,7 @@ async fn lists_derived_tags() {
     assert_eq!(page.tasks.len(), 1);
     assert_eq!(page.tasks[0].id, Some(target.to_string()));
     assert_eq!(
-        page.tasks[0].tags.get(JOB_ID_TAG_KEY),
+        page.tasks[0].tags.get(ID_TAG_KEY),
         Some(&target.to_string())
     );
     assert!(page.next_page_token.is_none());

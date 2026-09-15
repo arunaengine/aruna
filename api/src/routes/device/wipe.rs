@@ -14,7 +14,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::wipe::{
-    WIPE_INCOMPLETE_EXIT_CODE, WIPED_EXIT_CODE, WipeDeviceConfig, WipeDeviceError,
+    INCOMPLETE_EXIT_CODE, WIPED_EXIT_CODE, WipeDeviceConfig, WipeDeviceError,
     WipeDeviceOperation,
 };
 use aruna_operations::driver::drive;
@@ -120,7 +120,7 @@ async fn wipe_device(
         )
     });
     let exit_code = match incomplete_reason {
-        Some(_) => WIPE_INCOMPLETE_EXIT_CODE,
+        Some(_) => INCOMPLETE_EXIT_CODE,
         None => WIPED_EXIT_CODE,
     };
     Ok((

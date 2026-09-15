@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, NODE_STATE_KEYSPACE};
+use aruna_core::keyspaces::{SYNC_OUTBOX_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::telemetry::QUEUE_LAG_INTERVAL;
 use aruna_core::time::unix_timestamp_millis;
@@ -39,26 +39,26 @@ use tower_http::timeout::TimeoutLayer;
 /// readiness quickly instead of blocking on the much longer request timeout.
 const STORAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const SYNC_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const NODE_STATE_PROBE_KEY: &[u8] = b"node_state";
+const STATE_PROBE_KEY: &[u8] = b"node_state";
 
 /// Whole-request timeout for the monitoring listener so a slow or stalled probe caller
 /// cannot hold a connection open indefinitely.
 const OPS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Global cap on concurrent monitoring requests so an internal actor cannot exhaust FDs
 /// or pile storage-probe work onto the production queue.
-const OPS_MAX_CONCURRENT_REQUESTS: usize = 32;
+const OPS_MAX_REQUESTS: usize = 32;
 
-const DOCUMENT_SYNC_OUTBOX_QUEUE: &str = "document_sync_outbox";
+const SYNC_OUTBOX_QUEUE: &str = "document_sync_outbox";
 const METADATA_MATERIALIZATION_QUEUE: &str = "metadata_materialization";
-const MATERIALIZATION_DEAD_LETTER_QUEUE: &str = "metadata_materialization_dead_letters";
+const DEAD_LETTER_QUEUE: &str = "metadata_materialization_dead_letters";
 const BLOB_REPLICATION_QUEUE: &str = "blob_replication";
-const REFERENCE_METADATA_REFRESH_QUEUE: &str = "reference_metadata_refresh";
+const METADATA_REFRESH_QUEUE: &str = "reference_metadata_refresh";
 const QUEUE_NAMES: [&str; 5] = [
-    DOCUMENT_SYNC_OUTBOX_QUEUE,
+    SYNC_OUTBOX_QUEUE,
     METADATA_MATERIALIZATION_QUEUE,
-    MATERIALIZATION_DEAD_LETTER_QUEUE,
+    DEAD_LETTER_QUEUE,
     BLOB_REPLICATION_QUEUE,
-    REFERENCE_METADATA_REFRESH_QUEUE,
+    METADATA_REFRESH_QUEUE,
 ];
 
 /// Startup and drain gate for readiness. `started` flips once the node has
@@ -186,7 +186,7 @@ pub fn router(state: Arc<MonitoringState>) -> Router {
                     OPS_REQUEST_TIMEOUT,
                 ))
                 .layer(GlobalConcurrencyLimitLayer::new(
-                    OPS_MAX_CONCURRENT_REQUESTS,
+                    OPS_MAX_REQUESTS,
                 )),
         )
 }
@@ -323,7 +323,7 @@ async fn check_storage(ctx: &DriverContext) -> CheckOutcome {
     }
     let probe = ctx.storage_handle.send_storage_effect(StorageEffect::Read {
         key_space: NODE_STATE_KEYSPACE.to_string(),
-        key: ByteView::from(NODE_STATE_PROBE_KEY),
+        key: ByteView::from(STATE_PROBE_KEY),
         txn_id: None,
     });
     match tokio::time::timeout(STORAGE_PROBE_TIMEOUT, probe).await {
@@ -345,7 +345,7 @@ async fn check_sync(ctx: &DriverContext) -> CheckOutcome {
         return CheckOutcome::failed("document sync node not attached");
     }
     let probe = ctx.storage_handle.send_storage_effect(StorageEffect::Iter {
-        key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+        key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
         prefix: None,
         start: None,
         limit: 1,
@@ -525,7 +525,7 @@ struct QueueMetrics {
     oldest_age_seconds: Family<QueueLabels, Gauge<f64, AtomicU64>>,
     depth_capped: Family<QueueLabels, Gauge>,
     probe_up: Family<QueueLabels, Gauge>,
-    probe_last_success_timestamp_seconds: Family<QueueLabels, Gauge>,
+    last_success_seconds: Family<QueueLabels, Gauge>,
 }
 
 impl QueueMetrics {
@@ -536,7 +536,7 @@ impl QueueMetrics {
             self.oldest_age_seconds.get_or_create(&labels).set(0.0);
             self.depth_capped.get_or_create(&labels).set(0);
             self.probe_up.get_or_create(&labels).set(0);
-            self.probe_last_success_timestamp_seconds
+            self.last_success_seconds
                 .get_or_create(&labels)
                 .set(0);
         }
@@ -556,7 +556,7 @@ impl QueueMetrics {
             .get_or_create(&labels)
             .set(i64::from(snapshot.depth_capped));
         self.probe_up.get_or_create(&labels).set(1);
-        self.probe_last_success_timestamp_seconds
+        self.last_success_seconds
             .get_or_create(&labels)
             .set((unix_timestamp_millis() / 1_000) as i64);
     }
@@ -565,18 +565,18 @@ impl QueueMetrics {
     // when the bulk lane is saturated.
     async fn refresh(&self, ctx: &DriverContext, reporter: &mut QueueLagReporter) {
         let sample = reporter.sample(&ctx.storage_handle).await;
-        self.apply(DOCUMENT_SYNC_OUTBOX_QUEUE, sample.document_sync_outbox);
+        self.apply(SYNC_OUTBOX_QUEUE, sample.document_sync_outbox);
         self.apply(
             METADATA_MATERIALIZATION_QUEUE,
             sample.metadata_materialization,
         );
         self.apply(
-            MATERIALIZATION_DEAD_LETTER_QUEUE,
+            DEAD_LETTER_QUEUE,
             sample.materialization_dead_letters,
         );
         self.apply(BLOB_REPLICATION_QUEUE, sample.blob_replication);
         self.apply(
-            REFERENCE_METADATA_REFRESH_QUEUE,
+            METADATA_REFRESH_QUEUE,
             sample.reference_metadata_refresh,
         );
     }
@@ -667,12 +667,12 @@ async fn register_queue_metrics(metrics: &NodeMetrics) -> Arc<QueueMetrics> {
             probe_up.clone(),
         )
         .await;
-    let probe_last_success_timestamp_seconds = Family::<QueueLabels, Gauge>::default();
+    let last_success_seconds = Family::<QueueLabels, Gauge>::default();
     metrics
         .register(
             "queue_probe_last_success_timestamp_seconds",
             "Unix timestamp of the latest successful durable queue probe",
-            probe_last_success_timestamp_seconds.clone(),
+            last_success_seconds.clone(),
         )
         .await;
 
@@ -681,7 +681,7 @@ async fn register_queue_metrics(metrics: &NodeMetrics) -> Arc<QueueMetrics> {
         oldest_age_seconds,
         depth_capped,
         probe_up,
-        probe_last_success_timestamp_seconds,
+        last_success_seconds,
     });
     queue_metrics.seed();
     queue_metrics
@@ -751,7 +751,7 @@ mod tests {
         })
     }
 
-    async fn wait_for_stop_lock(state: &MonitoringState) {
+    async fn wait_for_lock(state: &MonitoringState) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if state.queue_refresher.try_lock().is_err() {
@@ -782,7 +782,7 @@ mod tests {
         let _ = storage
             .send_storage_effect(StorageEffect::Read {
                 key_space: NODE_STATE_KEYSPACE.to_string(),
-                key: ByteView::from(NODE_STATE_PROBE_KEY),
+                key: ByteView::from(STATE_PROBE_KEY),
                 txn_id: None,
             })
             .await;
@@ -972,17 +972,17 @@ mod tests {
             oldest_age_seconds: Family::<QueueLabels, Gauge<f64, AtomicU64>>::default(),
             depth_capped: Family::<QueueLabels, Gauge>::default(),
             probe_up: Family::<QueueLabels, Gauge>::default(),
-            probe_last_success_timestamp_seconds: Family::<QueueLabels, Gauge>::default(),
+            last_success_seconds: Family::<QueueLabels, Gauge>::default(),
         };
         queue_metrics.seed();
 
         let labels = QueueLabels {
-            queue: DOCUMENT_SYNC_OUTBOX_QUEUE,
+            queue: SYNC_OUTBOX_QUEUE,
         };
         assert_eq!(queue_metrics.probe_up.get_or_create(&labels).get(), 0);
 
         queue_metrics.apply(
-            DOCUMENT_SYNC_OUTBOX_QUEUE,
+            SYNC_OUTBOX_QUEUE,
             Ok(QueueLagSnapshot {
                 depth: 7,
                 depth_capped: true,
@@ -994,13 +994,13 @@ mod tests {
         assert_eq!(queue_metrics.depth_capped.get_or_create(&labels).get(), 1);
         assert_eq!(queue_metrics.probe_up.get_or_create(&labels).get(), 1);
         let last_success = queue_metrics
-            .probe_last_success_timestamp_seconds
+            .last_success_seconds
             .get_or_create(&labels)
             .get();
         assert!(last_success > 0);
 
         queue_metrics.apply(
-            DOCUMENT_SYNC_OUTBOX_QUEUE,
+            SYNC_OUTBOX_QUEUE,
             Err("storage closed".to_string()),
         );
         assert_eq!(queue_metrics.depth.get_or_create(&labels).get(), 7);
@@ -1008,7 +1008,7 @@ mod tests {
         assert_eq!(queue_metrics.probe_up.get_or_create(&labels).get(), 0);
         assert_eq!(
             queue_metrics
-                .probe_last_success_timestamp_seconds
+                .last_success_seconds
                 .get_or_create(&labels)
                 .get(),
             last_success
@@ -1068,7 +1068,7 @@ mod tests {
             let state = state.clone();
             async move { state.stop_queue_refresher().await }
         });
-        wait_for_stop_lock(&state).await;
+        wait_for_lock(&state).await;
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         // The dropped caller released the lock without the task completing.
@@ -1079,7 +1079,7 @@ mod tests {
             let state = state.clone();
             async move { state.stop_queue_refresher().await }
         });
-        wait_for_stop_lock(&state).await;
+        wait_for_lock(&state).await;
         assert!(!resumed.is_finished(), "stop returned before completion");
 
         release.notify_one();
@@ -1111,7 +1111,7 @@ mod tests {
                 })
             })
             .collect();
-        wait_for_stop_lock(&state).await;
+        wait_for_lock(&state).await;
         tokio::task::yield_now().await;
         assert!(callers.iter().all(|caller| !caller.is_finished()));
         assert!(!finished.load(Ordering::SeqCst));

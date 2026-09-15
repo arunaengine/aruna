@@ -100,13 +100,13 @@ fn family_report_fixture() -> FamilyReport {
             group_id: payload.group_id,
             created_by,
             created_at_ms: 10,
-            retention_ms: aruna_core::structs::execution::job::DEFAULT_JOB_RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
             payload,
             request_digest: [7u8; 32],
             spec_digest: [8u8; 32],
             resources,
             retry: JobRetryPolicy {
-                max_launches_per_witness: 3,
+                launches_per_witness: 3,
             },
             admission: JobAdmissionRecord {
                 submission_id,
@@ -381,7 +381,7 @@ fn decodes_system_key() {
     ] {
         let row = report_row(entry_key);
         let value = postcard::to_allocvec(&row).unwrap();
-        let mut stored_key = vec![JOB_SYSTEM_ENTRY_PREFIX];
+        let mut stored_key = vec![SYSTEM_ENTRY_PREFIX];
         stored_key.extend_from_slice(entry_key.as_bytes());
         let decoded = decode_report_row(JobKind::from(&payload), &stored_key, &value).unwrap();
         assert_eq!(decoded["entry_key"], entry_key);
@@ -1013,7 +1013,7 @@ fn local_request() -> SubmitExecutionRequest {
         description: None,
         image: "alpine:3".to_string(),
         runtime: None,
-        session_idle_after_ms: None,
+        session_idle_ms: None,
         session_mount: None,
         entrypoint: None,
         command: vec!["true".to_string()],
@@ -1182,7 +1182,7 @@ async fn rejects_huge_ram() {
             description: None,
             image: "alpine:3".to_string(),
             runtime: None,
-            session_idle_after_ms: None,
+            session_idle_ms: None,
             session_mount: None,
             entrypoint: None,
             command: vec!["true".to_string()],

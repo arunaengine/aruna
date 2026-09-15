@@ -91,7 +91,7 @@ fn folder_error_message() {
         created_at_ms: 7,
         last_reconcile_ms: None,
         last_error: Some("watcher stopped".to_string()),
-        last_error_at_ms: Some(9),
+        last_error_ms: Some(9),
         observed_files: 3,
         list_cursor: None,
     };
@@ -262,7 +262,7 @@ fn projects_deleting_folder() {
         created_at_ms: 7,
         last_reconcile_ms: Some(9),
         last_error: None,
-        last_error_at_ms: None,
+        last_error_ms: None,
         observed_files: 0,
         list_cursor: None,
     };

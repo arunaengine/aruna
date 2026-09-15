@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::execution::job::{
-    CompositionError, ExportReportRow, ImportReportRow, JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord,
+    CompositionError, ExportReportRow, ImportReportRow, SYSTEM_ENTRY_PREFIX, JobId, JobRecord,
     JobState,
 };
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
@@ -21,7 +21,7 @@ use aruna_operations::jobs::service::{
     read_report_routed,
 };
 use aruna_operations::jobs::store::RunDelete;
-use aruna_operations::jobs::{JOB_REPORT_MAX_ROWS, JobRouteError};
+use aruna_operations::jobs::{REPORT_MAX_ROWS, JobRouteError};
 use aruna_operations::s3::object::get::ObjectRangeRequest;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -220,7 +220,8 @@ pub struct SubmitExecutionRequest {
     /// minutes. The executing node clamps it to the realm's value, so a longer
     /// request never extends the session. Refused outside a session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_idle_after_ms: Option<u64>,
+    #[serde(rename = "session_idle_after_ms")]
+    pub session_idle_ms: Option<u64>,
     /// Which part of the workspace bucket a session mounts, and where. Refused
     /// outside a session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,7 +298,7 @@ impl From<SubmitExecutionRequest> for SubmitExecutionCommand {
             description: request.description,
             image: request.image,
             runtime: request.runtime,
-            session_idle_after_ms: request.session_idle_after_ms,
+            session_idle_ms: request.session_idle_ms,
             session_mount: request.session_mount.map(Into::into),
             entrypoint: request.entrypoint,
             command: request.command,
@@ -1497,7 +1498,7 @@ fn decode_report_row(
             let row: ImportReportRow = postcard::from_bytes(value)
                 .map_err(|error| ServerError::InternalError(error.to_string()))?;
             let visible_key = entry_key
-                .strip_prefix(&[JOB_SYSTEM_ENTRY_PREFIX])
+                .strip_prefix(&[SYSTEM_ENTRY_PREFIX])
                 .unwrap_or(entry_key);
             if row.entry_key.as_bytes() != visible_key {
                 return Err(ServerError::InternalError(
@@ -1652,7 +1653,7 @@ pub async fn get_job_report(
         .limit
         .filter(|limit| *limit > 0)
         .unwrap_or(DEFAULT_REPORT_LIMIT)
-        .min(usize::from(JOB_REPORT_MAX_ROWS));
+        .min(usize::from(REPORT_MAX_ROWS));
     let expected_digest = cursor.as_ref().map(|cursor| cursor.report_digest);
     let last_key = cursor.map(|cursor| cursor.last_key);
     match read_report_routed(

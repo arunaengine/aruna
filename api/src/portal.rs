@@ -203,7 +203,7 @@ mod tests {
     use super::{IMMUTABLE_CACHE, NO_CACHE, PortalConfig, serve_portal_request};
     use crate::cors::CorsConfig;
     use crate::csp::PortalCspConfig;
-    use crate::server::{DEFAULT_MAX_HTTP_BODY_SIZE, Server, ServerConfig};
+    use crate::server::{MAX_BODY_SIZE, Server, ServerConfig};
     use crate::server_state::{PortalStatus, ServerState};
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
@@ -327,7 +327,7 @@ mod tests {
             state,
             ServerConfig {
                 http_addr: "127.0.0.1:0".parse().unwrap(),
-                max_http_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
+                max_body_size: MAX_BODY_SIZE,
                 cors: CorsConfig::default(),
             },
         )

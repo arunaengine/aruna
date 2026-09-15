@@ -232,7 +232,7 @@ async fn build_node(owner: UserId) -> (TempDir, Arc<ServerState>, JobId, DuplexS
             workspace_bucket: "lab-data".to_string(),
             executor_node_id: node().to_string(),
             idle_after_ms: 600_000,
-            credential_expires_at_ms: 0,
+            credential_expires_ms: 0,
         },
         backend,
         FenceContext {

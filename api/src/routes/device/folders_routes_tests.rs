@@ -129,7 +129,7 @@ fn sample_folder(id: Ulid, fixture: &Fixture, root: &str, state: FolderState) ->
         created_at_ms: 1,
         last_reconcile_ms: None,
         last_error: None,
-        last_error_at_ms: None,
+        last_error_ms: None,
         observed_files: 0,
         list_cursor: None,
     }

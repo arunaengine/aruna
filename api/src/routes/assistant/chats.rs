@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
-const MAX_CHAT_ID_CHARS: usize = 64;
+const MAX_ID_CHARS: usize = 64;
 const MAX_TITLE_CHARS: usize = 80;
 const MAX_SUBJECT_CHARS: usize = 200;
 
@@ -107,7 +107,7 @@ fn map_chat_error(error: ChatStoreError) -> ServerError {
 
 fn check_chat_id(id: String) -> ServerResult<String> {
     let valid = !id.is_empty()
-        && id.len() <= MAX_CHAT_ID_CHARS
+        && id.len() <= MAX_ID_CHARS
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');

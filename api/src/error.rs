@@ -103,9 +103,9 @@ pub enum TokenError {
     #[error(transparent)]
     FromSliceError(#[from] TryFromSliceError),
     #[error(transparent)]
-    PublicKeyConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
+    PublicConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
     #[error(transparent)]
-    PrivateKeyConversionError(#[from] ed25519_dalek::pkcs8::Error),
+    PrivateConversionError(#[from] ed25519_dalek::pkcs8::Error),
     #[error(transparent)]
     JWTError(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
@@ -125,8 +125,8 @@ impl From<ArunaBearerError> for TokenError {
             ArunaBearerError::AuthContextConversion(error) => Self::AuthContextConversion(error),
             ArunaBearerError::PublicKeyError(error) => Self::PublicKeyError(error),
             ArunaBearerError::FromSliceError(error) => Self::FromSliceError(error),
-            ArunaBearerError::PublicKeyConversionError(error) => {
-                Self::PublicKeyConversionError(error)
+            ArunaBearerError::PublicConversionError(error) => {
+                Self::PublicConversionError(error)
             }
             ArunaBearerError::JwtError(error) => Self::JWTError(error),
             ArunaBearerError::Base64Error(error) => Self::Base64Error(error),
@@ -145,7 +145,7 @@ pub enum OidcError {
     #[error("OIDC key id is missing")]
     MissingKeyId,
     #[error("OIDC signing key not found")]
-    SigningKeyNotFound,
+    SigningNotFound,
     #[error("OIDC token subject is missing")]
     MissingSubject,
     #[error("OIDC configuration error: {0}")]

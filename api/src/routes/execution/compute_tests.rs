@@ -8,13 +8,13 @@ fn config_round_trips() {
         links: vec![LocationLink {
             from: "eu-west".to_string(),
             to: "us-east".to_string(),
-            bandwidth_bytes_per_sec: 125_000_000,
+            bandwidth_per_sec: 125_000_000,
         }],
         group_quotas: vec![GroupComputeQuota {
             group_id: Ulid::from_bytes([7u8; 16]),
             quota: ComputeQuota {
                 max_jobs: Some(4),
-                max_job_walltime_ms: Some(1_000),
+                job_walltime_ms: Some(1_000),
                 ..ComputeQuota::default()
             },
         }],
@@ -37,7 +37,7 @@ fn conflict_is_retryable() {
     ));
     assert!(matches!(conflict, ServerError::Conflict(_)));
     assert!(matches!(
-        map_compute_error(SetComputeError::RealmConfigNotFound),
+        map_compute_error(SetComputeError::ConfigMissing),
         ServerError::NotFound
     ));
     assert!(matches!(

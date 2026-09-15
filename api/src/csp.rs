@@ -29,7 +29,7 @@ const BASELINE_CSP: &str = "frame-ancestors 'none'";
 const OIDC_ORIGIN_TTL: Duration = Duration::from_secs(60);
 const OIDC_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-const CROSS_ORIGIN_OPENER_POLICY: HeaderName =
+const ORIGIN_OPENER_POLICY: HeaderName =
     HeaderName::from_static("cross-origin-opener-policy");
 
 /// Extra origins the portal document may connect to, on top of this node's own
@@ -236,7 +236,7 @@ pub(crate) async fn portal_security_headers(
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_SECURITY_POLICY, policy);
     headers.insert(
-        CROSS_ORIGIN_OPENER_POLICY,
+        ORIGIN_OPENER_POLICY,
         HeaderValue::from_static("same-origin"),
     );
     response

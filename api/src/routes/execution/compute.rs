@@ -49,7 +49,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 pub struct LocationLinkBody {
     pub from: String,
     pub to: String,
-    pub bandwidth_bytes_per_sec: u64,
+    #[serde(rename = "bandwidth_bytes_per_sec")]
+    pub bandwidth_per_sec: u64,
 }
 
 /// Every dimension is optional and an unconfigured one is unbounded, never zero.
@@ -64,13 +65,17 @@ pub struct ComputeQuotaBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_disk_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_job_cpu_cores: Option<u32>,
+    #[serde(rename = "max_job_cpu_cores")]
+    pub job_cpu_cores: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_job_ram_bytes: Option<u64>,
+    #[serde(rename = "max_job_ram_bytes")]
+    pub job_ram_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_job_disk_bytes: Option<u64>,
+    #[serde(rename = "max_job_disk_bytes")]
+    pub job_disk_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_job_walltime_ms: Option<u64>,
+    #[serde(rename = "max_job_walltime_ms")]
+    pub job_walltime_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -82,15 +87,20 @@ pub struct GroupQuotaBody {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ComputeConfigBody {
     pub links: Vec<LocationLinkBody>,
-    pub pessimistic_bandwidth_bytes_per_sec: u64,
-    pub availability_stale_after_ms: u64,
-    pub witness_base_delay_ms: u64,
+    #[serde(rename = "pessimistic_bandwidth_bytes_per_sec")]
+    pub pessimistic_per_sec: u64,
+    #[serde(rename = "availability_stale_after_ms")]
+    pub availability_stale_ms: u64,
+    #[serde(rename = "witness_base_delay_ms")]
+    pub witness_delay_ms: u64,
     pub default_group_quota: ComputeQuotaBody,
     pub group_quotas: Vec<GroupQuotaBody>,
-    pub catch_up_after_ms: u64,
+    #[serde(rename = "catch_up_after_ms")]
+    pub catch_up_ms: u64,
     /// How long an interactive session job may stay without a cell submit
     /// before the executing node ends it.
-    pub session_idle_after_ms: u64,
+    #[serde(rename = "session_idle_after_ms")]
+    pub session_idle_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -172,10 +182,10 @@ impl From<ComputeQuota> for ComputeQuotaBody {
             max_cpu_cores: quota.max_cpu_cores,
             max_ram_bytes: quota.max_ram_bytes,
             max_disk_bytes: quota.max_disk_bytes,
-            max_job_cpu_cores: quota.max_job_cpu_cores,
-            max_job_ram_bytes: quota.max_job_ram_bytes,
-            max_job_disk_bytes: quota.max_job_disk_bytes,
-            max_job_walltime_ms: quota.max_job_walltime_ms,
+            job_cpu_cores: quota.job_cpu_cores,
+            job_ram_bytes: quota.job_ram_bytes,
+            job_disk_bytes: quota.job_disk_bytes,
+            job_walltime_ms: quota.job_walltime_ms,
         }
     }
 }
@@ -187,10 +197,10 @@ impl From<ComputeQuotaBody> for ComputeQuota {
             max_cpu_cores: body.max_cpu_cores,
             max_ram_bytes: body.max_ram_bytes,
             max_disk_bytes: body.max_disk_bytes,
-            max_job_cpu_cores: body.max_job_cpu_cores,
-            max_job_ram_bytes: body.max_job_ram_bytes,
-            max_job_disk_bytes: body.max_job_disk_bytes,
-            max_job_walltime_ms: body.max_job_walltime_ms,
+            job_cpu_cores: body.job_cpu_cores,
+            job_ram_bytes: body.job_ram_bytes,
+            job_disk_bytes: body.job_disk_bytes,
+            job_walltime_ms: body.job_walltime_ms,
         }
     }
 }
@@ -214,12 +224,12 @@ fn config_body(compute: &RealmComputeConfig) -> ComputeConfigBody {
             .map(|link| LocationLinkBody {
                 from: link.from.clone(),
                 to: link.to.clone(),
-                bandwidth_bytes_per_sec: link.bandwidth_bytes_per_sec,
+                bandwidth_per_sec: link.bandwidth_per_sec,
             })
             .collect(),
-        pessimistic_bandwidth_bytes_per_sec: compute.pessimistic_bandwidth_bytes_per_sec,
-        availability_stale_after_ms: compute.availability_stale_after_ms,
-        witness_base_delay_ms: compute.witness_base_delay_ms,
+        pessimistic_per_sec: compute.pessimistic_per_sec,
+        availability_stale_ms: compute.availability_stale_ms,
+        witness_delay_ms: compute.witness_delay_ms,
         default_group_quota: compute.default_group_quota.into(),
         group_quotas: compute
             .group_quotas
@@ -229,8 +239,8 @@ fn config_body(compute: &RealmComputeConfig) -> ComputeConfigBody {
                 quota: entry.quota.into(),
             })
             .collect(),
-        catch_up_after_ms: compute.catch_up_after_ms,
-        session_idle_after_ms: compute.session_idle_after_ms,
+        catch_up_ms: compute.catch_up_ms,
+        session_idle_ms: compute.session_idle_ms,
     }
 }
 
@@ -249,16 +259,16 @@ fn compute_config(body: ComputeConfigBody) -> ServerResult<RealmComputeConfig> {
             .map(|link| LocationLink {
                 from: link.from,
                 to: link.to,
-                bandwidth_bytes_per_sec: link.bandwidth_bytes_per_sec,
+                bandwidth_per_sec: link.bandwidth_per_sec,
             })
             .collect(),
-        pessimistic_bandwidth_bytes_per_sec: body.pessimistic_bandwidth_bytes_per_sec,
-        availability_stale_after_ms: body.availability_stale_after_ms,
-        witness_base_delay_ms: body.witness_base_delay_ms,
+        pessimistic_per_sec: body.pessimistic_per_sec,
+        availability_stale_ms: body.availability_stale_ms,
+        witness_delay_ms: body.witness_delay_ms,
         default_group_quota: body.default_group_quota.into(),
         group_quotas,
-        catch_up_after_ms: body.catch_up_after_ms,
-        session_idle_after_ms: body.session_idle_after_ms,
+        catch_up_ms: body.catch_up_ms,
+        session_idle_ms: body.session_idle_ms,
     })
 }
 
@@ -485,7 +495,7 @@ pub async fn put_compute_config(
 fn map_compute_error(error: SetComputeError) -> ServerError {
     use aruna_core::errors::StorageError;
     match error {
-        SetComputeError::RealmConfigNotFound => ServerError::NotFound,
+        SetComputeError::ConfigMissing => ServerError::NotFound,
         SetComputeError::Unauthorized | SetComputeError::NotManagementNode => {
             ServerError::Forbidden
         }

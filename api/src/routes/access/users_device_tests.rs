@@ -81,7 +81,7 @@ async fn setup_devices() -> Fixture {
                 target_node_kind: RealmNodeKind::User {
                     owner: device_owner,
                 },
-                default_metadata_replication_factor: 3,
+                metadata_replication_factor: 3,
                 realm_description: String::new(),
                 create_if_missing: false,
                 reject_kind_mismatch: true,

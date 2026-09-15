@@ -9,7 +9,7 @@ use aruna_core::compute::runtimes::{
 };
 use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::storage::blob::{
-    OBJECT_CONTENT_TYPE_KEY, group_permission_path, key_content_type,
+    CONTENT_TYPE_KEY, group_permission_path, key_content_type,
 };
 use aruna_core::structs::identity::auth::Permission;
 use aruna_operations::driver::drive;
@@ -382,7 +382,7 @@ impl McpServer {
             description: None,
             image: String::new(),
             runtime: Some(input.runtime),
-            session_idle_after_ms: input.idle_after_ms,
+            session_idle_ms: input.idle_after_ms,
             session_mount: (input.mount_prefix.is_some() || input.mount_path.is_some()).then_some(
                 SessionMountSpec {
                     prefix: input.mount_prefix,
@@ -909,7 +909,7 @@ async fn artifact_output(
     };
     let content_type = head
         .as_ref()
-        .and_then(|head| head.metadata.get(OBJECT_CONTENT_TYPE_KEY).cloned())
+        .and_then(|head| head.metadata.get(CONTENT_TYPE_KEY).cloned())
         .or_else(|| {
             head.as_ref()
                 .and_then(|head| head.source_metadata.as_ref())
@@ -1154,7 +1154,7 @@ fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallT
             description: input.description,
             image: runtime.image.to_string(),
             runtime: None,
-            session_idle_after_ms: None,
+            session_idle_ms: None,
             session_mount: None,
             entrypoint: None,
             command,

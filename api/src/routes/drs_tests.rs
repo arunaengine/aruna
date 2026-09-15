@@ -1,6 +1,6 @@
 use super::{
-    DrsBulkBody, GetObjectError, MAX_BULK_OBJECT_IDS, RequestedObjectId, ResolveOutcome,
-    ResolvedObject, W3ID_DATA_PREFIX, build_object_response, download_error, drs_denied_error,
+    DrsBulkBody, GetObjectError, MAX_OBJECT_IDS, RequestedObjectId, ResolveOutcome,
+    ResolvedObject, DATA_PREFIX, build_object_response, download_error, drs_denied_error,
     encode_component, get_authorizations, get_object, parse_object_id, post_objects,
     resolve_object, routed_deadline,
 };
@@ -268,7 +268,7 @@ fn rejects_malformed_version() {
     let node_id = test_node_id();
     let bare = format!("arn:aruna:{realm_id}:{node_id}:s3/mybucket/path/file.txt@invalid");
 
-    for object_id in [bare.clone(), format!("{W3ID_DATA_PREFIX}{bare}")] {
+    for object_id in [bare.clone(), format!("{DATA_PREFIX}{bare}")] {
         let error = parse_object_id(&object_id)
             .err()
             .expect("malformed version should be rejected");
@@ -406,8 +406,8 @@ async fn caps_bulk_ids() {
     // An uncapped list would let one anonymous request spend a routed probe
     // per identifier, so the cap is refused before anything is resolved.
     let (_dir, state) = test_state().await;
-    let id = format!("{W3ID_DATA_PREFIX}{}", hex::encode([1u8; 32]));
-    let object_ids = std::iter::repeat_n(id, MAX_BULK_OBJECT_IDS + 1).collect();
+    let id = format!("{DATA_PREFIX}{}", hex::encode([1u8; 32]));
+    let object_ids = std::iter::repeat_n(id, MAX_OBJECT_IDS + 1).collect();
 
     let response = post_objects(
         State(state),
@@ -423,7 +423,7 @@ async fn caps_bulk_ids() {
 #[test]
 fn canonical_response_complete() {
     let blake3 = [0x11u8; 32];
-    let canonical_w3id = format!("{W3ID_DATA_PREFIX}{}", hex::encode(blake3));
+    let canonical_w3id = format!("{DATA_PREFIX}{}", hex::encode(blake3));
     let resolved = ResolvedObject {
         bucket: "mybucket".to_string(),
         key: "path/file.txt".to_string(),
@@ -476,7 +476,7 @@ fn content_response_aliases() {
     let realm_id = test_realm_id();
     let node_id = test_node_id();
     let blake3 = [0x22u8; 32];
-    let canonical_w3id = format!("{W3ID_DATA_PREFIX}{}", hex::encode(blake3));
+    let canonical_w3id = format!("{DATA_PREFIX}{}", hex::encode(blake3));
     let requested_id = format!("arn:aruna:{realm_id}:{node_id}:ch/{}", hex::encode(blake3));
     let resolved = ResolvedObject {
         bucket: "mybucket".to_string(),
@@ -576,5 +576,5 @@ fn openapi_has_drs() {
             .contains_key("/ga4gh/drs/v1/objects/{object_id}")
     );
     assert!(openapi.paths.paths.contains_key("/ga4gh/drs/v1/download"));
-    let _ = W3ID_DATA_PREFIX;
+    let _ = DATA_PREFIX;
 }

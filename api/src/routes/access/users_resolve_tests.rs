@@ -51,7 +51,7 @@ async fn rejects_foreign_realm() {
 async fn caps_batch_size() {
     let (state, _tempdir) = setup_state().await;
     let realm_id = state.get_realm_id();
-    let user_ids = (0..=super::MAX_RESOLVE_USER_IDS)
+    let user_ids = (0..=super::MAX_USER_IDS)
         .map(|_| UserId::local(Ulid::generate(), realm_id).to_string())
         .collect();
     let result = resolve_users(

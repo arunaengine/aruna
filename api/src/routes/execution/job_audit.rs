@@ -407,7 +407,7 @@ mod tests {
         assert!(parse_paging(&query(Some("not base64 !"), None)).is_err());
         assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode([1u8; 200])), None)).is_err());
         assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode([1u8; 32])), None)).is_err());
-        let mut key = [0u8; aruna_core::structs::execution::job::JOB_RECORD_KEY_BYTES];
+        let mut key = [0u8; aruna_core::structs::execution::job::RECORD_KEY_BYTES];
         key[64] = aruna_core::structs::execution::job::JobRecordKind::Spec.as_byte();
         assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode(key)), None)).is_ok());
         assert!(parse_paging(&query(None, Some(0))).is_err());

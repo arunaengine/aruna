@@ -6,7 +6,7 @@ use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
-use aruna_core::structs::identity::s3_session::{S3_SESSION_ACCESS_PREFIX, S3Session};
+use aruna_core::structs::identity::s3_session::{SESSION_ACCESS_PREFIX, S3Session};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::s3::session::{
@@ -406,7 +406,7 @@ async fn ensure_membership(
     )
     .await
     .map_err(|error| match error {
-        GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound => ServerError::Forbidden,
+        GetGroupError::GroupNotFound | GetGroupError::DocNotFound => ServerError::Forbidden,
         _ => ServerError::InternalError(error.to_string()),
     })?;
     authorization
@@ -471,7 +471,7 @@ async fn session_response(
 /// Issue time of a session, held only by the ULID inside its access key.
 fn session_issued(access_key: &str) -> Option<SystemTime> {
     let key_id = access_key
-        .strip_prefix(S3_SESSION_ACCESS_PREFIX)?
+        .strip_prefix(SESSION_ACCESS_PREFIX)?
         .parse::<Ulid>()
         .ok()?;
     Some(UNIX_EPOCH + Duration::from_millis(key_id.timestamp_ms()))

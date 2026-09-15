@@ -8,7 +8,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 const CORS_MAX_AGE: Duration = Duration::from_secs(3600);
 const S3_ALLOWED_METHODS: &str = "GET,HEAD,PUT,POST,DELETE,OPTIONS";
-const S3_DEFAULT_ALLOWED_HEADERS: &str = "authorization,content-type,content-md5,range,\
+const S3_ALLOWED_HEADERS: &str = "authorization,content-type,content-md5,range,\
      x-amz-content-sha256,x-amz-date,x-amz-security-token,x-amz-user-agent";
 const S3_EXPOSED_HEADERS: &str = "etag,content-range,accept-ranges,content-length,last-modified,\
      x-amz-request-id,x-amz-version-id,x-amz-delete-marker,aruna-source-content-type,\
@@ -186,7 +186,7 @@ impl CorsConfig {
             header::ACCESS_CONTROL_ALLOW_HEADERS,
             requested_headers
                 .cloned()
-                .unwrap_or_else(|| HeaderValue::from_static(S3_DEFAULT_ALLOWED_HEADERS)),
+                .unwrap_or_else(|| HeaderValue::from_static(S3_ALLOWED_HEADERS)),
         );
         headers.insert(
             header::ACCESS_CONTROL_MAX_AGE,

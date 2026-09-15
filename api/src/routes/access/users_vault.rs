@@ -212,7 +212,7 @@ pub async fn delete_vault(
 mod tests {
     use super::*;
     use crate::tests::users::{realm_auth, setup_state};
-    use aruna_core::structs::identity::user_vault::MAX_USER_VAULT_BYTES;
+    use aruna_core::structs::identity::user_vault::MAX_VAULT_BYTES;
     use axum::response::IntoResponse;
 
     async fn read(
@@ -318,7 +318,7 @@ mod tests {
     async fn refuses_large_payload() {
         let (state, _dir) = setup_state().await;
         let auth = realm_auth(state.get_realm_id());
-        let payload = "x".repeat(MAX_USER_VAULT_BYTES + 1);
+        let payload = "x".repeat(MAX_VAULT_BYTES + 1);
         assert_eq!(
             save(&state, Some(auth.clone()), &payload, None)
                 .await

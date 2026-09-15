@@ -38,13 +38,13 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-const W3ID_DATA_PREFIX: &str = "https://w3id.org/aruna/data/";
+const DATA_PREFIX: &str = "https://w3id.org/aruna/data/";
 const ACCESS_ID_HTTPS: &str = "https";
 /// Whole-request budget for the routed probes one call may need, however many
 /// identifiers it names.
 const DRS_ROUTED_TIMEOUT: Duration = Duration::from_secs(5);
 /// Identifiers one bulk request may name. Each foreign one costs a routed probe.
-const MAX_BULK_OBJECT_IDS: usize = 100;
+const MAX_OBJECT_IDS: usize = 100;
 /// Routed probes of one bulk request that may be in flight at once.
 const BULK_PROBE_CONCURRENCY: usize = 8;
 
@@ -525,9 +525,9 @@ pub async fn post_objects(
     headers: HeaderMap,
     Json(body): Json<DrsBulkBody>,
 ) -> Response {
-    if body.object_ids.len() > MAX_BULK_OBJECT_IDS {
+    if body.object_ids.len() > MAX_OBJECT_IDS {
         return DrsError::bad_request(format!(
-            "a bulk request names at most {MAX_BULK_OBJECT_IDS} identifiers"
+            "a bulk request names at most {MAX_OBJECT_IDS} identifiers"
         ))
         .into_response();
     }
@@ -719,7 +719,7 @@ fn build_object_response(base_url: &str, resolved: &ResolvedObject) -> DrsObject
     );
     let hash = resolved
         .canonical_w3id
-        .strip_prefix(W3ID_DATA_PREFIX)
+        .strip_prefix(DATA_PREFIX)
         .unwrap_or_default();
     let name = format!("content-{}", &hash[..hash.len().min(12)]);
     let checksums = resolved
@@ -1032,7 +1032,7 @@ async fn resolve_content_hash(
             key: mapping.key,
             group_id: mapping.group_id,
             version_id: mapping.version_id,
-            canonical_w3id: format!("{W3ID_DATA_PREFIX}{}", hex::encode(hash)),
+            canonical_w3id: format!("{DATA_PREFIX}{}", hex::encode(hash)),
             requested_id: requested_id.to_string(),
             size: location.blob_size,
             hashes: location.hashes.clone().into_iter().collect(),
@@ -1061,7 +1061,7 @@ async fn can_read_path(
 }
 
 fn parse_object_id(object_id: &str) -> Result<RequestedObjectId, DrsError> {
-    if object_id.starts_with(W3ID_DATA_PREFIX) {
+    if object_id.starts_with(DATA_PREFIX) {
         return match W3idIdentifier::parse(object_id)
             .map_err(|error| DrsError::bad_request(error.to_string()))?
         {

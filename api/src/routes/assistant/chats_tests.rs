@@ -4,8 +4,8 @@ use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::{
-    MAX_ASSISTANT_CHAT_BYTES, MAX_ASSISTANT_CHAT_TURNS, MAX_ASSISTANT_CHATS,
-    MAX_ASSISTANT_TURN_BYTES,
+    MAX_ASSISTANT_BYTES, MAX_ASSISTANT_TURNS, MAX_ASSISTANT_CHATS,
+    MAX_TURN_BYTES,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
@@ -343,7 +343,7 @@ async fn handles_missing_chats() {
 async fn refuses_large_turn() {
     let (_dir, state, auth) = setup_state().await;
     save_head(&state, &auth, "c-1", "Chat", None).await.unwrap();
-    let payload = "x".repeat(MAX_ASSISTANT_TURN_BYTES + 1);
+    let payload = "x".repeat(MAX_TURN_BYTES + 1);
     let error = save_turn(&state, &auth, "c-1", 0, &payload)
         .await
         .unwrap_err();
@@ -381,18 +381,18 @@ async fn refuses_over_budget() {
     // 64 KiB turns across two chats fill the 8 MiB budget exactly; one more is refused.
     let (_dir, state, auth) = setup_state().await;
     let fill = 64 * 1024;
-    assert!(fill <= MAX_ASSISTANT_TURN_BYTES);
+    assert!(fill <= MAX_TURN_BYTES);
     let payload = "x".repeat(fill);
-    let fitting = u32::try_from(MAX_ASSISTANT_CHAT_BYTES / fill as u64).unwrap();
-    assert!(fitting > MAX_ASSISTANT_CHAT_TURNS);
+    let fitting = u32::try_from(MAX_ASSISTANT_BYTES / fill as u64).unwrap();
+    assert!(fitting > MAX_ASSISTANT_TURNS);
     save_head(&state, &auth, "c-1", "Chat", None).await.unwrap();
     save_head(&state, &auth, "c-2", "Chat", None).await.unwrap();
-    for seq in 0..MAX_ASSISTANT_CHAT_TURNS {
+    for seq in 0..MAX_ASSISTANT_TURNS {
         save_turn(&state, &auth, "c-1", seq, &payload)
             .await
             .unwrap();
     }
-    for seq in 0..fitting - MAX_ASSISTANT_CHAT_TURNS {
+    for seq in 0..fitting - MAX_ASSISTANT_TURNS {
         save_turn(&state, &auth, "c-2", seq, &payload)
             .await
             .unwrap();
@@ -401,7 +401,7 @@ async fn refuses_over_budget() {
         &state,
         &auth,
         "c-2",
-        fitting - MAX_ASSISTANT_CHAT_TURNS,
+        fitting - MAX_ASSISTANT_TURNS,
         "y",
     )
     .await
@@ -412,19 +412,19 @@ async fn refuses_over_budget() {
     );
 
     // A full chat trims its oldest turn on the next append and stays within budget.
-    let head = save_turn(&state, &auth, "c-1", MAX_ASSISTANT_CHAT_TURNS, "y")
+    let head = save_turn(&state, &auth, "c-1", MAX_ASSISTANT_TURNS, "y")
         .await
         .unwrap();
     assert_eq!(
         (head.first_seq, head.next_seq),
-        (1, MAX_ASSISTANT_CHAT_TURNS + 1)
+        (1, MAX_ASSISTANT_TURNS + 1)
     );
     assert_eq!(
         head.bytes,
-        (MAX_ASSISTANT_CHAT_TURNS as u64 - 1) * fill as u64 + 1
+        (MAX_ASSISTANT_TURNS as u64 - 1) * fill as u64 + 1
     );
     let turns = read_turns(&state, &auth, "c-1", None).await.unwrap();
-    assert_eq!(turns.len() as u32, MAX_ASSISTANT_CHAT_TURNS);
+    assert_eq!(turns.len() as u32, MAX_ASSISTANT_TURNS);
     assert_eq!(turns[0].seq, 1);
 }
 

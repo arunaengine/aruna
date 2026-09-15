@@ -55,15 +55,15 @@ const TARGET_TAG_KEY: &str = "aruna-engine.org/target";
 
 /// Read-only tags derived at read time from the job and its family. They are
 /// never stored, so a task creation naming one of them is refused.
-const JOB_ID_TAG_KEY: &str = "aruna-engine.org/job-id";
-const LOGICAL_STATE_TAG_KEY: &str = "aruna-engine.org/logical-state";
-const EXECUTOR_KIND_TAG_KEY: &str = "aruna-engine.org/executor-kind";
-const TRANSFER_BYTES_TAG_KEY: &str = "aruna-engine.org/estimated-transfer-bytes";
+const ID_TAG_KEY: &str = "aruna-engine.org/job-id";
+const STATE_TAG_KEY: &str = "aruna-engine.org/logical-state";
+const KIND_TAG_KEY: &str = "aruna-engine.org/executor-kind";
+const TRANSFER_TAG_KEY: &str = "aruna-engine.org/estimated-transfer-bytes";
 const DERIVED_TAG_KEYS: [&str; 4] = [
-    JOB_ID_TAG_KEY,
-    LOGICAL_STATE_TAG_KEY,
-    EXECUTOR_KIND_TAG_KEY,
-    TRANSFER_BYTES_TAG_KEY,
+    ID_TAG_KEY,
+    STATE_TAG_KEY,
+    KIND_TAG_KEY,
+    TRANSFER_TAG_KEY,
 ];
 
 const DEFAULT_PAGE_SIZE: usize = 256;
@@ -1678,15 +1678,15 @@ impl TaskDetails {
     }
 
     fn stamp(&self, id: &str, tags: &mut BTreeMap<String, String>) {
-        tags.insert(JOB_ID_TAG_KEY.to_string(), id.to_string());
+        tags.insert(ID_TAG_KEY.to_string(), id.to_string());
         if let Some(state) = &self.logical_state {
-            tags.insert(LOGICAL_STATE_TAG_KEY.to_string(), state.clone());
+            tags.insert(STATE_TAG_KEY.to_string(), state.clone());
         }
         if let Some(kind) = &self.executor_kind {
-            tags.insert(EXECUTOR_KIND_TAG_KEY.to_string(), kind.clone());
+            tags.insert(KIND_TAG_KEY.to_string(), kind.clone());
         }
         if let Some(bytes) = self.transfer_bytes {
-            tags.insert(TRANSFER_BYTES_TAG_KEY.to_string(), bytes.to_string());
+            tags.insert(TRANSFER_TAG_KEY.to_string(), bytes.to_string());
         }
     }
 }

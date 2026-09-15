@@ -135,7 +135,8 @@ pub struct SyncedFolderView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_error_at_ms: Option<u64>,
+    #[serde(rename = "last_error_at_ms")]
+    pub last_error_ms: Option<u64>,
     pub created_at_ms: u64,
 }
 
@@ -342,7 +343,7 @@ pub fn folder_view(folder: SyncedFolder, counters: FolderCounters) -> SyncedFold
         },
         last_reconcile_ms: folder.last_reconcile_ms,
         last_error: folder.last_error,
-        last_error_at_ms: folder.last_error_at_ms,
+        last_error_ms: folder.last_error_ms,
         created_at_ms: folder.created_at_ms,
     }
 }

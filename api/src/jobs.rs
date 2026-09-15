@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use aruna_compute::session::Session;
 use aruna_core::compute::normalize_container_path;
-use aruna_core::compute::runtimes::SESSION_MOUNT_PREFIX_TAG;
+use aruna_core::compute::runtimes::MOUNT_PREFIX_TAG;
 use aruna_core::id::NodeId;
 use aruna_core::scheduling::MAX_PLAN_INPUTS;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
@@ -223,7 +223,7 @@ pub(crate) async fn admit_execution(
     // The mounted folder is written freely from the kernel, so the caller needs
     // WRITE on that folder itself, not only on the bucket.
     if let (Some(prefix), Some(bucket)) = (
-        command.tags.get(SESSION_MOUNT_PREFIX_TAG),
+        command.tags.get(MOUNT_PREFIX_TAG),
         workspace_bucket.as_deref(),
     ) {
         crate::auth::ensure_permission_with(

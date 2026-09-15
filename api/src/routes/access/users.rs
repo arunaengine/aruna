@@ -224,11 +224,11 @@ pub struct UpdateUserRequest {
 
 pub type PatchUserRequest = UpdateUserRequest;
 
-const DEFAULT_LIST_USERS_LIMIT: usize = 100;
-const MAX_LIST_USERS_LIMIT: usize = 1_000;
-pub(crate) const MIN_SEARCH_QUERY_CHARS: usize = 2;
-const MAX_SEARCH_USERS_LIMIT: usize = 20;
-const MAX_RESOLVE_USER_IDS: usize = 100;
+const LIST_USERS_LIMIT: usize = 100;
+const MAX_USERS_LIMIT: usize = 1_000;
+pub(crate) const MIN_QUERY_CHARS: usize = 2;
+const MAX_SEARCH_USERS: usize = 20;
+const MAX_USER_IDS: usize = 100;
 
 impl From<User> for GetUserResponse {
     fn from(value: User) -> Self {
@@ -310,7 +310,7 @@ fn map_inspect_error(error: InspectSecretError) -> ServerError {
     }
 }
 
-const USER_TOKEN_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
+const TOKEN_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
 
 async fn issue_user_session(
     state: &Arc<ServerState>,
@@ -724,7 +724,7 @@ async fn get_token(
     };
 
     let expiry = now_timestamp()
-        .checked_add(USER_TOKEN_EXPIRY_SECONDS)
+        .checked_add(TOKEN_EXPIRY_SECONDS)
         .ok_or_else(|| ServerError::InternalError("token expiry overflow".to_string()))?;
     let token = issue_user_session(&state, user_id, expiry, kind).await?;
 
@@ -1016,8 +1016,8 @@ async fn list_users(
 
     let limit = query
         .limit
-        .unwrap_or(DEFAULT_LIST_USERS_LIMIT)
-        .clamp(1, MAX_LIST_USERS_LIMIT);
+        .unwrap_or(LIST_USERS_LIMIT)
+        .clamp(1, MAX_USERS_LIMIT);
     ensure_permission(
         &state,
         &auth,
@@ -1141,13 +1141,13 @@ async fn search_users(
         return Err(ServerError::Forbidden);
     }
     let q = query.q.trim().to_string();
-    if q.chars().count() < MIN_SEARCH_QUERY_CHARS {
+    if q.chars().count() < MIN_QUERY_CHARS {
         return Err(ServerError::BadRequest);
     }
     let limit = query
         .limit
-        .unwrap_or(MAX_SEARCH_USERS_LIMIT)
-        .clamp(1, MAX_SEARCH_USERS_LIMIT);
+        .unwrap_or(MAX_SEARCH_USERS)
+        .clamp(1, MAX_SEARCH_USERS);
     if let Some(start_after) = &query.start_after {
         UserId::from_string(start_after).map_err(|_| ServerError::BadRequest)?;
     }
@@ -1241,7 +1241,7 @@ async fn resolve_users(
     if auth.realm_id != realm_id {
         return Err(ServerError::Forbidden);
     }
-    if request.user_ids.len() > MAX_RESOLVE_USER_IDS {
+    if request.user_ids.len() > MAX_USER_IDS {
         return Err(ServerError::BadRequest);
     }
     let user_ids = request
@@ -1744,7 +1744,7 @@ async fn evict_node(
     )
     .await
     .map_err(|err| match err {
-        RemoveNodeError::DeviceNotFound { .. } | RemoveNodeError::RealmConfigNotFound => {
+        RemoveNodeError::DeviceNotFound { .. } | RemoveNodeError::ConfigMissing => {
             ServerError::NotFound
         }
         RemoveNodeError::NotManagementNode => ServerError::Forbidden,

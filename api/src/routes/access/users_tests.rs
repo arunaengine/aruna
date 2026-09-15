@@ -352,7 +352,7 @@ async fn spawn_test_node(provider: OidcProviderConfig, claim_initial_admin: bool
         state.clone(),
         ServerConfig {
             http_addr: addr,
-            max_http_body_size: crate::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+            max_body_size: crate::server::MAX_BODY_SIZE,
             cors: crate::cors::CorsConfig::default(),
         },
     )
@@ -942,7 +942,7 @@ async fn token_expiry_bounded() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(claims.exp, claims.iat + super::USER_TOKEN_EXPIRY_SECONDS);
+    assert_eq!(claims.exp, claims.iat + super::TOKEN_EXPIRY_SECONDS);
 
     node.server_task.abort();
     node.net.shutdown().await;

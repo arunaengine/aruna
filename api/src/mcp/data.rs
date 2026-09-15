@@ -7,7 +7,7 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
-    BucketInfo, OBJECT_CONTENT_TYPE_KEY, bucket_permission_path, key_content_type,
+    BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type,
     object_permission_path,
 };
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
@@ -544,7 +544,7 @@ impl McpServer {
             .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
         let content_type = result
             .metadata
-            .get(OBJECT_CONTENT_TYPE_KEY)
+            .get(CONTENT_TYPE_KEY)
             .cloned()
             .or_else(|| {
                 result
@@ -909,7 +909,7 @@ pub(crate) async fn read_text(
     .map_err(map_get_error)?;
     let content_type = result
         .metadata
-        .remove(OBJECT_CONTENT_TYPE_KEY)
+        .remove(CONTENT_TYPE_KEY)
         .or_else(|| {
             result
                 .source_metadata
@@ -1026,7 +1026,7 @@ pub(crate) async fn write_text(
     })
     .with_rocrate_limits(server.state.rocrate_limits().clone())
     .with_metadata(HashMap::from([(
-        OBJECT_CONTENT_TYPE_KEY.to_string(),
+        CONTENT_TYPE_KEY.to_string(),
         content_type.clone(),
     )]))
     .with_restrictions(auth.path_restrictions.clone());

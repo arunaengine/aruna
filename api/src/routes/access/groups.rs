@@ -335,7 +335,7 @@ async fn load_group(
 
 fn map_group_error(error: GetGroupError) -> ServerError {
     match error {
-        GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound => ServerError::NotFound,
+        GetGroupError::GroupNotFound | GetGroupError::DocNotFound => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -526,7 +526,7 @@ pub async fn create_group(
     .instrument(create_span.clone())
     .await
     .map_err(|err| match err {
-        CreateGroupError::OwnedGroupLimitReached { limit } => {
+        CreateGroupError::GroupLimitReached { limit } => {
             ServerError::Conflict(format!("owned group limit reached ({limit})"))
         }
         CreateGroupError::StorageError(StorageError::TransactionConflict) => {
@@ -881,7 +881,7 @@ fn map_member_error(error: AddUserError) -> ServerError {
     match error {
         AddUserError::Unauthorized => ServerError::Forbidden,
         AddUserError::InvalidUserId => ServerError::BadRequest,
-        AddUserError::RoleNotFound | AddUserError::AuthDocNotFound => ServerError::NotFound,
+        AddUserError::RoleNotFound | AddUserError::DocNotFound => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -895,7 +895,7 @@ fn map_role_error(error: AddRoleError) -> ServerError {
         | AddRoleError::ReservedRoleName => ServerError::BadRequest,
         AddRoleError::GroupNotFound => ServerError::NotFound,
         AddRoleError::CheckPermissionsError(
-            AuthorizationError::GroupNotFound | AuthorizationError::AuthDocNotFound,
+            AuthorizationError::GroupNotFound | AuthorizationError::DocNotFound,
         ) => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
     }
@@ -905,7 +905,7 @@ fn map_removal_error(error: RemoveFromError) -> ServerError {
     match error {
         RemoveFromError::Unauthorized => ServerError::Forbidden,
         RemoveFromError::InvalidUserId => ServerError::BadRequest,
-        RemoveFromError::RoleNotFound | RemoveFromError::AuthDocNotFound => ServerError::NotFound,
+        RemoveFromError::RoleNotFound | RemoveFromError::DocNotFound => ServerError::NotFound,
         RemoveFromError::LastAdmin => {
             ServerError::Conflict("the last admin of a group cannot be removed".to_string())
         }
@@ -1627,7 +1627,7 @@ pub async fn delete_group_role(
     .await
     .map_err(|error| match error {
         RemoveGroupError::Unauthorized => ServerError::Forbidden,
-        RemoveGroupError::RoleNotFound | RemoveGroupError::AuthDocNotFound => ServerError::NotFound,
+        RemoveGroupError::RoleNotFound | RemoveGroupError::DocNotFound => ServerError::NotFound,
         RemoveGroupError::AdminRoleUndeletable => {
             ServerError::Conflict("the admin role cannot be deleted".to_string())
         }

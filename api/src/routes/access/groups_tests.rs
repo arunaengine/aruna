@@ -496,7 +496,7 @@ async fn policy_drops_exemption() {
     let (state, admin, _tempdir) = setup_admin_state().await;
     let realm_id = state.get_realm_id();
     update_config(&state, |config| {
-        config.quota.max_groups_per_user = Some(1);
+        config.quota.groups_per_user = Some(1);
     })
     .await;
 

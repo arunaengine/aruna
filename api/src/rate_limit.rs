@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const IP_REQUESTS_PER_MINUTE: u32 = 6_000;
+const IP_REQUESTS_MINUTE: u32 = 6_000;
 const IP_BURST: u32 = 1_000;
-const PRINCIPAL_REQUESTS_PER_MINUTE: u32 = 3_000;
+const PRINCIPAL_REQUESTS_MINUTE: u32 = 3_000;
 const PRINCIPAL_BURST: u32 = 500;
 /// Every N checks the keyed stores drop entries that are fully replenished.
 const MAINTENANCE_INTERVAL: u64 = 4_096;
@@ -161,9 +161,9 @@ pub struct ApiRateLimits {
 impl Default for ApiRateLimits {
     fn default() -> Self {
         Self::new(
-            IP_REQUESTS_PER_MINUTE,
+            IP_REQUESTS_MINUTE,
             IP_BURST,
-            PRINCIPAL_REQUESTS_PER_MINUTE,
+            PRINCIPAL_REQUESTS_MINUTE,
             PRINCIPAL_BURST,
         )
     }

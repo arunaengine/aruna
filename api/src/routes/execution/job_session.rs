@@ -8,7 +8,7 @@ use std::sync::Arc;
 use aruna_compute::session::EventKind;
 use aruna_compute::session::events::SessionEvent;
 use aruna_compute::session::{
-    EndReason, MAX_SCRATCH_READ_BYTES, PendingInput, Session, SessionError, StagedInput,
+    EndReason, MAX_SCRATCH_BYTES, PendingInput, Session, SessionError, StagedInput,
 };
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -102,7 +102,8 @@ pub struct SessionResponse {
     pub started_at_ms: u64,
     pub idle_after_ms: u64,
     pub idle_deadline_ms: u64,
-    pub credential_expires_at_ms: u64,
+    #[serde(rename = "credential_expires_at_ms")]
+    pub credential_expires_ms: u64,
     pub last_event_id: u64,
     /// Absent on the stream's own `session` frame, which carries no cells.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,7 +328,7 @@ fn base_response(record: &JobRecord) -> SessionResponse {
         started_at_ms: record.started_at_ms.unwrap_or(record.created_at_ms),
         idle_after_ms: 0,
         idle_deadline_ms: 0,
-        credential_expires_at_ms: 0,
+        credential_expires_ms: 0,
         last_event_id: 0,
         cells: Some(Vec::new()),
         ended: None,
@@ -345,7 +346,7 @@ pub(crate) fn session_response(session: &Session, with_cells: bool) -> SessionRe
         started_at_ms: snapshot.started_at_ms,
         idle_after_ms: snapshot.idle_after_ms,
         idle_deadline_ms: snapshot.idle_deadline_ms,
-        credential_expires_at_ms: snapshot.credential_expires_at_ms,
+        credential_expires_ms: snapshot.credential_expires_ms,
         last_event_id: snapshot.last_event_id,
         cells: with_cells.then(|| {
             snapshot
@@ -1205,7 +1206,7 @@ pub async fn read_scratch(
     };
     session.touch();
     let body = match session
-        .read_scratch(&query.path, 0, MAX_SCRATCH_READ_BYTES)
+        .read_scratch(&query.path, 0, MAX_SCRATCH_BYTES)
         .await
     {
         Ok(body) => body,

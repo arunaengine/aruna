@@ -32,7 +32,8 @@ pub struct ProfileCapabilitiesResponse {
     pub evaluator: String,
     pub supported_constraints: Vec<String>,
     pub unsupported_constraint_policy: String,
-    pub public_profile_iri_template: String,
+    #[serde(rename = "public_profile_iri_template")]
+    pub profile_iri_template: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -483,7 +484,8 @@ pub enum PreflightTargetBody {
     ContentW3ids {
         content_w3ids: Vec<String>,
         #[serde(default)]
-        remove_all_resolvable_locations: bool,
+        #[serde(rename = "remove_all_resolvable_locations")]
+        remove_resolvable_locations: bool,
     },
     BucketPrefix {
         bucket: String,
@@ -540,7 +542,8 @@ pub struct PreflightTargetResponse {
     pub targeted_versions: Vec<PreflightLocationResponse>,
     pub visible_references: Vec<PreflightVisibleResponse>,
     pub hidden_references_exist: bool,
-    pub would_remove_last_resolvable_aruna_location: bool,
+    #[serde(rename = "would_remove_last_resolvable_aruna_location")]
+    pub would_remove_location: bool,
     pub location_impact_complete: bool,
 }
 
@@ -556,7 +559,8 @@ pub struct ExcludedFormResponse {
 pub struct PreflightFreshnessResponse {
     pub node_id: String,
     pub index_state: String,
-    pub oldest_status_updated_at_ms: Option<u64>,
+    #[serde(rename = "oldest_status_updated_at_ms")]
+    pub oldest_status_updated: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -567,7 +571,8 @@ pub struct PreflightCoverageResponse {
     pub excluded_forms: Vec<ExcludedFormResponse>,
     pub node_freshness: Vec<PreflightFreshnessResponse>,
     pub target_resolution_complete: bool,
-    pub path_style_endpoint_coverage_complete: bool,
+    #[serde(rename = "path_style_endpoint_coverage_complete")]
+    pub path_style_complete: bool,
     pub realm_coverage_complete: bool,
 }
 
