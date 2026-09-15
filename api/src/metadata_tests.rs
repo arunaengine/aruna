@@ -2,7 +2,7 @@
 //! realm/group permission gate.
 
 use super::*;
-use crate::tests::fixtures::routes::{seed_realm_auth, test_context, test_state, test_storage};
+use crate::tests::routes::{seed_realm_auth, test_context, test_state, test_storage};
 use aruna_core::structs::{Actor, NodeCapabilities, RealmId};
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
