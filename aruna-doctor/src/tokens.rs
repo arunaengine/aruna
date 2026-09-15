@@ -9,27 +9,18 @@ use aruna_core::onboarding::{
 };
 use aruna_core::structs::{Actor, OidcProviderConfig, RealmId, TokenClaims};
 use aruna_operations::auth::bearer_token::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_bearer_token,
+    ArunaBearerError, ArunaValidationState, decode_bearer_token,
 };
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::onboarding::consume_secret::{
-    ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
-};
-use aruna_operations::onboarding::inspect_secret::{
-    InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
-};
+use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
+use aruna_operations::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
 use aruna_operations::realm::claim_admin::{
-    ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    ClaimInitialRealmAdminResult,
+    ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
 };
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
-use aruna_operations::realm::recover_admin::{
-    RecoverInitialAdminInput, RecoverInitialAdminOperation,
-};
-use aruna_operations::users::oidc_user::{
-    RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
-};
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::realm::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
+use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
 use aruna_tasks::TaskHandle;
 use async_trait::async_trait;
 use jsonwebtoken::dangerous::insecure_decode;
@@ -116,7 +107,7 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
     let now = chrono::Utc::now().timestamp().max(0) as u64;
     let user_id = UserId::local(Ulid::generate(), config.realm_id);
     let inspected = drive(
-        InspectOnboardingSecretOperation::new(InspectOnboardingSecretInput {
+        InspectSecretOperation::new(InspectSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash: onboarding_secret.secret_hash(),
             node_id: user_id.to_string(),
@@ -134,7 +125,7 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
     }
 
     drive(
-        ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
+        ConsumeSecretOperation::new(ConsumeSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash: onboarding_secret.secret_hash(),
             node_id: user_id.to_string(),
@@ -151,7 +142,7 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
         realm_id: config.realm_id,
     };
     let user = drive(
-        RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
+        ResolveOidcOperation::new(ResolveOidcInput {
             actor: actor.clone(),
             issuer: "aruna-local-bootstrap".to_string(),
             subject_id: onboarding_secret.enrollment_id.to_string(),
@@ -164,7 +155,7 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
     .map_err(|err| std::io::Error::other(err.to_string()))?;
 
     let claim_result = drive(
-        ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+        ClaimInitialOperation::new(ClaimInitialInput {
             actor: Actor {
                 user_id: user.user_id,
                 ..actor
@@ -174,9 +165,9 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
     )
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))?;
-    if matches!(claim_result, ClaimInitialRealmAdminResult::AlreadyClaimed) {
+    if matches!(claim_result, ClaimInitialResult::AlreadyClaimed) {
         return Err(std::io::Error::other(
-            ClaimInitialRealmAdminError::InitialAdministratorAlreadyClaimed.to_string(),
+            ClaimInitialError::InitialAdministratorAlreadyClaimed.to_string(),
         )
         .into());
     }
@@ -231,7 +222,7 @@ pub async fn recover_initial_admin() -> Result<String, CliError> {
         claimed_node_id: None,
     };
     drive(
-        RecoverInitialAdminOperation::new(RecoverInitialAdminInput { record }),
+        RecoverInitialOperation::new(RecoverInitialInput { record }),
         &driver_ctx,
     )
     .await
@@ -409,12 +400,12 @@ pub enum Valid {
 }
 
 #[derive(Debug, Default)]
-struct DoctorTokenValidationState {
+struct DoctorValidationState {
     revoked_token_hashes: HashSet<String, ahash::RandomState>,
     trusted_realms: HashSet<RealmId, ahash::RandomState>,
 }
 
-impl DoctorTokenValidationState {
+impl DoctorValidationState {
     async fn load(driver_ctx: &DriverContext) -> Self {
         let mut revoked_token_hashes = HashSet::<String, ahash::RandomState>::default();
         let trusted_realms = load_persisted_state::<HashSet<RealmId, ahash::RandomState>>(
@@ -425,7 +416,7 @@ impl DoctorTokenValidationState {
         .unwrap_or_default();
         // The replicated realm config is the only revocation authority.
         for realm_id in &trusted_realms {
-            if let Ok(config) = drive(GetRealmConfigOperation::new(*realm_id), driver_ctx).await {
+            if let Ok(config) = drive(GetConfigOperation::new(*realm_id), driver_ctx).await {
                 let now = aruna_core::time::unix_timestamp_secs();
                 revoked_token_hashes.extend(
                     config
@@ -450,12 +441,12 @@ impl DoctorTokenValidationState {
 }
 
 #[async_trait]
-impl ArunaBearerTokenValidationState for DoctorTokenValidationState {
+impl ArunaValidationState for DoctorValidationState {
     async fn is_token_revoked(
         &self,
         _realm_id: &RealmId,
         token_hash: &str,
-    ) -> Result<bool, ArunaBearerTokenError> {
+    ) -> Result<bool, ArunaBearerError> {
         Ok(self.revoked_token_hashes.contains(token_hash))
     }
 
@@ -475,7 +466,7 @@ pub async fn view_token(token: String) -> Result<String, CliError> {
         task_handle: None,
         compute_handle: None,
     });
-    let validation_state = DoctorTokenValidationState::load(driver_ctx.as_ref()).await;
+    let validation_state = DoctorValidationState::load(driver_ctx.as_ref()).await;
     let token_view = build_token_view(&token, &validation_state).await?;
 
     Ok(serde_json::to_string_pretty(&token_view)?)
@@ -483,7 +474,7 @@ pub async fn view_token(token: String) -> Result<String, CliError> {
 
 async fn build_token_view(
     token: &str,
-    validation_state: &DoctorTokenValidationState,
+    validation_state: &DoctorValidationState,
 ) -> Result<TokenView, CliError> {
     let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
     let valid = match decode_bearer_token(validation_state, token).await {
@@ -503,13 +494,13 @@ async fn build_token_view(
 #[cfg(test)]
 mod tests {
     use super::{
-        DoctorTokenValidationState, Valid, build_token_view, create_bootstrap_token,
-        create_oidc_token, load_oidc_providers, password_grant_body, request_oidc_token,
+        DoctorValidationState, Valid, build_token_view, create_bootstrap_token, create_oidc_token,
+        load_oidc_providers, password_grant_body, request_oidc_token,
     };
     use crate::tests::fixtures::{TestEnvGuard, env_lock};
     use aruna::bootstrap::ensure_onboarding_secret;
     use aruna_api::auth::OidcValidator;
-    use aruna_api::routes::onboarding::ListOnboardingSecretsResponse;
+    use aruna_api::routes::onboarding::ListSecretsResponse;
     use aruna_api::server::{Server, ServerConfig};
     use aruna_api::server_state::ServerState;
     use aruna_core::UserId;
@@ -526,14 +517,12 @@ mod tests {
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::realm::announce_presence::{
-        AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+        AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
-    use aruna_operations::realm::claim_admin::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    };
+    use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::sync::incoming::initialize_net_holder;
-    use aruna_operations::tasks::incoming::install_and_start_task_queues;
+    use aruna_operations::tasks::incoming::start_task_queues;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use axum::extract::State;
@@ -796,7 +785,7 @@ mod tests {
             jobs_runtime.clone(),
             &shutdown,
         );
-        install_and_start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
+        start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
 
         let realm_signing_key = generate_signing_key();
         let realm_id =
@@ -822,7 +811,7 @@ mod tests {
         .unwrap();
         if claim_admin {
             drive(
-                ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+                ClaimInitialOperation::new(ClaimInitialInput {
                     actor: Actor {
                         node_id: net.node_id(),
                         user_id: bootstrap_user,
@@ -835,7 +824,7 @@ mod tests {
             .unwrap();
         }
         drive(
-            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                 realm_id,
                 node_id: net.node_id(),
                 schedule_refresh: false,
@@ -998,7 +987,7 @@ mod tests {
             .await?;
         let status = response.status();
         if status == reqwest::StatusCode::OK {
-            let body: ListOnboardingSecretsResponse = response.json().await?;
+            let body: ListSecretsResponse = response.json().await?;
             assert!(!body.secrets.is_empty());
         }
         Ok(status)
@@ -1009,7 +998,7 @@ mod tests {
         let (realm_signing_key, realm_id, user_id) = aruna_token_fixture();
         let claims = aruna_token_claims(realm_id, user_id);
         let token = sign_aruna_token(&realm_signing_key, &claims);
-        let mut state = DoctorTokenValidationState::default();
+        let mut state = DoctorValidationState::default();
         state.trusted_realms.insert(realm_id);
         state.revoked_token_hashes.insert(bearer_token_hash(&token));
 
@@ -1033,7 +1022,7 @@ mod tests {
         claims.delegation_signature =
             Some(realm_signing_key.sign(issuer_pubkey.as_bytes()).to_string());
         let token = sign_aruna_token(&issuer_signing_key, &claims);
-        let mut state = DoctorTokenValidationState::default();
+        let mut state = DoctorValidationState::default();
         state.trusted_realms.insert(realm_id);
 
         let view = build_token_view(&token, &state).await.unwrap();
