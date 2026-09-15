@@ -4,7 +4,9 @@
 
 use aruna_operations::device::wipe as device_wipe;
 
-use crate::shutdown::{NodeShutdown, arm_signal_exit, shutdown_grace_env, wait_for_signal};
+use crate::shutdown::{
+    NodeShutdown, ShutdownOutcome, arm_signal_exit, shutdown_grace_env, wait_for_signal,
+};
 use crate::startup;
 use crate::startup::background::{Background, BackgroundOutcome, start as start_background};
 use crate::startup::listeners::{ServerBindings, bind as bind_servers, device_wipe_armed};
@@ -18,10 +20,14 @@ pub enum ProcessOutcome {
     /// The node drained and stopped normally.
     Stopped,
     /// The node stopped, but the shutdown sequence left an owner or a
-    /// persistence step unresolved; the stores were not verified clean.
+    /// persistence step unresolved; the stores were not verified clean. Also
+    /// the outcome of an accepted startup cancellation whose cleanup was
+    /// incomplete.
     StoppedIncomplete,
     /// The operator asked to stop before startup completed; no later phase
-    /// was admitted and every acquired owner was released.
+    /// was admitted and the ordered cleanup released every acquired owner. A
+    /// stop whose cleanup left an owner unresolved maps to
+    /// [`ProcessOutcome::StoppedIncomplete`] instead.
     StartupCancelled,
     /// Ingress failed before any signal; the node shut down because of it.
     ServerFailure(String),
@@ -202,8 +208,8 @@ async fn run_node_owned(
     // A stop requested while resources were still being acquired must not run
     // realm preparation against a node that is already being torn down.
     if stop_token.is_cancelled() {
-        release_unready(signals, resources, None).await;
-        return Ok(ProcessOutcome::StartupCancelled);
+        let cleanup = release_unready(signals, resources, None).await;
+        return Ok(cancellation_outcome(&cleanup));
     }
 
     let core_announcement = match startup::realm::prepare(
@@ -218,8 +224,8 @@ async fn run_node_owned(
         Ok(None) => {
             // The stop was accepted between preparation phases; release the
             // acquired subset without continuing startup.
-            release_unready(signals, resources, None).await;
-            return Ok(ProcessOutcome::StartupCancelled);
+            let cleanup = release_unready(signals, resources, None).await;
+            return Ok(cancellation_outcome(&cleanup));
         }
         Err(error) => {
             // Release the acquired subset, then report the initiating failure.
@@ -229,8 +235,8 @@ async fn run_node_owned(
     };
 
     if stop_token.is_cancelled() {
-        release_unready(signals, resources, None).await;
-        return Ok(ProcessOutcome::StartupCancelled);
+        let cleanup = release_unready(signals, resources, None).await;
+        return Ok(cancellation_outcome(&cleanup));
     }
 
     let bindings = match bind_servers(
@@ -255,8 +261,8 @@ async fn run_node_owned(
     // The operator asked to stop before admissions opened: tear down the
     // bound listeners and acquired resources without announcing readiness.
     if stop_token.is_cancelled() {
-        release_unready(signals, resources, Some(bindings)).await;
-        return Ok(ProcessOutcome::StartupCancelled);
+        let cleanup = release_unready(signals, resources, Some(bindings)).await;
+        return Ok(cancellation_outcome(&cleanup));
     }
 
     // Background startup applies the same required-versus-optional service
@@ -286,8 +292,8 @@ async fn run_node_owned(
     {
         BackgroundOutcome::Started => {}
         BackgroundOutcome::Cancelled => {
-            release_unready(signals, resources, Some(bindings)).await;
-            return Ok(ProcessOutcome::StartupCancelled);
+            let cleanup = release_unready(signals, resources, Some(bindings)).await;
+            return Ok(cancellation_outcome(&cleanup));
         }
         BackgroundOutcome::RequiredListenerFailed(service) => {
             failure = Some(format!(
@@ -450,14 +456,27 @@ fn observed_listener_exit(bindings: &ServerBindings) -> Option<(Service, Service
     }
 }
 
+/// The one mapping from accepted-stop cleanup to process outcome: a sequence
+/// that released every owner is a clean cancellation; an incomplete one leaves
+/// an owner or persistence step unresolved and must exit nonzero.
+fn cancellation_outcome(cleanup: &ShutdownOutcome) -> ProcessOutcome {
+    if cleanup.complete() {
+        ProcessOutcome::StartupCancelled
+    } else {
+        ProcessOutcome::StoppedIncomplete
+    }
+}
+
 /// Runs the ordered teardown for everything acquired before background work,
 /// including bound listeners. The caller decides whether the stop is a
 /// cancellation or a failure; every early drain keeps the second-signal policy.
+/// Returns what the sequence accomplished so a cancellation site can report a
+/// complete release and an incomplete one distinctly.
 async fn release_unready(
     signals: &mut SignalTasks,
     resources: NodeResources,
     bindings: Option<ServerBindings>,
-) {
+) -> ShutdownOutcome {
     signals.arm_escalation();
     let NodeResources {
         config: _,
@@ -508,7 +527,7 @@ async fn release_unready(
         grace: shutdown_grace_env(),
     }
     .run()
-    .await;
+    .await
 }
 
 #[cfg(test)]
@@ -833,5 +852,72 @@ mod tests {
                 "run {run} left the second task running"
             );
         }
+    }
+
+    /// The same minimal owner set as the shutdown-module helper, so the
+    /// mapping test runs a real `NodeShutdown` sequence.
+    fn node_shutdown(
+        shutdown: aruna_core::shutdown::Shutdown,
+        storage_handle: aruna_storage::StorageHandle,
+        grace: std::time::Duration,
+    ) -> NodeShutdown {
+        NodeShutdown {
+            shutdown,
+            readiness: aruna_api::monitoring::Readiness::new(),
+            rest: None,
+            s3: None,
+            portal: None,
+            session_s3: None,
+            monitoring: None,
+            task_handle: aruna_tasks::TaskHandle::new(),
+            jobs_runtime: aruna_operations::jobs::runtime::JobsRuntime::new(),
+            net_handle: None,
+            metadata_handle: None,
+            blob_handle: None,
+            storage_handle,
+            ops: None,
+            grace,
+        }
+    }
+
+    // The acquisition, realm-preparation, listener-binding, and
+    // background-start cancellations all map through `cancellation_outcome`; a
+    // real complete sequence is the clean cancellation and a real incomplete
+    // one is the nonzero incomplete stop, so no accepted stop can report
+    // success after a cleanup that left an owner unresolved.
+    #[tokio::test]
+    async fn cancellation_outcome_requires_complete_cleanup() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage_handle =
+            aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
+                .expect("storage opens");
+
+        let complete = node_shutdown(
+            aruna_core::shutdown::Shutdown::new(),
+            storage_handle.clone(),
+            crate::shutdown::MIN_SHUTDOWN_GRACE,
+        )
+        .run()
+        .await;
+        assert!(complete.complete(), "an idle sequence must complete");
+        assert_eq!(
+            cancellation_outcome(&complete),
+            ProcessOutcome::StartupCancelled
+        );
+
+        let shutdown = aruna_core::shutdown::Shutdown::new();
+        shutdown.spawn(std::future::pending());
+        let incomplete =
+            node_shutdown(shutdown, storage_handle, std::time::Duration::from_millis(200))
+                .run()
+                .await;
+        assert!(
+            !incomplete.background_drained,
+            "a pending child must leave the sequence incomplete: {incomplete:?}"
+        );
+        assert_eq!(
+            cancellation_outcome(&incomplete),
+            ProcessOutcome::StoppedIncomplete
+        );
     }
 }

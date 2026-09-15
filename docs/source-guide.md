@@ -139,7 +139,9 @@ assert effects, `step` explicit events, assert effects, `finalize`.
 1. `startup::resources::acquire` opens storage, then resolves identity,
    enrollment, and settings inside one owned boundary before building the
    network, metadata, blob, compute, ops, and task resources; on failure or an
-   accepted stop it tears down only what it acquired.
+   accepted stop it tears down only what it acquired, reports a clean
+   cancellation only when that teardown released every owner, and an incomplete
+   teardown is a nonzero startup error.
 2. `startup::realm::prepare` replays metadata and prepares the realm mode
    (initialize, join, or provision).
 3. `startup::listeners::bind` binds REST, S3, portal, and session S3.

@@ -3,6 +3,7 @@
 //! part-way releases exactly the acquired subset instead of leaking tasks.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
 use aruna_blob::blob::{BackendRegistry, BlobHandle, BlobHandler};
@@ -23,7 +24,7 @@ use tracing::{error, info, warn};
 use crate::compute_setup::build_registry;
 use crate::config::{Config, open_storage, resolve_config};
 use crate::settings::Settings;
-use crate::shutdown::{NodeShutdown, shutdown_grace_env};
+use crate::shutdown::{NodeShutdown, ShutdownOutcome, shutdown_grace_env};
 
 /// The node resources a running process owns. This is not the Tokio runtime.
 pub struct NodeResources {
@@ -92,11 +93,13 @@ impl Acquired {
     /// Runs the ordered teardown for the acquired subset: admissions, tasks,
     /// jobs, background, network, metadata, blob, storage. The ops task and
     /// driver context join after it; the sampler stops before storage closes.
-    pub(crate) async fn cleanup(self) {
+    /// Returns what the ordered sequence accomplished, so only a complete
+    /// outcome reports a clean release.
+    pub(crate) async fn cleanup(self, grace: Duration) -> ShutdownOutcome {
         info!("Startup stopped early; releasing the acquired resources");
         let ops = self.ops_handle;
         let driver_ctx = self.driver_ctx;
-        NodeShutdown {
+        let outcome = NodeShutdown {
             shutdown: self.shutdown,
             readiness: self.readiness,
             rest: None,
@@ -111,7 +114,7 @@ impl Acquired {
             blob_handle: self.blob_handle,
             storage_handle: self.storage_handle,
             ops: None,
-            grace: shutdown_grace_env(),
+            grace,
         }
         .run()
         .await;
@@ -120,6 +123,7 @@ impl Acquired {
             let _ = ops.await;
         }
         drop(driver_ctx);
+        outcome
     }
 
     fn finish(self, config: Config) -> NodeResources {
@@ -178,6 +182,39 @@ impl std::fmt::Display for StartupStopped {
 
 impl std::error::Error for StartupStopped {}
 
+/// A startup stop was accepted, but releasing the acquired subset did not
+/// complete: at least one owner or persistence step stayed unresolved, so this
+/// must not be reported as a clean startup cancellation.
+#[derive(Debug)]
+pub(crate) struct StartupCleanupIncomplete {
+    outcome: ShutdownOutcome,
+}
+
+impl std::fmt::Display for StartupCleanupIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "startup cleanup did not release every acquired owner: {:?}",
+            self.outcome
+        )
+    }
+}
+
+impl std::error::Error for StartupCleanupIncomplete {}
+
+/// Maps the cleanup of an accepted startup stop: only a sequence that released
+/// every owner and persistence step is a clean cancellation; an incomplete one
+/// becomes a typed startup error.
+fn cleanup_stop_outcome(
+    outcome: ShutdownOutcome,
+) -> Result<Option<NodeResources>, Box<dyn std::error::Error>> {
+    if outcome.complete() {
+        Ok(None)
+    } else {
+        Err(Box::new(StartupCleanupIncomplete { outcome }))
+    }
+}
+
 pub(crate) async fn acquire(
     stop: &tokio_util::sync::CancellationToken,
 ) -> Result<Option<NodeResources>, Box<dyn std::error::Error>> {
@@ -197,7 +234,9 @@ pub(crate) async fn acquire(
 
 /// Acquires the node resources from parsed settings and an already-open store,
 /// so identity loading, enrollment, and later stages run inside the explicit
-/// cleanup boundary. `Ok(None)` means a stop released exactly the acquired set.
+/// cleanup boundary. `Ok(None)` means a stop released exactly the acquired set
+/// and every ordered teardown step completed; an incomplete release is a typed
+/// error instead.
 pub(crate) async fn acquire_with_storage(
     settings: Settings,
     storage_handle: aruna_storage::StorageHandle,
@@ -209,27 +248,39 @@ pub(crate) async fn acquire_with_storage(
     // A stop accepted before configuration resolution must not read or write
     // identity or send enrollment traffic.
     if stop.is_cancelled() {
-        acquired.cleanup().await;
-        return Ok(None);
+        return cleanup_stop_outcome(acquired.cleanup(shutdown_grace_env()).await);
     }
     let config = match resolve_config(settings, acquired.storage_handle.clone(), stop).await {
         Ok(Some(config)) => config,
         Ok(None) => {
-            acquired.cleanup().await;
-            return Ok(None);
+            return cleanup_stop_outcome(acquired.cleanup(shutdown_grace_env()).await);
         }
         Err(error) => {
-            acquired.cleanup().await;
+            let cleanup = acquired.cleanup(shutdown_grace_env()).await;
+            if !cleanup.complete() {
+                warn!(
+                    ?cleanup,
+                    "Startup cleanup after a configuration failure did not release every owner"
+                );
+            }
             return Err(error.into());
         }
     };
     match fill(&config, &mut acquired, stop, &mut checkpoint).await {
         Ok(()) => Ok(Some(acquired.finish(config))),
         Err(error) => {
-            acquired.cleanup().await;
+            let cleanup = acquired.cleanup(shutdown_grace_env()).await;
             match error.downcast::<StartupStopped>() {
-                Ok(_) => Ok(None),
-                Err(error) => Err(error),
+                Ok(_) => cleanup_stop_outcome(cleanup),
+                Err(error) => {
+                    if !cleanup.complete() {
+                        warn!(
+                            ?cleanup,
+                            "Startup cleanup after an acquisition failure did not release every owner"
+                        );
+                    }
+                    Err(error)
+                }
             }
         }
     }
@@ -250,7 +301,7 @@ pub(crate) async fn acquire_resources(
     match fill(&config, &mut acquired, &stop, &mut checkpoint).await {
         Ok(()) => Ok(acquired.finish(config)),
         Err(error) => {
-            acquired.cleanup().await;
+            acquired.cleanup(shutdown_grace_env()).await;
             Err(error)
         }
     }
@@ -567,7 +618,11 @@ mod tests {
         assert!(acquired.metadata_handle.is_none());
         assert!(acquired.ops_handle.is_none());
 
-        acquired.cleanup().await;
+        let outcome = acquired.cleanup(Duration::from_secs(1)).await;
+        assert!(
+            outcome.complete(),
+            "an idle acquired subset must release cleanly: {outcome:?}"
+        );
 
         let event = storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -584,6 +639,43 @@ mod tests {
             })
         ));
     }
+
+    // A tracked child that ignores cancellation makes the cleanup outcome
+    // incomplete even though the store is still closed behind the bounded
+    // drain; the caller must not report a clean startup cancellation.
+    #[tokio::test]
+    async fn cleanup_reports_incomplete() {
+        let temp = tempdir().expect("temp dir");
+        let storage_handle = open_storage(&temp);
+        let task_handle = TaskHandle::new();
+        let acquired = Acquired::new(storage_handle.clone(), task_handle);
+        acquired.shutdown.spawn(std::future::pending());
+        assert_eq!(acquired.shutdown.tracked_children(), 1);
+
+        let outcome = acquired.cleanup(Duration::from_millis(200)).await;
+
+        assert!(
+            !outcome.background_drained,
+            "a pending tracked child must not be reported drained: {outcome:?}"
+        );
+        assert!(!outcome.complete());
+
+        let event = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: "late".to_string(),
+                key: b"key".to_vec().into(),
+                value: b"value".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Closed
+            })
+        ));
+    }
+
     // A failure after any acquisition stage must release exactly the acquired
     // subset: every later stage is absent and the store lock is given back.
     #[tokio::test]
