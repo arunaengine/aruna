@@ -18,11 +18,11 @@ use aruna_operations::driver::drive;
 use aruna_operations::jobs::lifecycle::ids::session_of;
 use aruna_operations::jobs::service::read_session_reason;
 use aruna_operations::jobs::service::submit_copy_job;
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::copy_object::{
     CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -43,8 +43,8 @@ use utoipa_axum::routes;
 use crate::auth::{blob_permission_path, ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::owned_session_job;
-use crate::routes::jobs::{
-    JobStatusResponse, coded_response, job_status_response, map_submit_error,
+use crate::routes::execution::jobs::{
+    JobStatusResponse, coded_response, job_status_response, map_job_request, map_submit_error,
 };
 use crate::routes::staging::queue_live_replication;
 use crate::server_state::ServerState;
@@ -56,10 +56,10 @@ const MAX_STAGED_ITEMS: usize = 64;
 
 #[derive(OpenApi)]
 #[openapi(tags((name = "compute/sessions", description = "Interactive notebook sessions")))]
-pub struct JobSessionApiDoc;
+pub struct JobSessionDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(JobSessionApiDoc::openapi())
+    OpenApiRouter::with_openapi(JobSessionDoc::openapi())
         .routes(routes!(get_session))
         .routes(routes!(stream_session))
         .routes(routes!(submit_cell))
@@ -439,7 +439,9 @@ pub async fn get_session(
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
+        .await
+        .map_err(map_job_request)?;
     match live_session(&state, &record, physical_job_id, true).await {
         Ok(session) => Ok(Json(session_response(&session, true)).into_response()),
         Err(response) => Ok(response),
@@ -485,7 +487,9 @@ pub async fn stream_session(
     headers: HeaderMap,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
+        .await
+        .map_err(map_job_request)?;
     let session = match live_session(&state, &record, physical_job_id, true).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -643,7 +647,9 @@ pub async fn submit_cell(
     Json(request): Json<SubmitCellRequest>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
+        .await
+        .map_err(map_job_request)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -690,7 +696,9 @@ pub async fn interrupt_session(
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
+        .await
+        .map_err(map_job_request)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -738,7 +746,9 @@ pub async fn end_session(
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
+        .await
+        .map_err(map_job_request)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -802,7 +812,9 @@ pub async fn stage_inputs(
     Json(request): Json<SessionInputsRequest>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
+        .await
+        .map_err(map_job_request)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -920,9 +932,9 @@ async fn bucket_info(
     context: &aruna_operations::driver::DriverContext,
     bucket: &str,
 ) -> ServerResult<aruna_core::structs::BucketInfo> {
-    match drive(GetBucketInfoOperation::new(bucket.to_string()), context).await {
+    match drive(GetBucketOperation::new(bucket.to_string()), context).await {
         Ok(info) => Ok(info),
-        Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
         Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
 }
@@ -987,7 +999,7 @@ async fn stage_one(
             .await
             .map(InputOutcome::Pending);
     }
-    let realm_config = drive(GetRealmConfigOperation::new(state.get_realm_id()), &context)
+    let realm_config = drive(GetConfigOperation::new(state.get_realm_id()), &context)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
     let input = CopyObjectInput {
@@ -1130,7 +1142,9 @@ pub async fn list_scratch(
     Query(query): Query<ScratchQuery>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
+        .await
+        .map_err(map_job_request)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -1182,7 +1196,9 @@ pub async fn read_scratch(
     Query(query): Query<ScratchReadQuery>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id).await?;
+    let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
+        .await
+        .map_err(map_job_request)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -1216,4 +1232,5 @@ pub async fn read_scratch(
 }
 
 #[cfg(test)]
+#[path = "job_session_tests.rs"]
 mod tests;

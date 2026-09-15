@@ -12,18 +12,18 @@ use utoipa_axum::routes;
 use aruna_core::structs::AuthContext;
 use aruna_operations::device::compute::{ComputeStatus, compute_status};
 
+use crate::auth::require_owner;
 use crate::error::{ErrorResponse, ServerResult};
-use crate::routes::device::require_owner;
-use crate::routes::jobs::map_local_error;
+use crate::routes::execution::jobs::map_local_error;
 use crate::server_state::ServerState;
 
 /// The device tag itself is declared by the device plane's own document.
 #[derive(OpenApi)]
 #[openapi()]
-pub struct DeviceComputeApiDoc;
+pub struct DeviceComputeDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(DeviceComputeApiDoc::openapi()).routes(routes!(get_device_compute))
+    OpenApiRouter::with_openapi(DeviceComputeDoc::openapi()).routes(routes!(get_device_compute))
 }
 
 /// The local executor and the owner's runs on it.
