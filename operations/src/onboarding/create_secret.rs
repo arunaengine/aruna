@@ -21,19 +21,19 @@ pub(crate) const SECRET_RECORD_PREFIX: &str = "secret:";
 pub(crate) const MAX_SCANNED_SECRETS: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateOnboardingSecretInput {
+pub struct CreateSecretInput {
     pub record: OnboardingSecretRecord,
 }
 
 #[derive(Debug, PartialEq)]
-pub struct CreateOnboardingSecretOperation {
-    input: CreateOnboardingSecretInput,
-    state: CreateOnboardingSecretState,
-    output: Option<Result<OnboardingSecretRecord, CreateOnboardingSecretError>>,
+pub struct CreateSecretOperation {
+    input: CreateSecretInput,
+    state: CreateSecretState,
+    output: Option<Result<OnboardingSecretRecord, CreateSecretError>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum CreateOnboardingSecretState {
+enum CreateSecretState {
     Init,
     StartTransaction,
     ReadRealmConfig {
@@ -55,7 +55,7 @@ enum CreateOnboardingSecretState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum CreateOnboardingSecretError {
+pub enum CreateSecretError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -72,25 +72,22 @@ pub enum CreateOnboardingSecretError {
     },
 }
 
-impl CreateOnboardingSecretOperation {
-    pub fn new(input: CreateOnboardingSecretInput) -> Self {
+impl CreateSecretOperation {
+    pub fn new(input: CreateSecretInput) -> Self {
         Self {
             input,
-            state: CreateOnboardingSecretState::Init,
+            state: CreateSecretState::Init,
             output: None,
         }
     }
 
     fn emit_write_record(&mut self, txn_id: TxnId) -> Effects {
-        self.state = CreateOnboardingSecretState::WriteRecord { txn_id };
+        self.state = CreateSecretState::WriteRecord { txn_id };
         let key = secret_record_key(self.input.record.enrollment_id);
         let value = match postcard::to_allocvec(&self.input.record) {
             Ok(value) => value,
             Err(error) => {
-                return fail(
-                    self,
-                    CreateOnboardingSecretError::ConversionError(error.into()),
-                );
+                return fail(self, CreateSecretError::ConversionError(error.into()));
             }
         };
         let state_entry = match secret_state_entry(
@@ -98,7 +95,7 @@ impl CreateOnboardingSecretOperation {
             OnboardingSecretState::Available,
         ) {
             Ok(entry) => entry,
-            Err(error) => return fail(self, CreateOnboardingSecretError::ConversionError(error)),
+            Err(error) => return fail(self, CreateSecretError::ConversionError(error)),
         };
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes: vec![
@@ -147,12 +144,12 @@ pub(crate) fn pending_devices(
         .count() as u32
 }
 
-impl Operation for CreateOnboardingSecretOperation {
+impl Operation for CreateSecretOperation {
     type Output = OnboardingSecretRecord;
-    type Error = CreateOnboardingSecretError;
+    type Error = CreateSecretError;
 
     fn start(&mut self) -> Effects {
-        self.state = CreateOnboardingSecretState::StartTransaction;
+        self.state = CreateSecretState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
         })]
@@ -161,18 +158,18 @@ impl Operation for CreateOnboardingSecretOperation {
     fn step(&mut self, event: Event) -> Effects {
         let event = match event {
             Event::Storage(StorageEvent::Error { error }) => {
-                return fail(self, CreateOnboardingSecretError::StorageError(error));
+                return fail(self, CreateSecretError::StorageError(error));
             }
             other => other,
         };
 
         match self.state.clone() {
-            CreateOnboardingSecretState::StartTransaction => {
+            CreateSecretState::StartTransaction => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return fail(
                         self,
-                        CreateOnboardingSecretError::UnexpectedEvent {
+                        CreateSecretError::UnexpectedEvent {
                             state: format!("{:?}", self.state),
                             expected: "transaction started",
                             got,
@@ -185,19 +182,19 @@ impl Operation for CreateOnboardingSecretOperation {
                 let Some(owner) = self.input.record.mode.owner() else {
                     return self.emit_write_record(txn_id);
                 };
-                self.state = CreateOnboardingSecretState::ReadRealmConfig { txn_id };
+                self.state = CreateSecretState::ReadRealmConfig { txn_id };
                 smallvec![Effect::Storage(StorageEffect::Read {
                     key_space: REALM_CONFIG_KEYSPACE.to_string(),
                     key: ByteView::from(*owner.realm_id.as_bytes()),
                     txn_id: Some(txn_id),
                 })]
             }
-            CreateOnboardingSecretState::ReadRealmConfig { txn_id } => {
+            CreateSecretState::ReadRealmConfig { txn_id } => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return fail(
                         self,
-                        CreateOnboardingSecretError::UnexpectedEvent {
+                        CreateSecretError::UnexpectedEvent {
                             state: format!("{:?}", self.state),
                             expected: "read result",
                             got,
@@ -210,7 +207,7 @@ impl Operation for CreateOnboardingSecretOperation {
                 {
                     Ok(config) => config,
                     Err(error) => {
-                        return fail(self, CreateOnboardingSecretError::ConversionError(error));
+                        return fail(self, CreateSecretError::ConversionError(error));
                     }
                 };
                 let cap = config
@@ -221,14 +218,11 @@ impl Operation for CreateOnboardingSecretOperation {
                 };
                 let enrolled = enrolled_devices(config.as_ref(), owner);
                 if enrolled.len() as u32 >= cap {
-                    return fail(
-                        self,
-                        CreateOnboardingSecretError::DeviceCapExceeded { limit: cap },
-                    );
+                    return fail(self, CreateSecretError::DeviceCapExceeded { limit: cap });
                 }
                 // Unclaimed secrets already occupy a slot: two mints followed by
                 // two enrollments would otherwise cross the cap.
-                self.state = CreateOnboardingSecretState::CountPending {
+                self.state = CreateSecretState::CountPending {
                     txn_id,
                     cap,
                     enrolled,
@@ -236,7 +230,7 @@ impl Operation for CreateOnboardingSecretOperation {
                 };
                 smallvec![scan_secrets(txn_id, None)]
             }
-            CreateOnboardingSecretState::CountPending {
+            CreateSecretState::CountPending {
                 txn_id,
                 cap,
                 enrolled,
@@ -250,7 +244,7 @@ impl Operation for CreateOnboardingSecretOperation {
                 else {
                     return fail(
                         self,
-                        CreateOnboardingSecretError::UnexpectedEvent {
+                        CreateSecretError::UnexpectedEvent {
                             state: format!("{:?}", self.state),
                             expected: "iter result",
                             got,
@@ -264,16 +258,13 @@ impl Operation for CreateOnboardingSecretOperation {
                     &enrolled,
                 ));
                 if enrolled.len() as u32 + pending >= cap {
-                    return fail(
-                        self,
-                        CreateOnboardingSecretError::DeviceCapExceeded { limit: cap },
-                    );
+                    return fail(self, CreateSecretError::DeviceCapExceeded { limit: cap });
                 }
                 // The range is followed to its end: a slot this owner holds may
                 // sit behind any number of other owners' records.
                 match next_start_after {
                     Some(next) => {
-                        self.state = CreateOnboardingSecretState::CountPending {
+                        self.state = CreateSecretState::CountPending {
                             txn_id,
                             cap,
                             enrolled,
@@ -284,60 +275,59 @@ impl Operation for CreateOnboardingSecretOperation {
                     None => self.emit_write_record(txn_id),
                 }
             }
-            CreateOnboardingSecretState::WriteRecord { txn_id } => {
+            CreateSecretState::WriteRecord { txn_id } => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return fail(
                         self,
-                        CreateOnboardingSecretError::UnexpectedEvent {
+                        CreateSecretError::UnexpectedEvent {
                             state: format!("{:?}", self.state),
                             expected: "batch write result",
                             got,
                         },
                     );
                 };
-                self.state = CreateOnboardingSecretState::CommitTransaction;
+                self.state = CreateSecretState::CommitTransaction;
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
-            CreateOnboardingSecretState::CommitTransaction => {
+            CreateSecretState::CommitTransaction => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return fail(
                         self,
-                        CreateOnboardingSecretError::UnexpectedEvent {
+                        CreateSecretError::UnexpectedEvent {
                             state: format!("{:?}", self.state),
                             expected: "transaction committed",
                             got,
                         },
                     );
                 };
-                self.state = CreateOnboardingSecretState::Finish;
+                self.state = CreateSecretState::Finish;
                 self.output = Some(Ok(self.input.record.clone()));
                 smallvec![]
             }
-            CreateOnboardingSecretState::Init
-            | CreateOnboardingSecretState::Finish
-            | CreateOnboardingSecretState::Error => smallvec![],
+            CreateSecretState::Init | CreateSecretState::Finish | CreateSecretState::Error => {
+                smallvec![]
+            }
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            CreateOnboardingSecretState::Finish | CreateOnboardingSecretState::Error
+            CreateSecretState::Finish | CreateSecretState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .ok_or(CreateOnboardingSecretError::NotFinished)?
+        self.output.ok_or(CreateSecretError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            CreateOnboardingSecretState::ReadRealmConfig { txn_id }
-            | CreateOnboardingSecretState::CountPending { txn_id, .. }
-            | CreateOnboardingSecretState::WriteRecord { txn_id } => {
+            CreateSecretState::ReadRealmConfig { txn_id }
+            | CreateSecretState::CountPending { txn_id, .. }
+            | CreateSecretState::WriteRecord { txn_id } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
             _ => smallvec![],
@@ -345,12 +335,9 @@ impl Operation for CreateOnboardingSecretOperation {
     }
 }
 
-fn fail(
-    operation: &mut CreateOnboardingSecretOperation,
-    error: CreateOnboardingSecretError,
-) -> Effects {
+fn fail(operation: &mut CreateSecretOperation, error: CreateSecretError) -> Effects {
     let cleanup = operation.abort();
-    operation.state = CreateOnboardingSecretState::Error;
+    operation.state = CreateSecretState::Error;
     operation.output = Some(Err(error));
     cleanup
 }
@@ -373,9 +360,7 @@ pub fn secret_record_key(enrollment_id: Ulid) -> ByteView {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CreateOnboardingSecretError, CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
-    };
+    use super::{CreateSecretError, CreateSecretInput, CreateSecretOperation};
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
@@ -446,7 +431,7 @@ mod tests {
     /// Runs a mint's effects against storage up to its commit and hands that
     /// commit back, so two mints can be interleaved deliberately.
     async fn run_to_commit(
-        operation: &mut CreateOnboardingSecretOperation,
+        operation: &mut CreateSecretOperation,
         context: &DriverContext,
     ) -> StorageEffect {
         let mut queue: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
@@ -476,12 +461,9 @@ mod tests {
             .await;
     }
 
-    async fn mint(
-        context: &DriverContext,
-        owner: UserId,
-    ) -> Result<(), CreateOnboardingSecretError> {
+    async fn mint(context: &DriverContext, owner: UserId) -> Result<(), CreateSecretError> {
         drive(
-            CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+            CreateSecretOperation::new(CreateSecretInput {
                 record: device_record(owner),
             }),
             context,
@@ -497,7 +479,7 @@ mod tests {
 
         assert!(matches!(
             mint(&context, owner).await,
-            Err(CreateOnboardingSecretError::DeviceCapExceeded { limit: 1 })
+            Err(CreateSecretError::DeviceCapExceeded { limit: 1 })
         ));
     }
 
@@ -510,7 +492,7 @@ mod tests {
         mint(&context, owner).await.expect("first device mints");
         assert!(matches!(
             mint(&context, owner).await,
-            Err(CreateOnboardingSecretError::DeviceCapExceeded { limit: 1 })
+            Err(CreateSecretError::DeviceCapExceeded { limit: 1 })
         ));
     }
 
@@ -555,7 +537,7 @@ mod tests {
 
         assert!(matches!(
             mint(&context, owner).await,
-            Err(CreateOnboardingSecretError::DeviceCapExceeded { limit: 1 })
+            Err(CreateSecretError::DeviceCapExceeded { limit: 1 })
         ));
         // Another owner is still unaffected by the records ahead of them.
         assert!(
@@ -583,10 +565,10 @@ mod tests {
         // read conflicts with the winner's insert, so only one commits.
         let owner = UserId::local(Ulid::generate(), realm());
         let (_dir, context) = context_with_cap(Some(1), &[]).await;
-        let mut first = CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+        let mut first = CreateSecretOperation::new(CreateSecretInput {
             record: device_record(owner),
         });
-        let mut second = CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+        let mut second = CreateSecretOperation::new(CreateSecretInput {
             record: device_record(owner),
         });
 
@@ -607,7 +589,7 @@ mod tests {
         second.step(event);
         assert!(matches!(
             second.finalize(),
-            Err(CreateOnboardingSecretError::StorageError(
+            Err(CreateSecretError::StorageError(
                 StorageError::TransactionConflict
             ))
         ));
@@ -633,7 +615,7 @@ mod tests {
 
         assert!(matches!(
             mint(&context, owner).await,
-            Err(CreateOnboardingSecretError::DeviceCapExceeded { limit: 2 })
+            Err(CreateSecretError::DeviceCapExceeded { limit: 2 })
         ));
     }
 
@@ -652,7 +634,7 @@ mod tests {
         let (_dir, context) = context_with_cap(Some(1), &[owner]).await;
 
         drive(
-            CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+            CreateSecretOperation::new(CreateSecretInput {
                 record: OnboardingSecretRecord {
                     mode: OnboardingMode::Server,
                     ..device_record(owner)

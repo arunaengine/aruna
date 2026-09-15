@@ -1,14 +1,14 @@
 use aruna_core::UserId;
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
-    DocumentSyncRevision, DocumentSyncTarget,
+    DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
+    DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE;
-use aruna_core::metrics::WatchAuthorizationMetricReason;
+use aruna_core::metrics::WatchMetricReason;
 use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
 use aruna_core::structs::{
     AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, PlacementRef,
@@ -47,7 +47,7 @@ pub const WATCH_SUBSCRIPTION_UNAVAILABLE: &str =
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WatchSubscriptionError {
     #[error("{WATCH_SUBSCRIPTION_UNAUTHORIZED}: {}", .0.as_str())]
-    Unauthorized(WatchAuthorizationMetricReason),
+    Unauthorized(WatchMetricReason),
     #[error("{WATCH_SUBSCRIPTION_UNAVAILABLE}: {0}")]
     AuthorizationUnavailable(String),
     #[error("watch path prefix must not be empty")]
@@ -74,8 +74,8 @@ enum CreateFailure {
 
 #[derive(Clone)]
 struct WatchReplication {
-    revision: DocumentSyncChange,
-    outbox: DocumentSyncOutboxRecord,
+    revision: DocumentChange,
+    outbox: DocumentOutboxRecord,
 }
 
 pub async fn create_local_watch(
@@ -149,7 +149,7 @@ fn validated_subscription(
     validate_subscription_fields(&path_prefix, event_mask)?;
     if !authorization.is_valid() {
         return Err(WatchSubscriptionError::Unauthorized(
-            WatchAuthorizationMetricReason::InvalidState,
+            WatchMetricReason::InvalidState,
         ));
     }
 
@@ -495,8 +495,8 @@ async fn delete_once(
     }
 }
 
-fn watch_subscription_target(owner: UserId, watch_id: Ulid) -> DocumentSyncTarget {
-    DocumentSyncTarget::WatchSubscription { owner, watch_id }
+fn watch_subscription_target(owner: UserId, watch_id: Ulid) -> DocumentTarget {
+    DocumentTarget::WatchSubscription { owner, watch_id }
 }
 
 fn watch_upsert_replication(
@@ -504,7 +504,7 @@ fn watch_upsert_replication(
     subscription: &WatchSubscription,
 ) -> Result<WatchReplication, WatchSubscriptionError> {
     let outbox_id = Ulid::generate();
-    let revision = DocumentSyncChange {
+    let revision = DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -512,7 +512,7 @@ fn watch_upsert_replication(
             actor: local_node_id,
             updated_at_ms: subscription.created_at_ms,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement: PlacementRef::NIL,
     };
     let target = watch_subscription_target(subscription.owner, subscription.watch_id);
@@ -521,7 +521,7 @@ fn watch_upsert_replication(
         local_node_id,
         target,
         Vec::new(),
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: subscription
                 .to_bytes()
                 .map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?,
@@ -540,7 +540,7 @@ fn watch_delete_replication(
     now_ms: u64,
 ) -> WatchReplication {
     let outbox_id = Ulid::generate();
-    let revision = DocumentSyncChange {
+    let revision = DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 2,
@@ -548,7 +548,7 @@ fn watch_delete_replication(
             actor: local_node_id,
             updated_at_ms: now_ms,
         },
-        kind: DocumentSyncChangeKind::Delete,
+        kind: DocumentChangeKind::Delete,
         placement: PlacementRef::NIL,
     };
     let outbox = new_identified_record(
@@ -556,7 +556,7 @@ fn watch_delete_replication(
         local_node_id,
         watch_subscription_target(owner, watch_id),
         Vec::new(),
-        DocumentSyncOutboxEvent::Delete { change: revision },
+        DocumentOutboxEvent::Delete { change: revision },
         PlacementRef::NIL,
         false,
     );
@@ -777,7 +777,7 @@ async fn abort_and_classify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::fixtures::notifications::{context, temp_storage, user};
+    use crate::tests::notifications::{context, temp_storage, user};
     use aruna_core::NodeId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
