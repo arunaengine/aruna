@@ -92,14 +92,14 @@ pub struct DhtPutStats {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DhtGetCompletedReason {
+pub enum GetCompletedReason {
     LocalValue,
     RemoteValue,
     LookupExhausted,
     FirstUsable,
 }
 
-impl DhtGetCompletedReason {
+impl GetCompletedReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LocalValue => "local_value",
@@ -118,7 +118,7 @@ pub struct DhtPeerError {
 
 #[derive(Debug, Clone)]
 pub struct DhtGetStats {
-    pub completed_reason: DhtGetCompletedReason,
+    pub completed_reason: GetCompletedReason,
     pub local_value_count: usize,
     pub remote_value_count: usize,
     pub queried_peer_count: usize,

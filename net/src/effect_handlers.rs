@@ -191,13 +191,13 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
     match effect {
         NetEffect::Dht(dht_effect) => handle_dht_effect(ctx, dht_effect).await,
         NetEffect::DocumentSync(document_sync_effect) => match document_sync_effect {
-            aruna_core::DocumentSyncEffect::PublishDocuments { documents, peers } => {
+            aruna_core::DocumentEffect::PublishDocuments { documents, peers } => {
                 NetEvent::DocumentSync(document_sync.publish_documents(documents, peers).await)
             }
-            aruna_core::DocumentSyncEffect::SyncDocument { topic, peers } => {
+            aruna_core::DocumentEffect::SyncDocument { topic, peers } => {
                 NetEvent::DocumentSync(document_sync.sync_document_event(topic, peers).await)
             }
-            aruna_core::DocumentSyncEffect::SyncDocuments { topics, peers } => {
+            aruna_core::DocumentEffect::SyncDocuments { topics, peers } => {
                 NetEvent::DocumentSync(document_sync.sync_documents_event(topics, peers).await)
             }
         },

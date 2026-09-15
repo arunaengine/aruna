@@ -5,7 +5,7 @@ pub const MAX_USER_ATTRIBUTE_KEY_BYTES: usize = 128;
 pub const MAX_USER_ATTRIBUTE_VALUE_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum UserAttributeValidationError {
+pub enum UserAttributeError {
     #[error("invalid user attribute key: {0}")]
     InvalidKey(String),
     #[error("invalid user attribute value for key: {0}")]
@@ -14,37 +14,34 @@ pub enum UserAttributeValidationError {
     TooManyAttributes,
 }
 
-pub fn validate_attribute_key(key: &str) -> Result<(), UserAttributeValidationError> {
+pub fn validate_attribute_key(key: &str) -> Result<(), UserAttributeError> {
     if key.is_empty()
         || key.len() > MAX_USER_ATTRIBUTE_KEY_BYTES
         || !key
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
     {
-        return Err(UserAttributeValidationError::InvalidKey(key.to_string()));
+        return Err(UserAttributeError::InvalidKey(key.to_string()));
     }
 
     Ok(())
 }
 
-pub fn validate_attribute_value(
-    key: &str,
-    value: &str,
-) -> Result<(), UserAttributeValidationError> {
+pub fn validate_attribute_value(key: &str, value: &str) -> Result<(), UserAttributeError> {
     if value.len() > MAX_USER_ATTRIBUTE_VALUE_BYTES
         || value.chars().any(char::is_control)
         || (key.starts_with(crate::user_profile::VISIBILITY_PREFIX)
             && !matches!(value, "public" | "private"))
     {
-        return Err(UserAttributeValidationError::InvalidValue(key.to_string()));
+        return Err(UserAttributeError::InvalidValue(key.to_string()));
     }
 
     Ok(())
 }
 
-pub fn validate_attribute_count(count: usize) -> Result<(), UserAttributeValidationError> {
+pub fn validate_attribute_count(count: usize) -> Result<(), UserAttributeError> {
     if count > MAX_USER_ATTRIBUTES {
-        return Err(UserAttributeValidationError::TooManyAttributes);
+        return Err(UserAttributeError::TooManyAttributes);
     }
 
     Ok(())
@@ -54,7 +51,7 @@ pub fn validate_attribute_count(count: usize) -> Result<(), UserAttributeValidat
 mod tests {
     use super::{
         MAX_USER_ATTRIBUTE_KEY_BYTES, MAX_USER_ATTRIBUTE_VALUE_BYTES, MAX_USER_ATTRIBUTES,
-        UserAttributeValidationError, validate_attribute_count, validate_attribute_key,
+        UserAttributeError, validate_attribute_count, validate_attribute_key,
         validate_attribute_value,
     };
 
@@ -77,14 +74,14 @@ mod tests {
         for key in ["", "display name", "\u{fc}mlaut", "owner/slash"] {
             assert_eq!(
                 validate_attribute_key(key),
-                Err(UserAttributeValidationError::InvalidKey(key.to_string()))
+                Err(UserAttributeError::InvalidKey(key.to_string()))
             );
         }
 
         let key = "a".repeat(MAX_USER_ATTRIBUTE_KEY_BYTES + 1);
         assert_eq!(
             validate_attribute_key(&key),
-            Err(UserAttributeValidationError::InvalidKey(key))
+            Err(UserAttributeError::InvalidKey(key))
         );
     }
 
@@ -101,9 +98,7 @@ mod tests {
     fn user_values_text() {
         assert_eq!(
             validate_attribute_value("department", "bio\nmedicine"),
-            Err(UserAttributeValidationError::InvalidValue(
-                "department".to_string()
-            ))
+            Err(UserAttributeError::InvalidValue("department".to_string()))
         );
 
         assert_eq!(
@@ -111,9 +106,7 @@ mod tests {
                 "department",
                 &"a".repeat(MAX_USER_ATTRIBUTE_VALUE_BYTES + 1)
             ),
-            Err(UserAttributeValidationError::InvalidValue(
-                "department".to_string()
-            ))
+            Err(UserAttributeError::InvalidValue("department".to_string()))
         );
     }
 
@@ -122,7 +115,7 @@ mod tests {
         assert_eq!(validate_attribute_count(MAX_USER_ATTRIBUTES), Ok(()));
         assert_eq!(
             validate_attribute_count(MAX_USER_ATTRIBUTES + 1),
-            Err(UserAttributeValidationError::TooManyAttributes)
+            Err(UserAttributeError::TooManyAttributes)
         );
     }
 }

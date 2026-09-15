@@ -1,14 +1,11 @@
 //! DHT-signed realm discovery and persisted peer state: announcement
-//! publication, endpoint lookup/validation, and the peer authorization list.
-//!
-//! Publication and lookup are I/O; selection and validation below them are
-//! pure decisions over verified records, so the tests can pin them without a
-//! live DHT.
+//! publication, endpoint lookup and validation, and the peer authorization list.
+//! The decisions below the I/O are pure, so tests pin them without a live DHT.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{DhtGetOptions, StorageEffect};
 use aruna_core::events::{DhtEntry, Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -395,7 +392,7 @@ pub(crate) async fn read_persisted_peers(
     realm_id: RealmId,
     local_id: NodeId,
 ) -> Result<Option<Vec<NodeId>>> {
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: target.storage_keyspace().to_string(),

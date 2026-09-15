@@ -1,10 +1,6 @@
-//! Network construction in named, ordered stages.
-//!
-//! `NetHandle::new` stays linear and small: bind the endpoint and freeze the
-//! configuration, load persisted peer and admission state, start the long-lived
-//! services, then start the background loops. The endpoint becomes externally
-//! reachable exactly at `NetworkEndpoint::bind`, the same point as before; every
-//! later stage only observes or serves that socket.
+//! Network construction in named, ordered stages: bind the endpoint and freeze
+//! the configuration, load persisted peer and admission state, start services,
+//! then the loops. The socket is reachable exactly at `NetworkEndpoint::bind`.
 
 use std::sync::Arc;
 
@@ -28,8 +24,7 @@ use ulid::Ulid;
 use crate::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use crate::connection_pool::{ConnectionPool, ConnectionPoolOptions};
 use crate::connectivity::{
-    PeerConnectivityEvent, PeerConnectivityManagerState, run_connectivity_manager,
-    send_connectivity_event,
+    PeerEvent, PeerManagerState, run_connectivity_manager, send_connectivity_event,
 };
 use crate::dht::DhtHandle;
 use crate::dht::handle::DhtSpawnResources;
@@ -40,8 +35,8 @@ use crate::error::{NetError, Result};
 use crate::eviction::spawn_eviction_maintenance;
 use crate::streams::{self, InboundAdmission, StreamsService};
 use crate::tasks::{
-    BackgroundTasks, MAX_INBOUND_APP_STREAM_HANDLERS, spawn_accept_loop,
-    spawn_dht_inbound_forwarder, spawn_effect_dispatch, spawn_inbound_stream_dispatch,
+    BackgroundTasks, MAX_INBOUND_APP_STREAM_HANDLERS, spawn_accept_loop, spawn_dht_forwarder,
+    spawn_effect_dispatch, spawn_stream_dispatch,
 };
 use crate::{
     EffectHandle, InboundEventHandler, NetHandle, NetInner, unique_endpoint_addrs,
@@ -237,10 +232,10 @@ struct PeerAdmissionState {
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
     inbound_admission: InboundAdmission,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
-    peer_connectivity: Arc<Mutex<PeerConnectivityManagerState>>,
+    peer_connectivity: Arc<Mutex<PeerManagerState>>,
     network_diagnostics: Arc<Mutex<NetworkDiagnosticsState>>,
-    peer_connectivity_tx: mpsc::Sender<PeerConnectivityEvent>,
-    peer_connectivity_rx: Option<mpsc::Receiver<PeerConnectivityEvent>>,
+    peer_connectivity_tx: mpsc::Sender<PeerEvent>,
+    peer_connectivity_rx: Option<mpsc::Receiver<PeerEvent>>,
 }
 
 impl PeerAdmissionState {
@@ -265,7 +260,7 @@ impl PeerAdmissionState {
             inbound_admission.mark_materialized();
         }
         let dht_signed_authorized_nodes = Arc::new(RwLock::new(realm_peer_nodes.clone()));
-        let peer_connectivity = Arc::new(Mutex::new(PeerConnectivityManagerState::new(
+        let peer_connectivity = Arc::new(Mutex::new(PeerManagerState::new(
             &realm_peer_nodes,
             "realm_config",
         )));
@@ -274,7 +269,7 @@ impl PeerAdmissionState {
         for node_id in &runtime.peer_hints {
             send_connectivity_event(
                 &peer_connectivity_tx,
-                PeerConnectivityEvent::ManagePeer {
+                PeerEvent::ManagePeer {
                     node_id: *node_id,
                     source: "configured_peer".to_string(),
                     immediate: true,
@@ -459,11 +454,11 @@ impl BackgroundRuntime {
         let (dht_tx, dht_rx) = mpsc::channel(64);
         let (stream_tx, stream_rx) = mpsc::channel(64);
         let dht_inbound_tx = dht_resources.inbound_stream_tx.clone();
-        tasks.push(spawn_dht_inbound_forwarder(dht_rx, dht_inbound_tx));
+        tasks.push(spawn_dht_forwarder(dht_rx, dht_inbound_tx));
 
         let inbound_stream_handlers =
             Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_APP_STREAM_HANDLERS));
-        tasks.push(spawn_inbound_stream_dispatch(
+        tasks.push(spawn_stream_dispatch(
             stream_rx,
             services.dht.clone(),
             inbound_handler.clone(),

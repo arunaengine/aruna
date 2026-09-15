@@ -1,7 +1,6 @@
 //! Network configuration: bind address, realm identity, discovery and relay
-//! selection, and the durable document-sync runtime settings. Parsing and
-//! formatting of endpoint addresses live here so the encoded text and the
-//! `NetConfig` shape stay one responsibility.
+//! selection, and durable document-sync runtime settings. Endpoint address
+//! parsing and formatting live here beside the `NetConfig` shape they encode.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

@@ -1,8 +1,6 @@
 //! Crate-wide aliases for the operation contract: effects, transaction and
-//! storage key types, and the ULID aliases.
-//!
-//! The type-safe identifiers are owned by [`crate::id`] and [`crate::user_id`];
-//! name those modules or the crate-root exports directly.
+//! storage key types, and the ULID aliases; name [`crate::id`] and
+//! [`crate::user_id`] or the crate-root exports for the type-safe identifiers.
 
 use byteview::ByteView;
 use smallvec::SmallVec;

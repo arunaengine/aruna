@@ -1,11 +1,6 @@
-//! Eviction maintenance beside the document-sync service it maintains.
-//!
-//! Irokle journals evictions before reset; this module converts journalled
-//! entries into durable outbox rows and releases an entry only once its
-//! replacement records commit. Progress happens on handler registration and
-//! on new evictions, with a bounded retry timer for an otherwise idle node.
-//! The flush decision (which entries may be released) stays in
-//! `flush_evicted_documents`; the loop owns the waits and the receiver.
+//! Eviction maintenance beside the document-sync service it maintains: Irokle
+//! journal entries become durable outbox rows, and an entry is released only
+//! once its replacement records commit. `flush_evicted_documents` decides.
 
 use std::mem;
 use std::sync::Arc;
