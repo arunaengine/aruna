@@ -7,9 +7,11 @@ use aruna_core::compute::runtimes::{
     QUICK_RUNTIMES, QuickRuntime, SESSION_RUNTIMES, SESSION_TAG, SESSION_TAG_NOTEBOOK,
     SessionRuntime, quick_runtime,
 };
-use aruna_core::structs::{
-    JobPayload, OBJECT_CONTENT_TYPE_KEY, Permission, group_permission_path, key_content_type,
+use aruna_core::structs::execution::job::JobPayload;
+use aruna_core::structs::storage::blob::{
+    OBJECT_CONTENT_TYPE_KEY, group_permission_path, key_content_type,
 };
+use aruna_core::structs::identity::auth::Permission;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::command::{
     CollisionPolicy, ExecutionInput, ExecutionOutput, ExecutionTarget, InputMode, SessionMountSpec,
@@ -19,7 +21,7 @@ use aruna_operations::jobs::lifecycle::family_report;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_job_routed,
 };
-use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation};
+use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
@@ -951,7 +953,7 @@ fn request_bearer(parts: &http::request::Parts) -> Option<crate::auth::Validated
 
 /// A malformed job id is absence to the shared parser, which reads to a caller
 /// as a missing job rather than a wrong argument.
-fn parse_job(id: &str) -> Result<aruna_core::structs::JobId, CallToolResult> {
+fn parse_job(id: &str) -> Result<aruna_core::structs::execution::job::JobId, CallToolResult> {
     crate::jobs::parse_job_id(id).map_err(|_| {
         bad_request(
             "id must be a 26-character job ULID such as 01JZ8Y6T0K4W7M2N9Q5R3S8V1X; read job_id \
@@ -960,7 +962,7 @@ fn parse_job(id: &str) -> Result<aruna_core::structs::JobId, CallToolResult> {
     })
 }
 
-fn parse_job_state(value: &str) -> Result<aruna_core::structs::JobState, CallToolResult> {
+fn parse_job_state(value: &str) -> Result<aruna_core::structs::execution::job::JobState, CallToolResult> {
     crate::routes::jobs::parse_state(value).map_err(|_| {
         bad_request(
             "state must be one of queued, claimed, preparing, ready, running, cancelling, \
@@ -1030,7 +1032,7 @@ fn map_job_request(error: crate::jobs::JobRequestError) -> crate::error::ServerE
 
 async fn compute_probe(
     server: &McpServer,
-    auth: &aruna_core::structs::AuthContext,
+    auth: &aruna_core::structs::identity::auth::AuthContext,
     permission: Permission,
     extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {

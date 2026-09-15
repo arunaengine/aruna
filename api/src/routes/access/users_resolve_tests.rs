@@ -2,7 +2,7 @@ use super::{ResolveUsersRequest, resolve_users};
 use crate::error::ServerError;
 use crate::tests::users::{realm_auth, setup_state};
 use aruna_core::UserId;
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use axum::extract::State;
 use axum::{Extension, Json};
 use ulid::Ulid;

@@ -6,9 +6,8 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{
-    Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmId, RealmNodeKind,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_operations::device::publish_queue::{PublishEntry, PublishState};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;

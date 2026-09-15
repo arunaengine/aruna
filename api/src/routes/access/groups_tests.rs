@@ -16,11 +16,14 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     GROUP_KEYSPACE, S3_BUCKET_KEYSPACE, USER_KEYSPACE,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities,
-    RealmId, RealmNodeKind, Role, User, VersionKey, bucket_permission_path, object_permission_path,
+use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Role};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
+    CurrentVersionPointer, VersionKey, bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+use aruna_core::structs::identity::user::User;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::driver::drive;
 use aruna_operations::groups::list_groups::ListGroupOperation;
@@ -142,7 +145,7 @@ async fn setup_state() -> (Arc<ServerState>, TempDir) {
     // Policy loading fails closed without the realm config document, and a
     // node the configuration does not name has no resolvable kind.
     let mut config =
-        aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.ensure_node(state.get_node_id(), RealmNodeKind::Management);
     store_bytes(
         &state,
@@ -227,7 +230,7 @@ async fn setup_admin_state() -> (Arc<ServerState>, UserId, TempDir) {
 
 async fn update_config(
     state: &ServerState,
-    mutate: impl FnOnce(&mut aruna_core::structs::RealmConfigDocument),
+    mutate: impl FnOnce(&mut aruna_core::structs::identity::realm::RealmConfigDocument),
 ) {
     let realm_id = state.get_realm_id();
     let mut config = drive(

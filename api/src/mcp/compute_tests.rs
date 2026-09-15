@@ -140,7 +140,7 @@ fn parse_job_reasons() {
             .unwrap_or_default()
             .contains("job ULID")
     );
-    let id = aruna_core::structs::JobId::from_bytes([7u8; 16]).to_string();
+    let id = aruna_core::structs::execution::job::JobId::from_bytes([7u8; 16]).to_string();
     assert!(parse_job(&id).is_ok());
 }
 

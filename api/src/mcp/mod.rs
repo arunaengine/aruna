@@ -119,10 +119,10 @@ impl ServerHandler for McpServer {
 
 pub(crate) fn request_auth(
     parts: &http::request::Parts,
-) -> Result<aruna_core::structs::AuthContext, CallToolResult> {
+) -> Result<aruna_core::structs::identity::auth::AuthContext, CallToolResult> {
     parts
         .extensions
-        .get::<Option<aruna_core::structs::AuthContext>>()
+        .get::<Option<aruna_core::structs::identity::auth::AuthContext>>()
         .cloned()
         .flatten()
         .ok_or_else(|| server_error(crate::error::ServerError::Unauthorized))
@@ -211,9 +211,9 @@ pub(crate) fn parse_ulid(
 
 pub(crate) async fn authorize_tool(
     state: &ServerState,
-    auth: &aruna_core::structs::AuthContext,
+    auth: &aruna_core::structs::identity::auth::AuthContext,
     path: String,
-    permission: aruna_core::structs::Permission,
+    permission: aruna_core::structs::identity::auth::Permission,
     extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), crate::error::ServerError> {
     crate::auth::ensure_permission_with(state, auth, path, permission, extras).await
@@ -223,8 +223,8 @@ pub(crate) async fn authorize_tool(
 /// the realm deny policies apply, and unreadable policy state refuses.
 pub(crate) async fn authorize_self(
     state: &ServerState,
-    auth: &aruna_core::structs::AuthContext,
-    permission: aruna_core::structs::Permission,
+    auth: &aruna_core::structs::identity::auth::AuthContext,
+    permission: aruna_core::structs::identity::auth::Permission,
     extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), crate::error::ServerError> {
     let realm_id = state.get_realm_id();
@@ -297,7 +297,7 @@ fn allowed_hosts(api_public_url: Option<&str>) -> Vec<String> {
 async fn mcp_auth(State(state): State<Arc<ServerState>>, request: Request, next: Next) -> Response {
     let auth = request
         .extensions()
-        .get::<Option<aruna_core::structs::AuthContext>>()
+        .get::<Option<aruna_core::structs::identity::auth::AuthContext>>()
         .cloned()
         .flatten();
     match require_unrestricted_auth(&state, auth) {

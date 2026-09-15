@@ -2,10 +2,12 @@ use super::*;
 use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::{
-    Actor, MAX_ASSISTANT_CHAT_BYTES, MAX_ASSISTANT_CHAT_TURNS, MAX_ASSISTANT_CHATS,
-    MAX_ASSISTANT_TURN_BYTES, NodeCapabilities, RealmId,
+    MAX_ASSISTANT_CHAT_BYTES, MAX_ASSISTANT_CHAT_TURNS, MAX_ASSISTANT_CHATS,
+    MAX_ASSISTANT_TURN_BYTES,
 };
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use axum::response::IntoResponse;
 use tempfile::TempDir;

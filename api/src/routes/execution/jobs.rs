@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use aruna_core::structs::{
-    AuthContext, CompositionError, ExportReportRow, ImportReportRow, JOB_SYSTEM_ENTRY_PREFIX,
-    JobId, JobRecord, JobState,
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::execution::job::{
+    CompositionError, ExportReportRow, ImportReportRow, JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord,
+    JobState,
 };
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::device::compute::LocalExecutionError;
@@ -21,7 +22,7 @@ use aruna_operations::jobs::service::{
 };
 use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::jobs::{JOB_REPORT_MAX_ROWS, JobRouteError};
-use aruna_operations::s3::get_object::ObjectRangeRequest;
+use aruna_operations::s3::object::get::ObjectRangeRequest;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
@@ -709,7 +710,7 @@ pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
 }
 
 pub(crate) fn output_response(
-    output: &aruna_core::structs::OutputObject,
+    output: &aruna_core::structs::execution::job::OutputObject,
     endpoint_url: Option<&String>,
 ) -> JobOutputResponse {
     JobOutputResponse {
@@ -718,7 +719,7 @@ pub(crate) fn output_response(
         execution_id: output.execution_id.to_string(),
         container_path: output.container_path.clone(),
         size: output.size,
-        content_type: aruna_core::structs::key_content_type(&output.key).to_string(),
+        content_type: aruna_core::structs::storage::blob::key_content_type(&output.key).to_string(),
         key: output.key.clone(),
         digest: output.digest.clone(),
         endpoint_url: endpoint_url.cloned(),
@@ -1516,7 +1517,7 @@ fn decode_report_row(
             serde_json::to_value(row)
         }
         JobKind::Execution => {
-            use aruna_core::structs::{SessionReportDetail, SessionReportRow};
+            use aruna_core::structs::execution::job::{SessionReportDetail, SessionReportRow};
 
             let row: SessionReportRow = postcard::from_bytes(value)
                 .map_err(|error| ServerError::InternalError(error.to_string()))?;

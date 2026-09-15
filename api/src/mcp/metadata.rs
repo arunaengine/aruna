@@ -7,7 +7,8 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
     parse_ulid, request_auth, server_error, tool_extras,
 };
-use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_operations::metadata::api::{
     DocumentQueryRequest, ExportMetadataRequest, MetadataQueryRequest, MetadataReferencesRequest,
     MetadataSearchRequest, RoCrateExportView, query_metadata, query_metadata_document,
@@ -997,10 +998,8 @@ mod authorization_tests {
         seed_group_docs, seed_realm_auth, test_context, test_state, test_storage, write_doc,
     };
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::structs::{
-        Actor, NodeCapabilities, PathRestriction, Permission, RealmConfigDocument, RealmId,
-        RealmNodeKind,
-    };
+    use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction, Permission};
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::drive;
     use aruna_operations::metadata::MetadataHandle;

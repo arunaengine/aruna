@@ -11,19 +11,19 @@ use aruna_compute::session::{
     EndReason, MAX_SCRATCH_READ_BYTES, PendingInput, Session, SessionError, StagedInput,
 };
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::{
-    AuthContext, CopyJobSpec, JobId, JobPayload, JobRecord, JobState, Permission, key_content_type,
-};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::execution::job::{CopyJobSpec, JobId, JobPayload, JobRecord, JobState};
+use aruna_core::structs::storage::blob::key_content_type;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::lifecycle::ids::session_of;
 use aruna_operations::jobs::service::read_session_reason;
 use aruna_operations::jobs::service::submit_copy_job;
 use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::s3::copy_object::{
+use aruna_operations::s3::object::copy::{
     CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
-use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -931,7 +931,7 @@ fn failed_input(dest_key: String, error: &ServerError) -> FailedInputResponse {
 async fn bucket_info(
     context: &aruna_operations::driver::DriverContext,
     bucket: &str,
-) -> ServerResult<aruna_core::structs::BucketInfo> {
+) -> ServerResult<aruna_core::structs::storage::blob::BucketInfo> {
     match drive(GetBucketOperation::new(bucket.to_string()), context).await {
         Ok(info) => Ok(info),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),

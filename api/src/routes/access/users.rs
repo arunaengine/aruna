@@ -7,10 +7,10 @@ use crate::routes::onboarding::authorize_onboarding_admin;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
-use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument,
-    Role, SessionKind, User,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role, SessionKind};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs as now_timestamp;
 use aruna_operations::auth::token_subject::{SubjectCheckError, SubjectCheckOperation};
 use aruna_operations::device::remove_node::{

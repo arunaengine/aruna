@@ -7,12 +7,12 @@ use crate::tests::routes::{
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::structs::NodeCapabilities;
-use aruna_core::structs::RealmId;
-use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, PathRestriction, Permission,
-    RealmAuthorizationDocument, RealmConfigDocument, group_permission_path,
-};
+use aruna_core::structs::identity::auth::NodeCapabilities;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
+use aruna_core::structs::storage::blob::group_permission_path;
 use std::sync::Arc;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -111,7 +111,7 @@ async fn scoped_state(
         group_id,
         roles: HashMap::from([(
             role_id,
-            aruna_core::structs::Role {
+            aruna_core::structs::identity::auth::Role {
                 role_id,
                 name: "scoped".to_string(),
                 permissions: permissions.into_iter().collect(),
@@ -348,15 +348,15 @@ fn group_root_canonical() {
 fn permission_case_insensitive() {
     assert_eq!(
         parse_permission("read").unwrap(),
-        aruna_core::structs::Permission::READ
+        aruna_core::structs::identity::auth::Permission::READ
     );
     assert_eq!(
         parse_permission("WRITE").unwrap(),
-        aruna_core::structs::Permission::WRITE
+        aruna_core::structs::identity::auth::Permission::WRITE
     );
     assert_eq!(
         parse_permission("Deny").unwrap(),
-        aruna_core::structs::Permission::DENY
+        aruna_core::structs::identity::auth::Permission::DENY
     );
 }
 

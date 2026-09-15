@@ -2,7 +2,8 @@ use super::{
     JsonPayload, McpServer, empty_extras, explained, internal_error, parse_ulid, request_auth,
     server_error, tool_extras,
 };
-use aruna_core::structs::{AuthContext, Group, Permission, Role};
+use aruna_core::structs::identity::auth::{AuthContext, Permission, Role};
+use aruna_core::structs::identity::group::Group;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};

@@ -17,7 +17,7 @@ use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{ProfilePreviewRequest, ProfilePreviewResponse, ensure_metadata_scope};
 use crate::server_state::ServerState;
-use aruna_core::structs::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::device::delete_draft::{DeleteDraftError, DeleteDraftOperation};
 use aruna_operations::device::enqueue_draft::{
     EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation,

@@ -5,7 +5,8 @@ use super::{
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{AssistantProvider, AssistantProviderKind, AuthContext};
+use aruna_core::structs::{AssistantProvider, AssistantProviderKind};
+use aruna_core::structs::identity::auth::AuthContext;
 use axum::Extension;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, Request, State};

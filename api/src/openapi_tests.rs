@@ -822,7 +822,7 @@ async fn accepts_runtime_examples() {
         wrapping_public_key: None,
         delegation_signature: Some("<realm-delegation-signature>".to_string()),
         onboarding_sync_ticket: "<one-time-onboarding-sync-ticket>".to_string(),
-        realm_endpoints: vec![aruna_core::structs::StaticRealmEndpoint {
+        realm_endpoints: vec![aruna_core::structs::identity::realm::StaticRealmEndpoint {
             node_id: endpoint_addr().id.to_string(),
             endpoint_addr: format!("{};ip:192.0.2.10:4433", endpoint_addr().id),
         }],

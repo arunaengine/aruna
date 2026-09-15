@@ -9,10 +9,13 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
-use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, JobError, NodeCapabilities, OutputObject,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess,
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::execution::job::{JobError, OutputObject};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
+use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::insert_job;
@@ -270,7 +273,7 @@ fn maps_submit_errors() {
     // must keep the status the native submit surface answers with.
     use aruna_core::ClockHealthError;
     use aruna_core::compute_quota::{QuotaDenied, QuotaDimension, QuotaScope};
-    use aruna_core::structs::CompositionError;
+    use aruna_core::structs::execution::job::CompositionError;
     use aruna_operations::jobs::submit::SubmitJobError;
 
     let cases = [
@@ -896,10 +899,12 @@ fn view_projections() {
 /// The replicated family behind one succeeded distributed task.
 fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
     use aruna_core::jobs::{JobKind, JobStatusView};
-    use aruna_core::structs::{
+    use aruna_core::structs::execution::job::{
         EffectiveResources, JobAdmissionRecord, JobProgress, JobRetryPolicy, LogicalJobSpec,
-        LogicalJobState, OutputObject, PlacementRef, RealmId, SubmissionId, WorkspaceMode,
+        LogicalJobState, OutputObject, SubmissionId, WorkspaceMode,
     };
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_operations::jobs::lifecycle::FamilyReport;
 
     let realm_id = RealmId([1u8; 32]);
@@ -942,7 +947,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
         group_id: payload.group_id,
         created_by,
         created_at_ms: 10,
-        retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
+        retention_ms: aruna_core::structs::execution::job::DEFAULT_JOB_RETENTION_MS,
         payload,
         request_digest: [7u8; 32],
         spec_digest: [8u8; 32],
@@ -1028,7 +1033,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
 #[test]
 fn family_preserves_versions() {
     // TES preserves canonical output versions and reports none before canonical success.
-    use aruna_core::structs::LogicalJobState;
+    use aruna_core::structs::execution::job::LogicalJobState;
 
     let report = family_fixture();
     let version_id = Ulid::from_bytes([9u8; 16]);
@@ -1146,7 +1151,8 @@ async fn management_state() -> (TempDir, Arc<ServerState>) {
 }
 
 async fn enroll_device(state: &ServerState, owner: UserId) {
-    use aruna_core::structs::{Actor, RealmConfigDocument, RealmNodeKind};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
     config.seed_default_placement();
     config.ensure_node(node_id(), RealmNodeKind::User { owner });

@@ -4,10 +4,9 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{
-    Actor, EntryState, NodeCapabilities, RealmConfigDocument, RealmId, RealmNodeKind,
-    SyncActionRecord, SyncBase, SyncedFolder,
-};
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+use aruna_core::structs::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::types::{Key, Value};
 use aruna_operations::device::sync::repository::{action_entry, base_entry, folder_entry};
 use aruna_operations::driver::DriverContext;

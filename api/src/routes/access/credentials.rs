@@ -1,16 +1,15 @@
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{
-    AuthContext, PathRestriction, Permission, UserAccess, group_permission_path,
-};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::storage::blob::{UserAccess, group_permission_path};
 use aruna_operations::driver::drive;
-use aruna_operations::s3::create_access::{
+use aruna_operations::s3::access::create::{
     CreateUserConfig, CreateUserError, CreateUserOperation, DEFAULT_CREDENTIAL_TTL,
 };
-use aruna_operations::s3::get_access::{GetAccessError, GetAccessOperation};
-use aruna_operations::s3::list_access::{ListUserInput, ListUserOperation};
-use aruna_operations::s3::revoke_access::{RevokeUserError, RevokeUserOperation};
+use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
+use aruna_operations::s3::access::list::{ListUserInput, ListUserOperation};
+use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};

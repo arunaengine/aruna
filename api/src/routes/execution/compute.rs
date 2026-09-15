@@ -5,10 +5,11 @@
 use std::sync::Arc;
 
 use aruna_core::compute_quota::{ComputeQuota, ResourceTotals};
-use aruna_core::structs::{
-    Actor, AuthContext, GroupComputeQuota, LocationLink, Permission, RealmComputeConfig,
-    policy_admin_path,
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::placement::compute_config::{
+    GroupComputeQuota, LocationLink, RealmComputeConfig,
 };
+use aruna_core::structs::placement::policy_document::policy_admin_path;
 use aruna_operations::driver::drive;
 use aruna_operations::node::node_info::{
     departure_report, group_demand, read_info_documents, read_operator_drain, set_operator_drain,

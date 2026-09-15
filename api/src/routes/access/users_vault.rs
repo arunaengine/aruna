@@ -3,7 +3,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::{AuthContext, UserVault};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::user_vault::UserVault;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::driver::drive;
 use aruna_operations::users::user_vault::{
@@ -211,7 +212,7 @@ pub async fn delete_vault(
 mod tests {
     use super::*;
     use crate::tests::users::{realm_auth, setup_state};
-    use aruna_core::structs::MAX_USER_VAULT_BYTES;
+    use aruna_core::structs::identity::user_vault::MAX_USER_VAULT_BYTES;
     use axum::response::IntoResponse;
 
     async fn read(

@@ -86,7 +86,7 @@ fn folder_error_message() {
         },
         created_by: aruna_core::UserId::local(
             Ulid::from_bytes([5u8; 16]),
-            aruna_core::structs::RealmId::from_bytes([5u8; 32]),
+            aruna_core::structs::identity::realm::RealmId::from_bytes([5u8; 32]),
         ),
         created_at_ms: 7,
         last_reconcile_ms: None,
@@ -124,7 +124,7 @@ fn failed_action_reason() {
         },
         actor: aruna_core::UserId::local(
             Ulid::from_bytes([8u8; 16]),
-            aruna_core::structs::RealmId::from_bytes([5u8; 32]),
+            aruna_core::structs::identity::realm::RealmId::from_bytes([5u8; 32]),
         ),
         at_ms: 11,
         before: Some([1u8; 32]),
@@ -257,7 +257,7 @@ fn projects_deleting_folder() {
         state: FolderState::Deleting,
         created_by: aruna_core::UserId::local(
             Ulid::from_bytes([11u8; 16]),
-            aruna_core::structs::RealmId::from_bytes([5u8; 32]),
+            aruna_core::structs::identity::realm::RealmId::from_bytes([5u8; 32]),
         ),
         created_at_ms: 7,
         last_reconcile_ms: Some(9),

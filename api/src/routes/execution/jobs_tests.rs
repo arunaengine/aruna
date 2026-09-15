@@ -6,14 +6,17 @@ use crate::jobs::{
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::{
-    ArtifactRef, BackendLocation, BackendRef, ExportOmissionCounts, ExportRoCrateResult,
-    ExportRoCrateSpec, FIRST_GRANTABLE_HANDLE, ImportMetadataTarget, ImportReportDetail,
-    ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload,
-    JobProgress, JobResultPayload, NodeCapabilities, PathRestriction, Permission, RealmId,
-    ReasonCode, RoCrateLimits,
+use aruna_core::structs::execution::job::{
+    ArtifactRef, ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec,
+    ImportMetadataTarget, ImportReportDetail, ImportRoCrateResult, ImportRoCrateSource,
+    ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, JobProgress, JobResultPayload, ReasonCode,
+    RoCrateLimits,
 };
-use aruna_core::structs::{
+use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction, Permission};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::job::{
     CollisionPolicy, ComputeResources, ExecutionSpec, OutputDestination, WorkspaceMode,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
@@ -35,10 +38,11 @@ use ulid::Ulid;
 /// One reduced family with a duplicate success and a locally exhausted view.
 fn family_report_fixture() -> FamilyReport {
     use aruna_core::jobs::{JobKind, JobStatusView};
-    use aruna_core::structs::{
+    use aruna_core::structs::execution::job::{
         EffectiveResources, ExecutionSpec, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec,
-        LogicalJobState, OutputObject, PlacementRef, SubmissionId,
+        LogicalJobState, OutputObject, SubmissionId,
     };
+    use aruna_core::structs::placement::placement_record::PlacementRef;
 
     let created_by = user(2);
     let job_id = JobId::from_bytes([3u8; 16]);
@@ -60,7 +64,7 @@ fn family_report_fixture() -> FamilyReport {
         command: vec!["true".to_string()],
         workdir: None,
         env: BTreeMap::new(),
-        resources: aruna_core::structs::ComputeResources::default(),
+        resources: aruna_core::structs::execution::job::ComputeResources::default(),
         executor_constraint: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
@@ -96,7 +100,7 @@ fn family_report_fixture() -> FamilyReport {
             group_id: payload.group_id,
             created_by,
             created_at_ms: 10,
-            retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::DEFAULT_JOB_RETENTION_MS,
             payload,
             request_digest: [7u8; 32],
             spec_digest: [8u8; 32],
@@ -341,7 +345,7 @@ fn report_row(entry_key: &str) -> ImportReportRow {
 
 #[test]
 fn decodes_session_report() {
-    use aruna_core::structs::{SessionReportDetail, SessionReportRow};
+    use aruna_core::structs::execution::job::{SessionReportDetail, SessionReportRow};
 
     let row = SessionReportRow {
         entry_key: "input/0000".to_string(),
@@ -1057,7 +1061,8 @@ async fn management_state() -> (TempDir, Arc<ServerState>) {
 }
 
 async fn enroll_device(state: &ServerState, owner: UserId) {
-    use aruna_core::structs::{Actor, RealmConfigDocument, RealmNodeKind};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
     config.seed_default_placement();
     config.ensure_node(node_id(), RealmNodeKind::User { owner });

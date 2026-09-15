@@ -9,7 +9,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use aruna_core::structs::AuthContext;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::compute::{ComputeStatus, compute_status};
 
 use crate::auth::require_owner;

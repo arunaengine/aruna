@@ -10,12 +10,13 @@ use aruna_core::compute::normalize_container_path;
 use aruna_core::compute::runtimes::SESSION_MOUNT_PREFIX_TAG;
 use aruna_core::id::NodeId;
 use aruna_core::scheduling::MAX_PLAN_INPUTS;
-use aruna_core::structs::{
-    AuthContext, CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec, InputMode,
-    InputSelection, InputSource, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS,
-    NodeCapabilities, OutputDestination, OutputSelection, Permission, WorkspaceMode,
-    WorkspaceOutput, bucket_permission_path, group_permission_path,
+use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
+use aruna_core::structs::execution::job::{
+    CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec, InputMode, InputSelection,
+    InputSource, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
+    OutputSelection, WorkspaceMode, WorkspaceOutput,
 };
+use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::device::compute::{
     LocalExecutionConfig, LocalExecutionError, submit_local_execution,
@@ -30,7 +31,7 @@ use aruna_operations::jobs::lifecycle::routing::session_job;
 use aruna_operations::jobs::lifecycle::submit_external_job;
 use aruna_operations::jobs::service::read_owned_job;
 use aruna_operations::jobs::submit::SubmitJobError;
-use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use ulid::Ulid;
 
 use crate::auth::{ValidatedBearer, require_owner, require_unrestricted_auth};

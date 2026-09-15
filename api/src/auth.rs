@@ -2,10 +2,9 @@ use crate::error::{OidcError, ServerError, ServerResult, TokenError};
 use crate::server_state::ServerState;
 use crate::telemetry::record_auth_context;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::structs::{
-    AuthContext, NodeCapabilities, OidcProviderConfig, Permission, TokenClaims,
-    object_permission_path,
-};
+use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission, TokenClaims};
+use aruna_core::structs::identity::realm::OidcProviderConfig;
+use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_operations::auth::bearer_token::{
     ArunaBearerError, ArunaValidationState, decode_bearer_token,
 };
@@ -441,13 +440,13 @@ struct RevocationBlindState<'a>(&'a ServerState);
 impl ArunaValidationState for RevocationBlindState<'_> {
     async fn is_token_revoked(
         &self,
-        _realm_id: &aruna_core::structs::RealmId,
+        _realm_id: &aruna_core::structs::identity::realm::RealmId,
         _token_hash: &str,
     ) -> Result<bool, ArunaBearerError> {
         Ok(false)
     }
 
-    async fn is_trusted_realm(&self, realm_id: &aruna_core::structs::RealmId) -> bool {
+    async fn is_trusted_realm(&self, realm_id: &aruna_core::structs::identity::realm::RealmId) -> bool {
         self.0.is_trusted_realm(realm_id).await
     }
 
@@ -653,10 +652,9 @@ mod test {
     use aruna_core::handle::Handle;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
-    use aruna_core::structs::OidcProviderConfig;
-    use aruna_core::structs::{
-        Actor, NodeCapabilities, RealmAuthorizationDocument, RealmId, TokenClaims,
-    };
+    use aruna_core::structs::identity::realm::OidcProviderConfig;
+    use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, TokenClaims};
+    use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::auth::request_authorization::AuthorizeError;
@@ -737,7 +735,7 @@ mod test {
         let group_id = Ulid::from_bytes([9u8; 16]);
         assert_eq!(
             blob_permission_path(&state, group_id, "bucket", "nested/file.txt"),
-            aruna_core::structs::object_permission_path(
+            aruna_core::structs::storage::blob::object_permission_path(
                 realm_id,
                 group_id,
                 node_id,

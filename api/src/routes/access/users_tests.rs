@@ -13,10 +13,12 @@ use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord,
 };
-use aruna_core::structs::{
-    Actor, NodeCapabilities, OidcProviderConfig, PathRestriction, Permission, RealmConfigDocument,
-    RealmId, SessionKind, TokenClaims, User, oidc_subject_key,
+use aruna_core::structs::identity::auth::{
+    Actor, NodeCapabilities, PathRestriction, Permission, SessionKind, TokenClaims,
+    oidc_subject_key,
 };
+use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::user::User;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
@@ -1048,7 +1050,7 @@ async fn policy_denies_update() {
         None,
     )
     .await;
-    let admin = aruna_core::structs::AuthContext {
+    let admin = aruna_core::structs::identity::auth::AuthContext {
         user_id: node.realm_admin_id,
         realm_id: node.realm_id,
         path_restrictions: None,
@@ -1145,7 +1147,7 @@ async fn policy_denies_reads() {
         None,
     )
     .await;
-    let admin = aruna_core::structs::AuthContext {
+    let admin = aruna_core::structs::identity::auth::AuthContext {
         user_id: node.realm_admin_id,
         realm_id: node.realm_id,
         path_restrictions: None,

@@ -207,7 +207,8 @@ mod tests {
     use crate::server_state::{PortalStatus, ServerState};
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::{Actor, NodeCapabilities, OidcProviderConfig, RealmId};
+    use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+    use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_storage::storage;

@@ -1,7 +1,8 @@
 use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{Actor, AuthContext, SessionKind, UserSession};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, SessionKind};
+use aruna_core::structs::identity::user_session::UserSession;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::driver::drive;
 use aruna_operations::session::{
@@ -310,7 +311,8 @@ mod tests {
     use crate::tests::routes::{test_context, test_state, test_storage};
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::{NodeCapabilities, RealmId, SessionRef};
+    use aruna_core::structs::identity::auth::{NodeCapabilities, SessionRef};
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use axum::response::IntoResponse;
     use tempfile::TempDir;

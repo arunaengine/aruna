@@ -5,18 +5,20 @@ use crate::error::ServerError;
 use crate::forwarded::{client_ip, external_base_url};
 use crate::rate_limit::LocalKey;
 use crate::server_state::ServerState;
-use aruna_core::structs::{
-    ArunaArn, ArunaArnType, AuthContext, BackendLocation, Permission, SourceMetadata,
-    VersionedObjectArn, W3idIdentifier, object_permission_path,
+use aruna_core::structs::storage::replication::{
+    ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{BackendLocation, object_permission_path};
+use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use aruna_operations::replication::protocol::LocationSummaryRequest;
-use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
-use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -194,7 +196,7 @@ pub struct DrsErrorPayload {
 enum RequestedObjectId {
     CanonicalW3id([u8; 32]),
     ContentHashArn {
-        realm_id: aruna_core::structs::RealmId,
+        realm_id: aruna_core::structs::identity::realm::RealmId,
         node_id: aruna_core::NodeId,
         hash: [u8; 32],
     },
@@ -960,7 +962,7 @@ async fn resolve_content_hash(
     state: &ServerState,
     auth: &AuthContext,
     requested_id: &str,
-    requested_scope: Option<(aruna_core::structs::RealmId, aruna_core::NodeId)>,
+    requested_scope: Option<(aruna_core::structs::identity::realm::RealmId, aruna_core::NodeId)>,
     hash: &[u8; 32],
 ) -> Result<ResolveOutcome, DrsError> {
     if let Some((realm_id, node_id)) = requested_scope

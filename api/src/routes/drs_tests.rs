@@ -13,10 +13,13 @@ use crate::tests::routes::{
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::structs::{
-    Actor, AuthContext, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BucketInfo,
-    NodeCapabilities, RealmId, SourceMetadata, VersionKey, VersionedObjectArn,
+use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BucketInfo, VersionKey,
 };
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::{NodeId, UserId};
 use axum::Extension;
 use axum::body::to_bytes;

@@ -4,10 +4,13 @@ use crate::metadata::map_api_error;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::errors::{AuthorizationError, StorageError};
-use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmId, Role,
-    bucket_permission_path, group_permission_path, object_permission_path, usage_group_key,
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{
+    bucket_permission_path, group_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::usage::usage_group_key;
 use aruna_core::types::RoleId;
 use aruna_operations::device::realm_documents::install_group_docs;
 use aruna_operations::driver::drive;
@@ -32,9 +35,9 @@ use aruna_operations::groups::update_group::{
 use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::stats::count_group_purpose;
 use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
-use aruna_operations::s3::list_objects::{
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
+use aruna_operations::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,
 };
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
@@ -640,7 +643,7 @@ fn parse_group_include(include: Option<&str>) -> ServerResult<bool> {
 
 async fn build_api_groups(
     state: &ServerState,
-    groups: Vec<aruna_core::structs::Group>,
+    groups: Vec<aruna_core::structs::identity::group::Group>,
     include_roles: bool,
     caller: UserId,
 ) -> ServerResult<Vec<ApiGroup>> {
@@ -826,7 +829,7 @@ pub async fn update_group(
         &state,
         &auth,
         group_admin,
-        aruna_core::structs::Permission::WRITE,
+        aruna_core::structs::identity::auth::Permission::WRITE,
     )
     .await?
     {
@@ -834,7 +837,7 @@ pub async fn update_group(
             &state,
             &auth,
             format!("/{realm_id}/admin/groups"),
-            aruna_core::structs::Permission::WRITE,
+            aruna_core::structs::identity::auth::Permission::WRITE,
         )
         .await?;
     }

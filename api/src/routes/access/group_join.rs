@@ -2,7 +2,7 @@ use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::join_request::{JoinDecisionKind, JoinRequestState};
-use aruna_core::structs::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_operations::auth::request_policy::{
     PolicyEnforcementError, PolicyRequestExtras, enforce_policies, policy_request_with,
 };

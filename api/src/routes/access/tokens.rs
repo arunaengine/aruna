@@ -3,7 +3,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
 use crate::server_state::ServerState;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
-use aruna_core::structs::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::forward::forward_token_revoke;
 use aruna_operations::auth::revoke_token::{
@@ -175,7 +175,8 @@ mod tests {
     use crate::error::TokenError;
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::{Actor, NodeCapabilities, PathRestriction, RealmId, TokenRevocation};
+    use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
+    use aruna_core::structs::identity::realm::{RealmId, TokenRevocation};
     use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
@@ -367,7 +368,7 @@ mod tests {
     async fn write_realm_config(
         ctx: &DriverContext,
         realm_id: RealmId,
-        config: &aruna_core::structs::RealmConfigDocument,
+        config: &aruna_core::structs::identity::realm::RealmConfigDocument,
     ) {
         let target = aruna_core::document::DocumentTarget::RealmConfig { realm_id };
         store_bytes(
@@ -382,7 +383,7 @@ mod tests {
     /// Assigns every realm role, including `realm_admin`, to one user.
     async fn grant_realm_admin(ctx: &DriverContext, realm_id: RealmId, user_id: UserId) {
         let mut auth_doc =
-            aruna_core::structs::RealmAuthorizationDocument::default_realm_doc(realm_id);
+            aruna_core::structs::identity::realm::RealmAuthorizationDocument::default_realm_doc(realm_id);
         for role in auth_doc.roles.values_mut() {
             role.assigned_users.insert(user_id);
         }
@@ -523,7 +524,7 @@ mod tests {
         write_realm_config(
             state.get_ctx().as_ref(),
             foreign_realm_id,
-            &aruna_core::structs::RealmConfigDocument::default_for_realm(
+            &aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(
                 foreign_realm_id,
                 Vec::new(),
             ),

@@ -12,7 +12,7 @@ use utoipa_axum::routes;
 
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::AuthContext;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::wipe::{
     WIPE_INCOMPLETE_EXIT_CODE, WIPED_EXIT_CODE, WipeDeviceConfig, WipeDeviceError,
     WipeDeviceOperation,

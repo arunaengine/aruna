@@ -8,12 +8,13 @@ use crate::routes::routes_at;
 use aruna_core::compute::{
     has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
 };
-use aruna_core::structs::{
-    AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
-    JobPayload, JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, NodeCapabilities,
-    OutputDestination, OutputSelection, PhysicalExecutionResult, ResultMessage, WorkspaceMode,
-    group_permission_path,
+use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
+use aruna_core::structs::execution::job::{
+    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId, JobPayload,
+    JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
+    OutputSelection, PhysicalExecutionResult, ResultMessage, WorkspaceMode,
 };
+use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JobRouteError;
@@ -21,7 +22,7 @@ use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_exte
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
 };
-use aruna_operations::s3::get_access::{GetAccessError, GetAccessOperation};
+use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
@@ -2023,7 +2024,7 @@ async fn ensure_group_write(
         state,
         auth,
         group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
-        aruna_core::structs::Permission::WRITE,
+        aruna_core::structs::identity::auth::Permission::WRITE,
     )
     .await
     .map_err(|error| match error {

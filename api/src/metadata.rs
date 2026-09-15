@@ -14,7 +14,8 @@ use aruna_core::errors::StorageError;
 use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
-use aruna_core::structs::{AuthContext, MetadataRegistryRecord, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::forward::routing::origin_holds_document as run_origin_holds_document;
@@ -209,7 +210,7 @@ pub(crate) fn map_create_error(error: CreateDocumentError) -> ServerError {
         CreateDocumentError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent metadata create conflict; retry".to_string())
         }
-        CreateDocumentError::PlacementBinding(aruna_core::structs::BindingError::Conflicted(_)) => {
+        CreateDocumentError::PlacementBinding(aruna_core::structs::placement::binding_directory::BindingError::Conflicted(_)) => {
             ServerError::ServiceUnavailableReason("placement_binding_conflict".to_string())
         }
         CreateDocumentError::PlacementBinding(_)

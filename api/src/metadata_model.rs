@@ -3,7 +3,7 @@ use crate::error::{ProfileFindingResponse, ValidationViolationResponse};
 use aruna_core::metadata::{
     ProfileValidationCompleteness, ProfileValidationState, ProfileValidationStatus,
 };
-use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_operations::metadata::MetadataPathWinner;
 use aruna_operations::metadata::profile_validation::MetadataProfilePreview;
 use aruna_operations::metadata::public_preview::RestrictedFilesPreview;

@@ -3,7 +3,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::{AssistantChatHead, AssistantChatTurn, AuthContext};
+use aruna_core::structs::{AssistantChatHead, AssistantChatTurn};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::assistant::{
     ChatStoreError, DeleteChatOperation, ListChatOperation, ReadChatOperation, WriteChatOperation,
