@@ -1,13 +1,11 @@
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState, REALM_CONFIG_POLICIES_PATH,
-};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, REALM_CONFIG_POLICIES_PATH};
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -27,7 +25,7 @@ use crate::sync::document_outbox::{
 };
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SetRealmPoliciesConfig {
+pub struct SetPoliciesConfig {
     pub actor: Actor,
     /// The caller's own token context, so a path-restricted credential stays
     /// restricted; it is never derived from `actor`.
@@ -42,15 +40,15 @@ pub struct SetRealmPoliciesConfig {
 /// document machinery as the other realm config settings, so the set
 /// replicates realm-wide and merges last-writer-wins as one value.
 #[derive(Debug, PartialEq)]
-pub struct SetRealmPoliciesOperation {
-    config: SetRealmPoliciesConfig,
+pub struct SetPoliciesOperation {
+    config: SetPoliciesConfig,
     txn_id: Option<TxnId>,
-    state: SetRealmPoliciesState,
-    output: Option<Result<RealmConfigDocument, SetRealmPoliciesError>>,
+    state: SetPoliciesState,
+    output: Option<Result<RealmConfigDocument, SetPoliciesError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum SetRealmPoliciesState {
+enum SetPoliciesState {
     Init,
     Auth,
     StartTransaction,
@@ -73,13 +71,13 @@ enum SetRealmPoliciesState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum SetRealmPoliciesError {
+pub enum SetPoliciesError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
-    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
+    AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
     RealmConfigNotFound,
     #[error("caller may not write the realm configuration")]
@@ -102,18 +100,18 @@ pub enum SetRealmPoliciesError {
     },
 }
 
-impl SetRealmPoliciesOperation {
-    pub fn new(config: SetRealmPoliciesConfig) -> Self {
+impl SetPoliciesOperation {
+    pub fn new(config: SetPoliciesConfig) -> Self {
         Self {
             config,
             txn_id: None,
-            state: SetRealmPoliciesState::Init,
+            state: SetPoliciesState::Init,
             output: None,
         }
     }
 
-    fn document_ref(&self) -> DocumentSyncTarget {
-        DocumentSyncTarget::RealmConfig {
+    fn document_ref(&self) -> DocumentTarget {
+        DocumentTarget::RealmConfig {
             realm_id: self.config.actor.realm_id,
         }
     }
@@ -126,7 +124,7 @@ impl SetRealmPoliciesOperation {
 
     fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
         self.txn_id = Some(txn_id);
-        self.state = SetRealmPoliciesState::ReadCurrent;
+        self.state = SetPoliciesState::ReadCurrent;
         let document = self.document_ref();
         let target = self.admin_target();
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -148,25 +146,25 @@ impl SetRealmPoliciesOperation {
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, SetRealmPoliciesError> {
+    ) -> Result<Effects, SetPoliciesError> {
         let Some(txn_id) = self.txn_id else {
-            return Err(SetRealmPoliciesError::MissingTransaction);
+            return Err(SetPoliciesError::MissingTransaction);
         };
         validate_policy_set(&self.config.policies)
-            .map_err(|reason| SetRealmPoliciesError::InvalidPolicies { reason })?;
+            .map_err(|reason| SetPoliciesError::InvalidPolicies { reason })?;
 
         let Some(document_value) = document_value else {
-            return Err(SetRealmPoliciesError::RealmConfigNotFound);
+            return Err(SetPoliciesError::RealmConfigNotFound);
         };
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
         if !is_management(&document, self.config.actor.node_id) {
-            return Err(SetRealmPoliciesError::NotManagementNode);
+            return Err(SetPoliciesError::NotManagementNode);
         }
 
         if let Some(expected) = self.config.expected_hash
             && policy_set_hash(&document.request_policies) != expected
         {
-            return Err(SetRealmPoliciesError::StaleHash);
+            return Err(SetPoliciesError::StaleHash);
         }
 
         let target = self.admin_target();
@@ -181,12 +179,12 @@ impl SetRealmPoliciesOperation {
             .as_ref()
             .is_some_and(|state| state.target != target)
         {
-            return Err(AdminDocumentReducerError::TargetMismatch.into());
+            return Err(AdminDocumentError::TargetMismatch.into());
         }
 
         let mut reducer_state = previous_reducer_state
             .clone()
-            .unwrap_or_else(|| AdminDocumentReducerState::new(target));
+            .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_event = reducer_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::RealmConfigPoliciesSet {
@@ -214,7 +212,7 @@ impl SetRealmPoliciesOperation {
             self.config.actor.node_id,
             document_target,
             Vec::new(),
-            DocumentSyncOutboxEvent::admin(admin_event),
+            DocumentOutboxEvent::admin(admin_event),
             placement,
             false,
         );
@@ -222,7 +220,7 @@ impl SetRealmPoliciesOperation {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
-        self.state = SetRealmPoliciesState::WriteDocumentAndAdminState {
+        self.state = SetPoliciesState::WriteDocumentAndAdminState {
             document,
             stale_conflict_deletes,
         };
@@ -235,22 +233,22 @@ impl SetRealmPoliciesOperation {
 
     fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.fail(SetRealmPoliciesError::MissingTransaction);
+            return self.fail(SetPoliciesError::MissingTransaction);
         };
-        self.state = SetRealmPoliciesState::CommitTransaction { document };
+        self.state = SetPoliciesState::CommitTransaction { document };
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
-    fn fail(&mut self, error: SetRealmPoliciesError) -> Effects {
+    fn fail(&mut self, error: SetPoliciesError) -> Effects {
         let cleanup = self.abort();
-        self.state = SetRealmPoliciesState::Error;
+        self.state = SetPoliciesState::Error;
         self.output = Some(Err(error));
         cleanup
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
-        self.fail(SetRealmPoliciesError::UnexpectedEvent {
+        self.fail(SetPoliciesError::UnexpectedEvent {
             state,
             expected,
             got,
@@ -258,15 +256,15 @@ impl SetRealmPoliciesOperation {
     }
 }
 
-impl Operation for SetRealmPoliciesOperation {
+impl Operation for SetPoliciesOperation {
     type Output = RealmConfigDocument;
-    type Error = SetRealmPoliciesError;
+    type Error = SetPoliciesError;
 
     fn start(&mut self) -> Effects {
         if self.config.auth_context.realm_id != self.config.actor.realm_id {
-            return self.fail(SetRealmPoliciesError::Unauthorized);
+            return self.fail(SetPoliciesError::Unauthorized);
         }
-        self.state = SetRealmPoliciesState::Auth;
+        self.state = SetPoliciesState::Auth;
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: self.config.auth_context.clone(),
@@ -279,37 +277,37 @@ impl Operation for SetRealmPoliciesOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state.clone() {
-            SetRealmPoliciesState::Auth => match event {
+            SetPoliciesState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
                         Ok(true) => {
-                            self.state = SetRealmPoliciesState::StartTransaction;
+                            self.state = SetPoliciesState::StartTransaction;
                             smallvec![Effect::Storage(StorageEffect::StartTransaction {
                                 read: false
                             })]
                         }
-                        Ok(false) => self.fail(SetRealmPoliciesError::Unauthorized),
+                        Ok(false) => self.fail(SetPoliciesError::Unauthorized),
                         Err(error) => {
                             warn!(error = %error, "Realm policy authorization check failed");
                             match error {
                                 AuthorizationError::StorageError(error) => {
-                                    self.fail(SetRealmPoliciesError::StorageError(error))
+                                    self.fail(SetPoliciesError::StorageError(error))
                                 }
-                                _ => self.fail(SetRealmPoliciesError::Unauthorized),
+                                _ => self.fail(SetPoliciesError::Unauthorized),
                             }
                         }
                     }
                 }
                 other => self.unexpected_event("authorization result", format!("{other:?}")),
             },
-            SetRealmPoliciesState::StartTransaction => match event {
+            SetPoliciesState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("transaction start result", format!("{other:?}")),
             },
-            SetRealmPoliciesState::ReadCurrent => match event {
+            SetPoliciesState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
                         return self.unexpected_event(
@@ -326,16 +324,16 @@ impl Operation for SetRealmPoliciesOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            SetRealmPoliciesState::WriteDocumentAndAdminState {
+            SetPoliciesState::WriteDocumentAndAdminState {
                 document,
                 stale_conflict_deletes,
             } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
-                        return self.fail(SetRealmPoliciesError::MissingTransaction);
+                        return self.fail(SetPoliciesError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state = SetRealmPoliciesState::DeleteStaleAdminConflicts { document };
+                        self.state = SetPoliciesState::DeleteStaleAdminConflicts { document };
                         return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                             deletes: stale_conflict_deletes,
                             txn_id: Some(txn_id),
@@ -346,18 +344,17 @@ impl Operation for SetRealmPoliciesOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             },
-            SetRealmPoliciesState::DeleteStaleAdminConflicts { document } => match event {
+            SetPoliciesState::DeleteStaleAdminConflicts { document } => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
             },
-            SetRealmPoliciesState::CommitTransaction { document } => match event {
+            SetPoliciesState::CommitTransaction { document } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state =
-                        SetRealmPoliciesState::ScheduleDocumentSyncOutboxDrain { document };
+                    self.state = SetPoliciesState::ScheduleDocumentSyncOutboxDrain { document };
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -366,14 +363,14 @@ impl Operation for SetRealmPoliciesOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            SetRealmPoliciesState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
+            SetPoliciesState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = SetRealmPoliciesState::Finish;
+                    self.state = SetPoliciesState::Finish;
                     smallvec![]
                 }
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                    self.state = SetRealmPoliciesState::Finish;
+                    self.state = SetPoliciesState::Finish;
                     smallvec![]
                 }
                 other => self.unexpected_event(
@@ -381,9 +378,7 @@ impl Operation for SetRealmPoliciesOperation {
                     format!("{other:?}"),
                 ),
             },
-            SetRealmPoliciesState::Finish
-            | SetRealmPoliciesState::Error
-            | SetRealmPoliciesState::Init => {
+            SetPoliciesState::Finish | SetPoliciesState::Error | SetPoliciesState::Init => {
                 smallvec![]
             }
         }
@@ -392,13 +387,12 @@ impl Operation for SetRealmPoliciesOperation {
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            SetRealmPoliciesState::Finish | SetRealmPoliciesState::Error
+            SetPoliciesState::Finish | SetPoliciesState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(SetRealmPoliciesError::NotFinished))
+        self.output.unwrap_or(Err(SetPoliciesError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -411,10 +405,7 @@ impl Operation for SetRealmPoliciesOperation {
 
 /// Overlays the reducer's materialized policy set onto the config document,
 /// mirroring the replicated materialization in `net::irokle`.
-fn apply_reducer_policies(
-    document: &mut RealmConfigDocument,
-    reducer_state: &AdminDocumentReducerState,
-) {
+fn apply_reducer_policies(document: &mut RealmConfigDocument, reducer_state: &AdminDocumentState) {
     if !reducer_state
         .conflicts
         .contains_key(REALM_CONFIG_POLICIES_PATH)
@@ -426,12 +417,12 @@ fn apply_reducer_policies(
 
 #[cfg(test)]
 mod tests {
-    use super::{SetRealmPoliciesConfig, SetRealmPoliciesError, SetRealmPoliciesOperation};
+    use super::{SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation};
     use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::realm::get_config::GetRealmConfigOperation;
+    use crate::realm::get_config::GetConfigOperation;
     use aruna_core::UserId;
-    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::document::DocumentTarget;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::{AuthorizationError, StorageError};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -468,8 +459,8 @@ mod tests {
         actor: &Actor,
         policies: Vec<RequestPolicy>,
         expected_hash: Option<[u8; 32]>,
-    ) -> SetRealmPoliciesConfig {
-        SetRealmPoliciesConfig {
+    ) -> SetPoliciesConfig {
+        SetPoliciesConfig {
             actor: actor.clone(),
             auth_context: auth(actor),
             policies,
@@ -545,7 +536,7 @@ mod tests {
     async fn seed_server_config(context: &DriverContext, actor: &Actor) {
         let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
         document.ensure_node(actor.node_id, RealmNodeKind::Server);
-        let target = DocumentSyncTarget::RealmConfig {
+        let target = DocumentTarget::RealmConfig {
             realm_id: actor.realm_id,
         };
         match context
@@ -571,7 +562,7 @@ mod tests {
         seed_server_config(&context, &actor).await;
 
         let error = drive(
-            SetRealmPoliciesOperation::new(policies_config(
+            SetPoliciesOperation::new(policies_config(
                 &actor,
                 vec![policy("permission == 'write'")],
                 None,
@@ -580,9 +571,9 @@ mod tests {
         )
         .await
         .expect_err("a server node is refused");
-        assert!(matches!(error, SetRealmPoliciesError::NotManagementNode));
+        assert!(matches!(error, SetPoliciesError::NotManagementNode));
 
-        let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+        let read = drive(GetConfigOperation::new(actor.realm_id), &context)
             .await
             .unwrap();
         assert!(read.request_policies.is_empty());
@@ -594,14 +585,14 @@ mod tests {
         let (_dir, context, actor) = setup_realm().await;
         let policies = vec![policy("permission == 'write'")];
         let document = drive(
-            SetRealmPoliciesOperation::new(policies_config(&actor, policies.clone(), None)),
+            SetPoliciesOperation::new(policies_config(&actor, policies.clone(), None)),
             &context,
         )
         .await
         .unwrap();
         assert_eq!(document.request_policies, policies);
 
-        let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+        let read = drive(GetConfigOperation::new(actor.realm_id), &context)
             .await
             .unwrap();
         assert_eq!(read.request_policies, policies);
@@ -616,18 +607,14 @@ mod tests {
         let empty_hash = policy_set_hash(&[]);
         let first = vec![policy("permission == 'write'")];
         drive(
-            SetRealmPoliciesOperation::new(policies_config(
-                &actor,
-                first.clone(),
-                Some(empty_hash),
-            )),
+            SetPoliciesOperation::new(policies_config(&actor, first.clone(), Some(empty_hash))),
             &context,
         )
         .await
         .unwrap();
 
         let stale = drive(
-            SetRealmPoliciesOperation::new(policies_config(
+            SetPoliciesOperation::new(policies_config(
                 &actor,
                 vec![policy("permission == 'read'")],
                 Some(empty_hash),
@@ -635,9 +622,9 @@ mod tests {
             &context,
         )
         .await;
-        assert!(matches!(stale, Err(SetRealmPoliciesError::StaleHash)));
+        assert!(matches!(stale, Err(SetPoliciesError::StaleHash)));
 
-        let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+        let read = drive(GetConfigOperation::new(actor.realm_id), &context)
             .await
             .unwrap();
         assert_eq!(read.request_policies, first);
@@ -648,7 +635,7 @@ mod tests {
         // An uncompilable expression is refused at administration time.
         let (_dir, context, actor) = setup_realm().await;
         let result = drive(
-            SetRealmPoliciesOperation::new(policies_config(
+            SetPoliciesOperation::new(policies_config(
                 &actor,
                 vec![policy("path.startsWith(")],
                 None,
@@ -658,7 +645,7 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(SetRealmPoliciesError::InvalidPolicies { .. })
+            Err(SetPoliciesError::InvalidPolicies { .. })
         ));
     }
 
@@ -671,7 +658,7 @@ mod tests {
             ..actor.clone()
         };
         let error = drive(
-            SetRealmPoliciesOperation::new(policies_config(
+            SetPoliciesOperation::new(policies_config(
                 &outsider,
                 vec![policy("permission == 'write'")],
                 None,
@@ -680,9 +667,9 @@ mod tests {
         )
         .await
         .expect_err("an unauthorized caller is refused");
-        assert_eq!(error, SetRealmPoliciesError::Unauthorized);
+        assert_eq!(error, SetPoliciesError::Unauthorized);
 
-        let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+        let read = drive(GetConfigOperation::new(actor.realm_id), &context)
             .await
             .unwrap();
         assert!(read.request_policies.is_empty());
@@ -692,8 +679,7 @@ mod tests {
     fn start_checks_permission() {
         let realm_id = RealmId([21u8; 32]);
         let actor = actor(realm_id);
-        let mut operation =
-            SetRealmPoliciesOperation::new(policies_config(&actor, Vec::new(), None));
+        let mut operation = SetPoliciesOperation::new(policies_config(&actor, Vec::new(), None));
         let effects = operation.start();
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
         let emitted = format!("{effects:?}");
@@ -705,18 +691,14 @@ mod tests {
     fn denied_is_terminal() {
         let realm_id = RealmId([21u8; 32]);
         let actor = actor(realm_id);
-        let mut operation =
-            SetRealmPoliciesOperation::new(policies_config(&actor, Vec::new(), None));
+        let mut operation = SetPoliciesOperation::new(policies_config(&actor, Vec::new(), None));
         operation.start();
         let effects = operation.step(Event::SubOperation(
             SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
         ));
         assert!(effects.is_empty());
         assert!(operation.is_complete());
-        assert_eq!(
-            operation.finalize(),
-            Err(SetRealmPoliciesError::Unauthorized)
-        );
+        assert_eq!(operation.finalize(), Err(SetPoliciesError::Unauthorized));
     }
 
     #[test]
@@ -724,8 +706,7 @@ mod tests {
         // Storage exhaustion inside the check is infrastructure, not a verdict.
         let realm_id = RealmId([21u8; 32]);
         let actor = actor(realm_id);
-        let mut operation =
-            SetRealmPoliciesOperation::new(policies_config(&actor, Vec::new(), None));
+        let mut operation = SetPoliciesOperation::new(policies_config(&actor, Vec::new(), None));
         operation.start();
         operation.step(Event::SubOperation(
             SubOperationEvent::AuthorizationResult {
@@ -737,7 +718,7 @@ mod tests {
         assert!(operation.is_complete());
         assert_eq!(
             operation.finalize(),
-            Err(SetRealmPoliciesError::StorageError(
+            Err(SetPoliciesError::StorageError(
                 StorageError::CleanupCapacity
             ))
         );
@@ -747,8 +728,7 @@ mod tests {
     fn allowed_starts_transaction() {
         let realm_id = RealmId([21u8; 32]);
         let actor = actor(realm_id);
-        let mut operation =
-            SetRealmPoliciesOperation::new(policies_config(&actor, Vec::new(), None));
+        let mut operation = SetPoliciesOperation::new(policies_config(&actor, Vec::new(), None));
         operation.start();
         let effects = operation.step(Event::SubOperation(
             SubOperationEvent::AuthorizationResult { allowed: Ok(true) },

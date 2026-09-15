@@ -13,19 +13,19 @@ use crate::onboarding::create_secret::secret_record_key;
 use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry, secret_state_key};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecoverInitialAdminInput {
+pub struct RecoverInitialInput {
     pub record: OnboardingSecretRecord,
 }
 
 #[derive(Debug, PartialEq)]
-pub struct RecoverInitialAdminOperation {
-    input: RecoverInitialAdminInput,
-    state: RecoverInitialAdminState,
-    output: Option<Result<OnboardingSecretRecord, RecoverInitialAdminError>>,
+pub struct RecoverInitialOperation {
+    input: RecoverInitialInput,
+    state: RecoverInitialState,
+    output: Option<Result<OnboardingSecretRecord, RecoverInitialError>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum RecoverInitialAdminState {
+enum RecoverInitialState {
     Init,
     StartTransaction,
     ReadRecords {
@@ -49,7 +49,7 @@ enum RecoverInitialAdminState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum RecoverInitialAdminError {
+pub enum RecoverInitialError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -64,16 +64,16 @@ pub enum RecoverInitialAdminError {
     },
 }
 
-impl RecoverInitialAdminOperation {
-    pub fn new(input: RecoverInitialAdminInput) -> Self {
+impl RecoverInitialOperation {
+    pub fn new(input: RecoverInitialInput) -> Self {
         Self {
             input,
-            state: RecoverInitialAdminState::Init,
+            state: RecoverInitialState::Init,
             output: None,
         }
     }
 
-    fn replacement_writes(&self) -> Result<Vec<(KeySpace, Key, Value)>, RecoverInitialAdminError> {
+    fn replacement_writes(&self) -> Result<Vec<(KeySpace, Key, Value)>, RecoverInitialError> {
         let value = postcard::to_allocvec(&self.input.record).map_err(ConversionError::from)?;
         let state = secret_state_entry(
             self.input.record.enrollment_id,
@@ -94,7 +94,7 @@ impl RecoverInitialAdminOperation {
             Ok(writes) => writes,
             Err(error) => return self.fail(error),
         };
-        self.state = RecoverInitialAdminState::WriteReplacement { txn_id };
+        self.state = RecoverInitialState::WriteReplacement { txn_id };
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: Some(txn_id),
@@ -102,27 +102,27 @@ impl RecoverInitialAdminOperation {
     }
 
     fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
-        self.fail(RecoverInitialAdminError::UnexpectedEvent {
+        self.fail(RecoverInitialError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
             got: format!("{event:?}"),
         })
     }
 
-    fn fail(&mut self, error: RecoverInitialAdminError) -> Effects {
+    fn fail(&mut self, error: RecoverInitialError) -> Effects {
         let cleanup = self.abort();
-        self.state = RecoverInitialAdminState::Error;
+        self.state = RecoverInitialState::Error;
         self.output = Some(Err(error));
         cleanup
     }
 }
 
-impl Operation for RecoverInitialAdminOperation {
+impl Operation for RecoverInitialOperation {
     type Output = OnboardingSecretRecord;
-    type Error = RecoverInitialAdminError;
+    type Error = RecoverInitialError;
 
     fn start(&mut self) -> Effects {
-        self.state = RecoverInitialAdminState::StartTransaction;
+        self.state = RecoverInitialState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
         })]
@@ -134,11 +134,11 @@ impl Operation for RecoverInitialAdminOperation {
         }
 
         match self.state.clone() {
-            RecoverInitialAdminState::StartTransaction => {
+            RecoverInitialState::StartTransaction => {
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return self.unexpected("transaction started", event);
                 };
-                self.state = RecoverInitialAdminState::ReadRecords { txn_id };
+                self.state = RecoverInitialState::ReadRecords { txn_id };
                 smallvec![Effect::Storage(StorageEffect::Iter {
                     key_space: ONBOARDING_KEYSPACE.to_string(),
                     prefix: Some(ByteView::from(b"secret:".as_slice())),
@@ -147,7 +147,7 @@ impl Operation for RecoverInitialAdminOperation {
                     txn_id: Some(txn_id),
                 })]
             }
-            RecoverInitialAdminState::ReadRecords { txn_id } => {
+            RecoverInitialState::ReadRecords { txn_id } => {
                 let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
                     return self.unexpected("onboarding secret iteration result", event);
                 };
@@ -173,18 +173,18 @@ impl Operation for RecoverInitialAdminOperation {
                         )
                     })
                     .collect();
-                self.state = RecoverInitialAdminState::ReadStates { txn_id, records };
+                self.state = RecoverInitialState::ReadStates { txn_id, records };
                 smallvec![Effect::Storage(StorageEffect::BatchRead {
                     reads,
                     txn_id: Some(txn_id),
                 })]
             }
-            RecoverInitialAdminState::ReadStates { txn_id, records } => {
+            RecoverInitialState::ReadStates { txn_id, records } => {
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return self.unexpected("onboarding secret states", event);
                 };
                 if values.len() != records.len() {
-                    return self.fail(RecoverInitialAdminError::UnexpectedEvent {
+                    return self.fail(RecoverInitialError::UnexpectedEvent {
                         state: format!("{:?}", self.state),
                         expected: "one state per onboarding secret",
                         got: format!("{values:?}"),
@@ -214,13 +214,13 @@ impl Operation for RecoverInitialAdminOperation {
                 if deletes.is_empty() {
                     return self.write_replacement(txn_id);
                 }
-                self.state = RecoverInitialAdminState::DeleteRecords { txn_id };
+                self.state = RecoverInitialState::DeleteRecords { txn_id };
                 smallvec![Effect::Storage(StorageEffect::BatchDelete {
                     deletes,
                     txn_id: Some(txn_id),
                 })]
             }
-            RecoverInitialAdminState::DeleteRecords { txn_id } => {
+            RecoverInitialState::DeleteRecords { txn_id } => {
                 if !matches!(
                     event,
                     Event::Storage(StorageEvent::BatchDeleteResult { .. })
@@ -229,26 +229,26 @@ impl Operation for RecoverInitialAdminOperation {
                 }
                 self.write_replacement(txn_id)
             }
-            RecoverInitialAdminState::WriteReplacement { txn_id } => {
+            RecoverInitialState::WriteReplacement { txn_id } => {
                 if !matches!(event, Event::Storage(StorageEvent::BatchWriteResult { .. })) {
                     return self.unexpected("replacement secret write result", event);
                 }
-                self.state = RecoverInitialAdminState::CommitTransaction { txn_id };
+                self.state = RecoverInitialState::CommitTransaction { txn_id };
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
-            RecoverInitialAdminState::CommitTransaction { .. } => {
+            RecoverInitialState::CommitTransaction { .. } => {
                 if !matches!(
                     event,
                     Event::Storage(StorageEvent::TransactionCommitted { .. })
                 ) {
                     return self.unexpected("transaction committed", event);
                 }
-                self.state = RecoverInitialAdminState::Finish;
+                self.state = RecoverInitialState::Finish;
                 self.output = Some(Ok(self.input.record.clone()));
                 smallvec![]
             }
-            RecoverInitialAdminState::Init => self.unexpected("operation start", event),
-            RecoverInitialAdminState::Finish | RecoverInitialAdminState::Error => {
+            RecoverInitialState::Init => self.unexpected("operation start", event),
+            RecoverInitialState::Finish | RecoverInitialState::Error => {
                 self.unexpected("no event after completion", event)
             }
         }
@@ -257,21 +257,21 @@ impl Operation for RecoverInitialAdminOperation {
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            RecoverInitialAdminState::Finish | RecoverInitialAdminState::Error
+            RecoverInitialState::Finish | RecoverInitialState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(RecoverInitialAdminError::NotFinished)?
+        self.output.ok_or(RecoverInitialError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
         let txn_id = match &self.state {
-            RecoverInitialAdminState::ReadRecords { txn_id }
-            | RecoverInitialAdminState::ReadStates { txn_id, .. }
-            | RecoverInitialAdminState::DeleteRecords { txn_id }
-            | RecoverInitialAdminState::WriteReplacement { txn_id }
-            | RecoverInitialAdminState::CommitTransaction { txn_id } => Some(*txn_id),
+            RecoverInitialState::ReadRecords { txn_id }
+            | RecoverInitialState::ReadStates { txn_id, .. }
+            | RecoverInitialState::DeleteRecords { txn_id }
+            | RecoverInitialState::WriteReplacement { txn_id }
+            | RecoverInitialState::CommitTransaction { txn_id } => Some(*txn_id),
             _ => None,
         };
         txn_id
@@ -282,15 +282,11 @@ impl Operation for RecoverInitialAdminOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::{RecoverInitialAdminInput, RecoverInitialAdminOperation};
+    use super::{RecoverInitialInput, RecoverInitialOperation};
     use crate::driver::{DriverContext, drive};
-    use crate::onboarding::consume_secret::{
-        ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
-    };
-    use crate::onboarding::create_secret::{
-        CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
-    };
-    use crate::onboarding::list_secrets::ListOnboardingSecretsOperation;
+    use crate::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
+    use crate::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
+    use crate::onboarding::list_secrets::ListSecretsOperation;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_storage::storage;
     use tempfile::tempdir;
@@ -348,14 +344,14 @@ mod tests {
             },
         ] {
             drive(
-                CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput { record }),
+                CreateSecretOperation::new(CreateSecretInput { record }),
                 &context,
             )
             .await
             .unwrap();
         }
         drive(
-            ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
+            ConsumeSecretOperation::new(ConsumeSecretInput {
                 enrollment_id: claimed_id,
                 secret_hash: "claimed".to_string(),
                 node_id: "node-a".to_string(),
@@ -376,7 +372,7 @@ mod tests {
         };
         assert_eq!(
             drive(
-                RecoverInitialAdminOperation::new(RecoverInitialAdminInput {
+                RecoverInitialOperation::new(RecoverInitialInput {
                     record: replacement.clone(),
                 }),
                 &context,
@@ -386,9 +382,7 @@ mod tests {
             replacement
         );
 
-        let entries = drive(ListOnboardingSecretsOperation::new(), &context)
-            .await
-            .unwrap();
+        let entries = drive(ListSecretsOperation::new(), &context).await.unwrap();
         assert!(entries.iter().all(|entry| {
             entry.record.enrollment_id != old_id && entry.record.enrollment_id != other_old_id
         }));
