@@ -343,7 +343,7 @@ pub(super) fn plan_object_search(
     }
     let limit = request
         .limit
-        .clamp(1, crate::s3::search_objects::OBJECT_SEARCH_MAX_LIMIT);
+        .clamp(1, crate::s3::object::search::OBJECT_SEARCH_MAX_LIMIT);
     let fingerprint = object_search_fingerprint(
         realm_id,
         &request.query,

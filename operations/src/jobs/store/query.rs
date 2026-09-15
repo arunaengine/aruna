@@ -190,7 +190,7 @@ pub async fn first_schedule_entry(
     )
     .await?;
     match values.into_iter().next() {
-        Some((key, _)) => match aruna_core::structs::parse_schedule_key(key.as_ref()) {
+        Some((key, _)) => match aruna_core::structs::execution::job::parse_schedule_key(key.as_ref()) {
             Ok(parsed) => Ok(Some(parsed)),
             Err(error) => {
                 warn!(error = %error, "Deleting malformed job schedule index row");

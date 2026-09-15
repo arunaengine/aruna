@@ -15,9 +15,9 @@ use aruna_core::metadata::MetadataEventPayload;
 use aruna_core::storage_entries::{
     create_projection_entries, document_lifecycle_entry, graph_lifecycle_entry,
 };
-use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmNodeKind, Role,
-};
+use aruna_core::structs::identity::auth::{Actor, Role};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmNodeKind};
 use aruna_core::types::{Key, RoleId};
 use aruna_storage::storage;
 use byteview::ByteView;

@@ -7,8 +7,8 @@ use aruna_core::compute::{
 };
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
-use aruna_core::structs::tail_str;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::tail_str;
+use aruna_core::structs::execution::job::{
     AttemptControl, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, JobRecordError,
     JobResultPayload, MAX_RESULT_MESSAGE_BYTES, OutputObject,
 };
@@ -514,7 +514,7 @@ async fn terminal_complete(
         .ok()
         .flatten()
         .map(|record| record.progress)
-        .unwrap_or_else(|| aruna_core::structs::JobProgress::new("phases"));
+        .unwrap_or_else(|| aruna_core::structs::execution::job::JobProgress::new("phases"));
     match complete_cancelled(
         storage,
         job_id,
@@ -569,7 +569,7 @@ async fn store_or_fail(
     };
     match Box::pin(store_outputs(context, &record, control, outputs)).await {
         Ok(digest) => Some(digest),
-        Err(error) if error.kind == aruna_core::structs::JobErrorKind::Permanent => {
+        Err(error) if error.kind == aruna_core::structs::execution::job::JobErrorKind::Permanent => {
             warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output record store failed; failing");
             Box::pin(fail_and_crate(context, job_id, token, &record, error)).await;
             None
@@ -592,7 +592,7 @@ async fn terminal_execution(
         .ok()
         .flatten()
         .map(|record| record.progress)
-        .unwrap_or_else(|| aruna_core::structs::JobProgress::new("phases"));
+        .unwrap_or_else(|| aruna_core::structs::execution::job::JobProgress::new("phases"));
     match complete_execution(
         storage,
         job_id,
@@ -699,9 +699,9 @@ fn log_compute_summary(record: &JobRecord) {
         .or(spec.executor_constraint.as_deref())
         .unwrap_or("unresolved");
     let outcome = match record.state {
-        aruna_core::structs::JobState::Succeeded => "success",
-        aruna_core::structs::JobState::Failed => "failure",
-        aruna_core::structs::JobState::Cancelled => "cancelled",
+        aruna_core::structs::execution::job::JobState::Succeeded => "success",
+        aruna_core::structs::execution::job::JobState::Failed => "failure",
+        aruna_core::structs::execution::job::JobState::Cancelled => "cancelled",
         _ => return,
     };
     info!(
@@ -798,7 +798,7 @@ pub(super) async fn collect_or_park(
 ) -> Option<Vec<OutputObject>> {
     match Box::pin(collect_outputs(context, spec, bucket, control)).await {
         Ok(outputs) => Some(outputs),
-        Err(error) if error.kind == aruna_core::structs::JobErrorKind::Permanent => {
+        Err(error) if error.kind == aruna_core::structs::execution::job::JobErrorKind::Permanent => {
             warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output inventory failed permanently; failing");
             Box::pin(fail_or_park(context, job_id, token, error)).await;
             None
@@ -886,7 +886,7 @@ async fn export_or_park(
     .await
     {
         Ok(outputs) => Some(outputs),
-        Err(error) if error.kind == aruna_core::structs::JobErrorKind::Retryable => {
+        Err(error) if error.kind == aruna_core::structs::execution::job::JobErrorKind::Retryable => {
             warn!(job_id = %job_id, error = ?error, "Output capture failed; parking");
             Box::pin(park_attempt(context, job_id, token, error)).await;
             None

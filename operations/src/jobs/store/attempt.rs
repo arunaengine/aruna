@@ -465,14 +465,14 @@ pub async fn requeue_before_attempt(
 pub async fn put_crate_status(
     storage: &StorageHandle,
     job_id: JobId,
-    status: &aruna_core::structs::RunCrateStatus,
+    status: &aruna_core::structs::execution::job::RunCrateStatus,
 ) -> Result<(), String> {
     let bytes = status.to_bytes().map_err(|error| error.to_string())?;
     batch_write(
         storage,
         vec![(
             JOB_RUN_CRATE_KEYSPACE.to_string(),
-            aruna_core::structs::run_crate_key(job_id),
+            aruna_core::structs::execution::job::run_crate_key(job_id),
             ByteView::from(bytes),
         )],
         None,
@@ -484,16 +484,16 @@ pub async fn put_crate_status(
 pub async fn read_crate_status(
     storage: &StorageHandle,
     job_id: JobId,
-) -> Result<Option<aruna_core::structs::RunCrateStatus>, String> {
+) -> Result<Option<aruna_core::structs::execution::job::RunCrateStatus>, String> {
     match read_raw(
         storage,
         JOB_RUN_CRATE_KEYSPACE,
-        aruna_core::structs::run_crate_key(job_id),
+        aruna_core::structs::execution::job::run_crate_key(job_id),
         None,
     )
     .await?
     {
-        Some(value) => aruna_core::structs::RunCrateStatus::from_bytes(value.as_ref())
+        Some(value) => aruna_core::structs::execution::job::RunCrateStatus::from_bytes(value.as_ref())
             .map(Some)
             .map_err(|error| error.to_string()),
         None => Ok(None),

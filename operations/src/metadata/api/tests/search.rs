@@ -357,7 +357,7 @@ fn search_plan_limits() {
     .expect("large limit clamps");
     assert_eq!(
         plan.limit,
-        crate::s3::search_objects::OBJECT_SEARCH_MAX_LIMIT
+        crate::s3::object::search::OBJECT_SEARCH_MAX_LIMIT
     );
 }
 
@@ -407,7 +407,7 @@ fn search_assembly_order() {
     let page = |node_id, key: Option<&str>| SearchNodePage {
         hits: key
             .map(|key| {
-                vec![crate::s3::search_objects::SearchNodeHit {
+                vec![crate::s3::object::search::SearchNodeHit {
                     hit: ObjectInventoryHit {
                         node_id,
                         group_id: Ulid::nil(),

@@ -11,7 +11,7 @@ use crate::jobs::store::{
 };
 use crate::jobs::workflow::workspace::mint_workspace_credential;
 use crate::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
-use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::session::{EndReason, Session};
 use aruna_core::UserId;
@@ -19,11 +19,12 @@ use aruna_core::compute::{
     AdoptableEvidence, AttemptPhase, AttemptStatus, CancelEvidence, LogLimits, LogTails, NOBODY,
     NetworkAccess, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, UserSpec,
 };
-use aruna_core::structs::{
-    FIRST_GRANTABLE_HANDLE, JobErrorKind, JobResultPayload, JobState, MAX_RESULT_MESSAGE_BYTES,
-    OutputDestination, OutputSelection, RealmId, SessionReportDetail, SessionReportRow,
-    WorkspaceMode,
+use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::execution::job::{
+    JobErrorKind, JobResultPayload, JobState, MAX_RESULT_MESSAGE_BYTES, OutputDestination,
+    OutputSelection, SessionReportDetail, SessionReportRow, WorkspaceMode,
 };
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
@@ -631,7 +632,7 @@ async fn net_context(storage: StorageHandle) -> (Arc<DriverContext>, aruna_net::
     let net = aruna_net::NetHandle::new(
         aruna_net::NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
-            realm_id: aruna_core::structs::RealmId([1; 32]),
+            realm_id: aruna_core::structs::identity::realm::RealmId([1; 32]),
             discovery_method: aruna_net::DiscoveryMethod::None,
             relay_method: aruna_net::RelayMethod::None,
             ..aruna_net::NetConfig::default()
@@ -1050,7 +1051,7 @@ async fn crate_write_idempotent() {
     put_crate_status(
         &storage,
         job_id,
-        &aruna_core::structs::RunCrateStatus::Written {
+        &aruna_core::structs::execution::job::RunCrateStatus::Written {
             resource: "already-there".to_string(),
         },
     )
@@ -1151,13 +1152,14 @@ async fn store_site(storage: &StorageHandle, job_id: JobId, generation: u64, dig
     use aruna_core::compute_quota::JobReservationRecord;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{JOB_RESERVATION_KEYSPACE, NODE_SUBJECT_KEYSPACE};
-    use aruna_core::structs::{NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementSubject};
+    use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+    use aruna_core::structs::placement::placement_policy::PlacementSubject;
 
     let reservation = JobReservationRecord {
         execution_id: Ulid::from_bytes([0xA1; 16]),
         job_id,
         logical_job_id: job_id,
-        resources: aruna_core::structs::EffectiveResources {
+        resources: aruna_core::structs::execution::job::EffectiveResources {
             cpu_cores: 1,
             ram_bytes: 1,
             disk_bytes: 0,
@@ -1272,7 +1274,8 @@ async fn stored_site_starts() {
     // The exact stored generation and digest still admit the start.
     use aruna_compute::ExecutorRegistry;
     use aruna_core::compute::ExecutorCapability;
-    use aruna_core::structs::{NodeSubjectRecord, PlacementSubject};
+    use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
+    use aruna_core::structs::placement::placement_policy::PlacementSubject;
 
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();

@@ -12,10 +12,11 @@ use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     graph_revision_change, lifecycle_revision_change, updated_index_delete,
 };
-use aruna_core::structs::{
-    MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, PlacementRef,
-    RealmConfigDocument,
+use aruna_core::structs::storage::metadata_registry::{
+    MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
 };
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::Effects;
 use byteview::ByteView;
@@ -42,7 +43,7 @@ use crate::tasks::queue_backoff::conflict_backoff;
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteDocumentOperation {
-    actor: aruna_core::structs::Actor,
+    actor: aruna_core::structs::identity::auth::Actor,
     group_id: Ulid,
     document_id: Ulid,
     record: Option<MetadataRegistryRecord>,
@@ -119,7 +120,7 @@ pub enum DeleteDocumentError {
 }
 
 impl DeleteDocumentOperation {
-    pub fn new(actor: aruna_core::structs::Actor, group_id: Ulid, document_id: Ulid) -> Self {
+    pub fn new(actor: aruna_core::structs::identity::auth::Actor, group_id: Ulid, document_id: Ulid) -> Self {
         Self {
             actor,
             group_id,
@@ -1015,21 +1016,21 @@ mod pure_tests {
         METADATA_GRAPH_PRUNE_JOB_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE,
     };
     use aruna_core::storage_entries::sync_revision_key;
-    use aruna_core::structs::{
-        JobId, PersistentIdMapping, PersistentIdStatus, PlacementStrategy, RealmId, RealmNodeKind,
-        persistent_id_key,
-    };
+    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::{PersistentIdMapping, PersistentIdStatus, persistent_id_key};
+    use aruna_core::structs::placement::placement_record::PlacementStrategy;
+    use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
 
-    fn actor() -> aruna_core::structs::Actor {
+    fn actor() -> aruna_core::structs::identity::auth::Actor {
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        aruna_core::structs::Actor {
+        aruna_core::structs::identity::auth::Actor {
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
             user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
             realm_id,
         }
     }
 
-    fn record(actor: &aruna_core::structs::Actor) -> MetadataRegistryRecord {
+    fn record(actor: &aruna_core::structs::identity::auth::Actor) -> MetadataRegistryRecord {
         let group_id = Ulid::from_parts(2, 2);
         let document_id = Ulid::from_parts(3, 3);
         let document_path = "datasets/delete-lifecycle";
@@ -1262,7 +1263,7 @@ mod pure_tests {
     /// resolves a generation and takes the bucket's fence.
     fn activated_config(
         record: &mut MetadataRegistryRecord,
-        actor: &aruna_core::structs::Actor,
+        actor: &aruna_core::structs::identity::auth::Actor,
     ) -> RealmConfigDocument {
         let mut config = RealmConfigDocument::new(record.realm_id, Vec::new(), 3);
         let strategy = PlacementStrategy {
@@ -1757,7 +1758,7 @@ mod pure_tests {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::from_bytes([0x51; 16]);
-        let run = |actor: aruna_core::structs::Actor, record: &MetadataRegistryRecord| {
+        let run = |actor: aruna_core::structs::identity::auth::Actor, record: &MetadataRegistryRecord| {
             let mut operation =
                 DeleteDocumentOperation::new(actor, record.group_id, record.document_id)
                     .with_phase_source(fixed_phase_source());

@@ -4,14 +4,19 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
-    ArtifactRef, AuthContext, CopyJobSpec, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
-    FIRST_GRANTABLE_HANDLE, ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord,
-    JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, MintPersistentSpec, OutputDestination,
-    Permission, RealmId, RunCrateStatus, SessionReportDetail, SessionReportRow,
-    StagingJobCheckpoint, StagingJobSpec, StoragePurgeSpec, WorkspaceMode, pid_dedup_key,
-    shard_for_subject, user_dedup_key,
+use aruna_core::structs::execution::job::{
+    ArtifactRef, CopyJobSpec, ExecutionSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId,
+    JobPayload, JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
+    RunCrateStatus, SessionReportDetail, SessionReportRow, StagingJobCheckpoint, StagingJobSpec,
+    WorkspaceMode, pid_dedup_key, user_dedup_key,
 };
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::placement::placement_record::{
+    DEFAULT_SHARD_COUNT, FIRST_GRANTABLE_HANDLE, shard_for_subject,
+};
+use aruna_core::structs::identity::realm::{JobOwnerError, RealmId};
+use aruna_core::structs::MintPersistentSpec;
+use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
@@ -86,7 +91,7 @@ pub(crate) async fn mint_local_job(
 /// the realm config. The resulting job id and dedup shard can therefore be
 /// written atomically with the producer's own records.
 pub(crate) fn mint_configured_job(
-    config: &aruna_core::structs::RealmConfigDocument,
+    config: &aruna_core::structs::identity::realm::RealmConfigDocument,
     owner_node_id: NodeId,
     subject: &[u8],
 ) -> Result<JobId, SubmitJobError> {
@@ -135,7 +140,7 @@ pub(crate) fn validate_execution(
     workspace_bucket: Option<&str>,
 ) -> Result<(), SubmitJobError> {
     spec.inputs =
-        aruna_core::structs::plan_composition(spec.inputs.clone(), spec.collision_policy)?;
+        aruna_core::structs::execution::job::plan_composition(spec.inputs.clone(), spec.collision_policy)?;
     // Nothing copies an input into a bucket any more, so one that names no
     // container path would reach nobody.
     if let Some(input) = spec
@@ -1363,10 +1368,12 @@ pub(crate) async fn kick_drain(context: &DriverContext) {
 mod tests {
     use super::super::store::{insert_job, preserve_artifact_tombstone, read_job_record};
     use super::*;
-    use aruna_core::structs::{
-        AuthContext, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
-        ImportRoCrateTarget, JobState, RealmId, RoCrateLimits,
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::execution::job::{
+        ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
+        JobState, RoCrateLimits,
     };
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
@@ -1405,7 +1412,7 @@ mod tests {
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: (0..=MAX_EXECUTION_OUTPUTS)
-                .map(|index| aruna_core::structs::WorkspaceOutput {
+                .map(|index| aruna_core::structs::execution::job::WorkspaceOutput {
                     container_path: format!("/out/{index}"),
                     dest_key: format!("out/{index}"),
                 })
@@ -1473,15 +1480,15 @@ mod tests {
             env: Default::default(),
             resources: Default::default(),
             executor_constraint: None,
-            inputs: vec![aruna_core::structs::InputSelection {
-                source: aruna_core::structs::InputSource::S3 {
+            inputs: vec![aruna_core::structs::execution::job::InputSelection {
+                source: aruna_core::structs::execution::job::InputSource::S3 {
                     bucket: "data".to_string(),
                     key: "in.txt".to_string(),
                     version_id: None,
                 },
                 source_node_id: None,
                 dest_key: "in.txt".to_string(),
-                mode: aruna_core::structs::InputMode::Snapshot,
+                mode: aruna_core::structs::execution::job::InputMode::Snapshot,
                 container_path: None,
                 name: None,
                 description: None,
@@ -1518,7 +1525,7 @@ mod tests {
             resources: Default::default(),
             executor_constraint: None,
             inputs: Vec::new(),
-            file_outputs: vec![aruna_core::structs::OutputSelection {
+            file_outputs: vec![aruna_core::structs::execution::job::OutputSelection {
                 container_path: "/out/result.txt".to_string(),
                 path_prefix: None,
                 destination: OutputDestination::S3 {
@@ -1529,7 +1536,7 @@ mod tests {
                 name: None,
                 description: None,
             }],
-            workspace_outputs: vec![aruna_core::structs::WorkspaceOutput {
+            workspace_outputs: vec![aruna_core::structs::execution::job::WorkspaceOutput {
                 container_path: "/result.txt".to_string(),
                 dest_key: "result.txt".to_string(),
             }],

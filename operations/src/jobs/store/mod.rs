@@ -10,16 +10,18 @@ use aruna_core::keyspaces::{
     JOB_OWNER_INDEX_KEYSPACE, JOB_RUN_CRATE_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
     ROCRATE_JOB_STATE_KEYSPACE, S3_PURGE_CHECKPOINT_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
 };
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     ActiveJobKind, AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError,
     JobErrorKind, JobExecutionClass, JobId, JobPayload, JobProgress, JobRecord, JobRecordEnvelope,
     JobRecordError, JobResultPayload, JobState, JobTransitionError, RunCrateStatus,
-    StoragePurgeCheckpoint, UserAccess, attempt_control_key, cleanup_dedup_key, cleanup_job_id,
-    crate_dedup_key, crate_job_id, due_index_key, encode_dedup_value, job_active_key,
-    job_entry_key, job_entry_prefix, job_owner_cursor, job_prune_key, job_record_key,
-    lease_index_key, owner_index_key, owner_index_prefix, parse_dedup_value, parse_entry_key,
-    parse_owner_key, rocrate_plan_key, run_crate_key, validate_transition, workspace_credential_id,
+    attempt_control_key, cleanup_dedup_key, cleanup_job_id, crate_dedup_key, crate_job_id,
+    due_index_key, encode_dedup_value, job_active_key, job_entry_key, job_entry_prefix,
+    job_owner_cursor, job_prune_key, job_record_key, lease_index_key, owner_index_key,
+    owner_index_prefix, parse_dedup_value, parse_entry_key, parse_owner_key, rocrate_plan_key,
+    run_crate_key, validate_transition, workspace_credential_id,
 };
+use aruna_core::structs::storage::storage_purge::StoragePurgeCheckpoint;
+use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;

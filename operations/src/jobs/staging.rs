@@ -1,11 +1,14 @@
 use std::path::{Component, Path};
 
 use aruna_core::keyspaces::STAGING_JOB_STATE_KEYSPACE;
-use aruna_core::structs::{
-    BucketInfo, JobError, JobId, JobResultPayload, Permission, SourceEntry, SourceEntryKind,
-    StagingJobCheckpoint, StagingJobDirectory, StagingJobError, StagingJobPhase, StagingJobSpec,
-    StagingPendingItem, StagingStrategy, object_permission_path,
+use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
+use aruna_core::structs::execution::job::{
+    JobError, JobId, JobResultPayload, StagingJobCheckpoint, StagingJobDirectory, StagingJobError,
+    StagingJobPhase, StagingJobSpec, StagingPendingItem,
 };
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::execution::source_access::{SourceEntry, SourceEntryKind};
+use aruna_core::structs::execution::staging::StagingStrategy;
 use byteview::ByteView;
 use tracing::warn;
 
@@ -15,7 +18,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::driver::drive;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
-use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
 use crate::staging::list_source::{ListStagingInput, ListStagingOperation};
 use crate::staging::reference::{MaterializeReferenceInput, stage_reference_blob};
@@ -419,7 +422,7 @@ async fn ensure_item_permission(
 async fn load_live_bucket(
     ctx: &JobContext,
     bucket: &str,
-) -> Result<aruna_core::structs::BucketInfo, ItemFailure> {
+) -> Result<aruna_core::structs::storage::blob::BucketInfo, ItemFailure> {
     match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
         Ok(bucket_info) => Ok(bucket_info),
         Err(GetBucketError::NotFound) => Err(ItemFailure::Stage(
@@ -649,9 +652,9 @@ mod pure_tests {
 
     #[test]
     fn initial_prefix_marked() {
-        let realm_id = aruna_core::structs::RealmId::from_bytes([1; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         let mut spec = StagingJobSpec {
-            auth_context: aruna_core::structs::AuthContext {
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
                 user_id: aruna_core::UserId::local(Ulid::from_bytes([2; 16]), realm_id),
                 realm_id,
                 path_restrictions: None,
@@ -663,7 +666,7 @@ mod pure_tests {
             bucket: "bucket".to_string(),
             strategy: StagingStrategy::Reference,
             items: Vec::new(),
-            prefixes: vec![aruna_core::structs::StagingJobPrefix {
+            prefixes: vec![aruna_core::structs::execution::job::StagingJobPrefix {
                 source_prefix: "refseq".to_string(),
                 target_prefix: String::new(),
             }],

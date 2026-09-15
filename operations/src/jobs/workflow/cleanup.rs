@@ -1,10 +1,12 @@
 use aruna_core::compute::{BackendError, ExecutorKind, TombstoneSpec};
-use aruna_core::structs::{AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload};
+use aruna_core::structs::execution::job::{
+    AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload,
+};
 
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{JobMutationError, authorize_cleanup, record_attempt_tombstone};
 use crate::driver::drive;
-use crate::s3::revoke_access::{RevokeUserError, RevokeUserOperation};
+use crate::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 
 pub async fn run_terminal_cleanup(
     ctx: &JobContext,
@@ -133,11 +135,14 @@ mod tests {
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, USER_ACCESS_KEYSPACE};
-    use aruna_core::structs::{
-        BlobHeadKey, BlobVersion, BucketInfo, ComputeResources, CurrentVersionPointer,
-        ExecutionSpec, JobClaim, JobPayload, JobProgress, JobRecord, JobState, RealmId, UserAccess,
-        VersionKey, WorkspaceMode,
+    use aruna_core::structs::storage::blob::{
+        BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, UserAccess, VersionKey,
     };
+    use aruna_core::structs::execution::job::{
+        ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobProgress, JobRecord, JobState,
+        WorkspaceMode,
+    };
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
@@ -147,9 +152,9 @@ mod tests {
     use crate::driver::DriverContext;
     use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::{insert_job, record_attempt_intent};
-    use crate::s3::create_bucket::CreateBucketOperation;
-    use crate::s3::get_access::GetAccessOperation;
-    use crate::s3::get_bucket::GetBucketOperation;
+    use crate::s3::bucket::create::CreateBucketOperation;
+    use crate::s3::access::get::GetAccessOperation;
+    use crate::s3::bucket::get::GetBucketOperation;
 
     struct StubBackend {
         kind: ExecutorKind,
@@ -539,7 +544,7 @@ mod tests {
         let stored = drive(GetAccessOperation::new(access.access_key), &ctx.driver).await;
         assert!(matches!(
             stored,
-            Err(crate::s3::get_access::GetAccessError::NotFound)
+            Err(crate::s3::access::get::GetAccessError::NotFound)
         ));
     }
 

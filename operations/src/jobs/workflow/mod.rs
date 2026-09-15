@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use aruna_compute::ExecutorBackend;
 use aruna_core::compute::{AttemptRef, BackendError, ExecutorKind, FenceContext};
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, PhysicalExecutionState,
 };
 use aruna_core::time::unix_timestamp_millis;

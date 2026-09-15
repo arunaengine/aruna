@@ -4,7 +4,7 @@ use aruna_compute::ExecutorBackend;
 use aruna_core::compute::{
     AttemptStatus, BackendError, FenceContext, ReconcileEvidence, TombstoneSpec,
 };
-use aruna_core::structs::{ExecutionSpec, JobError, JobId, JobRecord};
+use aruna_core::structs::execution::job::{ExecutionSpec, JobError, JobId, JobRecord};
 use aruna_core::time::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -334,7 +334,7 @@ pub(super) async fn pre_submit_failure(
     error: JobError,
     error_logged: bool,
 ) {
-    if error.kind == aruna_core::structs::JobErrorKind::Permanent {
+    if error.kind == aruna_core::structs::execution::job::JobErrorKind::Permanent {
         if !error_logged {
             warn!(job_id = %job_id, error = ?error, "Permanent pre-submit failure");
         }

@@ -18,12 +18,16 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::{
     document_lifecycle_key, event_log_key, graph_lifecycle_key, pending_projection_target,
 };
-use aruna_core::structs::{
-    ARUNA_DATA_PREFIX, AuthContext, BlobHeadKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, MetadataRegistryRecord, PathClaimRecord, Permission, PlacementRef,
-    RealmConfigDocument, RealmId, VersionKey, W3idIdentifier, bucket_permission_path,
-    object_permission_path,
+use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, W3idIdentifier};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{
+    BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
+    bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::PathClaimRecord;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
 use aruna_core::{MetaResourceId, NodeId};
@@ -101,9 +105,9 @@ use crate::placement::{
 };
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::get_nodes::{GetNodesOperation, REALM_DISCOVERY_TIMEOUT};
-use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
-use crate::s3::search_objects::{
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::search::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
+use crate::s3::object::search::{
     ObjectInventoryHit, ObjectKeyMatch, SearchNodePage, SearchObjectsInput, search_local_objects,
 };
 

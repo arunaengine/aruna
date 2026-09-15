@@ -3,11 +3,16 @@ use std::collections::BTreeSet;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::BLOB_DELETE_AUDIT_KEYSPACE;
-use aruna_core::structs::{
-    BlobAuditKind, BlobAuditRecord, BlobPurgeKind, JobError, JobProgress, JobResultPayload,
-    MultipartUpload, Permission, StoragePurgeCheckpoint, StoragePurgeResult, StoragePurgeScope,
-    StoragePurgeSpec, delete_audit_key, object_permission_path,
+use aruna_core::structs::storage::delete_audit::{
+    BlobAuditKind, BlobAuditRecord, BlobPurgeKind, delete_audit_key,
 };
+use aruna_core::structs::execution::job::{JobError, JobProgress, JobResultPayload};
+use aruna_core::structs::storage::multipart::MultipartUpload;
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::storage::storage_purge::{
+    StoragePurgeCheckpoint, StoragePurgeResult, StoragePurgeScope, StoragePurgeSpec,
+};
+use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::time::unix_timestamp_millis;
 
 use super::super::executor::{JobContext, JobRunOutcome};
@@ -15,13 +20,13 @@ use super::super::store::{flush_progress, put_purge_checkpoint, read_purge_check
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::drive;
-use crate::s3::abort_upload::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
-use crate::s3::delete_bucket::{DeleteBucketError, DeleteBucketOperation};
-use crate::s3::delete_object::DeleteObjectError;
-use crate::s3::delete_objects::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
-use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use crate::s3::list_uploads::{ListUploadsInput, ListUploadsOperation};
-use crate::s3::list_versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
+use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
+use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
+use crate::s3::object::delete::DeleteObjectError;
+use crate::s3::object::delete_bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
+use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
 use crate::s3::purge_fence::{PurgeFenceError, acquire_purge_fence};
 
 const PURGE_BATCH_SIZE: usize = 1_000;
@@ -591,10 +596,10 @@ fn fence_error(error: PurgeFenceError) -> JobError {
 mod pure_tests {
     use super::purge_audit_record;
     use aruna_core::UserId;
-    use aruna_core::structs::RealmId;
-    use aruna_core::structs::{
-        AuthContext, BlobAuditKind, BlobPurgeKind, StoragePurgeScope, StoragePurgeSpec,
-    };
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobPurgeKind};
+    use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
     use ulid::Ulid;
 
     fn spec(scope: StoragePurgeScope) -> StoragePurgeSpec {

@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{JOB_ACTIVE_USER_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     ActiveJobKind, JobId, JobPayload, JobRecord, WorkspaceMode, job_active_prefix, job_record_key,
     parse_dedup_value,
 };
@@ -94,7 +94,7 @@ pub enum SubmitJobError {
     #[error("compute quota denied: {0}")]
     QuotaDenied(#[from] aruna_core::compute_quota::QuotaDenied),
     #[error(transparent)]
-    Composition(#[from] aruna_core::structs::CompositionError),
+    Composition(#[from] aruna_core::structs::execution::job::CompositionError),
     #[error("active RO-Crate job limit reached ({limit})")]
     ActiveJobLimit { limit: u32 },
     #[error("unexpected event while submitting job: {0}")]
@@ -457,11 +457,13 @@ mod tests {
     use aruna_core::keyspaces::{
         JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
     };
-    use aruna_core::structs::{
-        AuthContext, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, ImportMetadataTarget,
-        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobState, RealmId,
-        RoCrateLimits, encode_dedup_value,
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::execution::job::{
+        ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
+        ImportRoCrateSpec, ImportRoCrateTarget, JobState, RoCrateLimits, encode_dedup_value,
     };
+    use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
     use byteview::ByteView;
@@ -507,7 +509,7 @@ mod tests {
             owner_node_id: node_id(7),
             dedup_key,
             now_ms: 1_000,
-            retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::DEFAULT_JOB_RETENTION_MS,
             workspace_mode: WorkspaceMode::None,
             workspace_bucket: None,
             active_cap: None,

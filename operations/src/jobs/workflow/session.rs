@@ -4,9 +4,9 @@ use std::sync::Arc;
 use aruna_compute::ExecutorBackend;
 use aruna_compute::session::{EndReason, Session, SessionConfig};
 use aruna_core::compute::FenceContext;
-use aruna_core::structs::{
-    DEFAULT_SESSION_IDLE_AFTER_MS, ExecutionSpec, JobId, JobRecord, JobResultPayload,
-    SessionReportDetail, SessionReportRow,
+use aruna_core::structs::placement::compute_config::DEFAULT_SESSION_IDLE_AFTER_MS;
+use aruna_core::structs::execution::job::{
+    ExecutionSpec, JobId, JobRecord, JobResultPayload, SessionReportDetail, SessionReportRow,
 };
 use tracing::warn;
 

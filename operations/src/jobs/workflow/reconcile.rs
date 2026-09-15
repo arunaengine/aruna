@@ -3,7 +3,9 @@ use std::sync::{Arc, Weak};
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, ExecutorKind, FenceContext, ReconcileEvidence,
 };
-use aruna_core::structs::{ExecutionSpec, JobError, JobErrorKind, JobPayload, JobRecord, JobState};
+use aruna_core::structs::execution::job::{
+    ExecutionSpec, JobError, JobErrorKind, JobPayload, JobRecord, JobState,
+};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use tokio_util::sync::CancellationToken;
@@ -322,7 +324,7 @@ impl ComputeReconciler {
     #[allow(clippy::too_many_arguments)]
     async fn resume(
         &self,
-        job_id: aruna_core::structs::JobId,
+        job_id: aruna_core::structs::execution::job::JobId,
         token: ulid::Ulid,
         backend: Arc<dyn aruna_compute::ExecutorBackend>,
         fence: FenceContext,
@@ -365,7 +367,7 @@ impl ComputeReconciler {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn resume_attempt(
     context: Arc<DriverContext>,
-    job_id: aruna_core::structs::JobId,
+    job_id: aruna_core::structs::execution::job::JobId,
     token: ulid::Ulid,
     backend: Arc<dyn aruna_compute::ExecutorBackend>,
     fence: FenceContext,
@@ -505,7 +507,7 @@ pub(super) async fn resume_attempt(
 
 async fn fail_or_park(
     context: &Arc<DriverContext>,
-    job_id: aruna_core::structs::JobId,
+    job_id: aruna_core::structs::execution::job::JobId,
     token: ulid::Ulid,
     record: &JobRecord,
     error: JobError,
@@ -533,7 +535,9 @@ mod tests {
     use crate::tests::workflow::{execution_spec, node_id};
     use aruna_compute::ExecutorRegistry;
     use aruna_core::UserId;
-    use aruna_core::structs::{AttemptIntent, FIRST_GRANTABLE_HANDLE, JobClaim, JobId, RealmId};
+    use aruna_core::structs::execution::job::{AttemptIntent, JobClaim, JobId};
+    use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;

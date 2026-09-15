@@ -10,14 +10,20 @@ use aruna_core::compute::{
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::id::NodeId;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::{
-    AttemptControl, AuthContext, BackendLocation, BucketInfo, CapturedInput, ExecutionSpec,
-    HashIndex, InputMode, InputSelection, InputSource, JobError, JobRecord, MAX_EXECUTION_OUTPUTS,
-    OBJECT_CONTENT_TYPE_KEY, OutputDestination, OutputObject, OutputSelection, PathRestriction,
-    Permission, PlacementPolicyRef, RealmId, ReplicationFailure, UserAccess, VersionedObjectArn,
-    bucket_permission_path, ensure_confined_path, group_permission_path, key_content_type,
-    object_permission_path, workspace_credential_id,
+use aruna_core::structs::execution::job::{
+    AttemptControl, CapturedInput, ExecutionSpec, InputMode, InputSelection, InputSource, JobError,
+    JobRecord, MAX_EXECUTION_OUTPUTS, OutputDestination, OutputObject, OutputSelection,
+    workspace_credential_id,
 };
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BucketInfo, HashIndex, OBJECT_CONTENT_TYPE_KEY, UserAccess,
+    bucket_permission_path, ensure_confined_path, group_permission_path, key_content_type,
+    object_permission_path,
+};
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::replication::{ReplicationFailure, VersionedObjectArn};
 use futures_util::StreamExt;
 use std::sync::Arc;
 use ulid::Ulid;
@@ -40,16 +46,16 @@ use crate::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget, SourceAuthorization,
     SourceAuthorizationError,
 };
-use crate::s3::create_access::{CreateUserConfig, CreateUserOperation};
-use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
-use crate::s3::delete_bucket::{DeleteBucketError, DeleteBucketOperation};
-use crate::s3::delete_object::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
-use crate::s3::get_access::{GetAccessError, GetAccessOperation};
-use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use crate::s3::list_objects::{ListBucketInput, ListBucketOperation};
-use crate::s3::put_object::{
+use crate::s3::access::create::{CreateUserConfig, CreateUserOperation};
+use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
+use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
+use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
+use crate::s3::access::get::{GetAccessError, GetAccessOperation};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
+use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 
@@ -1148,7 +1154,7 @@ struct StagedSource {
 }
 
 impl StagedSource {
-    fn from_local(get: crate::s3::get_object::GetObjectResult) -> Self {
+    fn from_local(get: crate::s3::object::get::GetObjectResult) -> Self {
         Self {
             blob: get.blob,
             location: get.location,
@@ -1558,9 +1564,11 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
-    use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, JobErrorKind, JobId, JobPayload,
-        OutputCommitIntent, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::execution::job::{JobErrorKind, JobId, JobPayload, OutputCommitIntent};
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -1952,7 +1960,7 @@ mod tests {
         let owner = record.created_by;
         let ungranted = UserId::local(Ulid::from_bytes([9; 16]), realm_id);
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-        config.ensure_node(node_id, aruna_core::structs::RealmNodeKind::User { owner });
+        config.ensure_node(node_id, aruna_core::structs::identity::realm::RealmNodeKind::User { owner });
         let actor = Actor {
             node_id,
             user_id: owner,
@@ -2102,7 +2110,7 @@ mod tests {
             panic!("a foreign key must not yield a credential")
         };
 
-        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(error.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
         assert!(
             error
                 .message
@@ -2191,7 +2199,7 @@ mod tests {
             panic!("an over-limit mount set must not yield a credential")
         };
 
-        assert_eq!(over.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(over.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
         assert!(
             over.message
                 .starts_with("workspace credential restrictions invalid")
@@ -2331,7 +2339,7 @@ mod tests {
         assert_eq!(merged.len(), MAX_EXECUTION_OUTPUTS);
 
         let error = merge_outputs(inventoried, vec![output("overflow")]).unwrap_err();
-        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(error.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
     }
 
     fn wildcard_output(pattern: &str) -> OutputSelection {
@@ -2397,12 +2405,12 @@ mod tests {
     fn rejects_foreign_match() {
         let output = wildcard_output("/out/*.txt");
         let error = expand_selection(&output, vec!["/other/a.txt".to_string()]).unwrap_err();
-        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(error.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
 
         let mut output = output;
         output.path_prefix = None;
         let error = expand_selection(&output, vec!["/out/a.txt".to_string()]).unwrap_err();
-        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(error.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
     }
 
     #[test]
@@ -2414,7 +2422,7 @@ mod tests {
         }
         insert_output(&mut outputs, &mut keys, output("0")).unwrap();
         let error = insert_output(&mut outputs, &mut keys, output("overflow")).unwrap_err();
-        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(error.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
         assert_eq!(outputs.len(), MAX_EXECUTION_OUTPUTS);
     }
 }
