@@ -1,12 +1,6 @@
-//! The S3 listener: connection acceptance, request pipeline and response
-//! lifetime ownership.
-//!
-//! Request handling is a sequence of named stages. Classification, tracing,
-//! activity/deadline setup and body wrapping happen synchronously in
-//! [`Service::call`]; quota, admission, CORS, validation, service execution and
-//! response finalisation run in [`PreparedRequest::run`] in that order. The
-//! bodies that carry a response own their permits and accounting until the
-//! stream ends, so returning headers never releases the request early.
+//! The S3 listener: connection acceptance, the staged request pipeline, and
+//! response-lifetime ownership. Responding bodies keep their permits and
+//! accounting until the stream ends, so headers never release a request early.
 
 mod activity;
 mod body;
@@ -245,9 +239,8 @@ struct PreparedRequest {
 
 impl PreparedRequest {
     /// Runs the request stages in execution order: IP quota, admission,
-    /// oversized-body rejection, local lease, active-request accounting plus
-    /// total deadline, bucket CORS, preflight, bucket-name validation, capture
-    /// budget, stream idle watch, service execution and response lifetime.
+    /// oversized-body rejection, lease, accounting and deadline, CORS,
+    /// preflight, bucket validation, capture, idle watch, execution, response.
     async fn run(mut self) -> Result<HttpResponse, HttpError> {
         // Stage: charge the transport IP before any validation or body handling.
         if let Some(charged_ip) = self.charged_ip
@@ -300,7 +293,6 @@ impl PreparedRequest {
             .extensions_mut()
             .insert(self.lease.clone());
 
-        // Stage: active-request accounting plus the total stream deadline.
         self.connection.begin_request();
         let deadline_activity = spawn_total_deadline(self.service.timeouts.stream_lifetime);
         self.active = Some(ActiveRequestGuard::new(
@@ -308,8 +300,6 @@ impl PreparedRequest {
             deadline_activity.clone(),
         ));
 
-        // Stage: load the bucket CORS configuration, cancelled by a disconnect
-        // or the total deadline.
         let bucket_cors = if self.classification.origin_header.is_some() {
             let driver_ctx = self.service.driver_ctx.clone();
             let bucket = self.classification.bucket.clone();
@@ -367,7 +357,6 @@ impl PreparedRequest {
             return self.trace.respond("invalid_bucket", response);
         }
 
-        // Stage: bound concurrent DeleteObjects body aggregation.
         if self.classification.delete_objects {
             match self.capture_limit.clone().try_acquire_owned() {
                 Ok(permit) => self.capture_permit = Some(permit),
@@ -388,7 +377,6 @@ impl PreparedRequest {
             self.stream.stop();
         }
 
-        // Stage: run the s3s service under disconnect, total and idle bounds.
         let shared = self.service.shared.clone();
         let span = self.trace.span.clone();
         let request = self
@@ -410,7 +398,6 @@ impl PreparedRequest {
             _ = stream.wait_cancelled() => HandlerOutcome::TimedOut,
         };
 
-        // Stage: attach the response lifetime and finish the request record.
         self.finish(outcome, handler, bucket_cors, deadline_activity)
             .await
     }
@@ -441,10 +428,9 @@ impl PreparedRequest {
         let stream = self.stream.clone();
         let result = match outcome {
             HandlerOutcome::Done(result) => result,
-            // AWS answers a slow CompleteMultipartUpload the same way: the
-            // 200 head first, whitespace while it works, the XML last. The
-            // returned body is wrapped below like any stream, so the response
-            // lifetime stays attached while the completion runs behind it.
+            // AWS answers a slow CompleteMultipartUpload the same way: the 200
+            // head first, whitespace while it works, the XML last. The body is
+            // wrapped below, keeping the response lifetime on the completion.
             HandlerOutcome::Keepalive => Ok(keepalive_response(handler)),
             HandlerOutcome::Aborted => {
                 self.finish_request();
@@ -764,7 +750,6 @@ impl S3Server {
         let server_abort = abort_connections.clone();
 
         let server = async move {
-            let _abort_connections = server_abort.clone().drop_guard();
             loop {
                 let (socket, peer) = tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -813,13 +798,6 @@ impl S3Server {
                     }
                 });
             }
-
-            connection_tracker.close();
-            let in_flight = connection_tracker.len();
-            if in_flight > 0 {
-                info!(in_flight, "Draining in-flight S3 connections");
-            }
-            connection_tracker.wait().await;
         };
 
         let task = tokio::spawn(server);
@@ -828,7 +806,7 @@ impl S3Server {
         Ok((
             local_addr,
             S3ServerHandle {
-                task,
+                task: Some(task),
                 connections,
                 abort_connections,
             },
@@ -843,41 +821,66 @@ impl S3Server {
     }
 }
 
-/// Completion boundary for one bound S3 server. The accept task and the
-/// connection tracker are separate owners: aborting the accept task still
-/// leaves every connection child tracked here, so a forced shutdown awaits
-/// their release instead of detaching them with the aborted future.
+/// Completion boundary for one bound S3 server. The accept task ends with the
+/// accept loop while connection children stay owned here, so a forced shutdown
+/// awaits their release instead of detaching them with the aborted future.
 pub struct S3ServerHandle {
-    task: JoinHandle<()>,
+    /// `None` once `exit` consumed the accept task's result.
+    task: Option<JoinHandle<()>>,
     connections: TaskTracker,
     abort_connections: CancellationToken,
 }
 
 impl S3ServerHandle {
     pub fn is_finished(&self) -> bool {
-        self.task.is_finished()
+        self.task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
     /// Stops accepting and asks every connection to close; does not wait.
     pub fn abort(&self) {
         self.abort_connections.cancel();
-        self.task.abort();
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
     }
 
-    /// Resolves when the accept loop exits, for supervision selects.
+    /// Resolves when the accept loop exits, for supervision selects. The accept
+    /// result is consumed exactly once; a later call pends, and the handle keeps
+    /// owning the connection children for the wait that follows.
     pub async fn exit(&mut self, label: &str) -> String {
-        match (&mut self.task).await {
+        let Some(task) = self.task.as_mut() else {
+            return std::future::pending().await;
+        };
+        let result = (&mut *task).await;
+        self.task = None;
+        match result {
             Ok(()) => format!("{label} server stopped unexpectedly"),
             Err(error) if error.is_cancelled() => format!("{label} server aborted"),
             Err(error) => format!("{label} server panicked: {error}"),
         }
     }
 
-    /// Waits for the accept loop and every connection task to release.
-    pub async fn wait(self) {
-        let _ = self.task.await;
+    /// Waits for the accept loop and every connection task to release while the
+    /// handle stays owned. Dropping this future (a phase deadline) leaves the
+    /// owner able to abort and await the remaining work.
+    pub async fn wait_until_released(&mut self) {
+        if let Some(task) = self.task.as_mut() {
+            let _ = (&mut *task).await;
+        }
+        self.task = None;
         self.connections.close();
+        let in_flight = self.connections.len();
+        if in_flight > 0 {
+            info!(in_flight, "Draining in-flight S3 connections");
+        }
         self.connections.wait().await;
+    }
+
+    /// Waits for the accept loop and every connection task to release.
+    pub async fn wait(mut self) {
+        self.wait_until_released().await;
     }
 }
 
@@ -1207,16 +1210,17 @@ mod tests {
     #[tokio::test]
     async fn exit_reports_stop_abort_and_panic() {
         let handle = |task| S3ServerHandle {
-            task,
+            task: Some(task),
             connections: TaskTracker::new(),
             abort_connections: CancellationToken::new(),
         };
 
         let mut stopped = handle(tokio::spawn(async {}));
         assert_eq!(stopped.exit("S3").await, "S3 server stopped unexpectedly");
+        assert!(stopped.is_finished());
 
         let mut aborted = handle(tokio::spawn(std::future::pending::<()>()));
-        aborted.task.abort();
+        aborted.task.as_mut().expect("accept task retained").abort();
         assert_eq!(aborted.exit("S3").await, "S3 server aborted");
 
         let mut panicked = handle(tokio::spawn(async { panic!("boom") }));
@@ -1277,5 +1281,81 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait())
             .await
             .expect("a forced abort must await every connection child");
+    }
+
+    // An expired phase deadline drops the wait future but not the owner: the
+    // retained handle still aborts and awaits the active connection child.
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_wait_keeps_the_owner() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap())
+            .expect("test storage");
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let node_id = iroh::SecretKey::from_bytes(&[0x57; 32]).public();
+        let server = S3Server::new(
+            "127.0.0.1:0",
+            "localhost".to_string(),
+            driver_ctx,
+            RealmId([0x57; 32]),
+            node_id,
+            CredentialEncryptionKey::random(),
+            Default::default(),
+            crate::cors::CorsConfig::default(),
+            Arc::new(NodeMetrics::new()),
+        )
+        .await
+        .expect("s3 server builds");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let (_bound, mut handle) = server
+            .run_with_listener(listener, CancellationToken::new())
+            .expect("server runs");
+
+        // A request with an unfinished body keeps a connection child busy.
+        let mut socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        socket
+            .write_all(
+                b"PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nab",
+            )
+            .await
+            .expect("partial body");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The accept loop is still running, so this wait stays pending and the
+        // zero budget drops it exactly like an expired phase deadline.
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, handle.wait_until_released())
+                .await
+                .is_err(),
+            "the wait must still be pending when its deadline expires"
+        );
+
+        handle.abort();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle.wait_until_released(),
+        )
+        .await
+        .expect("forced cleanup must await the connection child");
+
+        let mut buf = [0u8; 1];
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_secs(1), socket.read(&mut buf)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "the connection child must have released the client, got {closed:?}"
+        );
     }
 }
