@@ -5,7 +5,7 @@ use super::*;
 /// stamp a document that decodes to another, even when both share this holder.
 #[tokio::test]
 async fn pid_placement_fence() {
-    use aruna_core::keyspaces::{PERSISTENT_ID_MAPPING_KEYSPACE, SHARD_MANIFEST_KEYSPACE};
+    use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, SHARD_MANIFEST_KEYSPACE};
     use aruna_core::storage_entries::shard_manifest_key;
     use aruna_core::structs::PersistentIdRevision;
 
@@ -145,7 +145,7 @@ async fn pid_placement_fence() {
     assert!(
         read_storage_value(
             &storage,
-            PERSISTENT_ID_MAPPING_KEYSPACE,
+            ID_MAPPING_KEYSPACE,
             ByteView::from(persistent_id_key(valid_document)),
         )
         .await
@@ -168,7 +168,7 @@ async fn pid_placement_fence() {
         assert!(
             read_storage_value(
                 &storage,
-                PERSISTENT_ID_MAPPING_KEYSPACE,
+                ID_MAPPING_KEYSPACE,
                 ByteView::from(persistent_id_key(document_id)),
             )
             .await
@@ -261,7 +261,7 @@ async fn capacity_holds_cursor() {
 
     // A full store fails the write closed: no evidence, no cursor movement.
     let full = SyncQuarantineUsage {
-        records: SYNC_QUARANTINE_MAX_RECORDS,
+        records: QUARANTINE_MAX_RECORDS,
         bytes: 0,
     };
     write_usage(&storage, full).await;
@@ -442,7 +442,7 @@ async fn replay_backlog() {
         .ensure_sync_topics(&[topic_id], Vec::new())
         .expect("shard topic exists");
 
-    let documents = (0..(DOCUMENT_SYNC_REPLAY_BATCH_LIMIT + 1))
+    let documents = (0..(REPLAY_BATCH_LIMIT + 1))
         .map(|index| {
             let event_id = Ulid::from_parts(1_800_000_000_000 + index as u64, 1);
             DocumentSyncPublish::Upsert {
@@ -472,7 +472,7 @@ async fn replay_backlog() {
     let cursor = ::irokle::ActorClock::default();
     service
         .storage_write(
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+            APPLIED_OPS_KEYSPACE.to_string(),
             topic_cursor_key(topic_id),
             postcard::to_allocvec(&cursor)
                 .expect("cursor serializes")
@@ -482,17 +482,17 @@ async fn replay_backlog() {
         .expect("cursor resets");
 
     let first = service
-        .document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)
+        .document_event_batch(topic_id, &cursor, FRAME_LEN_LIMIT)
         .expect("first replay batch");
     assert_eq!(
         first.events.len(),
-        DOCUMENT_SYNC_REPLAY_BATCH_LIMIT - 1,
+        REPLAY_BATCH_LIMIT - 1,
         "genesis consumes one bounded replay slot"
     );
     let actor = ::irokle::actor_id_for(topic_id, service.node().peer_id());
     assert_eq!(
         first.cursor.get(&actor),
-        DOCUMENT_SYNC_REPLAY_BATCH_LIMIT as u64
+        REPLAY_BATCH_LIMIT as u64
     );
     let topic_clock = service
         .node()
@@ -503,11 +503,11 @@ async fn replay_backlog() {
 
     // An interrupted run before the cursor write retries the same batch.
     let retry = service
-        .document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)
+        .document_event_batch(topic_id, &cursor, FRAME_LEN_LIMIT)
         .expect("retry replay batch");
     assert_eq!(retry.cursor, first.cursor);
     let remaining = service
-        .document_event_batch(topic_id, &first.cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)
+        .document_event_batch(topic_id, &first.cursor, FRAME_LEN_LIMIT)
         .expect("remaining replay batch");
     assert!(remaining.cursor.dominates(&topic_clock));
 

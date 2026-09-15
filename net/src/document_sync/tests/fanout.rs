@@ -5,7 +5,7 @@ fn budget_caps_streams() {
     // Per-peer and global caps hold, and dropping a permit restores both.
     let budget = Arc::new(InboundSyncBudget::default());
     let mut held = Vec::new();
-    for _ in 0..DOCUMENT_SYNC_INBOUND_PEER_STREAMS {
+    for _ in 0..INBOUND_PEER_STREAMS {
         held.push(budget.acquire(peer(1)).expect("within per-peer budget"));
     }
     assert!(budget.acquire(peer(1)).is_none());
@@ -28,14 +28,14 @@ fn budget_caps_streams() {
 
 #[test]
 fn inbound_timeout_order() {
-    assert!(DOCUMENT_SYNC_INBOUND_FRAME_TIMEOUT < DOCUMENT_SYNC_INBOUND_STREAM_TIMEOUT);
+    assert!(INBOUND_FRAME_TIMEOUT < INBOUND_STREAM_TIMEOUT);
 }
 
 #[test]
 fn sync_peers_bounded() {
     let selection = select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject", 0);
 
-    assert_eq!(selection.peers.len(), DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
+    assert_eq!(selection.peers.len(), OUTBOUND_PEER_LIMIT);
     assert!(selection.truncated);
     assert!(!selection.peers.contains(&peer(0)));
 }
@@ -50,7 +50,7 @@ fn sync_peers_dedup() {
         0,
     );
 
-    assert_eq!(selection.peers.len(), DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
+    assert_eq!(selection.peers.len(), OUTBOUND_PEER_LIMIT);
     assert!(selection.truncated);
 }
 
@@ -58,7 +58,7 @@ fn sync_peers_dedup() {
 fn sync_peers_cover() {
     let candidates = (1u8..=17).map(peer).collect::<BTreeSet<_>>();
     let mut seen = BTreeSet::new();
-    let rounds = candidates.len().div_ceil(DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
+    let rounds = candidates.len().div_ceil(OUTBOUND_PEER_LIMIT);
     for round in 0..rounds as u64 {
         seen.extend(
             select_sync_peers(
@@ -85,7 +85,7 @@ fn fanout_cursor_restart() {
             .expect("fanout cursor database");
         let cursors = db
             .keyspace(
-                DOCUMENT_SYNC_FANOUT_KEYSPACE,
+                SYNC_FANOUT_KEYSPACE,
                 fjall::KeyspaceCreateOptions::default,
             )
             .expect("fanout cursor keyspace");
@@ -103,7 +103,7 @@ fn fanout_cursor_restart() {
         .expect("reopen fanout cursor database");
     let cursors = db
         .keyspace(
-            DOCUMENT_SYNC_FANOUT_KEYSPACE,
+            SYNC_FANOUT_KEYSPACE,
             fjall::KeyspaceCreateOptions::default,
         )
         .expect("reopen fanout cursor keyspace");
@@ -128,7 +128,7 @@ fn fanout_cursor_restart() {
 fn fanout_cursor_clear() {
     // A topic reset can remove stale fan-out progress before re-emission.
     let selection = select_sync_peers((1u8..=9).map(peer), peer(0), b"missing-topic", 0);
-    assert_eq!(selection.peers.len(), DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
+    assert_eq!(selection.peers.len(), OUTBOUND_PEER_LIMIT);
     assert!(selection.truncated);
     let root = TempDir::new().expect("fanout cursor clear tempdir");
     let topic_id = topic(43);
@@ -139,7 +139,7 @@ fn fanout_cursor_clear() {
             .expect("fanout cursor clear database");
         let cursors = db
             .keyspace(
-                DOCUMENT_SYNC_FANOUT_KEYSPACE,
+                SYNC_FANOUT_KEYSPACE,
                 fjall::KeyspaceCreateOptions::default,
             )
             .expect("fanout cursor clear keyspace");
@@ -159,7 +159,7 @@ fn fanout_cursor_clear() {
         .expect("reopen fanout cursor clear database");
     let cursors = db
         .keyspace(
-            DOCUMENT_SYNC_FANOUT_KEYSPACE,
+            SYNC_FANOUT_KEYSPACE,
             fjall::KeyspaceCreateOptions::default,
         )
         .expect("reopen fanout cursor clear keyspace");
@@ -267,7 +267,7 @@ fn write_permission_scope() {
 fn revocation_expiry_bound() {
     // The shared admission window bounds replicated reducer retention.
     let now = 1_000;
-    let bound = now + MAX_BEARER_TOKEN_LIFETIME_SECS + REVOCATION_GRACE_SECS;
+    let bound = now + MAX_TOKEN_LIFETIME + REVOCATION_GRACE_SECS;
 
     assert!(valid_revocation_expiry(bound, now));
     assert!(!valid_revocation_expiry(bound + 1, now));
@@ -290,7 +290,7 @@ fn index_skip_expiry() {
             target,
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigTokenRevoked {
+            AdminDocumentOperation::ConfigTokenRevoked {
                 token_hash: aruna_core::auth::bearer_token_hash("scheduled"),
                 expires_at: 2_000,
                 token_owner: actor.user_id,
@@ -327,7 +327,7 @@ fn floor_stays_monotonic() {
             target,
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigTokenRevoked {
+            AdminDocumentOperation::ConfigTokenRevoked {
                 token_hash: token_hash.clone(),
                 expires_at: 10_000,
                 token_owner: actor.user_id,
@@ -361,7 +361,7 @@ async fn malformed_state_aborts() {
     batch_write_to(
         &storage,
         vec![(
-            ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            DOCUMENT_STATE_KEYSPACE.to_string(),
             reducer_state_key(&target),
             vec![0xff].into(),
         )],
@@ -378,7 +378,7 @@ async fn malformed_state_aborts() {
                 target.clone(),
                 &actor,
                 1,
-                AdminDocumentOperation::RealmConfigSettingsSet {
+                AdminDocumentOperation::ConfigSettingsSet {
                     metadata_replication: MetadataReplicationConfig::new(3),
                     discovery: test_discovery(27, "https://abort.example:443"),
                 },
@@ -390,7 +390,7 @@ async fn malformed_state_aborts() {
     batch_delete_to(
         &storage,
         vec![(
-            ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            DOCUMENT_STATE_KEYSPACE.to_string(),
             reducer_state_key(&target),
         )],
     )
@@ -405,7 +405,7 @@ async fn malformed_state_aborts() {
             target,
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: MetadataReplicationConfig::new(3),
                 discovery: test_discovery(27, "https://abort.example:443"),
             },
@@ -433,22 +433,22 @@ async fn admits_known_peers() {
 fn budget_caps_bytes() {
     // Per-peer and global byte ceilings hold, and release restores both.
     let budget = Arc::new(InboundSyncBudget::default());
-    assert!(budget.reserve_bytes(peer(1), DOCUMENT_SYNC_INBOUND_PEER_BYTES));
+    assert!(budget.reserve_bytes(peer(1), INBOUND_PEER_BYTES));
     assert!(!budget.reserve_bytes(peer(1), 1));
-    budget.release_bytes(peer(1), DOCUMENT_SYNC_INBOUND_PEER_BYTES);
+    budget.release_bytes(peer(1), INBOUND_PEER_BYTES);
     assert!(budget.reserve_bytes(peer(1), 1));
     budget.release_bytes(peer(1), 1);
 
     let mut reserved = 0usize;
     for seed in 10..u8::MAX {
-        if budget.reserve_bytes(peer(seed), DOCUMENT_SYNC_INBOUND_PEER_BYTES) {
-            reserved = reserved.saturating_add(DOCUMENT_SYNC_INBOUND_PEER_BYTES);
+        if budget.reserve_bytes(peer(seed), INBOUND_PEER_BYTES) {
+            reserved = reserved.saturating_add(INBOUND_PEER_BYTES);
         } else {
             break;
         }
     }
-    assert!(reserved <= DOCUMENT_SYNC_INBOUND_GLOBAL_BYTES);
-    assert!(!budget.reserve_bytes(peer(9), DOCUMENT_SYNC_INBOUND_PEER_BYTES));
+    assert!(reserved <= INBOUND_GLOBAL_BYTES);
+    assert!(!budget.reserve_bytes(peer(9), INBOUND_PEER_BYTES));
 }
 
 #[test]
@@ -458,11 +458,11 @@ fn drop_releases_reservation() {
     {
         let mut reservation = InboundByteReservation::new(budget.clone(), peer(1));
         reservation
-            .reserve(DOCUMENT_SYNC_INBOUND_PEER_BYTES)
+            .reserve(INBOUND_PEER_BYTES)
             .expect("first reservation fits");
         assert!(reservation.reserve(1).is_err());
     }
-    assert!(budget.reserve_bytes(peer(1), DOCUMENT_SYNC_INBOUND_PEER_BYTES));
+    assert!(budget.reserve_bytes(peer(1), INBOUND_PEER_BYTES));
 }
 
 #[tokio::test]

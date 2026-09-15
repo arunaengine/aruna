@@ -4,17 +4,17 @@ use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
 use aruna_core::alpn::Alpn;
-use aruna_core::auth::{MAX_BEARER_TOKEN_LIFETIME_SECS, REVOCATION_GRACE_SECS};
+use aruna_core::auth::{MAX_TOKEN_LIFETIME, REVOCATION_GRACE_SECS};
 use aruna_core::document::{DocumentChangeKind, DocumentSyncRevision};
 use aruna_core::keyspaces::{
-    ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE,
-    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
-    METADATA_INDEX_KEYSPACE, USER_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE,
-    USER_SUBJECT_INDEX_KEYSPACE,
+    DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE,
+    CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE,
+    EVENT_LOG_KEYSPACE, PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
+    METADATA_INDEX_KEYSPACE, USER_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE,
+    SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::MetadataEventPayload;
-use aruna_core::reducer::REALM_CONFIG_DEFAULT_STRATEGY_PATH;
+use aruna_core::reducer::CONFIG_STRATEGY_PATH;
 use aruna_core::storage_entries::{
     create_acceptance_key, event_log_key, metadata_document_key, metadata_registry_key,
     reducer_conflict_key, reducer_state_key, subject_index_key, subject_index_value,
@@ -32,7 +32,7 @@ use aruna_core::structs::identity::realm::{
     UserCapOverride,
 };
 use aruna_core::structs::execution::job::JobId;
-use aruna_core::structs::{SYNC_QUARANTINE_MAX_RECORDS, SyncQuarantineFamily, SyncQuarantineRecord};
+use aruna_core::structs::{QUARANTINE_MAX_RECORDS, SyncQuarantineFamily, SyncQuarantineRecord};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::{MetaResourceId, StructuredId, UserId};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -268,7 +268,7 @@ async fn eviction_preserves_event() {
     assert!(
         loser
             .storage_read(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                APPLIED_OPS_KEYSPACE.to_string(),
                 topic_cursor_key(topic_id),
             )
             .await
@@ -288,7 +288,7 @@ async fn eviction_preserves_event() {
     assert!(
         loser
             .storage_read(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                APPLIED_OPS_KEYSPACE.to_string(),
                 topic_cursor_key(topic_id),
             )
             .await
@@ -417,7 +417,7 @@ async fn deferred_admin_retries() {
         AdminDocumentTarget::Realm { realm_id },
         &admin_actor,
         2,
-        AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+        AdminDocumentOperation::RealmAssignmentAdded {
             role_id,
             user_id: admin_user_id,
         },
@@ -428,7 +428,7 @@ async fn deferred_admin_retries() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &bootstrap_actor,
         1,
-        AdminDocumentOperation::RealmConfigNodeEnsured {
+        AdminDocumentOperation::ConfigNodeEnsured {
             node_id: bootstrap_actor.node_id,
             kind: RealmNodeKind::Management,
         },
@@ -438,7 +438,7 @@ async fn deferred_admin_retries() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &bootstrap_actor,
         2,
-        AdminDocumentOperation::RealmConfigSettingsSet {
+        AdminDocumentOperation::ConfigSettingsSet {
             metadata_replication: MetadataReplicationConfig::new(3),
             discovery: test_discovery(68, "https://management.example:443"),
         },
@@ -499,7 +499,7 @@ async fn deferred_admin_retries() {
         postcard::from_bytes(
             &read_storage_value(
                 &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                APPLIED_OPS_KEYSPACE,
                 deferred_topics_key(),
             )
             .await
@@ -816,7 +816,7 @@ async fn quarantine_malformed_payloads() {
     write_usage(
         &storage,
         SyncQuarantineUsage {
-            records: SYNC_QUARANTINE_MAX_RECORDS,
+            records: QUARANTINE_MAX_RECORDS,
             bytes: 0,
         },
     )

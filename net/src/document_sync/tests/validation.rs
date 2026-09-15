@@ -82,7 +82,7 @@ fn watch_interest_validation() {
 
     let too_many = WatchInterestDigest::from_subscriptions(
         node_id,
-        (0..=NOTIFICATION_WATCH_INTEREST_ENTRY_CAP).map(|index| {
+        (0..=INTEREST_ENTRY_CAP).map(|index| {
             (
                 format!("/entry/{index}"),
                 WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
@@ -91,7 +91,7 @@ fn watch_interest_validation() {
     );
     assert!(validate_watch_interest(&target, &too_many.to_bytes().unwrap()).is_err());
     assert!(
-        validate_watch_interest(&target, &vec![0; NOTIFICATION_WATCH_INTEREST_BYTES_CAP + 1],)
+        validate_watch_interest(&target, &vec![0; INTEREST_BYTES_CAP + 1],)
             .is_err()
     );
 
@@ -627,7 +627,7 @@ async fn forged_watch_skipped() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &actor,
         1,
-        AdminDocumentOperation::RealmConfigDescriptionSet {
+        AdminDocumentOperation::ConfigDescriptionSet {
             description: "forged watch-interest admin op".to_string(),
         },
     );

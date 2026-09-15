@@ -21,7 +21,7 @@ async fn node_state_only() {
             target.clone(),
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigNodeEnsured {
+            AdminDocumentOperation::ConfigNodeEnsured {
                 node_id: reducer_node,
                 kind: RealmNodeKind::Management,
             },
@@ -41,7 +41,7 @@ async fn node_state_only() {
     );
     let state_value = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -93,7 +93,7 @@ async fn settings_materialize_config() {
             target.clone(),
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: metadata_replication.clone(),
                 discovery: discovery.clone(),
             },
@@ -112,7 +112,7 @@ async fn settings_materialize_config() {
     );
     let state_value = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -163,7 +163,7 @@ async fn description_materializes_config() {
             target.clone(),
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigDescriptionSet {
+            AdminDocumentOperation::ConfigDescriptionSet {
                 description: "Replicated Realm".to_string(),
             },
         ),
@@ -175,7 +175,7 @@ async fn description_materializes_config() {
     assert_eq!(config.description, "Replicated Realm");
     let state_value = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -241,19 +241,19 @@ async fn placement_materializes_config() {
     };
 
     for (index, op) in [
-        AdminDocumentOperation::RealmConfigNodePlacementSet {
+        AdminDocumentOperation::NodePlacementSet {
             entry: entry.clone(),
         },
-        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+        AdminDocumentOperation::PlacementStrategyUpserted {
             strategy: strategy.clone(),
         },
-        AdminDocumentOperation::RealmConfigDefaultStrategySet {
+        AdminDocumentOperation::ConfigStrategySet {
             strategy_id: strategy.strategy_id,
         },
-        AdminDocumentOperation::RealmConfigStrategyBindingSet {
+        AdminDocumentOperation::StrategyBindingSet {
             binding: binding.clone(),
         },
-        AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+        AdminDocumentOperation::PlacementOverrideSet {
             record: record.clone(),
         },
     ]
@@ -285,7 +285,7 @@ async fn placement_materializes_config() {
 
     let state_value = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -339,7 +339,7 @@ fn conflict_clears_default() {
                 target.clone(),
                 actor,
                 1,
-                AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+                AdminDocumentOperation::ConfigStrategySet { strategy_id },
             ))
             .unwrap();
     }
@@ -347,7 +347,7 @@ fn conflict_clears_default() {
     assert!(
         state
             .conflicts
-            .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
+            .contains_key(CONFIG_STRATEGY_PATH)
     );
     assert_eq!(state.materialized_default_strategy(), None);
 
@@ -400,7 +400,7 @@ async fn dangling_strategy_materializes() {
             target.clone(),
             &strategy_actor,
             1,
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            AdminDocumentOperation::PlacementStrategyUpserted {
                 strategy: strategy.clone(),
             },
         ),
@@ -422,25 +422,25 @@ async fn dangling_strategy_materializes() {
     for (index, (actor, op)) in [
         (
             test_actor(31, user_id, realm_id),
-            AdminDocumentOperation::RealmConfigPlacementStrategyRemoved {
+            AdminDocumentOperation::PlacementStrategyRemoved {
                 strategy_id: strategy.strategy_id,
             },
         ),
         (
             test_actor(32, user_id, realm_id),
-            AdminDocumentOperation::RealmConfigDefaultStrategySet {
+            AdminDocumentOperation::ConfigStrategySet {
                 strategy_id: strategy.strategy_id,
             },
         ),
         (
             test_actor(33, user_id, realm_id),
-            AdminDocumentOperation::RealmConfigStrategyBindingSet {
+            AdminDocumentOperation::StrategyBindingSet {
                 binding: binding.clone(),
             },
         ),
         (
             test_actor(34, user_id, realm_id),
-            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+            AdminDocumentOperation::PlacementOverrideSet {
                 record: record.clone(),
             },
         ),
@@ -473,7 +473,7 @@ async fn dangling_strategy_materializes() {
 
     let state_value = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -509,7 +509,7 @@ async fn settings_create_config() {
             target.clone(),
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: metadata_replication.clone(),
                 discovery: discovery.clone(),
             },
@@ -525,7 +525,7 @@ async fn settings_create_config() {
     assert!(config.oidc_providers.is_empty());
     let state_value = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -564,7 +564,7 @@ async fn realm_policies_replicate() {
             target.clone(),
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: MetadataReplicationConfig::new(3),
                 discovery: test_discovery(24, "https://policies.example:443"),
             },
@@ -589,7 +589,7 @@ async fn realm_policies_replicate() {
             target.clone(),
             &actor,
             2,
-            AdminDocumentOperation::RealmConfigPoliciesSet {
+            AdminDocumentOperation::ConfigPoliciesSet {
                 policies: policies.clone(),
             },
         ),
@@ -623,7 +623,7 @@ async fn replicated_revocation_applies() {
             target.clone(),
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: MetadataReplicationConfig::new(3),
                 discovery: test_discovery(25, "https://revocation.example:443"),
             },
@@ -640,7 +640,7 @@ async fn replicated_revocation_applies() {
             target.clone(),
             &actor,
             2,
-            AdminDocumentOperation::RealmConfigNodeEnsured {
+            AdminDocumentOperation::ConfigNodeEnsured {
                 node_id: actor.node_id,
                 kind: RealmNodeKind::Server,
             },
@@ -660,7 +660,7 @@ async fn replicated_revocation_applies() {
                 target.clone(),
                 &actor,
                 seq,
-                AdminDocumentOperation::RealmConfigTokenRevoked {
+                AdminDocumentOperation::ConfigTokenRevoked {
                     token_hash: token_hash.clone(),
                     expires_at,
                     token_owner: actor.user_id,
@@ -710,7 +710,7 @@ async fn accepts_onboarded_origin() {
         admin_target,
         &attacker,
         1,
-        AdminDocumentOperation::RealmConfigTokenRevoked {
+        AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: aruna_core::auth::bearer_token_hash("observed-token"),
             expires_at: unix_timestamp_secs() + 600,
             token_owner,
@@ -774,10 +774,10 @@ async fn accepts_onboarded_origin() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &attacker,
         1,
-        AdminDocumentOperation::RealmConfigTokenRevoked {
+        AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: aruna_core::auth::bearer_token_hash("long-token"),
             expires_at: unix_timestamp_secs()
-                + MAX_BEARER_TOKEN_LIFETIME_SECS
+                + MAX_TOKEN_LIFETIME
                 + REVOCATION_GRACE_SECS
                 + 1,
             token_owner: attacker.user_id,
@@ -818,7 +818,7 @@ async fn accepts_onboarded_origin() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &attacker,
         1,
-        AdminDocumentOperation::RealmConfigTokenRevoked {
+        AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: aruna_core::auth::bearer_token_hash("owned-token"),
             expires_at: unix_timestamp_secs() + 600,
             token_owner: attacker.user_id,
@@ -1076,11 +1076,11 @@ async fn caps_flooding_origin() {
     let expires_at = unix_timestamp_secs() + 600;
     let mut state = AdminDocumentState::new(admin_target.clone());
     let mut index = state.revocation_index(expires_at);
-    for seed in 0..MAX_LIVE_REVOCATIONS_PER_ORIGIN {
+    for seed in 0..REVOCATIONS_PER_ORIGIN {
         state
             .apply_revocation_operation(
                 &flooder,
-                AdminDocumentOperation::RealmConfigTokenRevoked {
+                AdminDocumentOperation::ConfigTokenRevoked {
                     token_hash: aruna_core::auth::bearer_token_hash(&format!("flood-{seed}")),
                     expires_at,
                     token_owner: flooder.user_id,
@@ -1102,7 +1102,7 @@ async fn caps_flooding_origin() {
         admin_target.clone(),
         &flooder,
         1,
-        AdminDocumentOperation::RealmConfigTokenRevoked {
+        AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: aruna_core::auth::bearer_token_hash("flood-extra"),
             expires_at,
             token_owner: flooder.user_id,
@@ -1131,7 +1131,7 @@ async fn caps_flooding_origin() {
         admin_target,
         &neighbour,
         1,
-        AdminDocumentOperation::RealmConfigTokenRevoked {
+        AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: aruna_core::auth::bearer_token_hash("neighbour-token"),
             expires_at,
             token_owner: neighbour.user_id,
@@ -1174,7 +1174,7 @@ fn accepts_historical_origin() {
         target.clone(),
         &origin,
         1,
-        AdminDocumentOperation::RealmConfigNodeEnsured {
+        AdminDocumentOperation::ConfigNodeEnsured {
             node_id: origin.node_id,
             kind: RealmNodeKind::Server,
         },
@@ -1184,7 +1184,7 @@ fn accepts_historical_origin() {
         target.clone(),
         &other,
         1,
-        AdminDocumentOperation::RealmConfigNodeEnsured {
+        AdminDocumentOperation::ConfigNodeEnsured {
             node_id: origin.node_id,
             kind: RealmNodeKind::User {
                 owner: UserId::nil(realm_id),
@@ -1209,7 +1209,7 @@ fn accepts_historical_origin() {
         origin_seq: 2,
         observed: AdminDocumentClock::default().with_observed(origin.node_id, 1),
         actor: origin,
-        op: AdminDocumentOperation::RealmConfigTokenRevoked {
+        op: AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: aruna_core::auth::bearer_token_hash("historical-token"),
             expires_at: unix_timestamp_secs() + 600,
             token_owner: other.user_id,
@@ -1245,7 +1245,7 @@ async fn replicated_revocation_compacts() {
             target.clone(),
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: MetadataReplicationConfig::new(3),
                 discovery: test_discovery(26, "https://compaction.example:443"),
             },
@@ -1262,7 +1262,7 @@ async fn replicated_revocation_compacts() {
             target.clone(),
             &actor,
             2,
-            AdminDocumentOperation::RealmConfigNodeEnsured {
+            AdminDocumentOperation::ConfigNodeEnsured {
                 node_id: actor.node_id,
                 kind: RealmNodeKind::Server,
             },
@@ -1286,7 +1286,7 @@ async fn replicated_revocation_compacts() {
                 target.clone(),
                 &actor,
                 seq,
-                AdminDocumentOperation::RealmConfigTokenRevoked {
+                AdminDocumentOperation::ConfigTokenRevoked {
                     token_hash,
                     expires_at,
                     token_owner: actor.user_id,
@@ -1377,7 +1377,7 @@ async fn redundant_persists_clock() {
         target.clone(),
         &actor_a,
         1,
-        AdminDocumentOperation::RealmConfigTokenRevoked {
+        AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: token_hash.clone(),
             expires_at,
             token_owner: actor_a.user_id,
@@ -1411,7 +1411,7 @@ async fn redundant_persists_clock() {
         target.clone(),
         &actor_b,
         1,
-        AdminDocumentOperation::RealmConfigTokenRevoked {
+        AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: token_hash.clone(),
             expires_at,
             token_owner: actor_b.user_id,
@@ -1761,7 +1761,7 @@ async fn quota_survives_materialization() {
     let target = AdminDocumentTarget::RealmConfig { realm_id };
     let document_target = DocumentTarget::RealmConfig { realm_id };
     let quota = QuotaConfig {
-        default_group_quota_bytes: Some(9_000),
+        default_quota_bytes: Some(9_000),
         grace_factor_percent: 130,
         warn_threshold_percent: 70,
         group_overrides: vec![GroupQuotaOverride {
@@ -1769,12 +1769,12 @@ async fn quota_survives_materialization() {
             quota_bytes: Some(4_500),
             grace_factor_percent: Some(140),
         }],
-        max_groups_per_user: Some(7),
-        user_group_cap_overrides: vec![UserCapOverride {
+        groups_per_user: Some(7),
+        group_cap_overrides: vec![UserCapOverride {
             user_id: UserId::local(Ulid::from_parts(1_386, 1), realm_id),
             max_groups: Some(2),
         }],
-        max_devices_per_user: Some(6),
+        devices_per_user: Some(6),
         ..QuotaConfig::default()
     };
 
@@ -1788,7 +1788,7 @@ async fn quota_survives_materialization() {
             target.clone(),
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigQuotaSet {
+            AdminDocumentOperation::ConfigQuotaSet {
                 quota: quota.clone(),
             },
         ),
@@ -1806,7 +1806,7 @@ async fn quota_survives_materialization() {
             target.clone(),
             &actor,
             2,
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: metadata_replication.clone(),
                 discovery: discovery.clone(),
             },
@@ -1839,14 +1839,14 @@ async fn settings_bootstrap_config() {
     for (seq, op) in [
         (
             1,
-            AdminDocumentOperation::RealmConfigNodeEnsured {
+            AdminDocumentOperation::ConfigNodeEnsured {
                 node_id: reducer_node,
                 kind: RealmNodeKind::Management,
             },
         ),
         (
             2,
-            AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+            AdminDocumentOperation::OidcProviderUpserted {
                 provider: provider.clone(),
             },
         ),
@@ -1883,7 +1883,7 @@ async fn settings_bootstrap_config() {
             target,
             &actor,
             3,
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: metadata_replication.clone(),
                 discovery: discovery.clone(),
             },
@@ -1923,7 +1923,7 @@ async fn drops_evicted_node() {
     for (seq, op) in [
         (
             1,
-            AdminDocumentOperation::RealmConfigNodeEnsured {
+            AdminDocumentOperation::ConfigNodeEnsured {
                 node_id: device,
                 kind: RealmNodeKind::User {
                     owner: actor.user_id,
@@ -1932,7 +1932,7 @@ async fn drops_evicted_node() {
         ),
         (
             2,
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: MetadataReplicationConfig::new(3),
                 discovery: test_discovery(31, "https://eviction.example:443"),
             },
@@ -1965,7 +1965,7 @@ async fn drops_evicted_node() {
             target,
             &actor,
             3,
-            AdminDocumentOperation::RealmConfigNodeRemoved { node_id: device },
+            AdminDocumentOperation::ConfigNodeRemoved { node_id: device },
         ),
     )
     .await
@@ -1988,22 +1988,22 @@ async fn replicates_compute_config() {
     let target = AdminDocumentTarget::RealmConfig { realm_id };
     let document_target = DocumentTarget::RealmConfig { realm_id };
     let compute = aruna_core::structs::placement::compute_config::RealmComputeConfig {
-        witness_base_delay_ms: 4_200,
-        catch_up_after_ms: 61_000,
+        witness_delay_ms: 4_200,
+        catch_up_ms: 61_000,
         ..Default::default()
     };
 
     for (seq, op) in [
         (
             1,
-            AdminDocumentOperation::RealmConfigNodeEnsured {
+            AdminDocumentOperation::ConfigNodeEnsured {
                 node_id: node(8),
                 kind: RealmNodeKind::Management,
             },
         ),
         (
             2,
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: MetadataReplicationConfig::new(3),
                 discovery: test_discovery(32, "https://compute.example:443"),
             },
@@ -2032,7 +2032,7 @@ async fn replicates_compute_config() {
             target,
             &actor,
             3,
-            AdminDocumentOperation::RealmConfigComputeSet {
+            AdminDocumentOperation::ConfigComputeSet {
                 compute: compute.clone(),
             },
         ),
@@ -2087,7 +2087,7 @@ async fn settings_conflict_withholds() {
             target.clone(),
             &actor_a,
             1,
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: first_metadata.clone(),
                 discovery: discovery.clone(),
             },
@@ -2103,7 +2103,7 @@ async fn settings_conflict_withholds() {
             target.clone(),
             &actor_b,
             1,
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: second_metadata.clone(),
                 discovery: discovery.clone(),
             },
@@ -2118,7 +2118,7 @@ async fn settings_conflict_withholds() {
     assert_eq!(config.discovery, discovery);
     let state_value = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -2129,8 +2129,8 @@ async fn settings_conflict_withholds() {
     assert!(
         read_storage_value(
             &storage,
-            ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
-            reducer_conflict_key(&target, REALM_CONFIG_METADATA_REPLICATION_PATH,),
+            DOCUMENT_CONFLICT_KEYSPACE,
+            reducer_conflict_key(&target, METADATA_REPLICATION_PATH,),
         )
         .await
         .is_some()
@@ -2172,7 +2172,7 @@ async fn retries_config_conflict() {
         target.clone(),
         &actor_a,
         1,
-        AdminDocumentOperation::RealmConfigDescriptionSet {
+        AdminDocumentOperation::ConfigDescriptionSet {
             description: "first".to_string(),
         },
     );
@@ -2181,7 +2181,7 @@ async fn retries_config_conflict() {
         target.clone(),
         &actor_b,
         1,
-        AdminDocumentOperation::RealmConfigDescriptionSet {
+        AdminDocumentOperation::ConfigDescriptionSet {
             description: "second".to_string(),
         },
     );
@@ -2198,7 +2198,7 @@ async fn retries_config_conflict() {
         .expect("reducer state reads")
         .expect("reducer state exists");
     assert!(matches!(config.description.as_str(), "first" | "second"));
-    let path = REALM_CONFIG_DESCRIPTION_PATH;
+    let path = CONFIG_DESCRIPTION_PATH;
     assert!(state.conflicts.contains_key(path));
     assert_eq!(
         state
@@ -2244,7 +2244,7 @@ async fn keeps_stale_config() {
             target.clone(),
             &actor,
             2,
-            AdminDocumentOperation::RealmConfigDescriptionSet {
+            AdminDocumentOperation::ConfigDescriptionSet {
                 description: "new".to_string(),
             },
         ),
@@ -2259,7 +2259,7 @@ async fn keeps_stale_config() {
             target.clone(),
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigDescriptionSet {
+            AdminDocumentOperation::ConfigDescriptionSet {
                 description: "stale".to_string(),
             },
         ),
@@ -2322,7 +2322,7 @@ async fn node_ensure_merges() {
                 target.clone(),
                 &actor,
                 seq,
-                AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind },
+                AdminDocumentOperation::ConfigNodeEnsured { node_id, kind },
             ),
         )
         .await
@@ -2380,19 +2380,19 @@ async fn oidc_updates_merge() {
     for (seq, op) in [
         (
             1,
-            AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+            AdminDocumentOperation::OidcProviderUpserted {
                 provider: first.clone(),
             },
         ),
         (
             2,
-            AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+            AdminDocumentOperation::OidcProviderUpserted {
                 provider: second.clone(),
             },
         ),
         (
             3,
-            AdminDocumentOperation::RealmConfigOidcProviderRemoved {
+            AdminDocumentOperation::OidcProviderRemoved {
                 provider_id: removed.id.clone(),
             },
         ),
@@ -2477,7 +2477,7 @@ async fn oidc_conflict_withholds() {
             target.clone(),
             &actor_a,
             1,
-            AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider: first },
+            AdminDocumentOperation::OidcProviderUpserted { provider: first },
         ),
     )
     .await
@@ -2490,7 +2490,7 @@ async fn oidc_conflict_withholds() {
             target.clone(),
             &actor_b,
             1,
-            AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider: second },
+            AdminDocumentOperation::OidcProviderUpserted { provider: second },
         ),
     )
     .await
@@ -2504,7 +2504,7 @@ async fn oidc_conflict_withholds() {
     assert!(
         read_storage_value(
             &storage,
-            ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+            DOCUMENT_CONFLICT_KEYSPACE,
             reducer_conflict_key(&target, &path),
         )
         .await
@@ -2533,7 +2533,7 @@ async fn orphan_oidc_stores() {
             target.clone(),
             &actor,
             1,
-            AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+            AdminDocumentOperation::OidcProviderUpserted {
                 provider: provider.clone(),
             },
         ),
@@ -2552,7 +2552,7 @@ async fn orphan_oidc_stores() {
     );
     let state_value = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -2605,7 +2605,7 @@ async fn kind_conflict_withholds() {
             target.clone(),
             &actor_a,
             1,
-            AdminDocumentOperation::RealmConfigNodeEnsured {
+            AdminDocumentOperation::ConfigNodeEnsured {
                 node_id: conflicted_node,
                 kind: RealmNodeKind::Management,
             },
@@ -2621,7 +2621,7 @@ async fn kind_conflict_withholds() {
             target.clone(),
             &actor_b,
             1,
-            AdminDocumentOperation::RealmConfigNodeEnsured {
+            AdminDocumentOperation::ConfigNodeEnsured {
                 node_id: conflicted_node,
                 kind: RealmNodeKind::Server,
             },
@@ -2636,7 +2636,7 @@ async fn kind_conflict_withholds() {
     assert!(
         read_storage_value(
             &storage,
-            ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+            DOCUMENT_CONFLICT_KEYSPACE,
             reducer_conflict_key(&target, &path),
         )
         .await

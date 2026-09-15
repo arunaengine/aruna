@@ -119,7 +119,7 @@ struct NetInner {
     notification_wakes: broadcast::Sender<UserId>,
     dashboard_epoch: Ulid,
     dashboard_changes: watch::Sender<u64>,
-    dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
+    signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     dht: Arc<DhtHandle>,
     document_sync: Arc<DocumentSyncService>,
     streams: Arc<StreamsService>,
@@ -159,7 +159,7 @@ impl std::fmt::Debug for NetHandle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetShutdownOutcome {
     /// Inbound handlers still running when the soft drain deadline expired.
-    pub inbound_pending_at_deadline: usize,
+    pub inbound_pending_deadline: usize,
     /// Accepted effect futures that did not finish before the final join.
     pub effects_pending: usize,
     /// Inbound handlers that did not finish before the final join.
@@ -427,7 +427,7 @@ impl NetHandle {
         self.inner
             .inbound_admission
             .set_device_limits(device_limits::DeviceLimits {
-                requests_per_minute: document.quota.device_requests_per_minute,
+                requests_per_minute: document.quota.device_request_rate,
                 concurrent: document.quota.device_concurrent_pulls,
             });
         // Connection admission covers every registered realm node, User kind
@@ -553,7 +553,7 @@ impl NetHandle {
         *self.inner.realm_peers.write() = peers.clone();
         self.inner.inbound_admission.mark_materialized();
         replace_authorized_nodes(
-            &self.inner.dht_signed_authorized_nodes,
+            &self.inner.signed_authorized_nodes,
             &peers,
             self.inner.node_id,
         );
@@ -578,7 +578,7 @@ impl NetHandle {
         }
 
         authorize_signed_node(
-            &self.inner.dht_signed_authorized_nodes,
+            &self.inner.signed_authorized_nodes,
             node_id,
             self.inner.node_id,
         );
@@ -709,7 +709,7 @@ impl NetHandle {
             }
             Err(mut err) => {
                 if node_id != self.inner.node_id {
-                    let authorized_nodes = self.inner.dht_signed_authorized_nodes.read().clone();
+                    let authorized_nodes = self.inner.signed_authorized_nodes.read().clone();
                     match resolve_signed_endpoint(
                         &self.inner.dht,
                         self.inner.realm_id,
@@ -807,10 +807,10 @@ impl NetHandle {
             tokio::time::timeout(drain, self.inner.inbound_tasks.wait())
                 .await
                 .is_ok();
-        let inbound_pending_at_deadline = self.inner.inbound_tasks.len();
+        let inbound_pending_deadline = self.inner.inbound_tasks.len();
         if !inbound_drained_before_teardown {
             warn!(
-                pending = inbound_pending_at_deadline,
+                pending = inbound_pending_deadline,
                 drain_ms = drain.as_millis(),
                 "Inbound stream handlers outlived the drain deadline; closing the endpoint under them"
             );
@@ -866,7 +866,7 @@ impl NetHandle {
             );
         }
         NetShutdownOutcome {
-            inbound_pending_at_deadline,
+            inbound_pending_deadline,
             effects_pending,
             inbound_pending,
         }

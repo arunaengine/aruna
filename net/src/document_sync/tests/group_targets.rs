@@ -47,7 +47,7 @@ async fn user_conflicts_rejected() {
     assert!(
         read_storage_value(
             &storage,
-            ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+            DOCUMENT_CONFLICT_KEYSPACE,
             reducer_conflict_key(&target, USER_NAME_PATH),
         )
         .await
@@ -56,7 +56,7 @@ async fn user_conflicts_rejected() {
     assert!(
         read_storage_value(
             &storage,
-            ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+            DOCUMENT_CONFLICT_KEYSPACE,
             reducer_conflict_key(&target, &user_attribute_path("department")),
         )
         .await
@@ -106,7 +106,7 @@ async fn created_group_bootstraps() {
     assert!(
         read_storage_value(
             &storage,
-            GROUP_OWNER_INDEX_KEYSPACE,
+            OWNER_INDEX_KEYSPACE,
             owner_group_key(actor.user_id, group_id).into(),
         )
         .await
@@ -153,7 +153,7 @@ async fn rename_updates_row() {
         target,
         &actor,
         2,
-        AdminDocumentOperation::GroupDisplayNameSet {
+        AdminDocumentOperation::DisplayNameSet {
             display_name: "Platform".to_string(),
         },
     );
@@ -245,7 +245,7 @@ async fn validate_rename(
         AdminDocumentTarget::Group { group_id },
         actor,
         1,
-        AdminDocumentOperation::GroupDisplayNameSet {
+        AdminDocumentOperation::DisplayNameSet {
             display_name: "Platform".to_string(),
         },
     );
@@ -612,7 +612,7 @@ async fn role_removal_updates() {
     );
     let reducer_state = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -673,7 +673,7 @@ async fn user_operation_materializes() {
     assert_eq!(user.attributes["department"], "physics");
     let reducer_state = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&AdminDocumentTarget::User { user_id }),
     )
     .await
@@ -687,7 +687,7 @@ async fn user_operation_materializes() {
     assert_eq!(
         read_storage_value(
             &storage,
-            USER_SUBJECT_INDEX_KEYSPACE,
+            SUBJECT_INDEX_KEYSPACE,
             subject_index_key("subject-1")
         )
         .await,
@@ -742,7 +742,7 @@ async fn stale_user_recorded() {
     assert_eq!(user.name, "newer");
     let reducer_state = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -771,7 +771,7 @@ async fn subject_add_indexes() {
         origin_seq: 1,
         observed: AdminDocumentClock::default(),
         actor,
-        op: AdminDocumentOperation::UserSubjectIdAdded {
+        op: AdminDocumentOperation::SubjectIdAdded {
             subject_id: "subject-created".to_string(),
         },
     };
@@ -788,7 +788,7 @@ async fn subject_add_indexes() {
     assert_eq!(
         read_storage_value(
             &storage,
-            USER_SUBJECT_INDEX_KEYSPACE,
+            SUBJECT_INDEX_KEYSPACE,
             subject_index_key("subject-created")
         )
         .await,
@@ -796,7 +796,7 @@ async fn subject_add_indexes() {
     );
     let claims = read_storage_value(
         &storage,
-        USER_SUBJECT_CLAIMS_KEYSPACE,
+        SUBJECT_CLAIMS_KEYSPACE,
         subject_index_key("subject-created"),
     )
     .await
@@ -833,7 +833,7 @@ async fn subject_remove_cleans() {
                 original.to_bytes(&actor).expect("user serializes").into(),
             ),
             (
-                USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+                SUBJECT_INDEX_KEYSPACE.to_string(),
                 subject_index_key("subject-removed"),
                 subject_index_value(user_id),
             ),
@@ -849,7 +849,7 @@ async fn subject_remove_cleans() {
         origin_seq: 1,
         observed: AdminDocumentClock::default(),
         actor,
-        op: AdminDocumentOperation::UserSubjectIdRemoved {
+        op: AdminDocumentOperation::SubjectIdRemoved {
             subject_id: "subject-removed".to_string(),
         },
     };
@@ -865,7 +865,7 @@ async fn subject_remove_cleans() {
     assert_eq!(
         read_storage_value(
             &storage,
-            USER_SUBJECT_INDEX_KEYSPACE,
+            SUBJECT_INDEX_KEYSPACE,
             subject_index_key("subject-removed")
         )
         .await,

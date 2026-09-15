@@ -37,7 +37,7 @@ async fn stale_registry_skipped() {
     .await;
     let document_index = read_registry_record(
         &storage,
-        METADATA_DOCUMENT_INDEX_KEYSPACE,
+        DOCUMENT_INDEX_KEYSPACE,
         metadata_document_key(document_id),
     )
     .await;
@@ -492,7 +492,7 @@ async fn capacity_retains_cursors() {
             .expect("placement dependency checks")
     );
     let mut filler_topics = BTreeSet::new();
-    for index in 0..MAX_DEFERRED_TOPICS_PER_DEPENDENCY {
+    for index in 0..TOPICS_PER_DEPENDENCY {
         let mut filler_realm = [0xA5; 32];
         filler_realm[..8].copy_from_slice(&(index as u64).to_be_bytes());
         let filler_realm = RealmId::from_bytes(filler_realm);
@@ -503,7 +503,7 @@ async fn capacity_retains_cursors() {
             .sync_topic_id(filler_realm, &PlacementRef::NIL),
         );
     }
-    assert_eq!(filler_topics.len(), MAX_DEFERRED_TOPICS_PER_DEPENDENCY);
+    assert_eq!(filler_topics.len(), TOPICS_PER_DEPENDENCY);
     assert!(!filler_topics.contains(&registry_topic));
     assert!(!filler_topics.contains(&create_topic));
     let deferred_topics = BTreeMap::from([(dependency, filler_topics)]);
@@ -522,7 +522,7 @@ async fn capacity_retains_cursors() {
     );
     service
         .storage_write(
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+            APPLIED_OPS_KEYSPACE.to_string(),
             deferred_topics_key(),
             postcard::to_allocvec(&deferred_topics)
                 .expect("deferred topics serialize")
@@ -539,7 +539,7 @@ async fn capacity_retains_cursors() {
         postcard::from_bytes(
             &read_storage_value(
                 &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                APPLIED_OPS_KEYSPACE,
                 deferred_topics_key(),
             )
             .await
@@ -548,7 +548,7 @@ async fn capacity_retains_cursors() {
         .expect("deferred topic registry decodes");
     assert_eq!(
         deferred_topics.get(&dependency).map(BTreeSet::len),
-        Some(MAX_DEFERRED_TOPICS_PER_DEPENDENCY)
+        Some(TOPICS_PER_DEPENDENCY)
     );
     let registered_dependencies = deferred_topics
         .iter()
@@ -752,7 +752,7 @@ async fn metadata_placement_defers() {
     assert!(
         read_storage_value(
             &storage,
-            METADATA_EVENT_LOG_KEYSPACE,
+            EVENT_LOG_KEYSPACE,
             event_log_key(document_id, create_event_id),
         )
         .await
@@ -771,7 +771,7 @@ async fn metadata_placement_defers() {
         postcard::from_bytes(
             &read_storage_value(
                 &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                APPLIED_OPS_KEYSPACE,
                 deferred_topics_key(),
             )
             .await
@@ -794,7 +794,7 @@ async fn metadata_placement_defers() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &actor,
         1,
-        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+        AdminDocumentOperation::PlacementStrategyUpserted {
             strategy: strategy.clone(),
         },
     );
@@ -826,7 +826,7 @@ async fn metadata_placement_defers() {
     assert_registry_present(&storage, &record).await;
     let stored_create = read_storage_value(
         &storage,
-        METADATA_EVENT_LOG_KEYSPACE,
+        EVENT_LOG_KEYSPACE,
         event_log_key(document_id, create_event_id),
     )
     .await
@@ -837,7 +837,7 @@ async fn metadata_placement_defers() {
     );
     let acceptance = read_storage_value(
         &storage,
-        METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+        CREATE_ACCEPTANCE_KEYSPACE,
         create_acceptance_key(document_id),
     )
     .await
@@ -863,7 +863,7 @@ async fn metadata_placement_defers() {
     assert!(applied_cursor.dominates(&metadata_clock));
     let acceptance = read_storage_value(
         &storage,
-        METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+        CREATE_ACCEPTANCE_KEYSPACE,
         create_acceptance_key(document_id),
     )
     .await
@@ -901,7 +901,7 @@ async fn metadata_placement_defers() {
     assert!(rejected.metadata_create_events.is_empty());
     let acceptance = read_storage_value(
         &storage,
-        METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+        CREATE_ACCEPTANCE_KEYSPACE,
         create_acceptance_key(document_id),
     )
     .await
@@ -959,14 +959,14 @@ async fn tombstone_blocks_upsert() {
     let (_dir, storage) = test_storage();
     let group_id = Ulid::from_parts(1_570, 1);
     let document_id = Ulid::from_parts(1_571, 1);
-    let deleted_after_event_id = Ulid::from_parts(1_572, 1);
+    let deleted_after_id = Ulid::from_parts(1_572, 1);
     let newer_event_id = Ulid::from_parts(1_574, 1);
     let delete_lifecycle = metadata_delete_lifecycle(
         group_id,
         document_id,
         200,
         Ulid::from_parts(1_573, 1),
-        deleted_after_event_id,
+        deleted_after_id,
     );
     assert!(
         store_document_lifecycle(
@@ -1204,7 +1204,7 @@ async fn delete_requires_tombstone() {
     .await;
     let document_index = read_registry_record(
         &storage,
-        METADATA_DOCUMENT_INDEX_KEYSPACE,
+        DOCUMENT_INDEX_KEYSPACE,
         metadata_document_key(document_id),
     )
     .await;
@@ -1252,7 +1252,7 @@ async fn lifecycle_upsert_idempotent() {
 
     let stored_event = read_storage_value(
         &storage,
-        METADATA_EVENT_LOG_KEYSPACE,
+        EVENT_LOG_KEYSPACE,
         event_log_key(document_id, event_id),
     )
     .await
@@ -1266,7 +1266,7 @@ async fn lifecycle_upsert_idempotent() {
     assert_eq!(revision, change);
     let acceptance = read_storage_value(
         &storage,
-        METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+        CREATE_ACCEPTANCE_KEYSPACE,
         create_acceptance_key(document_id),
     )
     .await
@@ -1315,7 +1315,7 @@ async fn lifecycle_acceptance_fence() {
     );
     let acceptance = read_storage_value(
         &storage,
-        METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+        CREATE_ACCEPTANCE_KEYSPACE,
         create_acceptance_key(document_id),
     )
     .await
@@ -1345,7 +1345,7 @@ async fn lifecycle_acceptance_fence() {
     assert!(
         read_storage_value(
             &storage,
-            METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+            CREATE_ACCEPTANCE_KEYSPACE,
             create_acceptance_key(orphan_id),
         )
         .await
@@ -1418,7 +1418,7 @@ async fn newer_sidecar_blocks() {
     assert!(
         read_storage_value(
             &storage,
-            METADATA_EVENT_LOG_KEYSPACE,
+            EVENT_LOG_KEYSPACE,
             event_log_key(document_id, stale_event_id),
         )
         .await
@@ -1434,13 +1434,13 @@ async fn stale_sidecars_block() {
     let (_dir, storage) = test_storage();
     let group_id = Ulid::from_parts(20, 1);
     let document_id = Ulid::from_parts(21, 1);
-    let deleted_after_event_id = Ulid::from_parts(22, 1);
+    let deleted_after_id = Ulid::from_parts(22, 1);
     let local_delete = metadata_delete_lifecycle(
         group_id,
         document_id,
         200,
         Ulid::from_parts(23, 1),
-        deleted_after_event_id,
+        deleted_after_id,
     );
     let mut local_change = metadata_lifecycle_change(&local_delete, node(8));
     local_change.placement = aruna_core::structs::placement::placement_record::PlacementRef {
@@ -1463,7 +1463,7 @@ async fn stale_sidecars_block() {
         document_id,
         100,
         Ulid::from_parts(24, 1),
-        deleted_after_event_id,
+        deleted_after_id,
     );
     assert!(
         !store_document_lifecycle(
@@ -1496,14 +1496,14 @@ fn delete_entries_prune() {
     let record = MetadataDeleteRecord {
         event_id: Ulid::from_parts(13, 1),
         tombstone: tombstone.clone(),
-        deleted_after_event_id: Ulid::from_parts(9, 1),
+        deleted_after_id: Ulid::from_parts(9, 1),
     };
 
     let entries = document_delete_entries(&record).expect("entries build");
 
     let prune_jobs = entries
         .iter()
-        .filter(|(keyspace, _, _)| keyspace == METADATA_GRAPH_PRUNE_JOB_KEYSPACE)
+        .filter(|(keyspace, _, _)| keyspace == PRUNE_JOB_KEYSPACE)
         .map(|(_, _, value)| {
             postcard::from_bytes::<GraphPruneRecord>(value.as_ref()).expect("prune job decodes")
         })

@@ -23,7 +23,7 @@ async fn subject_claims_promote() {
             },
             actor,
             1,
-            AdminDocumentOperation::UserSubjectIdAdded {
+            AdminDocumentOperation::SubjectIdAdded {
                 subject_id: subject_id.clone(),
             },
         )
@@ -46,7 +46,7 @@ async fn subject_claims_promote() {
     for storage in [&left, &right] {
         let claims = read_storage_value(
             storage,
-            USER_SUBJECT_CLAIMS_KEYSPACE,
+            SUBJECT_CLAIMS_KEYSPACE,
             subject_index_key(&subject_id),
         )
         .await
@@ -58,7 +58,7 @@ async fn subject_claims_promote() {
         assert_eq!(
             read_storage_value(
                 storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
+                SUBJECT_INDEX_KEYSPACE,
                 subject_index_key(&subject_id),
             )
             .await,
@@ -73,7 +73,7 @@ async fn subject_claims_promote() {
         },
         &actors[0],
         2,
-        AdminDocumentOperation::UserSubjectIdRemoved {
+        AdminDocumentOperation::SubjectIdRemoved {
             subject_id: subject_id.clone(),
         },
     );
@@ -91,7 +91,7 @@ async fn subject_claims_promote() {
         assert_eq!(
             read_storage_value(
                 storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
+                SUBJECT_INDEX_KEYSPACE,
                 subject_index_key(&subject_id),
             )
             .await,
@@ -164,7 +164,7 @@ async fn seeded_group_materializes() {
         origin_seq: 2,
         observed: AdminDocumentClock::default(),
         actor: actor.clone(),
-        op: AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+        op: AdminDocumentOperation::GroupAssignmentAdded {
             role_id,
             user_id: assigned_user_id,
         },
@@ -189,7 +189,7 @@ async fn seeded_group_materializes() {
     );
     let reducer_state = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -217,7 +217,7 @@ async fn seeded_group_materializes() {
         origin_seq: 3,
         observed: AdminDocumentClock::default(),
         actor,
-        op: AdminDocumentOperation::GroupRoleUserAssignmentRemoved {
+        op: AdminDocumentOperation::GroupAssignmentRemoved {
             role_id,
             user_id: assigned_user_id,
         },
@@ -242,7 +242,7 @@ async fn seeded_group_materializes() {
     );
     let reducer_state = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&AdminDocumentTarget::Group { group_id }),
     )
     .await
@@ -281,7 +281,7 @@ async fn new_role_materializes() {
             target.clone(),
             &actor,
             1,
-            AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+            AdminDocumentOperation::GroupAssignmentAdded {
                 role_id,
                 user_id: assigned_user_id,
             },
@@ -330,7 +330,7 @@ async fn new_role_materializes() {
 
     let reducer_state = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -399,7 +399,7 @@ async fn assignment_conflict_materializes() {
         origin_seq: 1,
         observed: AdminDocumentClock::default(),
         actor: actor.clone(),
-        op: AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+        op: AdminDocumentOperation::GroupAssignmentAdded {
             role_id,
             user_id: assigned_user_id,
         },
@@ -418,7 +418,7 @@ async fn assignment_conflict_materializes() {
         origin_seq: 1,
         observed: AdminDocumentClock::default(),
         actor: actor.clone(),
-        op: AdminDocumentOperation::GroupRoleUserAssignmentRemoved {
+        op: AdminDocumentOperation::GroupAssignmentRemoved {
             role_id,
             user_id: assigned_user_id,
         },
@@ -434,7 +434,7 @@ async fn assignment_conflict_materializes() {
     assert!(
         read_storage_value(
             &storage,
-            ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+            DOCUMENT_CONFLICT_KEYSPACE,
             conflict_key.clone(),
         )
         .await
@@ -455,7 +455,7 @@ async fn assignment_conflict_materializes() {
             .with_observed(add_origin, 1)
             .with_observed(remove_origin, 1),
         actor,
-        op: AdminDocumentOperation::GroupRoleUserAssignmentRemoved {
+        op: AdminDocumentOperation::GroupAssignmentRemoved {
             role_id,
             user_id: assigned_user_id,
         },
@@ -469,7 +469,7 @@ async fn assignment_conflict_materializes() {
     .expect("resolving remove applies");
 
     assert_eq!(
-        read_storage_value(&storage, ADMIN_DOCUMENT_CONFLICT_KEYSPACE, conflict_key).await,
+        read_storage_value(&storage, DOCUMENT_CONFLICT_KEYSPACE, conflict_key).await,
         None
     );
     let stored_auth_doc = read_storage_value(&storage, AUTH_KEYSPACE, group_id.to_bytes().into())
@@ -484,7 +484,7 @@ async fn assignment_conflict_materializes() {
     );
     let reducer_state = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -536,7 +536,7 @@ async fn conflicting_add_removes() {
             origin_seq: 1,
             observed: AdminDocumentClock::default(),
             actor: actor.clone(),
-            op: AdminDocumentOperation::RealmRoleUserAssignmentRemoved {
+            op: AdminDocumentOperation::RealmAssignmentRemoved {
                 role_id,
                 user_id: assigned_user_id,
             },
@@ -569,7 +569,7 @@ async fn conflicting_add_removes() {
             origin_seq: 1,
             observed: AdminDocumentClock::default(),
             actor,
-            op: AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+            op: AdminDocumentOperation::RealmAssignmentAdded {
                 role_id,
                 user_id: assigned_user_id,
             },
@@ -581,7 +581,7 @@ async fn conflicting_add_removes() {
     assert!(
         read_storage_value(
             &storage,
-            ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+            DOCUMENT_CONFLICT_KEYSPACE,
             reducer_conflict_key(&target, &assignment_path),
         )
         .await
@@ -657,7 +657,7 @@ async fn seeded_realm_materializes() {
         origin_seq: 2,
         observed: AdminDocumentClock::default(),
         actor: actor.clone(),
-        op: AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+        op: AdminDocumentOperation::RealmAssignmentAdded {
             role_id,
             user_id: assigned_user_id,
         },
@@ -683,7 +683,7 @@ async fn seeded_realm_materializes() {
     );
     let reducer_state = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await
@@ -711,7 +711,7 @@ async fn seeded_realm_materializes() {
         origin_seq: 3,
         observed: AdminDocumentClock::default(),
         actor,
-        op: AdminDocumentOperation::RealmRoleUserAssignmentRemoved {
+        op: AdminDocumentOperation::RealmAssignmentRemoved {
             role_id,
             user_id: assigned_user_id,
         },
@@ -737,7 +737,7 @@ async fn seeded_realm_materializes() {
     );
     let reducer_state = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&AdminDocumentTarget::Realm { realm_id }),
     )
     .await
@@ -775,7 +775,7 @@ async fn new_realm_materializes() {
             target.clone(),
             &actor,
             1,
-            AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+            AdminDocumentOperation::RealmAssignmentAdded {
                 role_id,
                 user_id: assigned_user_id,
             },
@@ -824,7 +824,7 @@ async fn new_realm_materializes() {
 
     let reducer_state = read_storage_value(
         &storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE,
         reducer_state_key(&target),
     )
     .await

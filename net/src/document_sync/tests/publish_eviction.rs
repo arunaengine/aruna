@@ -279,7 +279,7 @@ async fn lost_eviction_replays() {
         genesis(loser_node),
         loser
             .storage_read(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                APPLIED_OPS_KEYSPACE.to_string(),
                 topic_cursor_key(topic_id),
             )
             .await
@@ -310,7 +310,7 @@ async fn lost_eviction_replays() {
     assert!(
         loser
             .storage_read(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                APPLIED_OPS_KEYSPACE.to_string(),
                 topic_cursor_key(topic_id),
             )
             .await
@@ -326,7 +326,7 @@ async fn lost_eviction_replays() {
     let stored: AppliedCursor = postcard::from_bytes(
         &loser
             .storage_read(
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                APPLIED_OPS_KEYSPACE.to_string(),
                 topic_cursor_key(topic_id),
             )
             .await

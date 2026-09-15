@@ -29,7 +29,7 @@ async fn applied_cursor_lineage() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &local_actor,
         1,
-        AdminDocumentOperation::RealmConfigDescriptionSet {
+        AdminDocumentOperation::ConfigDescriptionSet {
             description: "cursor lineage".to_string(),
         },
     );
@@ -283,7 +283,7 @@ async fn publisher_impersonation_rejected() {
                 AdminDocumentTarget::RealmConfig { realm_id },
                 &actor,
                 1,
-                AdminDocumentOperation::RealmConfigDescriptionSet {
+                AdminDocumentOperation::ConfigDescriptionSet {
                     description: "forged".to_string(),
                 },
             ),
@@ -367,7 +367,7 @@ async fn management_preserves_genesis() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &nil_actor,
         1,
-        AdminDocumentOperation::RealmConfigNodeEnsured {
+        AdminDocumentOperation::ConfigNodeEnsured {
             node_id: nil_actor.node_id,
             kind: RealmNodeKind::Management,
         },
@@ -397,7 +397,7 @@ async fn management_preserves_genesis() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &nil_actor,
         2,
-        AdminDocumentOperation::RealmConfigDescriptionSet {
+        AdminDocumentOperation::ConfigDescriptionSet {
             description: "genesis".to_string(),
         },
     );
@@ -478,7 +478,7 @@ async fn management_preserves_genesis() {
                 AdminDocumentTarget::RealmConfig { realm_id },
                 &server_actor,
                 1,
-                AdminDocumentOperation::RealmConfigQuotaSet {
+                AdminDocumentOperation::ConfigQuotaSet {
                     quota: QuotaConfig::default(),
                 },
             ),
@@ -567,7 +567,7 @@ async fn inbound_rejects_pool() {
         admin_target.clone(),
         &attacker,
         1,
-        AdminDocumentOperation::RealmConfigBandPoolAssigned { pool: forged },
+        AdminDocumentOperation::BandPoolAssigned { pool: forged },
     );
     let forged_publisher = ::irokle::actor_id_for(topic, node_to_peer(&attacker.node_id));
     assert!(matches!(
@@ -600,7 +600,7 @@ async fn inbound_rejects_pool() {
         admin_target,
         &coordinator,
         1,
-        AdminDocumentOperation::RealmConfigBandPoolAssigned { pool: orphan },
+        AdminDocumentOperation::BandPoolAssigned { pool: orphan },
     );
     let publisher = ::irokle::actor_id_for(topic, node_to_peer(&coordinator.node_id));
     assert!(matches!(
@@ -683,7 +683,7 @@ async fn inbound_checks_grants() {
             admin_target.clone(),
             &coordinator,
             1,
-            AdminDocumentOperation::RealmConfigHandleRangeGranted { range },
+            AdminDocumentOperation::HandleRangeGranted { range },
         );
         assert_eq!(
             validate_admin_event(
@@ -721,7 +721,7 @@ async fn inbound_checks_grants() {
         admin_target,
         &coordinator,
         1,
-        AdminDocumentOperation::RealmConfigHandleRangeGranted {
+        AdminDocumentOperation::HandleRangeGranted {
             range: HandleRange {
                 range_id: Ulid::from_bytes([96; 16]),
                 owner: node(76),
@@ -894,7 +894,7 @@ async fn rejection_advances_cursor() {
         },
         &local_actor,
         1,
-        AdminDocumentOperation::RealmConfigNodePlacementSet {
+        AdminDocumentOperation::NodePlacementSet {
             entry: placement_entry(node(90)),
         },
     );
@@ -903,7 +903,7 @@ async fn rejection_advances_cursor() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &claimed_actor,
         1,
-        AdminDocumentOperation::RealmConfigNodePlacementSet {
+        AdminDocumentOperation::NodePlacementSet {
             entry: placement_entry(node(91)),
         },
     );
@@ -912,7 +912,7 @@ async fn rejection_advances_cursor() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &local_actor,
         2,
-        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+        AdminDocumentOperation::PlacementStrategyUpserted {
             strategy: PlacementStrategy {
                 strategy_id: Ulid::from_parts(1_633, 2),
                 name: "invalid".to_string(),
@@ -931,7 +931,7 @@ async fn rejection_advances_cursor() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &local_actor,
         3,
-        AdminDocumentOperation::RealmConfigNodePlacementSet {
+        AdminDocumentOperation::NodePlacementSet {
             entry: placement_entry(local_actor.node_id),
         },
     );
@@ -943,7 +943,7 @@ async fn rejection_advances_cursor() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &claimed_actor,
         2,
-        AdminDocumentOperation::RealmConfigDescriptionSet {
+        AdminDocumentOperation::ConfigDescriptionSet {
             description: "unrelated operation applied".to_string(),
         },
     );
@@ -1092,7 +1092,7 @@ async fn unknown_report_quarantined() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &local_actor,
         1,
-        AdminDocumentOperation::RealmConfigTransitionStallReported {
+        AdminDocumentOperation::TransitionStallReported {
             transition_id: Ulid::from_parts(1_741, 1),
             bucket: 0,
             reported_by: local_actor.node_id,
@@ -1104,7 +1104,7 @@ async fn unknown_report_quarantined() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &local_actor,
         2,
-        AdminDocumentOperation::RealmConfigDescriptionSet {
+        AdminDocumentOperation::ConfigDescriptionSet {
             description: "progress after the invented report".to_string(),
         },
     );
@@ -1161,7 +1161,7 @@ async fn unknown_report_quarantined() {
         postcard::from_bytes(
             &read_storage_value(
                 &storage,
-                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                APPLIED_OPS_KEYSPACE,
                 deferred_topics_key(),
             )
             .await
@@ -1239,14 +1239,14 @@ async fn plan_report_coalesce() {
         AdminDocumentTarget::RealmConfig { realm_id },
         &local_actor,
         1,
-        AdminDocumentOperation::RealmConfigTransitionStarted { plan },
+        AdminDocumentOperation::ConfigTransitionStarted { plan },
     );
     let mut barrier = test_admin_event(
         Ulid::from_parts(1_753, 1),
         AdminDocumentTarget::RealmConfig { realm_id },
         &local_actor,
         2,
-        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+        AdminDocumentOperation::TransitionBarrierReported {
             transition_id,
             bucket: 0,
             reported_by: local_actor.node_id,

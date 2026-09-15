@@ -59,7 +59,7 @@ fn unwanted_summaries_ignored() {
 
 #[test]
 fn buffered_publish_child() {
-    let Ok(root) = env::var(DOCUMENT_SYNC_RESTART_CHILD_PATH_ENV) else {
+    let Ok(root) = env::var(CHILD_PATH_ENV) else {
         return;
     };
     let root = PathBuf::from(root);
