@@ -1,17 +1,17 @@
 //! Metadata query and search routes: thin request-to-operation conversion over
 //! the shared `crate::metadata` adapter.
 
-use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id};
+use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerResult};
 use crate::metadata::{
-    MetadataQueryMode, MetadataQueryResponse, MetadataSearchParams, MetadataSearchResponse,
+    MetadataQueryMode, MetadataQueryResponse, MetadataSearchParams, SearchResultsResponse,
     SparqlQueryRequest, bearer_token_string, map_api_error, map_query_mode, map_query_results,
     map_search_hit, parse_document_id,
 };
 use crate::server_state::ServerState;
 use aruna_core::structs::AuthContext;
 use aruna_operations::metadata::api::{
-    MetadataDocumentQueryRequest, MetadataQueryRequest, MetadataSearchRequest,
+    DocumentQueryRequest, MetadataQueryRequest, MetadataSearchRequest,
     query_metadata as run_query_metadata, query_metadata_document as run_query_metadata_document,
     search_metadata as run_search_metadata,
 };
@@ -123,7 +123,7 @@ both answer 404.
 pub async fn query_metadata_document(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
@@ -133,7 +133,7 @@ pub async fn query_metadata_document(
         ctx.as_ref(),
         state.get_realm_id(),
         state.get_node_id(),
-        MetadataDocumentQueryRequest {
+        DocumentQueryRequest {
             document_id,
             auth,
             bearer_token: bearer_token_string(bearer_token),
@@ -251,7 +251,7 @@ caller may read, so an anonymous request sees the public documents alone.
 pub async fn query_all_metadata(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
     let ctx = state.get_ctx();
@@ -321,7 +321,7 @@ so an anonymous request returns fewer documents.
         (
             status = 200,
             description = "Search hits ordered by descending score, with the paging and partition flags",
-            body = MetadataSearchResponse,
+            body = SearchResultsResponse,
             examples(
                 (
                     "SearchPage" = (
@@ -392,9 +392,9 @@ so an anonymous request returns fewer documents.
 pub async fn search_metadata(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(params): Query<MetadataSearchParams>,
-) -> ServerResult<(StatusCode, Json<MetadataSearchResponse>)> {
+) -> ServerResult<(StatusCode, Json<SearchResultsResponse>)> {
     let group_id = params.group_id.as_deref().map(parse_group_id).transpose()?;
     let ctx = state.get_ctx();
     let result = run_search_metadata(
@@ -418,7 +418,7 @@ pub async fn search_metadata(
     .map_err(map_api_error)?;
     Ok((
         StatusCode::OK,
-        Json(MetadataSearchResponse {
+        Json(SearchResultsResponse {
             hits: result.hits.into_iter().map(map_search_hit).collect(),
             next_cursor: result.next_cursor,
             nodes_queried: result.fanout_stats.nodes_queried,

@@ -1,23 +1,20 @@
 //! Metadata reference routes: thin request-to-operation conversion over the
 //! shared `crate::metadata` adapter.
 
-use crate::auth::{ValidatedArunaBearerTokenCarrier, require_realm_auth};
+use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerResult};
 use crate::metadata::{
-    MetadataPreflightCoverageResponse, MetadataPreflightExcludedFormResponse,
-    MetadataPreflightLocationResponse, MetadataPreflightNodeFreshnessResponse,
-    MetadataPreflightStorageOperationBody, MetadataPreflightTargetResponse,
-    MetadataPreflightVisibleReferenceResponse, MetadataReferencePreflightBody,
-    MetadataReferencePreflightResponse, MetadataReferencePreflightTargetBody,
-    MetadataReferencesParams, MetadataReferencesResponse, bearer_token_string, map_api_error,
-    map_query_mode, map_references_response,
+    ExcludedFormResponse, MetadataReferencesParams, MetadataReferencesResponse, PreflightBody,
+    PreflightCoverageResponse, PreflightFreshnessResponse, PreflightLocationResponse,
+    PreflightResponse, PreflightStorageBody, PreflightTargetBody, PreflightTargetResponse,
+    PreflightVisibleResponse, bearer_token_string, map_api_error, map_query_mode,
+    map_references_response,
 };
 use crate::server_state::ServerState;
 use aruna_core::structs::AuthContext;
 use aruna_operations::metadata::api::{
-    MetadataPreflightStorageOperation, MetadataReferencePreflightExecution,
-    MetadataReferencePreflightRequest, MetadataReferencePreflightTarget, MetadataReferencesRequest,
-    references_metadata as run_references_metadata,
+    MetadataReferencesRequest, MetadataStorageOperation, ReferenceExecution, ReferenceRequest,
+    ReferenceTarget, references_metadata as run_references_metadata,
     references_preflight as run_references_preflight,
 };
 use axum::extract::{Query, State};
@@ -140,7 +137,7 @@ target names content identities directly and checks no storage permission.
   reports per-node index freshness, failed partitions and stable cursor pagination.
 - Restricted referencing documents are represented only by `hidden_references_exist`; their count
   and identity are never returned."#,
-    request_body(content = MetadataReferencePreflightBody,
+    request_body(content = PreflightBody,
         example = json!({
             "target": {
                 "kind": "bucket_prefix",
@@ -152,7 +149,7 @@ target names content identities directly and checks no storage permission.
             "limit": 50
         })),
     responses(
-        (status = 200, description = "Reference warnings, location impact, pagination, and explicit coverage metadata", body = MetadataReferencePreflightResponse,
+        (status = 200, description = "Reference warnings, location impact, pagination, and explicit coverage metadata", body = PreflightResponse,
             example = json!({
                 "targets": [
                     {
@@ -214,31 +211,31 @@ target names content identities directly and checks no storage permission.
 pub async fn metadata_reference_preflight(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
-    Json(request): Json<MetadataReferencePreflightBody>,
-) -> ServerResult<(StatusCode, Json<MetadataReferencePreflightResponse>)> {
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
+    Json(request): Json<PreflightBody>,
+) -> ServerResult<(StatusCode, Json<PreflightResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let target = match request.target {
-        MetadataReferencePreflightTargetBody::ContentW3ids {
+        PreflightTargetBody::ContentW3ids {
             content_w3ids,
             remove_all_resolvable_locations,
-        } => MetadataReferencePreflightTarget::ContentW3ids {
+        } => ReferenceTarget::ContentW3ids {
             content_w3ids,
             remove_all_resolvable_locations,
         },
-        MetadataReferencePreflightTargetBody::BucketPrefix {
+        PreflightTargetBody::BucketPrefix {
             bucket,
             prefix,
             operation,
-        } => MetadataReferencePreflightTarget::BucketPrefix {
+        } => ReferenceTarget::BucketPrefix {
             bucket,
             prefix,
             operation: match operation {
-                MetadataPreflightStorageOperationBody::LatestVersionTombstone => {
-                    MetadataPreflightStorageOperation::LatestVersionTombstone
+                PreflightStorageBody::LatestVersionTombstone => {
+                    MetadataStorageOperation::LatestVersionTombstone
                 }
-                MetadataPreflightStorageOperationBody::AllVersionsPurge => {
-                    MetadataPreflightStorageOperation::AllVersionsPurge
+                PreflightStorageBody::AllVersionsPurge => {
+                    MetadataStorageOperation::AllVersionsPurge
                 }
             },
         },
@@ -252,7 +249,7 @@ pub async fn metadata_reference_preflight(
         state.get_ctx().as_ref(),
         state.get_realm_id(),
         state.get_node_id(),
-        MetadataReferencePreflightRequest {
+        ReferenceRequest {
             auth,
             bearer_token: bearer_token_string(bearer_token),
             target,
@@ -269,19 +266,17 @@ pub async fn metadata_reference_preflight(
     Ok((StatusCode::OK, Json(map_preflight_response(execution))))
 }
 
-fn map_preflight_response(
-    execution: MetadataReferencePreflightExecution,
-) -> MetadataReferencePreflightResponse {
-    MetadataReferencePreflightResponse {
+fn map_preflight_response(execution: ReferenceExecution) -> PreflightResponse {
+    PreflightResponse {
         targets: execution
             .targets
             .into_iter()
-            .map(|target| MetadataPreflightTargetResponse {
+            .map(|target| PreflightTargetResponse {
                 content_w3id: target.content_w3id,
                 targeted_versions: target
                     .targeted_versions
                     .into_iter()
-                    .map(|location| MetadataPreflightLocationResponse {
+                    .map(|location| PreflightLocationResponse {
                         node_id: location.node_id.to_string(),
                         bucket: location.bucket,
                         key: location.key,
@@ -291,7 +286,7 @@ fn map_preflight_response(
                 visible_references: target
                     .visible_references
                     .into_iter()
-                    .map(|reference| MetadataPreflightVisibleReferenceResponse {
+                    .map(|reference| PreflightVisibleResponse {
                         document_id: reference.document_id,
                         title: reference.title,
                     })
@@ -312,7 +307,7 @@ fn map_preflight_response(
             .into_iter()
             .map(|node_id| node_id.to_string())
             .collect(),
-        coverage: MetadataPreflightCoverageResponse {
+        coverage: PreflightCoverageResponse {
             queried_scope: execution.coverage.queried_scope.to_string(),
             queried_forms: execution
                 .coverage
@@ -324,7 +319,7 @@ fn map_preflight_response(
                 .coverage
                 .excluded_forms
                 .into_iter()
-                .map(|excluded| MetadataPreflightExcludedFormResponse {
+                .map(|excluded| ExcludedFormResponse {
                     form: excluded.form.to_string(),
                     reason: excluded.reason.to_string(),
                 })
@@ -333,21 +328,13 @@ fn map_preflight_response(
                 .coverage
                 .node_freshness
                 .into_iter()
-                .map(|freshness| MetadataPreflightNodeFreshnessResponse {
+                .map(|freshness| PreflightFreshnessResponse {
                     node_id: freshness.node_id.to_string(),
                     index_state: match freshness.index_state {
-                        aruna_operations::metadata::api::MetadataPreflightIndexState::Current => {
-                            "current"
-                        }
-                        aruna_operations::metadata::api::MetadataPreflightIndexState::Pending => {
-                            "pending"
-                        }
-                        aruna_operations::metadata::api::MetadataPreflightIndexState::Failed => {
-                            "failed"
-                        }
-                        aruna_operations::metadata::api::MetadataPreflightIndexState::Mixed => {
-                            "mixed"
-                        }
+                        aruna_operations::metadata::api::MetadataIndexState::Current => "current",
+                        aruna_operations::metadata::api::MetadataIndexState::Pending => "pending",
+                        aruna_operations::metadata::api::MetadataIndexState::Failed => "failed",
+                        aruna_operations::metadata::api::MetadataIndexState::Mixed => "mixed",
                     }
                     .to_string(),
                     oldest_status_updated_at_ms: freshness.oldest_status_updated_at_ms,

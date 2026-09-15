@@ -1,7 +1,7 @@
 //! Metadata document lifecycle routes: thin request-to-operation conversion
 //! over the shared `crate::metadata` adapter.
 
-use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth};
+use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerResult};
 use crate::metadata::{
     CreateMetadataRequest, CreateMetadataResponse, ListMetadataQuery, ListMetadataResponse,
@@ -13,10 +13,9 @@ use crate::server_state::ServerState;
 use aruna_core::structs::{Actor, AuthContext};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::metadata::api::{
-    GetVisibleMetadataDocumentRequest, MetadataPathLookupRequest,
-    lookup_metadata_path as run_lookup_metadata_path,
+    GetVisibleRequest, MetadataLookupRequest, lookup_metadata_path as run_lookup_metadata_path,
 };
-use aruna_operations::metadata::create_document::CreateMetadataDocumentPayload;
+use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::{
     get_metadata_routed as run_get_visible_metadata_document,
     route_metadata_delete as run_delete_metadata_document,
@@ -127,7 +126,7 @@ a holder that re-runs both checks under the caller's own token.
 pub async fn create_metadata_document(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateMetadataRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateMetadataResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
@@ -136,7 +135,7 @@ pub async fn create_metadata_document(
             parse_group_id(&request.group_id)?,
             request.path,
             request.public,
-            CreateMetadataDocumentPayload::Scaffold {
+            CreateDocumentPayload::Scaffold {
                 name: request.name,
                 description: request.description,
                 date_published: request.date_published,
@@ -147,7 +146,7 @@ pub async fn create_metadata_document(
             parse_group_id(&request.group_id)?,
             request.path,
             request.public,
-            CreateMetadataDocumentPayload::RoCrate {
+            CreateDocumentPayload::RoCrate {
                 jsonld: serialize_jsonld_object(&request.rocrate)?,
             },
         ),
@@ -385,7 +384,7 @@ anonymous caller resolves the winner among public documents only.
 pub async fn get_metadata_path(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(group_id): Path<String>,
     Query(query): Query<MetadataPathQuery>,
 ) -> ServerResult<(StatusCode, Json<MetadataPathResponse>)> {
@@ -393,7 +392,7 @@ pub async fn get_metadata_path(
     let result = run_lookup_metadata_path(
         state.get_ctx().as_ref(),
         state.get_realm_id(),
-        MetadataPathLookupRequest {
+        MetadataLookupRequest {
             group_id,
             document_path: query.path,
             auth,
@@ -461,7 +460,7 @@ caller whose identity may read it, and existence is hidden, so an anonymous call
 pub async fn get_metadata_document(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let document_id = parse_document_id(&document_id)?;
@@ -469,7 +468,7 @@ pub async fn get_metadata_document(
     let record = run_get_visible_metadata_document(
         &ctx,
         state.get_realm_id(),
-        GetVisibleMetadataDocumentRequest { document_id, auth },
+        GetVisibleRequest { document_id, auth },
         forwarded_auth_token(bearer_token)?,
     )
     .await
@@ -507,7 +506,7 @@ caller's own token.
 pub async fn delete_metadata_document(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let auth = require_realm_auth(&state, auth)?;
