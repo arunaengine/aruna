@@ -316,10 +316,10 @@ pub(crate) fn entity_identity(entity_id: &str, content_urls: &[String]) -> Entit
     let mut hash = None;
     let mut hash_realm = None;
     for value in std::iter::once(entity_id).chain(content_urls.iter().map(String::as_str)) {
-        if let Ok(identifier) = W3idDataIdentifier::parse(value) {
+        if let Ok(identifier) = W3idIdentifier::parse(value) {
             match identifier {
-                W3idDataIdentifier::ContentHash(value) => hash = Some(value),
-                W3idDataIdentifier::VersionedObject(value) => exact = Some(value),
+                W3idIdentifier::ContentHash(value) => hash = Some(value),
+                W3idIdentifier::VersionedObject(value) => exact = Some(value),
             }
             continue;
         }

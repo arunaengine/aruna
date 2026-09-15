@@ -3,7 +3,7 @@
 //! and a conflicting claim is visible; signed candidates make this decide only.
 
 use aruna_core::compute_quota::QuotaDenied;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -124,7 +124,7 @@ impl AdmitSubmissionOperation {
 
     fn read_config(&mut self) -> Effects {
         self.state = AdmitState::ReadConfig;
-        let config = DocumentSyncTarget::RealmConfig {
+        let config = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
         smallvec![Effect::Storage(StorageEffect::Read {
@@ -523,7 +523,7 @@ fn logical_record(spec: &LogicalJobSpec) -> JobRecord {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::tests::fixtures::records::{Family, REALM};
+    use crate::tests::records::{Family, REALM};
 
     // A state that expects no event must reject one instead of ignoring it.
     #[test]

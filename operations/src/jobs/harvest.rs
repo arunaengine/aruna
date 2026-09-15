@@ -32,16 +32,16 @@ use crate::harvest::repository::{
 use crate::harvest::target_path::{HARVEST_PATH_BYTES, normalize_target_prefix};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
-use crate::metadata::MetadataAuthToken;
+use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, mint_job_document,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
+    mint_job_document,
 };
 use crate::metadata::forward::{
     route_metadata_create, route_metadata_delete, route_metadata_update,
 };
 use crate::metadata::get_document::load_document_record;
-use crate::metadata::update_document::UpdateMetadataDocumentMutation;
+use crate::metadata::update_document::UpdateDocumentMutation;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
 /// Operationally generous at a typical page size, and small enough that a
@@ -463,13 +463,13 @@ async fn create_document(
 ) -> Result<(), HarvestFailure> {
     let document_path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
     let created = route_metadata_create(
-        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
             actor: actor.clone(),
             group_id: source.group_id,
             document_id,
             document_path: document_path.clone(),
             public: false,
-            payload: CreateMetadataDocumentPayload::RoCrate {
+            payload: CreateDocumentPayload::RoCrate {
                 jsonld: dc_to_jsonld(record),
             },
         }),
@@ -481,7 +481,7 @@ async fn create_document(
         Ok(_) => Ok(()),
         // A create the pending identity already committed under a different
         // payload: the id is resolved, and the newer content lands as an update.
-        Err(MetadataWriteError::Create(CreateMetadataDocumentError::DocumentAlreadyExists)) => {
+        Err(MetadataWriteError::Create(CreateDocumentError::DocumentAlreadyExists)) => {
             let stored = read_stored(ctx, document_id).await?;
             update_document(
                 ctx,
@@ -514,7 +514,7 @@ async fn update_document(
         stored,
         document_id,
         None,
-        UpdateMetadataDocumentMutation::ReplaceRoCrate {
+        UpdateDocumentMutation::ReplaceRoCrate {
             jsonld: dc_to_jsonld(record),
         },
         Some(internal_token(source.created_by, realm_id)),
@@ -525,8 +525,8 @@ async fn update_document(
 
 /// Harvest writes run as the source owner, unrestricted: the source record is
 /// the authorization decision, made when an operator created it.
-fn internal_token(created_by: aruna_core::UserId, realm_id: RealmId) -> MetadataAuthToken {
-    MetadataAuthToken::internal(AuthContext {
+fn internal_token(created_by: aruna_core::UserId, realm_id: RealmId) -> AuthToken {
+    AuthToken::internal(AuthContext {
         user_id: created_by,
         realm_id,
         path_restrictions: None,
