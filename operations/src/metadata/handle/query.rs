@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aruna_core::metadata::{MetadataError, MetadataQueryResults};
-use aruna_core::structs::AuthContext;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::telemetry::{record_duration_ms, record_elapsed_ms};
 use craqle::{CraqleNode, GraphId};
 use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};

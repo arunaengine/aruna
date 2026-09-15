@@ -2,7 +2,7 @@ use super::super::transport::with_sync_timeout;
 use super::auth::{auth_storage, node_id_seed, realm_fixture};
 use super::*;
 use crate::metadata::handle::transport::read_budget;
-use crate::s3::get_bucket::GetBucketOperation;
+use crate::s3::bucket::get::GetBucketOperation;
 use craqle::CraqleFjallPersistMode;
 #[test]
 fn workspace_delete_allowed() {

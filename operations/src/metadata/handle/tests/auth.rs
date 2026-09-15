@@ -9,10 +9,10 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::API_STATE_KEYSPACE;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::AuthContext;
-use aruna_core::structs::Permission;
-use aruna_core::structs::RealmConfigDocument;
-use aruna_core::structs::TokenClaims;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::identity::auth::TokenClaims;
 use byteview::ByteView;
 pub(super) async fn assert_auth_rejected(state: &AuthValidationState, token: &str, expected: &str) {
     let error = remote_auth_context(state, Some(AuthToken::bearer(token).unwrap()))

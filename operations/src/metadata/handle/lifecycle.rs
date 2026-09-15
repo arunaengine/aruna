@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE};
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEffect, MetadataError, MetadataEvent};
-use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::GroupId;
 use aruna_storage::StorageHandle;

@@ -11,7 +11,7 @@ use aruna_core::metadata::{
     ProfileValidationStatus, is_rocrate_specification,
 };
 use aruna_core::storage_entries::{profile_validation_entry, profile_validation_key};
-use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis as now_ms;
 use aruna_core::types::{GroupId, TxnId};
 use craqle::{CrateViolation, ShaclValidationResult};
@@ -1305,7 +1305,8 @@ mod tests {
         // A merge can leave the displayed revision behind the newest event, so
         // freshness follows the render's digest, not the event id.
         use aruna_core::metadata::{MetadataEventPayload, MetadataEventRecord};
-        use aruna_core::structs::{PlacementRef, RealmId};
+        use aruna_core::structs::placement::placement_record::PlacementRef;
+        use aruna_core::structs::identity::realm::RealmId;
         use aruna_storage::FjallStorage;
 
         let dir = tempfile::tempdir().expect("temp dir");

@@ -14,12 +14,19 @@ use aruna_core::keyspaces::{
     NOTIFICATION_WATCH_INTEREST_KEYSPACE,
 };
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, NotificationClass, NotificationKind,
-    NotificationRecord, PathRestriction, Permission, RealmAuthorizationDocument, RealmNodeKind,
-    TokenRevocation, WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind,
-    WatchEventMask, interest_dirty_key, object_permission_path, watch_resource_path,
+use aruna_core::structs::identity::auth::{Actor, PathRestriction, Permission};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::execution::notification::{
+    NotificationClass, NotificationKind, NotificationRecord,
 };
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmNodeKind, TokenRevocation,
+};
+use aruna_core::structs::execution::notification_watch::{
+    WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
+    interest_dirty_key, watch_resource_path,
+};
+use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_storage::FjallStorage;
 use std::sync::Arc;

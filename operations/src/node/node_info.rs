@@ -19,12 +19,17 @@ use aruna_core::keyspaces::{
     NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
 };
 use aruna_core::storage_entries::sync_revision_key;
-use aruna_core::structs::{
-    AdvertisementEpoch, BackendCatalog, JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
-    JobRecordKind, LogicalJobState, NODE_SUBJECT_KEY, NodeInfoDocument, NodeSubjectRecord,
-    NodeUrls, NodeUtilization, PlacementRef, RealmConfigDocument, RealmId,
-    STORAGE_CLASS_LABEL_PREFIX, SubmissionId, node_info_key,
+use aruna_core::structs::storage::node_info::{
+    AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, STORAGE_CLASS_LABEL_PREFIX,
+    node_info_key,
 };
+use aruna_core::structs::storage::routing::BackendCatalog;
+use aruna_core::structs::execution::job::{
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LogicalJobState, SubmissionId,
+};
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, TxnId, Value};
@@ -311,7 +316,7 @@ async fn read_family_spec(
 ) -> Result<
     Option<(
         aruna_core::types::GroupId,
-        aruna_core::structs::EffectiveResources,
+        aruna_core::structs::execution::job::EffectiveResources,
     )>,
     String,
 > {
@@ -1077,10 +1082,12 @@ mod tests {
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
     use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
     use aruna_core::storage_entries::metadata_registry_key;
-    use aruna_core::structs::{
-        KIND_LABEL_KEY, MetadataRegistryRecord, NodePlacementEntry, PlacementRef,
-        PlacementStrategy, RealmConfigDocument, RealmNodeKind,
+    use aruna_core::structs::storage::node_info::KIND_LABEL_KEY;
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_core::structs::placement::placement_record::{
+        NodePlacementEntry, PlacementRef, PlacementStrategy,
     };
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
@@ -1115,7 +1122,7 @@ mod tests {
             .ok()
             .and_then(|ids| ids.first().copied())
             .unwrap_or_else(|| node(1));
-        let actor = aruna_core::structs::Actor {
+        let actor = aruna_core::structs::identity::auth::Actor {
             node_id,
             user_id: aruna_core::UserId::nil(config.realm_id),
             realm_id: config.realm_id,
@@ -1568,22 +1575,22 @@ mod tests {
 
     fn family(seed: u8) -> JobFamilyId {
         JobFamilyId {
-            submission_id: aruna_core::structs::SubmissionId([seed; 32]),
+            submission_id: aruna_core::structs::execution::job::SubmissionId([seed; 32]),
             request_digest: [seed; 32],
         }
     }
 
     fn spec_record(realm_id: RealmId, family: JobFamilyId, group_id: Ulid) -> JobRecordEnvelope {
-        let resources = aruna_core::structs::EffectiveResources {
+        let resources = aruna_core::structs::execution::job::EffectiveResources {
             cpu_cores: 2,
             ram_bytes: 1_024,
             disk_bytes: 2_048,
             max_walltime_ms: 60_000,
             preemptible: false,
         };
-        let job_id = aruna_core::structs::JobId::from_bytes([9u8; 16]);
+        let job_id = aruna_core::structs::execution::job::JobId::from_bytes([9u8; 16]);
         let origin = node(1);
-        let spec = aruna_core::structs::LogicalJobSpec {
+        let spec = aruna_core::structs::execution::job::LogicalJobSpec {
             submission_id: family.submission_id,
             job_id,
             origin_node_id: origin,
@@ -1592,8 +1599,8 @@ mod tests {
             group_id,
             created_by: aruna_core::UserId::nil(realm_id),
             created_at_ms: 1_000,
-            retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
-            payload: aruna_core::structs::ExecutionSpec {
+            retention_ms: aruna_core::structs::execution::job::DEFAULT_JOB_RETENTION_MS,
+            payload: aruna_core::structs::execution::job::ExecutionSpec {
                 group_id,
                 name: None,
                 description: None,
@@ -1614,10 +1621,10 @@ mod tests {
             request_digest: family.request_digest,
             spec_digest: [0u8; 32],
             resources,
-            retry: aruna_core::structs::JobRetryPolicy {
+            retry: aruna_core::structs::execution::job::JobRetryPolicy {
                 max_launches_per_witness: 2,
             },
-            admission: aruna_core::structs::JobAdmissionRecord {
+            admission: aruna_core::structs::execution::job::JobAdmissionRecord {
                 submission_id: family.submission_id,
                 request_digest: family.request_digest,
                 job_id,
@@ -1652,15 +1659,15 @@ mod tests {
             version: crate::jobs::records::rows::PROJECTION_CACHE_VERSION,
             revision: 1,
             stale: false,
-            projection: Some(aruna_core::structs::JobProjection {
+            projection: Some(aruna_core::structs::execution::job::JobProjection {
                 submission_id: family.submission_id,
                 request_digest: family.request_digest,
-                canonical_job_id: aruna_core::structs::JobId::from_bytes([9u8; 16]),
+                canonical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([9u8; 16]),
                 aliases: Vec::new(),
                 state,
                 canonical_execution_id: None,
                 executions: Vec::new(),
-                outputs: aruna_core::structs::OutputSet::new(Vec::new()).expect("empty outputs"),
+                outputs: aruna_core::structs::execution::job::OutputSet::new(Vec::new()).expect("empty outputs"),
                 cancel_requested: false,
             }),
         };
@@ -1686,9 +1693,9 @@ mod tests {
     async fn write_reservation(ctx: &DriverContext, execution_id: Ulid, cpu: u32) {
         let record = JobReservationRecord {
             execution_id,
-            job_id: aruna_core::structs::JobId::from_bytes([9u8; 16]),
-            logical_job_id: aruna_core::structs::JobId::from_bytes([9u8; 16]),
-            resources: aruna_core::structs::EffectiveResources {
+            job_id: aruna_core::structs::execution::job::JobId::from_bytes([9u8; 16]),
+            logical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([9u8; 16]),
+            resources: aruna_core::structs::execution::job::EffectiveResources {
                 cpu_cores: cpu,
                 ram_bytes: 512,
                 disk_bytes: 0,
@@ -1798,7 +1805,7 @@ mod tests {
         let shared = DemandFamily {
             submission_id: family(1).submission_id,
             request_digest: family(1).request_digest,
-            resources: aruna_core::structs::EffectiveResources {
+            resources: aruna_core::structs::execution::job::EffectiveResources {
                 cpu_cores: 2,
                 ram_bytes: 1_024,
                 disk_bytes: 2_048,
@@ -1937,7 +1944,7 @@ mod tests {
             labels: BTreeMap::new(),
         });
         write_realm_config(&ctx, &config).await;
-        let subject = aruna_core::structs::storage_subject(&config.placement_map[0], 1);
+        let subject = aruna_core::structs::placement::node_subject::storage_subject(&config.placement_map[0], 1);
         let record = NodeSubjectRecord::seed(subject).expect("subject is valid");
         write_row(
             &ctx,
@@ -2080,7 +2087,7 @@ mod tests {
         let mut request_digest = [0u8; 32];
         request_digest[..8].copy_from_slice(&(index as u64).to_be_bytes());
         JobFamilyId {
-            submission_id: aruna_core::structs::SubmissionId([1u8; 32]),
+            submission_id: aruna_core::structs::execution::job::SubmissionId([1u8; 32]),
             request_digest,
         }
     }

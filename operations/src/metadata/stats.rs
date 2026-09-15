@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::GROUP_KEYSPACE;
-use aruna_core::structs::{Group, RealmId};
+use aruna_core::structs::identity::group::Group;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
 use futures_util::{StreamExt, stream};
 use serde_json::Value;
@@ -326,7 +327,10 @@ mod tests {
         MetadataGraphPolicy, MetadataRequestDurability,
     };
     use aruna_core::storage_entries::{graph_lifecycle_entry, registry_write_entries};
-    use aruna_core::structs::{Actor, Group, MetadataRegistryRecord, PlacementRef};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::Group;
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_core::types::GroupId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use byteview::ByteView;

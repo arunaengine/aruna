@@ -21,12 +21,12 @@ use aruna_core::StructuredId;
 use aruna_core::UserId;
 use aruna_core::metadata::MetadataMergedRevision;
 use aruna_core::metadata::ProfileValidationStatus;
-use aruna_core::structs::Actor;
-use aruna_core::structs::MetadataRegistryRecord;
-use aruna_core::structs::PlacementRef;
-use aruna_core::structs::RealmConfigDocument;
-use aruna_core::structs::RealmId;
-use aruna_core::structs::RealmNodeKind;
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::RealmNodeKind;
 use ulid::Ulid;
 
 use super::read::device_raw_revision;
@@ -36,7 +36,7 @@ use super::*;
 
 use crate::device::replica::ReplicaOrigin;
 use aruna_core::metadata::{ProfileValidationCompleteness, ProfileValidationState};
-use aruna_core::structs::{METADATA_HANDLE, PlacementStrategy};
+use aruna_core::structs::placement::placement_record::{METADATA_HANDLE, PlacementStrategy};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 
 fn node(seed: u8) -> NodeId {

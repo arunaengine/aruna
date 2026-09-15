@@ -12,7 +12,8 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::metadata::MetadataEventRecord;
-use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -1636,9 +1637,9 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect};
     use aruna_core::events::{DhtEntry, DhtEvent, NetEvent};
-    use aruna_core::structs::{
-        Actor, PlacementOverride, PlacementStrategy, RealmNode, RealmNodeKind,
-    };
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::placement::placement_record::{PlacementOverride, PlacementStrategy};
+    use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
@@ -2376,7 +2377,7 @@ mod tests {
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: aruna_core::keyspaces::USAGE_STATS_KEYSPACE.to_string(),
-                key: aruna_core::structs::usage_group_key(group_id).into(),
+                key: aruna_core::structs::storage::usage::usage_group_key(group_id).into(),
                 value: vec![0xff].into(),
                 txn_id: None,
             })

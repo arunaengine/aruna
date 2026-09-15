@@ -4,7 +4,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::outbox_write_entry;
-use aruna_core::structs::{NotificationOutboxRecord, NotificationRecord};
+use aruna_core::structs::execution::notification::{NotificationOutboxRecord, NotificationRecord};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
@@ -173,7 +173,7 @@ mod tests {
     use crate::tests::notifications::{context_with_storage, record, user};
     use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
-    use aruna_core::structs::{NotificationClass, notification_outbox_key};
+    use aruna_core::structs::execution::notification::{NotificationClass, notification_outbox_key};
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_storage::storage;
     use aruna_tasks::{InboundTaskHandler, TaskHandle};

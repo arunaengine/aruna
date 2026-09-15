@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
-use aruna_core::structs::{AuthContext, Permission, RealmId, object_permission_path};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::types::GroupId;
 use serde_json::Value as JsonValue;
 
@@ -328,9 +330,12 @@ mod tests {
         AUTH_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
         S3_BUCKET_KEYSPACE,
     };
-    use aruna_core::structs::{
-        ARUNA_DATA_PREFIX, Actor, BucketInfo, Group, GroupAuthorizationDocument, HashIndex,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, Role,
+    use aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX;
+    use aruna_core::structs::identity::auth::{Actor, Role};
+    use aruna_core::structs::storage::blob::{BucketInfo, HashIndex};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
     };
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
@@ -673,7 +678,7 @@ mod tests {
     async fn marks_remote_exact() {
         let fixture = fixture(true).await;
         let remote = iroh::SecretKey::from_bytes(&[99; 32]).public();
-        let exact = aruna_core::structs::VersionedObjectArn::new(
+        let exact = aruna_core::structs::storage::replication::VersionedObjectArn::new(
             fixture.realm_id,
             remote,
             BUCKET.to_string(),
@@ -699,7 +704,7 @@ mod tests {
     async fn checks_anonymous_first() {
         let fixture = fixture(true).await;
         let mut caller = fixture.owner.clone();
-        caller.path_restrictions = Some(vec![aruna_core::structs::PathRestriction {
+        caller.path_restrictions = Some(vec![aruna_core::structs::identity::auth::PathRestriction {
             pattern: format!("/{}/g/*/meta/**", fixture.realm_id),
             permission: Permission::READ,
         }]);
@@ -737,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn marks_missing_version() {
         let fixture = fixture(false).await;
-        let exact = aruna_core::structs::VersionedObjectArn::new(
+        let exact = aruna_core::structs::storage::replication::VersionedObjectArn::new(
             fixture.realm_id,
             fixture.node_id,
             BUCKET,

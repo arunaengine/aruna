@@ -1,6 +1,6 @@
 use super::*;
 use crate::auth::permission_rules::GroupPermissionRules;
-use aruna_core::structs::Permission;
+use aruna_core::structs::identity::auth::Permission;
 pub(super) fn registry_record(document_path: &str) -> MetadataRegistryRecord {
     let document_id = Ulid::generate();
     MetadataRegistryRecord {
@@ -38,7 +38,7 @@ pub(super) fn read_rules(
 ) -> crate::auth::permission_rules::PermissionRules {
     crate::auth::permission_rules::PermissionRules::from_roles(
         vec![crate::auth::permission_rules::CollectedRole {
-            role: aruna_core::structs::Role {
+            role: aruna_core::structs::identity::auth::Role {
                 role_id: Ulid::generate(),
                 name: "test".to_string(),
                 permissions: patterns

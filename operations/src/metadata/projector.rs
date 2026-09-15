@@ -23,9 +23,9 @@ use aruna_core::storage_entries::{
     lifecycle_revision_change, pending_projection_key, pending_projection_target,
     registry_delete_entries,
 };
-use aruna_core::structs::{
-    MetadataAuditRecord, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId,
-};
+use aruna_core::structs::storage::metadata_registry::{MetadataAuditRecord, MetadataRegistryRecord};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
 use aruna_storage::StorageHandle;
@@ -938,7 +938,7 @@ fn expand_event_holders(
 
 async fn read_realm_config(
     context: &DriverContext,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
 ) -> Result<Option<RealmConfigDocument>, MetadataProjectionError> {
     let target = DocumentTarget::RealmConfig { realm_id };
     match context
@@ -1160,9 +1160,8 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::metadata::{MetadataEventPayload, MetadataLifecycleRecord};
     use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
-    use aruna_core::structs::{
-        PlacementRef, PlacementStrategy, RealmConfigDocument, RealmId, RealmNodeKind,
-    };
+    use aruna_core::structs::placement::placement_record::{PlacementRef, PlacementStrategy};
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
     use async_trait::async_trait;
@@ -1954,7 +1953,7 @@ mod tests {
         };
 
         let create_ref = placement_of(&create);
-        assert_ne!(create_ref, aruna_core::structs::PlacementRef::NIL);
+        assert_ne!(create_ref, aruna_core::structs::placement::placement_record::PlacementRef::NIL);
         assert_eq!(create_ref, placement_of(&update));
     }
 

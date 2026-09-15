@@ -15,9 +15,9 @@ use aruna_core::storage_entries::{
     create_acceptance_key, document_lifecycle_entry, event_log_key, event_log_prefix,
     profile_validation_entry, raw_budget_entry, raw_budget_key, sync_revision_entry,
 };
-use aruna_core::structs::{
-    MetadataAuditRecord, MetadataRegistryRecord, PlacementRef, RealmConfigDocument,
-};
+use aruna_core::structs::storage::metadata_registry::{MetadataAuditRecord, MetadataRegistryRecord};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use byteview::ByteView;
@@ -45,7 +45,7 @@ const RAW_EVENT_LIMIT: usize = METADATA_RAW_EVENT_LIMIT as usize;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateDocumentConfig {
-    pub actor: aruna_core::structs::Actor,
+    pub actor: aruna_core::structs::identity::auth::Actor,
     pub group_id: GroupId,
     pub document_id: Ulid,
     pub public: bool,
@@ -1013,7 +1013,9 @@ mod pure_tests {
         create_acceptance_key, event_log_key, metadata_registry_key, raw_budget_key,
         sync_revision_key,
     };
-    use aruna_core::structs::{Actor, PlacementRef, RealmId};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::identity::realm::RealmId;
 
     fn actor() -> Actor {
         let realm_id = RealmId::from_bytes([9u8; 32]);
@@ -1421,11 +1423,11 @@ mod pure_tests {
     /// resolves a generation and takes the bucket's fence.
     fn activated_config(record: &mut MetadataRegistryRecord) -> Event {
         let mut config = RealmConfigDocument::new(record.realm_id, Vec::new(), 3);
-        config.ensure_node(actor().node_id, aruna_core::structs::RealmNodeKind::Server);
+        config.ensure_node(actor().node_id, aruna_core::structs::identity::realm::RealmNodeKind::Server);
         let strategy_id = Ulid::from_bytes([5u8; 16]);
         config
             .strategies
-            .push(aruna_core::structs::PlacementStrategy {
+            .push(aruna_core::structs::placement::placement_record::PlacementStrategy {
                 strategy_id,
                 name: "default".to_string(),
                 replica_count: Some(1),

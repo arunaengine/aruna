@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aruna_core::metadata::{MetadataError, MetadataSearchHit};
-use aruna_core::structs::{AuthContext, MetadataRegistryRecord};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::telemetry::{record_duration_ms, record_elapsed_ms};
 use aruna_core::types::GroupId;
 use craqle::{

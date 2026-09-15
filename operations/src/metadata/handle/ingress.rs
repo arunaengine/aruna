@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
-use aruna_core::structs::{Permission, SyncRelationship, bucket_permission_path};
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::SyncRelationship;
+use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
@@ -25,9 +27,9 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::{AuthToken, MetadataReadError, MetadataTransportMessage};
-use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use crate::s3::search_buckets::{SearchBucketsInput, search_local_buckets};
-use crate::s3::search_objects::{SearchObjectsInput, search_local_objects};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::search::{SearchBucketsInput, search_local_buckets};
+use crate::s3::object::search::{SearchObjectsInput, search_local_objects};
 use crate::sync::sync_relationship::{
     DeleteRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
@@ -168,7 +170,7 @@ impl MetadataHandle {
 async fn delete_mirror(
     context: &Arc<DriverContext>,
     net_handle: &NetHandle,
-    auth: &aruna_core::structs::AuthContext,
+    auth: &aruna_core::structs::identity::auth::AuthContext,
     relationship: &SyncRelationship,
     local_bucket: &str,
     direction: SyncRelationshipDirection,
@@ -866,7 +868,7 @@ impl MetadataHandle {
             }
             create @ MetadataTransportMessage::ForwardCreateBucket { .. } => {
                 Box::pin(async {
-                    crate::s3::forward::apply_bucket_create(context, peer, create).await
+                    crate::s3::bucket::forward::apply_bucket_create(context, peer, create).await
                 })
                 .await
             }

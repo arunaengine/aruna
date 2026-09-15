@@ -42,7 +42,7 @@ pub(crate) fn targets_change_dashboard(targets: &[DocumentTarget]) -> bool {
 mod pure_tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
     use ulid::Ulid;
 
     #[test]

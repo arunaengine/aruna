@@ -9,17 +9,20 @@ use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    BucketInfo, CurrentVersionPointer, NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX,
-    NODE_USAGE_GLOBAL_PREFIX, NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY,
-    NODE_USAGE_SUMMARY_GROUP_PREFIX, NodeUsageSnapshot, RealmConfigDocument, RealmId,
-    USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta,
-    VersionKey, dirty_group_id, dirty_group_key, global_group_key, global_shard_index,
-    global_shard_key, global_shard_keys, shard_for_hash, usage_backend_key, usage_global_key,
-    usage_group_id, usage_group_key, usage_group_prefix, usage_hash_key, usage_node_id,
-    usage_snapshot_key, usage_summary_key,
+    BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::usage::{
+    NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX, NODE_USAGE_GLOBAL_PREFIX,
+    NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY, NODE_USAGE_SUMMARY_GROUP_PREFIX,
+    NodeUsageSnapshot, USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT, UsageCounterError,
+    UsageCounters, UsageDelta, dirty_group_id, dirty_group_key, global_group_key,
+    global_shard_index, global_shard_key, global_shard_keys, shard_for_hash, usage_backend_key,
+    usage_global_key, usage_group_id, usage_group_key, usage_group_prefix, usage_hash_key,
+    usage_node_id, usage_snapshot_key, usage_summary_key,
+};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_storage::StorageHandle;
@@ -1771,12 +1774,16 @@ pub async fn restore_usage_timer(storage: &StorageHandle, task_handle: &TaskHand
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::s3::create_bucket::CreateBucketOperation;
-    use aruna_core::structs::{
-        BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer, PortableSourceDescriptor,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionSourceBinding,
-        global_shard_keys,
+    use crate::s3::bucket::create::CreateBucketOperation;
+    use aruna_core::structs::storage::blob::{
+        BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer,
     };
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::storage::usage::global_shard_keys;
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;

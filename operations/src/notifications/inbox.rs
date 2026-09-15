@@ -7,7 +7,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
 use aruna_core::storage_entries::inbox_write_entries;
-use aruna_core::structs::{
+use aruna_core::structs::execution::notification::{
     NOTIFICATION_TRANSIENT_PER_USER_CAP, NotificationClass, NotificationRecord,
     notification_inbox_key, notification_inbox_prefix,
 };
@@ -267,7 +267,7 @@ mod tests {
         NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
     };
     use aruna_core::storage_entries::inbox_update_entry;
-    use aruna_core::structs::NotificationClass;
+    use aruna_core::structs::execution::notification::NotificationClass;
 
     fn make_record() -> NotificationRecord {
         record(user(1, 2), NotificationClass::Direct, 1_000)

@@ -1,9 +1,11 @@
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::metrics::WatchMetricReason;
-use aruna_core::structs::{
-    NotificationClass, NotificationKind, NotificationRecord, WatchAuthorizationBinding,
-    WatchEventMask, WatchInterestEntry, WatchSubscription,
+use aruna_core::structs::execution::notification::{
+    NotificationClass, NotificationKind, NotificationRecord,
+};
+use aruna_core::structs::execution::notification_watch::{
+    WatchAuthorizationBinding, WatchEventMask, WatchInterestEntry, WatchSubscription,
 };
 use aruna_core::time::unix_timestamp_millis;
 use thiserror::Error;

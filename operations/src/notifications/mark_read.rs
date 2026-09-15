@@ -5,7 +5,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::inbox_update_entry;
-use aruna_core::structs::{
+use aruna_core::structs::execution::notification::{
     NotificationRecord, invert_timestamp_ms, notification_inbox_prefix, parse_inbox_key,
 };
 use aruna_core::types::{Effects, Key, KeySpace, Value};
@@ -279,7 +279,7 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::tests::notifications::{context_with_storage, seed, user};
     use aruna_core::keyspaces::NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE;
-    use aruna_core::structs::{NotificationClass, notification_inbox_key};
+    use aruna_core::structs::execution::notification::{NotificationClass, notification_inbox_key};
     use aruna_storage::storage::StorageHandle;
 
     fn record(recipient: UserId, created_at_ms: u64) -> NotificationRecord {

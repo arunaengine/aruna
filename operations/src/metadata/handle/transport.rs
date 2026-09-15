@@ -25,8 +25,8 @@ use crate::metadata::protocol::{
     read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
     write_message,
 };
-use crate::s3::search_buckets::BucketSearchHit;
-use crate::s3::search_objects::{ObjectKeyMatch, SearchNodePage};
+use crate::s3::bucket::search::BucketSearchHit;
+use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
 
 #[tracing::instrument(
     name = "metadata.remote.request",

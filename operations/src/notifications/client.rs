@@ -3,8 +3,9 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
-use aruna_core::structs::{
-    NotificationRecord, WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
+use aruna_core::structs::execution::notification::NotificationRecord;
+use aruna_core::structs::execution::notification_watch::{
+    WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
 };
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;

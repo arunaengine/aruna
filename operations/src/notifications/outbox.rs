@@ -4,7 +4,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
-use aruna_core::structs::{NotificationOutboxRecord, NotificationRecord};
+use aruna_core::structs::execution::notification::{NotificationOutboxRecord, NotificationRecord};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::TxnId;
 use aruna_storage::StorageHandle;
@@ -180,7 +180,7 @@ async fn restore_timer_with(
 mod tests {
     use super::*;
     use crate::tests::notifications::{record, temp_storage, user};
-    use aruna_core::structs::{NotificationClass, notification_outbox_key};
+    use aruna_core::structs::execution::notification::{NotificationClass, notification_outbox_key};
     use aruna_tasks::InboundTaskHandler;
     use async_trait::async_trait;
     use std::sync::Arc;

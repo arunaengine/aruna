@@ -4,7 +4,7 @@ use aruna_core::metadata::{
     MetadataGraphPolicy, MetadataQuadOp, MetadataRequestDurability, MetadataRoCratePage,
     MetadataSearchHit, MetadataValidationViolation, UpsertEntityRequest,
 };
-use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_storage::FjallPersistPolicy;
 use craqle::{
     ActorId, AllowAllAuthorizer, Batch, CraqleError, CraqleFjallPersistMode, CraqleNode,

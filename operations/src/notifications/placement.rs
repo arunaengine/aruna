@@ -1,9 +1,9 @@
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::{
-    DEFAULT_SHARD_COUNT, PlacementStrategy, RealmConfigDocument, WatchSubscription,
-};
+use aruna_core::structs::placement::placement_record::{DEFAULT_SHARD_COUNT, PlacementStrategy};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::execution::notification_watch::WatchSubscription;
 use ulid::Ulid;
 
 use crate::placement::{build_view, resolve_holders};
@@ -61,7 +61,7 @@ pub fn filter_local_subscriptions(
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::{RealmId, RealmNodeKind};
+    use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
     use std::collections::HashSet;
     use ulid::Ulid;
 

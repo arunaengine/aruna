@@ -6,7 +6,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::METADATA_UPDATED_INDEX_KEYSPACE;
 use aruna_core::shutdown::Shutdown;
 use aruna_core::storage_entries::{parse_updated_key, updated_index_key};
-use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::Key;
 use tracing::warn;
 use ulid::Ulid;
@@ -213,7 +213,11 @@ mod tests {
     use aruna_core::NodeId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, PlacementRef, RealmId};
+    use aruna_core::structs::storage::metadata_registry::{
+        MetadataAuditOperation, MetadataAuditRecord,
+    };
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::storage;
     use tempfile::tempdir;
 

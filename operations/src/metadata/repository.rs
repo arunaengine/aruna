@@ -20,7 +20,7 @@ pub use aruna_core::storage_entries::{
     materialization_status_key, metadata_document_key, metadata_registry_key,
     metadata_registry_prefix, registry_write_entries, shard_manifest_entry,
 };
-use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
+use aruna_core::structs::storage::metadata_registry::{MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -151,7 +151,7 @@ pub fn write_document_lifecycle(
 pub fn write_lifecycle_revision(
     record: &MetadataLifecycleRecord,
     delete_actor: NodeId,
-    placement: aruna_core::structs::PlacementRef,
+    placement: aruna_core::structs::placement::placement_record::PlacementRef,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     let mut writes = vec![
@@ -373,7 +373,9 @@ mod pure_tests {
     };
     use aruna_core::metadata::MetadataEventPayload;
     use aruna_core::storage_entries::{shard_manifest_key, sync_revision_key, updated_index_key};
-    use aruna_core::structs::{MetadataAuditOperation, PlacementRef, RealmId};
+    use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::identity::realm::RealmId;
 
     fn node(seed: u8) -> NodeId {
         NodeId::from_bytes(&[seed; 32]).expect("node id")

@@ -11,12 +11,18 @@ use aruna_core::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataQueryResults, MetadataSearchHit,
     ProfileValidationFinding, ProfileValidationStatus,
 };
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::{
-    Group, GroupAuthorizationDocument, MetadataRegistryRecord, NodeInfoDocument, PathClaimRecord,
-    PersistentIdFailure, PersistentIdMapping, PlacementPolicy, PlacementPolicyDocument,
-    PlacementPolicyRef, PlacementRef, SubmissionId, SyncListCursor, SyncPageLimit, SyncPullAck,
-    SyncRefusal, SyncRelationship, SyncVersionPage, VersionedObjectArn,
+    PathClaimRecord, PersistentIdFailure, PersistentIdMapping, SyncListCursor, SyncPageLimit,
+    SyncPullAck, SyncRefusal, SyncRelationship, SyncVersionPage,
 };
+use aruna_core::structs::placement::placement_policy::{PlacementPolicy, PlacementPolicyRef};
+use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::execution::job::SubmissionId;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
 use craqle::GraphReplicaSnapshot;
@@ -31,8 +37,8 @@ use crate::jobs::lifecycle::ingress::{SubmissionAck, SubmissionRefusal};
 use crate::metadata::api::{ReferenceNodeExecution, ReferenceNodeRequest, RoCrateExportView};
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::update_document::UpdateDocumentMutation;
-use crate::s3::search_buckets::BucketSearchHit;
-use crate::s3::search_objects::{ObjectKeyMatch, SearchNodePage};
+use crate::s3::bucket::search::BucketSearchHit;
+use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
 
 pub use aruna_core::metadata::{AuthToken, AuthTokenError};
 
@@ -53,7 +59,7 @@ pub struct MetadataPathCandidate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataPathWinner {
-    pub realm_id: aruna_core::structs::RealmId,
+    pub realm_id: aruna_core::structs::identity::realm::RealmId,
     pub group_id: GroupId,
     pub document_id: Ulid,
     pub document_path: String,
@@ -549,7 +555,7 @@ pub enum PersistentIdOutcome {
     /// The authority's mint job: its id is owned by the authority, and `created`
     /// is false for a caller that joined the job another submitter opened.
     Submission {
-        job_id: aruna_core::structs::JobId,
+        job_id: aruna_core::structs::execution::job::JobId,
         created: bool,
     },
 }
@@ -788,10 +794,11 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::audit::{AuditPageEntry, AuditPageRequest};
     use aruna_core::metadata::MAX_METADATA_BEARER_TOKEN_LEN;
-    use aruna_core::structs::{
-        AuthContext, MetadataAuditOperation, MetadataAuditRecord, PathRestriction, Permission,
-        RealmId,
+    use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+    use aruna_core::structs::storage::metadata_registry::{
+        MetadataAuditOperation, MetadataAuditRecord,
     };
+    use aruna_core::structs::identity::realm::RealmId;
     use tokio::sync::Semaphore;
 
     #[test]

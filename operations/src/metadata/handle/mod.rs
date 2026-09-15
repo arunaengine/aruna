@@ -10,7 +10,10 @@ use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::effects::StoragePriority;
 use aruna_core::events::Event;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, MetadataRoCratePage};
-use aruna_core::structs::{BucketInfo, MetadataRegistryRecord, RealmId, SyncRelationship};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::SyncRelationship;
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
@@ -43,7 +46,7 @@ use crate::auth::bearer_token::{
     ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_token_revoked,
 };
 use crate::driver::{DriverContext, drive};
-use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
+use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::sync::mirror_repair::RECONCILE_GRACE;
 
 mod effects;

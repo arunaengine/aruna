@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataQueryResults;
-use aruna_core::structs::{AuthContext, RealmId};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
 use lru::LruCache;
 
 use super::api::MetadataFanoutStats;

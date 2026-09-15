@@ -13,11 +13,15 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{METADATA_AUDIT_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE};
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
-use aruna_core::structs::{
-    MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, PersistentIdFailure,
-    PersistentIdMapping, PersistentIdRevision, PlacementRef, RealmConfigDocument, RealmId,
-    persistent_id_change, persistent_id_key, persistent_id_target,
+use aruna_core::structs::storage::metadata_registry::{
+    MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
 };
+use aruna_core::structs::{
+    PersistentIdFailure, PersistentIdMapping, PersistentIdRevision, persistent_id_change,
+    persistent_id_key, persistent_id_target,
+};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::TxnId;
 use byteview::ByteView;
 use thiserror::Error;
@@ -646,9 +650,12 @@ async fn schedule_drain(ctx: &DriverContext) {
 mod tests {
     use super::*;
     use aruna_core::storage_entries::registry_write_entries;
-    use aruna_core::structs::{
-        JobId, MetadataAuditRecord, MetadataRegistryRecord, PersistentIdStatus, RealmId,
+    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::storage::metadata_registry::{
+        MetadataAuditRecord, MetadataRegistryRecord,
     };
+    use aruna_core::structs::PersistentIdStatus;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::storage;
     use tempfile::tempdir;
 
@@ -920,7 +927,7 @@ mod tests {
     fn activated_config() -> RealmConfigDocument {
         let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
         config.seed_default_placement();
-        config.ensure_node(node(), aruna_core::structs::RealmNodeKind::Server);
+        config.ensure_node(node(), aruna_core::structs::identity::realm::RealmNodeKind::Server);
         config.snapshot_candidate_map();
         config
     }
@@ -944,7 +951,7 @@ mod tests {
         use aruna_core::StructuredId;
         let document_id = aruna_core::MetaResourceId::from_parts(
             13,
-            aruna_core::structured_id::PlacementHandle::new(aruna_core::structs::METADATA_HANDLE)
+            aruna_core::structured_id::PlacementHandle::new(aruna_core::structs::placement::placement_record::METADATA_HANDLE)
                 .unwrap(),
             aruna_core::structured_id::BucketId::new(3).unwrap(),
             13,

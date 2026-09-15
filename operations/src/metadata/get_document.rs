@@ -4,7 +4,7 @@ use aruna_core::metadata::{
     MaterializationState, MetadataDocumentView, MetadataEffect, MetadataError, MetadataEvent,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -218,7 +218,9 @@ mod tests {
     use aruna_core::handle::Handle;
     use aruna_core::metadata::{MaterializationState, MaterializationStatusRecord};
     use aruna_core::storage_entries::materialization_status_entry;
-    use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::storage::FjallStorage;
     use tempfile::tempdir;
     use ulid::Ulid;
