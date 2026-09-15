@@ -12,10 +12,10 @@ impl AdminDocumentState {
             AdminDocumentOperation::RealmRoleCreated { role } => {
                 self.apply_realm_role(event, &role.role_id, role_definition_value(role));
             }
-            AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id } => {
+            AdminDocumentOperation::RealmAssignmentAdded { role_id, user_id } => {
                 self.apply_realm_assignment(event, role_id, user_id, Some(user_id.to_string()));
             }
-            AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id } => {
+            AdminDocumentOperation::RealmAssignmentRemoved { role_id, user_id } => {
                 self.apply_realm_assignment(event, role_id, user_id, None);
             }
             _ => return Err(AdminDocumentError::UnsupportedTarget),

@@ -55,11 +55,11 @@ fn group_created_name() {
 
     assert_eq!(state.materialized_group_name(), None);
     assert_eq!(state.materialized_group_realm(), Some(realm_id));
-    assert!(!state.conflicts.contains_key(GROUP_REALM_ID_PATH));
+    assert!(!state.conflicts.contains_key(REALM_ID_PATH));
 
     let conflict = state
         .conflicts
-        .get(GROUP_DISPLAY_NAME_PATH)
+        .get(DISPLAY_NAME_PATH)
         .expect("display name conflict is recorded");
     assert_eq!(conflict.values.len(), 2);
     assert!(
@@ -118,7 +118,7 @@ fn concurrent_renames_conflict() {
     assert_eq!(state.materialized_group_name(), None);
     let conflict = state
         .conflicts
-        .get(GROUP_DISPLAY_NAME_PATH)
+        .get(DISPLAY_NAME_PATH)
         .expect("display name conflict is recorded");
     assert_eq!(conflict.values.len(), 2);
 }
@@ -143,11 +143,11 @@ fn group_created_id() {
         Some("Engineering")
     );
     assert_eq!(state.materialized_group_realm(), None);
-    assert!(!state.conflicts.contains_key(GROUP_DISPLAY_NAME_PATH));
+    assert!(!state.conflicts.contains_key(DISPLAY_NAME_PATH));
 
     let conflict = state
         .conflicts
-        .get(GROUP_REALM_ID_PATH)
+        .get(REALM_ID_PATH)
         .expect("realm id conflict is recorded");
     assert_eq!(conflict.values.len(), 2);
     assert!(

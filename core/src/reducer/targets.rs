@@ -46,7 +46,7 @@ impl AdminDocumentState {
         }
 
         self.user_subject_ids
-            .get(GROUP_DISPLAY_NAME_PATH)
+            .get(DISPLAY_NAME_PATH)
             .and_then(|version| version.value.clone())
     }
 
@@ -56,7 +56,7 @@ impl AdminDocumentState {
         }
 
         self.user_subject_ids
-            .get(GROUP_REALM_ID_PATH)
+            .get(REALM_ID_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(|value| RealmId::from_base64(value).ok())
     }
@@ -189,7 +189,7 @@ impl AdminDocumentState {
         }
 
         self.user_subject_ids
-            .get(REALM_CONFIG_METADATA_REPLICATION_PATH)
+            .get(METADATA_REPLICATION_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(decode_metadata_replication)
     }
@@ -200,7 +200,7 @@ impl AdminDocumentState {
         }
 
         self.user_subject_ids
-            .get(REALM_CONFIG_DISCOVERY_PATH)
+            .get(CONFIG_DISCOVERY_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(decode_realm_discovery)
     }
@@ -211,7 +211,7 @@ impl AdminDocumentState {
         }
 
         self.user_subject_ids
-            .get(REALM_CONFIG_DESCRIPTION_PATH)
+            .get(CONFIG_DESCRIPTION_PATH)
             .and_then(|version| version.value.clone())
     }
 
@@ -221,7 +221,7 @@ impl AdminDocumentState {
         }
 
         self.user_subject_ids
-            .get(REALM_CONFIG_POLICIES_PATH)
+            .get(CONFIG_POLICIES_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(policies_from_value)
     }
@@ -233,7 +233,7 @@ impl AdminDocumentState {
         }
 
         self.user_subject_ids
-            .get(REALM_CONFIG_COMPUTE_PATH)
+            .get(CONFIG_COMPUTE_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(compute_from_value)
     }
@@ -244,7 +244,7 @@ impl AdminDocumentState {
         }
 
         self.user_subject_ids
-            .get(REALM_CONFIG_QUOTA_PATH)
+            .get(CONFIG_QUOTA_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(quota_from_value)
     }
@@ -310,10 +310,10 @@ impl AdminDocumentState {
     ) {
         self.apply_group_field(
             event,
-            GROUP_DISPLAY_NAME_PATH,
+            DISPLAY_NAME_PATH,
             Some(display_name.to_string()),
         );
-        self.apply_group_field(event, GROUP_REALM_ID_PATH, Some(realm_id.to_string()));
+        self.apply_group_field(event, REALM_ID_PATH, Some(realm_id.to_string()));
         self.apply_group_field(event, GROUP_OWNER_PATH, Some(owner.to_string()));
     }
 
@@ -475,12 +475,12 @@ impl AdminDocumentState {
     ) {
         self.apply_config_setting(
             event,
-            REALM_CONFIG_METADATA_REPLICATION_PATH,
+            METADATA_REPLICATION_PATH,
             metadata_replication_value(metadata_replication),
         );
         self.apply_config_setting(
             event,
-            REALM_CONFIG_DISCOVERY_PATH,
+            CONFIG_DISCOVERY_PATH,
             realm_discovery_value(discovery),
         );
     }

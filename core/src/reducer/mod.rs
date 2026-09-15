@@ -19,7 +19,7 @@ use crate::admin_documents::{
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained, valid_token_hash};
 use crate::structs::identity::auth::Actor;
 use crate::structs::placement::placement_record::{
-    BandPool, BindingScope, DocumentClass, HandleRange, MAX_PLACEMENT_SHARD_COUNT,
+    BandPool, BindingScope, DocumentClass, HandleRange, MAX_SHARD_COUNT,
     NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementStrategy, StrategyBinding,
 };
 use crate::structs::placement::placement_transition::{
@@ -49,7 +49,7 @@ pub use paths::*;
 use paths::{event_observes_dot, operation_paths, role_definition_value};
 pub use placement::*;
 use placement::{candidate_map_value, transition_plan_value, transition_proof_value};
-pub use revocation::{MAX_LIVE_REVOCATIONS_PER_ORIGIN, revoked_token_entry, revoked_token_path};
+pub use revocation::{REVOCATIONS_PER_ORIGIN, revoked_token_entry, revoked_token_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminApplyStatus {
@@ -72,14 +72,14 @@ pub enum AdminDocumentError {
     #[error("placement labels must not set the derived label `{0}`")]
     ReservedPlacementLabel(String),
     #[error("placement strategy replica count must not be zero")]
-    ZeroPlacementReplicaCount,
+    ZeroReplicaCount,
     #[error(
         "placement strategy shard count must be a non-zero power of two no greater than {}",
-        MAX_PLACEMENT_SHARD_COUNT
+        MAX_SHARD_COUNT
     )]
-    InvalidPlacementShardCount,
+    InvalidShardCount,
     #[error("placement strategy shard count cannot be changed")]
-    PlacementShardCountChanged,
+    ShardCountChanged,
     #[error("placement handle range is malformed")]
     InvalidHandleRange,
     #[error("revoked bearer token hash is malformed")]
@@ -237,7 +237,7 @@ impl AdminDocumentState {
         if self.applied_event_ids.contains(&event.event_id) {
             return Ok(AdminApplyStatus::Duplicate);
         }
-        let AdminDocumentOperation::RealmConfigTokenRevoked {
+        let AdminDocumentOperation::ConfigTokenRevoked {
             token_hash,
             expires_at,
             token_owner,

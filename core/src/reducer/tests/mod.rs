@@ -1,8 +1,8 @@
 use super::{
     AdminApplyStatus, AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentError,
-    AdminDocumentState, GROUP_DISPLAY_NAME_PATH, GROUP_REALM_ID_PATH,
-    REALM_CONFIG_DEFAULT_STRATEGY_PATH, REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
-    REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH,
+    AdminDocumentState, DISPLAY_NAME_PATH, REALM_ID_PATH,
+    CONFIG_STRATEGY_PATH, CONFIG_DESCRIPTION_PATH, CONFIG_DISCOVERY_PATH,
+    METADATA_REPLICATION_PATH, CONFIG_QUOTA_PATH, USER_NAME_PATH,
     binding_scope_key, config_node_path, config_oidc_path, decode_node_kind, group_role_path,
     group_user_path, handle_range_path, metadata_replication_value, node_kind_value,
     oidc_provider_value, overlay_placement, parse_config_node, parse_config_oidc,
@@ -16,7 +16,7 @@ use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocume
 use crate::auth::REVOCATION_GRACE_SECS;
 use crate::structs::placement::placement_record::{
     AffinityEffect, AffinityRule, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HandleRange,
-    LabelMatch, MAX_PLACEMENT_SHARD_COUNT, NodePlacementEntry, PlacementBinding, PlacementOverride,
+    LabelMatch, MAX_SHARD_COUNT, NodePlacementEntry, PlacementBinding, PlacementOverride,
     PlacementScope, PlacementStrategy, StrategyBinding,
 };
 use crate::structs::placement::binding_directory::BindingError;
@@ -28,7 +28,7 @@ use crate::structs::identity::realm::{
     GroupQuotaOverride, MetadataReplicationConfig, QuotaConfig, RealmConfigDocument,
     RealmDiscoveryConfig, RealmNodeKind, UserCapOverride,
 };
-use crate::structs::storage::node_info::{KIND_LABEL_KEY, STORAGE_CLASS_LABEL_PREFIX};
+use crate::structs::storage::node_info::{KIND_LABEL_KEY, CLASS_LABEL_PREFIX};
 use crate::structured_id::PlacementHandle;
 use crate::user_validation::UserAttributeError;
 use crate::{NodeId, UserId};

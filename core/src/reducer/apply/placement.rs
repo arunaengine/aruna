@@ -7,7 +7,7 @@ impl AdminDocumentState {
         realm_id: &RealmId,
     ) -> Result<AdminApplyStatus, AdminDocumentError> {
         match &event.op {
-            AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
+            AdminDocumentOperation::NodePlacementSet { entry } => {
                 if let Some(label) = reserved_label(&entry.labels) {
                     return Err(AdminDocumentError::ReservedPlacementLabel(
                         label.to_string(),
@@ -19,25 +19,25 @@ impl AdminDocumentState {
                     Some(placement_entry_value(entry)),
                 );
             }
-            AdminDocumentOperation::RealmConfigNodePlacementRemoved { node_id } => {
+            AdminDocumentOperation::NodePlacementRemoved { node_id } => {
                 self.apply_placement_field(event, placement_node_path(node_id), None);
             }
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy } => {
+            AdminDocumentOperation::PlacementStrategyUpserted { strategy } => {
                 if strategy.replica_count == Some(0) {
-                    return Err(AdminDocumentError::ZeroPlacementReplicaCount);
+                    return Err(AdminDocumentError::ZeroReplicaCount);
                 }
                 if strategy.shard_count == 0
                     || !strategy.shard_count.is_power_of_two()
-                    || strategy.shard_count > MAX_PLACEMENT_SHARD_COUNT
+                    || strategy.shard_count > MAX_SHARD_COUNT
                 {
-                    return Err(AdminDocumentError::InvalidPlacementShardCount);
+                    return Err(AdminDocumentError::InvalidShardCount);
                 }
                 if self
                     .materialized_strategies()
                     .get(&strategy.strategy_id)
                     .is_some_and(|current| current.shard_count != strategy.shard_count)
                 {
-                    return Err(AdminDocumentError::PlacementShardCountChanged);
+                    return Err(AdminDocumentError::ShardCountChanged);
                 }
                 self.apply_placement_field(
                     event,
@@ -45,20 +45,20 @@ impl AdminDocumentState {
                     Some(placement_strategy_value(strategy)),
                 );
             }
-            AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id } => {
+            AdminDocumentOperation::PlacementStrategyRemoved { strategy_id } => {
                 if self.materialized_family_strategy() == Some(*strategy_id) {
                     return Err(AdminDocumentError::JobFamilyRemoved);
                 }
                 self.apply_placement_field(event, placement_strategy_path(strategy_id), None);
             }
-            AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id } => {
+            AdminDocumentOperation::ConfigStrategySet { strategy_id } => {
                 self.apply_config_setting(
                     event,
-                    REALM_CONFIG_DEFAULT_STRATEGY_PATH,
+                    CONFIG_STRATEGY_PATH,
                     strategy_id.to_string(),
                 );
             }
-            AdminDocumentOperation::RealmConfigJobFamilySet { strategy_id } => {
+            AdminDocumentOperation::JobFamilySet { strategy_id } => {
                 if strategy_id.is_nil() {
                     return Err(AdminDocumentError::NilJobFamily);
                 }
@@ -70,34 +70,34 @@ impl AdminDocumentState {
                 }
                 self.apply_config_setting(
                     event,
-                    REALM_CONFIG_JOB_FAMILY_PATH,
+                    JOB_FAMILY_PATH,
                     strategy_id.to_string(),
                 );
             }
-            AdminDocumentOperation::RealmConfigStrategyBindingSet { binding } => {
+            AdminDocumentOperation::StrategyBindingSet { binding } => {
                 self.apply_placement_field(
                     event,
                     strategy_binding_path(&binding.scope),
                     Some(strategy_binding_value(binding)),
                 );
             }
-            AdminDocumentOperation::RealmConfigStrategyBindingRemoved { scope } => {
+            AdminDocumentOperation::StrategyBindingRemoved { scope } => {
                 self.apply_placement_field(event, strategy_binding_path(scope), None);
             }
-            AdminDocumentOperation::RealmConfigPlacementOverrideSet { record } => {
+            AdminDocumentOperation::PlacementOverrideSet { record } => {
                 self.apply_placement_field(
                     event,
                     placement_override_path(&record.subject),
                     Some(placement_override_value(record)),
                 );
             }
-            AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { subject } => {
+            AdminDocumentOperation::PlacementOverrideRemoved { subject } => {
                 self.apply_placement_field(event, placement_override_path(subject), None);
             }
-            AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding } => {
+            AdminDocumentOperation::PlacementBindingAppended { binding } => {
                 self.apply_placement_binding(event, binding);
             }
-            AdminDocumentOperation::RealmConfigCandidateMapPublished { map } => {
+            AdminDocumentOperation::CandidateMapPublished { map } => {
                 // Epoch zero is reserved for "no map", and a map naming a node
                 // twice would make its selection weight ambiguous.
                 let mut seen = BTreeSet::new();
@@ -110,7 +110,7 @@ impl AdminDocumentState {
                     candidate_map_value(map),
                 );
             }
-            AdminDocumentOperation::RealmConfigActivationsInitialized {
+            AdminDocumentOperation::ConfigActivationsInitialized {
                 strategy_id,
                 candidate_map_epoch,
             } => {

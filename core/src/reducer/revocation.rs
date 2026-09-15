@@ -23,7 +23,7 @@ fn add_paths<T>(
     paths: &BTreeMap<String, T>,
     indexed: &mut BTreeMap<String, Option<RevocationPath>>,
 ) {
-    let prefix = format!("{REALM_CONFIG_REVOKED_TOKENS_PATH}.");
+    let prefix = format!("{REVOKED_TOKENS_PATH}.");
     for path in paths
         .range((Included(prefix.clone()), Unbounded))
         .map(|(path, _)| path)
@@ -473,13 +473,13 @@ impl AdminDocumentState {
     }
 }
 
-pub const MAX_LIVE_REVOCATIONS_PER_ORIGIN: usize = 1024;
+pub const REVOCATIONS_PER_ORIGIN: usize = 1024;
 pub fn revoked_token_path(token_hash: &str, expires_at: u64, token_owner: &UserId) -> String {
-    format!("{REALM_CONFIG_REVOKED_TOKENS_PATH}.{token_hash}.{expires_at}.{token_owner}")
+    format!("{REVOKED_TOKENS_PATH}.{token_hash}.{expires_at}.{token_owner}")
 }
 
 pub fn revoked_token_entry(path: &str) -> Option<(&str, u64, UserId)> {
-    let rest = path.strip_prefix(REALM_CONFIG_REVOKED_TOKENS_PATH)?;
+    let rest = path.strip_prefix(REVOKED_TOKENS_PATH)?;
     let mut parts = rest.strip_prefix('.')?.split('.');
     let hash = parts.next()?;
     let expires_at = parts.next()?.parse().ok()?;

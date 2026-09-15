@@ -21,16 +21,16 @@ impl AdminDocumentState {
             AdminDocumentOperation::GroupRoleRemoved { role_id } => {
                 self.remove_group_role(event, role_id);
             }
-            AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id } => {
+            AdminDocumentOperation::GroupAssignmentAdded { role_id, user_id } => {
                 self.apply_group_assignment(event, role_id, user_id, Some(user_id.to_string()));
             }
-            AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id } => {
+            AdminDocumentOperation::GroupAssignmentRemoved { role_id, user_id } => {
                 self.apply_group_assignment(event, role_id, user_id, None);
             }
-            AdminDocumentOperation::GroupDisplayNameSet { display_name } => {
+            AdminDocumentOperation::DisplayNameSet { display_name } => {
                 self.apply_group_field(
                     event,
-                    GROUP_DISPLAY_NAME_PATH,
+                    DISPLAY_NAME_PATH,
                     Some(display_name.to_string()),
                 );
             }

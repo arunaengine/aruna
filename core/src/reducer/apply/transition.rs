@@ -7,7 +7,7 @@ impl AdminDocumentState {
         realm_id: &RealmId,
     ) -> Result<AdminApplyStatus, AdminDocumentError> {
         match &event.op {
-            AdminDocumentOperation::RealmConfigTransitionStarted { plan } => {
+            AdminDocumentOperation::ConfigTransitionStarted { plan } => {
                 let mut seen = BTreeSet::new();
                 let well_formed = plan.limits.max_incomplete_buckets >= 1
                     && plan.target_map_epoch > 0
@@ -24,7 +24,7 @@ impl AdminDocumentState {
                     transition_plan_value(plan),
                 );
             }
-            AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            AdminDocumentOperation::TransitionBarrierReported {
                 transition_id,
                 bucket,
                 reported_by,
@@ -33,7 +33,7 @@ impl AdminDocumentState {
                 if *reported_by != event.origin_node_id {
                     return Err(AdminDocumentError::TransitionOriginMismatch);
                 }
-                if frontier.len() > crate::structs::placement::placement_transition::MAX_BARRIER_FRONTIER_BYTES {
+                if frontier.len() > crate::structs::placement::placement_transition::MAX_FRONTIER_BYTES {
                     return Err(AdminDocumentError::TransitionReportOversized);
                 }
                 self.apply_transition_report(
@@ -42,7 +42,7 @@ impl AdminDocumentState {
                     hex::encode(frontier),
                 );
             }
-            AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            AdminDocumentOperation::TransitionProofSubmitted {
                 transition_id,
                 strategy_id,
                 proof,
@@ -66,19 +66,19 @@ impl AdminDocumentState {
                     transition_proof_value(&strategy_id, proof),
                 );
             }
-            AdminDocumentOperation::RealmConfigTransitionAborted { transition_id } => {
+            AdminDocumentOperation::ConfigTransitionAborted { transition_id } => {
                 self.apply_immutable_value(
                     event,
                     transition_abort_path(transition_id),
                     true.to_string(),
                 );
             }
-            AdminDocumentOperation::RealmConfigTransitionBucketForced {
+            AdminDocumentOperation::TransitionBucketForced {
                 transition_id,
                 bucket,
                 at_risk_report,
             } => {
-                if at_risk_report.len() > crate::structs::placement::placement_transition::MAX_STALL_REASON_BYTES {
+                if at_risk_report.len() > crate::structs::placement::placement_transition::MAX_STALL_BYTES {
                     return Err(AdminDocumentError::TransitionReportOversized);
                 }
                 self.apply_transition_report(
@@ -87,7 +87,7 @@ impl AdminDocumentState {
                     at_risk_report.clone(),
                 );
             }
-            AdminDocumentOperation::RealmConfigTransitionStallReported {
+            AdminDocumentOperation::TransitionStallReported {
                 transition_id,
                 bucket,
                 reported_by,
@@ -96,7 +96,7 @@ impl AdminDocumentState {
                 if *reported_by != event.origin_node_id {
                     return Err(AdminDocumentError::TransitionOriginMismatch);
                 }
-                if reason.len() > crate::structs::placement::placement_transition::MAX_STALL_REASON_BYTES {
+                if reason.len() > crate::structs::placement::placement_transition::MAX_STALL_BYTES {
                     return Err(AdminDocumentError::TransitionReportOversized);
                 }
                 self.apply_transition_report(
@@ -105,7 +105,7 @@ impl AdminDocumentState {
                     reason.clone(),
                 );
             }
-            AdminDocumentOperation::RealmConfigTransitionDrainReported {
+            AdminDocumentOperation::TransitionDrainReported {
                 transition_id,
                 bucket,
                 reported_by,
@@ -119,13 +119,13 @@ impl AdminDocumentState {
                     true.to_string(),
                 );
             }
-            AdminDocumentOperation::RealmConfigHandleRangeGranted { range } => {
+            AdminDocumentOperation::HandleRangeGranted { range } => {
                 if !range.is_well_formed() {
                     return Err(AdminDocumentError::InvalidHandleRange);
                 }
                 self.apply_handle_range(event, range);
             }
-            AdminDocumentOperation::RealmConfigBandPoolAssigned { pool } => {
+            AdminDocumentOperation::BandPoolAssigned { pool } => {
                 if !pool.is_well_formed() {
                     return Err(AdminDocumentError::InvalidHandleRange);
                 }

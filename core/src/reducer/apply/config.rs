@@ -7,43 +7,43 @@ impl AdminDocumentState {
         realm_id: &RealmId,
     ) -> Result<AdminApplyStatus, AdminDocumentError> {
         match &event.op {
-            AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind } => {
+            AdminDocumentOperation::ConfigNodeEnsured { node_id, kind } => {
                 self.apply_config_node(event, node_id, Some(node_kind_value(kind)));
             }
-            AdminDocumentOperation::RealmConfigNodeRemoved { node_id } => {
+            AdminDocumentOperation::ConfigNodeRemoved { node_id } => {
                 self.apply_config_node(event, node_id, None);
             }
-            AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider } => {
+            AdminDocumentOperation::OidcProviderUpserted { provider } => {
                 self.apply_oidc_provider(event, &provider.id, Some(oidc_provider_value(provider)));
             }
-            AdminDocumentOperation::RealmConfigOidcProviderRemoved { provider_id } => {
+            AdminDocumentOperation::OidcProviderRemoved { provider_id } => {
                 self.apply_oidc_provider(event, provider_id, None);
             }
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication,
                 discovery,
             } => self.apply_config_settings(event, metadata_replication, discovery),
-            AdminDocumentOperation::RealmConfigDescriptionSet { description } => {
+            AdminDocumentOperation::ConfigDescriptionSet { description } => {
                 self.apply_config_setting(
                     event,
-                    REALM_CONFIG_DESCRIPTION_PATH,
+                    CONFIG_DESCRIPTION_PATH,
                     description.clone(),
                 );
             }
-            AdminDocumentOperation::RealmConfigQuotaSet { quota } => {
-                self.apply_config_setting(event, REALM_CONFIG_QUOTA_PATH, quota_value(quota));
+            AdminDocumentOperation::ConfigQuotaSet { quota } => {
+                self.apply_config_setting(event, CONFIG_QUOTA_PATH, quota_value(quota));
             }
-            AdminDocumentOperation::RealmConfigComputeSet { compute } => {
-                self.apply_config_setting(event, REALM_CONFIG_COMPUTE_PATH, compute_value(compute));
+            AdminDocumentOperation::ConfigComputeSet { compute } => {
+                self.apply_config_setting(event, CONFIG_COMPUTE_PATH, compute_value(compute));
             }
-            AdminDocumentOperation::RealmConfigPoliciesSet { policies } => {
+            AdminDocumentOperation::ConfigPoliciesSet { policies } => {
                 self.apply_config_setting(
                     event,
-                    REALM_CONFIG_POLICIES_PATH,
+                    CONFIG_POLICIES_PATH,
                     policies_value(policies),
                 );
             }
-            AdminDocumentOperation::RealmConfigTokenRevoked {
+            AdminDocumentOperation::ConfigTokenRevoked {
                 token_hash,
                 expires_at,
                 token_owner,

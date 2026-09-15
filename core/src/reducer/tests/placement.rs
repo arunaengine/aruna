@@ -43,7 +43,7 @@ pub(super) fn set_placement_entry(
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigNodePlacementSet { entry },
+        AdminDocumentOperation::NodePlacementSet { entry },
     )
 }
 
@@ -59,7 +59,7 @@ pub(super) fn upsert_placement_strategy(
             node(origin_seed),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            AdminDocumentOperation::PlacementStrategyUpserted {
                 strategy: placement_strategy(strategy_id, Some(3)),
             },
         ))
@@ -83,7 +83,7 @@ pub(super) fn admin_document_trip() {
     assert_eq!(parse_placement_strategy(&strategy_path), Some(strategy_id));
 
     assert_eq!(
-        REALM_CONFIG_DEFAULT_STRATEGY_PATH,
+        CONFIG_STRATEGY_PATH,
         "realm_config.placement.default_strategy"
     );
     assert_eq!(
@@ -200,19 +200,19 @@ fn realm_config_deterministically() {
     let mut state = realm_config_state();
     let actor = actor(node(1));
     for op in [
-        AdminDocumentOperation::RealmConfigNodePlacementSet {
+        AdminDocumentOperation::NodePlacementSet {
             entry: owned_entry.clone(),
         },
-        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+        AdminDocumentOperation::PlacementStrategyUpserted {
             strategy: owned_strategy.clone(),
         },
-        AdminDocumentOperation::RealmConfigDefaultStrategySet {
+        AdminDocumentOperation::ConfigStrategySet {
             strategy_id: owned_strategy.strategy_id,
         },
-        AdminDocumentOperation::RealmConfigStrategyBindingSet {
+        AdminDocumentOperation::StrategyBindingSet {
             binding: owned_binding.clone(),
         },
-        AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+        AdminDocumentOperation::PlacementOverrideSet {
             record: owned_override.clone(),
         },
     ] {
@@ -352,7 +352,7 @@ fn equal_concurrent_frontier() {
         origin_a,
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigNodePlacementSet {
+        AdminDocumentOperation::NodePlacementSet {
             entry: placement_entry(config_node, 100),
         },
     );
@@ -361,7 +361,7 @@ fn equal_concurrent_frontier() {
         origin_b,
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigNodePlacementSet {
+        AdminDocumentOperation::NodePlacementSet {
             entry: placement_entry(config_node, 100),
         },
     );
@@ -370,7 +370,7 @@ fn equal_concurrent_frontier() {
         origin_a,
         2,
         AdminDocumentClock::default().with_observed(origin_a, 1),
-        AdminDocumentOperation::RealmConfigNodePlacementSet {
+        AdminDocumentOperation::NodePlacementSet {
             entry: placement_entry(config_node, 250),
         },
     );
@@ -424,7 +424,7 @@ fn observed_realm_entry() {
         set_origin,
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigNodePlacementSet {
+        AdminDocumentOperation::NodePlacementSet {
             entry: placement_entry(config_node, 100),
         },
     );
@@ -433,7 +433,7 @@ fn observed_realm_entry() {
         node(2),
         1,
         AdminDocumentClock::default().with_observed(set_origin, 1),
-        AdminDocumentOperation::RealmConfigNodePlacementRemoved {
+        AdminDocumentOperation::NodePlacementRemoved {
             node_id: config_node,
         },
     );
@@ -450,7 +450,7 @@ fn rejects_derived_labels() {
     // Both the kind label and any storage class are stamped by the node.
     for key in [
         KIND_LABEL_KEY.to_string(),
-        format!("{STORAGE_CLASS_LABEL_PREFIX}cold"),
+        format!("{CLASS_LABEL_PREFIX}cold"),
     ] {
         let mut state = realm_config_state();
         let before = state.clone();
@@ -477,7 +477,7 @@ fn realm_placement_materializes() {
             node(1),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            AdminDocumentOperation::PlacementStrategyUpserted {
                 strategy: strategy.clone(),
             },
         ))
@@ -505,7 +505,7 @@ fn strategy_shards_immutable() {
             origin,
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy: initial },
+            AdminDocumentOperation::PlacementStrategyUpserted { strategy: initial },
         )),
         Ok(AdminApplyStatus::Applied)
     );
@@ -515,7 +515,7 @@ fn strategy_shards_immutable() {
             origin,
             2,
             AdminDocumentClock::default().with_observed(origin, 1),
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            AdminDocumentOperation::PlacementStrategyUpserted {
                 strategy: renamed.clone(),
             },
         )),
@@ -531,9 +531,9 @@ fn strategy_shards_immutable() {
             origin,
             3,
             AdminDocumentClock::default().with_observed(origin, 2),
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy: changed },
+            AdminDocumentOperation::PlacementStrategyUpserted { strategy: changed },
         )),
-        Err(AdminDocumentError::PlacementShardCountChanged)
+        Err(AdminDocumentError::ShardCountChanged)
     );
     assert_eq!(state, before);
 }
@@ -549,11 +549,11 @@ fn realm_config_count() {
             node(1),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            AdminDocumentOperation::PlacementStrategyUpserted {
                 strategy: placement_strategy(Ulid::from_bytes([4; 16]), Some(0)),
             },
         )),
-        Err(AdminDocumentError::ZeroPlacementReplicaCount)
+        Err(AdminDocumentError::ZeroReplicaCount)
     );
     assert_eq!(state, before);
 }
@@ -563,7 +563,7 @@ fn realm_placement_count() {
     let mut state = realm_config_state();
     let strategy_id = Ulid::from_bytes([4; 16]);
     let mut strategy = placement_strategy(strategy_id, Some(3));
-    strategy.shard_count = MAX_PLACEMENT_SHARD_COUNT;
+    strategy.shard_count = MAX_SHARD_COUNT;
 
     state
         .apply(&realm_config_event(
@@ -571,7 +571,7 @@ fn realm_placement_count() {
             node(1),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            AdminDocumentOperation::PlacementStrategyUpserted {
                 strategy: strategy.clone(),
             },
         ))
@@ -589,7 +589,7 @@ fn realm_config_max() {
     let mut state = realm_config_state();
     let before = state.clone();
     let mut strategy = placement_strategy(Ulid::from_bytes([4; 16]), Some(3));
-    strategy.shard_count = MAX_PLACEMENT_SHARD_COUNT * 2;
+    strategy.shard_count = MAX_SHARD_COUNT * 2;
 
     assert_eq!(
         state.apply(&realm_config_event(
@@ -597,9 +597,9 @@ fn realm_config_max() {
             node(1),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy },
+            AdminDocumentOperation::PlacementStrategyUpserted { strategy },
         )),
-        Err(AdminDocumentError::InvalidPlacementShardCount)
+        Err(AdminDocumentError::InvalidShardCount)
     );
     assert_eq!(state, before);
 }
@@ -618,9 +618,9 @@ fn realm_strategy_count() {
                 node(1),
                 1,
                 AdminDocumentClock::default(),
-                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy },
+                AdminDocumentOperation::PlacementStrategyUpserted { strategy },
             )),
-            Err(AdminDocumentError::InvalidPlacementShardCount),
+            Err(AdminDocumentError::InvalidShardCount),
             "shard_count {bad} must be rejected"
         );
         assert_eq!(state, before);
@@ -639,7 +639,7 @@ fn realm_default_materializes() {
             node(1),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+            AdminDocumentOperation::ConfigStrategySet { strategy_id },
         ))
         .unwrap();
 
@@ -660,14 +660,14 @@ fn family_survives_rebuild() {
             node(1),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigJobFamilySet { strategy_id },
+            AdminDocumentOperation::JobFamilySet { strategy_id },
         ))
         .unwrap();
 
     assert_eq!(state.materialized_family_strategy(), Some(strategy_id));
     let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
     overlay_placement(&mut config, &state, 0);
-    assert_eq!(config.job_family_strategy_id, strategy_id);
+    assert_eq!(config.family_strategy_id, strategy_id);
     assert!(config.strategy(&strategy_id).is_some());
 }
 
@@ -682,7 +682,7 @@ fn rejects_family_mutation() {
             node(1),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigJobFamilySet {
+            AdminDocumentOperation::JobFamilySet {
                 strategy_id: Ulid::nil()
             },
         )),
@@ -694,7 +694,7 @@ fn rejects_family_mutation() {
             node(1),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigJobFamilySet { strategy_id },
+            AdminDocumentOperation::JobFamilySet { strategy_id },
         ))
         .unwrap();
     let stored = state.clone();
@@ -705,7 +705,7 @@ fn rejects_family_mutation() {
             node(1),
             2,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigJobFamilySet {
+            AdminDocumentOperation::JobFamilySet {
                 strategy_id: Ulid::from_bytes([5; 16])
             },
         )),
@@ -717,7 +717,7 @@ fn rejects_family_mutation() {
             node(1),
             2,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id },
+            AdminDocumentOperation::PlacementStrategyRemoved { strategy_id },
         )),
         Err(AdminDocumentError::JobFamilyRemoved)
     );
@@ -730,14 +730,14 @@ fn concurrent_realm_independent() {
     let fallback_strategy_id = Ulid::from_bytes([3; 16]);
     let subject = b"document-subject".to_vec();
     let reference_ops = vec![
-        AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
-        AdminDocumentOperation::RealmConfigStrategyBindingSet {
+        AdminDocumentOperation::ConfigStrategySet { strategy_id },
+        AdminDocumentOperation::StrategyBindingSet {
             binding: StrategyBinding {
                 scope: BindingScope::MetadataPathPrefix("datasets".to_string()),
                 strategy_id,
             },
         },
-        AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+        AdminDocumentOperation::PlacementOverrideSet {
             record: PlacementOverride {
                 subject,
                 pinned: vec![node(4)],
@@ -758,7 +758,7 @@ fn concurrent_realm_independent() {
             node(seed + 1),
             1,
             observed_strategy.clone(),
-            AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id },
+            AdminDocumentOperation::PlacementStrategyRemoved { strategy_id },
         );
         let reference = realm_config_event(
             seed + 2,
@@ -809,8 +809,8 @@ fn concurrent_realm_independent() {
         assert_realm_live(&remove_first_config);
 
         match &reference_op {
-            AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => {}
-            AdminDocumentOperation::RealmConfigStrategyBindingSet { binding } => assert!(
+            AdminDocumentOperation::ConfigStrategySet { .. } => {}
+            AdminDocumentOperation::StrategyBindingSet { binding } => assert!(
                 remove_first_config
                     .strategy_bindings
                     .iter()
@@ -819,7 +819,7 @@ fn concurrent_realm_independent() {
                             && materialized.strategy_id == fallback_strategy_id
                     })
             ),
-            AdminDocumentOperation::RealmConfigPlacementOverrideSet { record } => {
+            AdminDocumentOperation::PlacementOverrideSet { record } => {
                 let materialized = remove_first_config
                     .placement_overrides
                     .iter()
@@ -837,7 +837,7 @@ fn concurrent_realm_independent() {
             node(seed + 3),
             1,
             AdminDocumentClock::default().with_observed(removal.origin_node_id, 1),
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            AdminDocumentOperation::PlacementStrategyUpserted {
                 strategy: placement_strategy(strategy_id, Some(3)),
             },
         );
@@ -846,10 +846,10 @@ fn concurrent_realm_independent() {
         assert!(remove_first_config.strategy(&strategy_id).is_some());
         assert_realm_live(&remove_first_config);
         match reference_op {
-            AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => {
+            AdminDocumentOperation::ConfigStrategySet { .. } => {
                 assert_eq!(remove_first_config.default_strategy_id, Some(strategy_id))
             }
-            AdminDocumentOperation::RealmConfigStrategyBindingSet { binding } => assert!(
+            AdminDocumentOperation::StrategyBindingSet { binding } => assert!(
                 remove_first_config
                     .strategy_bindings
                     .iter()
@@ -858,7 +858,7 @@ fn concurrent_realm_independent() {
                             && materialized.strategy_id == strategy_id
                     })
             ),
-            AdminDocumentOperation::RealmConfigPlacementOverrideSet { record } => assert!(
+            AdminDocumentOperation::PlacementOverrideSet { record } => assert!(
                 remove_first_config
                     .placement_overrides
                     .iter()
@@ -909,7 +909,7 @@ fn realm_config_removes() {
         set_origin,
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigStrategyBindingSet {
+        AdminDocumentOperation::StrategyBindingSet {
             binding: binding.clone(),
         },
     );
@@ -926,7 +926,7 @@ fn realm_config_removes() {
         node(2),
         1,
         AdminDocumentClock::default().with_observed(set_origin, 1),
-        AdminDocumentOperation::RealmConfigStrategyBindingRemoved { scope },
+        AdminDocumentOperation::StrategyBindingRemoved { scope },
     );
     state.apply(&removal).unwrap();
     assert!(state.materialized_strategy_bindings().is_empty());
@@ -955,7 +955,7 @@ fn realm_config_key() {
         set_origin,
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigStrategyBindingSet { binding },
+        AdminDocumentOperation::StrategyBindingSet { binding },
     );
 
     state.apply(&set).unwrap();
@@ -975,7 +975,7 @@ fn realm_config_key() {
         node(2),
         1,
         AdminDocumentClock::default().with_observed(set_origin, 1),
-        AdminDocumentOperation::RealmConfigStrategyBindingRemoved {
+        AdminDocumentOperation::StrategyBindingRemoved {
             scope: BindingScope::MetadataPathPrefix(" datasets/ ".to_string()),
         },
     );
@@ -1005,7 +1005,7 @@ fn realm_override_materializes() {
             node(1),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+            AdminDocumentOperation::PlacementOverrideSet {
                 record: record.clone(),
             },
         ))
@@ -1027,7 +1027,7 @@ fn realm_config_removed(event_seed: u8, subject: Vec<u8>) -> AdminDocumentEvent 
         node(2),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { subject },
+        AdminDocumentOperation::PlacementOverrideRemoved { subject },
     )
 }
 
@@ -1040,7 +1040,7 @@ fn placement_op_target() {
         node(1),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigDefaultStrategySet {
+        AdminDocumentOperation::ConfigStrategySet {
             strategy_id: Ulid::from_bytes([4; 16]),
         },
     );
@@ -1074,7 +1074,7 @@ fn append_placement_binding(
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding },
+        AdminDocumentOperation::PlacementBindingAppended { binding },
     )
 }
 
@@ -1093,7 +1093,7 @@ fn grant_handle_range(event_seed: u8, origin_seed: u8, range: HandleRange) -> Ad
         node(origin_seed),
         1,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigHandleRangeGranted { range },
+        AdminDocumentOperation::HandleRangeGranted { range },
     )
 }
 
@@ -1189,7 +1189,7 @@ fn binding_conflicts_converge() {
         node(1),
         2,
         AdminDocumentClock::default().with_observed(node(1), 1),
-        AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+        AdminDocumentOperation::PlacementBindingAppended {
             binding: placement_binding(7, 2),
         },
     );
@@ -1276,7 +1276,7 @@ fn binding_reappend_idempotent() {
         node(2),
         1,
         AdminDocumentClock::default().with_observed(origin, 1),
-        AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+        AdminDocumentOperation::PlacementBindingAppended {
             binding: binding.clone(),
         },
     );
@@ -1344,7 +1344,7 @@ fn denial_preserves_state() {
             node(1),
             1,
             AdminDocumentClock::default(),
-            AdminDocumentOperation::RealmConfigJobFamilySet {
+            AdminDocumentOperation::JobFamilySet {
                 strategy_id: accepted,
             },
         ))
@@ -1356,7 +1356,7 @@ fn denial_preserves_state() {
         node(1),
         2,
         AdminDocumentClock::default(),
-        AdminDocumentOperation::RealmConfigJobFamilySet {
+        AdminDocumentOperation::JobFamilySet {
             strategy_id: Ulid::from_bytes([0xde; 16]),
         },
     );
@@ -1385,7 +1385,7 @@ proptest::proptest! {
                 node(1),
                 index as u64 + 1,
                 AdminDocumentClock::default(),
-                AdminDocumentOperation::RealmConfigJobFamilySet {
+                AdminDocumentOperation::JobFamilySet {
                     strategy_id: Ulid::from_bytes(raw.to_be_bytes()),
                 },
             );

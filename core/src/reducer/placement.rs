@@ -9,10 +9,10 @@ pub fn overlay_placement(
 ) {
     if reducer_state
         .user_subject_ids
-        .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
+        .contains_key(CONFIG_STRATEGY_PATH)
         || reducer_state
             .conflicts
-            .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
+            .contains_key(CONFIG_STRATEGY_PATH)
     {
         config.default_strategy_id = reducer_state.materialized_default_strategy();
     }
@@ -20,7 +20,7 @@ pub fn overlay_placement(
     // The stored family strategy is immutable, so a materialized value always
     // wins and an absent one never clears what the document already carries.
     if let Some(strategy_id) = reducer_state.materialized_family_strategy() {
-        config.job_family_strategy_id = strategy_id;
+        config.family_strategy_id = strategy_id;
     }
 
     let materialized_placement_map = reducer_state.materialized_placement_map();
@@ -473,7 +473,7 @@ impl AdminDocumentState {
         }
 
         self.user_subject_ids
-            .get(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
+            .get(CONFIG_STRATEGY_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(|value| Ulid::from_string(value).ok())
     }
@@ -486,7 +486,7 @@ impl AdminDocumentState {
         }
 
         self.user_subject_ids
-            .get(REALM_CONFIG_JOB_FAMILY_PATH)
+            .get(JOB_FAMILY_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(|value| Ulid::from_string(value).ok())
             .filter(|strategy_id| !strategy_id.is_nil())

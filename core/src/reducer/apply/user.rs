@@ -7,10 +7,10 @@ impl AdminDocumentState {
     ) -> Result<AdminApplyStatus, AdminDocumentError> {
         match &event.op {
             AdminDocumentOperation::UserNameSet { name } => self.apply_user_name(event, name),
-            AdminDocumentOperation::UserSubjectIdAdded { subject_id } => {
+            AdminDocumentOperation::SubjectIdAdded { subject_id } => {
                 self.apply_user_subject(event, subject_id, Some(subject_id.clone()));
             }
-            AdminDocumentOperation::UserSubjectIdRemoved { subject_id } => {
+            AdminDocumentOperation::SubjectIdRemoved { subject_id } => {
                 self.apply_user_subject(event, subject_id, None);
             }
             AdminDocumentOperation::UserAttributeSet { key, value } => {
