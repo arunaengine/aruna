@@ -2,9 +2,9 @@
 #![recursion_limit = "256"]
 mod shared;
 
-use aruna_api::routes::credentials::CreateS3PathRestriction;
-use aruna_api::routes::groups::AddGroupMemberRequest;
-use aruna_api::routes::info::{RealmGroupQuotaOverride, RealmInfoResponse, RealmQuotaConfig};
+use aruna_api::routes::credentials::CreatePathRestriction;
+use aruna_api::routes::groups::AddMemberRequest;
+use aruna_api::routes::info::{RealmInfoResponse, RealmQuotaConfig, RealmQuotaOverride};
 use aruna_api::routes::sync::{
     ApiReferenceHandling, ApiSyncMode, CreateSyncRequest, SyncDetailResponse,
     SyncRelationshipResponse, SyncSourceRequest, SyncTargetRequest,
@@ -23,7 +23,7 @@ use aruna_core::structs::{
     VersionKey, group_permission_path, sync_relationship_key,
 };
 use aruna_operations::driver::DriverContext;
-use aruna_operations::replication::queue::{LiveReplicationObligationRecord, live_obligation_key};
+use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -163,7 +163,7 @@ impl ReplicationHarness {
 
     async fn create_seed_client(
         &self,
-        path_restrictions: Vec<CreateS3PathRestriction>,
+        path_restrictions: Vec<CreatePathRestriction>,
     ) -> TestResult<S3Client> {
         let seed_s3 = self
             .seed
@@ -271,7 +271,7 @@ impl ReplicationHarness {
                 self.seed.base_url, self.group_id
             ))
             .bearer_auth(&self.seed_token)
-            .json(&AddGroupMemberRequest {
+            .json(&AddMemberRequest {
                 user_id: user_id.to_string(),
                 role_ids: None,
             })
@@ -1045,7 +1045,7 @@ async fn quota_surfaces_failure() -> TestResult<()> {
             default_group_quota_bytes: None,
             grace_factor_percent: 100,
             warn_threshold_percent: 85,
-            group_overrides: vec![RealmGroupQuotaOverride {
+            group_overrides: vec![RealmQuotaOverride {
                 group_id: harness.group_id.clone(),
                 quota_bytes: Some(1),
                 grace_factor_percent: Some(100),
@@ -1621,7 +1621,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
             .await?;
 
         let scoped_client = harness
-            .create_seed_client(vec![CreateS3PathRestriction {
+            .create_seed_client(vec![CreatePathRestriction {
                 pattern: format!("{bucket}/scoped/**"),
                 permission: "WRITE".to_string(),
             }])
@@ -1643,7 +1643,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
             harness.group_id.parse()?,
             harness.seed.net.node_id(),
         );
-        let record = LiveReplicationObligationRecord::new(
+        let record = LiveObligationRecord::new(
             harness.seed.net.node_id(),
             AuthContext {
                 user_id: harness.seed.user_id,
@@ -1719,7 +1719,7 @@ async fn scoped_replication_paths() -> TestResult<()> {
             .await?;
 
         let scoped_client = harness
-            .create_seed_client(vec![CreateS3PathRestriction {
+            .create_seed_client(vec![CreatePathRestriction {
                 pattern: format!("{bucket}/scoped/**"),
                 permission: "WRITE".to_string(),
             }])

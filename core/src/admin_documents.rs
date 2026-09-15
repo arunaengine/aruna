@@ -61,13 +61,13 @@ pub enum AdminDocumentTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdminDocumentRoleDefinition {
+pub struct AdminRoleDefinition {
     pub role_id: RoleId,
     pub name: String,
     pub permissions: BTreeMap<String, Permission>,
 }
 
-impl From<&Role> for AdminDocumentRoleDefinition {
+impl From<&Role> for AdminRoleDefinition {
     fn from(role: &Role) -> Self {
         Self {
             role_id: role.role_id,
@@ -81,7 +81,7 @@ impl From<&Role> for AdminDocumentRoleDefinition {
     }
 }
 
-impl From<Role> for AdminDocumentRoleDefinition {
+impl From<Role> for AdminRoleDefinition {
     fn from(role: Role) -> Self {
         Self::from(&role)
     }
@@ -128,13 +128,13 @@ pub enum AdminDocumentOperation {
         user_id: UserId,
     },
     GroupRoleCreated {
-        role: AdminDocumentRoleDefinition,
+        role: AdminRoleDefinition,
     },
     GroupRoleRemoved {
         role_id: RoleId,
     },
     RealmRoleCreated {
-        role: AdminDocumentRoleDefinition,
+        role: AdminRoleDefinition,
     },
     RealmConfigNodeEnsured {
         node_id: NodeId,
@@ -305,7 +305,7 @@ pub enum AdminDocumentOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget};
+    use super::{AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition};
     use crate::NodeId;
     use crate::UserId;
     use crate::structs::{
@@ -335,8 +335,8 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    fn role_definition(role_id: RoleId) -> AdminDocumentRoleDefinition {
-        AdminDocumentRoleDefinition {
+    fn role_definition(role_id: RoleId) -> AdminRoleDefinition {
+        AdminRoleDefinition {
             role_id,
             name: "admin".to_string(),
             permissions: BTreeMap::from([("/dataset/**".to_string(), Permission::READ)]),

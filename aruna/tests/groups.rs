@@ -3,7 +3,7 @@
 mod shared;
 
 use aruna_api::routes::groups::{
-    AddGroupMemberRequest, CreateGroupRoleRequest, GroupInfoResponse, GroupMembersResponse,
+    AddMemberRequest, CreateRoleRequest, GroupInfoResponse, GroupMembersResponse,
     GroupRolesResponse, RoleResponse,
 };
 use aruna_core::UserId;
@@ -48,7 +48,7 @@ async fn membership_invite_leave() -> TestResult<()> {
             seed.base_url, group.group_id
         ))
         .bearer_auth(&admin_token)
-        .json(&AddGroupMemberRequest {
+        .json(&AddMemberRequest {
             user_id: everyone.to_string(),
             role_ids: None,
         })
@@ -76,7 +76,7 @@ async fn membership_invite_leave() -> TestResult<()> {
             seed.base_url, group.group_id
         ))
         .bearer_auth(&admin_token)
-        .json(&AddGroupMemberRequest {
+        .json(&AddMemberRequest {
             user_id: member_id.to_string(),
             role_ids: None,
         })
@@ -151,7 +151,7 @@ async fn roles_reject_foreign() -> TestResult<()> {
             seed.base_url
         ))
         .bearer_auth(&admin_token)
-        .json(&CreateGroupRoleRequest {
+        .json(&CreateRoleRequest {
             name: "escalation".to_string(),
             permissions: HashMap::from([(format!("/{realm_id}/admin/**"), "write".to_string())]),
             assigned_users: Vec::new(),
@@ -168,7 +168,7 @@ async fn roles_reject_foreign() -> TestResult<()> {
                 seed.base_url
             ))
             .bearer_auth(&admin_token)
-            .json(&CreateGroupRoleRequest {
+            .json(&CreateRoleRequest {
                 name: format!("public-{permission}"),
                 permissions: HashMap::from([(
                     format!("/{realm_id}/g/{group_id}/data/**"),
@@ -188,7 +188,7 @@ async fn roles_reject_foreign() -> TestResult<()> {
             seed.base_url
         ))
         .bearer_auth(&admin_token)
-        .json(&CreateGroupRoleRequest {
+        .json(&CreateRoleRequest {
             name: "nil-assigned-user".to_string(),
             permissions: HashMap::from([(
                 format!("/{realm_id}/g/{group_id}/data/**"),
@@ -208,7 +208,7 @@ async fn roles_reject_foreign() -> TestResult<()> {
             seed.base_url
         ))
         .bearer_auth(&admin_token)
-        .json(&CreateGroupRoleRequest {
+        .json(&CreateRoleRequest {
             name: "data-reader".to_string(),
             permissions: HashMap::from([(
                 format!("/{realm_id}/g/{group_id}/data/**"),

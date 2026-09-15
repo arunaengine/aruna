@@ -2,7 +2,7 @@
 #![recursion_limit = "256"]
 mod shared;
 
-use aruna_api::routes::credentials::CreateS3PathRestriction;
+use aruna_api::routes::credentials::CreatePathRestriction;
 use aruna_core::structs::{Permission, group_permission_path};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -251,7 +251,7 @@ async fn delete_authorizes_entries() -> TestResult<()> {
             &seed.base_url,
             &admin_token,
             &group.group_id,
-            Some(vec![CreateS3PathRestriction {
+            Some(vec![CreatePathRestriction {
                 pattern: format!("{group_root}/{bucket}/scoped/**"),
                 permission: Permission::WRITE.to_string(),
             }]),

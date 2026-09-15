@@ -1,6 +1,6 @@
 use crate::server_state::ServerState;
 use aruna_operations::driver::drive;
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
@@ -157,7 +157,7 @@ impl PortalSecurity {
         }
 
         match drive(
-            GetRealmConfigOperation::new(self.state.get_realm_id()),
+            GetConfigOperation::new(self.state.get_realm_id()),
             &self.state.get_ctx(),
         )
         .await

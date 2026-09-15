@@ -104,10 +104,9 @@ pub struct MonitoringState {
     metrics: Arc<NodeMetrics>,
     readiness: Readiness,
     recovery: RecoveryStatus,
-    /// The queue-lag sampler owner. Cancel and completion are held together, so
-    /// no caller can stop sampling without the sampler having released its
-    /// driver context. Taken out exactly once by [`Self::stop_queue_refresher`];
-    /// the ops HTTP task stays separate and keeps serving through the drain.
+    /// The queue-lag sampler owner: cancel and completion are held together, so
+    /// stopping it always releases its driver context; taken out exactly once by
+    /// [`Self::stop_queue_refresher`]. The ops HTTP task drains separately.
     queue_refresher: tokio::sync::Mutex<Option<QueueRefresher>>,
 }
 
@@ -960,7 +959,7 @@ mod tests {
     // The owner cancels and joins in one step and reports a clean completion
     // rather than dropping the task on the floor.
     #[tokio::test(start_paused = true)]
-    async fn refresher_stop_observes_completion() {
+    async fn refresher_stop_completes() {
         let metrics = NodeMetrics::new();
         let queue_metrics = register_queue_metrics(&metrics).await;
         let refresher = spawn_queue_refresher(
@@ -975,7 +974,7 @@ mod tests {
     // A sampler blocked in a storage probe must still be cancelled and joined,
     // and stopping consumes the owner so a later close cannot race it.
     #[tokio::test(start_paused = true)]
-    async fn stop_awaits_an_in_flight_sample() {
+    async fn stop_awaits_sample() {
         let (storage, receivers) = StorageHandle::new();
         let state = MonitoringState::new(
             ctx_with_storage(storage),

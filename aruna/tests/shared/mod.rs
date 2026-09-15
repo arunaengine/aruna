@@ -9,9 +9,7 @@ use aruna::identity::{mark_onboarding_phase, mark_state_complete};
 use aruna::settings::read_settings_from;
 use aruna_api::cors::CorsConfig;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
-use aruna_api::routes::credentials::{
-    CreateS3CredentialsRequest, CreateS3CredentialsResponse, CreateS3PathRestriction,
-};
+use aruna_api::routes::credentials::{CreatePathRestriction, CreateS3Request, CreateS3Response};
 use aruna_api::routes::groups::{CreateGroupRequest, CreateGroupResponse, GroupInfoResponse};
 use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
 use aruna_api::server::{Server, ServerConfig};
@@ -22,7 +20,7 @@ use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::{
-    CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode, OnboardingPhase,
+    CreateSecretRequest, CreateSecretResponse, OnboardingMode, OnboardingPhase,
 };
 use aruna_core::structs::{
     Actor, ArunaArn, Backend, BackendConfig, BlobTimeoutConfig, ManagedCopyQuarantine,
@@ -35,16 +33,14 @@ use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::node::node_info::seed_info_document;
 use aruna_operations::placement::policy::{SubjectScanMode, sync_subject};
 use aruna_operations::realm::announce_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::realm::claim_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-};
+use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
-use aruna_operations::s3::get_access::GetUserAccessOperation;
-use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::realm::get_nodes::GetNodesOperation;
+use aruna_operations::s3::get_access::GetAccessOperation;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use aws_sdk_s3::Client as S3Client;
@@ -99,7 +95,7 @@ enum NodeServiceMode {
 }
 
 #[derive(Clone, Debug)]
-struct FullNodeStorageConfig {
+struct FullStorageConfig {
     metadata_storage_path: String,
     blob_root: String,
     blob_bucket_prefix: Option<String>,
@@ -108,7 +104,7 @@ struct FullNodeStorageConfig {
     blob_timeouts: BlobTimeoutConfig,
 }
 
-impl FullNodeStorageConfig {
+impl FullStorageConfig {
     fn for_temp_dir(temp_dir: &TempDir) -> Self {
         let root = temp_dir.path();
         Self {
@@ -279,7 +275,7 @@ pub(crate) async fn wait_realm_nodes(
         Duration::from_millis(100),
         || async {
             for context in contexts {
-                match drive(GetRealmNodesOperation::new(*realm_id), context).await {
+                match drive(GetNodesOperation::new(*realm_id), context).await {
                     Ok(nodes) if nodes.len() == expected => {}
                     _ => return false,
                 }
@@ -349,11 +345,7 @@ pub(crate) async fn get_user_access(
     context: &DriverContext,
     access_key_id: &str,
 ) -> TestResult<UserAccess> {
-    let access = drive(
-        GetUserAccessOperation::new(access_key_id.to_string()),
-        context,
-    )
-    .await?;
+    let access = drive(GetAccessOperation::new(access_key_id.to_string()), context).await?;
 
     Ok(access)
 }
@@ -437,7 +429,7 @@ pub(crate) async fn create_restricted_credentials(
     base_url: &str,
     bearer_token: &str,
     group_id: &str,
-    path_restrictions: Option<Vec<CreateS3PathRestriction>>,
+    path_restrictions: Option<Vec<CreatePathRestriction>>,
 ) -> TestResult<S3Credentials> {
     wait_group_http(base_url, bearer_token, group_id).await?;
 
@@ -448,7 +440,7 @@ pub(crate) async fn create_restricted_credentials(
         let response = client
             .post(format!("{base_url}/api/v1/access/credentials"))
             .bearer_auth(bearer_token)
-            .json(&CreateS3CredentialsRequest {
+            .json(&CreateS3Request {
                 group_id: group_id.to_string(),
                 expires_in_seconds: Some(600),
                 path_restrictions: path_restrictions.clone(),
@@ -456,7 +448,7 @@ pub(crate) async fn create_restricted_credentials(
             .send()
             .await?;
         if response.status() == StatusCode::CREATED {
-            let response: CreateS3CredentialsResponse = response.json().await?;
+            let response: CreateS3Response = response.json().await?;
             return Ok(S3Credentials {
                 access_key_id: response.access_key_id,
                 access_secret: response.access_secret,
@@ -577,7 +569,7 @@ pub(crate) async fn create_onboarding_secret(
             seed.base_url
         ))
         .bearer_auth(token)
-        .json(&CreateOnboardingSecretRequest {
+        .json(&CreateSecretRequest {
             seed_url: seed.base_url.clone(),
             mode: mode.into(),
             expires_in_seconds: Some(600),
@@ -591,7 +583,7 @@ pub(crate) async fn create_onboarding_secret(
         ))
         .into());
     }
-    let response: CreateOnboardingSecretResponse = response.json().await?;
+    let response: CreateSecretResponse = response.json().await?;
     Ok(response.onboarding_secret)
 }
 
@@ -636,7 +628,7 @@ async fn spawn_seed_mode(
     )
     .await?;
     let full_storage_config =
-        (mode == NodeServiceMode::Full).then(|| FullNodeStorageConfig::for_temp_dir(&temp_dir));
+        (mode == NodeServiceMode::Full).then(|| FullStorageConfig::for_temp_dir(&temp_dir));
     let compute_enabled = compute.is_some();
     let context =
         initialize_context(storage, net.clone(), full_storage_config.as_ref(), compute).await?;
@@ -692,7 +684,7 @@ async fn spawn_seed_mode(
     )
     .await;
     drive(
-        ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+        ClaimInitialOperation::new(ClaimInitialInput {
             actor: Actor {
                 node_id: net.node_id(),
                 user_id,
@@ -768,7 +760,7 @@ async fn spawn_joiner_mode(
     )
     .await?;
     let full_storage_config =
-        (mode == NodeServiceMode::Full).then(|| FullNodeStorageConfig::from_config(&config));
+        (mode == NodeServiceMode::Full).then(|| FullStorageConfig::from_config(&config));
     let joiner_context = initialize_context(
         storage_handle,
         joiner_net.clone(),
@@ -878,7 +870,7 @@ async fn spawn_joiner_mode(
 async fn initialize_context(
     storage_handle: StorageHandle,
     net: NetHandle,
-    full_storage_config: Option<&FullNodeStorageConfig>,
+    full_storage_config: Option<&FullStorageConfig>,
     compute: Option<Arc<ExecutorRegistry>>,
 ) -> TestResult<Arc<DriverContext>> {
     let task_handle = TaskHandle::new();
@@ -915,9 +907,9 @@ async fn initialize_context(
         task_handle: Some(task_handle.clone()),
         compute_handle: compute,
     });
-    initialize_net_incoming_for_tests(context.clone());
+    initialize_incoming_fixture(context.clone());
     let shutdown = aruna_core::shutdown::Shutdown::new();
-    install_and_start_task_queues(
+    start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -933,7 +925,7 @@ async fn announce_realm_presence(
     node_id: iroh::PublicKey,
 ) -> TestResult<()> {
     drive(
-        AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+        AnnouncePresenceOperation::new(AnnouncePresenceConfig {
             realm_id: *realm_id,
             node_id,
             schedule_refresh: true,
