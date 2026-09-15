@@ -10,7 +10,7 @@ use crate::tests::staging::setup_driver_context;
 use aruna_blob::blob::{BlobHandle, BlobHandler};
 use aruna_core::UserId;
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, PATHS_INDEX_KEYSPACE,
     REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -759,7 +759,7 @@ async fn remote_read_ephemeral() {
         BLOB_HEAD_KEYSPACE,
         BLOB_LOCATIONS_KEYSPACE,
         BLOB_VERSIONS_KEYSPACE,
-        HASH_PATHS_INDEX_KEYSPACE,
+        PATHS_INDEX_KEYSPACE,
     ];
     for key_space in key_spaces {
         assert_eq!(keyspace_len(client.driver.as_ref(), key_space).await, 0);
@@ -1033,7 +1033,7 @@ async fn denies_foreign_alias() {
         node.driver
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
+                key_space: PATHS_INDEX_KEYSPACE.to_string(),
                 key: alias.to_bytes().unwrap().into(),
                 value: Vec::new().into(),
                 txn_id: None,
@@ -1436,15 +1436,15 @@ fn reports_context_overrides() {
 
     assert_eq!(document["@graph"][0]["hasPart"], "preserved");
     assert_eq!(
-        document["@graph"][0][SCHEMA_SUBJECT_HTTPS_IRI]["@id"],
+        document["@graph"][0][SUBJECT_HTTPS_IRI]["@id"],
         "#aruna-export-report"
     );
     assert_eq!(
-        document["@graph"][0][SCHEMA_HAS_PART_HTTPS_IRI]["@id"],
+        document["@graph"][0][PART_HTTPS_IRI]["@id"],
         REPORT_PATH
     );
     assert_eq!(
-        document["@graph"][2][SCHEMA_ENCODING_HTTPS_IRI],
+        document["@graph"][2][ENCODING_HTTPS_IRI],
         "application/json"
     );
 }

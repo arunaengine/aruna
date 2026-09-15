@@ -6,7 +6,7 @@ use aruna_core::compute::ExecutionTargetId;
 use aruna_core::effects::{FetchCursor, PageLimit};
 use aruna_core::id::NodeId;
 use aruna_core::jobs::JobStatusView;
-use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE};
+use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, PLAN_EXPLAIN_KEYSPACE};
 use aruna_core::scheduling::{PlanCandidate, PlannedInput};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::execution::job::{
@@ -177,7 +177,7 @@ pub async fn family_report(
 async fn sibling_families(context: &DriverContext, family: JobFamilyId) -> u32 {
     let Ok((rows, _)) = iter_prefix_page(
         &context.storage_handle,
-        JOB_FAMILY_RECORD_KEYSPACE,
+        FAMILY_RECORD_KEYSPACE,
         Some(submission_prefix(family.submission_id)),
         None,
         MAX_SIBLING_SCAN,
@@ -258,7 +258,7 @@ async fn plan_estimate(context: &DriverContext, family: JobFamilyId) -> Option<P
 async fn stored_plan(context: &DriverContext, family: JobFamilyId) -> Option<PlanEstimate> {
     let (rows, _) = iter_prefix_page(
         &context.storage_handle,
-        JOB_PLAN_EXPLAIN_KEYSPACE,
+        PLAN_EXPLAIN_KEYSPACE,
         Some(Key::from(family.to_bytes().as_slice())),
         None,
         MAX_EXPLAIN_ROWS,
@@ -326,7 +326,7 @@ async fn launched_plan(context: &DriverContext, family: JobFamilyId) -> Option<P
 
 /// Records one audit page may return. The transport clamps to this before it
 /// reaches the record store, so a caller cannot ask for an unbounded page.
-pub const MAX_AUDIT_PAGE: usize = aruna_core::effects::MAX_JOB_RECORD_PAGE;
+pub const MAX_AUDIT_PAGE: usize = aruna_core::effects::MAX_RECORD_PAGE;
 
 /// Why one audit request could not be paged. Both are caller mistakes, so they
 /// map to a bad request rather than to an availability answer.

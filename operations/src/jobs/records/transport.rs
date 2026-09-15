@@ -157,7 +157,7 @@ async fn fetch_records(
     };
     let deadline = tokio::time::Instant::now() + deadline;
     for holder in holders {
-        let message = MetadataTransportMessage::ForwardJobRecordPage {
+        let message = MetadataTransportMessage::ForwardRecordPage {
             placement: request.placement,
             submission_id: request.submission_id,
             request_digest: request.request_digest,
@@ -174,7 +174,7 @@ async fn fetch_records(
                 Err(_) => break,
             };
         match reply {
-            MetadataTransportMessage::ForwardedJobRecordPage {
+            MetadataTransportMessage::ForwardedRecordPage {
                 result: Ok(JobPageReply { page, next }),
             } => {
                 return JobRecordEvent::Fetched {
@@ -183,7 +183,7 @@ async fn fetch_records(
                     next_cursor: next,
                 };
             }
-            MetadataTransportMessage::ForwardedJobRecordPage {
+            MetadataTransportMessage::ForwardedRecordPage {
                 result: Err(reason),
             } => {
                 warn!(peer = %holder, reason = ?reason, "Job record holder refused the fetch");
@@ -272,7 +272,7 @@ pub async fn serve_job_record(
                 Err(ServeError::Unavailable) => MetadataTransportMessage::ForwardedWriteUnavailable,
             }
         }
-        MetadataTransportMessage::ForwardJobRecordPage {
+        MetadataTransportMessage::ForwardRecordPage {
             placement,
             submission_id,
             request_digest,
@@ -287,9 +287,9 @@ pub async fn serve_job_record(
                 limit,
             };
             match serve_page(context, peer, request).await {
-                Ok(reply) => MetadataTransportMessage::ForwardedJobRecordPage { result: Ok(reply) },
+                Ok(reply) => MetadataTransportMessage::ForwardedRecordPage { result: Ok(reply) },
                 Err(ServeError::Refused(reason)) => {
-                    MetadataTransportMessage::ForwardedJobRecordPage {
+                    MetadataTransportMessage::ForwardedRecordPage {
                         result: Err(reason),
                     }
                 }

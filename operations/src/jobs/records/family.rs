@@ -5,7 +5,7 @@
 use std::future::Future;
 
 use aruna_core::errors::ConversionError;
-use aruna_core::keyspaces::JOB_FAMILY_RECORD_KEYSPACE;
+use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind,
 };
@@ -73,7 +73,7 @@ async fn stored_page(
 ) -> Result<RecordPage, String> {
     iter_prefix_page(
         &context.storage_handle,
-        JOB_FAMILY_RECORD_KEYSPACE,
+        FAMILY_RECORD_KEYSPACE,
         Some(prefix),
         cursor,
         RECORD_PAGE_SIZE,

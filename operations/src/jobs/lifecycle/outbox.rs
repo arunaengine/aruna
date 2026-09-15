@@ -5,13 +5,13 @@
 use std::time::Duration;
 
 use aruna_core::effects::{
-    Effect, HolderList, JobRecordEffect, JobRecordFrame, MAX_JOB_RECORD_HOLDERS, NetEffect,
+    Effect, HolderList, JobRecordEffect, JobRecordFrame, MAX_RECORD_HOLDERS, NetEffect,
     StorageEffect,
 };
 use aruna_core::events::{Event, JobRecordEvent, NetEvent, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE, NODE_STATE_KEYSPACE,
+    FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, NODE_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{JobRecordEnvelope, JobRecordKey};
@@ -44,7 +44,7 @@ const OUTBOX_CURSOR_KEY: &[u8] = b"job_family_outbox_cursor";
 /// Kicks the outbox drain without persisting a timer of its own.
 pub fn schedule_outbox_drain(after: Duration) -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainJobFamilyOutbox,
+        key: TaskKey::DrainFamilyOutbox,
         after,
     })
 }
@@ -109,7 +109,7 @@ impl PublishRecordOperation {
     fn clear(&mut self) -> Effects {
         self.state = PublishState::Clear;
         smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: JOB_FAMILY_OUTBOX_KEYSPACE.to_string(),
+            key_space: FAMILY_OUTBOX_KEYSPACE.to_string(),
             key: record_key(&self.config.key),
             txn_id: None,
         })]
@@ -128,7 +128,7 @@ impl PublishRecordOperation {
             }
             pending.push(holder);
             last_index = Some(index);
-            if pending.len() == MAX_JOB_RECORD_HOLDERS {
+            if pending.len() == MAX_RECORD_HOLDERS {
                 break;
             }
         }
@@ -162,7 +162,7 @@ impl PublishRecordOperation {
         })?;
         self.state = PublishState::Store;
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: JOB_FAMILY_OUTBOX_KEYSPACE.to_string(),
+            key_space: FAMILY_OUTBOX_KEYSPACE.to_string(),
             key: record_key(&self.config.key),
             value: value.into(),
             txn_id: None,
@@ -189,7 +189,7 @@ impl Operation for PublishRecordOperation {
     fn start(&mut self) -> Effects {
         self.state = PublishState::Read;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_FAMILY_OUTBOX_KEYSPACE.to_string(),
+            key_space: FAMILY_OUTBOX_KEYSPACE.to_string(),
             key: record_key(&self.config.key),
             txn_id: None,
         })]
@@ -351,7 +351,7 @@ pub async fn drain_family_outbox(context: &DriverContext) -> bool {
     };
     let (entries, next_cursor) = match iter_prefix_page(
         &context.storage_handle,
-        JOB_FAMILY_OUTBOX_KEYSPACE,
+        FAMILY_OUTBOX_KEYSPACE,
         None,
         start_after,
         OUTBOX_DRAIN_BATCH,
@@ -406,7 +406,7 @@ pub async fn drain_family_outbox(context: &DriverContext) -> bool {
     }
     match iter_prefix_page(
         &context.storage_handle,
-        JOB_FAMILY_OUTBOX_KEYSPACE,
+        FAMILY_OUTBOX_KEYSPACE,
         None,
         None,
         1,
@@ -475,7 +475,7 @@ async fn clear_entry(context: &DriverContext, key: Key) -> bool {
         context
             .storage_handle
             .send_storage_effect(StorageEffect::Delete {
-                key_space: JOB_FAMILY_OUTBOX_KEYSPACE.to_string(),
+                key_space: FAMILY_OUTBOX_KEYSPACE.to_string(),
                 key,
                 txn_id: None,
             })
@@ -488,7 +488,7 @@ async fn read_record(context: &DriverContext, key: &Key) -> Option<JobRecordFram
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
             key: key.clone(),
             txn_id: None,
         })
@@ -595,7 +595,7 @@ mod tests {
         else {
             panic!("expected publish effect")
         };
-        assert_eq!(offered.as_slice(), &holders[..MAX_JOB_RECORD_HOLDERS]);
+        assert_eq!(offered.as_slice(), &holders[..MAX_RECORD_HOLDERS]);
         let effects = first.step(Event::Net(NetEvent::JobRecord(
             JobRecordEvent::Unavailable("unreachable".to_string()),
         )));
@@ -604,7 +604,7 @@ mod tests {
         };
         let entry = from_bytes::<OutboxEntry>(value).expect("outbox entry decodes");
         assert!(entry.delivered.is_empty());
-        assert_eq!(entry.next_holder as usize, MAX_JOB_RECORD_HOLDERS);
+        assert_eq!(entry.next_holder as usize, MAX_RECORD_HOLDERS);
 
         let mut second = PublishRecordOperation::new(config);
         let _ = second.start();
@@ -622,8 +622,8 @@ mod tests {
             panic!("expected publish effect")
         };
         assert_eq!(
-            &offered.as_slice()[..holders.len() - MAX_JOB_RECORD_HOLDERS],
-            &holders[MAX_JOB_RECORD_HOLDERS..]
+            &offered.as_slice()[..holders.len() - MAX_RECORD_HOLDERS],
+            &holders[MAX_RECORD_HOLDERS..]
         );
     }
 
@@ -647,7 +647,7 @@ mod tests {
             assert!(matches!(
                 storage
                     .send_storage_effect(StorageEffect::Write {
-                        key_space: JOB_FAMILY_OUTBOX_KEYSPACE.to_string(),
+                        key_space: FAMILY_OUTBOX_KEYSPACE.to_string(),
                         key: key.clone(),
                         value: Value::from(b"queued".to_vec()),
                         txn_id: None,
@@ -659,7 +659,7 @@ mod tests {
 
         let (page, next) = iter_prefix_page(
             &context.storage_handle,
-            JOB_FAMILY_OUTBOX_KEYSPACE,
+            FAMILY_OUTBOX_KEYSPACE,
             None,
             read_outbox_cursor(&context).await.expect("cursor read"),
             1,
@@ -674,7 +674,7 @@ mod tests {
 
         let (page, next) = iter_prefix_page(
             &context.storage_handle,
-            JOB_FAMILY_OUTBOX_KEYSPACE,
+            FAMILY_OUTBOX_KEYSPACE,
             None,
             read_outbox_cursor(&context).await.expect("cursor read"),
             1,

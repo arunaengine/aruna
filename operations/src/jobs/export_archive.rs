@@ -141,12 +141,12 @@ pub(super) fn recognize_entities(
             {
                 files.insert(subject);
             }
-            SCHEMA_CONTENT_IRI | SCHEMA_CONTENT_HTTPS_IRI => {
+            SCHEMA_CONTENT_IRI | CONTENT_HTTPS_IRI => {
                 if let Some(value) = term_value(&quad.object) {
                     content_urls.entry(subject).or_default().push(value);
                 }
             }
-            LOCAL_PATH_IRI | LOCAL_PATH_HTTP_IRI => {
+            LOCAL_PATH_IRI | PATH_HTTP_IRI => {
                 if let Some(value) = term_value(&quad.object) {
                     local_paths.entry(subject).or_default().push(value);
                 }
@@ -277,7 +277,7 @@ pub(super) fn raw_local_path(
 ) -> Option<String> {
     object.iter().find_map(|(key, value)| {
         keywords
-            .expands_to(key, &["localPath", LOCAL_PATH_IRI, LOCAL_PATH_HTTP_IRI])
+            .expands_to(key, &["localPath", LOCAL_PATH_IRI, PATH_HTTP_IRI])
             .then(|| match value {
                 JsonValue::String(value) => Some(value.clone()),
                 JsonValue::Array(values) => values
@@ -688,10 +688,10 @@ pub(super) fn add_report(document: &mut JsonValue) -> Result<(), ExportFailure> 
             "subjectOf",
             "schema:subjectOf",
             SCHEMA_SUBJECT_IRI,
-            SCHEMA_SUBJECT_HTTPS_IRI,
+            SUBJECT_HTTPS_IRI,
         ],
         "subjectOf",
-        SCHEMA_SUBJECT_HTTPS_IRI,
+        SUBJECT_HTTPS_IRI,
     );
     match root.get_mut(&subject_key) {
         Some(JsonValue::Array(values)) => values.push(json!({"@id": "#aruna-export-report"})),
@@ -709,11 +709,11 @@ pub(super) fn add_report(document: &mut JsonValue) -> Result<(), ExportFailure> 
         &[
             "hasPart",
             "schema:hasPart",
-            SCHEMA_HAS_PART_IRI,
-            SCHEMA_HAS_PART_HTTPS_IRI,
+            SCHEMA_PART_IRI,
+            PART_HTTPS_IRI,
         ],
         "hasPart",
-        SCHEMA_HAS_PART_HTTPS_IRI,
+        PART_HTTPS_IRI,
     );
     match root.get_mut(&part_key) {
         Some(JsonValue::Array(values)) => values.push(json!({"@id": REPORT_PATH})),
@@ -730,34 +730,34 @@ pub(super) fn add_report(document: &mut JsonValue) -> Result<(), ExportFailure> 
         "encodingFormat",
         &[
             SCHEMA_ENCODING_IRI,
-            SCHEMA_ENCODING_HTTPS_IRI,
+            ENCODING_HTTPS_IRI,
             "schema:encodingFormat",
         ],
-        SCHEMA_ENCODING_HTTPS_IRI,
+        ENCODING_HTTPS_IRI,
     );
     let about_key = safe_term(
         &keywords,
         "about",
-        &[SCHEMA_ABOUT_IRI, SCHEMA_ABOUT_HTTPS_IRI, "schema:about"],
-        SCHEMA_ABOUT_HTTPS_IRI,
+        &[SCHEMA_ABOUT_IRI, ABOUT_HTTPS_IRI, "schema:about"],
+        ABOUT_HTTPS_IRI,
     );
     let name_key = safe_term(
         &keywords,
         "name",
-        &[SCHEMA_NAME_IRI, SCHEMA_NAME_HTTPS_IRI, "schema:name"],
-        SCHEMA_NAME_HTTPS_IRI,
+        &[SCHEMA_NAME_IRI, NAME_HTTPS_IRI, "schema:name"],
+        NAME_HTTPS_IRI,
     );
     let file_type = if keywords.term_matches(
         "File",
         &[
             SCHEMA_MEDIA_IRI,
-            SCHEMA_MEDIA_HTTPS_IRI,
+            MEDIA_HTTPS_IRI,
             "schema:MediaObject",
         ],
     ) {
         "File"
     } else {
-        SCHEMA_MEDIA_HTTPS_IRI
+        MEDIA_HTTPS_IRI
     };
     graph.push(JsonValue::Object(serde_json::Map::from_iter([
         ("@id".to_string(), json!(REPORT_PATH)),
@@ -789,7 +789,7 @@ pub(super) fn report_root_id(graph: &[JsonValue], keywords: &JsonLdKeywords) -> 
                         "about",
                         "schema:about",
                         SCHEMA_ABOUT_IRI,
-                        SCHEMA_ABOUT_HTTPS_IRI,
+                        ABOUT_HTTPS_IRI,
                     ],
                 )
                 .then(|| reference_id(value, keywords).map(str::to_string))
@@ -1232,7 +1232,7 @@ pub(super) async fn read_export_checkpoint(
 ) -> Result<Option<ExportCheckpoint>, String> {
     read_state(
         &ctx.driver.storage_handle,
-        ROCRATE_JOB_STATE_KEYSPACE,
+        JOB_STATE_KEYSPACE,
         ByteView::from(job_id.to_bytes().to_vec()),
         "export checkpoint",
     )
@@ -1247,7 +1247,7 @@ pub(super) async fn persist_checkpoint(
         &ctx.driver.storage_handle,
         ctx.job_id,
         ctx.claim_token,
-        ROCRATE_JOB_STATE_KEYSPACE,
+        JOB_STATE_KEYSPACE,
         ByteView::from(ctx.job_id.to_bytes().to_vec()),
         checkpoint,
     )

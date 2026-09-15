@@ -36,7 +36,7 @@ pub(crate) use aruna_core::jobs::{
 };
 
 const JOB_IO_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_JOB_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum JobRouteError {
@@ -645,7 +645,7 @@ async fn reservation_matches(
 
 async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<(), String> {
     let bytes = postcard::to_allocvec(value).map_err(|error| error.to_string())?;
-    if bytes.len() > MAX_JOB_FRAME_SIZE {
+    if bytes.len() > MAX_FRAME_SIZE {
         return Err("job-control frame exceeds maximum size".to_string());
     }
     send.write_all(&(bytes.len() as u32).to_be_bytes())
@@ -663,7 +663,7 @@ async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, Str
         .await
         .map_err(|error| error.to_string())?;
     let length = u32::from_be_bytes(length) as usize;
-    if length > MAX_JOB_FRAME_SIZE {
+    if length > MAX_FRAME_SIZE {
         return Err("job-control frame exceeds maximum size".to_string());
     }
     let mut bytes = vec![0u8; length];

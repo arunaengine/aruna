@@ -15,7 +15,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, LaunchDecline, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    JOB_FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE, NODE_INFO_KEYSPACE,
+    FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE, NODE_INFO_KEYSPACE,
 };
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
@@ -92,7 +92,7 @@ async fn wakeups(fired: &mut mpsc::UnboundedReceiver<TaskKey>) -> HashSet<TaskKe
 
 /// Replication of the receipt and the start of the execution.
 fn both_wakeups() -> HashSet<TaskKey> {
-    HashSet::from([TaskKey::DrainJobFamilyOutbox, TaskKey::DrainJobQueue])
+    HashSet::from([TaskKey::DrainFamilyOutbox, TaskKey::DrainJobQueue])
 }
 
 /// A receipt for this launch id storing different content. The row is written
@@ -104,7 +104,7 @@ async fn seed_receipt(ctx: &DriverContext, family: &Family, launch: &LaunchInten
     let event = ctx
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
             key: record_key(&envelope.key()),
             value: Value::from(to_bytes(&envelope).expect("record encodes").as_slice()),
             txn_id: None,
@@ -226,7 +226,7 @@ async fn cancellation_read_required() {
             let event = driver
                 .storage_handle
                 .send_effect(Effect::Storage(StorageEffect::Write {
-                    key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+                    key_space: FAMILY_RECORD_KEYSPACE.to_string(),
                     key,
                     value: Value::from([0xffu8; 16].as_slice()),
                     txn_id: None,

@@ -2,7 +2,7 @@
 
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::JOB_FAMILY_RECORD_KEYSPACE;
+use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
 use aruna_core::structs::execution::job::{
     ExecutionReceipt, JobFamilyRecord, JobRecordKey, JobRecordKind, LogicalJobSpec,
 };
@@ -80,7 +80,7 @@ async fn poison(ctx: &DriverContext, family: &Family) {
     let event = ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
             key,
             value: Value::from([0xffu8; 16].as_slice()),
             txn_id: None,

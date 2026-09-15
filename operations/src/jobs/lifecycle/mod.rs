@@ -88,7 +88,7 @@ mod tests;
 pub async fn restore_lifecycle_timers(storage: &StorageHandle, task_handle: &TaskHandle) {
     let pending = crate::jobs::store::iter_prefix_page(
         storage,
-        aruna_core::keyspaces::JOB_WITNESS_DEADLINE_KEYSPACE,
+        aruna_core::keyspaces::WITNESS_DEADLINE_KEYSPACE,
         None,
         None,
         1,

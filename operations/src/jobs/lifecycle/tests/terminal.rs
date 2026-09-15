@@ -129,7 +129,7 @@ pub(super) async fn reserve_execution(
     record.claim = Some(JobClaim {
         holder_node_id: family.target.public(),
         claim_token: TOKEN,
-        lease_expires_at_ms: 100_000,
+        lease_expires_ms: 100_000,
     });
     drive(
         ReserveExecutionOperation::new(ReserveExecutionConfig {

@@ -6,7 +6,7 @@ use aruna_core::UserId;
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::errors::StorageError;
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE};
+use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::execution::job::{
@@ -48,7 +48,7 @@ use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperat
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
 /// stored in the immutable spec, so a later config change cannot widen it.
-pub const MAX_LAUNCHES_PER_WITNESS: u32 = 3;
+pub const LAUNCHES_PER_WITNESS: u32 = 3;
 
 /// What the caller learns about an accepted submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,7 +418,7 @@ async fn admit_here(
         resources: effective_resources(&request.spec),
         retention_ms: request.retention_ms,
         retry: JobRetryPolicy {
-            max_launches_per_witness: MAX_LAUNCHES_PER_WITNESS,
+            launches_per_witness: LAUNCHES_PER_WITNESS,
         },
         admission: JobAdmissionRecord {
             submission_id: identity.submission_id,
@@ -520,7 +520,7 @@ async fn cached_projection(
 ) -> Result<Option<ProjectionCache>, String> {
     let (page, _) = crate::jobs::store::iter_prefix_page(
         &context.storage_handle,
-        JOB_FAMILY_PROJECTION_KEYSPACE,
+        FAMILY_PROJECTION_KEYSPACE,
         Some(family_prefix(family)),
         None,
         1,
@@ -595,7 +595,7 @@ async fn admit_with_quota(
 async fn has_claim(context: &DriverContext, family: &JobFamilyId) -> Result<bool, SubmitJobError> {
     let (page, _) = crate::jobs::store::iter_prefix_page(
         &context.storage_handle,
-        JOB_FAMILY_RECORD_KEYSPACE,
+        FAMILY_RECORD_KEYSPACE,
         Some(kind_prefix(family, JobRecordKind::Claim)),
         None,
         1,
@@ -906,7 +906,7 @@ mod tests {
         key.extend_from_slice(&[0u8; 40]);
         write_row(
             context,
-            JOB_FAMILY_RECORD_KEYSPACE,
+            FAMILY_RECORD_KEYSPACE,
             Key::from(key.as_slice()),
             postcard::to_allocvec(&envelope).unwrap(),
         )
@@ -936,7 +936,7 @@ mod tests {
         };
         write_row(
             context,
-            JOB_FAMILY_PROJECTION_KEYSPACE,
+            FAMILY_PROJECTION_KEYSPACE,
             family_prefix(&family),
             postcard::to_allocvec(&cache).unwrap(),
         )

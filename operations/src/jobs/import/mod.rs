@@ -19,19 +19,19 @@ use std::sync::{Arc, Mutex};
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE};
+use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, JOB_STATE_KEYSPACE};
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BucketInfo, OBJECT_CONTENT_TYPE_KEY, bucket_permission_path,
+    BackendLocation, BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path,
     object_permission_path,
 };
 use aruna_core::structs::execution::job::{
     ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
-    ImportRoCrateSpec, JOB_SYSTEM_ENTRY_PREFIX, JobError, JobResultPayload, ReasonCode,
+    ImportRoCrateSpec, SYSTEM_ENTRY_PREFIX, JobError, JobResultPayload, ReasonCode,
     RoCrateCheckpointRefs, RoCrateMediaType, job_entry_key, rocrate_plan_key,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -434,7 +434,7 @@ async fn acquire_source(
                 .or_else(|| {
                     result
                         .metadata
-                        .get(OBJECT_CONTENT_TYPE_KEY)
+                        .get(CONTENT_TYPE_KEY)
                         .map(String::as_str)
                 });
             spool_source(
@@ -1483,7 +1483,7 @@ async fn put_report(
 
 fn system_report_key(entry_key: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(entry_key.len().saturating_add(1));
-    key.push(JOB_SYSTEM_ENTRY_PREFIX);
+    key.push(SYSTEM_ENTRY_PREFIX);
     key.extend_from_slice(entry_key.as_bytes());
     key
 }
@@ -1543,7 +1543,7 @@ async fn load_reports(ctx: &JobContext) -> Result<HashMap<String, ImportReportRo
             .await
             .map_err(ImportFailure::Retryable)?;
         for (entry_key, value) in page {
-            if entry_key.first() == Some(&JOB_SYSTEM_ENTRY_PREFIX) {
+            if entry_key.first() == Some(&SYSTEM_ENTRY_PREFIX) {
                 continue;
             }
             let row: ImportReportRow = postcard::from_bytes(value.as_ref())
@@ -1560,7 +1560,7 @@ async fn load_reports(ctx: &JobContext) -> Result<HashMap<String, ImportReportRo
 async fn read_checkpoint(ctx: &JobContext) -> Result<Option<ImportCheckpoint>, String> {
     read_state(
         &ctx.driver.storage_handle,
-        ROCRATE_JOB_STATE_KEYSPACE,
+        JOB_STATE_KEYSPACE,
         ByteView::from(ctx.job_id.to_bytes().to_vec()),
         "import checkpoint",
     )
@@ -1570,7 +1570,7 @@ async fn read_checkpoint(ctx: &JobContext) -> Result<Option<ImportCheckpoint>, S
 async fn read_plan(ctx: &JobContext) -> Result<Option<ImportPlan>, String> {
     read_state(
         &ctx.driver.storage_handle,
-        ROCRATE_JOB_STATE_KEYSPACE,
+        JOB_STATE_KEYSPACE,
         rocrate_plan_key(ctx.job_id),
         "import plan",
     )
@@ -1582,7 +1582,7 @@ async fn persist_checkpoint(ctx: &JobContext, checkpoint: &ImportCheckpoint) -> 
         &ctx.driver.storage_handle,
         ctx.job_id,
         ctx.claim_token,
-        ROCRATE_JOB_STATE_KEYSPACE,
+        JOB_STATE_KEYSPACE,
         ByteView::from(ctx.job_id.to_bytes().to_vec()),
         checkpoint,
     )
@@ -1595,7 +1595,7 @@ async fn persist_plan(ctx: &JobContext, plan: &ImportPlan) -> Result<(), String>
         &ctx.driver.storage_handle,
         ctx.job_id,
         ctx.claim_token,
-        ROCRATE_JOB_STATE_KEYSPACE,
+        JOB_STATE_KEYSPACE,
         rocrate_plan_key(ctx.job_id),
         plan,
     )
@@ -1937,7 +1937,7 @@ pub(crate) mod tests {
         ] {
             let system_key = system_report_key(entry_key);
             assert_ne!(system_key, entry_key.as_bytes());
-            assert_eq!(system_key.first(), Some(&JOB_SYSTEM_ENTRY_PREFIX));
+            assert_eq!(system_key.first(), Some(&SYSTEM_ENTRY_PREFIX));
             assert_eq!(&system_key[1..], entry_key.as_bytes());
         }
     }
@@ -2174,7 +2174,7 @@ pub(crate) mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id,
             claim_token: token,
-            lease_expires_at_ms: u64::MAX,
+            lease_expires_ms: u64::MAX,
         });
         insert_job(&driver.storage_handle, &record).await.unwrap();
         let ctx = JobContext {

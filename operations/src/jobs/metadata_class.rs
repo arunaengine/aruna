@@ -48,7 +48,7 @@ pub fn metadata_is_transient(error: &MetadataWriteError) -> bool {
             CreateDocumentError::MetadataError(error) => metadata_error_transient(error),
             CreateDocumentError::ClockHealth(_)
             | CreateDocumentError::TopicAnnouncement(_)
-            | CreateDocumentError::OriginHoldsNoBucket
+            | CreateDocumentError::HoldsNoBucket
             | CreateDocumentError::PlacementBindingUnavailable(_) => true,
             CreateDocumentError::PlacementBinding(error) => binding_is_transient(error),
             _ => false,
@@ -74,7 +74,7 @@ pub fn metadata_is_transient(error: &MetadataWriteError) -> bool {
 fn binding_is_transient(error: &BindingError) -> bool {
     match error {
         BindingError::Unknown(_) | BindingError::UnknownStrategy(_) => true,
-        BindingError::Conflicted(_) | BindingError::BucketOutOfRange(_) => false,
+        BindingError::Conflicted(_) | BindingError::OutOfRange(_) => false,
     }
 }
 
@@ -234,7 +234,7 @@ mod pure_tests {
                 BindingError::Conflicted(handle()),
             )),
             create(CreateDocumentError::PlacementBinding(
-                BindingError::BucketOutOfRange(
+                BindingError::OutOfRange(
                     aruna_core::structured_id::BucketId::new(9)
                         .expect("bucket")
                         .in_strategy_range(4)
@@ -267,7 +267,7 @@ mod pure_tests {
             create(CreateDocumentError::TopicAnnouncement(
                 "no topic".to_string(),
             )),
-            create(CreateDocumentError::OriginHoldsNoBucket),
+            create(CreateDocumentError::HoldsNoBucket),
             create(CreateDocumentError::PlacementBindingUnavailable(
                 "no binding".to_string(),
             )),

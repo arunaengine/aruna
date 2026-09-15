@@ -4,7 +4,7 @@
 
 use aruna_core::effects::{Effect, FetchCursor, IterStart, PageLimit, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE};
+use aruna_core::keyspaces::{FAMILY_CONFLICT_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobRecordEnvelope, JobRecordKey, SubmissionId,
@@ -134,7 +134,7 @@ impl Operation for FamilyAuditOperation {
         };
         self.state = AuditState::Page;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
             prefix: Some(self.config.scope.prefix()),
             start,
             limit: self.config.limit.get(),
@@ -152,7 +152,7 @@ impl Operation for FamilyAuditOperation {
                     }
                     self.state = AuditState::Conflicts;
                     smallvec![Effect::Storage(StorageEffect::Iter {
-                        key_space: JOB_FAMILY_CONFLICT_KEYSPACE.to_string(),
+                        key_space: FAMILY_CONFLICT_KEYSPACE.to_string(),
                         prefix: Some(self.config.scope.prefix()),
                         start: None,
                         limit: MAX_CONFLICT_ROWS,

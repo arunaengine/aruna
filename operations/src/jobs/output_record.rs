@@ -274,7 +274,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: net.node_id(),
             claim_token: TOKEN,
-            lease_expires_at_ms: 10_000,
+            lease_expires_ms: 10_000,
         });
         insert_job(&storage, &record).await.unwrap();
         let context = DriverContext {

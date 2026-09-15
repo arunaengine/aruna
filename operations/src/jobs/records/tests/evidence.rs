@@ -4,7 +4,7 @@
 use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::JOB_FAMILY_RECORD_KEYSPACE;
+use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     JobFamilyRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
@@ -56,7 +56,7 @@ async fn seed(context: &DriverContext, records: &[JobRecordEnvelope]) {
         .iter()
         .map(|envelope| {
             (
-                JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+                FAMILY_RECORD_KEYSPACE.to_string(),
                 record_key(&envelope.key()),
                 Value::from(to_bytes(envelope).expect("record encodes").as_slice()),
             )

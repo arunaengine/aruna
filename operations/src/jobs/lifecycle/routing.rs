@@ -5,7 +5,7 @@
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobKind, JobStatusView};
-use aruna_core::keyspaces::JOB_FAMILY_ALIAS_KEYSPACE;
+use aruna_core::keyspaces::FAMILY_ALIAS_KEYSPACE;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::execution::job::{
     ExecutionRole, JobError, JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobProgress,
@@ -25,7 +25,7 @@ use crate::jobs::records::{
 };
 use crate::jobs::service::{RoutedJobStatus, read_owned_job};
 use crate::jobs::store::iter_prefix_page;
-use crate::jobs::{JOB_MUTATE_MAX_ATTEMPTS, JobRouteError};
+use crate::jobs::{MUTATE_MAX_ATTEMPTS, JobRouteError};
 
 /// Families one alias may resolve to. Two families claiming one id is an
 /// anomaly that stays visible instead of rebinding the first one.
@@ -56,7 +56,7 @@ pub async fn family_of_alias(
 ) -> Result<Option<JobFamilyId>, JobRouteError> {
     let (rows, _) = iter_prefix_page(
         &context.storage_handle,
-        JOB_FAMILY_ALIAS_KEYSPACE,
+        FAMILY_ALIAS_KEYSPACE,
         Some(alias_prefix(job_id)),
         None,
         MAX_ALIAS_FAMILIES,
@@ -73,7 +73,7 @@ async fn project_alias(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<ProjectedFamily>, JobRouteError> {
-    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+    for attempt in 0..MUTATE_MAX_ATTEMPTS {
         match drive(
             ProjectFamilyOperation::new(ProjectFamilyConfig {
                 family: FamilyRef::Alias(job_id),

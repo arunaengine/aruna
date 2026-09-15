@@ -172,7 +172,7 @@ async fn refuses_page_mismatch() {
     let response = serve_job_record(
         &context,
         crate::tests::records::node(2),
-        MetadataTransportMessage::ForwardJobRecordPage {
+        MetadataTransportMessage::ForwardRecordPage {
             placement,
             submission_id: family.submission_id,
             request_digest: None,
@@ -183,7 +183,7 @@ async fn refuses_page_mismatch() {
     .await;
     assert_eq!(
         response,
-        MetadataTransportMessage::ForwardedJobRecordPage {
+        MetadataTransportMessage::ForwardedRecordPage {
             result: Err(JobRecordRejection::Invalid),
         }
     );

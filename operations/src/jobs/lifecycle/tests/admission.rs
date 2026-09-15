@@ -4,7 +4,7 @@
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{JOB_ADMISSION_QUOTA_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE};
+use aruna_core::keyspaces::{ADMISSION_QUOTA_KEYSPACE, FAMILY_OUTBOX_KEYSPACE};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::execution::job::{
     CapturedInput, InputMode, InputSelection, InputSource, JobFamilyRecord, JobId, JobState,
@@ -73,7 +73,7 @@ async fn rejects_stale_quota() {
     let event = ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: JOB_ADMISSION_QUOTA_KEYSPACE.to_string(),
+            key_space: ADMISSION_QUOTA_KEYSPACE.to_string(),
             key: spec.group_id.to_bytes().as_slice().into(),
             value: postcard::to_allocvec(&1u64)
                 .expect("revision encodes")
@@ -132,7 +132,7 @@ async fn admits_local_claim() {
     assert_eq!(record.retention_ms, family.spec().retention_ms);
     let (queued, _) = iter_prefix_page(
         &ctx.storage_handle,
-        JOB_FAMILY_OUTBOX_KEYSPACE,
+        FAMILY_OUTBOX_KEYSPACE,
         None,
         None,
         8,
@@ -214,7 +214,7 @@ async fn refuses_undeliverable_submit() {
     ));
     let (queued, _) = iter_prefix_page(
         &ctx.storage_handle,
-        JOB_FAMILY_OUTBOX_KEYSPACE,
+        FAMILY_OUTBOX_KEYSPACE,
         None,
         None,
         8,
@@ -378,7 +378,7 @@ async fn device_skips_materialization() {
     assert!(matches!(error, SubmitJobError::PlacementUnavailable(_)));
     let (queued, _) = iter_prefix_page(
         &device.storage_handle,
-        JOB_FAMILY_OUTBOX_KEYSPACE,
+        FAMILY_OUTBOX_KEYSPACE,
         None,
         None,
         8,

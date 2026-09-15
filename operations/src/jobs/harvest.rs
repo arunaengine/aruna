@@ -6,7 +6,7 @@ use aruna_blob::blob::BlobHandle;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::METADATA_PENDING_PROJECTION_KEYSPACE;
+use aruna_core::keyspaces::PENDING_PROJECTION_KEYSPACE;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::execution::harvest::{
     HarvestCursor, HarvestGranularity, HarvestJobSpec, HarvestProvenance, HarvestRecordState,
@@ -414,7 +414,7 @@ async fn projection_pending(ctx: &JobContext, document_id: Ulid) -> Result<bool,
         .driver
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
-            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
             prefix: Some(ByteView::from(document_id.to_bytes().to_vec())),
             start: None,
             limit: 1,

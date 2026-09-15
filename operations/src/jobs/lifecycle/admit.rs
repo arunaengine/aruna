@@ -9,9 +9,9 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    JOB_ADMISSION_QUOTA_KEYSPACE, JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
-    JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE,
-    JOB_OWNER_INDEX_KEYSPACE,
+    ADMISSION_QUOTA_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
+    FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE,
+    JOB_INDEX_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
@@ -148,7 +148,7 @@ impl AdmitSubmissionOperation {
     fn scan(&mut self, txn_id: TxnId) -> Effects {
         self.state = AdmitState::Scan { txn_id };
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
             prefix: Some(submission_prefix(self.config.submission_id)),
             start: self.cursor.clone().map(IterStart::After),
             limit: RECORD_PAGE_SIZE,
@@ -204,7 +204,7 @@ impl AdmitSubmissionOperation {
             return self.cancel(txn_id);
         };
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_ADMISSION_QUOTA_KEYSPACE.to_string(),
+            key_space: ADMISSION_QUOTA_KEYSPACE.to_string(),
             key: Key::from(spec.group_id.to_bytes().as_slice()),
             txn_id: Some(txn_id),
         })]
@@ -228,7 +228,7 @@ impl AdmitSubmissionOperation {
         }
         self.state = AdmitState::ReadCache { txn_id };
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+            key_space: FAMILY_PROJECTION_KEYSPACE.to_string(),
             key: family_prefix(&self.family()),
             txn_id: Some(txn_id),
         })]
@@ -270,12 +270,12 @@ impl AdmitSubmissionOperation {
         for envelope in [spec, claim] {
             let key = record_key(&envelope.key());
             writes.push((
-                JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+                FAMILY_RECORD_KEYSPACE.to_string(),
                 key.clone(),
                 Value::from(to_bytes(envelope)?.as_slice()),
             ));
             writes.push((
-                JOB_FAMILY_OUTBOX_KEYSPACE.to_string(),
+                FAMILY_OUTBOX_KEYSPACE.to_string(),
                 key,
                 Value::from(
                     to_bytes(&OutboxEntry {
@@ -289,12 +289,12 @@ impl AdmitSubmissionOperation {
             ));
         }
         writes.push((
-            JOB_FAMILY_ALIAS_KEYSPACE.to_string(),
+            FAMILY_ALIAS_KEYSPACE.to_string(),
             alias_key(self.config.candidate.job_id, &self.family()),
             Value::from(claim.key().to_bytes().as_slice()),
         ));
         writes.push((
-            JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+            FAMILY_PROJECTION_KEYSPACE.to_string(),
             family_prefix(&self.family()),
             Value::from(to_bytes(&ProjectionCache::invalidated(self.cache.as_ref()))?.as_slice()),
         ));
@@ -305,12 +305,12 @@ impl AdmitSubmissionOperation {
             Value::from(record.to_bytes()?.as_slice()),
         ));
         writes.push((
-            JOB_OWNER_INDEX_KEYSPACE.to_string(),
+            JOB_INDEX_KEYSPACE.to_string(),
             owner_index_key(record.created_by, record.created_at_ms, record.job_id),
             Value::from(Vec::<u8>::new().as_slice()),
         ));
         writes.push((
-            JOB_ADMISSION_QUOTA_KEYSPACE.to_string(),
+            ADMISSION_QUOTA_KEYSPACE.to_string(),
             Key::from(stored.group_id.to_bytes().as_slice()),
             Value::from(to_bytes(&self.quota_revision.saturating_add(1))?.as_slice()),
         ));

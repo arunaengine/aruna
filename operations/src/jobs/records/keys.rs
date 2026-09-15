@@ -5,13 +5,13 @@
 use aruna_core::NodeId;
 use aruna_core::effects::{FetchCursor, FrameBoundsError};
 use aruna_core::structs::execution::job::{
-    JOB_RECORD_KEY_BYTES, JobFamilyId, JobId, JobRecordError, JobRecordKey, JobRecordKind,
+    RECORD_KEY_BYTES, JobFamilyId, JobId, JobRecordError, JobRecordKey, JobRecordKind,
     SubmissionId,
 };
 use aruna_core::types::Key;
 
 /// Encoded width of a conflict row key: record key plus the rejected digest.
-pub const CONFLICT_KEY_BYTES: usize = JOB_RECORD_KEY_BYTES + 32;
+pub const CONFLICT_KEY_BYTES: usize = RECORD_KEY_BYTES + 32;
 
 pub fn record_key(key: &JobRecordKey) -> Key {
     Key::from(key.to_bytes().as_slice())

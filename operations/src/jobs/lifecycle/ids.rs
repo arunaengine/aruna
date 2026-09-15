@@ -5,7 +5,7 @@
 use aruna_core::UserId;
 use aruna_core::compute::SessionMount;
 use aruna_core::compute::runtimes::{
-    SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_MOUNT_PATH_TAG, SESSION_MOUNT_PREFIX_TAG,
+    SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, MOUNT_PATH_TAG, MOUNT_PREFIX_TAG,
     SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
 };
 use aruna_core::errors::ConversionError;
@@ -179,11 +179,11 @@ pub fn session_of(spec: &ExecutionSpec) -> Option<SessionSpec> {
     }
     let mount = spec
         .tags
-        .get(SESSION_MOUNT_PATH_TAG)
+        .get(MOUNT_PATH_TAG)
         .map(|path| SessionMount {
             prefix: spec
                 .tags
-                .get(SESSION_MOUNT_PREFIX_TAG)
+                .get(MOUNT_PREFIX_TAG)
                 .cloned()
                 .unwrap_or_default(),
             path: path.clone(),
@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(session_of(&spec).unwrap().mount, None);
 
         spec.tags
-            .insert(SESSION_MOUNT_PATH_TAG.to_string(), "/work/raw".to_string());
+            .insert(MOUNT_PATH_TAG.to_string(), "/work/raw".to_string());
         assert_eq!(
             session_of(&spec).unwrap().mount,
             Some(SessionMount {
@@ -293,7 +293,7 @@ mod tests {
         );
 
         spec.tags.insert(
-            SESSION_MOUNT_PREFIX_TAG.to_string(),
+            MOUNT_PREFIX_TAG.to_string(),
             "raw/2024/".to_string(),
         );
         assert_eq!(

@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
+    FAMILY_OUTBOX_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
     JOB_RESERVATION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
@@ -233,7 +233,7 @@ impl ReserveExecutionOperation {
         }
         self.state = ReserveState::ReadCache { txn_id };
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+            key_space: FAMILY_PROJECTION_KEYSPACE.to_string(),
             key: family_prefix(&self.family()),
             txn_id: Some(txn_id),
         })]
@@ -291,12 +291,12 @@ impl ReserveExecutionOperation {
                 ),
             ),
             (
-                JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+                FAMILY_RECORD_KEYSPACE.to_string(),
                 key.clone(),
                 Value::from(to_bytes(receipt)?.as_slice()),
             ),
             (
-                JOB_FAMILY_OUTBOX_KEYSPACE.to_string(),
+                FAMILY_OUTBOX_KEYSPACE.to_string(),
                 key,
                 Value::from(
                     to_bytes(&OutboxEntry {
@@ -309,7 +309,7 @@ impl ReserveExecutionOperation {
                 ),
             ),
             (
-                JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+                FAMILY_PROJECTION_KEYSPACE.to_string(),
                 family_prefix(&self.family()),
                 Value::from(
                     to_bytes(&ProjectionCache::invalidated(self.cache.as_ref()))?.as_slice(),
@@ -320,7 +320,7 @@ impl ReserveExecutionOperation {
             job_insert_entries(self.config.record.as_ref())?
                 .into_iter()
                 .filter(|(key_space, _, _)| {
-                    key_space != aruna_core::keyspaces::JOB_OWNER_INDEX_KEYSPACE
+                    key_space != aruna_core::keyspaces::JOB_INDEX_KEYSPACE
                 }),
         );
         Ok(writes)

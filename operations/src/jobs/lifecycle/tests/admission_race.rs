@@ -6,7 +6,7 @@ use std::sync::Arc;
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::{JobRecordFrame, ReceiptFrame};
 use aruna_core::events::LaunchDecline;
-use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
+use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::structs::execution::job::{
     EffectiveResources, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordKind, LaunchIntent,
 };
@@ -138,7 +138,7 @@ pub(super) async fn rows(ctx: &DriverContext, key_space: &str, prefix: Option<Ke
 
 pub(super) async fn receipts(ctx: &DriverContext, family: &Family) -> usize {
     let prefix = kind_prefix(&family.family(), JobRecordKind::Receipt);
-    rows(ctx, JOB_FAMILY_RECORD_KEYSPACE, Some(prefix)).await
+    rows(ctx, FAMILY_RECORD_KEYSPACE, Some(prefix)).await
 }
 
 /// Whether exactly one of the two minted physical jobs became durable.

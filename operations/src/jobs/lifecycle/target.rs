@@ -7,7 +7,7 @@ use std::sync::Arc;
 use aruna_compute::ExecutorRegistry;
 use aruna_core::compute::{ExecutorCapability, ExecutorKind, NetworkAccess, ResourceEnvelope};
 use aruna_core::effects::{
-    Effect, HolderList, JobRecordEffect, JobRecordFrame, LaunchFrame, MAX_JOB_RECORD_HOLDERS,
+    Effect, HolderList, JobRecordEffect, JobRecordFrame, LaunchFrame, MAX_RECORD_HOLDERS,
     NetEffect, PageLimit, ReceiptFrame,
 };
 use aruna_core::errors::StorageError;
@@ -816,7 +816,7 @@ async fn fetch_family(
     };
     let mut holders = resolve_shard_holders(config, &placement);
     holders.retain(|holder| *holder != scheduler);
-    holders.truncate(MAX_JOB_RECORD_HOLDERS.saturating_sub(1));
+    holders.truncate(MAX_RECORD_HOLDERS.saturating_sub(1));
     holders.insert(0, scheduler);
     let Ok(holders) = HolderList::new(holders) else {
         return;

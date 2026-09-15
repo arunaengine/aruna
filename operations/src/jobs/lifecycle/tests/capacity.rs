@@ -3,7 +3,7 @@
 
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
-use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
+use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::execution::job::{
     CapturedInput, EffectiveResources, JobFamilyRecord, JobPayload, JobRecord, JobRecordBody,
@@ -237,7 +237,7 @@ async fn persists_receipt_first() {
     );
     let (records, _) = iter_prefix_page(
         &ctx.storage_handle,
-        JOB_FAMILY_RECORD_KEYSPACE,
+        FAMILY_RECORD_KEYSPACE,
         None,
         None,
         32,

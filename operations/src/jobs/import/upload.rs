@@ -2,7 +2,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{ROCRATE_UPLOAD_CLEANUP_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE};
+use aruna_core::keyspaces::{UPLOAD_CLEANUP_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::blob::HiddenBlobKey;
@@ -20,7 +20,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::jobs::JOB_MUTATE_MAX_ATTEMPTS;
+use crate::jobs::MUTATE_MAX_ATTEMPTS;
 use crate::jobs::store::{CommitStep, commit_write};
 
 #[derive(Debug, PartialEq)]
@@ -141,7 +141,7 @@ impl CreateRoCrateOperation {
             return smallvec![];
         };
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: ROCRATE_UPLOAD_CLEANUP_KEYSPACE.to_string(),
+            key_space: UPLOAD_CLEANUP_KEYSPACE.to_string(),
             key: upload_key(self.upload_id),
             value: ByteView::from(value),
             txn_id: None,
@@ -500,7 +500,7 @@ pub async fn claim_rocrate_upload(
     job_id: JobId,
     now_ms: u64,
 ) -> Result<RoCrateUploadRecord, UploadClaimError> {
-    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+    for attempt in 0..MUTATE_MAX_ATTEMPTS {
         let txn_id = start_txn(storage)
             .await
             .map_err(UploadClaimError::Storage)?;
@@ -815,7 +815,7 @@ mod tests {
         else {
             panic!("expected durable cleanup row")
         };
-        assert_eq!(key_space, ROCRATE_UPLOAD_CLEANUP_KEYSPACE);
+        assert_eq!(key_space, UPLOAD_CLEANUP_KEYSPACE);
         assert_eq!(key, &upload_key(Ulid::from_bytes([2u8; 16])));
         let cleanup = RoCrateUploadCleanup::from_bytes(value.as_ref()).unwrap();
         assert_eq!(cleanup.upload_id, Ulid::from_bytes([2u8; 16]));
@@ -900,7 +900,7 @@ mod tests {
         else {
             panic!("expected durable cleanup row")
         };
-        assert_eq!(key_space, ROCRATE_UPLOAD_CLEANUP_KEYSPACE);
+        assert_eq!(key_space, UPLOAD_CLEANUP_KEYSPACE);
         assert_eq!(
             RoCrateUploadCleanup::from_bytes(value.as_ref())
                 .unwrap()
@@ -1002,7 +1002,7 @@ mod tests {
         assert!(matches!(
             operation.abort().as_slice(),
             [Effect::Storage(StorageEffect::Write { key_space, .. })]
-                if key_space == ROCRATE_UPLOAD_CLEANUP_KEYSPACE
+                if key_space == UPLOAD_CLEANUP_KEYSPACE
         ));
 
         operation.step(Event::Storage(StorageEvent::WriteResult {

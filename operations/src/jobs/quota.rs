@@ -9,7 +9,7 @@ use aruna_core::compute_quota::{
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::JOB_ADMISSION_QUOTA_KEYSPACE;
+use aruna_core::keyspaces::ADMISSION_QUOTA_KEYSPACE;
 use aruna_core::structs::execution::job::EffectiveResources;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{GroupId, Key};
@@ -86,7 +86,7 @@ async fn quota_revision(context: &DriverContext, group_id: GroupId) -> Result<u6
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: JOB_ADMISSION_QUOTA_KEYSPACE.to_string(),
+            key_space: ADMISSION_QUOTA_KEYSPACE.to_string(),
             key: Key::from(group_id.to_bytes().as_slice()),
             txn_id: None,
         })
@@ -149,7 +149,7 @@ mod pure_tests {
             None
         );
         let per_job = ComputeQuota {
-            max_job_cpu_cores: Some(2),
+            job_cpu_cores: Some(2),
             ..Default::default()
         };
         assert_eq!(

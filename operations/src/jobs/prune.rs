@@ -3,10 +3,10 @@ use std::time::Duration;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
+use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::storage::blob::HiddenBlobKey;
 use aruna_core::structs::execution::job::{
-    JOB_PRUNE_INDEX_PREFIX, JobPayload, JobRecord, JobResultPayload, cleanup_job_id,
+    PRUNE_INDEX_PREFIX, JobPayload, JobRecord, JobResultPayload, cleanup_job_id,
     parse_schedule_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -17,7 +17,7 @@ use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use tracing::warn;
 
-use super::JOB_PRUNE_SCAN_PAGE_SIZE;
+use super::JOB_PRUNE_PAGE;
 use super::store::{
     artifact_tombstone_key, batch_delete, first_schedule_entry, iter_prefix_page,
     job_entry_deletes, preserve_artifact_tombstone, prune_delete_entries, read_job_record,
@@ -32,7 +32,7 @@ pub struct JobPruneOutcome {
 }
 
 pub async fn prune_job_batch(context: &DriverContext) -> Result<JobPruneOutcome, String> {
-    prune_job_page(context, JOB_PRUNE_SCAN_PAGE_SIZE).await
+    prune_job_page(context, JOB_PRUNE_PAGE).await
 }
 
 pub(crate) async fn prune_job_page(
@@ -52,8 +52,8 @@ pub(crate) async fn prune_job_page(
     'scan: loop {
         let (values, next) = iter_prefix_page(
             storage,
-            JOB_SCHEDULE_INDEX_KEYSPACE,
-            Some(ByteView::from(JOB_PRUNE_INDEX_PREFIX.to_vec())),
+            SCHEDULE_INDEX_KEYSPACE,
+            Some(ByteView::from(PRUNE_INDEX_PREFIX.to_vec())),
             start_after.take(),
             page_size,
             None,
@@ -71,7 +71,7 @@ pub(crate) async fn prune_job_page(
                 Ok(parsed) => parsed,
                 Err(error) => {
                     warn!(error = %error, "Deleting malformed job prune index row");
-                    deletes.push((JOB_SCHEDULE_INDEX_KEYSPACE.to_string(), key));
+                    deletes.push((SCHEDULE_INDEX_KEYSPACE.to_string(), key));
                     continue;
                 }
             };
@@ -109,9 +109,9 @@ pub(crate) async fn prune_job_page(
                     deletes.extend(prune_delete_entries(&record));
                 }
                 None => {
-                    deletes.push((JOB_SCHEDULE_INDEX_KEYSPACE.to_string(), key));
+                    deletes.push((SCHEDULE_INDEX_KEYSPACE.to_string(), key));
                     deletes.push((
-                        aruna_core::keyspaces::JOB_ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
+                        aruna_core::keyspaces::ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
                         artifact_tombstone_key(job_id),
                     ));
                 }
@@ -177,7 +177,7 @@ async fn cleanup_pending(storage: &StorageHandle, record: &JobRecord) -> Result<
 
 /// ShortenTimer restore keyed off the earliest `prune/` entry.
 pub async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    let after = match first_schedule_entry(storage, JOB_PRUNE_INDEX_PREFIX).await {
+    let after = match first_schedule_entry(storage, PRUNE_INDEX_PREFIX).await {
         Ok(Some((expiry_ms, _))) => {
             Duration::from_millis(expiry_ms.saturating_sub(unix_timestamp_millis()))
         }
@@ -208,7 +208,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
-        JOB_ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE,
+        ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_INDEX_KEYSPACE,
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::execution::job::{
@@ -330,8 +330,8 @@ mod tests {
         let outcome = prune_job_batch(&context(storage.clone())).await.unwrap();
         assert_eq!(outcome.pruned, 1);
         assert_eq!(count(&storage, JOB_KEYSPACE).await, 0);
-        assert_eq!(count(&storage, JOB_OWNER_INDEX_KEYSPACE).await, 0);
-        assert_eq!(count(&storage, JOB_SCHEDULE_INDEX_KEYSPACE).await, 0);
+        assert_eq!(count(&storage, JOB_INDEX_KEYSPACE).await, 0);
+        assert_eq!(count(&storage, SCHEDULE_INDEX_KEYSPACE).await, 0);
     }
 
     #[tokio::test]
@@ -369,8 +369,8 @@ mod tests {
         let outcome = prune_job_batch(&context(storage.clone())).await.unwrap();
 
         assert_eq!(outcome.pruned, 1);
-        assert_eq!(count(&storage, JOB_ARTIFACT_TOMBSTONE_KEYSPACE).await, 0);
-        assert_eq!(count(&storage, JOB_SCHEDULE_INDEX_KEYSPACE).await, 0);
+        assert_eq!(count(&storage, ARTIFACT_TOMBSTONE_KEYSPACE).await, 0);
+        assert_eq!(count(&storage, SCHEDULE_INDEX_KEYSPACE).await, 0);
     }
 
     #[tokio::test]
