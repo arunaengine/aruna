@@ -344,7 +344,7 @@ pub async fn submit_mint_pid(
     retention_ms: u64,
     auth_token: Option<crate::metadata::MetadataAuthToken>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    let (job_id, created) = crate::metadata::forward::submit_pid_routed(
+    let (job_id, created) = crate::metadata::persistent_id::forward::submit_pid_routed(
         context,
         spec.document_id,
         spec.minted_by,

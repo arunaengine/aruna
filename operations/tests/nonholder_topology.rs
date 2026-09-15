@@ -17,6 +17,8 @@ use aruna_core::structs::{
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::driver::drive;
+use aruna_operations::forward::routing::origin_holds_document;
+use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::jobs::JobRouteError;
 use aruna_operations::jobs::drain::{JobClassBudget, drain_job_batch};
 use aruna_operations::jobs::runtime::JobsRuntime;
@@ -37,8 +39,7 @@ use aruna_operations::metadata::create_document::{
     mint_forward_document, mint_local_document,
 };
 use aruna_operations::metadata::forward::{
-    MetadataWriteError, export_rocrate_routed, origin_holds_document, route_metadata_create,
-    route_metadata_delete, route_metadata_update,
+    export_rocrate_routed, route_metadata_create, route_metadata_delete, route_metadata_update,
 };
 use aruna_operations::metadata::get_document::{
     GetMetadataDocumentError, GetMetadataDocumentOperation, load_document_record,
@@ -632,7 +633,7 @@ async fn fixture_proves_nonholders() -> TestResult<()> {
     }
 
     // A User-kind node is never sync-eligible, so it holds no bucket to stamp: the one origin
-    // from which a create must be forwarded (D10).
+    // from which a create must be forwarded.
     assert_eq!(
         realm.origin_placement(realm.user_node(), group_id, document_id, path),
         None
@@ -749,7 +750,7 @@ async fn read_misses_nonholder() -> TestResult<()> {
     Ok(())
 }
 
-// D10/D11: a write arriving at a node that holds no bucket of the document is forwarded to a
+// A write arriving at a node that holds no bucket of the document is forwarded to a
 // holder.
 #[tokio::test]
 async fn bystander_writes_forward() -> TestResult<()> {
@@ -997,7 +998,7 @@ async fn document_export_routes() -> TestResult<()> {
 }
 
 // The create a bucket-holding node can never reach: a User-kind node holds no bucket, so it can
-// stamp none and must forward the create to a holder (D10).
+// stamp none and must forward the create to a holder.
 #[tokio::test]
 async fn user_create_forwards() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;

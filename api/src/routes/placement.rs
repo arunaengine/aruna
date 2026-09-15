@@ -12,7 +12,7 @@ use aruna_core::structs::{
     PolicyBlockedReason, PolicyBulkStatus, VersionKey,
 };
 use aruna_operations::driver::{drive, gate_context, now_ms};
-use aruna_operations::metadata::forward::MetadataWriteError;
+use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
 use aruna_operations::placement::policy::diagnostics::{
     DiagnosticsError, DiagnosticsInput, PolicyDiagnosticsOperation,

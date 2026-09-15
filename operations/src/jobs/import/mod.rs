@@ -51,11 +51,12 @@ use super::metadata_class::MetadataFailure;
 use super::store::{list_job_entries, put_job_entry, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
+use crate::forward::transport::MetadataWriteError;
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
-use crate::metadata::forward::{MetadataWriteError, route_metadata_create};
+use crate::metadata::forward::route_metadata_create;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetRealmConfigOperation;
 use crate::replication::queue::{
@@ -1686,10 +1687,9 @@ fn validation_message(violations: &[MetadataValidationViolation]) -> String {
         .join("; ")
 }
 
-/// Why a backend blob write failed, as far as the import may decide on it. The
-/// typed blob error carries the cause from where it was identified; no local
-/// error text is interpreted, so wording cannot flip permanence. A cause the
-/// import does not know stays retryable.
+/// Why a backend blob write failed, as far as the import may decide. The typed
+/// error carries the cause; local error text is never interpreted, so wording
+/// cannot flip permanence, and an unknown cause stays retryable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlobWriteFailure {
     /// An integrity fault the source bytes will not heal by retrying.

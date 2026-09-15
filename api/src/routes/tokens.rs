@@ -7,12 +7,13 @@ use crate::server_state::ServerState;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::structs::{Actor, AuthContext, Permission};
 use aruna_core::time::unix_timestamp_secs;
+use aruna_operations::auth::forward::forward_token_revoke;
 use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
 };
 use aruna_operations::driver::drive;
+use aruna_operations::forward::routing::is_user_origin;
 use aruna_operations::metadata::api::forwarded_bearer;
-use aruna_operations::metadata::forward::{forward_token_revoke, is_user_origin};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};

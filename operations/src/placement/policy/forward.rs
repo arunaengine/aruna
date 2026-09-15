@@ -9,9 +9,8 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::driver::{DriverContext, drive};
-use crate::metadata::forward::{
-    MetadataWriteError, authorize_forwarded_caller, forward_auth_error, forward_to_holders,
-};
+use crate::forward::authorize::{authorize_forwarded_caller, forward_auth_error};
+use crate::forward::transport::{MetadataWriteError, forward_to_holders};
 use crate::metadata::protocol::{MetadataAuthToken, MetadataTransportMessage};
 use crate::placement::policy::create::{
     CreatePolicyConfig, CreatePolicyError, CreatePolicyOperation,

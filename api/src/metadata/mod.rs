@@ -1,9 +1,6 @@
-//! Shared metadata application adapter.
-//!
-//! Both REST handlers under `crate::routes::metadata` and the MCP tools under
-//! `crate::mcp::metadata` convert through these functions: request DTOs in
-//! `model`, operation error mapping, the local-write lookup, and response
-//! assembly. Neither transport reaches into the other's handlers.
+//! Shared metadata application adapter for the REST and MCP transports:
+//! request DTOs in `model`, operation error mapping, the local-write lookup,
+//! and response assembly. Neither transport reaches into the other's handlers.
 
 mod model;
 
@@ -19,6 +16,8 @@ use aruna_core::metadata::{
 use aruna_core::structs::{AuthContext, MetadataRegistryRecord, Permission};
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::forward::routing::origin_holds_document as run_origin_holds_document;
+use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateResult, ListVisibleMetadataDocumentsRequest, MetadataApiError,
     MetadataApiQueryMode, MetadataFanoutStats, MetadataListOrder, MetadataReferenceEntry,
@@ -29,8 +28,7 @@ use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentError, CreateMetadataDocumentPayload,
 };
 use aruna_operations::metadata::forward::{
-    CreateMetadataAuthorizedError, MetadataWriteError, create_metadata_authorized,
-    origin_holds_document as run_origin_holds_document,
+    CreateMetadataAuthorizedError, create_metadata_authorized,
 };
 use aruna_operations::metadata::get_document::load_document_record as load_metadata_record_by_document_from_operations;
 use aruna_operations::metadata::update_document::UpdateMetadataDocumentError;

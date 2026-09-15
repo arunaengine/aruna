@@ -31,6 +31,7 @@ use super::{LifecycleError, ids};
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
+use crate::forward::authorize::{is_sync_eligible, peer_acts_for};
 use crate::jobs::records::keys::{family_prefix, kind_prefix};
 use crate::jobs::records::rows::ProjectionCache;
 use crate::jobs::records::verify::FamilyView;
@@ -38,7 +39,6 @@ use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperatio
 use crate::jobs::service::{mint_local_job, validate_execution};
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::api::load_realm_config;
-use crate::metadata::forward::{is_sync_eligible, peer_acts_for};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::{MetadataAuthToken, MetadataWritePeerError};
 use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};

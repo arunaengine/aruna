@@ -21,10 +21,10 @@ use aruna_core::structs::{
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
-use aruna_operations::metadata::forward::{
+use aruna_operations::metadata::get_document::load_document_record;
+use aruna_operations::metadata::persistent_id::forward::{
     read_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };
-use aruna_operations::metadata::get_document::load_document_record;
 
 use crate::auth::{ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};

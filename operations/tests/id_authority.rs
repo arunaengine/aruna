@@ -15,6 +15,7 @@ use aruna_core::structs::{
     PersistentIdStatus, PlacementRef, persistent_id_key, pid_dedup_key,
 };
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::jobs::service::{read_job_routed, submit_mint_pid};
 use aruna_operations::jobs::store::{find_dedup_job, read_job_record};
 use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
@@ -24,11 +25,11 @@ use aruna_operations::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::metadata::forward::{
-    MetadataWriteError, mint_pid_routed, resolve_pid_routed, route_metadata_create,
-    route_metadata_delete, withdraw_pid_routed,
-};
+use aruna_operations::metadata::forward::{route_metadata_create, route_metadata_delete};
 use aruna_operations::metadata::get_document::load_document_record;
+use aruna_operations::metadata::persistent_id::forward::{
+    mint_pid_routed, resolve_pid_routed, withdraw_pid_routed,
+};
 use aruna_operations::metadata::persistent_id::read_mapping;
 use aruna_operations::metadata::projector::replay_event_log;
 use aruna_operations::realm::claim_admin::{
