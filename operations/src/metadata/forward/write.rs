@@ -49,31 +49,31 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::authorize::authorize_create;
-use super::authorize::authorize_forwarded_caller;
-use super::authorize::authorize_write;
-use super::authorize::forward_auth_error;
-use super::pid::pid_authority_node;
 use super::read::device_replica;
-use super::replay::HeldRecordError;
-use super::replay::create_record_matches;
-use super::replay::forwarded_create_replay;
-use super::replay::held_record;
-use super::replay::routed_record_matches;
-use super::replay::update_record_matches;
-use super::routing::create_forward_holders;
-use super::routing::distinct_holders;
-use super::routing::holder_intersection;
-use super::routing::holds_metadata_id;
-use super::routing::is_user_origin;
-use super::transport::MetadataWriteError;
-use super::transport::RetryDisposition;
-use super::transport::forward_to_holders;
-use super::transport::forwarded_unavailable;
-use super::transport::read_error;
-use super::transport::reject;
-use super::transport::retry_disposition;
-use super::transport::unexpected_response;
+use crate::forward::authorize::authorize_create;
+use crate::forward::authorize::authorize_forwarded_caller;
+use crate::forward::authorize::authorize_write;
+use crate::forward::authorize::forward_auth_error;
+use crate::forward::replay::HeldRecordError;
+use crate::forward::replay::create_record_matches;
+use crate::forward::replay::forwarded_create_replay;
+use crate::forward::replay::held_record;
+use crate::forward::replay::routed_record_matches;
+use crate::forward::replay::update_record_matches;
+use crate::forward::routing::create_forward_holders;
+use crate::forward::routing::distinct_holders;
+use crate::forward::routing::holder_intersection;
+use crate::forward::routing::holds_metadata_id;
+use crate::forward::routing::is_user_origin;
+use crate::forward::transport::MetadataWriteError;
+use crate::forward::transport::RetryDisposition;
+use crate::forward::transport::forward_to_holders;
+use crate::forward::transport::forwarded_unavailable;
+use crate::forward::transport::read_error;
+use crate::forward::transport::reject;
+use crate::forward::transport::retry_disposition;
+use crate::forward::transport::unexpected_response;
+use crate::metadata::persistent_id::forward::pid_authority_node;
 use aruna_core::StructuredId;
 
 /// Creates locally when the origin holds the bucket, otherwise at a holder.
@@ -91,8 +91,8 @@ pub async fn route_metadata_create(
         Err(error) => return Err(error.into()),
     }
 
-    // Mint the forwarded id at the origin with the blind-hash bucket of the D8
-    // subject, so every candidate holder stamps the same bucket (D3/D4).
+    // Mint the forwarded id at the origin with the blind-hash bucket of the
+    // subject, so every candidate holder stamps the same bucket.
     let realm_config = load_realm_config(&context, config.actor.realm_id)
         .await
         .ok_or_else(|| {

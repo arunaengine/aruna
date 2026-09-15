@@ -13,6 +13,7 @@ pub mod create_upload;
 pub mod delete_bucket;
 pub mod delete_object;
 pub mod delete_objects;
+pub mod forward;
 pub mod get_access;
 pub mod get_attributes;
 pub mod get_bucket;

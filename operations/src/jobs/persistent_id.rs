@@ -5,7 +5,7 @@ use aruna_core::time::unix_timestamp_millis;
 
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::forward::{fail_pid_routed, mint_pid_routed};
+use crate::metadata::persistent_id::forward::{fail_pid_routed, mint_pid_routed};
 
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 

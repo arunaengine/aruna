@@ -40,10 +40,10 @@ use tokio::time::Instant;
 use tokio::time::timeout;
 use ulid::Ulid;
 
-use super::authorize::is_sync_eligible;
-use super::replay::routed_record_matches;
-use super::routing::holds_metadata_id;
-use super::transport::read_error;
+use crate::forward::authorize::is_sync_eligible;
+use crate::forward::replay::routed_record_matches;
+use crate::forward::routing::holds_metadata_id;
+use crate::forward::transport::read_error;
 use futures_util::StreamExt;
 
 pub(super) const METADATA_READ_FANOUT_LIMIT: usize = 8;

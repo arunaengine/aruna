@@ -86,7 +86,7 @@ pub async fn origin_holds_document(
     Ok(holds_placement(&config, &placement, local_node_id))
 }
 
-pub(super) fn holds_metadata_id(
+pub(crate) fn holds_metadata_id(
     config: &RealmConfigDocument,
     realm_id: RealmId,
     local_node_id: NodeId,
@@ -99,7 +99,7 @@ pub(super) fn holds_metadata_id(
 /// Holders of the document's blind-hashed bucket: candidates for a create the
 /// origin cannot place. Every candidate holds that one bucket and a forwarded
 /// create stamps exactly it, so the answering candidate cannot change placement.
-pub(super) fn create_forward_holders(
+pub(crate) fn create_forward_holders(
     realm_config: &RealmConfigDocument,
     config: &CreateMetadataDocumentConfig,
     document_id: Ulid,
@@ -115,7 +115,7 @@ pub(super) fn create_forward_holders(
     Some((placement, holders))
 }
 
-pub(super) fn distinct_holders(holders: &[NodeId]) -> Vec<NodeId> {
+pub(crate) fn distinct_holders(holders: &[NodeId]) -> Vec<NodeId> {
     let mut distinct = Vec::with_capacity(holders.len());
     for holder in holders.iter().copied() {
         if !distinct.contains(&holder) {
@@ -125,7 +125,7 @@ pub(super) fn distinct_holders(holders: &[NodeId]) -> Vec<NodeId> {
     distinct
 }
 
-pub(super) fn holder_intersection(current: &[NodeId], frozen: &[NodeId]) -> Vec<NodeId> {
+pub(crate) fn holder_intersection(current: &[NodeId], frozen: &[NodeId]) -> Vec<NodeId> {
     let holders = current
         .iter()
         .copied()

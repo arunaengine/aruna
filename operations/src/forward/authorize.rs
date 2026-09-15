@@ -27,7 +27,7 @@ pub(crate) fn is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) ->
 
 /// A User peer is owner-bound: it may forward only for the owner its realm
 /// config names, whatever token it managed to present. Other kinds are not
-/// owner-bound, so any authenticated caller may travel through them (D12).
+/// owner-bound, so any authenticated caller may travel through them.
 pub(crate) fn peer_acts_for(config: &RealmConfigDocument, peer: NodeId, user_id: UserId) -> bool {
     match configured_kind(config, peer).and_then(RealmNodeKind::owner) {
         Some(owner) => owner == user_id,
@@ -47,7 +47,7 @@ pub(super) fn configured_kind(
         .map(|node| &node.kind)
 }
 
-pub(super) async fn authorize_forwarded_pid(
+pub(crate) async fn authorize_forwarded_pid(
     context: &Arc<DriverContext>,
     peer: NodeId,
     realm_id: RealmId,
@@ -111,7 +111,7 @@ pub(crate) async fn authorize_forwarded_caller(
         return Err(ForwardAuthError::Forbidden);
     }
     // A User peer is owner-bound: whatever token it presents, the write it
-    // forwards must be its owner's own (D12).
+    // forwards must be its owner's own.
     let Some(config) = load_realm_config(context, realm_id).await else {
         return Err(ForwardAuthError::Unavailable(
             "forwarded metadata write needs the realm configuration".to_string(),
@@ -123,7 +123,7 @@ pub(crate) async fn authorize_forwarded_caller(
     Ok(auth)
 }
 
-pub(super) async fn authorize_write(
+pub(crate) async fn authorize_write(
     context: &Arc<DriverContext>,
     auth_context: AuthContext,
     path: String,
@@ -171,7 +171,7 @@ pub(crate) fn forward_auth_error(error: ForwardAuthError) -> MetadataTransportMe
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn authorize_create(
+pub(crate) async fn authorize_create(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     auth: &AuthContext,

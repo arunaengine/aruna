@@ -174,7 +174,7 @@ impl MetadataRequestError {
         }
     }
 
-    pub(super) fn possibly_sent(error: MetadataError) -> Self {
+    pub(crate) fn possibly_sent(error: MetadataError) -> Self {
         Self {
             delivery: MetadataRequestDelivery::PossiblySent,
             error,
