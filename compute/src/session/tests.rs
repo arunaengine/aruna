@@ -61,6 +61,17 @@ async fn exposes_public_id() {
     assert_eq!(data["job_id"], config.public_job_id);
 }
 
+#[tokio::test(start_paused = true)]
+async fn ended_session_stays() {
+    let registry = Arc::new(SessionRegistry::new());
+    let config = config(600_000);
+    let (session, _channel) = registry.open_detached(config.clone());
+    session.end(EndReason::Ended);
+    assert!(registry.get(&config.job_id).is_some());
+    registry.close(&config.job_id);
+    assert!(registry.get(&config.job_id).is_none());
+}
+
 /// A session the kernel already reported ready for, with its request channel
 /// kept open so submits are accepted.
 fn ready(idle_after_ms: u64) -> (Arc<Session>, TestChannel) {

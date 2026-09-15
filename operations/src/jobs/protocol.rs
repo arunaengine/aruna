@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
 use tracing::warn;

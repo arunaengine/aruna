@@ -25,6 +25,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::persistent_id::read_mapping;
 use aruna_operations::placement::resolve_shard_holders;
 use aruna_operations::placement::{
     PlacementResolutionContext, choose_origin_bucket, meta_bucket_subject, strategy_for_target,
@@ -89,6 +90,9 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
         create_document(leader_node, realm_id, group_id, *document_id, index).await?;
     }
 
+    // The mint job rewrites each mapping once it activates the id, so the
+    // manifests can only settle after every mapping is active on both holders.
+    wait_for_active_ids(&nodes, &document_ids).await?;
     // Every create lands two rows in the shard: the document and its
     // persistent-id mapping. Both holders must converge on set and digest.
     let manifest_rows = document_ids.len() * 2;
@@ -232,6 +236,25 @@ async fn create_document(
     )
     .await?;
     Ok(())
+}
+
+async fn wait_for_active_ids(
+    nodes: &[TestNode],
+    document_ids: &[Ulid],
+) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_convergence("persistent ids did not activate", || async {
+        let mut pending = 0usize;
+        for node in nodes {
+            for document_id in document_ids {
+                let mapping = read_mapping(node.context.as_ref(), *document_id).await?;
+                if !mapping.is_some_and(|mapping| mapping.is_active()) {
+                    pending += 1;
+                }
+            }
+        }
+        Ok(pending)
+    })
+    .await
 }
 
 async fn wait_for_manifest_agreement(

@@ -1238,6 +1238,7 @@ async fn permission_rechecks_creator() -> TestResult<()> {
                         .await
                         .is_ok_and(|detail| {
                             detail.relationship.state == "failed"
+                                && detail.pending_jobs == 0
                                 && detail
                                     .last_error
                                     .as_deref()

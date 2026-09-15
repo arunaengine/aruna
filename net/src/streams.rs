@@ -2,7 +2,7 @@ use aruna_core::NodeId;
 use aruna_core::alpn::{Alpn, AlpnRole};
 use aruna_core::structs::RealmNodeKind;
 use iroh::Endpoint;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{ClosedStream, Connection, ReadError, ReadToEndError, VarInt};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -135,7 +135,7 @@ impl InboundAdmission {
     }
 
     /// What this node's own kind accepts for itself.
-    fn local_serves(&self, alpn: Alpn) -> bool {
+    pub(crate) fn local_serves(&self, alpn: Alpn) -> bool {
         alpn.permits(self.local_kind.read().as_ref(), AlpnRole::LocalServe)
     }
 
@@ -255,7 +255,154 @@ impl Drop for InboundConnectionPermit {
     }
 }
 
-pub use iroh::endpoint::{RecvStream, SendStream};
+/// Pipe capacity per direction of an in-process stream.
+const LOOPBACK_PIPE_SIZE: usize = 64 * 1024;
+
+/// Send half of a stream: an iroh stream to a peer, or one end of an
+/// in-process pipe when the node dials itself. `finish` drops the pipe end,
+/// which the reading side observes as end of stream.
+#[derive(Debug)]
+pub enum SendStream {
+    Remote(iroh::endpoint::SendStream),
+    Local(Option<DuplexStream>),
+}
+
+impl SendStream {
+    pub fn finish(&mut self) -> std::result::Result<(), ClosedStream> {
+        match self {
+            Self::Remote(stream) => stream.finish(),
+            Self::Local(pipe) => {
+                pipe.take();
+                Ok(())
+            }
+        }
+    }
+
+    pub fn reset(&mut self, error_code: VarInt) -> std::result::Result<(), ClosedStream> {
+        match self {
+            Self::Remote(stream) => stream.reset(error_code),
+            Self::Local(pipe) => {
+                pipe.take();
+                Ok(())
+            }
+        }
+    }
+}
+
+impl AsyncWrite for SendStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Remote(stream) => AsyncWrite::poll_write(Pin::new(stream), cx, buf),
+            Self::Local(Some(pipe)) => Pin::new(pipe).poll_write(cx, buf),
+            Self::Local(None) => Poll::Ready(Err(finished_pipe())),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Remote(stream) => AsyncWrite::poll_flush(Pin::new(stream), cx),
+            Self::Local(Some(pipe)) => Pin::new(pipe).poll_flush(cx),
+            Self::Local(None) => Poll::Ready(Err(finished_pipe())),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Remote(stream) => AsyncWrite::poll_shutdown(Pin::new(stream), cx),
+            Self::Local(Some(pipe)) => Pin::new(pipe).poll_shutdown(cx),
+            Self::Local(None) => Poll::Ready(Ok(())),
+        }
+    }
+}
+
+fn finished_pipe() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "local stream finished")
+}
+
+/// Receive half of a stream; `stop` drops a pipe end so the writer sees a
+/// broken pipe, like a stopped iroh stream.
+#[derive(Debug)]
+pub enum RecvStream {
+    Remote(iroh::endpoint::RecvStream),
+    Local(Option<DuplexStream>),
+}
+
+impl RecvStream {
+    pub fn stop(&mut self, error_code: VarInt) -> std::result::Result<(), ClosedStream> {
+        match self {
+            Self::Remote(stream) => stream.stop(error_code),
+            Self::Local(pipe) => {
+                pipe.take();
+                Ok(())
+            }
+        }
+    }
+
+    /// Reads until end of stream; fails once more than `size_limit` bytes arrive.
+    pub async fn read_to_end(
+        &mut self,
+        size_limit: usize,
+    ) -> std::result::Result<Vec<u8>, ReadToEndError> {
+        match self {
+            Self::Remote(stream) => stream.read_to_end(size_limit).await,
+            Self::Local(pipe) => {
+                let mut bytes = Vec::new();
+                if let Some(pipe) = pipe {
+                    AsyncReadExt::take(pipe, size_limit as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .await
+                        .map_err(|_| ReadToEndError::Read(ReadError::ClosedStream))?;
+                }
+                if bytes.len() > size_limit {
+                    return Err(ReadToEndError::TooLong);
+                }
+                Ok(bytes)
+            }
+        }
+    }
+}
+
+impl AsyncRead for RecvStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Remote(stream) => AsyncRead::poll_read(Pin::new(stream), cx, buf),
+            Self::Local(Some(pipe)) => Pin::new(pipe).poll_read(cx, buf),
+            Self::Local(None) => Poll::Ready(Ok(())),
+        }
+    }
+}
+
+/// Opens a stream to this node itself. One pipe carries each direction; the
+/// far end is queued to the inbound stream handler like an accepted stream.
+pub(crate) fn open_loopback(
+    alpn: Alpn,
+    node_id: NodeId,
+    stream_handler: &mpsc::Sender<(Alpn, BiStream, NodeId)>,
+) -> Result<BiStream> {
+    let (outbound_send, inbound_recv) = tokio::io::duplex(LOOPBACK_PIPE_SIZE);
+    let (inbound_send, outbound_recv) = tokio::io::duplex(LOOPBACK_PIPE_SIZE);
+    let inbound = BiStream(
+        SendStream::Local(Some(inbound_send)),
+        RecvStream::Local(Some(inbound_recv)),
+        None,
+    );
+    stream_handler
+        .try_send((alpn, inbound, node_id))
+        .map_err(|error| NetError::Stream(format!("loopback {alpn} stream not queued: {error}")))?;
+    Ok(BiStream(
+        SendStream::Local(Some(outbound_send)),
+        RecvStream::Local(Some(outbound_recv)),
+        None,
+    ))
+}
 
 #[derive(Debug)]
 pub struct BiStream(
@@ -378,7 +525,11 @@ impl StreamsService {
                         duration_ms = duration_ms(elapsed),
                         "Completed Iroh stream open phase"
                     );
-                    BiStream(stream.0, stream.1, Some(conn))
+                    BiStream(
+                        SendStream::Remote(stream.0),
+                        RecvStream::Remote(stream.1),
+                        Some(conn),
+                    )
                 }
                 Ok(Err(error)) => {
                     let elapsed = open_started.elapsed();
@@ -457,7 +608,11 @@ impl std::fmt::Debug for StreamsService {
 )]
 pub async fn run_accept_loop(
     endpoint: Endpoint,
-    dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
+    dht_handler: mpsc::Sender<(
+        iroh::endpoint::SendStream,
+        iroh::endpoint::RecvStream,
+        NodeId,
+    )>,
     stream_handler: mpsc::Sender<(Alpn, BiStream, NodeId)>,
     document_sync: std::sync::Arc<DocumentSyncService>,
     inbound_admission: InboundAdmission,
@@ -633,7 +788,11 @@ pub async fn run_accept_loop(
 async fn run_admitted(
     conn: Connection,
     alpn: Alpn,
-    dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
+    dht_handler: mpsc::Sender<(
+        iroh::endpoint::SendStream,
+        iroh::endpoint::RecvStream,
+        NodeId,
+    )>,
     stream_handler: mpsc::Sender<(Alpn, BiStream, NodeId)>,
     document_sync: std::sync::Arc<DocumentSyncService>,
     peer_id: NodeId,
@@ -678,7 +837,11 @@ fn stream_frames(conn: &Connection) -> u64 {
 
 async fn run_dht_connection(
     conn: Connection,
-    dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
+    dht_handler: mpsc::Sender<(
+        iroh::endpoint::SendStream,
+        iroh::endpoint::RecvStream,
+        NodeId,
+    )>,
     peer_id: NodeId,
 ) {
     let mut timers = ConnectionTimers::new();
@@ -732,7 +895,11 @@ async fn run_dht_connection(
 async fn run_connection(
     conn: Connection,
     alpn: Alpn,
-    dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
+    dht_handler: mpsc::Sender<(
+        iroh::endpoint::SendStream,
+        iroh::endpoint::RecvStream,
+        NodeId,
+    )>,
     stream_handler: mpsc::Sender<(Alpn, BiStream, NodeId)>,
     document_sync: std::sync::Arc<DocumentSyncService>,
     peer_id: NodeId,
@@ -782,7 +949,11 @@ async fn run_app_connection(
             }
             incoming = conn.accept_bi() => match incoming {
                 Ok((send, recv)) => {
-                    match stream_handler.try_send((alpn, BiStream(send, recv, None), peer_id)) {
+                    match stream_handler.try_send((
+                        alpn,
+                        BiStream(SendStream::Remote(send), RecvStream::Remote(recv), None),
+                        peer_id,
+                    )) {
                         Ok(()) => timers.activity(),
                         Err(TrySendError::Full((_, mut stream, _))) => {
                             warn!(node_id = %peer_id, alpn = %alpn, "Dropping inbound app stream: queue full");

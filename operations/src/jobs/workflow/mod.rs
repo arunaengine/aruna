@@ -1079,6 +1079,12 @@ pub async fn supervise_and_finalize(
     .is_none()
     {
         info!(job_id = %job_id, "Execution supervisor superseded; abandoning");
+        return;
+    }
+    // The session outlives its end until here, so a client that reads or
+    // ends it during the teardown still gets the ended state, not 409.
+    if let (Some(session), Some(registry)) = (&session, context.compute_handle.as_ref()) {
+        registry.sessions().close(session.job_id());
     }
 }
 
@@ -3036,6 +3042,7 @@ mod tests {
             .unwrap();
         assert_eq!(stored.state, JobState::Succeeded);
         assert!(stored.report_digest.is_some());
+        assert!(registry.sessions().get(&job_id.to_string()).is_none());
         let report = crate::jobs::service::read_owned_report(
             &ctx,
             stored.created_by,
