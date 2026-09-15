@@ -7,7 +7,7 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{
     PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
 };
-use crate::blob::permission_paths::ResolveBlobPermissionPathsOperation;
+use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::driver::{
     DriverContext, drive, gate_context, node_routing, now_ms, quota_marked_routing,
 };
@@ -23,33 +23,29 @@ use crate::node::usage_stats::refresh_usage_targets;
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::process_placements::reconcile_shard_topics;
-use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
-use crate::replication::bao_read::IncomingBaoReadOperation;
-use crate::replication::incoming_version::{
-    IncomingVersionReplicationOperation, IncomingVersionReplicationResult,
-};
+use crate::replication::bao_read::IncomingBaoOperation;
+use crate::replication::incoming_version::{IncomingVersionOperation, IncomingVersionResult};
 use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::{
     BaoReadRequest, LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
 };
-use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use crate::sync::document_outbox::{
     new_identified_record, schedule_drain_effect, write_outbox_effect,
 };
 use crate::tasks::queue_backoff::retry_delay_ms;
 use aruna_core::alpn::Alpn;
-use aruna_core::document::{
-    DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
-};
+use aruna_core::document::{DocumentEvictedDocument, DocumentReconcileResult, DocumentTarget};
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::{
-    AuthContext, HashPathIndexKey, Permission, RealmId, ReplicationItemKind, RoCrateLimits,
-    WatchEvent, WatchEventDetail, WatchEventKind, bucket_permission_path, object_permission_path,
+    AuthContext, HashIndex, Permission, RealmId, ReplicationItemKind, RoCrateLimits, WatchEvent,
+    WatchEventDetail, WatchEventKind, bucket_permission_path, object_permission_path,
     watch_resource_path,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
@@ -68,7 +64,7 @@ const INBOUND_BAO_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 struct OperationsInboundHandler {
     context: Arc<DriverContext>,
-    document_sync_reconcile: Arc<DocumentSyncReconcileCoalescer>,
+    document_sync_reconcile: Arc<DocumentReconcileCoalescer>,
     rocrate_limits: RoCrateLimits,
     jobs_runtime: Arc<JobsRuntime>,
 }
@@ -80,8 +76,7 @@ impl OperationsInboundHandler {
         jobs_runtime: Arc<JobsRuntime>,
         shutdown: Shutdown,
     ) -> Self {
-        let document_sync_reconcile =
-            Arc::new(DocumentSyncReconcileCoalescer::new(shutdown.clone()));
+        let document_sync_reconcile = Arc::new(DocumentReconcileCoalescer::new(shutdown.clone()));
         spawn_queue_gauge(Arc::downgrade(&document_sync_reconcile), &shutdown);
         Self {
             context,
@@ -100,12 +95,7 @@ impl OperationsInboundHandler {
         local: NodeId,
         peer: NodeId,
     ) -> Option<BaoAdmission> {
-        let config = match drive(
-            GetRealmConfigOperation::new(realm_id),
-            self.context.as_ref(),
-        )
-        .await
-        {
+        let config = match drive(GetConfigOperation::new(realm_id), self.context.as_ref()).await {
             Ok(config) => config,
             Err(error) => {
                 warn!(peer = %peer, error = %error, "Failed to read realm config for replication gate");
@@ -150,7 +140,7 @@ impl OperationsInboundHandler {
     /// Executes the manifest/reference-advance family for an admitted infra
     /// peer: routing, request policy, placement gate, and the watch emitted on
     /// success. Every refusal here closes the registered bao stream.
-    async fn handle_inbound_version_replication(
+    async fn accept_version_replication(
         &self,
         blob_handle: &aruna_blob::blob::BlobHandle,
         realm_id: RealmId,
@@ -213,13 +203,12 @@ impl OperationsInboundHandler {
                 return;
             }
         };
-        let mut op =
-            IncomingVersionReplicationOperation::new(stream_id, local_node, realm_id, manifest)
-                .with_routing(routing)
-                .with_rocrate_limits(self.rocrate_limits.clone())
-                .with_publisher_node(peer)
-                .with_manifest_policy(manifest_path)
-                .with_writer_policy(writer_path);
+        let mut op = IncomingVersionOperation::new(stream_id, local_node, realm_id, manifest)
+            .with_routing(routing)
+            .with_rocrate_limits(self.rocrate_limits.clone())
+            .with_publisher_node(peer)
+            .with_manifest_policy(manifest_path)
+            .with_writer_policy(writer_path);
         if let Some(gate) = gate {
             op = op.with_gate(gate);
         }
@@ -237,7 +226,7 @@ impl OperationsInboundHandler {
 
     /// Answers the bao read family: policy resolution, then the read operation;
     /// a policy or drive failure refuses the stream.
-    async fn answer_inbound_bao_read(
+    async fn answer_bao_read(
         &self,
         blob_handle: &aruna_blob::blob::BlobHandle,
         realm_id: RealmId,
@@ -260,7 +249,7 @@ impl OperationsInboundHandler {
                     return;
                 }
             };
-        let op = IncomingBaoReadOperation::new(peer, local_node, realm_id, stream_id, request)
+        let op = IncomingBaoOperation::new(peer, local_node, realm_id, stream_id, request)
             .with_policy_paths(policy_paths)
             .with_policy_candidates(policy_candidates, had_denial)
             .with_now(now_ms())
@@ -373,7 +362,7 @@ impl OperationsInboundHandler {
                             close_failed_bao(&blob_handle, stream_id).await;
                             return;
                         }
-                        self.handle_inbound_version_replication(
+                        self.accept_version_replication(
                             &blob_handle,
                             realm_id,
                             local_node,
@@ -384,7 +373,7 @@ impl OperationsInboundHandler {
                         .await;
                     }
                     Ok(VersionReplicationMessage::BaoReadRequest(request)) => {
-                        self.answer_inbound_bao_read(
+                        self.answer_bao_read(
                             &blob_handle,
                             realm_id,
                             local_node,
@@ -439,7 +428,7 @@ impl OperationsInboundHandler {
 
     /// Reconciles the topics an admitted document sync stream touched; refusals
     /// fall back to the coalesced reconcile without panicking the peer.
-    async fn handle_document_sync_stream(&self, stream: BiStream, node_id: NodeId) {
+    async fn accept_document_sync(&self, stream: BiStream, node_id: NodeId) {
         let Some(net_handle) = self.context.net_handle.clone() else {
             warn!(peer = %node_id, "Dropping inbound document sync stream without net handle");
             return;
@@ -495,7 +484,7 @@ async fn emit_replication_watch(
     context: &DriverContext,
     node_id: aruna_core::NodeId,
     manifest: &VersionReplicationManifest,
-    result: &IncomingVersionReplicationResult,
+    result: &IncomingVersionResult,
 ) {
     let Some(group_id) = result.group_id else {
         return;
@@ -563,14 +552,9 @@ async fn manifest_policy(
     local_node: NodeId,
     manifest: &VersionReplicationManifest,
 ) -> Result<(Option<String>, Option<String>), String> {
-    let group_id = match drive(
-        GetBucketInfoOperation::new(manifest.bucket.clone()),
-        context,
-    )
-    .await
-    {
+    let group_id = match drive(GetBucketOperation::new(manifest.bucket.clone()), context).await {
         Ok(info) => info.group_id,
-        Err(GetBucketInfoError::NotFound) => manifest.group_id,
+        Err(GetBucketError::NotFound) => manifest.group_id,
         Err(error) => return Err(error.to_string()),
     };
     let path = if manifest.key.is_empty() {
@@ -629,7 +613,7 @@ async fn bao_policy(
     local_realm: RealmId,
     local_node: NodeId,
     request: &crate::replication::protocol::BaoReadRequest,
-) -> Result<(HashSet<String>, Vec<HashPathIndexKey>, bool), String> {
+) -> Result<(HashSet<String>, Vec<HashIndex>, bool), String> {
     let mut paths = HashSet::new();
     if request.realm_id != local_realm || !auth_matches(&request.auth_context, request.realm_id) {
         return Ok((paths, Vec::new(), false));
@@ -640,9 +624,9 @@ async fn bao_policy(
                 return Ok((paths, Vec::new(), false));
             }
             let group_id =
-                match drive(GetBucketInfoOperation::new(target.bucket.clone()), context).await {
+                match drive(GetBucketOperation::new(target.bucket.clone()), context).await {
                     Ok(info) => info.group_id,
-                    Err(GetBucketInfoError::NotFound) => {
+                    Err(GetBucketError::NotFound) => {
                         return Ok((paths, Vec::new(), false));
                     }
                     Err(error) => return Err(error.to_string()),
@@ -668,7 +652,7 @@ async fn bao_policy(
             Ok((paths, Vec::new(), false))
         }
         crate::replication::protocol::BaoReadTarget::Blake3(hash) => {
-            let candidates = drive(ResolveBlobPermissionPathsOperation::new(*hash), context)
+            let candidates = drive(ResolvePathsOperation::new(*hash), context)
                 .await
                 .map_err(|error| error.to_string())?;
             let mut unique = BTreeMap::new();
@@ -731,19 +715,19 @@ async fn bao_policy(
 // Coalesces concurrent inbound reconcile triggers: one run in flight, all
 // further triggers fold their topic sets into a single queued re-run.
 #[derive(Debug, Default)]
-struct DocumentSyncReconcileCoalescer {
-    state: Mutex<DocumentSyncReconcileQueue>,
+struct DocumentReconcileCoalescer {
+    state: Mutex<DocumentReconcileQueue>,
     shutdown: Shutdown,
 }
 
 #[derive(Debug, Default)]
-struct DocumentSyncReconcileQueue {
+struct DocumentReconcileQueue {
     running: bool,
     queued: BTreeSet<irokle::TopicId>,
     queued_since: Option<Instant>,
 }
 
-impl DocumentSyncReconcileCoalescer {
+impl DocumentReconcileCoalescer {
     fn new(shutdown: Shutdown) -> Self {
         Self {
             state: Mutex::default(),
@@ -822,7 +806,7 @@ impl DocumentSyncReconcileCoalescer {
 
 // Emits a `queue.lag` line every tick while the coalescer holds queued topics
 // or a reconcile run is in flight, plus one final line once it drains.
-fn spawn_queue_gauge(coalescer: Weak<DocumentSyncReconcileCoalescer>, shutdown: &Shutdown) {
+fn spawn_queue_gauge(coalescer: Weak<DocumentReconcileCoalescer>, shutdown: &Shutdown) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
@@ -881,7 +865,7 @@ async fn reconcile_inbound_topics(
     let realm_config_changed = targets
         .targets
         .iter()
-        .any(|target| matches!(target, DocumentSyncTarget::RealmConfig { .. }));
+        .any(|target| matches!(target, DocumentTarget::RealmConfig { .. }));
     if realm_config_changed {
         // Transition-free: a heavy transition step here would stall document
         // application; the reconcile arms the SyncPlacements timer instead.
@@ -948,7 +932,7 @@ impl IncomingFixture {
 /// Installs a handler under fixture-owned lifecycle owners; bind the fixture
 /// and call [`IncomingFixture::stop`] to deregister and drain before dropping
 /// test storage. Startup uses [`initialize_net_holder`] with the node owners.
-pub fn initialize_net_incoming_for_tests(context: Arc<DriverContext>) -> Option<IncomingFixture> {
+pub fn initialize_incoming_fixture(context: Arc<DriverContext>) -> Option<IncomingFixture> {
     let net_handle = context.net_handle.clone()?;
     let shutdown = Shutdown::new();
     let jobs_runtime = JobsRuntime::new();
@@ -1025,7 +1009,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                     Box::pin(self.handle_bao_stream(stream, node_id)).await;
                 }
                 Alpn::DocumentSync => {
-                    Box::pin(self.handle_document_sync_stream(stream, node_id)).await;
+                    Box::pin(self.accept_document_sync(stream, node_id)).await;
                 }
                 Alpn::Metadata => {
                     Box::pin(self.handle_metadata_stream(stream, node_id)).await;
@@ -1084,7 +1068,7 @@ impl InboundEventHandler for OperationsInboundHandler {
         .await;
     }
 
-    async fn handle_evicted_documents(&self, documents: Vec<DocumentSyncEvictedDocument>) -> bool {
+    async fn handle_evicted_documents(&self, documents: Vec<DocumentEvictedDocument>) -> bool {
         reemit_evicted_documents(self.context.as_ref(), documents).await
     }
 }
@@ -1108,7 +1092,7 @@ fn close_bao_stream(mut stream: BiStream) {
 /// is minted. Returns whether every record is durable; otherwise the journal is kept.
 async fn reemit_evicted_documents(
     context: &DriverContext,
-    documents: Vec<DocumentSyncEvictedDocument>,
+    documents: Vec<DocumentEvictedDocument>,
 ) -> bool {
     let Some(net_handle) = context.net_handle.as_ref() else {
         warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, "Cannot re-emit evicted documents without net handle");
@@ -1166,7 +1150,7 @@ async fn reemit_evicted_documents(
     complete
 }
 
-async fn project_inbound_events(context: &DriverContext, reconciled: DocumentSyncReconcileResult) {
+async fn project_inbound_events(context: &DriverContext, reconciled: DocumentReconcileResult) {
     if !reconciled.metadata_create_events.is_empty() {
         let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
         if let Err(error) =
@@ -1183,7 +1167,7 @@ async fn project_inbound_events(context: &DriverContext, reconciled: DocumentSyn
 
     let mut targets = Vec::new();
     for target in reconciled.targets {
-        let DocumentSyncTarget::MetadataCreateEvent {
+        let DocumentTarget::MetadataCreateEvent {
             document_id,
             event_id,
             ..
@@ -1210,7 +1194,7 @@ async fn schedule_projection_retry(context: &DriverContext) {
 
 fn schedule_sync_maintenance(
     context: Arc<DriverContext>,
-    coalescer: Weak<DocumentSyncReconcileCoalescer>,
+    coalescer: Weak<DocumentReconcileCoalescer>,
     metadata_handle: MetadataHandle,
     shutdown: &Shutdown,
 ) {
@@ -1321,7 +1305,7 @@ mod tests {
             user_id: aruna_core::UserId::nil(realm_id),
             realm_id,
         };
-        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let target = DocumentTarget::RealmConfig { realm_id };
         storage
             .send_storage_effect(aruna_core::effects::StorageEffect::Write {
                 key_space: target.storage_keyspace().to_string(),
@@ -1598,7 +1582,7 @@ mod tests {
             });
 
             let fixture =
-                initialize_net_incoming_for_tests(context.clone()).expect("net handle installs");
+                initialize_incoming_fixture(context.clone()).expect("net handle installs");
             assert!(fixture.installed(), "handler registered on the net handle");
             // The gauge and the periodic maintenance loop are both tracked.
             assert!(fixture.shutdown().tracked_children() >= 2);
@@ -1633,8 +1617,8 @@ mod tests {
 
         project_inbound_events(
             &context,
-            DocumentSyncReconcileResult {
-                targets: vec![DocumentSyncTarget::MetadataCreateEvent {
+            DocumentReconcileResult {
+                targets: vec![DocumentTarget::MetadataCreateEvent {
                     document_id,
                     event_id,
                 }],
@@ -1686,22 +1670,23 @@ mod tests {
             let dir_b = tempdir().unwrap();
             let storage_a = FjallStorage::open(dir_a.path().to_str().unwrap()).unwrap();
             let storage_b = FjallStorage::open(dir_b.path().to_str().unwrap()).unwrap();
-            let config = || NetConfig {
+            let realm_id = RealmId::from_bytes([8u8; 32]);
+            let config = |realm_id: RealmId| NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
+                realm_id,
                 discovery_method: DiscoveryMethod::None,
                 relay_method: RelayMethod::None,
                 ..NetConfig::default()
             };
-            let net_a = aruna_net::NetHandle::new(config(), storage_a)
+            let net_a = aruna_net::NetHandle::new(config(realm_id), storage_a)
                 .await
                 .unwrap();
-            let net_b = aruna_net::NetHandle::new(config(), storage_b.clone())
+            let net_b = aruna_net::NetHandle::new(config(realm_id), storage_b.clone())
                 .await
                 .unwrap();
             net_a.add_peer_addr(net_b.endpoint_addr()).await;
             net_b.add_peer_addr(net_a.endpoint_addr()).await;
 
-            let realm_id = RealmId::from_bytes([8u8; 32]);
             let mut realm =
                 aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
             realm.ensure_node(net_b.node_id(), aruna_core::structs::RealmNodeKind::Server);
@@ -1719,7 +1704,7 @@ mod tests {
                 user_id: owner,
                 realm_id,
             };
-            let realm_target = DocumentSyncTarget::RealmConfig { realm_id };
+            let realm_target = DocumentTarget::RealmConfig { realm_id };
             storage_b
                 .send_storage_effect(aruna_core::effects::StorageEffect::Write {
                     key_space: realm_target.storage_keyspace().to_string(),
@@ -1807,10 +1792,13 @@ mod tests {
             self.handler
                 .handle_incoming_stream(alpn, stream, peer)
                 .await;
-            let reply = tokio::time::timeout(Duration::from_millis(250), outbound.1.read_to_end(1))
-                .await
-                .expect("protocol reply arrived")
-                .expect("reply stream readable");
+            let reply = tokio::time::timeout(
+                Duration::from_millis(250),
+                outbound.1.read_to_end(64 * 1024),
+            )
+            .await
+            .expect("protocol reply arrived")
+            .expect("reply stream readable");
             assert!(
                 !reply.is_empty(),
                 "BR-003_EXPECT_REPLY: routed message closed without a protocol reply"
@@ -1827,7 +1815,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_device_replication_family_messages() {
+    async fn refuses_device_family() {
         let mut boundary = BaoBoundary::start(true).await;
         let manifest = VersionReplicationMessage::VersionManifest(VersionReplicationManifest {
             bucket: "bucket".to_string(),
@@ -1871,7 +1859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_malformed_and_oversized_bao_frames() {
+    async fn bao_frame_validation() {
         let mut boundary = BaoBoundary::start(false).await;
         let mut malformed = 8u32.to_be_bytes().to_vec();
         malformed.extend_from_slice(b"x");
@@ -1887,7 +1875,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn answers_accepted_location_summary() {
+    async fn answers_location_summary() {
         let mut boundary = BaoBoundary::start(false).await;
         let realm_id = RealmId::from_bytes([8u8; 32]);
         // The bucket record names a group with no authorization document in
@@ -1932,20 +1920,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_bao_stream_drops_the_handler_future() {
+    async fn cancel_drops_handler() {
         let mut boundary = BaoBoundary::start(false).await;
-        let outbound = boundary
+        let mut outbound = boundary
             .net_a
             .open_stream(boundary.net_b.node_id(), Alpn::Bao)
             .await
             .unwrap();
+        // One byte surfaces the stream without completing a frame, so the
+        // handler is inside its bounded read when the outer timeout drops it.
+        outbound.0.write_all(&[0u8]).await.unwrap();
         let (alpn, stream, peer) =
             tokio::time::timeout(Duration::from_secs(5), boundary.inbound.recv())
                 .await
                 .expect("inbound stream captured")
                 .expect("inbound stream channel open");
-        // No frame follows, so the handler is inside its bounded read; the
-        // timeout drops the single handler future before any family ran.
         let cancelled = tokio::time::timeout(
             Duration::from_millis(200),
             boundary.handler.handle_incoming_stream(alpn, stream, peer),
@@ -1958,7 +1947,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bao_read_policy_requires_local_identity() {
+    async fn foreign_reads_denied() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
