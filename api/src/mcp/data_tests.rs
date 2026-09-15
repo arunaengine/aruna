@@ -59,13 +59,13 @@ fn object_error_forbidden() {
 #[test]
 fn bucket_error_maps() {
     assert!(
-        body(map_bucket_error(GetBucketInfoError::NotFound))["error"]
+        body(map_bucket_error(GetBucketError::NotFound))["error"]
             .as_str()
             .unwrap_or_default()
             .contains("list_buckets")
     );
     assert_eq!(
-        body(map_bucket_error(GetBucketInfoError::Incomplete))["code"],
+        body(map_bucket_error(GetBucketError::Incomplete))["code"],
         "Internal error"
     );
 }

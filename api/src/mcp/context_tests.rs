@@ -60,11 +60,11 @@ fn map_role_permissions() {
 #[test]
 fn maps_user_error() {
     assert_eq!(
-        body(map_user_error(ReadUserDocumentError::NotFound))["code"],
+        body(map_user_error(ReadUserError::NotFound))["code"],
         "Not found"
     );
     assert_eq!(
-        body(map_user_error(ReadUserDocumentError::NotFinished))["code"],
+        body(map_user_error(ReadUserError::NotFinished))["code"],
         "Internal error"
     );
 }
