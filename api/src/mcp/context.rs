@@ -8,8 +8,8 @@ use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::metadata::stats::count_group_purpose;
-use aruna_operations::realm::read_authorization::ReadRealmAuthorizationOperation;
-use aruna_operations::users::read_document::{ReadUserDocumentError, ReadUserDocumentOperation};
+use aruna_operations::realm::read_authorization::ReadAuthorizationOperation;
+use aruna_operations::users::read_document::{ReadUserError, ReadUserOperation};
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
@@ -100,15 +100,12 @@ impl McpServer {
     ) -> Result<Json<WhoamiOutput>, CallToolResult> {
         let auth = request_auth(&parts)?;
         authorize_read(self, &auth, empty_extras("whoami")).await?;
-        let user = drive(
-            ReadUserDocumentOperation::new(auth.user_id),
-            &self.state.get_ctx(),
-        )
-        .await
-        .map_err(map_user_error)?;
+        let user = drive(ReadUserOperation::new(auth.user_id), &self.state.get_ctx())
+            .await
+            .map_err(map_user_error)?;
         let groups = member_groups(self, &auth).await?;
         let realm = drive(
-            ReadRealmAuthorizationOperation::new(self.state.get_realm_id()),
+            ReadAuthorizationOperation::new(self.state.get_realm_id()),
             &self.state.get_ctx(),
         )
         .await
@@ -394,21 +391,22 @@ fn map_role(role: Role) -> RoleOutput {
     }
 }
 
-fn map_user_error(error: ReadUserDocumentError) -> CallToolResult {
+fn map_user_error(error: ReadUserError) -> CallToolResult {
     match error {
-        ReadUserDocumentError::NotFound => server_error(crate::error::ServerError::NotFound),
-        ReadUserDocumentError::StorageError(error) => internal_error(error),
-        ReadUserDocumentError::ConversionError(error) => internal_error(error),
-        ReadUserDocumentError::UnexpectedEvent {
+        ReadUserError::NotFound => server_error(crate::error::ServerError::NotFound),
+        ReadUserError::StorageError(error) => internal_error(error),
+        ReadUserError::ConversionError(error) => internal_error(error),
+        ReadUserError::UnexpectedEvent {
             state,
             expected,
             got,
         } => internal_error(format!(
             "unexpected user read event in {state}: expected {expected}, got {got}"
         )),
-        ReadUserDocumentError::NotFinished => internal_error("user read did not finish"),
+        ReadUserError::NotFinished => internal_error("user read did not finish"),
     }
 }
 
 #[cfg(test)]
+#[path = "context_tests.rs"]
 mod pure_tests;
