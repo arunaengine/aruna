@@ -1,4 +1,4 @@
-use super::access_index::{decode_index, encode_index, owner_key};
+use super::index::{decode_index, encode_index, owner_key};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RevokeUserAccessState {
+pub enum RevokeUserState {
     Init,
     StartTransaction,
     ReadUserAccess,
@@ -24,7 +24,7 @@ pub enum RevokeUserAccessState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum RevokeUserAccessError {
+pub enum RevokeUserError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -42,33 +42,33 @@ pub enum RevokeUserAccessError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct RevokeUserAccessOperation {
+pub struct RevokeUserOperation {
     access_key: String,
-    state: RevokeUserAccessState,
+    state: RevokeUserState,
     txn_id: Option<ulid::Ulid>,
     access: Option<UserAccess>,
-    output: Option<Result<UserAccess, RevokeUserAccessError>>,
+    output: Option<Result<UserAccess, RevokeUserError>>,
 }
 
-impl RevokeUserAccessOperation {
+impl RevokeUserOperation {
     pub fn new(access_key: String) -> Self {
         Self {
             access_key,
-            state: RevokeUserAccessState::Init,
+            state: RevokeUserState::Init,
             txn_id: None,
             access: None,
             output: None,
         }
     }
 
-    fn emit_error(&mut self, error: RevokeUserAccessError) -> Effects {
-        self.state = RevokeUserAccessState::Error;
+    fn emit_error(&mut self, error: RevokeUserError) -> Effects {
+        self.state = RevokeUserState::Error;
         self.output = Some(Err(error));
         self.abort()
     }
 
     fn handle_init(&mut self) -> Effects {
-        self.state = RevokeUserAccessState::StartTransaction;
+        self.state = RevokeUserState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
         })]
@@ -76,11 +76,11 @@ impl RevokeUserAccessOperation {
 
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(RevokeUserAccessError::InvalidOperationState);
+            return self.emit_error(RevokeUserError::InvalidOperationState);
         };
 
         self.txn_id = Some(txn_id);
-        self.state = RevokeUserAccessState::ReadUserAccess;
+        self.state = RevokeUserState::ReadUserAccess;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: USER_ACCESS_KEYSPACE.to_string(),
             key: self.access_key.as_bytes().into(),
@@ -90,10 +90,10 @@ impl RevokeUserAccessOperation {
 
     fn access_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(RevokeUserAccessError::InvalidOperationState);
+            return self.emit_error(RevokeUserError::InvalidOperationState);
         };
         let Some(value) = value else {
-            return self.emit_error(RevokeUserAccessError::NotFound);
+            return self.emit_error(RevokeUserError::NotFound);
         };
 
         let access = match UserAccess::from_bytes(value.as_ref()) {
@@ -101,12 +101,12 @@ impl RevokeUserAccessOperation {
             Err(err) => return self.emit_error(err.into()),
         };
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(RevokeUserAccessError::NoTransactionFound);
+            return self.emit_error(RevokeUserError::NoTransactionFound);
         };
-        self.state = RevokeUserAccessState::ReadOwnerIndex;
+        self.state = RevokeUserState::ReadOwnerIndex;
         self.access = Some(access);
         let Some(access) = self.access.as_ref() else {
-            return self.emit_error(RevokeUserAccessError::NotFound);
+            return self.emit_error(RevokeUserError::NotFound);
         };
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: USER_ACCESS_OWNER_KEYSPACE.to_string(),
@@ -117,17 +117,17 @@ impl RevokeUserAccessOperation {
 
     fn handle_index_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(RevokeUserAccessError::InvalidOperationState);
+            return self.emit_error(RevokeUserError::InvalidOperationState);
         };
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(RevokeUserAccessError::NoTransactionFound);
+            return self.emit_error(RevokeUserError::NoTransactionFound);
         };
         let mut index = match decode_index(value.as_ref()) {
             Ok(index) => index,
             Err(err) => return self.emit_error(err.into()),
         };
         let Some(mut access) = self.access.clone() else {
-            return self.emit_error(RevokeUserAccessError::NotFound);
+            return self.emit_error(RevokeUserError::NotFound);
         };
         let indexed = index.remove(&self.access_key);
         if access.revoked_at.is_none() {
@@ -138,7 +138,7 @@ impl RevokeUserAccessOperation {
         // A credential that still authenticates must always be revocable, so a
         // missing owner-index entry leaves nothing to repair and is skipped.
         if !indexed {
-            self.state = RevokeUserAccessState::DeleteUserAccess;
+            self.state = RevokeUserState::DeleteUserAccess;
             return smallvec![Effect::Storage(StorageEffect::Delete {
                 key_space: USER_ACCESS_KEYSPACE.to_string(),
                 key: self.access_key.as_bytes().into(),
@@ -149,7 +149,7 @@ impl RevokeUserAccessOperation {
             Ok(value) => value,
             Err(err) => return self.emit_error(err.into()),
         };
-        self.state = RevokeUserAccessState::WriteUserAccess;
+        self.state = RevokeUserState::WriteUserAccess;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes: vec![(
                 USER_ACCESS_OWNER_KEYSPACE.to_string(),
@@ -162,13 +162,13 @@ impl RevokeUserAccessOperation {
 
     fn access_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.emit_error(RevokeUserAccessError::InvalidOperationState);
+            return self.emit_error(RevokeUserError::InvalidOperationState);
         };
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(RevokeUserAccessError::NoTransactionFound);
+            return self.emit_error(RevokeUserError::NoTransactionFound);
         };
 
-        self.state = RevokeUserAccessState::DeleteUserAccess;
+        self.state = RevokeUserState::DeleteUserAccess;
         smallvec![Effect::Storage(StorageEffect::Delete {
             key_space: USER_ACCESS_KEYSPACE.to_string(),
             key: self.access_key.as_bytes().into(),
@@ -178,13 +178,13 @@ impl RevokeUserAccessOperation {
 
     fn handle_access_deleted(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
-            return self.emit_error(RevokeUserAccessError::InvalidOperationState);
+            return self.emit_error(RevokeUserError::InvalidOperationState);
         };
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(RevokeUserAccessError::NoTransactionFound);
+            return self.emit_error(RevokeUserError::NoTransactionFound);
         };
 
-        self.state = RevokeUserAccessState::CommitTransaction;
+        self.state = RevokeUserState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -192,7 +192,7 @@ impl RevokeUserAccessOperation {
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
-                self.state = RevokeUserAccessState::Finish;
+                self.state = RevokeUserState::Finish;
                 smallvec![]
             }
             Event::Storage(StorageEvent::Error { error }) => {
@@ -201,14 +201,14 @@ impl RevokeUserAccessOperation {
                 }
                 self.emit_error(error.into())
             }
-            _ => self.emit_error(RevokeUserAccessError::InvalidOperationState),
+            _ => self.emit_error(RevokeUserError::InvalidOperationState),
         }
     }
 }
 
-impl Operation for RevokeUserAccessOperation {
+impl Operation for RevokeUserOperation {
     type Output = UserAccess;
-    type Error = RevokeUserAccessError;
+    type Error = RevokeUserError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -216,30 +216,27 @@ impl Operation for RevokeUserAccessOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            RevokeUserAccessState::Init => self.handle_init(),
-            RevokeUserAccessState::StartTransaction => self.handle_transaction_started(event),
-            RevokeUserAccessState::ReadUserAccess => self.access_read(event),
-            RevokeUserAccessState::ReadOwnerIndex => self.handle_index_read(event),
-            RevokeUserAccessState::WriteUserAccess => self.access_written(event),
-            RevokeUserAccessState::DeleteUserAccess => self.handle_access_deleted(event),
-            RevokeUserAccessState::CommitTransaction => self.handle_transaction_committed(event),
-            RevokeUserAccessState::Finish => smallvec![],
-            RevokeUserAccessState::Error => self.abort(),
+            RevokeUserState::Init => self.handle_init(),
+            RevokeUserState::StartTransaction => self.handle_transaction_started(event),
+            RevokeUserState::ReadUserAccess => self.access_read(event),
+            RevokeUserState::ReadOwnerIndex => self.handle_index_read(event),
+            RevokeUserState::WriteUserAccess => self.access_written(event),
+            RevokeUserState::DeleteUserAccess => self.handle_access_deleted(event),
+            RevokeUserState::CommitTransaction => self.handle_transaction_committed(event),
+            RevokeUserState::Finish => smallvec![],
+            RevokeUserState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            RevokeUserAccessState::Finish | RevokeUserAccessState::Error
-        )
+        matches!(self.state, RevokeUserState::Finish | RevokeUserState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         match self.output {
             Some(Ok(value)) => Ok(value),
             Some(Err(error)) => Err(error),
-            None => Err(RevokeUserAccessError::NotFinished),
+            None => Err(RevokeUserError::NotFinished),
         }
     }
 
@@ -256,7 +253,7 @@ impl Operation for RevokeUserAccessOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::s3::access_index::{decode_index, encode_index, owner_key};
+    use crate::s3::access::index::{decode_index, encode_index, owner_key};
     use aruna_core::UserId;
     use aruna_core::structs::{RealmId, UserAccess};
     use aruna_storage::storage;
@@ -278,7 +275,7 @@ mod tests {
             issued_by,
             revoked_at: None,
         };
-        let mut op = RevokeUserAccessOperation::new(access.access_key.clone());
+        let mut op = RevokeUserOperation::new(access.access_key.clone());
         op.start();
         op.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::generate(),
@@ -319,7 +316,7 @@ mod tests {
             txn_id: Ulid::generate(),
         }));
         assert!(effects.is_empty());
-        assert_eq!(op.state, RevokeUserAccessState::Finish);
+        assert_eq!(op.state, RevokeUserState::Finish);
     }
 
     #[test]
@@ -337,7 +334,7 @@ mod tests {
             issued_by,
             revoked_at: None,
         };
-        let mut op = RevokeUserAccessOperation::new(access.access_key.clone());
+        let mut op = RevokeUserOperation::new(access.access_key.clone());
         op.start();
         op.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::generate(),
@@ -370,7 +367,7 @@ mod tests {
             }))
             .is_empty()
         );
-        assert_eq!(op.state, RevokeUserAccessState::Finish);
+        assert_eq!(op.state, RevokeUserState::Finish);
         assert!(matches!(
             op.finalize(),
             Ok(revoked) if revoked.revoked_at.is_some()
@@ -422,7 +419,7 @@ mod tests {
             })
             .await;
 
-        let result = drive(RevokeUserAccessOperation::new(access_key), &driver_ctx)
+        let result = drive(RevokeUserOperation::new(access_key), &driver_ctx)
             .await
             .unwrap();
         assert!(result.revoked_at.is_some());
