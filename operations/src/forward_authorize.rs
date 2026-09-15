@@ -2,10 +2,10 @@ use crate::auth::request_authorization::AuthorizeError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
-use crate::metadata::handle::MetadataWritePeerError;
-use crate::metadata::protocol::MetadataAuthToken;
+use crate::metadata::handle::WritePeerError;
+use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::protocol::MetadataWriteAuthError;
+use crate::metadata::protocol::WriteAuthError;
 use crate::placement::process_placements::load_realm_config;
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -51,7 +51,7 @@ pub(crate) async fn authorize_forwarded_pid(
     context: &Arc<DriverContext>,
     peer: NodeId,
     realm_id: RealmId,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<AuthContext, ForwardAuthError> {
     let Some(metadata_handle) = context.metadata_handle.as_ref() else {
         return Err(ForwardAuthError::Unavailable(
@@ -62,10 +62,8 @@ pub(crate) async fn authorize_forwarded_pid(
         .authorize_write_peer(peer, auth_token)
         .await
         .map_err(|error| match error {
-            MetadataWritePeerError::Unauthorized => ForwardAuthError::Unauthorized,
-            MetadataWritePeerError::Unavailable(error) => {
-                ForwardAuthError::Unavailable(error.to_string())
-            }
+            WritePeerError::Unauthorized => ForwardAuthError::Unauthorized,
+            WritePeerError::Unavailable(error) => ForwardAuthError::Unavailable(error.to_string()),
         })?;
     if auth.realm_id != realm_id {
         return Err(ForwardAuthError::Forbidden);
@@ -102,10 +100,8 @@ pub(crate) async fn authorize_forwarded_caller(
         .authorize_write_peer(peer, auth_token)
         .await
         .map_err(|error| match error {
-            MetadataWritePeerError::Unauthorized => ForwardAuthError::Unauthorized,
-            MetadataWritePeerError::Unavailable(error) => {
-                ForwardAuthError::Unavailable(error.to_string())
-            }
+            WritePeerError::Unauthorized => ForwardAuthError::Unauthorized,
+            WritePeerError::Unavailable(error) => ForwardAuthError::Unavailable(error.to_string()),
         })?;
     if auth.realm_id != realm_id {
         return Err(ForwardAuthError::Forbidden);
@@ -158,10 +154,10 @@ pub(crate) enum ForwardAuthError {
 pub(crate) fn forward_auth_error(error: ForwardAuthError) -> MetadataTransportMessage {
     match error {
         ForwardAuthError::Unauthorized => MetadataTransportMessage::ForwardedWriteDenied {
-            error: MetadataWriteAuthError::Unauthorized,
+            error: WriteAuthError::Unauthorized,
         },
         ForwardAuthError::Forbidden => MetadataTransportMessage::ForwardedWriteDenied {
-            error: MetadataWriteAuthError::Forbidden,
+            error: WriteAuthError::Forbidden,
         },
         ForwardAuthError::Unavailable(error) => {
             warn!(%error, "Forwarded metadata authorization is unavailable");

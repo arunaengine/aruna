@@ -1,13 +1,13 @@
 use super::routing::distinct_holders;
 use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::create_document::CreateMetadataDocumentError;
-use crate::metadata::delete_document::DeleteMetadataDocumentError;
+use crate::metadata::create_document::CreateDocumentError;
+use crate::metadata::delete_document::DeleteDocumentError;
 use crate::metadata::handle::MetadataRequestDelivery;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::protocol::MetadataWriteAuthError;
-use crate::metadata::update_document::UpdateMetadataDocumentError;
+use crate::metadata::protocol::WriteAuthError;
+use crate::metadata::update_document::UpdateDocumentError;
 use aruna_core::NodeId;
 use std::sync::Arc;
 use thiserror::Error;
@@ -23,11 +23,11 @@ pub enum MetadataWriteError {
     #[error("metadata document not found")]
     NotFound,
     #[error(transparent)]
-    Create(#[from] CreateMetadataDocumentError),
+    Create(#[from] CreateDocumentError),
     #[error(transparent)]
-    Update(#[from] UpdateMetadataDocumentError),
+    Update(#[from] UpdateDocumentError),
     #[error(transparent)]
-    Delete(#[from] DeleteMetadataDocumentError),
+    Delete(#[from] DeleteDocumentError),
     /// The write reached a node that cannot publish it and no holder accepted
     /// the forward. Loud by construction: never accepted, never deferred into an
     /// outbox that can only drain to a topic this node may not join.
@@ -91,10 +91,10 @@ pub(crate) async fn forward_to_holders(
             .await
         {
             Ok(MetadataTransportMessage::ForwardedWriteDenied {
-                error: MetadataWriteAuthError::Unauthorized,
+                error: WriteAuthError::Unauthorized,
             }) => return Err(MetadataWriteError::Unauthorized),
             Ok(MetadataTransportMessage::ForwardedWriteDenied {
-                error: MetadataWriteAuthError::Forbidden,
+                error: WriteAuthError::Forbidden,
             }) => return Err(MetadataWriteError::Forbidden),
             Ok(MetadataTransportMessage::ForwardedWriteNotFound) if tracks_not_found => {
                 not_found += 1;

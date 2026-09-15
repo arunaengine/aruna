@@ -9,8 +9,7 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::events::Event;
 use aruna_core::metadata::{
-    MetadataAuthToken, MetadataClockRelation, MetadataEffect, MetadataEvent,
-    compare_metadata_clocks,
+    AuthToken, MetadataClockRelation, MetadataEffect, MetadataEvent, compare_metadata_clocks,
 };
 use aruna_core::structs::{AuthContext, RealmConfigDocument, RealmId, SyncRefusal};
 use aruna_core::time::unix_timestamp_millis;
@@ -150,7 +149,7 @@ async fn ask_holders(
     };
     for holder in holders_for(plan, document_id) {
         let message = MetadataTransportMessage::FetchGraphState {
-            auth_token: MetadataAuthToken::internal(auth.clone()),
+            auth_token: AuthToken::internal(auth.clone()),
             document_id,
         };
         match metadata.request_forwarded_write(holder, message).await {

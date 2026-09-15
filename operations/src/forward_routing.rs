@@ -1,7 +1,7 @@
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::create_document::CreateMetadataDocumentConfig;
+use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::placement::holds_placement;
 use crate::placement::resolve_shard_holders;
@@ -52,7 +52,7 @@ pub async fn is_user_origin(
     local_node_id: NodeId,
 ) -> Result<bool, MetadataApiError> {
     let config = drive(
-        crate::realm::get_config::GetRealmConfigOperation::new(realm_id),
+        crate::realm::get_config::GetConfigOperation::new(realm_id),
         context.as_ref(),
     )
     .await
@@ -73,7 +73,7 @@ pub async fn origin_holds_document(
     document_id: Ulid,
 ) -> Result<bool, MetadataApiError> {
     let config = drive(
-        crate::realm::get_config::GetRealmConfigOperation::new(realm_id),
+        crate::realm::get_config::GetConfigOperation::new(realm_id),
         context.as_ref(),
     )
     .await
@@ -101,7 +101,7 @@ pub(crate) fn holds_metadata_id(
 /// create stamps exactly it, so the answering candidate cannot change placement.
 pub(crate) fn create_forward_holders(
     realm_config: &RealmConfigDocument,
-    config: &CreateMetadataDocumentConfig,
+    config: &CreateDocumentConfig,
     document_id: Ulid,
 ) -> Option<(PlacementRef, Vec<NodeId>)> {
     let placement = resolve_metadata_id(

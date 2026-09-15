@@ -8,7 +8,7 @@ use std::time::Duration;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE};
-use aruna_core::metadata::MetadataAuthToken;
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::{
     AuthContext, EntrySide, EntryState, FolderState, RealmId, SyncBase, SyncPullAck, SyncRefusal,
     SyncedBytes, SyncedFolder, VersionedObjectArn,
@@ -122,7 +122,7 @@ async fn forward_upload(
         session: None,
     };
     let message = MetadataTransportMessage::ForwardSyncPull {
-        auth_token: MetadataAuthToken::internal(auth),
+        auth_token: AuthToken::internal(auth),
         source: Box::new(source),
         blake3: upload.blake3,
         size: upload.size,
@@ -444,7 +444,7 @@ mod tests {
     use crate::device::sync::folders::store_folder;
     use crate::device::sync::repository::{base_key, read_value, upload_entry, write_rows};
     use crate::driver::DriverContext;
-    use crate::tests::fixtures::device::context;
+    use crate::tests::device::context;
     use aruna_core::keyspaces::SYNC_UPLOAD_OUTBOX_KEYSPACE;
     use aruna_core::structs::{FolderState, RealmId, SyncedFolder};
 

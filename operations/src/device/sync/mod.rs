@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::id::NodeId;
-use aruna_core::metadata::MetadataAuthToken;
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::{
     AuthContext, FolderState, Observed, RemoteBinding, RemoteHead, SyncListCursor, SyncPageLimit,
     SyncRefusal, SyncVersionPage, SyncedFolder,
@@ -325,7 +325,7 @@ pub(super) async fn request_versions(
         .request_forwarded_write(
             node_id,
             MetadataTransportMessage::ForwardListVersions {
-                auth_token: MetadataAuthToken::internal(auth),
+                auth_token: AuthToken::internal(auth),
                 bucket,
                 prefix,
                 cursor,

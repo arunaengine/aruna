@@ -23,7 +23,7 @@ use crate::device::publish_queue::{PublishEntry, PublishKind, PublishState};
 use crate::device::replica::{ReplicaRecord, mark_edited, store_replica};
 use crate::device::sync_status::read_publish_entries;
 use crate::driver::{DriverContext, drive};
-use crate::metadata::update_document::UpdateMetadataDocumentMutation;
+use crate::metadata::update_document::UpdateDocumentMutation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DeviceEditError {
@@ -55,7 +55,7 @@ pub async fn apply_local_edit(
     owner: UserId,
     node_id: NodeId,
     replica: &ReplicaRecord,
-    mutation: UpdateMetadataDocumentMutation,
+    mutation: UpdateDocumentMutation,
 ) -> Result<MetadataRegistryRecord, DeviceEditError> {
     let record = replica
         .record
@@ -100,15 +100,15 @@ pub async fn apply_local_edit(
 
 /// The submission behind an edit, or `None` for a mutation only a holder
 /// originates.
-fn authored_source(mutation: UpdateMetadataDocumentMutation) -> Option<MetadataBatchSource> {
+fn authored_source(mutation: UpdateDocumentMutation) -> Option<MetadataBatchSource> {
     match mutation {
-        UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld } => {
+        UpdateDocumentMutation::ReplaceRoCrate { jsonld } => {
             Some(MetadataBatchSource::ReplaceRoCrate { jsonld })
         }
-        UpdateMetadataDocumentMutation::UpsertDataEntity { jsonld } => {
+        UpdateDocumentMutation::UpsertDataEntity { jsonld } => {
             Some(MetadataBatchSource::UpsertDataEntity { jsonld })
         }
-        UpdateMetadataDocumentMutation::UpsertContextualEntity { jsonld } => {
+        UpdateDocumentMutation::UpsertContextualEntity { jsonld } => {
             Some(MetadataBatchSource::UpsertContextualEntity { jsonld })
         }
         _ => None,
@@ -279,8 +279,8 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::metadata::{
-        MetadataBatch, MetadataBatchSource, MetadataCreateCrateRequest, MetadataEffect,
-        MetadataEvent, MetadataGraphPolicy, MetadataRequestDurability,
+        MetadataBatch, MetadataBatchSource, MetadataCrateRequest, MetadataEffect, MetadataEvent,
+        MetadataGraphPolicy, MetadataRequestDurability,
     };
     use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use craqle::VectorClock;
@@ -383,7 +383,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .send_metadata_effect(MetadataEffect::CreateCrate {
-                    request: MetadataCreateCrateRequest {
+                    request: MetadataCrateRequest {
                         graph_iri: record.graph_iri.clone(),
                         name: "Notes".to_string(),
                         description: "Offline notes".to_string(),
@@ -443,7 +443,7 @@ mod tests {
                 owner,
                 node(1),
                 &replica,
-                crate::metadata::update_document::UpdateMetadataDocumentMutation::UpsertContextualEntity {
+                crate::metadata::update_document::UpdateDocumentMutation::UpsertContextualEntity {
                     jsonld: r##"{"@id":"#ada","@type":"Person","name":"Ada"}"##.to_string(),
                 },
             )
