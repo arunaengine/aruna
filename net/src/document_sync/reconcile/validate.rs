@@ -376,7 +376,7 @@ pub(in crate::document_sync) fn validate_config_authority(
             }
             _ => false,
         };
-        // D9: every holder acts. A barrier, proof, or stall names its own origin
+        // Every holder acts. A barrier, proof, or stall names its own origin
         // and moves no authority on its own, so a holder may emit it.
         let self_report = matches!(
             &event.op,
@@ -1133,11 +1133,11 @@ pub(in crate::document_sync) async fn read_group_authorization(
     .map_err(|error| NetError::Bootstrap(error.to_string()))
 }
 
-/// Validates one replicated administrative event. Authority comes from the
-/// origin's signature, never the transport publisher: a relay may carry an
-/// origin's event but cannot forge, re-target, or re-actor it.
+/// Shared admission prerequisites for every replicated admin event: the topic
+/// binding, origin signature, relay permission, actor pairing, and observed
+/// clock. `Accepted` means the event may reach its family decision.
 #[allow(clippy::too_many_arguments)]
-pub(in crate::document_sync) async fn validate_admin_event(
+async fn validate_admin_envelope(
     storage: &StorageHandle,
     topic_id: ::irokle::TopicId,
     authenticated_actor_id: ::irokle::ActorId,
@@ -1146,7 +1146,6 @@ pub(in crate::document_sync) async fn validate_admin_event(
     realm_id: RealmId,
     placement: &PlacementRef,
     origin_signature: &iroh::Signature,
-    config_cache: &mut ConfigValidationCache,
 ) -> Result<AdminEventValidation> {
     let reject = |reason: &str| Ok(AdminEventValidation::Rejected(reason.to_string()));
 
@@ -1181,6 +1180,294 @@ pub(in crate::document_sync) async fn validate_admin_event(
         != Some(event.origin_seq)
     {
         return reject("event origin sequence does not follow its observed clock");
+    }
+    Ok(AdminEventValidation::Accepted)
+}
+
+/// Whether the dispatched family agrees with both the sync target address and
+/// the payload's declared target.
+fn family_matches_targets(
+    family: AdminOperationFamily,
+    target: &DocumentSyncTarget,
+    event_target: &AdminDocumentTarget,
+) -> bool {
+    matches!(
+        (family, target, event_target),
+        (
+            AdminOperationFamily::Group,
+            DocumentSyncTarget::GroupAuthorization { group_id },
+            AdminDocumentTarget::Group { group_id: event_group_id }
+        ) if group_id == event_group_id
+    ) || matches!(
+        (family, target, event_target),
+        (
+            AdminOperationFamily::RealmAuthorization,
+            DocumentSyncTarget::RealmAuthorization { realm_id },
+            AdminDocumentTarget::Realm { realm_id: event_realm_id }
+        ) if realm_id == event_realm_id
+    ) || matches!(
+        (family, target, event_target),
+        (
+            AdminOperationFamily::User,
+            DocumentSyncTarget::User { user_id },
+            AdminDocumentTarget::User { user_id: event_user_id }
+        ) if user_id == event_user_id
+    ) || matches!(
+        (family, target, event_target),
+        (
+            AdminOperationFamily::RealmConfig,
+            DocumentSyncTarget::RealmConfig { realm_id },
+            AdminDocumentTarget::RealmConfig { realm_id: event_realm_id }
+        ) if realm_id == event_realm_id
+    )
+}
+
+/// Whether a payload target realm and any realm-scoped placement binding agree
+/// with the event actor's realm.
+fn validate_event_scope(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
+    let target_realm = match &event.target {
+        AdminDocumentTarget::Realm { realm_id } | AdminDocumentTarget::RealmConfig { realm_id } => {
+            Some(*realm_id)
+        }
+        AdminDocumentTarget::User { user_id } => Some(user_id.realm_id),
+        AdminDocumentTarget::Group { .. } => None,
+    };
+    if target_realm.is_some_and(|realm_id| realm_id != event.actor.realm_id) {
+        return Err("admin event target and actor realms do not match".to_string());
+    }
+    if matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding }
+            if matches!(
+                binding.scope,
+                aruna_core::structs::PlacementScope::Realm(binding_realm_id)
+                    if binding_realm_id != event.actor.realm_id
+            )
+    ) {
+        return Err("placement binding realm does not match the admin event target".to_string());
+    }
+    Ok(())
+}
+
+/// Whether a role assignment names a user in the event actor's realm.
+fn validate_role_assignment(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
+    match &event.op {
+        AdminDocumentOperation::GroupRoleUserAssignmentAdded { user_id, .. }
+        | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { user_id, .. }
+        | AdminDocumentOperation::RealmRoleUserAssignmentAdded { user_id, .. }
+        | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { user_id, .. }
+            if user_id.realm_id != event.actor.realm_id =>
+        {
+            Err("role assignment user belongs to a different realm".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Payload-shape rules for the group family: creation identity, role subtree
+/// confinement, assignment realms, and policy well-formedness.
+fn validate_group_shape(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
+    validate_role_assignment(event)?;
+    match &event.op {
+        AdminDocumentOperation::GroupCreated {
+            realm_id, owner, ..
+        } => {
+            if *realm_id != event.actor.realm_id
+                || owner.realm_id != *realm_id
+                || *owner != event.actor.user_id
+                || owner.is_nil()
+            {
+                return Err("group creation realm and owner must match the actor".to_string());
+            }
+        }
+        AdminDocumentOperation::GroupRoleCreated { role } => {
+            // Distributed events must enforce the same subtree confinement as
+            // local issuance; the publisher is not trusted to have done so.
+            let AdminDocumentTarget::Group { group_id } = &event.target else {
+                return Err("group role event target must be a group".to_string());
+            };
+            let subtree_root =
+                aruna_core::permission_path::role_subtree_root(event.actor.realm_id, group_id);
+            if role.permissions.keys().any(|pattern| {
+                !aruna_core::permission_path::role_path_confined(pattern, &subtree_root)
+            }) {
+                return Err("group role grants outside its group subtree".to_string());
+            }
+        }
+        AdminDocumentOperation::GroupPoliciesSet { policies } => {
+            if let Err(error) = aruna_core::request_policy::validate_policy_set(policies) {
+                return Err(format!("invalid policy set: {error}"));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Payload-shape rules for the realm-config family: compute, candidate maps,
+/// transitions, grants, labels, strategies, policies, and revocations.
+fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
+    match &event.op {
+        AdminDocumentOperation::RealmConfigComputeSet { compute } => {
+            // A malformed link or quota set would make every planner estimate
+            // meaningless, so it is refused before it reaches storage.
+            if compute.validate().is_err() {
+                return Err("realm compute configuration is malformed".to_string());
+            }
+        }
+        AdminDocumentOperation::RealmConfigCandidateMapPublished { map } => {
+            let mut seen = std::collections::BTreeSet::new();
+            if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
+                return Err("candidate placement map is malformed".to_string());
+            }
+        }
+        AdminDocumentOperation::RealmConfigActivationsInitialized {
+            candidate_map_epoch,
+            ..
+        } => {
+            if *candidate_map_epoch == 0 {
+                return Err("activation names no candidate map epoch".to_string());
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionStarted { plan } => {
+            let mut seen = std::collections::BTreeSet::new();
+            let well_formed = plan.limits.max_incomplete_buckets >= 1
+                && plan.target_map_epoch > 0
+                && !plan.buckets.is_empty()
+                && plan
+                    .buckets
+                    .iter()
+                    .all(|bucket| seen.insert(bucket.bucket) && !bucket.target_holders.is_empty());
+            if !well_formed {
+                return Err("placement transition plan is malformed".to_string());
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            reported_by,
+            frontier,
+            ..
+        } => {
+            if *reported_by != event.origin_node_id {
+                return Err("transition report does not come from the node it names".to_string());
+            }
+            if frontier.len() > aruna_core::structs::MAX_BARRIER_FRONTIER_BYTES {
+                return Err("transition barrier frontier exceeds its size bound".to_string());
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionStallReported {
+            reported_by,
+            reason,
+            ..
+        } => {
+            if *reported_by != event.origin_node_id {
+                return Err("transition report does not come from the node it names".to_string());
+            }
+            if reason.len() > aruna_core::structs::MAX_STALL_REASON_BYTES {
+                return Err("transition stall reason exceeds its size bound".to_string());
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionDrainReported { reported_by, .. } => {
+            if *reported_by != event.origin_node_id {
+                return Err("transition report does not come from the node it names".to_string());
+            }
+        }
+        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            transition_id,
+            strategy_id,
+            proof,
+        } => {
+            // Verified here as well as in the reducer: a forged proof must never
+            // reach storage, and the publisher binding already fixed the origin.
+            if proof.holder != event.origin_node_id
+                || !proof.verify(event.actor.realm_id, *transition_id, *strategy_id)
+            {
+                return Err("transition completion proof does not verify".to_string());
+            }
+        }
+        AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
+            if let Some(label) = reserved_label(&entry.labels) {
+                return Err(format!(
+                    "placement entry must not set derived label {label}"
+                ));
+            }
+        }
+        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy }
+            if strategy.replica_count == Some(0) =>
+        {
+            return Err("placement strategy replica count must be greater than zero".to_string());
+        }
+        AdminDocumentOperation::RealmConfigPoliciesSet { policies } => {
+            if let Err(error) = aruna_core::request_policy::validate_policy_set(policies) {
+                return Err(format!("invalid policy set: {error}"));
+            }
+        }
+        AdminDocumentOperation::RealmConfigTokenRevoked {
+            token_hash,
+            expires_at,
+            token_owner,
+            ..
+        } => {
+            if !aruna_core::auth::valid_token_hash(token_hash) {
+                return Err("revoked bearer token hash is malformed".to_string());
+            }
+            if !valid_revocation_expiry(*expires_at, unix_timestamp_secs()) {
+                return Err("revoked bearer token expiry exceeds the admission window".to_string());
+            }
+            if token_owner.is_nil() || token_owner.realm_id != event.actor.realm_id {
+                return Err("revoked bearer token owner is malformed".to_string());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Whether the reducer accepts the event; a rejected reduction is malformed
+/// input, never a family authority decision.
+fn accept_reducer_event(
+    previous_state: Option<AdminDocumentReducerState>,
+    event: &AdminDocumentEvent,
+) -> Result<AdminEventValidation> {
+    let mut reducer_state =
+        previous_state.unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+    match reducer_state.apply(event) {
+        Ok(_) => Ok(AdminEventValidation::Accepted),
+        Err(error) => Ok(AdminEventValidation::Rejected(format!(
+            "admin operation is malformed: {error}"
+        ))),
+    }
+}
+
+/// Validates one replicated administrative event. Authority comes from the
+/// origin's signature, never the transport publisher: a relay may carry an
+/// origin's event but cannot forge, re-target, or re-actor it.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::document_sync) async fn validate_admin_event(
+    storage: &StorageHandle,
+    topic_id: ::irokle::TopicId,
+    authenticated_actor_id: ::irokle::ActorId,
+    target: &DocumentSyncTarget,
+    event: &AdminDocumentEvent,
+    realm_id: RealmId,
+    placement: &PlacementRef,
+    origin_signature: &iroh::Signature,
+    config_cache: &mut ConfigValidationCache,
+) -> Result<AdminEventValidation> {
+    let reject = |reason: &str| Ok(AdminEventValidation::Rejected(reason.to_string()));
+
+    let admission = validate_admin_envelope(
+        storage,
+        topic_id,
+        authenticated_actor_id,
+        target,
+        event,
+        realm_id,
+        placement,
+        origin_signature,
+    )
+    .await?;
+    if !matches!(admission, AdminEventValidation::Accepted) {
+        return Ok(admission);
     }
 
     // This match is deliberately exhaustive. Adding an operation requires an
@@ -1243,238 +1530,21 @@ pub(in crate::document_sync) async fn validate_admin_event(
         }
     };
 
-    let target_matches = matches!(
-        (family, target, &event.target),
-        (
-            AdminOperationFamily::Group,
-            DocumentSyncTarget::GroupAuthorization { group_id },
-            AdminDocumentTarget::Group { group_id: event_group_id }
-        ) if group_id == event_group_id
-    ) || matches!(
-        (family, target, &event.target),
-        (
-            AdminOperationFamily::RealmAuthorization,
-            DocumentSyncTarget::RealmAuthorization { realm_id },
-            AdminDocumentTarget::Realm { realm_id: event_realm_id }
-        ) if realm_id == event_realm_id
-    ) || matches!(
-        (family, target, &event.target),
-        (
-            AdminOperationFamily::User,
-            DocumentSyncTarget::User { user_id },
-            AdminDocumentTarget::User { user_id: event_user_id }
-        ) if user_id == event_user_id
-    ) || matches!(
-        (family, target, &event.target),
-        (
-            AdminOperationFamily::RealmConfig,
-            DocumentSyncTarget::RealmConfig { realm_id },
-            AdminDocumentTarget::RealmConfig { realm_id: event_realm_id }
-        ) if realm_id == event_realm_id
-    );
-    if !target_matches {
+    if !family_matches_targets(family, target, &event.target) {
         return reject("operation, sync target, and admin event target do not match");
     }
+    if let Err(reason) = validate_event_scope(event) {
+        return reject(&reason);
+    }
 
-    let target_realm = match &event.target {
-        AdminDocumentTarget::Realm { realm_id } | AdminDocumentTarget::RealmConfig { realm_id } => {
-            Some(*realm_id)
-        }
-        AdminDocumentTarget::User { user_id } => Some(user_id.realm_id),
-        AdminDocumentTarget::Group { .. } => None,
+    let shape = match family {
+        AdminOperationFamily::Group => validate_group_shape(event),
+        AdminOperationFamily::RealmAuthorization => validate_role_assignment(event),
+        AdminOperationFamily::RealmConfig => validate_config_shape(event),
+        AdminOperationFamily::User => Ok(()),
     };
-    if target_realm.is_some_and(|realm_id| realm_id != event.actor.realm_id) {
-        return reject("admin event target and actor realms do not match");
-    }
-    if matches!(
-        &event.op,
-        AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding }
-            if matches!(
-                binding.scope,
-                aruna_core::structs::PlacementScope::Realm(binding_realm_id)
-                    if binding_realm_id != event.actor.realm_id
-            )
-    ) {
-        return reject("placement binding realm does not match the admin event target");
-    }
-
-    match &event.op {
-        AdminDocumentOperation::GroupJoinRequested { .. }
-        | AdminDocumentOperation::GroupJoinDecided { .. } => {}
-        AdminDocumentOperation::GroupCreated {
-            realm_id, owner, ..
-        } => {
-            if *realm_id != event.actor.realm_id
-                || owner.realm_id != *realm_id
-                || *owner != event.actor.user_id
-                || owner.is_nil()
-            {
-                return reject("group creation realm and owner must match the actor");
-            }
-        }
-        AdminDocumentOperation::GroupRoleUserAssignmentAdded { user_id, .. }
-        | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { user_id, .. }
-        | AdminDocumentOperation::RealmRoleUserAssignmentAdded { user_id, .. }
-        | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { user_id, .. } => {
-            if user_id.realm_id != event.actor.realm_id {
-                return reject("role assignment user belongs to a different realm");
-            }
-        }
-        AdminDocumentOperation::GroupRoleCreated { role } => {
-            // Distributed events must enforce the same subtree confinement as
-            // local issuance; the publisher is not trusted to have done so.
-            let AdminDocumentTarget::Group { group_id } = &event.target else {
-                return reject("group role event target must be a group");
-            };
-            let subtree_root =
-                aruna_core::permission_path::role_subtree_root(event.actor.realm_id, group_id);
-            if role.permissions.keys().any(|pattern| {
-                !aruna_core::permission_path::role_path_confined(pattern, &subtree_root)
-            }) {
-                return reject("group role grants outside its group subtree");
-            }
-        }
-        AdminDocumentOperation::GroupRoleAdded { .. }
-        | AdminDocumentOperation::GroupRoleRemoved { .. }
-        | AdminDocumentOperation::GroupDisplayNameSet { .. }
-        | AdminDocumentOperation::RealmRoleAdded { .. }
-        | AdminDocumentOperation::RealmRoleCreated { .. }
-        | AdminDocumentOperation::UserAttributeSet { .. }
-        | AdminDocumentOperation::UserAttributeRemoved { .. }
-        | AdminDocumentOperation::UserNameSet { .. }
-        | AdminDocumentOperation::UserSubjectIdAdded { .. }
-        | AdminDocumentOperation::UserSubjectIdRemoved { .. }
-        | AdminDocumentOperation::RealmConfigNodeEnsured { .. }
-        | AdminDocumentOperation::RealmConfigNodeRemoved { .. }
-        | AdminDocumentOperation::RealmConfigOidcProviderUpserted { .. }
-        | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
-        | AdminDocumentOperation::RealmConfigSettingsSet { .. }
-        | AdminDocumentOperation::RealmConfigDescriptionSet { .. }
-        | AdminDocumentOperation::RealmConfigQuotaSet { .. }
-        | AdminDocumentOperation::RealmConfigNodePlacementRemoved { .. }
-        | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
-        | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
-        | AdminDocumentOperation::RealmConfigJobFamilySet { .. }
-        | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
-        | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
-        | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
-        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
-        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. } => {}
-        AdminDocumentOperation::RealmConfigComputeSet { compute } => {
-            // A malformed link or quota set would make every planner estimate
-            // meaningless, so it is refused before it reaches storage.
-            if compute.validate().is_err() {
-                return reject("realm compute configuration is malformed");
-            }
-        }
-        AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
-        | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
-        | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
-        | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. } => {}
-        AdminDocumentOperation::RealmConfigCandidateMapPublished { map } => {
-            let mut seen = std::collections::BTreeSet::new();
-            if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
-                return reject("candidate placement map is malformed");
-            }
-        }
-        AdminDocumentOperation::RealmConfigActivationsInitialized {
-            candidate_map_epoch,
-            ..
-        } => {
-            if *candidate_map_epoch == 0 {
-                return reject("activation names no candidate map epoch");
-            }
-        }
-        AdminDocumentOperation::RealmConfigTransitionStarted { plan } => {
-            let mut seen = std::collections::BTreeSet::new();
-            let well_formed = plan.limits.max_incomplete_buckets >= 1
-                && plan.target_map_epoch > 0
-                && !plan.buckets.is_empty()
-                && plan
-                    .buckets
-                    .iter()
-                    .all(|bucket| seen.insert(bucket.bucket) && !bucket.target_holders.is_empty());
-            if !well_formed {
-                return reject("placement transition plan is malformed");
-            }
-        }
-        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
-            reported_by,
-            frontier,
-            ..
-        } => {
-            if *reported_by != event.origin_node_id {
-                return reject("transition report does not come from the node it names");
-            }
-            if frontier.len() > aruna_core::structs::MAX_BARRIER_FRONTIER_BYTES {
-                return reject("transition barrier frontier exceeds its size bound");
-            }
-        }
-        AdminDocumentOperation::RealmConfigTransitionStallReported {
-            reported_by,
-            reason,
-            ..
-        } => {
-            if *reported_by != event.origin_node_id {
-                return reject("transition report does not come from the node it names");
-            }
-            if reason.len() > aruna_core::structs::MAX_STALL_REASON_BYTES {
-                return reject("transition stall reason exceeds its size bound");
-            }
-        }
-        AdminDocumentOperation::RealmConfigTransitionDrainReported { reported_by, .. } => {
-            if *reported_by != event.origin_node_id {
-                return reject("transition report does not come from the node it names");
-            }
-        }
-        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
-            transition_id,
-            strategy_id,
-            proof,
-        } => {
-            // Verified here as well as in the reducer: a forged proof must never
-            // reach storage, and the publisher binding already fixed the origin.
-            if proof.holder != event.origin_node_id
-                || !proof.verify(event.actor.realm_id, *transition_id, *strategy_id)
-            {
-                return reject("transition completion proof does not verify");
-            }
-        }
-        AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
-            if let Some(label) = reserved_label(&entry.labels) {
-                return reject(&format!(
-                    "placement entry must not set derived label {label}"
-                ));
-            }
-        }
-        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy }
-            if strategy.replica_count == Some(0) =>
-        {
-            return reject("placement strategy replica count must be greater than zero");
-        }
-        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. } => {}
-        AdminDocumentOperation::RealmConfigPoliciesSet { policies }
-        | AdminDocumentOperation::GroupPoliciesSet { policies } => {
-            if let Err(error) = aruna_core::request_policy::validate_policy_set(policies) {
-                return reject(&format!("invalid policy set: {error}"));
-            }
-        }
-        AdminDocumentOperation::RealmConfigTokenRevoked {
-            token_hash,
-            expires_at,
-            token_owner,
-            ..
-        } => {
-            if !aruna_core::auth::valid_token_hash(token_hash) {
-                return reject("revoked bearer token hash is malformed");
-            }
-            if !valid_revocation_expiry(*expires_at, unix_timestamp_secs()) {
-                return reject("revoked bearer token expiry exceeds the admission window");
-            }
-            if token_owner.is_nil() || token_owner.realm_id != event.actor.realm_id {
-                return reject("revoked bearer token owner is malformed");
-            }
-        }
+    if let Err(reason) = shape {
+        return reject(&reason);
     }
 
     let previous_state = match family {
@@ -1523,15 +1593,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         return Ok(AdminEventValidation::Accepted);
     }
 
-    let mut reducer_state =
-        previous_state.unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
-    if let Err(error) = reducer_state.apply(event) {
-        return Ok(AdminEventValidation::Rejected(format!(
-            "admin operation is malformed: {error}"
-        )));
-    }
-
-    Ok(AdminEventValidation::Accepted)
+    accept_reducer_event(previous_state, event)
 }
 
 /// Who a transition report claims to be, against the named plan's roles.
