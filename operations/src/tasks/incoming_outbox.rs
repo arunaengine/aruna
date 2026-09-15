@@ -47,26 +47,26 @@ impl DrainSyncOutcome {
 
 pub(super) fn publish_from_outbox(
     event_id: ulid::Ulid,
-    target: DocumentSyncTarget,
-    event: DocumentSyncOutboxEvent,
+    target: DocumentTarget,
+    event: DocumentOutboxEvent,
     placement: aruna_core::structs::PlacementRef,
     allow_genesis: bool,
 ) -> DocumentSyncPublish {
     match event {
-        DocumentSyncOutboxEvent::Upsert { bytes, change } => DocumentSyncPublish::Upsert {
+        DocumentOutboxEvent::Upsert { bytes, change } => DocumentSyncPublish::Upsert {
             event_id,
             target,
             bytes,
             change,
             allow_genesis,
         },
-        DocumentSyncOutboxEvent::Delete { change } => DocumentSyncPublish::Delete {
+        DocumentOutboxEvent::Delete { change } => DocumentSyncPublish::Delete {
             event_id,
             target,
             change,
             allow_genesis,
         },
-        DocumentSyncOutboxEvent::AdminOperation {
+        DocumentOutboxEvent::AdminOperation {
             event,
             origin_signature,
         } => DocumentSyncPublish::AdminOperation {
@@ -83,7 +83,7 @@ pub(super) async fn load_drain_config(
     context: &Arc<DriverContext>,
     realm_id: aruna_core::structs::RealmId,
 ) -> Option<aruna_core::structs::RealmConfigDocument> {
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     match context
         .storage_handle
         .send_storage_effect(aruna_core::effects::StorageEffect::Read {
@@ -104,7 +104,7 @@ pub(super) async fn load_drain_config(
 /// config. Shared realm targets ignore placement, so resolving is harmless.
 pub(super) fn resolve_publish_placement(
     config: Option<&aruna_core::structs::RealmConfigDocument>,
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     current: aruna_core::structs::PlacementRef,
 ) -> aruna_core::structs::PlacementRef {
     if current != aruna_core::structs::PlacementRef::NIL {
@@ -202,7 +202,7 @@ impl OutboxBarrier {
 pub(super) fn classify_deferred_record(
     config: Option<&aruna_core::structs::RealmConfigDocument>,
     net_handle: &aruna_net::NetHandle,
-    record: &DocumentSyncOutboxRecord,
+    record: &DocumentOutboxRecord,
 ) -> DeferOutcome {
     let Some(config) = config else {
         return DeferOutcome::Retry;
@@ -228,7 +228,7 @@ pub(super) fn partition_drain_records(
     defer: &mut DrainDeferState,
     publishes_shared: bool,
     mut topic_available: impl FnMut(irokle::TopicId) -> bool,
-    mut classify_defer: impl FnMut(&DocumentSyncOutboxRecord) -> DeferOutcome,
+    mut classify_defer: impl FnMut(&DocumentOutboxRecord) -> DeferOutcome,
 ) -> (Vec<DrainRecord>, Vec<DrainRecord>, Vec<DrainRecord>) {
     let mut to_publish = Vec::with_capacity(records.len());
     let mut deferred = Vec::new();
@@ -292,9 +292,9 @@ pub(super) fn partition_drain_records(
 
 /// The admin origin stream a record belongs to. Origin sequence is ordered
 /// within one origin node.
-pub(super) fn admin_origin(record: &DocumentSyncOutboxRecord) -> Option<aruna_core::NodeId> {
+pub(super) fn admin_origin(record: &DocumentOutboxRecord) -> Option<aruna_core::NodeId> {
     match &record.event {
-        DocumentSyncOutboxEvent::AdminOperation { event, .. } => Some(event.origin_node_id),
+        DocumentOutboxEvent::AdminOperation { event, .. } => Some(event.origin_node_id),
         _ => None,
     }
 }
@@ -523,7 +523,7 @@ impl OperationsTaskHandler {
         net_handle: &aruna_net::NetHandle,
         config: Option<&aruna_core::structs::RealmConfigDocument>,
         realm_id: RealmId,
-        records: Vec<(Vec<u8>, DocumentSyncOutboxRecord)>,
+        records: Vec<(Vec<u8>, DocumentOutboxRecord)>,
         invocation: &mut DrainInvocation,
     ) {
         invocation.pages += 1;
@@ -598,14 +598,14 @@ impl OperationsTaskHandler {
         net_handle: &aruna_net::NetHandle,
         config: Option<&aruna_core::structs::RealmConfigDocument>,
         realm_id: RealmId,
-        records: Vec<(Vec<u8>, DocumentSyncOutboxRecord)>,
+        records: Vec<(Vec<u8>, DocumentOutboxRecord)>,
         invocation: &mut DrainInvocation,
     ) -> Vec<DrainRecord> {
         let mut records: Vec<DrainRecord> = records
             .into_iter()
             .map(|(record_key, mut record)| {
                 invocation.config_drained |=
-                    matches!(record.target, DocumentSyncTarget::RealmConfig { .. });
+                    matches!(record.target, DocumentTarget::RealmConfig { .. });
                 record.placement =
                     resolve_publish_placement(config, &record.target, record.placement);
                 let topic = record.target.sync_topic_id(realm_id, &record.placement);
@@ -710,7 +710,7 @@ impl OperationsTaskHandler {
                 let publish_started = Instant::now();
                 let event = net_handle
                     .send_effect(Effect::Net(NetEffect::DocumentSync(
-                        DocumentSyncEffect::PublishDocuments { documents, peers },
+                        DocumentEffect::PublishDocuments { documents, peers },
                     )))
                     .await;
                 (event, publish_started.elapsed())
@@ -722,11 +722,11 @@ impl OperationsTaskHandler {
             publish_elapsed += publish_time;
             outcome.merge(sync_outcome);
             match publish_event {
-                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished {
+                Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsPublished {
                     ..
                 })) => awaiting_sync = Some(subbatch),
                 Event::Net(NetEvent::DocumentSync(
-                    DocumentSyncNetEvent::DocumentsPartiallyPublished {
+                    DocumentNetEvent::DocumentsPartiallyPublished {
                         published_indices,
                         retry_indices,
                         error,
@@ -760,9 +760,7 @@ impl OperationsTaskHandler {
                         }
                     }
                 }
-                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
-                    error, ..
-                })) => {
+                Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
                     warn!(task_id = ?retry_key, error = %error, "Failed to create local document sync batch");
                     outcome.retry_needed = true;
                     outcome.blocked_topics.extend(batch_topics.iter().copied());
@@ -861,7 +859,7 @@ impl OperationsTaskHandler {
         let sync_started = Instant::now();
         let event = net_handle
             .send_effect(Effect::Net(NetEffect::DocumentSync(
-                DocumentSyncEffect::SyncDocuments {
+                DocumentEffect::SyncDocuments {
                     topics: subbatch.topics,
                     peers: subbatch.peers,
                 },
@@ -1043,8 +1041,8 @@ impl OperationsTaskHandler {
     async fn project_create_events(
         &self,
         retry_key: &TaskKey,
-        targets: Vec<DocumentSyncTarget>,
-        metadata_create_events: Vec<aruna_core::metadata::MetadataCreateEventRecord>,
+        targets: Vec<DocumentTarget>,
+        metadata_create_events: Vec<aruna_core::metadata::MetadataEventRecord>,
     ) -> Result<(), ()> {
         if !metadata_create_events.is_empty() {
             let local_node_id = self.context.net_handle.as_ref().map(|net| net.node_id());
@@ -1059,7 +1057,7 @@ impl OperationsTaskHandler {
 
         let mut create_event_targets = Vec::new();
         for target in targets {
-            let DocumentSyncTarget::MetadataCreateEvent {
+            let DocumentTarget::MetadataCreateEvent {
                 document_id,
                 event_id,
                 ..
@@ -1082,12 +1080,12 @@ impl OperationsTaskHandler {
         &self,
         retry_key: &TaskKey,
         record_keys: Vec<Vec<u8>>,
-        requested_targets: Vec<DocumentSyncTarget>,
+        requested_targets: Vec<DocumentTarget>,
         event: Event,
         mut outcome: DrainSyncOutcome,
     ) -> DrainSyncOutcome {
         match event {
-            Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
+            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled {
                 targets,
                 metadata_create_events,
                 metadata_graph_tombstones,
@@ -1132,7 +1130,7 @@ impl OperationsTaskHandler {
                     notify_dashboard_change(self.context.as_ref());
                 }
             }
-            Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error { error, .. })) => {
+            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
                 warn!(task_id = ?retry_key, error = %error, "Failed to sync document batch");
                 outcome.retry_needed = true;
             }

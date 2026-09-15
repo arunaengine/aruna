@@ -25,10 +25,10 @@ use ulid::Ulid;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::metadata::MetadataAuthToken;
-use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::metadata::AuthToken;
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use crate::sync::sync_relationship::{
-    DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
+    DeleteRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
 };
 use crate::tasks::queue_backoff::retry_delay_ms;
@@ -39,27 +39,27 @@ pub(crate) const RECONCILE_GRACE: Duration = Duration::from_secs(30);
 pub const MIRROR_REPAIR_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum SyncMirrorRepairIntent {
+pub enum SyncMirrorIntent {
     Reconcile,
     Delete,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SyncMirrorRepairRecord {
+pub struct SyncMirrorRecord {
     pub relationship: SyncRelationship,
-    pub intent: SyncMirrorRepairIntent,
+    pub intent: SyncMirrorIntent,
     pub due_at_ms: u64,
     pub attempts: u32,
     pub last_error: Option<String>,
 }
 
-impl SyncMirrorRepairRecord {
-    fn new(relationship: SyncRelationship, intent: SyncMirrorRepairIntent) -> Self {
+impl SyncMirrorRecord {
+    fn new(relationship: SyncRelationship, intent: SyncMirrorIntent) -> Self {
         let due_at_ms = match intent {
-            SyncMirrorRepairIntent::Reconcile => {
+            SyncMirrorIntent::Reconcile => {
                 unix_timestamp_millis().saturating_add(RECONCILE_GRACE.as_millis() as u64)
             }
-            SyncMirrorRepairIntent::Delete => unix_timestamp_millis(),
+            SyncMirrorIntent::Delete => unix_timestamp_millis(),
         };
         Self {
             relationship,
@@ -88,7 +88,7 @@ impl SyncMirrorRepairRecord {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SyncMirrorRepairResult {
+pub struct SyncMirrorResult {
     pub processed: usize,
     pub succeeded: usize,
     pub failed: usize,
@@ -97,7 +97,7 @@ pub struct SyncMirrorRepairResult {
 }
 
 #[derive(Debug, Error)]
-pub enum SyncMirrorRepairError {
+pub enum SyncMirrorError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -111,7 +111,7 @@ pub enum SyncMirrorRepairError {
 }
 
 struct RepairScan {
-    records: Vec<(Vec<u8>, SyncMirrorRepairRecord)>,
+    records: Vec<(Vec<u8>, SyncMirrorRecord)>,
     has_more_due: bool,
     next_due_at_ms: Option<u64>,
 }
@@ -119,35 +119,35 @@ struct RepairScan {
 pub fn mirror_delete_entry(
     relationship: &SyncRelationship,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
-    repair_entry(SyncMirrorRepairRecord::new(
+    repair_entry(SyncMirrorRecord::new(
         relationship.clone(),
-        SyncMirrorRepairIntent::Delete,
+        SyncMirrorIntent::Delete,
     ))
 }
 
 pub async fn stage_mirror_reconcile(
     context: &DriverContext,
     relationship: &SyncRelationship,
-) -> Result<(), SyncMirrorRepairError> {
-    stage_mirror_intent(context, relationship, SyncMirrorRepairIntent::Reconcile).await
+) -> Result<(), SyncMirrorError> {
+    stage_mirror_intent(context, relationship, SyncMirrorIntent::Reconcile).await
 }
 
 pub async fn stage_mirror_delete(
     context: &DriverContext,
     relationship: &SyncRelationship,
-) -> Result<(), SyncMirrorRepairError> {
-    stage_mirror_intent(context, relationship, SyncMirrorRepairIntent::Delete).await
+) -> Result<(), SyncMirrorError> {
+    stage_mirror_intent(context, relationship, SyncMirrorIntent::Delete).await
 }
 
 pub async fn store_sync_status(
     context: &DriverContext,
     relationship: &SyncRelationship,
-) -> Result<bool, SyncMirrorRepairError> {
+) -> Result<bool, SyncMirrorError> {
     relationship.validate()?;
     let source_bucket = relationship
         .source
         .bucket()
-        .ok_or_else(|| SyncMirrorRepairError::Mirror("invalid source ARN".to_string()))?;
+        .ok_or_else(|| SyncMirrorError::Mirror("invalid source ARN".to_string()))?;
     let relationship_key = sync_relationship_key(source_bucket, relationship.id);
     let repair_key = relationship.id.to_bytes().to_vec();
     let txn_id = start_repair_transaction(&context.storage_handle).await?;
@@ -164,20 +164,19 @@ pub async fn store_sync_status(
             return Ok(false);
         }
         if !same_relationship(&existing, relationship) {
-            return Err(SyncMirrorRepairError::Mirror(
+            return Err(SyncMirrorError::Mirror(
                 "sync relationship identity changed during status update".to_string(),
             ));
         }
         if read_repair_record(&context.storage_handle, &repair_key, Some(txn_id))
             .await?
-            .is_some_and(|record| record.intent == SyncMirrorRepairIntent::Delete)
+            .is_some_and(|record| record.intent == SyncMirrorIntent::Delete)
         {
             commit_repair_transaction(&context.storage_handle, txn_id).await?;
             return Ok(false);
         }
 
-        let repair =
-            SyncMirrorRepairRecord::new(relationship.clone(), SyncMirrorRepairIntent::Reconcile);
+        let repair = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile);
         match context
             .storage_handle
             .send_storage_effect(StorageEffect::BatchWrite {
@@ -202,7 +201,7 @@ pub async fn store_sync_status(
                 Ok(true)
             }
             Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(SyncMirrorRepairError::Unexpected(other)),
+            other => Err(SyncMirrorError::Unexpected(other)),
         }
     }
     .await;
@@ -215,8 +214,8 @@ pub async fn store_sync_status(
 pub async fn clear_mirror_repair(
     context: &DriverContext,
     relationship: &SyncRelationship,
-    expected: SyncMirrorRepairIntent,
-) -> Result<(), SyncMirrorRepairError> {
+    expected: SyncMirrorIntent,
+) -> Result<(), SyncMirrorError> {
     clear_repair_intent(
         &context.storage_handle,
         relationship.id.to_bytes().to_vec(),
@@ -231,7 +230,7 @@ pub async fn clear_mirror_repair(
 pub async fn request_mirror_create(
     context: &DriverContext,
     target_node: NodeId,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
     source_group_id: Ulid,
     relationship: SyncRelationship,
     extras: PolicyRequestExtras,
@@ -270,31 +269,27 @@ pub async fn ensure_sync_mirror(
     context: &DriverContext,
     local_node: NodeId,
     relationship: &SyncRelationship,
-) -> Result<(), SyncMirrorRepairError> {
+) -> Result<(), SyncMirrorError> {
     relationship.validate()?;
     if relationship.source.node_id != local_node {
-        return Err(SyncMirrorRepairError::Mirror(
+        return Err(SyncMirrorError::Mirror(
             "sync mirror creation must run on the source node".to_string(),
         ));
     }
     let source_bucket = relationship
         .source
         .bucket()
-        .ok_or_else(|| SyncMirrorRepairError::Mirror("invalid source ARN".to_string()))?;
-    let source_group_id = match drive(
-        GetBucketInfoOperation::new(source_bucket.to_string()),
-        context,
-    )
-    .await
-    {
-        Ok(bucket_info) => bucket_info.group_id,
-        Err(GetBucketInfoError::NotFound) => {
-            return Err(SyncMirrorRepairError::Mirror(
-                "source bucket not found".to_string(),
-            ));
-        }
-        Err(error) => return Err(SyncMirrorRepairError::Mirror(error.to_string())),
-    };
+        .ok_or_else(|| SyncMirrorError::Mirror("invalid source ARN".to_string()))?;
+    let source_group_id =
+        match drive(GetBucketOperation::new(source_bucket.to_string()), context).await {
+            Ok(bucket_info) => bucket_info.group_id,
+            Err(GetBucketError::NotFound) => {
+                return Err(SyncMirrorError::Mirror(
+                    "source bucket not found".to_string(),
+                ));
+            }
+            Err(error) => return Err(SyncMirrorError::Mirror(error.to_string())),
+        };
     authorize_repair(
         context,
         relationship,
@@ -312,7 +307,7 @@ pub async fn ensure_sync_mirror(
     if relationship.target.node_id == local_node {
         ensure_target_write(context, relationship).await?;
         return drive(
-            StoreSyncRelationshipOperation::new(
+            StoreRelationshipOperation::new(
                 relationship.clone(),
                 SyncRelationshipDirection::Incoming,
             ),
@@ -326,11 +321,11 @@ pub async fn ensure_sync_mirror(
     let metadata_handle = context
         .metadata_handle
         .as_ref()
-        .ok_or_else(|| SyncMirrorRepairError::Mirror("target unreachable".to_string()))?;
+        .ok_or_else(|| SyncMirrorError::Mirror("target unreachable".to_string()))?;
     metadata_handle
         .request_sync_create(
             relationship.target.node_id,
-            Some(MetadataAuthToken::internal(AuthContext {
+            Some(AuthToken::internal(AuthContext {
                 user_id: relationship.created_by,
                 realm_id: relationship.source.realm_id,
                 path_restrictions: None,
@@ -341,14 +336,14 @@ pub async fn ensure_sync_mirror(
             PolicyRequestExtras::operation("s3.PutBucketReplication"),
         )
         .await
-        .map_err(|error| SyncMirrorRepairError::Mirror(error.to_string()))
+        .map_err(|error| SyncMirrorError::Mirror(error.to_string()))
 }
 
 pub async fn delete_sync_mirror(
     context: &DriverContext,
     local_node: NodeId,
     relationship: &SyncRelationship,
-) -> Result<(), SyncMirrorRepairError> {
+) -> Result<(), SyncMirrorError> {
     relationship.validate()?;
     if relationship.source.node_id == local_node && relationship.target.node_id == local_node {
         delete_local_relationships(context, local_node, relationship).await?;
@@ -360,18 +355,18 @@ pub async fn delete_sync_mirror(
     } else if relationship.target.node_id == local_node {
         relationship.source.node_id
     } else {
-        return Err(SyncMirrorRepairError::Mirror(
+        return Err(SyncMirrorError::Mirror(
             "sync mirror deletion must run on an endpoint node".to_string(),
         ));
     };
     let metadata_handle = context
         .metadata_handle
         .as_ref()
-        .ok_or_else(|| SyncMirrorRepairError::Mirror("target unreachable".to_string()))?;
+        .ok_or_else(|| SyncMirrorError::Mirror("target unreachable".to_string()))?;
     match metadata_handle
         .request_sync_delete(
             remote_node,
-            Some(MetadataAuthToken::internal(AuthContext {
+            Some(AuthToken::internal(AuthContext {
                 user_id: relationship.created_by,
                 realm_id: relationship.source.realm_id,
                 path_restrictions: None,
@@ -384,14 +379,14 @@ pub async fn delete_sync_mirror(
     {
         Ok(()) => Ok(()),
         Err(MetadataError::Backend(message)) if message == "not_found" => Ok(()),
-        Err(error) => Err(SyncMirrorRepairError::Mirror(error.to_string())),
+        Err(error) => Err(SyncMirrorError::Mirror(error.to_string())),
     }
 }
 
 pub async fn process_mirror_repairs(
     context: &DriverContext,
     local_node: NodeId,
-) -> Result<SyncMirrorRepairResult, SyncMirrorRepairError> {
+) -> Result<SyncMirrorResult, SyncMirrorError> {
     let now_ms = unix_timestamp_millis();
     let scan = scan_repair_records(&context.storage_handle, now_ms).await?;
     let mut succeeded = 0usize;
@@ -416,7 +411,7 @@ pub async fn process_mirror_repairs(
         }
     }
 
-    Ok(SyncMirrorRepairResult {
+    Ok(SyncMirrorResult {
         processed: scan.records.len(),
         succeeded,
         failed,
@@ -448,7 +443,7 @@ pub async fn restore_mirror_timer(storage: &StorageHandle, task_handle: &TaskHan
     }
 }
 
-fn repair_entry(record: SyncMirrorRepairRecord) -> Result<(KeySpace, Key, Value), ConversionError> {
+fn repair_entry(record: SyncMirrorRecord) -> Result<(KeySpace, Key, Value), ConversionError> {
     let key = record.relationship.id.to_bytes().to_vec();
     let value = record.to_bytes()?;
     Ok((
@@ -461,11 +456,11 @@ fn repair_entry(record: SyncMirrorRepairRecord) -> Result<(KeySpace, Key, Value)
 async fn stage_mirror_intent(
     context: &DriverContext,
     relationship: &SyncRelationship,
-    intent: SyncMirrorRepairIntent,
-) -> Result<(), SyncMirrorRepairError> {
+    intent: SyncMirrorIntent,
+) -> Result<(), SyncMirrorError> {
     store_repair_record(
         &context.storage_handle,
-        SyncMirrorRepairRecord::new(relationship.clone(), intent),
+        SyncMirrorRecord::new(relationship.clone(), intent),
     )
     .await
 }
@@ -473,24 +468,20 @@ async fn stage_mirror_intent(
 async fn ensure_target_write(
     context: &DriverContext,
     relationship: &SyncRelationship,
-) -> Result<(), SyncMirrorRepairError> {
+) -> Result<(), SyncMirrorError> {
     let target_bucket = relationship
         .target
         .bucket()
-        .ok_or_else(|| SyncMirrorRepairError::Mirror("invalid target ARN".to_string()))?;
-    let bucket_info = match drive(
-        GetBucketInfoOperation::new(target_bucket.to_string()),
-        context,
-    )
-    .await
+        .ok_or_else(|| SyncMirrorError::Mirror("invalid target ARN".to_string()))?;
+    let bucket_info = match drive(GetBucketOperation::new(target_bucket.to_string()), context).await
     {
         Ok(bucket_info) => bucket_info,
-        Err(GetBucketInfoError::NotFound) => {
-            return Err(SyncMirrorRepairError::Mirror(
+        Err(GetBucketError::NotFound) => {
+            return Err(SyncMirrorError::Mirror(
                 "target bucket not found".to_string(),
             ));
         }
-        Err(error) => return Err(SyncMirrorRepairError::Mirror(error.to_string())),
+        Err(error) => return Err(SyncMirrorError::Mirror(error.to_string())),
     };
     authorize_repair(
         context,
@@ -515,7 +506,7 @@ async fn authorize_repair(
     path: &str,
     permission: &Permission,
     operation: &'static str,
-) -> Result<(), SyncMirrorRepairError> {
+) -> Result<(), SyncMirrorError> {
     let auth = AuthContext {
         user_id: relationship.created_by,
         realm_id: relationship.created_by.realm_id,
@@ -534,23 +525,21 @@ async fn authorize_repair(
     {
         Ok(()) => Ok(()),
         Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
-            Err(SyncMirrorRepairError::Mirror("access_denied".to_string()))
+            Err(SyncMirrorError::Mirror("access_denied".to_string()))
         }
-        Err(AuthorizeError::CheckFailed(error)) => Err(SyncMirrorRepairError::Mirror(error)),
-        Err(AuthorizeError::Storage(error)) => {
-            Err(SyncMirrorRepairError::Mirror(error.to_string()))
-        }
+        Err(AuthorizeError::CheckFailed(error)) => Err(SyncMirrorError::Mirror(error)),
+        Err(AuthorizeError::Storage(error)) => Err(SyncMirrorError::Mirror(error.to_string())),
     }
 }
 
 async fn process_repair_record(
     context: &DriverContext,
     local_node: NodeId,
-    record: &SyncMirrorRepairRecord,
-) -> Result<(), SyncMirrorRepairError> {
+    record: &SyncMirrorRecord,
+) -> Result<(), SyncMirrorError> {
     match record.intent {
-        SyncMirrorRepairIntent::Reconcile => match drive(
-            GetSyncRelationshipOperation::new(
+        SyncMirrorIntent::Reconcile => match drive(
+            GetRelationshipOperation::new(
                 record.relationship.id,
                 SyncRelationshipDirection::Outgoing,
             ),
@@ -569,7 +558,7 @@ async fn process_repair_record(
             }
             Err(error) => Err(error.into()),
         },
-        SyncMirrorRepairIntent::Delete => {
+        SyncMirrorIntent::Delete => {
             delete_local_relationships(context, local_node, &record.relationship).await?;
             delete_sync_mirror(context, local_node, &record.relationship).await
         }
@@ -580,13 +569,13 @@ async fn delete_local_relationships(
     context: &DriverContext,
     local_node: NodeId,
     relationship: &SyncRelationship,
-) -> Result<(), SyncMirrorRepairError> {
+) -> Result<(), SyncMirrorError> {
     if relationship.source.node_id == local_node {
         remove_outgoing_relationship(context, relationship.clone()).await?;
     }
     if relationship.target.node_id == local_node {
         drive(
-            DeleteSyncRelationshipOperation::new(
+            DeleteRelationshipOperation::new(
                 relationship.clone(),
                 SyncRelationshipDirection::Incoming,
             ),
@@ -600,7 +589,7 @@ async fn delete_local_relationships(
 async fn scan_repair_records(
     storage: &StorageHandle,
     now_ms: u64,
-) -> Result<RepairScan, SyncMirrorRepairError> {
+) -> Result<RepairScan, SyncMirrorError> {
     let mut records = Vec::new();
     let mut next_due_at_ms: Option<u64> = None;
     let mut start_after = None;
@@ -620,11 +609,11 @@ async fn scan_repair_records(
                 next_start_after,
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => return Err(SyncMirrorRepairError::Unexpected(other)),
+            other => return Err(SyncMirrorError::Unexpected(other)),
         };
 
         for (key, value) in values {
-            let record = match SyncMirrorRepairRecord::from_bytes(&key, &value) {
+            let record = match SyncMirrorRecord::from_bytes(&key, &value) {
                 Ok(record) => record,
                 Err(error) => {
                     warn!(%error, "Dropping malformed sync mirror repair record");
@@ -658,9 +647,7 @@ async fn scan_repair_records(
     })
 }
 
-async fn next_repair_after(
-    storage: &StorageHandle,
-) -> Result<Option<Duration>, SyncMirrorRepairError> {
+async fn next_repair_after(storage: &StorageHandle) -> Result<Option<Duration>, SyncMirrorError> {
     let now_ms = unix_timestamp_millis();
     let scan = scan_repair_records(storage, now_ms).await?;
     if !scan.records.is_empty() || scan.has_more_due {
@@ -674,11 +661,11 @@ async fn next_repair_after(
 async fn reschedule_repair_record(
     storage: &StorageHandle,
     key: Vec<u8>,
-    record: &SyncMirrorRepairRecord,
+    record: &SyncMirrorRecord,
     error: String,
-) -> Result<(), SyncMirrorRepairError> {
+) -> Result<(), SyncMirrorError> {
     let attempts = record.attempts.saturating_add(1);
-    let next = SyncMirrorRepairRecord {
+    let next = SyncMirrorRecord {
         relationship: record.relationship.clone(),
         intent: record.intent,
         due_at_ms: unix_timestamp_millis().saturating_add(retry_delay_ms(attempts)),
@@ -707,7 +694,7 @@ async fn reschedule_repair_record(
                 commit_repair_transaction(storage, txn_id).await
             }
             Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(SyncMirrorRepairError::Unexpected(other)),
+            other => Err(SyncMirrorError::Unexpected(other)),
         }
     }
     .await;
@@ -719,14 +706,14 @@ async fn reschedule_repair_record(
 
 async fn store_repair_record(
     storage: &StorageHandle,
-    record: SyncMirrorRepairRecord,
-) -> Result<(), SyncMirrorRepairError> {
+    record: SyncMirrorRecord,
+) -> Result<(), SyncMirrorError> {
     let key = record.relationship.id.to_bytes().to_vec();
     let txn_id = start_repair_transaction(storage).await?;
     let result = async {
         let existing = read_repair_record(storage, &key, Some(txn_id)).await?;
-        if record.intent == SyncMirrorRepairIntent::Reconcile
-            && existing.is_some_and(|existing| existing.intent == SyncMirrorRepairIntent::Delete)
+        if record.intent == SyncMirrorIntent::Reconcile
+            && existing.is_some_and(|existing| existing.intent == SyncMirrorIntent::Delete)
         {
             return commit_repair_transaction(storage, txn_id).await;
         }
@@ -743,7 +730,7 @@ async fn store_repair_record(
                 commit_repair_transaction(storage, txn_id).await
             }
             Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(SyncMirrorRepairError::Unexpected(other)),
+            other => Err(SyncMirrorError::Unexpected(other)),
         }
     }
     .await;
@@ -757,14 +744,14 @@ async fn clear_repair_intent(
     storage: &StorageHandle,
     key: Vec<u8>,
     relationship: &SyncRelationship,
-    expected: SyncMirrorRepairIntent,
-) -> Result<(), SyncMirrorRepairError> {
+    expected: SyncMirrorIntent,
+) -> Result<(), SyncMirrorError> {
     let txn_id = start_repair_transaction(storage).await?;
     let result = async {
         let existing = read_repair_record(storage, &key, Some(txn_id)).await?;
         if existing.is_none_or(|existing| {
             existing.intent != expected
-                || (expected == SyncMirrorRepairIntent::Reconcile
+                || (expected == SyncMirrorIntent::Reconcile
                     && existing.relationship != *relationship)
         }) {
             return commit_repair_transaction(storage, txn_id).await;
@@ -781,7 +768,7 @@ async fn clear_repair_intent(
                 commit_repair_transaction(storage, txn_id).await
             }
             Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(SyncMirrorRepairError::Unexpected(other)),
+            other => Err(SyncMirrorError::Unexpected(other)),
         }
     }
     .await;
@@ -794,8 +781,8 @@ async fn clear_repair_intent(
 async fn clear_scanned_record(
     storage: &StorageHandle,
     key: Vec<u8>,
-    expected: &SyncMirrorRepairRecord,
-) -> Result<(), SyncMirrorRepairError> {
+    expected: &SyncMirrorRecord,
+) -> Result<(), SyncMirrorError> {
     let txn_id = start_repair_transaction(storage).await?;
     let result = async {
         if read_repair_record(storage, &key, Some(txn_id))
@@ -817,7 +804,7 @@ async fn clear_scanned_record(
                 commit_repair_transaction(storage, txn_id).await
             }
             Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(SyncMirrorRepairError::Unexpected(other)),
+            other => Err(SyncMirrorError::Unexpected(other)),
         }
     }
     .await;
@@ -831,7 +818,7 @@ async fn read_repair_record(
     storage: &StorageHandle,
     key: &[u8],
     txn_id: Option<TxnId>,
-) -> Result<Option<SyncMirrorRepairRecord>, SyncMirrorRepairError> {
+) -> Result<Option<SyncMirrorRecord>, SyncMirrorError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
@@ -843,11 +830,11 @@ async fn read_repair_record(
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
-        }) => SyncMirrorRepairRecord::from_bytes(key, &value)
+        }) => SyncMirrorRecord::from_bytes(key, &value)
             .map(Some)
             .map_err(Into::into),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(SyncMirrorRepairError::Unexpected(other)),
+        other => Err(SyncMirrorError::Unexpected(other)),
     }
 }
 
@@ -855,7 +842,7 @@ async fn read_out_relationship(
     storage: &StorageHandle,
     key: &[u8],
     txn_id: Option<TxnId>,
-) -> Result<Option<SyncRelationship>, SyncMirrorRepairError> {
+) -> Result<Option<SyncRelationship>, SyncMirrorError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
@@ -871,7 +858,7 @@ async fn read_out_relationship(
             .map(Some)
             .map_err(Into::into),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(SyncMirrorRepairError::Unexpected(other)),
+        other => Err(SyncMirrorError::Unexpected(other)),
     }
 }
 
@@ -887,28 +874,28 @@ fn same_relationship(left: &SyncRelationship, right: &SyncRelationship) -> bool 
         && left.created_at == right.created_at
 }
 
-async fn start_repair_transaction(storage: &StorageHandle) -> Result<TxnId, SyncMirrorRepairError> {
+async fn start_repair_transaction(storage: &StorageHandle) -> Result<TxnId, SyncMirrorError> {
     match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(SyncMirrorRepairError::Unexpected(other)),
+        other => Err(SyncMirrorError::Unexpected(other)),
     }
 }
 
 async fn commit_repair_transaction(
     storage: &StorageHandle,
     txn_id: TxnId,
-) -> Result<(), SyncMirrorRepairError> {
+) -> Result<(), SyncMirrorError> {
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(SyncMirrorRepairError::Unexpected(other)),
+        other => Err(SyncMirrorError::Unexpected(other)),
     }
 }
 
@@ -921,7 +908,7 @@ async fn abort_repair_transaction(storage: &StorageHandle, txn_id: TxnId) {
 async fn delete_repair_record(
     storage: &StorageHandle,
     key: Vec<u8>,
-) -> Result<(), SyncMirrorRepairError> {
+) -> Result<(), SyncMirrorError> {
     match storage
         .send_storage_effect(StorageEffect::Delete {
             key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
@@ -932,7 +919,7 @@ async fn delete_repair_record(
     {
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(SyncMirrorRepairError::Unexpected(other)),
+        other => Err(SyncMirrorError::Unexpected(other)),
     }
 }
 
@@ -1077,11 +1064,11 @@ mod tests {
 
     #[test]
     fn repair_record_roundtrips() {
-        let record = SyncMirrorRepairRecord::new(relationship(), SyncMirrorRepairIntent::Reconcile);
+        let record = SyncMirrorRecord::new(relationship(), SyncMirrorIntent::Reconcile);
         let key = record.relationship.id.to_bytes();
 
         assert_eq!(
-            SyncMirrorRepairRecord::from_bytes(&key, &record.to_bytes().unwrap()).unwrap(),
+            SyncMirrorRecord::from_bytes(&key, &record.to_bytes().unwrap()).unwrap(),
             record
         );
     }
@@ -1129,9 +1116,8 @@ mod tests {
         else {
             panic!("missing mirror repair record");
         };
-        let record =
-            SyncMirrorRepairRecord::from_bytes(&relationship.id.to_bytes(), &value).unwrap();
-        assert_eq!(record.intent, SyncMirrorRepairIntent::Delete);
+        let record = SyncMirrorRecord::from_bytes(&relationship.id.to_bytes(), &value).unwrap();
+        assert_eq!(record.intent, SyncMirrorIntent::Delete);
     }
 
     #[tokio::test]
@@ -1148,7 +1134,7 @@ mod tests {
         };
         let relationship = relationship();
         drive(
-            StoreSyncRelationshipOperation::new(
+            StoreRelationshipOperation::new(
                 relationship.clone(),
                 SyncRelationshipDirection::Outgoing,
             ),
@@ -1163,7 +1149,7 @@ mod tests {
         assert!(!store_sync_status(&context, &updated).await.unwrap());
         assert_eq!(
             drive(
-                GetSyncRelationshipOperation::new(
+                GetRelationshipOperation::new(
                     relationship.id,
                     SyncRelationshipDirection::Outgoing,
                 ),
@@ -1192,7 +1178,7 @@ mod tests {
             reason: "failed".to_string(),
         };
         drive(
-            StoreSyncRelationshipOperation::new(
+            StoreRelationshipOperation::new(
                 relationship.clone(),
                 SyncRelationshipDirection::Outgoing,
             ),
@@ -1206,7 +1192,7 @@ mod tests {
         assert!(store_sync_status(&context, &relationship).await.unwrap());
         assert_eq!(
             drive(
-                GetSyncRelationshipOperation::new(
+                GetRelationshipOperation::new(
                     relationship.id,
                     SyncRelationshipDirection::Outgoing,
                 ),
@@ -1241,10 +1227,7 @@ mod tests {
         let stale = current.clone();
         current.set_reference_handling(ReferenceHandling::Preserve);
         drive(
-            StoreSyncRelationshipOperation::new(
-                current.clone(),
-                SyncRelationshipDirection::Outgoing,
-            ),
+            StoreRelationshipOperation::new(current.clone(), SyncRelationshipDirection::Outgoing),
             &context,
         )
         .await
@@ -1252,11 +1235,11 @@ mod tests {
 
         assert!(matches!(
             store_sync_status(&context, &stale).await,
-            Err(SyncMirrorRepairError::Mirror(_))
+            Err(SyncMirrorError::Mirror(_))
         ));
         assert_eq!(
             drive(
-                GetSyncRelationshipOperation::new(current.id, SyncRelationshipDirection::Outgoing,),
+                GetRelationshipOperation::new(current.id, SyncRelationshipDirection::Outgoing,),
                 &context,
             )
             .await
@@ -1270,8 +1253,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let relationship = relationship();
-        let mut stale =
-            SyncMirrorRepairRecord::new(relationship.clone(), SyncMirrorRepairIntent::Reconcile);
+        let mut stale = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile);
         stale.due_at_ms = 0;
         store_repair_record(&storage, stale.clone()).await.unwrap();
 
@@ -1305,7 +1287,7 @@ mod tests {
         current.status.last_error = Some("newer".to_string());
         store_repair_record(
             &storage,
-            SyncMirrorRepairRecord::new(current.clone(), SyncMirrorRepairIntent::Reconcile),
+            SyncMirrorRecord::new(current.clone(), SyncMirrorIntent::Reconcile),
         )
         .await
         .unwrap();
@@ -1318,7 +1300,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
-        clear_mirror_repair(&context, &stale, SyncMirrorRepairIntent::Reconcile)
+        clear_mirror_repair(&context, &stale, SyncMirrorIntent::Reconcile)
             .await
             .unwrap();
 
@@ -1341,7 +1323,7 @@ mod tests {
         current.status.last_error = Some("newer".to_string());
         store_repair_record(
             &storage,
-            SyncMirrorRepairRecord::new(current, SyncMirrorRepairIntent::Delete),
+            SyncMirrorRecord::new(current, SyncMirrorIntent::Delete),
         )
         .await
         .unwrap();
@@ -1354,7 +1336,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
-        clear_mirror_repair(&context, &stale, SyncMirrorRepairIntent::Delete)
+        clear_mirror_repair(&context, &stale, SyncMirrorIntent::Delete)
             .await
             .unwrap();
 
@@ -1373,7 +1355,7 @@ mod tests {
         let storage = context.storage_handle.clone();
         let relationship = relationship();
         drive(
-            StoreSyncRelationshipOperation::new(
+            StoreRelationshipOperation::new(
                 relationship.clone(),
                 SyncRelationshipDirection::Outgoing,
             ),
@@ -1385,8 +1367,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut record =
-            SyncMirrorRepairRecord::new(relationship.clone(), SyncMirrorRepairIntent::Reconcile);
+        let mut record = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile);
         record.due_at_ms = 0;
         let (key_space, key, value) = repair_entry(record).unwrap();
         assert!(matches!(
@@ -1418,8 +1399,7 @@ mod tests {
         else {
             panic!("missing mirror repair retry");
         };
-        let record =
-            SyncMirrorRepairRecord::from_bytes(&relationship.id.to_bytes(), &value).unwrap();
+        let record = SyncMirrorRecord::from_bytes(&relationship.id.to_bytes(), &value).unwrap();
         assert_eq!(record.attempts, 1);
         assert_eq!(record.last_error.as_deref(), Some("target unreachable"));
     }
@@ -1432,7 +1412,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(SyncMirrorRepairError::Mirror(error)) if error == "access_denied"
+            Err(SyncMirrorError::Mirror(error)) if error == "access_denied"
         ));
     }
 
@@ -1454,7 +1434,7 @@ mod tests {
         )
         .unwrap();
         drive(
-            StoreSyncRelationshipOperation::new(
+            StoreRelationshipOperation::new(
                 relationship.clone(),
                 SyncRelationshipDirection::Outgoing,
             ),
@@ -1462,8 +1442,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut record =
-            SyncMirrorRepairRecord::new(relationship.clone(), SyncMirrorRepairIntent::Reconcile);
+        let mut record = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile);
         record.due_at_ms = 0;
         store_repair_record(&context.storage_handle, record)
             .await

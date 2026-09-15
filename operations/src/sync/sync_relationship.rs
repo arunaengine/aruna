@@ -122,14 +122,14 @@ pub async fn remove_outgoing_relationship(
             ..relationship
         };
         crate::driver::drive(
-            StoreSyncRelationshipOperation::new(stub, SyncRelationshipDirection::Outgoing),
+            StoreRelationshipOperation::new(stub, SyncRelationshipDirection::Outgoing),
             context,
         )
         .await
         .map(|_| ())
     } else {
         crate::driver::drive(
-            DeleteSyncRelationshipOperation::new(relationship, SyncRelationshipDirection::Outgoing),
+            DeleteRelationshipOperation::new(relationship, SyncRelationshipDirection::Outgoing),
             context,
         )
         .await
@@ -284,14 +284,14 @@ enum StoreState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct StoreSyncRelationshipOperation {
+pub struct StoreRelationshipOperation {
     relationship: SyncRelationship,
     direction: SyncRelationshipDirection,
     state: StoreState,
     output: Option<Result<SyncRelationship, SyncRelationshipError>>,
 }
 
-impl StoreSyncRelationshipOperation {
+impl StoreRelationshipOperation {
     pub fn new(relationship: SyncRelationship, direction: SyncRelationshipDirection) -> Self {
         Self {
             relationship,
@@ -308,7 +308,7 @@ impl StoreSyncRelationshipOperation {
     }
 }
 
-impl Operation for StoreSyncRelationshipOperation {
+impl Operation for StoreRelationshipOperation {
     type Output = SyncRelationship;
     type Error = SyncRelationshipError;
 
@@ -386,7 +386,7 @@ enum ListState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ListSyncRelationshipsOperation {
+pub struct ListRelationshipsOperation {
     direction: SyncRelationshipDirection,
     bucket: Option<String>,
     state: ListState,
@@ -394,7 +394,7 @@ pub struct ListSyncRelationshipsOperation {
     output: Option<Result<Vec<SyncRelationship>, SyncRelationshipError>>,
 }
 
-impl ListSyncRelationshipsOperation {
+impl ListRelationshipsOperation {
     pub fn new(direction: SyncRelationshipDirection, bucket: Option<String>) -> Self {
         Self {
             direction,
@@ -412,7 +412,7 @@ impl ListSyncRelationshipsOperation {
     }
 }
 
-impl Operation for ListSyncRelationshipsOperation {
+impl Operation for ListRelationshipsOperation {
     type Output = Vec<SyncRelationship>;
     type Error = SyncRelationshipError;
 
@@ -495,14 +495,14 @@ enum GetState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct GetSyncRelationshipOperation {
+pub struct GetRelationshipOperation {
     id: Ulid,
     direction: SyncRelationshipDirection,
     state: GetState,
     output: Option<Result<SyncRelationship, SyncRelationshipError>>,
 }
 
-impl GetSyncRelationshipOperation {
+impl GetRelationshipOperation {
     pub fn new(id: Ulid, direction: SyncRelationshipDirection) -> Self {
         Self {
             id,
@@ -519,7 +519,7 @@ impl GetSyncRelationshipOperation {
     }
 }
 
-impl Operation for GetSyncRelationshipOperation {
+impl Operation for GetRelationshipOperation {
     type Output = SyncRelationship;
     type Error = SyncRelationshipError;
 
@@ -603,14 +603,14 @@ enum DeleteState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct DeleteSyncRelationshipOperation {
+pub struct DeleteRelationshipOperation {
     relationship: SyncRelationship,
     direction: SyncRelationshipDirection,
     state: DeleteState,
     output: Option<Result<(), SyncRelationshipError>>,
 }
 
-impl DeleteSyncRelationshipOperation {
+impl DeleteRelationshipOperation {
     pub fn new(relationship: SyncRelationship, direction: SyncRelationshipDirection) -> Self {
         Self {
             relationship,
@@ -627,7 +627,7 @@ impl DeleteSyncRelationshipOperation {
     }
 }
 
-impl Operation for DeleteSyncRelationshipOperation {
+impl Operation for DeleteRelationshipOperation {
     type Output = ();
     type Error = SyncRelationshipError;
 
@@ -750,7 +750,7 @@ mod tests {
 
         assert_eq!(
             drive(
-                StoreSyncRelationshipOperation::new(
+                StoreRelationshipOperation::new(
                     first.clone(),
                     SyncRelationshipDirection::Outgoing,
                 ),
@@ -761,17 +761,14 @@ mod tests {
             first
         );
         drive(
-            StoreSyncRelationshipOperation::new(
-                second.clone(),
-                SyncRelationshipDirection::Outgoing,
-            ),
+            StoreRelationshipOperation::new(second.clone(), SyncRelationshipDirection::Outgoing),
             &context,
         )
         .await
         .unwrap();
 
         let listed = drive(
-            ListSyncRelationshipsOperation::new(
+            ListRelationshipsOperation::new(
                 SyncRelationshipDirection::Outgoing,
                 Some("source-a".to_string()),
             ),
@@ -782,7 +779,7 @@ mod tests {
         assert_eq!(listed, vec![first.clone()]);
 
         let fetched = drive(
-            GetSyncRelationshipOperation::new(first.id, SyncRelationshipDirection::Outgoing),
+            GetRelationshipOperation::new(first.id, SyncRelationshipDirection::Outgoing),
             &context,
         )
         .await
@@ -790,17 +787,14 @@ mod tests {
         assert_eq!(fetched, first);
 
         drive(
-            DeleteSyncRelationshipOperation::new(
-                first.clone(),
-                SyncRelationshipDirection::Outgoing,
-            ),
+            DeleteRelationshipOperation::new(first.clone(), SyncRelationshipDirection::Outgoing),
             &context,
         )
         .await
         .unwrap();
         assert_eq!(
             drive(
-                GetSyncRelationshipOperation::new(first.id, SyncRelationshipDirection::Outgoing,),
+                GetRelationshipOperation::new(first.id, SyncRelationshipDirection::Outgoing,),
                 &context,
             )
             .await,
@@ -808,7 +802,7 @@ mod tests {
         );
 
         let remaining = drive(
-            ListSyncRelationshipsOperation::new(SyncRelationshipDirection::Outgoing, None),
+            ListRelationshipsOperation::new(SyncRelationshipDirection::Outgoing, None),
             &context,
         )
         .await
@@ -825,7 +819,7 @@ mod tests {
 
         for relationship in &relationships {
             drive(
-                StoreSyncRelationshipOperation::new(
+                StoreRelationshipOperation::new(
                     relationship.clone(),
                     SyncRelationshipDirection::Incoming,
                 ),
@@ -836,7 +830,7 @@ mod tests {
         }
 
         let listed = drive(
-            ListSyncRelationshipsOperation::new(
+            ListRelationshipsOperation::new(
                 SyncRelationshipDirection::Incoming,
                 Some("target".to_string()),
             ),
@@ -848,7 +842,7 @@ mod tests {
 
         let last = relationships.last().unwrap();
         let fetched = drive(
-            GetSyncRelationshipOperation::new(last.id, SyncRelationshipDirection::Incoming),
+            GetRelationshipOperation::new(last.id, SyncRelationshipDirection::Incoming),
             &context,
         )
         .await
@@ -856,14 +850,14 @@ mod tests {
         assert_eq!(&fetched, last);
 
         drive(
-            DeleteSyncRelationshipOperation::new(last.clone(), SyncRelationshipDirection::Incoming),
+            DeleteRelationshipOperation::new(last.clone(), SyncRelationshipDirection::Incoming),
             &context,
         )
         .await
         .unwrap();
         assert_eq!(
             drive(
-                GetSyncRelationshipOperation::new(last.id, SyncRelationshipDirection::Incoming,),
+                GetRelationshipOperation::new(last.id, SyncRelationshipDirection::Incoming,),
                 &context,
             )
             .await,
@@ -893,10 +887,7 @@ mod tests {
             ));
 
             let stored = drive(
-                ListSyncRelationshipsOperation::new(
-                    SyncRelationshipDirection::Outgoing,
-                    Some(source),
-                ),
+                ListRelationshipsOperation::new(SyncRelationshipDirection::Outgoing, Some(source)),
                 &context,
             )
             .await
@@ -921,10 +912,8 @@ mod tests {
         };
         let record = relationship(1, "source-a", "target-a");
 
-        let mut store = StoreSyncRelationshipOperation::new(
-            record.clone(),
-            SyncRelationshipDirection::Outgoing,
-        );
+        let mut store =
+            StoreRelationshipOperation::new(record.clone(), SyncRelationshipDirection::Outgoing);
         store.start();
         store.step(Event::Storage(StorageEvent::WriteResult {
             key: Vec::<u8>::new().into(),
@@ -935,8 +924,7 @@ mod tests {
             Err(SyncRelationshipError::UnexpectedEvent { .. })
         ));
 
-        let mut list =
-            ListSyncRelationshipsOperation::new(SyncRelationshipDirection::Outgoing, None);
+        let mut list = ListRelationshipsOperation::new(SyncRelationshipDirection::Outgoing, None);
         list.start();
         list.step(page());
         list.step(stray());
@@ -945,8 +933,7 @@ mod tests {
             Err(SyncRelationshipError::UnexpectedEvent { .. })
         ));
 
-        let mut get =
-            GetSyncRelationshipOperation::new(record.id, SyncRelationshipDirection::Outgoing);
+        let mut get = GetRelationshipOperation::new(record.id, SyncRelationshipDirection::Outgoing);
         get.start();
         get.step(page());
         get.step(stray());
@@ -956,7 +943,7 @@ mod tests {
         ));
 
         let mut delete =
-            DeleteSyncRelationshipOperation::new(record, SyncRelationshipDirection::Outgoing);
+            DeleteRelationshipOperation::new(record, SyncRelationshipDirection::Outgoing);
         delete.start();
         delete.step(stray());
         delete.step(stray());
