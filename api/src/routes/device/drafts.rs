@@ -15,9 +15,7 @@ use utoipa_axum::routes;
 
 use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{
-    ProfileValidationPreviewRequest, ProfileValidationPreviewResponse, ensure_metadata_scope,
-};
+use crate::metadata::{ProfilePreviewRequest, ProfilePreviewResponse, ensure_metadata_scope};
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, Permission};
 use aruna_operations::device::delete_draft::{DeleteDraftError, DeleteDraftOperation};
@@ -31,7 +29,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::metadata::profile_validation::preview_submission;
 use aruna_operations::metadata::public_preview::restricted_files;
 
-use super::require_owner;
+use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -392,12 +390,12 @@ for.
 - `public` checks file readability for everyone. `restricted_files_complete` is false when
   remote objects or unavailable state prevent a complete check; this never changes acceptance."#,
     request_body(
-        content = ProfileValidationPreviewRequest,
+        content = ProfilePreviewRequest,
         description = "The RO-Crate JSON-LD to evaluate",
         example = json!({"group_id": "01JGROUP00000000000000000", "rocrate": {"@context": "https://w3id.org/ro/crate/1.1/context", "@graph": []}})
     ),
     responses(
-        (status = 200, description = "The verdict a create would enforce for this draft", body = ProfileValidationPreviewResponse,
+        (status = 200, description = "The verdict a create would enforce for this draft", body = ProfilePreviewResponse,
             example = json!({
                 "accepted": true,
                 "state": "valid",
@@ -417,8 +415,8 @@ for.
 async fn preview_draft(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Json(request): Json<ProfileValidationPreviewRequest>,
-) -> ServerResult<(StatusCode, Json<ProfileValidationPreviewResponse>)> {
+    Json(request): Json<ProfilePreviewRequest>,
+) -> ServerResult<(StatusCode, Json<ProfilePreviewResponse>)> {
     let auth = require_owner(&state, auth).await?;
     let group_id = request
         .group_id
@@ -434,7 +432,7 @@ async fn preview_draft(
     let preview = preview_submission(&state.get_ctx(), group_id, &jsonld)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    let mut response = ProfileValidationPreviewResponse::from(preview);
+    let mut response = ProfilePreviewResponse::from(preview);
     if request.public {
         response.set_restricted(
             restricted_files(
@@ -452,4 +450,5 @@ async fn preview_draft(
 }
 
 #[cfg(test)]
+#[path = "drafts_tests.rs"]
 mod tests;

@@ -18,7 +18,7 @@ use ulid::Ulid;
 
 use super::dto::{DeviceTransfer, DeviceTransferList, download_view, transfer_view};
 use super::folders::map_folder_error;
-use super::require_owner;
+use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(list_device_transfers))

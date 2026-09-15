@@ -16,7 +16,7 @@ use aruna_operations::device::sync_status::{
     DatasetRow, DocumentRow, SyncStatus, start_sync_run, sync_status,
 };
 
-use super::require_owner;
+use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
